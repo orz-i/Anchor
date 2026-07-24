@@ -301,6 +301,12 @@ CLI 不会接管已被 GUI 占用的端口。后台运行建议交给 systemd，
 
 默认扫描 `.agents/skills`、`.codex/skills` 和 `skills`。在 workspace 的 **MCP → 配置 → Agent Skills** 中可以扫描预览并保存目录。完整格式、协议和安全边界见 [MCP Agent Skills 服务](docs/skill-service.md)。
 
+### 断联恢复与 OAuth 续约
+
+桌面端和 Linux CLI 会检测 MCP、Actions 与隧道断联，并使用有限次数的指数退避自动恢复。OAuth 支持 1 小时 Access Token 和轮换的 90 天 Refresh Token。只读状态查询可自动重试，保存和可能产生副作用的工具调用不会盲目重放。
+
+详细策略和当前限制见 [连接恢复、自动重试与 OAuth 续约](docs/reliability.md)。
+
 ## 项目结构
 
 | 路径 | 作用 |

@@ -132,3 +132,15 @@ coding-tools-mcp serve PROFILE_ID --service mcp
 ```
 
 确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 将提供 `list_skills`、`load_skill`、`read_skill_resource` 和 `skill://` resources；Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
+
+## 自动恢复
+
+`serve` 会持续检测 MCP/Actions listener，而不是只等待 `Ctrl+C`：
+
+- listener 意外退出后最多自动恢复五次；
+- `starting` 超过 10 秒会进入恢复状态；
+- 隧道重连采用指数退避，最高间隔 60 秒；
+- `--json` 输出结构化恢复事件；
+- 本地服务恢复耗尽后优雅停止，并以非零状态退出，适合 systemd `Restart=on-failure`。
+
+完整行为见 [连接恢复、自动重试与 OAuth 续约](reliability.md)。

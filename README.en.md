@@ -293,6 +293,12 @@ Each workspace/profile can expose one or more Agent Skills roots. MCP clients ca
 
 The default roots are `.agents/skills`, `.codex/skills`, and `skills`. Configure and preview them under **MCP → Configuration → Agent Skills**. See the [MCP Agent Skills service guide](docs/skill-service.md) for the format, protocol, and security boundaries.
 
+### Reconnection and OAuth renewal
+
+The desktop app and Linux CLI detect MCP, Actions, and tunnel disconnects and recover them with bounded exponential backoff. OAuth now supports one-hour access tokens and rotating 90-day refresh tokens. Read-only status calls may retry automatically; writes and potentially side-effecting tool calls are never replayed blindly.
+
+See [Connection recovery, retries, and OAuth renewal](docs/reliability.md) for behavior and current limitations.
+
 ## Project layout
 
 | Path | Purpose |
