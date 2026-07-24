@@ -18,14 +18,11 @@ impl AuthConfig {
 }
 
 /// Resolve the external OAuth/MCP base URL for a request.
-/// Matches the Python server's behavior: prefer configured URL,
-/// then `X-Forwarded-*` / `Host`, then localhost.
+/// Prefer trusted reverse-proxy forwarding headers, then the configured URL,
+/// then `Host`, and finally localhost. This prevents quick-tunnel OAuth
+/// metadata from remaining pinned to a stale public hostname.
 pub fn external_base_url(headers: &HeaderMap, bind_port: u16, configured_url: &str) -> String {
     let configured = configured_url.trim().trim_end_matches('/');
-    if !configured.is_empty() {
-        return configured.to_string();
-    }
-
     let proto = {
         let value = first_header_value(headers, "x-forwarded-proto");
         if value.is_empty() {
@@ -34,19 +31,32 @@ pub fn external_base_url(headers: &HeaderMap, bind_port: u16, configured_url: &s
             value
         }
     };
-    let host = {
+    let forwarded_host = {
         let value = safe_external_host(&first_header_value(headers, "x-forwarded-host"));
         if !value.is_empty() {
             value
         } else {
-            let value = safe_external_host(&forwarded_header_param(headers, "host"));
-            if !value.is_empty() {
-                value
-            } else {
-                safe_external_host(&first_header_value(headers, "host"))
-            }
+            safe_external_host(&forwarded_header_param(headers, "host"))
         }
     };
+
+    if !forwarded_host.is_empty() {
+        let proto = resolve_external_proto(
+            if proto.is_empty() {
+                None
+            } else {
+                Some(proto.as_str())
+            },
+            &forwarded_host,
+        );
+        return format!("{proto}://{forwarded_host}");
+    }
+
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+
+    let host = safe_external_host(&first_header_value(headers, "host"));
 
     let host = if host.is_empty() {
         format!("127.0.0.1:{bind_port}")
@@ -140,15 +150,18 @@ pub fn authorization_server_metadata(base_url: &str, client_secret: Option<&str>
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": methods,
+        "scopes_supported": ["mcp"],
     })
 }
 
-pub fn protected_resource_metadata(base_url: &str) -> Value {
-    let base = base_url.trim_end_matches('/');
+pub fn protected_resource_metadata(resource_url: &str, authorization_server_url: &str) -> Value {
+    let resource = resource_url.trim_end_matches('/');
+    let authorization_server = authorization_server_url.trim_end_matches('/');
     json!({
-        "resource": base,
-        "authorization_servers": [base],
+        "resource": resource,
+        "authorization_servers": [authorization_server],
         "bearer_methods_supported": ["header"],
+        "scopes_supported": ["mcp"],
     })
 }
 
@@ -182,8 +195,12 @@ mod tests {
 
     #[test]
     fn protected_resource_metadata_lists_authorization_servers() {
-        let meta = protected_resource_metadata("https://example.com");
+        let meta = protected_resource_metadata(
+            "https://example.com/mcp",
+            "https://example.com",
+        );
         assert_eq!(meta["authorization_servers"], json!(["https://example.com"]));
+        assert_eq!(meta["resource"], "https://example.com/mcp");
     }
 
     #[test]
@@ -192,6 +209,17 @@ mod tests {
         assert_eq!(
             external_base_url(&headers, 28767, "https://lb.frp-tx1.evwali.com"),
             "https://lb.frp-tx1.evwali.com"
+        );
+    }
+
+    #[test]
+    fn external_base_url_prefers_forwarded_host_over_stale_configured_url() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "new-tunnel.example.com".parse().unwrap());
+        assert_eq!(
+            external_base_url(&headers, 28767, "https://old-tunnel.example.com"),
+            "https://new-tunnel.example.com"
         );
     }
 

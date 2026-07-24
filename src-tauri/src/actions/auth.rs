@@ -96,14 +96,22 @@ pub async fn require_actions_auth(
             )
                 .into_response();
         };
+        let issuer_url = external_base_url(
+            request.headers(),
+            auth.bind_port,
+            &auth.configured_public_url,
+        );
+        let resource_url = issuer_url.trim_end_matches('/').to_string();
+        let resource_metadata_url = format!(
+            "{}/.well-known/oauth-protected-resource",
+            issuer_url.trim_end_matches('/')
+        );
         if let Some(response) = verify_oauth_bearer_header(
             request.headers(),
             oauth,
-            &external_base_url(
-                request.headers(),
-                auth.bind_port,
-                &auth.configured_public_url,
-            ),
+            &issuer_url,
+            &resource_url,
+            &resource_metadata_url,
         ) {
             return response;
         }

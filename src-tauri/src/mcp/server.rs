@@ -10,7 +10,7 @@ use crate::workspace::AuthConfig;
 
 pub type SharedState = SharedToolContext;
 
-pub fn handle_request(state: &SharedState, body: &Value) -> Value {
+pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
     let method = body.get("method").and_then(Value::as_str).unwrap_or("");
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let params = body.get("params").cloned().unwrap_or(Value::Null);
@@ -23,10 +23,11 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
         "initialize" => Ok(initialize_result()),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
-            let tools = list_tools_for_profile(&state.tool_profile);
+            let mut tools = list_tools_for_profile(&state.tool_profile);
+            tools.extend(state.mcp_proxies.list_tools());
             Ok(serde_json::json!({ "tools": tools }))
         }
-        "tools/call" => handle_tools_call(state, &params),
+        "tools/call" => handle_tools_call(state, &params).await,
         _ => Err(serde_json::json!({
             "code": -32601,
             "message": format!("Method not found: {method}")
@@ -55,12 +56,16 @@ fn initialize_result() -> Value {
     })
 }
 
-fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value> {
+async fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let args = tool_arguments(name, params);
+
+    if let Some(result) = state.mcp_proxies.call_tool(name, &args).await {
+        return result;
+    }
 
     let canonical_name = crate::tools::registry::canonical_tool_name(name);
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
@@ -72,8 +77,25 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
         }));
     }
 
-    let structured = call_tool(state.as_ref(), canonical_name, &args);
-    Ok(wrap_mcp_tool_result(canonical_name, &args, structured))
+    let state = state.clone();
+    let canonical_name = canonical_name.to_string();
+    let call_name = canonical_name.clone();
+    let call_args = args.clone();
+    let structured = tokio::task::spawn_blocking(move || {
+        call_tool(state.as_ref(), &call_name, &call_args)
+    })
+    .await
+    .map_err(|error| {
+        serde_json::json!({
+            "code": -32603,
+            "message": "Local MCP tool worker failed",
+            "data": {
+                "reason": "worker_failed",
+                "detail": error.to_string()
+            }
+        })
+    })?;
+    Ok(wrap_mcp_tool_result(&canonical_name, &args, structured))
 }
 
 fn tool_arguments(name: &str, params: &Value) -> Value {
@@ -178,8 +200,8 @@ mod tests {
         assert!(existing.get("_host_session_key").is_none());
     }
 
-    #[test]
-    fn explicit_session_key_prevents_changed_chatgpt_metadata_from_redirecting_history() {
+    #[tokio::test]
+    async fn explicit_session_key_prevents_changed_chatgpt_metadata_from_redirecting_history() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let harness = tempfile::tempdir().expect("harness tempdir");
         let state = Arc::new(
@@ -198,7 +220,8 @@ mod tests {
                     "_meta": {"openai/session": "chatgpt-session"}
                 }
             }),
-        );
+        )
+        .await;
         let structured = &response["result"]["structuredContent"];
         assert_eq!(structured["ok"], true);
         assert_eq!(structured["session_key_source"], "explicit_session_key");
@@ -210,8 +233,8 @@ mod tests {
         assert!(!content.contains("**Session key:** chatgpt-session"));
     }
 
-    #[test]
-    fn legacy_grep_calls_are_mapped_to_the_public_grep_text_tool() {
+    #[tokio::test]
+    async fn legacy_grep_calls_are_mapped_to_the_public_grep_text_tool() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let harness = tempfile::tempdir().expect("harness tempdir");
         fs::write(workspace.path().join("sample.txt"), "catalog needle")
@@ -232,7 +255,8 @@ mod tests {
                     "arguments": {"query": "needle", "path": "."}
                 }
             }),
-        );
+        )
+        .await;
 
         assert!(response.get("error").is_none());
         assert_eq!(response["result"]["structuredContent"]["ok"], true);

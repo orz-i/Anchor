@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::http::{
+    header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    HeaderMap, HeaderValue, StatusCode,
+};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -26,6 +29,12 @@ pub struct OAuthRuntime {
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
 }
 
+fn resource_matches(requested: &str, canonical: &str) -> bool {
+    let requested = requested.trim().trim_end_matches('/');
+    let canonical = canonical.trim().trim_end_matches('/');
+    requested.is_empty() || constant_time_eq_str(requested, canonical)
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 struct PendingCode {
@@ -34,7 +43,8 @@ struct PendingCode {
     redirect_uri: String,
     state: String,
     expires_at: u64,
-    server_url: String,
+    issuer_url: String,
+    resource_url: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,11 +83,17 @@ impl OAuthRuntime {
         constant_time_eq_str(client_id, &self.client_id)
     }
 
-    pub fn verify_access_token(&self, token: &str, server_url: &str) -> bool {
-        let server_url = server_url.trim_end_matches('/');
+    pub fn verify_access_token(
+        &self,
+        token: &str,
+        issuer_url: &str,
+        resource_url: &str,
+    ) -> bool {
+        let issuer_url = issuer_url.trim_end_matches('/');
+        let resource_url = resource_url.trim_end_matches('/');
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_audience(&[server_url]);
-        validation.set_issuer(&[server_url]);
+        validation.set_audience(&[resource_url]);
+        validation.set_issuer(&[issuer_url]);
         decode::<TokenClaims>(
             token,
             &DecodingKey::from_secret(self.token_secret.as_bytes()),
@@ -90,22 +106,62 @@ impl OAuthRuntime {
 pub fn verify_oauth_bearer_header(
     headers: &HeaderMap,
     oauth: &OAuthRuntime,
-    server_url: &str,
+    issuer_url: &str,
+    resource_url: &str,
+    resource_metadata_url: &str,
 ) -> Option<Response> {
     let Some(header_value) = headers.get(AUTHORIZATION) else {
-        return Some((StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response());
+        return Some(oauth_unauthorized(
+            "Missing Authorization header",
+            resource_metadata_url,
+            None,
+        ));
     };
     let Ok(header_str) = header_value.to_str() else {
-        return Some((StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response());
+        return Some(oauth_unauthorized(
+            "Invalid Authorization header",
+            resource_metadata_url,
+            Some("invalid_token"),
+        ));
     };
     let Some(token) = header_str.strip_prefix("Bearer ").map(str::trim) else {
-        return Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response());
+        return Some(oauth_unauthorized(
+            "Invalid bearer token",
+            resource_metadata_url,
+            Some("invalid_token"),
+        ));
     };
-    if oauth.verify_access_token(token, server_url) {
+    if oauth.verify_access_token(token, issuer_url, resource_url) {
         None
     } else {
-        Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response())
+        Some(oauth_unauthorized(
+            "Invalid bearer token",
+            resource_metadata_url,
+            Some("invalid_token"),
+        ))
     }
+}
+
+fn oauth_unauthorized(
+    message: &'static str,
+    resource_metadata_url: &str,
+    error: Option<&str>,
+) -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, message).into_response();
+    let challenge = match error {
+        Some(error) => format!(
+            "Bearer error=\"{error}\", resource_metadata=\"{}\"",
+            resource_metadata_url.trim()
+        ),
+        None => format!(
+            "Bearer resource_metadata=\"{}\"",
+            resource_metadata_url.trim()
+        ),
+    };
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response.headers_mut().insert(WWW_AUTHENTICATE, value);
+    }
+    response
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +173,8 @@ pub struct AuthorizeParams {
     pub code_challenge_method: String,
     #[serde(default)]
     pub state: String,
+    #[serde(default)]
+    pub resource: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +185,8 @@ pub struct AuthorizeForm {
     pub code_challenge_method: String,
     #[serde(default)]
     pub state: String,
+    #[serde(default)]
+    pub resource: String,
     pub password: String,
 }
 
@@ -139,11 +199,14 @@ pub struct TokenForm {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
+    #[serde(default)]
+    pub resource: String,
 }
 
 pub fn authorize_get(
     oauth: &OAuthRuntime,
     params: AuthorizeParams,
+    canonical_resource_url: &str,
     workspace_path: Option<&str>,
 ) -> Response {
     if params.response_type != "code" {
@@ -158,19 +221,28 @@ pub fn authorize_get(
             StatusCode::BAD_REQUEST,
         );
     }
+    if !resource_matches(&params.resource, canonical_resource_url) {
+        return html_error("Unknown resource", StatusCode::BAD_REQUEST);
+    }
     Html(login_page(
         &params.client_id,
         &params.redirect_uri,
         &params.code_challenge,
         &params.code_challenge_method,
         &params.state,
+        canonical_resource_url,
         "",
         workspace_path,
     ))
     .into_response()
 }
 
-pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &str) -> Response {
+pub fn authorize_post(
+    oauth: &OAuthRuntime,
+    form: AuthorizeForm,
+    issuer_url: &str,
+    canonical_resource_url: &str,
+) -> Response {
     if !oauth.client_id_allowed(&form.client_id) {
         return Html(login_page(
             &form.client_id,
@@ -178,6 +250,7 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
             &form.code_challenge,
             &form.code_challenge_method,
             &form.state,
+            &form.resource,
             "Invalid client",
             None,
         ))
@@ -190,7 +263,21 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
             &form.code_challenge,
             &form.code_challenge_method,
             &form.state,
+            &form.resource,
             "Invalid PKCE parameters",
+            None,
+        ))
+        .into_response();
+    }
+    if !resource_matches(&form.resource, canonical_resource_url) {
+        return Html(login_page(
+            &form.client_id,
+            &form.redirect_uri,
+            &form.code_challenge,
+            &form.code_challenge_method,
+            &form.state,
+            &form.resource,
+            "Invalid resource",
             None,
         ))
         .into_response();
@@ -204,6 +291,7 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
                 &form.code_challenge,
                 &form.code_challenge_method,
                 &form.state,
+                &form.resource,
                 "Invalid password",
                 None,
             )),
@@ -211,7 +299,8 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
             .into_response();
     }
 
-    let server_url = server_url.trim_end_matches('/').to_string();
+    let issuer_url = issuer_url.trim_end_matches('/').to_string();
+    let resource_url = canonical_resource_url.trim_end_matches('/').to_string();
     let code = uuid::Uuid::new_v4().to_string().replace('-', "");
     let now = unix_now();
     {
@@ -225,7 +314,8 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
                 redirect_uri: form.redirect_uri.clone(),
                 state: form.state.clone(),
                 expires_at: now + OAUTH_CODE_TTL_SECONDS,
-                server_url: server_url.clone(),
+                issuer_url: issuer_url.clone(),
+                resource_url,
             },
         );
     }
@@ -244,7 +334,8 @@ pub fn token_exchange(
     oauth: &OAuthRuntime,
     headers: &HeaderMap,
     mut form: TokenForm,
-    server_url: &str,
+    issuer_url: &str,
+    canonical_resource_url: &str,
 ) -> Response {
     if form.grant_type != "authorization_code" {
         return token_error("unsupported_grant_type", "Only authorization_code is supported");
@@ -293,19 +384,30 @@ pub fn token_exchange(
     if !verify_pkce(&form.code_verifier, &code_data.code_challenge) {
         return token_error("invalid_grant", "PKCE verification failed");
     }
+    if !resource_matches(&form.resource, &code_data.resource_url)
+        || !resource_matches(&code_data.resource_url, canonical_resource_url)
+    {
+        return token_error("invalid_target", "resource mismatch");
+    }
 
-    let issuer = if code_data.server_url.trim().is_empty() {
-        server_url.trim_end_matches('/').to_string()
+    let issuer = if code_data.issuer_url.trim().is_empty() {
+        issuer_url.trim_end_matches('/').to_string()
     } else {
-        code_data.server_url.trim_end_matches('/').to_string()
+        code_data.issuer_url.trim_end_matches('/').to_string()
     };
-    match create_access_token(&issuer, &oauth.token_secret, OAUTH_TOKEN_TTL_SECONDS) {
+    match create_access_token(
+        &issuer,
+        &code_data.resource_url,
+        &oauth.token_secret,
+        OAUTH_TOKEN_TTL_SECONDS,
+    ) {
         Ok(access_token) => (
             StatusCode::OK,
             axum::Json(json!({
                 "access_token": access_token,
                 "token_type": "Bearer",
-                "expires_in": OAUTH_TOKEN_TTL_SECONDS
+                "expires_in": OAUTH_TOKEN_TTL_SECONDS,
+                "scope": "mcp"
             })),
         )
             .into_response(),
@@ -313,11 +415,16 @@ pub fn token_exchange(
     }
 }
 
-fn create_access_token(server_url: &str, token_secret: &str, ttl: i64) -> Result<String, ()> {
+fn create_access_token(
+    issuer_url: &str,
+    resource_url: &str,
+    token_secret: &str,
+    ttl: i64,
+) -> Result<String, ()> {
     let now = unix_now() as i64;
     let claims = TokenClaims {
-        iss: server_url.to_string(),
-        aud: server_url.to_string(),
+        iss: issuer_url.to_string(),
+        aud: resource_url.to_string(),
         iat: now,
         exp: now + ttl,
         scope: "mcp".into(),
@@ -375,6 +482,7 @@ fn login_page(
     code_challenge: &str,
     code_challenge_method: &str,
     state: &str,
+    resource: &str,
     error: &str,
     workspace_path: Option<&str>,
 ) -> String {
@@ -405,6 +513,7 @@ fn login_page(
         <input type='hidden' name='code_challenge' value='{}'>\
         <input type='hidden' name='code_challenge_method' value='{}'>\
         <input type='hidden' name='state' value='{}'>\
+        <input type='hidden' name='resource' value='{}'>\
         <label>Password<input type='password' name='password' autocomplete='current-password' required></label>\
         <button type='submit'>Authorize</button>\
         </form></body></html>",
@@ -415,6 +524,7 @@ fn login_page(
         html_escape(code_challenge),
         html_escape(code_challenge_method),
         html_escape(state),
+        html_escape(resource),
     )
 }
 
@@ -464,6 +574,7 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let redirect_uri = "https://chatgpt.com/connector/oauth/test";
+        let resource_url = "https://lb.example.com/mcp";
         let redirect = authorize_post(
             &oauth,
             AuthorizeForm {
@@ -472,9 +583,11 @@ mod tests {
                 code_challenge: challenge,
                 code_challenge_method: "S256".into(),
                 state: "state".into(),
+                resource: resource_url.into(),
                 password: "test-password".into(),
             },
             "https://lb.example.com",
+            resource_url,
         );
         assert_eq!(redirect.status(), StatusCode::SEE_OTHER);
         let code = {
@@ -492,10 +605,37 @@ mod tests {
                 code_verifier: verifier.into(),
                 client_id: "chatgpt-client-test".into(),
                 client_secret: String::new(),
+                resource: resource_url.into(),
             },
             "https://lb.example.com",
+            resource_url,
         );
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn missing_bearer_token_advertises_protected_resource_metadata() {
+        let oauth = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "chatgpt-client-test".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        );
+        let response = verify_oauth_bearer_header(
+            &HeaderMap::new(),
+            &oauth,
+            "https://lb.example.com",
+            "https://lb.example.com/mcp",
+            "https://lb.example.com/.well-known/oauth-protected-resource",
+        )
+        .expect("missing token should be rejected");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[WWW_AUTHENTICATE],
+            "Bearer resource_metadata=\"https://lb.example.com/.well-known/oauth-protected-resource\""
+        );
     }
 
     #[test]

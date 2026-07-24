@@ -14,6 +14,7 @@ pub struct ToolContext {
     pub tool_profile: String,
     pub permission_mode: String,
     pub harness: Harness,
+    pub mcp_proxies: crate::mcp::proxy::McpProxyRegistry,
     default_cwd: Mutex<PathBuf>,
     pub sessions: SessionStore,
 }
@@ -70,6 +71,7 @@ impl ToolContext {
             tool_profile: crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
             permission_mode,
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
+            mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             default_cwd: Mutex::new(root),
             sessions: SessionStore::new(),
         }

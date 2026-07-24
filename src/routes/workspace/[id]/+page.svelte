@@ -8,6 +8,7 @@
   import AuthConfigForm from "$lib/components/AuthConfigForm.svelte";
   import HealthPanel from "$lib/components/HealthPanel.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
+  import McpProxyConfigForm from "$lib/components/McpProxyConfigForm.svelte";
   import RuntimePolicyForm, {
     type RuntimePolicyDraft,
   } from "$lib/components/RuntimePolicyForm.svelte";
@@ -418,6 +419,21 @@
     await promptServiceRestart(mcpStatus === "running", "MCP 服务");
   }
 
+  async function saveMcpProxyConfig(config: string) {
+    if (!profile) return;
+    const next: WorkspaceProfile = {
+      ...profile,
+      runtime: {
+        ...profile.runtime,
+        mcp_config: config,
+      },
+    };
+    await updateWorkspace(next);
+    profile = next;
+    await load();
+    await promptServiceRestart(mcpStatus === "running", "MCP 服务");
+  }
+
   async function saveActionsPolicy(draft: ActionsPolicyDraft) {
     if (!profile) return;
     const current = actionsConfig(profile);
@@ -631,6 +647,13 @@
                 workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
                 workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}
                 onSave={saveMcpPolicy}
+              />
+            </div>
+            <div>
+              <p class="tx-section-label">MCP 工具聚合</p>
+              <McpProxyConfigForm
+                config={profile.runtime.mcp_config ?? ""}
+                onSave={saveMcpProxyConfig}
               />
             </div>
           </div>

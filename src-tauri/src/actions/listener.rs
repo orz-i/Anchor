@@ -16,7 +16,8 @@ use tower_http::cors::CorsLayer;
 
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    token_exchange, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    protected_resource_metadata, token_exchange, AuthorizeForm, AuthorizeParams, OAuthRuntime,
+    TokenForm,
 };
 use crate::tools::{self, is_allowed_tool, policy::PolicySettings, wrap_tool_result, ToolContext};
 use crate::tunnel::append_profile_log;
@@ -194,6 +195,10 @@ async fn serve(
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server_metadata),
         )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource_metadata),
+        )
         .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
         .route("/oauth/token", post(oauth_token_post))
         .merge(protected)
@@ -272,6 +277,12 @@ fn resolve_oauth_base(state: &AppState, headers: &HeaderMap) -> String {
     external_base_url(headers, state.bind_port, &state.configured_public_url)
 }
 
+fn resolve_oauth_resource(state: &AppState, headers: &HeaderMap) -> String {
+    resolve_oauth_base(state, headers)
+        .trim_end_matches('/')
+        .to_string()
+}
+
 async fn oauth_authorization_server_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -286,14 +297,36 @@ async fn oauth_authorization_server_metadata(
     .into_response()
 }
 
+async fn oauth_protected_resource_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.auth.oauth_enabled() {
+        return oauth_not_configured();
+    }
+    let authorization_server = resolve_oauth_base(&state, &headers);
+    let resource = resolve_oauth_resource(&state, &headers);
+    Json(protected_resource_metadata(
+        &resource,
+        &authorization_server,
+    ))
+    .into_response()
+}
+
 async fn oauth_authorize_get(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_get(oauth, params, Some(state.workspace_path.as_str()))
+    authorize_get(
+        oauth,
+        params,
+        &resolve_oauth_resource(&state, &headers),
+        Some(state.workspace_path.as_str()),
+    )
 }
 
 async fn oauth_authorize_post(
@@ -304,7 +337,12 @@ async fn oauth_authorize_post(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_post(oauth, form, &resolve_oauth_base(&state, &headers))
+    authorize_post(
+        oauth,
+        form,
+        &resolve_oauth_base(&state, &headers),
+        &resolve_oauth_resource(&state, &headers),
+    )
 }
 
 async fn oauth_token_post(
@@ -324,6 +362,7 @@ async fn oauth_token_post(
         &headers,
         form,
         &resolve_oauth_base(&state, &headers),
+        &resolve_oauth_resource(&state, &headers),
     )
 }
 

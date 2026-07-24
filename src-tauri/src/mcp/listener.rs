@@ -1,8 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Form, Query, State};
-use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
+use axum::http::{
+    header::{ALLOW, CACHE_CONTROL},
+    HeaderMap, HeaderValue, StatusCode,
+};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -15,6 +19,7 @@ use crate::auth::{
     protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
     AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
+use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{handle_request, new_state, SharedState};
 use crate::secret::SecretStore;
 use crate::tools::Workspace;
@@ -23,6 +28,8 @@ use crate::tools::policy::PolicySettings;
 use crate::workspace::{AuthConfig, RuntimeConfig};
 
 pub type ShutdownSender = oneshot::Sender<()>;
+
+const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 struct ListenerState {
@@ -35,6 +42,7 @@ struct ListenerState {
     bearer_token: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
+    proxy_specs: Vec<McpProxyServerSpec>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -50,6 +58,7 @@ pub fn spawn_listener(
     runtime: RuntimeConfig,
 ) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
     let workspace_display = workspace_path.display().to_string();
+    let proxy_specs = parse_mcp_proxy_config(&runtime.mcp_config, &workspace_path)?;
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
     let policy = PolicySettings::from_runtime(&runtime);
     let mcp = new_state(
@@ -98,6 +107,7 @@ pub fn spawn_listener(
         bearer_token,
         oauth,
         oauth_client_secret,
+        proxy_specs,
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
     let listener = bind_listener(port)?;
@@ -126,8 +136,16 @@ async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let profile_id = state.workspace_id.clone();
+    let proxy_registry = state.mcp.mcp_proxies.clone();
+    let proxy_specs = state.proxy_specs.clone();
+    let proxy_profile_id = profile_id.clone();
+    tokio::spawn(async move {
+        proxy_registry
+            .configure(proxy_specs, &proxy_profile_id)
+            .await;
+    });
     let app = Router::new()
-        .route("/mcp", get(mcp_discovery).post(mcp_post))
+        .route("/mcp", get(mcp_get_not_supported).post(mcp_post))
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server_metadata),
@@ -165,20 +183,30 @@ fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
         .map_err(|err| format!("MCP 本地监听器初始化失败: {err}"))
 }
 
-async fn mcp_discovery() -> Response {
-    ([(CACHE_CONTROL, "no-store")], Json(mcp_discovery_payload())).into_response()
-}
-
-fn mcp_discovery_payload() -> Value {
-    json!({
-        "name": "coding-tools-mcp",
-        "version": env!("CARGO_PKG_VERSION"),
-        "protocolVersion": "2025-06-18"
-    })
+async fn mcp_get_not_supported() -> Response {
+    let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+    response
+        .headers_mut()
+        .insert(ALLOW, HeaderValue::from_static("POST"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn resolve_oauth_base(state: &ListenerState, headers: &HeaderMap) -> String {
     external_base_url(headers, state.bind_port, &state.configured_public_url)
+}
+
+fn resolve_oauth_resource(state: &ListenerState, headers: &HeaderMap) -> String {
+    format!("{}/mcp", resolve_oauth_base(state, headers).trim_end_matches('/'))
+}
+
+fn resolve_oauth_resource_metadata(state: &ListenerState, headers: &HeaderMap) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource",
+        resolve_oauth_base(state, headers).trim_end_matches('/')
+    )
 }
 
 async fn mcp_post(
@@ -210,74 +238,83 @@ async fn mcp_post(
         ),
     );
 
-    let mcp = state.mcp.clone();
-    let profile_id = state.workspace_id.clone();
-    let result = tokio::task::spawn_blocking(move || handle_request(&mcp, &body)).await;
-    match result {
-        Ok(response) => {
-            append_profile_log(
-                &profile_id,
-                "mcp-requests.log",
-                &format!("[rpc] completed id={} method={} tool={}", request_id, method, tool_name),
-            );
-            if tool_name == "exec_command" || tool_name == "exec_health_check" {
-                let structured = response
-                    .get("result")
-                    .and_then(|result| result.get("structuredContent"));
-                let status = structured
-                    .and_then(|value| value.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let termination_reason = structured
-                    .and_then(|value| value.get("termination_reason"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let exit_code = structured
-                    .and_then(|value| value.get("exit_code"))
-                    .map(Value::to_string)
-                    .unwrap_or_default();
-                let is_error = response
-                    .get("result")
-                    .and_then(|result| result.get("isError"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                append_profile_log(
-                    &profile_id,
-                    "mcp-requests.log",
-                    &format!(
-                        "[exec] id={} tool={} is_error={} status={} termination_reason={} exit_code={}",
-                        request_id, tool_name, is_error, status, termination_reason, exit_code
-                    ),
-                );
-            }
-            Json(response).into_response()
-        }
-        Err(error) => {
-            append_profile_log(
-                &profile_id,
-                "mcp-requests.log",
-                &format!(
-                    "[rpc] worker_failed id={} method={} tool={} error={error}",
-                    request_id, method, tool_name
-                ),
-            );
-            Json(json!({
+    if request_id.is_null() && method.starts_with("notifications/") {
+        append_profile_log(
+            &state.workspace_id,
+            "mcp-requests.log",
+            &format!(
+                "[rpc] accepted_notification method={} duration_ms=0",
+                method
+            ),
+        );
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    let started = Instant::now();
+    let (response, outcome) = match tokio::time::timeout(
+        MCP_REQUEST_TIMEOUT,
+        handle_request(&state.mcp, &body),
+    )
+    .await
+    {
+        Ok(response) => (response, "ok"),
+        Err(_) => (
+            json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "error": {
-                    "code": -32603,
-                    "message": "Exec RPC worker failed",
+                    "code": -32001,
+                    "message": "MCP request timed out",
                     "data": {
-                        "stage": "rpc_worker",
-                        "reason": "worker_failed",
-                        "retryable": true,
-                        "suggestion": "重试请求或重启 MCP 运行时"
+                        "reason": "request_timeout",
+                        "timeout_seconds": MCP_REQUEST_TIMEOUT.as_secs(),
+                        "retryable": true
                     }
                 }
-            }))
-            .into_response()
-        }
+            }),
+            "timeout",
+        ),
+    };
+    let duration_ms = started.elapsed().as_millis();
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-requests.log",
+        &format!(
+            "[rpc] completed id={} method={} tool={} outcome={} duration_ms={}",
+            request_id, method, tool_name, outcome, duration_ms
+        ),
+    );
+    if tool_name == "exec_command" || tool_name == "exec_health_check" {
+        let structured = response
+            .get("result")
+            .and_then(|result| result.get("structuredContent"));
+        let status = structured
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let termination_reason = structured
+            .and_then(|value| value.get("termination_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let exit_code = structured
+            .and_then(|value| value.get("exit_code"))
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let is_error = response
+            .get("result")
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        append_profile_log(
+            &state.workspace_id,
+            "mcp-requests.log",
+            &format!(
+                "[exec] id={} tool={} is_error={} status={} termination_reason={} exit_code={}",
+                request_id, tool_name, is_error, status, termination_reason, exit_code
+            ),
+        );
     }
+    Json(response).into_response()
 }
 
 fn require_mcp_auth(state: &ListenerState, headers: &HeaderMap) -> Option<Response> {
@@ -287,8 +324,16 @@ fn require_mcp_auth(state: &ListenerState, headers: &HeaderMap) -> Option<Respon
     }
     if state.auth.oauth_enabled() {
         if let Some(oauth) = state.oauth.as_ref() {
-            let server_url = resolve_oauth_base(state, headers);
-            return verify_oauth_bearer_header(headers, oauth, &server_url);
+            let issuer_url = resolve_oauth_base(state, headers);
+            let resource_url = resolve_oauth_resource(state, headers);
+            let resource_metadata_url = resolve_oauth_resource_metadata(state, headers);
+            return verify_oauth_bearer_header(
+                headers,
+                oauth,
+                &issuer_url,
+                &resource_url,
+                &resource_metadata_url,
+            );
         }
     }
     None
@@ -316,11 +361,18 @@ async fn oauth_protected_resource_metadata(
     if !state.auth.oauth_enabled() {
         return oauth_not_configured();
     }
-    Json(protected_resource_metadata(&resolve_oauth_base(&state, &headers))).into_response()
+    let authorization_server = resolve_oauth_base(&state, &headers);
+    let resource = resolve_oauth_resource(&state, &headers);
+    Json(protected_resource_metadata(
+        &resource,
+        &authorization_server,
+    ))
+    .into_response()
 }
 
 async fn oauth_authorize_get(
     State(state): State<ListenerState>,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     let Some(oauth) = state.oauth.as_ref() else {
@@ -329,6 +381,7 @@ async fn oauth_authorize_get(
     authorize_get(
         oauth,
         params,
+        &resolve_oauth_resource(&state, &headers),
         Some(state.workspace_path.as_str()),
     )
 }
@@ -341,7 +394,12 @@ async fn oauth_authorize_post(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_post(oauth, form, &resolve_oauth_base(&state, &headers))
+    authorize_post(
+        oauth,
+        form,
+        &resolve_oauth_base(&state, &headers),
+        &resolve_oauth_resource(&state, &headers),
+    )
 }
 
 async fn oauth_token_post(
@@ -361,6 +419,7 @@ async fn oauth_token_post(
         &headers,
         form,
         &resolve_oauth_base(&state, &headers),
+        &resolve_oauth_resource(&state, &headers),
     )
 }
 
@@ -374,10 +433,13 @@ fn oauth_not_configured() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::CACHE_CONTROL;
+    use axum::http::{
+        header::{ALLOW, CACHE_CONTROL},
+        StatusCode,
+    };
     use axum::response::IntoResponse;
 
-    use super::{bind_listener, mcp_discovery, mcp_discovery_payload};
+    use super::{bind_listener, mcp_get_not_supported};
 
     #[test]
     fn bind_listener_reports_port_conflict_synchronously() {
@@ -388,16 +450,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_reports_the_current_package_version() {
-        let discovery = mcp_discovery_payload();
+    async fn unsupported_get_returns_405_and_prevents_caching() {
+        let response = mcp_get_not_supported().await.into_response();
 
-        assert_eq!(discovery["version"], env!("CARGO_PKG_VERSION"));
-    }
-
-    #[tokio::test]
-    async fn discovery_prevents_stale_tool_catalog_caching() {
-        let response = mcp_discovery().await.into_response();
-
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[ALLOW], "POST");
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
     }
 }

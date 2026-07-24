@@ -1,0 +1,635 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
+
+use crate::tunnel::append_profile_log;
+
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const MAX_TOOL_LIST_PAGES: usize = 100;
+
+#[derive(Debug, Clone)]
+pub struct McpProxyServerSpec {
+    pub name: String,
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: PathBuf,
+    tool_prefix: String,
+    request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawMcpServerConfig {
+    #[serde(rename = "type", default)]
+    transport_type: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(rename = "toolPrefix", default)]
+    tool_prefix: Option<String>,
+    #[serde(rename = "requestTimeoutSeconds", default)]
+    request_timeout_seconds: Option<u64>,
+}
+
+#[derive(Clone)]
+struct ProxyRoute {
+    client: Arc<McpProxyClient>,
+    server_name: String,
+    downstream_name: String,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    tools: Vec<Value>,
+    routes: HashMap<String, ProxyRoute>,
+}
+
+#[derive(Clone, Default)]
+pub struct McpProxyRegistry {
+    state: Arc<RwLock<RegistryState>>,
+}
+
+struct McpProxyClient {
+    server_name: String,
+    request_timeout: Duration,
+    connection: Mutex<ProxyConnection>,
+}
+
+struct ProxyConnection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl McpProxyRegistry {
+    pub fn list_tools(&self) -> Vec<Value> {
+        self.state.read().expect("mcp proxy registry read").tools.clone()
+    }
+
+    pub async fn configure(
+        &self,
+        specs: Vec<McpProxyServerSpec>,
+        workspace_id: &str,
+    ) {
+        *self.state.write().expect("mcp proxy registry write") = RegistryState::default();
+        let mut tasks = JoinSet::new();
+        for spec in specs {
+            let server_name = spec.name.clone();
+            let workspace_id = workspace_id.to_string();
+            tasks.spawn(async move {
+                let result = McpProxyClient::connect(spec, &workspace_id).await;
+                (server_name, workspace_id, result)
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((server_name, workspace_id, result)) = joined else {
+                append_profile_log(
+                    workspace_id,
+                    "stderr.log",
+                    "[mcp-proxy] initialization task failed",
+                );
+                continue;
+            };
+            match result {
+                Ok((client, catalog)) => {
+                    let mut added = 0usize;
+                    let mut skipped_duplicates = Vec::new();
+                    let mut state = self.state.write().expect("mcp proxy registry write");
+                    for tool in catalog {
+                        if !tool.is_object() {
+                            continue;
+                        }
+                        let Some(downstream_name) = tool
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                        else {
+                            continue;
+                        };
+                        let public_name = format!(
+                            "{}__{}",
+                            sanitize_tool_segment(&client.server_name),
+                            sanitize_tool_segment(&downstream_name)
+                        );
+                        if state.routes.contains_key(&public_name) {
+                            skipped_duplicates.push(public_name);
+                            continue;
+                        }
+
+                        let mut merged = tool;
+                        merged["name"] = Value::String(public_name.clone());
+                        let description = merged
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        merged["description"] = Value::String(if description.is_empty() {
+                            format!("Proxied from MCP server {server_name}")
+                        } else {
+                            format!("[{server_name}] {description}")
+                        });
+                        if merged.get("title").is_none() {
+                            merged["title"] = Value::String(format!(
+                                "{} · {}",
+                                server_name,
+                                downstream_name
+                            ));
+                        }
+
+                        state.routes.insert(
+                            public_name,
+                            ProxyRoute {
+                                client: client.clone(),
+                                server_name: server_name.clone(),
+                                downstream_name,
+                            },
+                        );
+                        state.tools.push(merged);
+                        added += 1;
+                    }
+                    drop(state);
+                    for public_name in skipped_duplicates {
+                        append_profile_log(
+                            &workspace_id,
+                            "stderr.log",
+                            &format!(
+                                "[mcp-proxy:{server_name}] skipped duplicate merged tool {public_name}"
+                            ),
+                        );
+                    }
+                    append_profile_log(
+                        &workspace_id,
+                        "stdout.log",
+                        &format!(
+                            "[mcp-proxy:{server_name}] connected; merged {added} tools"
+                        ),
+                    );
+                }
+                Err(error) => append_profile_log(
+                    &workspace_id,
+                    "stderr.log",
+                    &format!("[mcp-proxy:{server_name}] unavailable: {error}"),
+                ),
+            }
+        }
+    }
+
+    pub async fn call_tool(&self, public_name: &str, arguments: &Value) -> Option<Result<Value, Value>> {
+        let route = self
+            .state
+            .read()
+            .expect("mcp proxy registry read")
+            .routes
+            .get(public_name)
+            .cloned()?;
+
+        let client = route.client.clone();
+        let server_name = route.server_name.clone();
+        let result = client
+            .request(
+                "tools/call",
+                json!({
+                    "name": route.downstream_name,
+                    "arguments": arguments
+                }),
+            )
+            .await;
+        if result.is_err() {
+            self.invalidate_client(&client);
+        }
+
+        Some(result.map_err(|message| {
+            json!({
+                "code": -32603,
+                "message": format!(
+                    "Proxied MCP tool failed: {} / {}",
+                    server_name, public_name
+                ),
+                "data": {
+                    "reason": "proxy_call_failed",
+                    "server": server_name,
+                    "tool": public_name,
+                    "detail": message
+                }
+            })
+        }))
+    }
+
+    fn invalidate_client(&self, client: &Arc<McpProxyClient>) {
+        let mut state = self.state.write().expect("mcp proxy registry write");
+        let removed: HashSet<String> = state
+            .routes
+            .iter()
+            .filter(|(_, route)| Arc::ptr_eq(&route.client, client))
+            .map(|(name, _)| name.clone())
+            .collect();
+        state.routes.retain(|name, _| !removed.contains(name));
+        state.tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|name| !removed.contains(name))
+                .unwrap_or(true)
+        });
+    }
+}
+
+impl McpProxyClient {
+    async fn connect(
+        spec: McpProxyServerSpec,
+        workspace_id: &str,
+    ) -> Result<(Arc<Self>, Vec<Value>), String> {
+        let mut command = Command::new(&spec.command);
+        command
+            .args(&spec.args)
+            .envs(&spec.env)
+            .current_dir(&spec.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "failed to start `{}` in `{}`: {error}",
+                spec.command,
+                spec.cwd.display()
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "downstream MCP stdin is unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "downstream MCP stdout is unavailable".to_string())?;
+
+        if let Some(stderr) = child.stderr.take() {
+            let server_name = spec.name.clone();
+            let workspace_id = workspace_id.to_string();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    append_profile_log(
+                        &workspace_id,
+                        "stderr.log",
+                        &format!("[mcp-proxy:{server_name}] {line}"),
+                    );
+                }
+            });
+        }
+
+        let client = Arc::new(Self {
+            server_name: spec.tool_prefix,
+            request_timeout: spec.request_timeout,
+            connection: Mutex::new(ProxyConnection {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+            }),
+        });
+
+        client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "coding-tools-mcp-proxy",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await?;
+        client.notify("notifications/initialized", json!({})).await?;
+        let tools = client.list_tools().await?;
+        Ok((client, tools))
+    }
+
+    async fn list_tools(&self) -> Result<Vec<Value>, String> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..MAX_TOOL_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|value| json!({ "cursor": value }))
+                .unwrap_or_else(|| json!({}));
+            let result = self.request("tools/list", params).await?;
+            if let Some(page) = result.get("tools").and_then(Value::as_array) {
+                tools.extend(page.iter().cloned());
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                return Ok(tools);
+            }
+        }
+
+        Err("downstream MCP returned too many tools/list pages".to_string())
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        let result = timeout(self.request_timeout, async {
+            let mut connection = self.connection.lock().await;
+            let id = connection.next_id;
+            connection.next_id += 1;
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            });
+            request_over_stdio(&mut connection, id, &request).await
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Ok(mut connection) = self.connection.try_lock() {
+                    let _ = connection.child.kill().await;
+                    let _ = connection.child.wait().await;
+                }
+                Err(format!(
+                    "request `{method}` timed out after {} seconds including queue wait",
+                    self.request_timeout.as_secs()
+                ))
+            }
+        }
+    }
+
+    async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        timeout(self.request_timeout, async {
+            let mut connection = self.connection.lock().await;
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params
+            });
+            let encoded = serde_json::to_vec(&notification)
+                .map_err(|error| format!("failed to encode downstream notification: {error}"))?;
+            connection
+                .stdin
+                .write_all(&encoded)
+                .await
+                .map_err(|error| format!("failed to write downstream notification: {error}"))?;
+            connection
+                .stdin
+                .write_all(b"\n")
+                .await
+                .map_err(|error| format!("failed to terminate downstream notification: {error}"))?;
+            connection
+                .stdin
+                .flush()
+                .await
+                .map_err(|error| format!("failed to flush downstream notification: {error}"))
+        })
+        .await
+        .map_err(|_| format!("notification `{method}` timed out including queue wait"))?
+    }
+}
+
+async fn request_over_stdio(
+    connection: &mut ProxyConnection,
+    id: u64,
+    request: &Value,
+) -> Result<Value, String> {
+    let encoded = serde_json::to_vec(request)
+        .map_err(|error| format!("failed to encode downstream request: {error}"))?;
+    connection
+        .stdin
+        .write_all(&encoded)
+        .await
+        .map_err(|error| format!("failed to write downstream request: {error}"))?;
+    connection
+        .stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|error| format!("failed to terminate downstream request: {error}"))?;
+    connection
+        .stdin
+        .flush()
+        .await
+        .map_err(|error| format!("failed to flush downstream request: {error}"))?;
+
+    loop {
+        let mut line = String::new();
+        let bytes = connection
+            .stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|error| format!("failed to read downstream response: {error}"))?;
+        if bytes == 0 {
+            return Err("downstream MCP closed stdout".to_string());
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if message.get("method").and_then(Value::as_str).is_some() {
+            if let Some(server_request_id) = message.get("id").cloned() {
+                let rejection = json!({
+                    "jsonrpc": "2.0",
+                    "id": server_request_id,
+                    "error": {
+                        "code": -32601,
+                        "message": "Downstream server requests are not supported by this proxy"
+                    }
+                });
+                let encoded = serde_json::to_vec(&rejection)
+                    .map_err(|error| format!("failed to encode downstream rejection: {error}"))?;
+                connection
+                    .stdin
+                    .write_all(&encoded)
+                    .await
+                    .map_err(|error| format!("failed to reject downstream request: {error}"))?;
+                connection
+                    .stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|error| format!("failed to terminate downstream rejection: {error}"))?;
+                connection
+                    .stdin
+                    .flush()
+                    .await
+                    .map_err(|error| format!("failed to flush downstream rejection: {error}"))?;
+            }
+            continue;
+        }
+        if message.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            return Err(error.to_string());
+        }
+        return message
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "downstream response is missing result".to_string());
+    }
+}
+
+pub fn parse_mcp_proxy_config(
+    raw: &str,
+    workspace_path: &Path,
+) -> Result<Vec<McpProxyServerSpec>, String> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("MCP 聚合配置不是有效 JSON: {error}"))?;
+    let servers_value = value
+        .get("mcpServers")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    let servers: BTreeMap<String, RawMcpServerConfig> = serde_json::from_value(servers_value)
+        .map_err(|error| format!("MCP 聚合配置的 mcpServers 无效: {error}"))?;
+
+    let mut specs = Vec::new();
+    for (name, config) in servers {
+        if config.disabled {
+            continue;
+        }
+        if !config.transport_type.is_empty() && config.transport_type != "stdio" {
+            return Err(format!(
+                "MCP server `{name}` uses unsupported transport `{}`; only stdio is supported",
+                config.transport_type
+            ));
+        }
+        if config.command.trim().is_empty() {
+            return Err(format!("MCP server `{name}` is missing command"));
+        }
+
+        let workspace_display = workspace_path.display().to_string();
+        let command = expand_workspace_placeholders(&config.command, &workspace_display);
+        let args = config
+            .args
+            .into_iter()
+            .map(|arg| expand_workspace_placeholders(&arg, &workspace_display))
+            .collect();
+        let env = config
+            .env
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key,
+                    expand_workspace_placeholders(&value, &workspace_display),
+                )
+            })
+            .collect();
+        let cwd = config
+            .cwd
+            .map(|cwd| expand_workspace_placeholders(&cwd, &workspace_display))
+            .map(PathBuf::from)
+            .map(|cwd| if cwd.is_absolute() { cwd } else { workspace_path.join(cwd) })
+            .unwrap_or_else(|| workspace_path.to_path_buf());
+        let tool_prefix = sanitize_tool_segment(
+            config.tool_prefix.as_deref().unwrap_or(name.as_str()),
+        );
+
+        specs.push(McpProxyServerSpec {
+            name,
+            command,
+            args,
+            env,
+            cwd,
+            tool_prefix,
+            request_timeout: Duration::from_secs(
+                config
+                    .request_timeout_seconds
+                    .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECONDS)
+                    .clamp(1, 600),
+            ),
+        });
+    }
+    Ok(specs)
+}
+
+fn expand_workspace_placeholders(value: &str, workspace_path: &str) -> String {
+    value
+        .replace("${workspaceFolder}", workspace_path)
+        .replace("${workspaceRoot}", workspace_path)
+        .replace("${workspace}", workspace_path)
+}
+
+fn sanitize_tool_segment(value: &str) -> String {
+    let normalized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = normalized.trim_matches('_');
+    if trimmed.is_empty() {
+        "mcp".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::parse_mcp_proxy_config;
+
+    #[test]
+    fn parses_standard_mcp_servers_and_expands_workspace_folder() {
+        let specs = parse_mcp_proxy_config(
+            r#"{
+                "mcpServers": {
+                    "code graph": {
+                        "type": "stdio",
+                        "command": "codegraph",
+                        "args": ["serve", "--path", "${workspaceFolder}"]
+                    }
+                }
+            }"#,
+            Path::new("/tmp/example"),
+        )
+        .expect("parse proxy config");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "code graph");
+        assert_eq!(specs[0].tool_prefix, "code_graph");
+        assert_eq!(specs[0].args[2], "/tmp/example");
+    }
+
+    #[test]
+    fn rejects_non_stdio_transports() {
+        let error = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"remote":{"type":"sse","command":"noop"}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("reject unsupported transport");
+
+        assert!(error.contains("only stdio is supported"));
+    }
+}

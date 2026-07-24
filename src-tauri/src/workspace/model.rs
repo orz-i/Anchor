@@ -55,6 +55,9 @@ pub struct RuntimeConfig {
     pub permission_mode: String,
     #[serde(default)]
     pub runtime_command: String,
+    /// Optional JSON configuration containing stdio MCP servers to merge into this service.
+    #[serde(default)]
+    pub mcp_config: String,
     /// Workspace execution policy shared by MCP clients.
     #[serde(default = "default_allowed_commands")]
     pub allowed_commands: String,
@@ -214,6 +217,7 @@ impl Default for RuntimeConfig {
             tool_profile: default_tool_profile(),
             permission_mode: default_permission_mode(),
             runtime_command: String::new(),
+            mcp_config: String::new(),
             allowed_commands: default_allowed_commands(),
             workspace_local_entries: default_workspace_local_entries(),
             workspace_script_extensions: default_workspace_script_extensions(),
