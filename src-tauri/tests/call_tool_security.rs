@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::path::Path;
 
 use common::*;
 use serde_json::json;
@@ -20,6 +21,60 @@ fn read_file_rejects_symlink_escape() {
     let out = invoke(&ctx, "read_file", json!({"path": "outside-link.txt"}));
     if fx.root.join("outside-link.txt").exists() {
         assert_security_or_policy_err(&out);
+    }
+}
+
+#[test]
+fn exec_command_rejects_workspace_external_directory_link() {
+    let fx = tiny_js_fixture();
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    fs::write(outside.path().join("external.txt"), "external workspace data")
+        .expect("outside file");
+    let link = fx.root.join("external-workspace");
+    if !create_directory_link(&link, outside.path()) {
+        eprintln!("skip directory link test: platform did not allow link creation");
+        return;
+    }
+
+    let ctx = ctx_for(&fx.root);
+    let environment = invoke(&ctx, "check_exec_environment", json!({}));
+    let environment = assert_ok(&environment);
+    assert_eq!(environment["workspace_exec_available"], false);
+    assert_eq!(environment["workspace_link_guard"]["safe"], false);
+
+    let out = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": "python -c \"print('must not run')\"",
+            "workdir": "."
+        }),
+    );
+    let error = assert_err(&out);
+    assert_eq!(error["error"]["code"], "WORKSPACE_LINK_ESCAPE");
+    assert_eq!(
+        error["error"]["details"]["link_path"],
+        "external-workspace"
+    );
+}
+
+fn create_directory_link(link: &Path, target: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return true;
+        }
+        std::process::Command::new("cmd.exe")
+            .args(["/d", "/s", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }
 

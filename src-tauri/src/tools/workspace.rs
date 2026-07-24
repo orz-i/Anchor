@@ -1,4 +1,8 @@
+use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -24,6 +28,21 @@ pub struct ResolvedPath {
     pub display: String,
     pub path: PathBuf,
     pub existed: bool,
+}
+
+fn is_link_like(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -193,6 +212,55 @@ impl Workspace {
 
     pub fn resolve_existing(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
         self.resolve_existing_at(&self.root, raw_path)
+    }
+
+    /// Child processes are policy-limited rather than OS-sandboxed. A top-level
+    /// symlink or Windows junction that resolves outside the workspace would let
+    /// an interpreter reach another workspace through an otherwise relative path.
+    /// Reject process execution until the unsafe link is removed.
+    pub fn ensure_child_process_boundary(&self) -> WorkspaceResult<()> {
+        let entries = fs::read_dir(&self.root).map_err(|error| WorkspaceError::ToolDetails {
+            code: "WORKSPACE_SCAN_FAILED",
+            message: format!("Failed to inspect workspace boundary: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "stage": "workspace_boundary_scan",
+                "retryable": true
+            }),
+        })?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_link_like(&path) {
+                continue;
+            }
+            let resolved = match path.canonicalize() {
+                Ok(resolved) => resolved,
+                Err(_) => continue,
+            };
+            if resolved.starts_with(&self.root) {
+                continue;
+            }
+            let link_name = entry.file_name().to_string_lossy().into_owned();
+            return Err(WorkspaceError::ToolDetails {
+                code: "WORKSPACE_LINK_ESCAPE",
+                message: format!(
+                    "Workspace contains an external directory link: {link_name}. Remove the symlink/junction before running child processes."
+                ),
+                category: "security",
+                retryable: false,
+                details: json!({
+                    "stage": "workspace_boundary_scan",
+                    "reason": "external_workspace_link",
+                    "link_path": link_name,
+                    "sandbox_enforced": false,
+                    "recoverable": true,
+                    "suggestion": "Remove the workspace-local symlink/junction; do not delete its target directory"
+                }),
+            });
+        }
+        Ok(())
     }
 
     /// 解析只读路径。显式的绝对路径和 `..` 路径允许指向 Workspace 外部，

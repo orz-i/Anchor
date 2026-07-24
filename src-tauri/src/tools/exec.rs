@@ -67,6 +67,8 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
     let stdin_text = args.get("stdin").and_then(Value::as_str).unwrap_or("");
 
+    ctx.workspace.ensure_child_process_boundary()?;
+
     let result = crate::async_runtime::block_on(async {
         run_command(
             ctx,

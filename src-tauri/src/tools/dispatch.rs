@@ -407,6 +407,14 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
 }
 
 pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    let boundary_error = ctx.workspace.ensure_child_process_boundary().err();
+    let workspace_exec_available = boundary_error.is_none();
+    let mut warnings = vec![
+        "Workspace 子进程尚未启用操作系统级文件系统沙箱".to_string(),
+    ];
+    if let Some(error) = &boundary_error {
+        warnings.push(error.message());
+    }
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
@@ -419,9 +427,14 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
             "host_scope_available": false
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
-        "workspace_exec_available": true,
+        "workspace_exec_available": workspace_exec_available,
         "workspace_exec_sandbox_enforced": false,
         "workspace_exec_boundary": "policy_only",
+        "workspace_link_guard": {
+            "safe": workspace_exec_available,
+            "scope": "top_level_reparse_points",
+            "message": boundary_error.as_ref().map(WorkspaceError::message).unwrap_or_default()
+        },
         "system_command_allowlist": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "workspace_local_entries": {
             "enabled": ctx.policy.workspace_local_entries,
@@ -430,7 +443,7 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         },
         // Backward-compatible alias for older MCP clients.
         "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
-        "warnings": ["Workspace 子进程当前允许执行，但尚未启用操作系统级文件系统沙箱"]
+        "warnings": warnings
     })))
 }
 
