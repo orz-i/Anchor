@@ -283,6 +283,18 @@ cd src-tauri && cargo clippy --all-targets -- -D warnings
 
 Windows 也可以双击 `dev-desktop.cmd`。不要只用 `npm run dev` 验证桌面应用，它只启动 Vite，不会启动 Tauri 外壳。
 
+### Linux 无界面 CLI
+
+Linux 服务器可以构建不含桌面壳的 `coding-tools-mcp`，直接读取桌面端相同的 workspace/profile 配置，并以前台模式运行 MCP 或 Actions：
+
+```bash
+pnpm cli:build
+./src-tauri/target/release/coding-tools-mcp list
+./src-tauri/target/release/coding-tools-mcp serve <workspace> --service mcp
+```
+
+CLI 不会接管已被 GUI 占用的端口。后台运行建议交给 systemd，完整说明见 [Linux CLI 使用指南](docs/linux-cli.md)。
+
 ## 项目结构
 
 | 路径 | 作用 |

@@ -275,6 +275,18 @@ cd src-tauri && cargo clippy --all-targets -- -D warnings
 
 On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone to validate the desktop application; it starts Vite without the Tauri shell.
 
+### Headless Linux CLI
+
+Linux servers can build `coding-tools-mcp` without the Tauri desktop feature. It reads the same one-workspace/one-profile configuration as the GUI and runs MCP or Actions in the foreground:
+
+```bash
+pnpm cli:build
+./src-tauri/target/release/coding-tools-mcp list
+./src-tauri/target/release/coding-tools-mcp serve <workspace> --service mcp
+```
+
+The CLI will not take over a port already used by the GUI. Use systemd for background supervision; see the [Linux CLI guide](docs/linux-cli.md).
+
 ## Project layout
 
 | Path | Purpose |
