@@ -147,7 +147,7 @@ pub fn authorization_server_metadata(base_url: &str, client_secret: Option<&str>
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": methods,
         "scopes_supported": ["mcp"],
@@ -182,6 +182,10 @@ mod tests {
     #[test]
     fn authorization_metadata_includes_token_auth_methods() {
         let meta = authorization_server_metadata("https://example.com", None);
+        assert_eq!(
+            meta["grant_types_supported"],
+            json!(["authorization_code", "refresh_token"])
+        );
         assert_eq!(
             meta["token_endpoint_auth_methods_supported"],
             json!(["none"])

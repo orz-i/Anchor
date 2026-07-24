@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{
-    header::{AUTHORIZATION, WWW_AUTHENTICATE},
+    header::{AUTHORIZATION, CACHE_CONTROL, PRAGMA, WWW_AUTHENTICATE},
     HeaderMap, HeaderValue, StatusCode,
 };
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use super::bearer::constant_time_eq_str;
 
 pub const OAUTH_CODE_TTL_SECONDS: u64 = 300;
-pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
+pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60;
+pub const OAUTH_REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 90;
 #[allow(dead_code)]
 pub const OAUTH_MAX_BODY_BYTES: usize = 8_192;
 
@@ -27,6 +28,46 @@ pub struct OAuthRuntime {
     pub password: String,
     pub token_secret: String,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
+    used_refresh_tokens: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+fn decode_refresh_token(
+    token: &str,
+    token_secret: &str,
+    issuer_url: &str,
+    resource_url: &str,
+) -> Result<TokenClaims, &'static str> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_audience(&[resource_url]);
+    validation.set_issuer(&[issuer_url]);
+    let decoded = decode::<TokenClaims>(
+        token,
+        &DecodingKey::from_secret(token_secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|_| "refresh token is invalid or expired")?;
+    if decoded.claims.token_kind != "refresh" {
+        return Err("token is not a refresh token");
+    }
+    Ok(decoded.claims)
+}
+
+fn token_success(tokens: TokenPair) -> Response {
+    token_json_response(
+        StatusCode::OK,
+        json!({
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "token_type": "Bearer",
+            "expires_in": OAUTH_TOKEN_TTL_SECONDS,
+            "refresh_token_expires_in": OAUTH_REFRESH_TOKEN_TTL_SECONDS,
+            "scope": "mcp"
+        }),
+    )
+}
+
+fn default_access_token_kind() -> String {
+    "access".into()
 }
 
 fn resource_matches(requested: &str, canonical: &str) -> bool {
@@ -54,6 +95,12 @@ struct TokenClaims {
     iat: i64,
     exp: i64,
     scope: String,
+    #[serde(default = "default_access_token_kind")]
+    token_kind: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    jti: String,
 }
 
 impl OAuthRuntime {
@@ -70,6 +117,7 @@ impl OAuthRuntime {
             password,
             token_secret,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            used_refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -99,7 +147,8 @@ impl OAuthRuntime {
             &DecodingKey::from_secret(self.token_secret.as_bytes()),
             &validation,
         )
-        .is_ok()
+        .map(|decoded| decoded.claims.token_kind == "access")
+        .unwrap_or(false)
     }
 }
 
@@ -193,14 +242,22 @@ pub struct AuthorizeForm {
 #[derive(Debug, Deserialize, Default)]
 pub struct TokenForm {
     pub grant_type: String,
+    #[serde(default)]
     pub code: String,
+    #[serde(default)]
     pub redirect_uri: String,
+    #[serde(default)]
     pub code_verifier: String,
+    #[serde(default)]
     pub client_id: String,
     #[serde(default)]
     pub client_secret: String,
     #[serde(default)]
     pub resource: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub scope: String,
 }
 
 pub fn authorize_get(
@@ -337,10 +394,6 @@ pub fn token_exchange(
     issuer_url: &str,
     canonical_resource_url: &str,
 ) -> Response {
-    if form.grant_type != "authorization_code" {
-        return token_error("unsupported_grant_type", "Only authorization_code is supported");
-    }
-
     if let Some((id, secret)) = basic_auth_credentials(headers) {
         if form.client_id.is_empty() {
             form.client_id = id;
@@ -358,6 +411,32 @@ pub fn token_exchange(
             return token_error("invalid_client", "Invalid client_secret");
         }
     }
+    match form.grant_type.as_str() {
+        "authorization_code" => exchange_authorization_code(
+            oauth,
+            form,
+            issuer_url,
+            canonical_resource_url,
+        ),
+        "refresh_token" => refresh_access_token(
+            oauth,
+            form,
+            issuer_url,
+            canonical_resource_url,
+        ),
+        _ => token_error(
+            "unsupported_grant_type",
+            "Supported grant types are authorization_code and refresh_token",
+        ),
+    }
+}
+
+fn exchange_authorization_code(
+    oauth: &OAuthRuntime,
+    form: TokenForm,
+    issuer_url: &str,
+    canonical_resource_url: &str,
+) -> Response {
     if form.code.is_empty() {
         return token_error("invalid_grant", "code is required");
     }
@@ -395,30 +474,114 @@ pub fn token_exchange(
     } else {
         code_data.issuer_url.trim_end_matches('/').to_string()
     };
-    match create_access_token(
+    match create_token_pair(
         &issuer,
         &code_data.resource_url,
         &oauth.token_secret,
-        OAUTH_TOKEN_TTL_SECONDS,
+        &form.client_id,
     ) {
-        Ok(access_token) => (
-            StatusCode::OK,
-            axum::Json(json!({
-                "access_token": access_token,
-                "token_type": "Bearer",
-                "expires_in": OAUTH_TOKEN_TTL_SECONDS,
-                "scope": "mcp"
-            })),
-        )
-            .into_response(),
+        Ok(tokens) => token_success(tokens),
         Err(_) => token_error("server_error", "Failed to issue access token"),
     }
 }
 
-fn create_access_token(
+fn refresh_access_token(
+    oauth: &OAuthRuntime,
+    form: TokenForm,
+    issuer_url: &str,
+    canonical_resource_url: &str,
+) -> Response {
+    if form.refresh_token.trim().is_empty() {
+        return token_error("invalid_grant", "refresh_token is required");
+    }
+    let issuer = issuer_url.trim_end_matches('/');
+    let resource = canonical_resource_url.trim_end_matches('/');
+    let claims = match decode_refresh_token(
+        &form.refresh_token,
+        &oauth.token_secret,
+        issuer,
+        resource,
+    ) {
+        Ok(claims) => claims,
+        Err(message) => return token_error("invalid_grant", message),
+    };
+    if !claims.client_id.is_empty()
+        && !constant_time_eq_str(&claims.client_id, &form.client_id)
+    {
+        return token_error("invalid_grant", "refresh token client_id mismatch");
+    }
+    if !resource_matches(&form.resource, resource) {
+        return token_error("invalid_target", "resource mismatch");
+    }
+    if !form.scope.trim().is_empty() && form.scope.trim() != claims.scope {
+        return token_error("invalid_scope", "refresh scope cannot be expanded");
+    }
+
+    let tokens = match create_token_pair(
+        issuer,
+        resource,
+        &oauth.token_secret,
+        &form.client_id,
+    ) {
+        Ok(tokens) => tokens,
+        Err(_) => return token_error("server_error", "Failed to rotate refresh token"),
+    };
+
+    let now = unix_now();
+    let mut used = oauth
+        .used_refresh_tokens
+        .lock()
+        .expect("oauth refresh token lock");
+    used.retain(|_, expires_at| *expires_at >= now);
+    if claims.jti.is_empty() || used.contains_key(&claims.jti) {
+        return token_error(
+            "invalid_grant",
+            "refresh token was already used; re-authorization is required",
+        );
+    }
+    used.insert(claims.jti, claims.exp.max(0) as u64);
+    drop(used);
+
+    token_success(tokens)
+}
+
+struct TokenPair {
+    access_token: String,
+    refresh_token: String,
+}
+
+fn create_token_pair(
     issuer_url: &str,
     resource_url: &str,
     token_secret: &str,
+    client_id: &str,
+) -> Result<TokenPair, ()> {
+    Ok(TokenPair {
+        access_token: create_token(
+            issuer_url,
+            resource_url,
+            token_secret,
+            client_id,
+            "access",
+            OAUTH_TOKEN_TTL_SECONDS,
+        )?,
+        refresh_token: create_token(
+            issuer_url,
+            resource_url,
+            token_secret,
+            client_id,
+            "refresh",
+            OAUTH_REFRESH_TOKEN_TTL_SECONDS,
+        )?,
+    })
+}
+
+fn create_token(
+    issuer_url: &str,
+    resource_url: &str,
+    token_secret: &str,
+    client_id: &str,
+    token_kind: &str,
     ttl: i64,
 ) -> Result<String, ()> {
     let now = unix_now() as i64;
@@ -428,6 +591,9 @@ fn create_access_token(
         iat: now,
         exp: now + ttl,
         scope: "mcp".into(),
+        token_kind: token_kind.into(),
+        client_id: client_id.into(),
+        jti: uuid::Uuid::new_v4().to_string(),
     };
     encode(
         &Header::new(Algorithm::HS256),
@@ -462,14 +628,24 @@ fn basic_auth_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 }
 
 fn token_error(error: &str, description: &str) -> Response {
-    (
+    token_json_response(
         StatusCode::BAD_REQUEST,
-        axum::Json(json!({
+        json!({
             "error": error,
             "error_description": description
-        })),
+        }),
     )
-        .into_response()
+}
+
+fn token_json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    let mut response = (status, axum::Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn html_error(message: &str, status: StatusCode) -> Response {
@@ -561,8 +737,15 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn token_exchange_without_client_secret() {
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("response json")
+    }
+
+    #[tokio::test]
+    async fn token_exchange_without_client_secret_issues_rotating_refresh_token() {
         use axum::http::HeaderMap;
 
         let oauth = OAuthRuntime::new(
@@ -607,11 +790,65 @@ mod tests {
                 client_id: "chatgpt-client-test".into(),
                 client_secret: String::new(),
                 resource: resource_url.into(),
+                ..TokenForm::default()
             },
             "https://lb.example.com",
             resource_url,
         );
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[PRAGMA], "no-cache");
+        let issued = response_json(response).await;
+        let access_token = issued["access_token"].as_str().expect("access token");
+        let refresh_token = issued["refresh_token"].as_str().expect("refresh token");
+        assert!(oauth.verify_access_token(
+            access_token,
+            "https://lb.example.com",
+            resource_url
+        ));
+        assert!(!oauth.verify_access_token(
+            refresh_token,
+            "https://lb.example.com",
+            resource_url
+        ));
+
+        let refreshed_response = token_exchange(
+            &oauth,
+            &HeaderMap::new(),
+            TokenForm {
+                grant_type: "refresh_token".into(),
+                client_id: "chatgpt-client-test".into(),
+                resource: resource_url.into(),
+                refresh_token: refresh_token.into(),
+                ..TokenForm::default()
+            },
+            "https://lb.example.com",
+            resource_url,
+        );
+        assert_eq!(refreshed_response.status(), StatusCode::OK);
+        let refreshed = response_json(refreshed_response).await;
+        assert_ne!(refreshed["refresh_token"], issued["refresh_token"]);
+
+        let replay = token_exchange(
+            &oauth,
+            &HeaderMap::new(),
+            TokenForm {
+                grant_type: "refresh_token".into(),
+                client_id: "chatgpt-client-test".into(),
+                resource: resource_url.into(),
+                refresh_token: refresh_token.into(),
+                ..TokenForm::default()
+            },
+            "https://lb.example.com",
+            resource_url,
+        );
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        let replay_body = response_json(replay).await;
+        assert_eq!(replay_body["error"], "invalid_grant");
+        assert!(replay_body["error_description"]
+            .as_str()
+            .expect("description")
+            .contains("already used"));
     }
 
     #[test]
