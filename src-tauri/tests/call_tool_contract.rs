@@ -208,7 +208,10 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 24);
+    assert_eq!(names.len(), 27);
+    assert!(names.contains("list_skills"));
+    assert!(names.contains("load_skill"));
+    assert!(names.contains("read_skill_resource"));
     assert!(names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
