@@ -64,6 +64,8 @@
   type SubTab = "config" | "logs" | "health";
   type BackendConnectionState = "connected" | "checking" | "recovering" | "offline";
 
+  const INITIAL_CONNECT_TIMEOUT_MS = 12_000;
+
   const EMPTY_RECOVERY: RuntimeRecovery = {
     enabled: false,
     attempt: 0,
@@ -143,6 +145,20 @@
         return "错误";
       default:
         return "已停止";
+    }
+  }
+
+  async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: number | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) window.clearTimeout(timer);
     }
   }
 
@@ -246,13 +262,20 @@
     statusPolling = true;
     backendConnection = "checking";
     try {
-      await load(id);
-      if (id !== workspaceId) return;
+      const loaded = await withTimeout(
+        load(id),
+        INITIAL_CONNECT_TIMEOUT_MS,
+        "连接应用后台超时，正在自动重试",
+      );
+      if (!loaded || id !== workspaceId) return;
       backendFailures = 0;
       backendConnection = "connected";
       lastBackendSuccess = Date.now();
     } catch (error) {
       if (id !== workspaceId) return;
+      // Invalidate any late result from the timed-out load so it cannot overwrite
+      // the next retry or a newly selected workspace.
+      loadGeneration += 1;
       const previousFailures = backendFailures;
       backendFailures += 1;
       backendConnection = backendFailures >= 3 ? "offline" : "recovering";
@@ -279,35 +302,36 @@
     }
   }
 
-  async function load(id = workspaceId) {
-    if (!id) return;
+  async function load(id = workspaceId): Promise<boolean> {
+    if (!id) return false;
     const generation = ++loadGeneration;
     const items = await listWorkspaces();
-    if (generation !== loadGeneration || id !== workspaceId) return;
+    if (generation !== loadGeneration || id !== workspaceId) return false;
     workspaces.set(items);
     frpProfiles = await listFrpProfiles();
-    if (generation !== loadGeneration || id !== workspaceId) return;
+    if (generation !== loadGeneration || id !== workspaceId) return false;
     const nextProfile = items.find((item) => item.id === id) ?? null;
-    if (generation !== loadGeneration || id !== workspaceId) return;
+    if (generation !== loadGeneration || id !== workspaceId) return false;
     profile = nextProfile;
     if (nextProfile) {
       void setLastWorkspace(nextProfile.id).catch(() => {
         // Non-critical preference write. Runtime/config loading must continue.
       });
     }
-    if (generation !== loadGeneration || id !== workspaceId) return;
+    if (generation !== loadGeneration || id !== workspaceId) return false;
     if (!nextProfile) {
       await goto("/");
-      return;
+      return false;
     }
 
     const [mcpRuntime, actionsRuntime] = await Promise.all([
       getRuntimeStatus(id),
       getActionsRuntimeStatus(id),
     ]);
-    if (generation !== loadGeneration || id !== workspaceId) return;
+    if (generation !== loadGeneration || id !== workspaceId) return false;
     applyMcpRuntime(mcpRuntime, id);
     applyActionsRuntime(actionsRuntime, id);
+    return true;
   }
 
   async function refreshProfile(id = workspaceId): Promise<WorkspaceProfile | null> {
@@ -667,7 +691,11 @@
     profile = null;
     backendFailures = 0;
     backendConnection = "checking";
-    void initializeWorkspace(id);
+    // initializeWorkspace reads and writes reactive connection state before its
+    // first await. Running it in a microtask keeps those reads out of this
+    // effect's dependency graph; otherwise statusPolling retriggers this effect,
+    // clears profile, invalidates the load generation, and loops forever.
+    queueMicrotask(() => void initializeWorkspace(id));
 
     const handleOnline = () => retryBackendNow();
     const handleVisibility = () => {
