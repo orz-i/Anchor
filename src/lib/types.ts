@@ -14,6 +14,37 @@ export interface TunnelConfig {
   use_proxy?: boolean;
 }
 
+export interface SkillFileSummary {
+  path: string;
+  kind: "resource" | "script";
+  sizeBytes: number;
+  mimeType: string;
+  readable: boolean;
+}
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  license?: string | null;
+  compatibility?: string | null;
+  sourceRoot: string;
+  skillDir: string;
+  uri: string;
+  digest: string;
+  resources: SkillFileSummary[];
+  scripts: SkillFileSummary[];
+  scriptExecutionEnabled: boolean;
+}
+
+export interface SkillInspection {
+  enabled: boolean;
+  roots: string[];
+  skills: SkillSummary[];
+  warnings: string[];
+  truncated: boolean;
+  scriptExecutionEnabled: boolean;
+}
+
 export interface AuthConfig {
   type: string;
   oauth_client_id: string;
@@ -29,6 +60,8 @@ export interface RuntimeConfig {
   allowed_commands?: string;
   workspace_local_entries?: boolean;
   workspace_script_extensions?: string;
+  skill_service_enabled?: boolean;
+  skill_roots?: string;
 }
 
 export interface ActionsConfig {

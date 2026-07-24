@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { RuntimeStatus, WorkspaceProfile } from "$lib/types";
+import type { RuntimeStatus, SkillInspection, WorkspaceProfile } from "$lib/types";
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invoke<WorkspaceProfile[]>("list_workspaces");
@@ -14,6 +14,14 @@ export async function createWorkspace(
 
 export async function updateWorkspace(profile: WorkspaceProfile): Promise<void> {
   return invoke("update_workspace", { profile });
+}
+
+export async function inspectWorkspaceSkills(
+  id: string,
+  enabled: boolean,
+  roots: string,
+): Promise<SkillInspection> {
+  return invoke<SkillInspection>("inspect_workspace_skills", { id, enabled, roots });
 }
 
 export async function openWorkspaceDirectory(path: string): Promise<void> {

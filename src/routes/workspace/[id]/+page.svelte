@@ -9,6 +9,7 @@
   import HealthPanel from "$lib/components/HealthPanel.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
   import McpProxyConfigForm from "$lib/components/McpProxyConfigForm.svelte";
+  import SkillServiceConfigForm from "$lib/components/SkillServiceConfigForm.svelte";
   import RuntimePolicyForm, {
     type RuntimePolicyDraft,
   } from "$lib/components/RuntimePolicyForm.svelte";
@@ -419,6 +420,22 @@
     await promptServiceRestart(mcpStatus === "running", "MCP 服务");
   }
 
+  async function saveSkillService(config: { enabled: boolean; roots: string }) {
+    if (!profile) return;
+    const next: WorkspaceProfile = {
+      ...profile,
+      runtime: {
+        ...profile.runtime,
+        skill_service_enabled: config.enabled,
+        skill_roots: config.roots,
+      },
+    };
+    await updateWorkspace(next);
+    profile = next;
+    await load();
+    await promptServiceRestart(mcpStatus === "running", "MCP 服务");
+  }
+
   async function saveMcpProxyConfig(config: string) {
     if (!profile) return;
     const next: WorkspaceProfile = {
@@ -647,6 +664,15 @@
                 workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
                 workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}
                 onSave={saveMcpPolicy}
+              />
+            </div>
+            <div>
+              <p class="tx-section-label">Agent Skills</p>
+              <SkillServiceConfigForm
+                workspaceId={workspaceId!}
+                enabled={profile.runtime.skill_service_enabled ?? true}
+                roots={profile.runtime.skill_roots ?? ".agents/skills\n.codex/skills\nskills"}
+                onSave={saveSkillService}
               />
             </div>
             <div>
