@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -28,6 +29,34 @@ pub struct McpProxyServerSpec {
     request_timeout: Duration,
 }
 
+async fn connect_initial_with_retry(
+    spec: McpProxyServerSpec,
+    workspace_id: String,
+) -> Result<(Arc<ProxyServer>, Vec<Value>), String> {
+    let mut last_error = String::new();
+    for attempt in 1u8..=3 {
+        match ProxyServer::connect_initial(spec.clone(), workspace_id.clone()).await {
+            Ok(connected) => return Ok(connected),
+            Err(error) => {
+                last_error = error;
+                if attempt < 3 {
+                    tokio::time::sleep(proxy_reconnect_delay(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "initial connection failed after 3 attempts: {last_error}"
+    ))
+}
+
+struct ProxyServer {
+    spec: McpProxyServerSpec,
+    workspace_id: String,
+    client: Mutex<Option<Arc<McpProxyClient>>>,
+    reconnect_scheduled: AtomicBool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawMcpServerConfig {
     #[serde(rename = "type", default)]
@@ -49,7 +78,7 @@ struct RawMcpServerConfig {
 
 #[derive(Clone)]
 struct ProxyRoute {
-    client: Arc<McpProxyClient>,
+    server: Arc<ProxyServer>,
     server_name: String,
     downstream_name: String,
 }
@@ -66,7 +95,6 @@ pub struct McpProxyRegistry {
 }
 
 struct McpProxyClient {
-    server_name: String,
     request_timeout: Duration,
     connection: Mutex<ProxyConnection>,
 }
@@ -94,7 +122,7 @@ impl McpProxyRegistry {
             let server_name = spec.name.clone();
             let workspace_id = workspace_id.to_string();
             tasks.spawn(async move {
-                let result = McpProxyClient::connect(spec, &workspace_id).await;
+                let result = connect_initial_with_retry(spec, workspace_id.clone()).await;
                 (server_name, workspace_id, result)
             });
         }
@@ -109,7 +137,7 @@ impl McpProxyRegistry {
                 continue;
             };
             match result {
-                Ok((client, catalog)) => {
+                Ok((server, catalog)) => {
                     let mut added = 0usize;
                     let mut skipped_duplicates = Vec::new();
                     let mut state = self.state.write().expect("mcp proxy registry write");
@@ -126,7 +154,7 @@ impl McpProxyRegistry {
                         };
                         let public_name = format!(
                             "{}__{}",
-                            sanitize_tool_segment(&client.server_name),
+                            sanitize_tool_segment(&server.spec.tool_prefix),
                             sanitize_tool_segment(&downstream_name)
                         );
                         if state.routes.contains_key(&public_name) {
@@ -156,7 +184,7 @@ impl McpProxyRegistry {
                         state.routes.insert(
                             public_name,
                             ProxyRoute {
-                                client: client.clone(),
+                                server: server.clone(),
                                 server_name: server_name.clone(),
                                 downstream_name,
                             },
@@ -200,8 +228,21 @@ impl McpProxyRegistry {
             .get(public_name)
             .cloned()?;
 
-        let client = route.client.clone();
+        let server = route.server.clone();
         let server_name = route.server_name.clone();
+        let client = match server.ensure_client().await {
+            Ok(client) => client,
+            Err(message) => {
+                server.clone().schedule_reconnect();
+                return Some(Err(proxy_call_error(
+                    &server_name,
+                    public_name,
+                    "proxy_reconnect_failed",
+                    message,
+                    true,
+                )));
+            }
+        };
         let result = client
             .request(
                 "tools/call",
@@ -211,43 +252,121 @@ impl McpProxyRegistry {
                 }),
             )
             .await;
-        if result.is_err() {
-            self.invalidate_client(&client);
+        if let Err(message) = &result {
+            server.invalidate_client(&client).await;
+            server.clone().schedule_reconnect();
+            append_profile_log(
+                &server.workspace_id,
+                "stderr.log",
+                &format!(
+                    "[mcp-proxy:{server_name}] connection lost; reconnect scheduled: {message}"
+                ),
+            );
         }
 
         Some(result.map_err(|message| {
-            json!({
-                "code": -32603,
-                "message": format!(
-                    "Proxied MCP tool failed: {} / {}",
-                    server_name, public_name
-                ),
-                "data": {
-                    "reason": "proxy_call_failed",
-                    "server": server_name,
-                    "tool": public_name,
-                    "detail": message
-                }
-            })
+            proxy_call_error(
+                &server_name,
+                public_name,
+                "proxy_call_failed",
+                message,
+                true,
+            )
         }))
     }
+}
 
-    fn invalidate_client(&self, client: &Arc<McpProxyClient>) {
-        let mut state = self.state.write().expect("mcp proxy registry write");
-        let removed: HashSet<String> = state
-            .routes
-            .iter()
-            .filter(|(_, route)| Arc::ptr_eq(&route.client, client))
-            .map(|(name, _)| name.clone())
-            .collect();
-        state.routes.retain(|name, _| !removed.contains(name));
-        state.tools.retain(|tool| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .map(|name| !removed.contains(name))
-                .unwrap_or(true)
+impl ProxyServer {
+    async fn connect_initial(
+        spec: McpProxyServerSpec,
+        workspace_id: String,
+    ) -> Result<(Arc<Self>, Vec<Value>), String> {
+        let (client, catalog) = McpProxyClient::connect(spec.clone(), &workspace_id).await?;
+        Ok((
+            Arc::new(Self {
+                spec,
+                workspace_id,
+                client: Mutex::new(Some(client)),
+                reconnect_scheduled: AtomicBool::new(false),
+            }),
+            catalog,
+        ))
+    }
+
+    async fn ensure_client(&self) -> Result<Arc<McpProxyClient>, String> {
+        let mut client = self.client.lock().await;
+        if let Some(current) = client.as_ref() {
+            return Ok(current.clone());
+        }
+        let (connected, _) = McpProxyClient::connect(self.spec.clone(), &self.workspace_id).await?;
+        *client = Some(connected.clone());
+        append_profile_log(
+            &self.workspace_id,
+            "stdout.log",
+            &format!("[mcp-proxy:{}] reconnected", self.spec.name),
+        );
+        Ok(connected)
+    }
+
+    async fn invalidate_client(&self, failed: &Arc<McpProxyClient>) {
+        let mut client = self.client.lock().await;
+        if client
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, failed))
+        {
+            *client = None;
+        }
+    }
+
+    fn schedule_reconnect(self: Arc<Self>) {
+        if self.reconnect_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        crate::async_runtime::spawn(async move {
+            for attempt in 1u8..=5 {
+                tokio::time::sleep(proxy_reconnect_delay(attempt)).await;
+                if self.ensure_client().await.is_ok() {
+                    self.reconnect_scheduled.store(false, Ordering::Release);
+                    return;
+                }
+                append_profile_log(
+                    &self.workspace_id,
+                    "stderr.log",
+                    &format!(
+                        "[mcp-proxy:{}] reconnect attempt {attempt}/5 failed",
+                        self.spec.name
+                    ),
+                );
+            }
+            self.reconnect_scheduled.store(false, Ordering::Release);
         });
     }
+}
+
+fn proxy_reconnect_delay(attempt: u8) -> Duration {
+    Duration::from_millis(250 * (1u64 << attempt.saturating_sub(1).min(4)))
+}
+
+fn proxy_call_error(
+    server_name: &str,
+    public_name: &str,
+    reason: &str,
+    detail: String,
+    retryable: bool,
+) -> Value {
+    json!({
+        "code": -32603,
+        "message": format!("Proxied MCP tool failed: {server_name} / {public_name}"),
+        "data": {
+            "reason": reason,
+            "server": server_name,
+            "tool": public_name,
+            "detail": detail,
+            "retryable": retryable,
+            "request_replayed": false,
+            "reconnect_scheduled": true
+        }
+    })
 }
 
 impl McpProxyClient {
@@ -297,7 +416,6 @@ impl McpProxyClient {
         }
 
         let client = Arc::new(Self {
-            server_name: spec.tool_prefix,
             request_timeout: spec.request_timeout,
             connection: Mutex::new(ProxyConnection {
                 child,
@@ -596,9 +714,14 @@ fn sanitize_tool_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::Path;
+    use std::time::Duration;
 
-    use super::parse_mcp_proxy_config;
+    use serde_json::json;
+
+    use super::{parse_mcp_proxy_config, McpProxyRegistry, McpProxyServerSpec};
 
     #[test]
     fn parses_standard_mcp_servers_and_expands_workspace_folder() {
@@ -631,5 +754,82 @@ mod tests {
         .expect_err("reject unsupported transport");
 
         assert!(error.contains("only stdio is supported"));
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_disconnect_without_replaying_failed_tool_call() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("unstable_mcp.py");
+        let marker = temp.path().join("first-call-failed");
+        fs::write(
+            &script,
+            r#"import json
+import os
+import sys
+
+marker = sys.argv[1]
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "unstable", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "ping", "description": "Ping", "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        if not os.path.exists(marker):
+            open(marker, "w", encoding="utf-8").write("failed-once")
+            sys.exit(0)
+        result = {"content": [{"type": "text", "text": "reconnected"}], "structuredContent": {"ok": True}}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .expect("write fixture");
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![McpProxyServerSpec {
+                    name: "unstable".into(),
+                    command: python.display().to_string(),
+                    args: vec![
+                        script.display().to_string(),
+                        marker.display().to_string(),
+                    ],
+                    env: BTreeMap::new(),
+                    cwd: temp.path().to_path_buf(),
+                    tool_prefix: "unstable".into(),
+                    request_timeout: Duration::from_secs(5),
+                }],
+                "proxy-reconnect-test",
+            )
+            .await;
+
+        assert!(registry
+            .list_tools()
+            .iter()
+            .any(|tool| tool["name"] == "unstable__ping"));
+
+        let first = registry
+            .call_tool("unstable__ping", &json!({}))
+            .await
+            .expect("known route")
+            .expect_err("first call disconnects");
+        assert_eq!(first["data"]["request_replayed"], false);
+        assert_eq!(first["data"]["reconnect_scheduled"], true);
+
+        let second = registry
+            .call_tool("unstable__ping", &json!({}))
+            .await
+            .expect("known route")
+            .expect("second call reconnects");
+        assert_eq!(second["structuredContent"]["ok"], true);
     }
 }
