@@ -1,6 +1,7 @@
 mod args;
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
@@ -9,10 +10,22 @@ use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::runtime::{await_listener_shutdown, RuntimeSupervisor, ServiceKind};
-use crate::tunnel::{maybe_start_for_runtime, stop_for_runtime, TunnelServiceKind};
+use crate::tunnel::{
+    ensure_for_runtime, maybe_start_for_runtime, stop_for_runtime, TunnelServiceKind,
+};
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{CliArgs, Command, ServiceSelection};
+
+#[derive(Debug, Clone, Copy)]
+struct CliTunnelRetry {
+    attempts: u8,
+    next_attempt: tokio::time::Instant,
+}
+
+fn cli_tunnel_retry_delay(attempts: u8) -> Duration {
+    Duration::from_secs((1u64 << attempts.saturating_sub(1).min(6)).min(60))
+}
 
 pub fn run() -> i32 {
     let parsed = match args::parse(std::env::args().skip(1)) {
@@ -195,7 +208,8 @@ async fn serve_workspace(
 
     let mut runtime = RuntimeSupervisor::default();
     let mut started_services = Vec::new();
-    let mut started_tunnels = Vec::new();
+    let mut managed_tunnels = Vec::new();
+    let mut tunnel_retries = std::collections::HashMap::new();
 
     let start_result = async {
         if service.includes_mcp() {
@@ -209,10 +223,37 @@ async fn serve_workspace(
 
         if with_tunnel {
             for kind in selected_tunnels(service) {
-                if let Some(url) = maybe_start_for_runtime(&profile, kind).await? {
-                    started_tunnels.push(kind);
-                    if !as_json {
+                managed_tunnels.push(kind);
+                match maybe_start_for_runtime(&profile, kind).await {
+                    Ok(Some(url)) if !as_json => {
                         println!("{} tunnel\t{url}", tunnel_label(kind));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let attempts = 1;
+                        let delay = cli_tunnel_retry_delay(attempts);
+                        tunnel_retries.insert(
+                            kind,
+                            CliTunnelRetry {
+                                attempts,
+                                next_attempt: tokio::time::Instant::now() + delay,
+                            },
+                        );
+                        if as_json {
+                            print_json(&json!({
+                                "event": "tunnel_retry_scheduled",
+                                "service": tunnel_label(kind),
+                                "attempt": attempts,
+                                "retry_in_ms": delay.as_millis(),
+                                "detail": error.to_string()
+                            }))?;
+                        } else {
+                            eprintln!(
+                                "{} tunnel 暂未连接，{} 秒后自动重试：{error}",
+                                tunnel_label(kind),
+                                delay.as_secs()
+                            );
+                        }
                     }
                 }
             }
@@ -222,7 +263,7 @@ async fn serve_workspace(
     .await;
 
     if let Err(error) = start_result {
-        let _ = shutdown(&mut runtime, &profile, &started_services, &started_tunnels).await;
+        let _ = shutdown(&mut runtime, &profile, &started_services, &managed_tunnels).await;
         return Err(error);
     }
 
@@ -245,17 +286,128 @@ async fn serve_workspace(
         println!("前台运行中，按 Ctrl+C 停止。");
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|error| AppError::Message(format!("无法监听 Ctrl+C：{error}")))?;
+    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(2));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    maintenance.tick().await;
+    let mut last_states = std::collections::HashMap::new();
+    let mut terminal_error = None;
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    terminal_error = Some(AppError::Message(format!(
+                        "无法监听 Ctrl+C：{error}"
+                    )));
+                }
+                break;
+            }
+            _ = maintenance.tick() => {
+                for kind in started_services.iter().copied() {
+                    let status_result = match kind {
+                        ServiceKind::Mcp => runtime.maintain_mcp(&profile),
+                        ServiceKind::Actions => runtime.maintain_actions(&profile),
+                    };
+                    let status = match status_result {
+                        Ok(status) => status,
+                        Err(error) => {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    };
+                    let previous = last_states.insert(kind, status.state.clone());
+                    if previous.as_deref() != Some(status.state.as_str()) {
+                        if as_json {
+                            print_json(&json!({
+                                "event": "service_state",
+                                "service": service_label(kind),
+                                "state": status.state,
+                                "message": status.local_message,
+                                "recovery": status.recovery
+                            }))?;
+                        } else if status.state == "recovering" {
+                            eprintln!("{}", status.local_message);
+                        } else if status.state == "running" && previous.as_deref() == Some("recovering") {
+                            println!("{} 已自动恢复", service_label(kind));
+                        }
+                    }
+                    if status.state == "error" && !status.recovery.enabled {
+                        terminal_error = Some(AppError::Message(format!(
+                            "{}自动恢复失败：{}",
+                            service_label(kind),
+                            status.local_message
+                        )));
+                        break;
+                    }
+                }
+                if terminal_error.is_some() {
+                    break;
+                }
+                for kind in managed_tunnels.iter().copied() {
+                    if tunnel_retries
+                        .get(&kind)
+                        .is_some_and(|retry| retry.next_attempt > tokio::time::Instant::now())
+                    {
+                        continue;
+                    }
+                    match ensure_for_runtime(&profile, kind).await {
+                        Ok(_) => {
+                            if let Some(previous) = tunnel_retries.remove(&kind) {
+                                if as_json {
+                                    print_json(&json!({
+                                        "event": "tunnel_reconnected",
+                                        "service": tunnel_label(kind),
+                                        "attempts": previous.attempts
+                                    }))?;
+                                } else {
+                                    println!("{} tunnel 已自动恢复", tunnel_label(kind));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let attempts = tunnel_retries
+                                .get(&kind)
+                                .map(|retry| retry.attempts.saturating_add(1))
+                                .unwrap_or(1);
+                            let delay = cli_tunnel_retry_delay(attempts);
+                            tunnel_retries.insert(
+                                kind,
+                                CliTunnelRetry {
+                                    attempts,
+                                    next_attempt: tokio::time::Instant::now() + delay,
+                                },
+                            );
+                            if as_json {
+                                print_json(&json!({
+                                    "event": "tunnel_retry_scheduled",
+                                    "service": tunnel_label(kind),
+                                    "attempt": attempts,
+                                    "retry_in_ms": delay.as_millis(),
+                                    "detail": error.to_string()
+                                }))?;
+                            } else {
+                                eprintln!(
+                                    "{} tunnel 自动重连失败，{} 秒后重试：{error}",
+                                    tunnel_label(kind),
+                                    delay.as_secs()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if !as_json {
         println!("正在停止……");
     }
-    shutdown(&mut runtime, &profile, &started_services, &started_tunnels).await?;
+    shutdown(&mut runtime, &profile, &started_services, &managed_tunnels).await?;
     if as_json {
         print_json(&json!({"event": "stopped", "workspace_id": profile.id}))?;
     }
-    Ok(())
+    match terminal_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn ensure_running(status: RuntimeStatusDto, label: &str) -> AppResult<()> {
@@ -396,6 +548,16 @@ fn print_json(value: &impl Serialize) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_retry_delay_uses_bounded_exponential_backoff() {
+        assert_eq!(cli_tunnel_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(cli_tunnel_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(cli_tunnel_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(cli_tunnel_retry_delay(6), Duration::from_secs(32));
+        assert_eq!(cli_tunnel_retry_delay(7), Duration::from_secs(60));
+        assert_eq!(cli_tunnel_retry_delay(20), Duration::from_secs(60));
+    }
 
     #[test]
     fn resolves_one_workspace_to_one_profile_by_id_name_or_path() {

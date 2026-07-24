@@ -122,6 +122,18 @@ pub struct RuntimeStatusDto {
     pub public_message: String,
     pub local_endpoint: String,
     pub public_endpoint: String,
+    pub recovery: RuntimeRecoveryDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeRecoveryDto {
+    pub enabled: bool,
+    pub attempt: u8,
+    pub max_attempts: u8,
+    pub retry_in_ms: Option<u64>,
+    pub recovered_count: u32,
+    pub last_error: String,
 }
 
 fn default_tunnel_type() -> String {

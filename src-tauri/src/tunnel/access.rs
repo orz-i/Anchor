@@ -19,6 +19,24 @@ pub fn supervisor() -> &'static Mutex<TunnelSupervisor> {
     &TUNNEL_SUPERVISOR
 }
 
+pub async fn ensure_for_runtime(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<Option<String>> {
+    let tunnel_type = tunnel_type_for(profile, kind);
+    if tunnel_type.is_empty() || tunnel_type == "none" {
+        return Ok(None);
+    }
+    let settings = AppSettings::load_or_default();
+    let mut guard = supervisor().lock().await;
+    let current = guard.status(profile, kind, &settings);
+    if current.state == "running" {
+        return Ok(Some(current.public_url));
+    }
+    let status = guard.start(profile, kind, &settings).await?;
+    Ok(Some(status.public_url))
+}
+
 fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),

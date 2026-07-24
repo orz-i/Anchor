@@ -14,8 +14,13 @@ use crate::runtime::port::{
 };
 use crate::secret::SecretStore;
 use crate::tools::policy::PolicySettings;
-use crate::tunnel::{append_profile_log, cleanup_orphan_for_runtime, TunnelServiceKind};
-use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
+use crate::tunnel::{append_profile_log, TunnelServiceKind};
+use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
+
+const MAX_RECOVERY_ATTEMPTS: u8 = 5;
+const RECOVERY_BASE_DELAY_MS: u64 = 1_000;
+const RECOVERY_MAX_DELAY_MS: u64 = 16_000;
+const STARTING_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceKind {
@@ -23,11 +28,19 @@ pub enum ServiceKind {
     Actions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn starting_stalled(entry: &RuntimeEntry) -> bool {
+    entry.phase == RuntimePhase::Starting
+        && entry
+            .started_at
+            .is_some_and(|started| started.elapsed() >= STARTING_STALL_TIMEOUT)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimePhase {
     Stopped,
     Starting,
     Running,
+    Recovering,
     Stopping,
     Error,
 }
@@ -39,6 +52,10 @@ struct RuntimeEntry {
     error_message: Option<String>,
     started_at: Option<std::time::Instant>,
     missing_port_checks: u8,
+    desired_running: bool,
+    recovery_attempt: u8,
+    next_retry_at: Option<std::time::Instant>,
+    recovered_count: u32,
 }
 
 #[derive(Default)]
@@ -82,11 +99,19 @@ impl RuntimeSupervisor {
     }
 
     pub fn refresh_mcp(&mut self, profile: &WorkspaceProfile) {
-        self.refresh(profile, ServiceKind::Mcp);
+        let _ = self.maintain(profile, ServiceKind::Mcp);
     }
 
     pub fn refresh_actions(&mut self, profile: &WorkspaceProfile) {
-        self.refresh(profile, ServiceKind::Actions);
+        let _ = self.maintain(profile, ServiceKind::Actions);
+    }
+
+    pub fn maintain_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+        self.maintain(profile, ServiceKind::Mcp)
+    }
+
+    pub fn maintain_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+        self.maintain(profile, ServiceKind::Actions)
     }
 
     pub fn drop_workspace(&mut self, profile: &WorkspaceProfile) {
@@ -98,7 +123,7 @@ impl RuntimeSupervisor {
         self.entries
             .iter()
             .filter_map(|((workspace_id, kind), entry)| match entry.phase {
-                RuntimePhase::Running | RuntimePhase::Starting => Some((
+                RuntimePhase::Running | RuntimePhase::Starting | RuntimePhase::Recovering => Some((
                     workspace_id.clone(),
                     match kind {
                         ServiceKind::Mcp => TunnelServiceKind::Mcp,
@@ -115,6 +140,8 @@ impl RuntimeSupervisor {
         let entry = self.entries.get_mut(&key)?;
 
         entry.phase = RuntimePhase::Stopping;
+        entry.desired_running = false;
+        entry.next_retry_at = None;
         let shutdown = entry.shutdown.take();
         let handle = entry.handle.take();
         if let Some(shutdown) = shutdown {
@@ -132,12 +159,13 @@ impl RuntimeSupervisor {
         let phase = self
             .entries
             .get(&key)
-            .map(|entry| entry.phase.clone())
+            .map(|entry| entry.phase)
             .unwrap_or(RuntimePhase::Stopped);
 
         let (local_endpoint, public_endpoint) = endpoints(profile, kind);
         let port = port_for(profile, kind);
         let service_label = service_label(kind);
+        let recovery = self.recovery_status(&key);
 
         match phase {
             RuntimePhase::Running => RuntimeStatusDto {
@@ -147,6 +175,7 @@ impl RuntimeSupervisor {
                 public_message: public_message_for(profile, kind),
                 local_endpoint,
                 public_endpoint,
+                recovery,
             },
             RuntimePhase::Starting => RuntimeStatusDto {
                 state: "starting".into(),
@@ -155,6 +184,16 @@ impl RuntimeSupervisor {
                 public_message: "等待服务就绪".into(),
                 local_endpoint,
                 public_endpoint,
+                recovery,
+            },
+            RuntimePhase::Recovering => RuntimeStatusDto {
+                state: "recovering".into(),
+                pid: None,
+                local_message: recovery_message(service_label, &recovery),
+                public_message: "连接中断，正在自动恢复".into(),
+                local_endpoint,
+                public_endpoint,
+                recovery,
             },
             RuntimePhase::Stopping => RuntimeStatusDto {
                 state: "stopping".into(),
@@ -163,6 +202,7 @@ impl RuntimeSupervisor {
                 public_message: "正在停止".into(),
                 local_endpoint,
                 public_endpoint,
+                recovery,
             },
             RuntimePhase::Error => {
                 let message = self
@@ -177,6 +217,7 @@ impl RuntimeSupervisor {
                     public_message: message,
                     local_endpoint,
                     public_endpoint,
+                    recovery,
                 }
             }
             RuntimePhase::Stopped => RuntimeStatusDto {
@@ -186,7 +227,34 @@ impl RuntimeSupervisor {
                 public_message: "未知".into(),
                 local_endpoint,
                 public_endpoint,
+                recovery,
             },
+        }
+    }
+
+    fn recovery_status(&self, key: &(String, ServiceKind)) -> RuntimeRecoveryDto {
+        let Some(entry) = self.entries.get(key) else {
+            return RuntimeRecoveryDto {
+                enabled: false,
+                attempt: 0,
+                max_attempts: MAX_RECOVERY_ATTEMPTS,
+                retry_in_ms: None,
+                recovered_count: 0,
+                last_error: String::new(),
+            };
+        };
+        RuntimeRecoveryDto {
+            enabled: entry.desired_running,
+            attempt: entry.recovery_attempt,
+            max_attempts: MAX_RECOVERY_ATTEMPTS,
+            retry_in_ms: entry.next_retry_at.map(|deadline| {
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            }),
+            recovered_count: entry.recovered_count,
+            last_error: entry.error_message.clone().unwrap_or_default(),
         }
     }
 
@@ -195,14 +263,23 @@ impl RuntimeSupervisor {
         profile: &WorkspaceProfile,
         kind: ServiceKind,
     ) -> AppResult<RuntimeStatusDto> {
+        self.attempt_start(profile, kind, false)
+    }
+
+    fn attempt_start(
+        &mut self,
+        profile: &WorkspaceProfile,
+        kind: ServiceKind,
+        recovery: bool,
+    ) -> AppResult<RuntimeStatusDto> {
         let key = (profile.id.clone(), kind);
-        if matches!(
+        if !recovery && matches!(
             self.entries.get(&key).map(|e| &e.phase),
             Some(RuntimePhase::Running) | Some(RuntimePhase::Starting)
         ) {
             return Ok(self.status(profile, kind));
         }
-        if matches!(
+        if !recovery && matches!(
             self.entries.get(&key).map(|e| &e.phase),
             Some(RuntimePhase::Stopping)
         ) {
@@ -212,15 +289,34 @@ impl RuntimeSupervisor {
             )));
         }
 
+        let previous = self.entries.remove(&key);
+        let previous_recovered_count = previous
+            .as_ref()
+            .map(|entry| entry.recovered_count)
+            .unwrap_or(0);
+        let recovery_attempt = if recovery {
+            previous
+                .as_ref()
+                .map(|entry| entry.recovery_attempt.saturating_add(1))
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        let previous_error = previous.and_then(|entry| entry.error_message);
+
         self.entries.insert(
             key.clone(),
             RuntimeEntry {
                 phase: RuntimePhase::Starting,
                 shutdown: None,
                 handle: None,
-                error_message: None,
+                error_message: previous_error,
                 started_at: Some(std::time::Instant::now()),
                 missing_port_checks: 0,
+                desired_running: true,
+                recovery_attempt,
+                next_retry_at: None,
+                recovered_count: previous_recovered_count,
             },
         );
 
@@ -234,13 +330,22 @@ impl RuntimeSupervisor {
                 // app released the port; continue with the current listener.
             }
             if let Some(pid) = platform().find_pid_listening_on_port(port)? {
-                self.entries.remove(&key);
                 let message = port_busy_message(port, service_label(kind).trim(), pid);
                 append_profile_log(
                     &profile.id,
                     stderr_log_name(kind),
                     &format!("[start] {message}"),
                 );
+                if recovery {
+                    self.record_recovery_failure(
+                        &key,
+                        recovery_attempt,
+                        previous_recovered_count,
+                        message,
+                    );
+                    return Ok(self.status(profile, kind));
+                }
+                self.entries.remove(&key);
                 return Err(crate::error::AppError::Message(message));
             }
         }
@@ -354,8 +459,23 @@ impl RuntimeSupervisor {
                         error_message: None,
                         started_at,
                         missing_port_checks: 0,
+                        desired_running: true,
+                        recovery_attempt: 0,
+                        next_retry_at: None,
+                        recovered_count: previous_recovered_count
+                            .saturating_add(u32::from(recovery)),
                     },
                 );
+                if recovery {
+                    append_profile_log(
+                        &profile.id,
+                        "stdout.log",
+                        &format!(
+                            "[recovery] {}已自动恢复（第 {recovery_attempt} 次尝试）",
+                            service_label(kind).trim()
+                        ),
+                    );
+                }
             }
             Err(err) => {
                 // spawn_listener can fail synchronously before the server task is
@@ -367,6 +487,15 @@ impl RuntimeSupervisor {
                     stderr_log_name(kind),
                     &format!("[start] {}启动失败：{err}", service_label(kind).trim()),
                 );
+                if recovery {
+                    self.record_recovery_failure(
+                        &key,
+                        recovery_attempt,
+                        previous_recovered_count,
+                        err,
+                    );
+                    return Ok(self.status(profile, kind));
+                }
                 self.entries.insert(
                     key,
                     RuntimeEntry {
@@ -376,12 +505,54 @@ impl RuntimeSupervisor {
                         error_message: Some(err.to_string()),
                         started_at: None,
                         missing_port_checks: 0,
+                        desired_running: false,
+                        recovery_attempt: 0,
+                        next_retry_at: None,
+                        recovered_count: previous_recovered_count,
                     },
                 );
             }
         }
 
         Ok(self.status(profile, kind))
+    }
+
+    fn record_recovery_failure(
+        &mut self,
+        key: &(String, ServiceKind),
+        attempt: u8,
+        recovered_count: u32,
+        message: String,
+    ) {
+        let exhausted = attempt >= MAX_RECOVERY_ATTEMPTS;
+        let error_message = if exhausted {
+            format!(
+                "自动恢复已尝试 {MAX_RECOVERY_ATTEMPTS} 次仍失败：{message}。请检查配置后手动重试。"
+            )
+        } else {
+            message
+        };
+        self.entries.insert(
+            key.clone(),
+            RuntimeEntry {
+                phase: if exhausted {
+                    RuntimePhase::Error
+                } else {
+                    RuntimePhase::Recovering
+                },
+                shutdown: None,
+                handle: None,
+                error_message: Some(error_message),
+                started_at: None,
+                missing_port_checks: 0,
+                desired_running: !exhausted,
+                recovery_attempt: attempt,
+                next_retry_at: (!exhausted).then(|| {
+                    std::time::Instant::now() + recovery_delay(attempt)
+                }),
+                recovered_count,
+            },
+        );
     }
 
     /// Stop the current service (if running), then immediately start a new one.
@@ -417,12 +588,32 @@ impl RuntimeSupervisor {
         self.finish_stop(&profile.id, kind);
     }
 
-    fn refresh(&mut self, profile: &WorkspaceProfile, kind: ServiceKind) {
+    fn maintain(
+        &mut self,
+        profile: &WorkspaceProfile,
+        kind: ServiceKind,
+    ) -> AppResult<RuntimeStatusDto> {
         let key = (profile.id.clone(), kind);
         let port = port_for(profile, kind);
-        let mut should_cleanup_tunnel = false;
+        let mut should_retry = false;
         if let Some(entry) = self.entries.get_mut(&key) {
-            if entry.phase == RuntimePhase::Running {
+            if starting_stalled(entry) {
+                entry.phase = RuntimePhase::Recovering;
+                entry.error_message = Some(format!(
+                    "{}启动流程长时间未完成，已转入自动恢复",
+                    service_label(kind).trim()
+                ));
+                entry.started_at = None;
+                entry.desired_running = true;
+                entry.recovery_attempt = 0;
+                entry.next_retry_at = Some(std::time::Instant::now() + recovery_delay(0));
+                append_profile_log(
+                    &profile.id,
+                    stderr_log_name(kind),
+                    "[recovery] 启动流程超时，准备自动恢复",
+                );
+            } else if entry.phase == RuntimePhase::Running {
+                let task_finished = entry.handle.as_ref().is_some_and(JoinHandle::is_finished);
                 let listening = match platform().find_pid_listening_on_port(port) {
                     Ok(pid) => pid.is_some(),
                     Err(error) => {
@@ -431,10 +622,10 @@ impl RuntimeSupervisor {
                             stderr_log_name(kind),
                             &format!("[refresh] 检查端口 {port} 失败，保留当前线路：{error}"),
                         );
-                        return;
+                        return Ok(self.status(profile, kind));
                     }
                 };
-                if should_mark_runtime_error(entry, listening) {
+                if task_finished || should_mark_runtime_error(entry, listening) {
                     if let Some(handle) = entry.handle.take() {
                         handle.abort();
                         crate::async_runtime::spawn(async move {
@@ -461,37 +652,62 @@ impl RuntimeSupervisor {
                             port
                         )
                     };
-                    entry.phase = RuntimePhase::Error;
+                    entry.phase = RuntimePhase::Recovering;
                     entry.error_message = Some(message);
                     entry.started_at = None;
-                    should_cleanup_tunnel = true;
+                    entry.desired_running = true;
+                    entry.recovery_attempt = 0;
+                    entry.next_retry_at = Some(
+                        std::time::Instant::now() + recovery_delay(0),
+                    );
+                    append_profile_log(
+                        &profile.id,
+                        stderr_log_name(kind),
+                        &format!(
+                            "[recovery] 检测到{}断联，准备自动恢复",
+                            service_label(kind).trim()
+                        ),
+                    );
                 }
+            } else if entry.phase == RuntimePhase::Recovering
+                && entry.desired_running
+                && entry
+                    .next_retry_at
+                    .is_some_and(|deadline| deadline <= std::time::Instant::now())
+            {
+                should_retry = true;
             }
         }
-
-        // 状态查询本身不能改变其他工作区的隧道集合。只有本次刷新确认了
-        // 一个原本 Running 的 runtime 已经进入 Error，才清理它对应的孤儿线路。
-        // 之前无条件调用 cleanup_orphan 会把启动时的瞬时端口检测失败误认为
-        // 孤儿 runtime，删除 route 后重启唯一的 frpc，导致其他工作区公网线路消失。
-        if !should_cleanup_tunnel {
-            return;
+        if should_retry {
+            return self.attempt_start(profile, kind, true);
         }
+        Ok(self.status(profile, kind))
+    }
+}
 
-        let tunnel_kind = match kind {
-            ServiceKind::Mcp => TunnelServiceKind::Mcp,
-            ServiceKind::Actions => TunnelServiceKind::Actions,
-        };
+fn recovery_delay(completed_attempts: u8) -> Duration {
+    let multiplier = 1u64 << completed_attempts.min(4);
+    Duration::from_millis(
+        RECOVERY_BASE_DELAY_MS
+            .saturating_mul(multiplier)
+            .min(RECOVERY_MAX_DELAY_MS),
+    )
+}
 
-        let profile = profile.clone();
-        crate::async_runtime::spawn(async move {
-            if let Err(error) = cleanup_orphan_for_runtime(&profile, tunnel_kind, false).await {
-                append_profile_log(
-                    &profile.id,
-                    stderr_log_name(kind),
-                    &format!("[refresh] 清理失效隧道失败：{error}"),
-                );
-            }
-        });
+fn recovery_message(service_label: &str, recovery: &RuntimeRecoveryDto) -> String {
+    let next_attempt = recovery.attempt.saturating_add(1).min(recovery.max_attempts);
+    match recovery.retry_in_ms {
+        Some(ms) => format!(
+            "{}连接中断，{} 秒后进行第 {next_attempt}/{} 次自动恢复",
+            service_label.trim(),
+            ms.div_ceil(1_000).max(1),
+            recovery.max_attempts
+        ),
+        None => format!(
+            "{}连接中断，正在进行第 {next_attempt}/{} 次自动恢复",
+            service_label.trim(),
+            recovery.max_attempts
+        ),
     }
 }
 
@@ -578,6 +794,10 @@ mod tests {
             error_message: None,
             started_at,
             missing_port_checks: 0,
+            desired_running: phase != RuntimePhase::Stopped,
+            recovery_attempt: 0,
+            next_retry_at: None,
+            recovered_count: 0,
         }
     }
 
@@ -613,5 +833,51 @@ mod tests {
         assert!(!should_mark_runtime_error(&mut runtime, false));
         assert!(!should_mark_runtime_error(&mut runtime, true));
         assert!(!should_mark_runtime_error(&mut runtime, false));
+    }
+
+    #[test]
+    fn recovery_delay_uses_bounded_exponential_backoff() {
+        assert_eq!(recovery_delay(0), Duration::from_secs(1));
+        assert_eq!(recovery_delay(1), Duration::from_secs(2));
+        assert_eq!(recovery_delay(2), Duration::from_secs(4));
+        assert_eq!(recovery_delay(4), Duration::from_secs(16));
+        assert_eq!(recovery_delay(8), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn exhausted_recovery_stops_automatic_retries() {
+        let mut supervisor = RuntimeSupervisor::default();
+        let key = ("workspace".to_string(), ServiceKind::Mcp);
+
+        supervisor.record_recovery_failure(
+            &key,
+            MAX_RECOVERY_ATTEMPTS,
+            2,
+            "still unavailable".into(),
+        );
+
+        let entry = supervisor.entries.get(&key).expect("entry");
+        assert_eq!(entry.phase, RuntimePhase::Error);
+        assert!(!entry.desired_running);
+        assert!(entry.next_retry_at.is_none());
+        assert_eq!(entry.recovered_count, 2);
+        assert!(entry
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("5 次"));
+    }
+
+    #[test]
+    fn stalled_starting_entry_is_eligible_for_recovery() {
+        let runtime = entry(
+            RuntimePhase::Starting,
+            Some(std::time::Instant::now() - STARTING_STALL_TIMEOUT - Duration::from_secs(1)),
+        );
+        assert!(starting_stalled(&runtime));
+        assert!(!starting_stalled(&entry(
+            RuntimePhase::Starting,
+            Some(std::time::Instant::now()),
+        )));
     }
 }
