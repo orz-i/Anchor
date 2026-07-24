@@ -16,6 +16,9 @@ impl Platform for WindowsPlatform {
     }
 
     fn app_config_dir(&self) -> AppResult<PathBuf> {
+        if let Some(path) = crate::platform::app_config_dir_override() {
+            return Ok(path);
+        }
         paths::roaming_app_data().map(|dir| dir.join("coding-tools-mcp-desktop"))
     }
 

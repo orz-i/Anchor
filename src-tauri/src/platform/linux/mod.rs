@@ -16,6 +16,9 @@ impl Platform for LinuxPlatform {
     }
 
     fn app_config_dir(&self) -> AppResult<PathBuf> {
+        if let Some(path) = crate::platform::app_config_dir_override() {
+            return Ok(path);
+        }
         let base = dirs::config_dir()
             .or_else(dirs::home_dir)
             .ok_or_else(|| crate::error::AppError::Message("config dir not found".into()))?;

@@ -1,4 +1,7 @@
-use std::sync::Mutex;
+use std::fs::{File, OpenOptions};
+use std::sync::{Mutex, MutexGuard};
+
+use fs2::FileExt;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
@@ -9,6 +12,17 @@ use super::migrate::{data_file_path, load_or_migrate, maybe_backup_legacy_files,
 use super::model::AppData;
 
 static DATA_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+struct DataFileGuard {
+    _process_guard: MutexGuard<'static, ()>,
+    lock_file: File,
+}
+
+impl Drop for DataFileGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
 
 const SHARED_KEYS: &[&str] = &[
     "oauth_client_id",
@@ -229,10 +243,29 @@ impl DataStore {
 
 }
 
-fn lock_data_file() -> AppResult<std::sync::MutexGuard<'static, ()>> {
-    DATA_FILE_LOCK
+fn lock_data_file() -> AppResult<DataFileGuard> {
+    let process_guard = DATA_FILE_LOCK
         .lock()
-        .map_err(|_| AppError::Message("data file lock poisoned".into()))
+        .map_err(|_| AppError::Message("data file lock poisoned".into()))?;
+    let data_path = data_file_path()?;
+    let parent = data_path.parent().ok_or_else(|| {
+        AppError::Message(format!("配置路径缺少父目录：{}", data_path.display()))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let lock_path = parent.join(".profiles.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock_file = options.open(lock_path)?;
+    FileExt::lock_exclusive(&lock_file)?;
+    Ok(DataFileGuard {
+        _process_guard: process_guard,
+        lock_file,
+    })
 }
 
 fn random_secret() -> String {

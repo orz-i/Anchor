@@ -16,6 +16,9 @@ impl Platform for MacPlatform {
     }
 
     fn app_config_dir(&self) -> AppResult<PathBuf> {
+        if let Some(path) = crate::platform::app_config_dir_override() {
+            return Ok(path);
+        }
         let base = dirs::home_dir()
             .ok_or_else(|| crate::error::AppError::Message("home dir not found".into()))?;
         Ok(base

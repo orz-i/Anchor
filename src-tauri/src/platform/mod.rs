@@ -38,6 +38,12 @@ pub trait Platform: Send + Sync {
     fn frpc_candidates(&self) -> Vec<PathBuf>;
 }
 
+pub(crate) fn app_config_dir_override() -> Option<PathBuf> {
+    std::env::var_os("CODING_TOOLS_MCP_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
