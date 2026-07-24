@@ -38,9 +38,9 @@ fn migrate_or_load_secrets_at(
     let had_inline_secrets = !legacy.is_empty();
 
     if has_primary_or_backup(secrets_path) {
-        load_with_backup::<SecretsData>(&secrets_path)?.apply_to(data);
+        load_with_backup::<SecretsData>(secrets_path)?.apply_to(data);
     } else if had_inline_secrets {
-        write_secrets_data(&secrets_path, &legacy)?;
+        write_secrets_data(secrets_path, &legacy)?;
     }
 
     if had_inline_secrets {
@@ -54,6 +54,10 @@ pub fn secrets_file_path() -> AppResult<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::field_reassign_with_default,
+    clippy::items_after_test_module
+)]
 mod tests {
     use super::*;
 

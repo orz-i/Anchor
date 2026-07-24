@@ -476,6 +476,7 @@ fn html_error(message: &str, status: StatusCode) -> Response {
     (status, Html(format!("<h2>Error</h2><p>{message}</p>"))).into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn login_page(
     client_id: &str,
     redirect_uri: &str,
