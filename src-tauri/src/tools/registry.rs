@@ -26,6 +26,30 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "list_skills",
+        "List Agent Skills",
+        "Discover Agent Skills exposed by this workspace/profile. Returns only bounded metadata for progressive disclosure.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "load_skill",
+        "Load Agent Skill",
+        "Load the complete SKILL.md instructions for one discovered skill. Skill scripts are not executed.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "read_skill_resource",
+        "Read Skill resource",
+        "Read a supporting resource or script source inside a discovered Skill directory without executing it.",
+        true,
+        false,
+        false,
+    ),
+    (
         "history_session_bootstrap",
         "Initialize or restore development session",
         "At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
@@ -302,6 +326,9 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
 /// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
 pub const CORE_TOOLS: &[&str] = &[
     "server_info",
+    "list_skills",
+    "load_skill",
+    "read_skill_resource",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -329,6 +356,9 @@ pub const CORE_TOOLS: &[&str] = &[
 
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "server_info",
+    "list_skills",
+    "load_skill",
+    "read_skill_resource",
     "check_exec_environment",
     "get_default_cwd",
     "set_default_cwd",
@@ -351,6 +381,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "harness_status",
     "operation_log",
     "server_info",
+    "list_skills",
+    "load_skill",
+    "read_skill_resource",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -408,6 +441,9 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "harness_status",
     "operation_log",
     "server_info",
+    "list_skills",
+    "load_skill",
+    "read_skill_resource",
     "check_exec_environment",
     "exec_health_check",
     "get_default_cwd",
@@ -496,6 +532,35 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
 
 pub fn input_schema(name: &str) -> Value {
     match name {
+        "list_skills" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Optional case-insensitive name/description filter" },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 }
+            },
+            "additionalProperties": false
+        }),
+        "load_skill" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 262144 }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "read_skill_resource" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "start_line": { "type": "integer", "minimum": 1 },
+                "end_line": { "type": "integer", "minimum": 1 },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 262144 }
+            },
+            "required": ["name", "path"],
+            "additionalProperties": false
+        }),
         "history_session_bootstrap" => json!({
             "type": "object",
             "properties": {
@@ -868,7 +933,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile};
 
     #[test]
-    fn core_catalog_exposes_24_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_27_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -876,8 +941,11 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 27);
         assert_eq!(unique.len(), tools.len());
+        assert!(names.contains(&"list_skills"));
+        assert!(names.contains(&"load_skill"));
+        assert!(names.contains(&"read_skill_resource"));
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"history_session_validate"));

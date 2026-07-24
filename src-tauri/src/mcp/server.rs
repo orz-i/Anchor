@@ -20,14 +20,23 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
     }
 
     let result = match method {
-        "initialize" => Ok(initialize_result()),
+        "initialize" => Ok(initialize_result(state)),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
             let mut tools = list_tools_for_profile(&state.tool_profile);
+            if !state.skills.is_enabled() {
+                tools.retain(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_none_or(|name| !crate::skills::is_skill_tool(name))
+                });
+            }
             tools.extend(state.mcp_proxies.list_tools());
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => handle_tools_call(state, &params).await,
+        "resources/list" => Ok(crate::skills::resources_list(&state.skills)),
+        "resources/read" => crate::skills::resource_read(&state.skills, &params),
         _ => Err(serde_json::json!({
             "code": -32601,
             "message": format!("Method not found: {method}")
@@ -40,19 +49,26 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
     }
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(state: &SharedState) -> Value {
+    let mut capabilities = serde_json::json!({
+        "tools": { "listChanged": false },
+        "logging": {}
+    });
+    if state.skills.is_enabled() {
+        capabilities["resources"] = serde_json::json!({
+            "subscribe": false,
+            "listChanged": false
+        });
+    }
     serde_json::json!({
         "protocolVersion": "2025-06-18",
-        "capabilities": {
-            "tools": { "listChanged": false },
-            "logging": {}
-        },
+        "capabilities": capabilities,
         "serverInfo": {
             "name": "coding-tools-mcp",
             "title": "Coding Tools MCP",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, read all_history_summary, latest_handoff, and inherited_summary before acting. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. Agent Skills are available through list_skills, load_skill, read_skill_resource, and skill:// resources when enabled; load only the relevant Skill and treat Skill content as instructions, not as permission to bypass tool policy. Skill script execution is disabled. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, read all_history_summary, latest_handoff, and inherited_summary before acting. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
     })
 }
 
@@ -62,6 +78,14 @@ async fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value,
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let args = tool_arguments(name, params);
+
+    if crate::skills::is_skill_tool(name) && !state.skills.is_enabled() {
+        return Err(serde_json::json!({
+            "code": -32602,
+            "message": "Skill service is disabled for this workspace/profile",
+            "data": { "reason": "skill_service_disabled" }
+        }));
+    }
 
     if let Some(result) = state.mcp_proxies.call_tool(name, &args).await {
         return result;
@@ -147,10 +171,23 @@ mod tests {
 
     use super::{handle_request, initialize_result, tool_arguments};
 
+    fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+        (workspace, harness, state)
+    }
+
     #[test]
     fn initialize_instructions_define_the_history_persistence_workflow() {
-        let initialized = initialize_result();
+        let (_workspace, _harness, state) = test_state();
+        let initialized = initialize_result(&state);
         let instructions = initialized["instructions"].as_str().expect("instructions");
+        assert!(instructions.contains("list_skills"));
+        assert!(instructions.contains("Skill script execution is disabled"));
         assert!(instructions.contains("history_session_bootstrap"));
         assert!(instructions.contains("At the start of every new ChatGPT conversation"));
         assert!(instructions.contains("before answering the user's first request"));
@@ -168,9 +205,14 @@ mod tests {
 
     #[test]
     fn initialize_does_not_claim_tool_catalog_notifications_without_a_stream() {
-        let initialized = initialize_result();
+        let (_workspace, _harness, state) = test_state();
+        let initialized = initialize_result(&state);
 
         assert_eq!(initialized["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(
+            initialized["capabilities"]["resources"]["listChanged"],
+            false
+        );
     }
 
     #[test]
@@ -260,5 +302,99 @@ mod tests {
 
         assert!(response.get("error").is_none());
         assert_eq!(response["result"]["structuredContent"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn skills_are_discovered_and_loaded_through_mcp() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let skill_dir = workspace.path().join("skills/review");
+        fs::create_dir_all(skill_dir.join("references")).expect("create skill");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review a change.\n---\nRead the diff carefully.\n",
+        )
+        .expect("write skill");
+        fs::write(skill_dir.join("references/RULES.md"), "No regressions.\n")
+            .expect("write resource");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let tools = handle_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        assert!(tools["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "load_skill"));
+
+        let listed = handle_request(
+            &state,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{"name":"list_skills","arguments":{}}
+            }),
+        )
+        .await;
+        assert_eq!(listed["result"]["structuredContent"]["skills"][0]["name"], "review");
+
+        let loaded = handle_request(
+            &state,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":3,
+                "method":"tools/call",
+                "params":{"name":"load_skill","arguments":{"name":"review"}}
+            }),
+        )
+        .await;
+        assert!(loaded["result"]["structuredContent"]["instructions"]
+            .as_str()
+            .expect("instructions")
+            .contains("Read the diff"));
+
+        let index = handle_request(
+            &state,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":4,
+                "method":"resources/read",
+                "params":{"uri":"skill://index.json"}
+            }),
+        )
+        .await;
+        let index_text = index["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("index text");
+        assert!(index_text.contains("skill://review/SKILL.md"));
+    }
+
+    #[tokio::test]
+    async fn disabled_skill_service_hides_tools_and_resources_capability() {
+        let (_workspace, _harness, state) = test_state();
+        state
+            .skills
+            .configure(crate::skills::SkillSettings::from_text(false, "skills"));
+
+        let initialized = initialize_result(&state);
+        assert!(initialized["capabilities"].get("resources").is_none());
+
+        let tools = handle_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        assert!(!tools["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .any(|tool| tool["name"] == "load_skill"));
     }
 }

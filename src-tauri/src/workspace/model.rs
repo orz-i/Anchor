@@ -65,6 +65,12 @@ pub struct RuntimeConfig {
     pub workspace_local_entries: bool,
     #[serde(default = "default_workspace_script_extensions")]
     pub workspace_script_extensions: String,
+    /// Expose Agent Skills from configured directories through MCP tools/resources.
+    #[serde(default = "default_skill_service_enabled")]
+    pub skill_service_enabled: bool,
+    /// Newline-separated Skill roots. Relative paths resolve from the workspace root.
+    #[serde(default = "default_skill_roots")]
+    pub skill_roots: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +187,14 @@ fn default_workspace_script_extensions() -> String {
     ".exe,.bat,.cmd,.ps1".to_string()
 }
 
+fn default_skill_service_enabled() -> bool {
+    true
+}
+
+fn default_skill_roots() -> String {
+    ".agents/skills\n.codex/skills\nskills".to_string()
+}
+
 fn default_max_patch_bytes() -> u32 {
     200_000
 }
@@ -221,6 +235,8 @@ impl Default for RuntimeConfig {
             allowed_commands: default_allowed_commands(),
             workspace_local_entries: default_workspace_local_entries(),
             workspace_script_extensions: default_workspace_script_extensions(),
+            skill_service_enabled: default_skill_service_enabled(),
+            skill_roots: default_skill_roots(),
         }
     }
 }
@@ -380,4 +396,21 @@ fn computed_public_url(
         }
     }
     public_url.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeConfig;
+
+    #[test]
+    fn legacy_runtime_config_enables_default_skill_roots() {
+        let runtime: RuntimeConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("legacy runtime config");
+
+        assert!(runtime.skill_service_enabled);
+        assert_eq!(
+            runtime.skill_roots,
+            ".agents/skills\n.codex/skills\nskills"
+        );
+    }
 }

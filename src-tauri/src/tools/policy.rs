@@ -189,7 +189,7 @@ pub fn validate_tool_arguments_for_workspace(
 
 /// Actions OpenAPI 暴露层校验：仅限制「能否调用」，不参与执行逻辑。
 pub fn validate_actions_exposure(tool_name: &str) -> Result<(), PolicyError> {
-    if is_allowed_tool(tool_name) {
+    if is_allowed_tool(tool_name) && !crate::skills::is_skill_tool(tool_name) {
         Ok(())
     } else {
         Err(PolicyError(format!("Tool is not exposed: {tool_name}")))
@@ -578,5 +578,16 @@ mod tests {
         )
         .is_err());
         assert!(validate_command(&json!({"cmd": "echo hello > output.txt"}), &policy).is_err());
+    }
+
+    #[test]
+    fn actions_exposure_rejects_mcp_skill_tools() {
+        assert!(validate_actions_exposure("read_file").is_ok());
+        for name in crate::skills::TOOL_NAMES {
+            assert!(
+                validate_actions_exposure(name).is_err(),
+                "{name} must remain MCP-only"
+            );
+        }
     }
 }

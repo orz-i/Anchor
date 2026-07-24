@@ -68,6 +68,10 @@ pub fn spawn_listener(
         runtime.tool_profile.clone(),
         runtime.permission_mode.clone(),
     );
+    mcp.skills.configure(crate::skills::SkillSettings::from_text(
+        runtime.skill_service_enabled,
+        &runtime.skill_roots,
+    ));
     let bearer_token = if auth.bearer_enabled() {
         let key = "bearer_token";
         if auth.use_shared_secrets {

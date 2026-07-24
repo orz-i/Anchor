@@ -115,6 +115,11 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
         "history_session_validate" => history::validate(ctx, &effective_args),
         "server_info" => server_info(ctx),
+        "list_skills" => crate::skills::list_tool(&ctx.skills, &effective_args),
+        "load_skill" => crate::skills::load_tool(&ctx.skills, &effective_args),
+        "read_skill_resource" => {
+            crate::skills::read_resource_tool(&ctx.skills, &effective_args)
+        }
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),
         "get_default_cwd" => get_default_cwd(ctx),

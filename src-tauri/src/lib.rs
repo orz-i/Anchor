@@ -22,6 +22,7 @@ mod platform;
 mod runtime;
 mod secret;
 mod settings;
+mod skills;
 pub mod tools;
 mod tunnel;
 mod workspace;
@@ -32,8 +33,8 @@ use app_state::AppState;
 use commands::{
     create_workspace, delete_frp_profile, delete_workspace, get_actions_runtime_status,
     get_app_settings, get_download_config, get_frp_snippet, get_last_workspace_id, get_proxy,
-    get_runtime_status, get_shared_secret, get_workspace_secret, install_software,
-    list_frp_profiles, list_software, list_workspaces, open_workspace_directory,
+    get_runtime_status, get_shared_secret, get_workspace_secret, inspect_workspace_skills,
+    install_software, list_frp_profiles, list_software, list_workspaces, open_workspace_directory,
     read_workspace_logs, regenerate_shared_secret, regenerate_workspace_secret,
     restart_actions_runtime, restart_runtime, restart_tunnel, run_health_checks, save_frp_profile,
     set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
@@ -89,6 +90,7 @@ pub fn run() {
             list_workspaces,
             create_workspace,
             update_workspace,
+            inspect_workspace_skills,
             open_workspace_directory,
             delete_workspace,
             start_runtime,

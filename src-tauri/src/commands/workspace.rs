@@ -17,6 +17,24 @@ pub fn list_workspaces(state: State<'_, AppState>) -> AppResult<Vec<WorkspacePro
 }
 
 #[tauri::command]
+pub fn inspect_workspace_skills(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+    roots: String,
+) -> AppResult<serde_json::Value> {
+    let profile = state.with_workspaces(|store| {
+        store
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
+    })?;
+    let catalog = crate::skills::SkillCatalog::new(PathBuf::from(profile.path));
+    catalog.configure(crate::skills::SkillSettings::from_text(enabled, &roots));
+    Ok(serde_json::to_value(catalog.list(None, 200))?)
+}
+
+#[tauri::command]
 pub fn create_workspace(
     state: State<'_, AppState>,
     path: String,
