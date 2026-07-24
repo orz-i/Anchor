@@ -295,6 +295,12 @@ pnpm cli:build
 
 CLI 不会接管已被 GUI 占用的端口。后台运行建议交给 systemd，完整说明见 [Linux CLI 使用指南](docs/linux-cli.md)。
 
+### 通过 MCP 提请 Agent Skill
+
+每个 workspace/profile 可以配置一个或多个 Agent Skills 根目录。MCP 客户端可先调用 `list_skills` 获取有界元数据，再调用 `load_skill` 加载完整 `SKILL.md`，或通过 `read_skill_resource` / `skill://` 读取关联资源。Skill 脚本不会被服务器执行。
+
+默认扫描 `.agents/skills`、`.codex/skills` 和 `skills`。在 workspace 的 **MCP → 配置 → Agent Skills** 中可以扫描预览并保存目录。完整格式、协议和安全边界见 [MCP Agent Skills 服务](docs/skill-service.md)。
+
 ## 项目结构
 
 | 路径 | 作用 |

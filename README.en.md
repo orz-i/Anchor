@@ -287,6 +287,12 @@ pnpm cli:build
 
 The CLI will not take over a port already used by the GUI. Use systemd for background supervision; see the [Linux CLI guide](docs/linux-cli.md).
 
+### Request Agent Skills through MCP
+
+Each workspace/profile can expose one or more Agent Skills roots. MCP clients can call `list_skills` for bounded metadata, `load_skill` for the complete `SKILL.md`, and `read_skill_resource` or `skill://` resources for supporting files. The server does not execute Skill scripts.
+
+The default roots are `.agents/skills`, `.codex/skills`, and `skills`. Configure and preview them under **MCP → Configuration → Agent Skills**. See the [MCP Agent Skills service guide](docs/skill-service.md) for the format, protocol, and security boundaries.
+
 ## Project layout
 
 | Path | Purpose |

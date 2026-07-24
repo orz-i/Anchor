@@ -122,3 +122,13 @@ sudo loginctl enable-linger "$USER"
 - 不要同时用 GUI 和 CLI 启动同一个 workspace 的同一种服务；端口检查会阻止重复启动。
 - CLI 默认不启动隧道，只有显式传入 `--tunnel` 才使用 profile 中已保存的隧道配置。
 - 修改配置后，应重启负责运行该 workspace 的 GUI 服务或 systemd 服务。
+
+## Agent Skills
+
+Linux CLI 启动 MCP 时会读取同一个 WorkspaceProfile 中的 Skill 服务配置，不需要额外参数：
+
+```bash
+coding-tools-mcp serve PROFILE_ID --service mcp
+```
+
+确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 将提供 `list_skills`、`load_skill`、`read_skill_resource` 和 `skill://` resources；Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
