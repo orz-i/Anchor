@@ -59,7 +59,7 @@ pub fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()>
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })?;
-    tauri::async_runtime::block_on(drop_tunnel_workspace(&id))?;
+    crate::async_runtime::block_on(drop_tunnel_workspace(&id))?;
     state.with_runtime(|runtime| {
         runtime.drop_workspace(&profile);
         Ok(())

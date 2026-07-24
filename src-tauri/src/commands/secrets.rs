@@ -165,7 +165,7 @@ fn schedule_running_services_restart(
     key: String,
     shared: bool,
 ) {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         for profile in &profiles {
             restart_running_services(state.inner(), profile, &key, shared);

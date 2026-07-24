@@ -67,7 +67,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
     let stdin_text = args.get("stdin").and_then(Value::as_str).unwrap_or("");
 
-    let result = tauri::async_runtime::block_on(async {
+    let result = crate::async_runtime::block_on(async {
         run_command(
             ctx,
             cmd,
@@ -327,7 +327,7 @@ async fn run_command(
 }
 
 fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant) {
-    tauri::async_runtime::spawn(async move {
+    crate::async_runtime::spawn(async move {
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::time::sleep(remaining).await;
         session.refresh_status().await;
@@ -348,7 +348,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     #[cfg(not(windows))]
     let probe = r#"sh -c "printf exec-health; printf exec-health-stderr >&2""#;
 
-    let result = tauri::async_runtime::block_on(run_command(
+    let result = crate::async_runtime::block_on(run_command(
         ctx,
         probe,
         &cwd,

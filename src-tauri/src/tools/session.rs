@@ -68,7 +68,7 @@ pub struct ExecSession {
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
     termination_reason: Mutex<Option<String>>,
-    reader_tasks: AsyncMutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    reader_tasks: AsyncMutex<Vec<crate::async_runtime::JoinHandle<()>>>,
 }
 
 impl ExecSession {
@@ -109,14 +109,14 @@ impl ExecSession {
         };
         if let Some(stream) = stdout {
             let session = Arc::clone(self);
-            let task = tauri::async_runtime::spawn(async move {
+            let task = crate::async_runtime::spawn(async move {
                 session.read_stream(stream, true).await;
             });
             self.reader_tasks.lock().await.push(task);
         }
         if let Some(stream) = stderr {
             let session = Arc::clone(self);
-            let task = tauri::async_runtime::spawn(async move {
+            let task = crate::async_runtime::spawn(async move {
                 session.read_stream(stream, false).await;
             });
             self.reader_tasks.lock().await.push(task);
@@ -309,7 +309,7 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         ));
     }
     let session = store.get(session_id)?;
-    tauri::async_runtime::block_on(session.refresh_status());
+    crate::async_runtime::block_on(session.refresh_status());
 
     let requested_stream = args.get("stream").and_then(Value::as_str).unwrap_or("");
     let stream = if ref_stream == "stdout" || ref_stream == "stderr" {
@@ -367,7 +367,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         .and_then(Value::as_u64)
         .unwrap_or(65_536) as usize;
 
-    let running = tauri::async_runtime::block_on(session.is_running());
+    let running = crate::async_runtime::block_on(session.is_running());
     if !running {
         if !chars.is_empty() {
             return Err(WorkspaceError::Tool {
@@ -381,7 +381,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     }
 
     if !chars.is_empty() {
-        let mut stdin_guard = tauri::async_runtime::block_on(session.stdin.lock());
+        let mut stdin_guard = crate::async_runtime::block_on(session.stdin.lock());
         let stdin = stdin_guard.as_mut().ok_or_else(|| WorkspaceError::Tool {
             code: "SESSION_CLOSED",
             message: "Session stdin is closed.".into(),
@@ -389,7 +389,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
             retryable: false,
         })?;
         use tokio::io::AsyncWriteExt;
-        tauri::async_runtime::block_on(async {
+        crate::async_runtime::block_on(async {
             stdin
                 .write_all(chars.as_bytes())
                 .await
@@ -400,7 +400,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
                     retryable: false,
                 })
         })?;
-        let _ = tauri::async_runtime::block_on(stdin.flush());
+        let _ = crate::async_runtime::block_on(stdin.flush());
     }
 
     let yield_ms = args
@@ -409,7 +409,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         .unwrap_or(1000)
         .min(30_000);
     std::thread::sleep(std::time::Duration::from_millis(yield_ms));
-    tauri::async_runtime::block_on(session.refresh_status());
+    crate::async_runtime::block_on(session.refresh_status());
     Ok(tool_ok(session.snapshot(max_output_bytes)))
 }
 
@@ -430,14 +430,14 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         .min(30_000);
     let signal = args.get("signal").and_then(Value::as_str).unwrap_or("TERM");
 
-    let running = tauri::async_runtime::block_on(session.is_running());
+    let running = crate::async_runtime::block_on(session.is_running());
     let mut killed = false;
     let mut status = "exited";
     let mut evicted = true;
 
     if running {
         session.mark_termination_reason("killed");
-        tauri::async_runtime::block_on(async {
+        crate::async_runtime::block_on(async {
             let pid = {
                 let child = session.child.lock().await;
                 child.id()
@@ -454,8 +454,8 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
             })
             .await;
         });
-        tauri::async_runtime::block_on(session.refresh_status());
-        if tauri::async_runtime::block_on(session.is_running()) {
+        crate::async_runtime::block_on(session.refresh_status());
+        if crate::async_runtime::block_on(session.is_running()) {
             status = "terminating";
             evicted = false;
         } else {

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", test))]
 use std::path::Path;
 
-use tauri::async_runtime::JoinHandle;
+use crate::async_runtime::JoinHandle;
 
 use crate::platform::platform;
 
@@ -197,7 +197,7 @@ pub fn await_listener_shutdown_blocking(handle: Option<JoinHandle<()>>, port: u1
         if !port_free {
             handle.abort();
         }
-        tauri::async_runtime::spawn(async move {
+        crate::async_runtime::spawn(async move {
             let _ = handle.await;
         });
     } else if !wait_for_port_free_blocking(port, Duration::from_secs(5)) {

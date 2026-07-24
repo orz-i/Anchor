@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tauri::async_runtime::JoinHandle;
+use crate::async_runtime::JoinHandle;
 
 use crate::actions;
 use crate::error::AppResult;
@@ -437,7 +437,7 @@ impl RuntimeSupervisor {
                 if should_mark_runtime_error(entry, listening) {
                     if let Some(handle) = entry.handle.take() {
                         handle.abort();
-                        tauri::async_runtime::spawn(async move {
+                        crate::async_runtime::spawn(async move {
                             let _ = handle.await;
                         });
                     }
@@ -483,7 +483,7 @@ impl RuntimeSupervisor {
         };
 
         let profile = profile.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::async_runtime::spawn(async move {
             if let Err(error) = cleanup_orphan_for_runtime(&profile, tunnel_kind, false).await {
                 append_profile_log(
                     &profile.id,

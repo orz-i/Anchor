@@ -53,7 +53,7 @@ pub fn spawn_listener(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     policy: PolicySettings,
-) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
+) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
     if auth_type == "api_key" && api_key.as_ref().is_none_or(String::is_empty) {
         return Err("Actions API key is not configured".into());
     }
@@ -88,7 +88,7 @@ pub fn spawn_listener(
     let listener = bind_listener(actions_port)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = workspace_id.to_string();
-    let handle = tauri::async_runtime::spawn(async move {
+    let handle = crate::async_runtime::spawn(async move {
         let result = serve(
             listener,
             actions_port,

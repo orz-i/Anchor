@@ -1,8 +1,17 @@
 #![cfg_attr(target_os = "windows", allow(linker_messages))]
+#![cfg_attr(
+    all(feature = "cli", not(feature = "desktop")),
+    allow(dead_code, unused_imports)
+)]
 
 mod actions;
+#[cfg(feature = "desktop")]
 mod app_state;
+mod async_runtime;
 mod auth;
+#[cfg(feature = "cli")]
+pub mod cli;
+#[cfg(feature = "desktop")]
 mod commands;
 mod data;
 mod error;
@@ -17,7 +26,9 @@ pub mod tools;
 mod tunnel;
 mod workspace;
 
+#[cfg(feature = "desktop")]
 use app_state::AppState;
+#[cfg(feature = "desktop")]
 use commands::{
     create_workspace, delete_frp_profile, delete_workspace, get_actions_runtime_status,
     get_app_settings, get_download_config, get_frp_snippet, get_last_workspace_id, get_proxy,
@@ -29,9 +40,10 @@ use commands::{
     start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
     stop_tunnel, test_tunnel, uninstall_software, update_workspace,
 };
+#[cfg(feature = "desktop")]
 use tauri::Manager;
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "desktop", target_os = "windows"))]
 fn acquire_single_instance() -> bool {
     use windows::core::w;
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
@@ -56,12 +68,13 @@ fn acquire_single_instance() -> bool {
     true
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(feature = "desktop", not(target_os = "windows")))]
 fn acquire_single_instance() -> bool {
     true
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(feature = "desktop")]
 pub fn run() {
     if !acquire_single_instance() {
         return;

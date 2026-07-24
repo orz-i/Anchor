@@ -56,7 +56,7 @@ pub fn spawn_listener(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
-) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
+) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
     let workspace_display = workspace_path.display().to_string();
     let proxy_specs = parse_mcp_proxy_config(&runtime.mcp_config, &workspace_path)?;
     let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
@@ -113,7 +113,7 @@ pub fn spawn_listener(
     let listener = bind_listener(port)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = state.workspace_id.clone();
-    let handle = tauri::async_runtime::spawn(async move {
+    let handle = crate::async_runtime::spawn(async move {
         let result = serve(listener, port, state, shutdown_rx).await;
         if let Err(err) = &result {
             append_profile_log(
