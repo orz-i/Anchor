@@ -10,6 +10,7 @@
   const colorClass: Record<RuntimeState, string> = {
     running: "bg-[var(--color-success)]",
     starting: "bg-[var(--color-warning)]",
+    recovering: "bg-[var(--color-warning)]",
     stopping: "bg-[var(--color-warning)]",
     stopped: "bg-[var(--color-text-muted)]",
     error: "bg-[var(--color-error)]",

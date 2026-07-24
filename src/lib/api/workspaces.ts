@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import { invokeRead } from "$lib/api/invoke";
 import type { RuntimeStatus, SkillInspection, WorkspaceProfile } from "$lib/types";
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
-  return invoke<WorkspaceProfile[]>("list_workspaces");
+  return invokeRead<WorkspaceProfile[]>("list_workspaces");
 }
 
 export async function createWorkspace(
@@ -21,7 +22,7 @@ export async function inspectWorkspaceSkills(
   enabled: boolean,
   roots: string,
 ): Promise<SkillInspection> {
-  return invoke<SkillInspection>("inspect_workspace_skills", { id, enabled, roots });
+  return invokeRead<SkillInspection>("inspect_workspace_skills", { id, enabled, roots });
 }
 
 export async function openWorkspaceDirectory(path: string): Promise<void> {
@@ -41,7 +42,7 @@ export async function stopRuntime(id: string): Promise<RuntimeStatus> {
 }
 
 export async function getRuntimeStatus(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("get_runtime_status", { id });
+  return invokeRead<RuntimeStatus>("get_runtime_status", { id });
 }
 
 export async function startActionsRuntime(id: string): Promise<RuntimeStatus> {
@@ -53,7 +54,7 @@ export async function stopActionsRuntime(id: string): Promise<RuntimeStatus> {
 }
 
 export async function getActionsRuntimeStatus(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("get_actions_runtime_status", { id });
+  return invokeRead<RuntimeStatus>("get_actions_runtime_status", { id });
 }
 
 export async function restartRuntime(id: string): Promise<RuntimeStatus> {

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { invokeRead } from "$lib/api/invoke";
 
 export interface FrpProfileDto {
   id: string;
@@ -16,7 +17,7 @@ export interface FrpProfileInput {
 }
 
 export async function listFrpProfiles(): Promise<FrpProfileDto[]> {
-  return invoke<FrpProfileDto[]>("list_frp_profiles");
+  return invokeRead<FrpProfileDto[]>("list_frp_profiles");
 }
 
 export async function saveFrpProfile(
@@ -27,7 +28,7 @@ export async function saveFrpProfile(
 }
 
 export async function getLastWorkspaceId(): Promise<string> {
-  return invoke<string>("get_last_workspace_id");
+  return invokeRead<string>("get_last_workspace_id");
 }
 
 export async function setLastWorkspace(id: string): Promise<void> {
@@ -44,7 +45,7 @@ export interface ProxyConfigDto {
 }
 
 export async function getProxy(): Promise<ProxyConfigDto> {
-  return invoke<ProxyConfigDto>("get_proxy");
+  return invokeRead<ProxyConfigDto>("get_proxy");
 }
 
 export async function setProxy(proxy: ProxyConfigDto): Promise<void> {

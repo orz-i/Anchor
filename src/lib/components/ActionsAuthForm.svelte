@@ -259,6 +259,11 @@
       在 GPT Actions 认证里选 API Key → Bearer，Key 填这里的值。
     </p>
   {:else if showOAuth}
+    <div class="tx-alert tx-alert--warning" role="note">
+      OAuth 访问令牌有效期为 1 小时；Refresh Token 每次续约都会轮换并重新获得 90 天有效期。超过 90
+      天未续约，或重新生成 OAuth Token Secret 后，现有连接需要重新授权。
+    </div>
+
     <label class="grid gap-1">
       <span class="text-xs text-[var(--color-text-muted)]">OAuth Client ID（填到 GPT）</span>
       <div class="flex gap-2">

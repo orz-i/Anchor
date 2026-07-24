@@ -1,13 +1,23 @@
 <script lang="ts">
   import CopyButton from "$lib/components/CopyButton.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
-  import type { RuntimeState } from "$lib/types";
+  import type { RuntimeRecovery, RuntimeState } from "$lib/types";
+
+  const EMPTY_RECOVERY: RuntimeRecovery = {
+    enabled: false,
+    attempt: 0,
+    maxAttempts: 5,
+    retryInMs: null,
+    recoveredCount: 0,
+    lastError: "",
+  };
 
   interface Props {
     title: string;
     subtitle: string;
     status: RuntimeState;
     statusMessage?: string;
+    recovery?: RuntimeRecovery;
     port: number;
     portEditable?: boolean;
     busy?: boolean;
@@ -24,6 +34,7 @@
     subtitle,
     status,
     statusMessage = "",
+    recovery = EMPTY_RECOVERY,
     port,
     portEditable = false,
     busy = false,
@@ -42,8 +53,14 @@
   });
 
   const running = $derived(status === "running");
+  const recovering = $derived(status === "recovering");
   const showError = $derived(status === "error" && Boolean(statusMessage));
-  const canEditPort = $derived(portEditable && !running && status !== "starting");
+  const canEditPort = $derived(
+    portEditable && !running && !recovering && status !== "starting" && status !== "stopping",
+  );
+  const retrySeconds = $derived(
+    recovery.retryInMs === null ? null : Math.max(1, Math.ceil(recovery.retryInMs / 1000)),
+  );
   const tunnelEnabled = $derived(tunnelType === "cloudflare" || tunnelType === "frp");
   const tunnelLabel = $derived(
     tunnelType === "cloudflare" ? "Cloudflare" : tunnelType === "frp" ? "FRP" : "",
@@ -72,6 +89,11 @@
           {tunnelLabel} 隧道随服务自动连接，停止服务时一并断开
         </p>
       {/if}
+      {#if running && recovery.recoveredCount > 0}
+        <p class="mt-1 text-xs text-[var(--color-success)]">
+          已自动恢复 {recovery.recoveredCount} 次
+        </p>
+      {/if}
     </div>
     <button
       type="button"
@@ -84,6 +106,8 @@
         处理中…
       {:else if running}
         停止
+      {:else if recovering}
+        立即重试
       {:else}
         启动
       {/if}
@@ -93,6 +117,21 @@
   {#if showError}
     <div class="tx-alert tx-alert--error mt-4" role="alert">
       {statusMessage}
+    </div>
+  {/if}
+
+  {#if recovering}
+    <div class="tx-alert tx-alert--warning mt-4" role="status">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <span>{statusMessage || "连接中断，正在自动恢复"}</span>
+        <span class="text-xs opacity-80">
+          {#if retrySeconds !== null}
+            {retrySeconds}s 后重试
+          {:else}
+            第 {Math.min(recovery.attempt + 1, recovery.maxAttempts)}/{recovery.maxAttempts} 次
+          {/if}
+        </span>
+      </div>
     </div>
   {/if}
 

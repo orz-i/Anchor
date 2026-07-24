@@ -169,6 +169,11 @@
   </label>
 
   {#if showOAuth}
+    <div class="tx-alert tx-alert--warning" role="note">
+      OAuth 访问令牌有效期为 1 小时；Refresh Token 每次续约都会轮换并重新获得 90 天有效期。超过 90
+      天未续约，或重新生成 Token Secret 后，客户端需要重新授权。
+    </div>
+
     <label class="grid gap-1">
       <span class="text-xs text-[var(--color-text-muted)]">OAuth 客户端 ID</span>
       <input

@@ -1,4 +1,10 @@
-export type RuntimeState = "stopped" | "starting" | "running" | "stopping" | "error";
+export type RuntimeState =
+  | "stopped"
+  | "starting"
+  | "running"
+  | "recovering"
+  | "stopping"
+  | "error";
 
 export const DEFAULT_SERVICE_PORT = 28766;
 export const DEFAULT_ACTIONS_PORT = 8787;
@@ -102,6 +108,16 @@ export interface RuntimeStatus {
   publicMessage: string;
   localEndpoint: string;
   publicEndpoint: string;
+  recovery: RuntimeRecovery;
+}
+
+export interface RuntimeRecovery {
+  enabled: boolean;
+  attempt: number;
+  maxAttempts: number;
+  retryInMs: number | null;
+  recoveredCount: number;
+  lastError: string;
 }
 
 export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {

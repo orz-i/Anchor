@@ -54,18 +54,32 @@
     mcpLocalEndpoint,
     type AuthConfig,
     type ActionsAuthDraft,
+    type RuntimeRecovery,
+    type RuntimeStatus,
     type RuntimeState,
     type WorkspaceProfile,
   } from "$lib/types";
 
   type ServiceTab = "mcp" | "actions";
   type SubTab = "config" | "logs" | "health";
+  type BackendConnectionState = "connected" | "checking" | "recovering" | "offline";
+
+  const EMPTY_RECOVERY: RuntimeRecovery = {
+    enabled: false,
+    attempt: 0,
+    maxAttempts: 5,
+    retryInMs: null,
+    recoveredCount: 0,
+    lastError: "",
+  };
 
   let profile = $state<WorkspaceProfile | null>(null);
   let mcpStatus = $state<RuntimeState>("stopped");
   let actionsStatus = $state<RuntimeState>("stopped");
   let mcpStatusMessage = $state("");
   let actionsStatusMessage = $state("");
+  let mcpRecovery = $state<RuntimeRecovery>({ ...EMPTY_RECOVERY });
+  let actionsRecovery = $state<RuntimeRecovery>({ ...EMPTY_RECOVERY });
   let mcpBusy = $state(false);
   let actionsBusy = $state(false);
   let mcpLocal = $state("");
@@ -73,6 +87,11 @@
   let actionsLocal = $state("");
   let actionsPublic = $state("");
   let frpProfiles = $state<FrpProfileDto[]>([]);
+  let backendConnection = $state<BackendConnectionState>("checking");
+  let backendFailures = $state(0);
+  let lastBackendSuccess = $state<number | null>(null);
+  let statusPolling = $state(false);
+  let statusPollTimer: number | null = null;
 
   let activeService = $state<ServiceTab>("mcp");
   let mcpSubTab = $state<SubTab>("config");
@@ -116,6 +135,8 @@
         return "运行中";
       case "starting":
         return "启动中";
+      case "recovering":
+        return "恢复中";
       case "stopping":
         return "停止中";
       case "error":
@@ -125,32 +146,137 @@
     }
   }
 
-  function applyMcpRuntime(
-    runtime: { state: RuntimeState; localEndpoint: string; publicEndpoint: string; localMessage?: string },
-    id = workspaceId,
-  ) {
+  function lastSyncLabel(): string {
+    if (lastBackendSuccess === null) return "尚未成功同步";
+    return `上次同步 ${new Date(lastBackendSuccess).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    })}`;
+  }
+
+  function applyMcpRuntime(runtime: RuntimeStatus, id = workspaceId) {
     if (!id || id !== workspaceId) return;
+    const previous = mcpStatus;
     mcpStatus = runtime.state;
     mcpStatusMessage = runtime.localMessage ?? "";
+    mcpRecovery = runtime.recovery ?? { ...EMPTY_RECOVERY };
     mcpLocal = runtime.localEndpoint;
     mcpPublic = runtime.publicEndpoint;
     mcpRuntimeStates.update((current) => ({ ...current, [id]: runtime.state }));
+    if (previous === "recovering" && runtime.state === "running") {
+      showToast("MCP 连接已自动恢复", { title: "连接已恢复", kind: "success" });
+    }
   }
 
-  function applyActionsRuntime(runtime: {
-    state: RuntimeState;
-    localEndpoint: string;
-    publicEndpoint: string;
-    localMessage?: string;
-  },
-    id = workspaceId,
-  ) {
+  function applyActionsRuntime(runtime: RuntimeStatus, id = workspaceId) {
     if (!id || id !== workspaceId) return;
+    const previous = actionsStatus;
     actionsStatus = runtime.state;
     actionsStatusMessage = runtime.localMessage ?? "";
+    actionsRecovery = runtime.recovery ?? { ...EMPTY_RECOVERY };
     actionsLocal = runtime.localEndpoint;
     actionsPublic = runtime.publicEndpoint;
     actionsRuntimeStates.update((current) => ({ ...current, [id]: runtime.state }));
+    if (previous === "recovering" && runtime.state === "running") {
+      showToast("Actions 连接已自动恢复", { title: "连接已恢复", kind: "success" });
+    }
+  }
+
+  function nextStatusPollDelay(): number {
+    if (backendFailures === 0) return 5_000;
+    return Math.min(15_000, 1_000 * 2 ** Math.min(backendFailures - 1, 4));
+  }
+
+  function scheduleStatusPoll(id: string, delay = nextStatusPollDelay()) {
+    if (statusPollTimer !== null) window.clearTimeout(statusPollTimer);
+    statusPollTimer = window.setTimeout(() => {
+      statusPollTimer = null;
+      if (document.hidden) return;
+      if (profile) {
+        void pollRuntimeStatus(id);
+      } else {
+        void initializeWorkspace(id);
+      }
+    }, delay);
+  }
+
+  async function pollRuntimeStatus(id = workspaceId) {
+    if (!id || id !== workspaceId || statusPolling || document.hidden) return;
+    statusPolling = true;
+    if (backendFailures > 0) backendConnection = "recovering";
+    try {
+      const [mcpResult, actionsResult] = await Promise.allSettled([
+        getRuntimeStatus(id),
+        getActionsRuntimeStatus(id),
+      ]);
+      if (id !== workspaceId) return;
+      let succeeded = false;
+      if (mcpResult.status === "fulfilled") {
+        applyMcpRuntime(mcpResult.value, id);
+        succeeded = true;
+      }
+      if (actionsResult.status === "fulfilled") {
+        applyActionsRuntime(actionsResult.value, id);
+        succeeded = true;
+      }
+      if (succeeded) {
+        const wasDisconnected = backendFailures > 0;
+        backendFailures = 0;
+        backendConnection = "connected";
+        lastBackendSuccess = Date.now();
+        if (wasDisconnected) {
+          showToast("后台连接已恢复，状态已同步", {
+            title: "应用已重新连接",
+            kind: "success",
+          });
+        }
+      } else {
+        backendFailures += 1;
+        backendConnection = backendFailures >= 3 ? "offline" : "recovering";
+      }
+    } finally {
+      statusPolling = false;
+      if (id === workspaceId) scheduleStatusPoll(id);
+    }
+  }
+
+  async function initializeWorkspace(id: string) {
+    if (statusPolling || id !== workspaceId) return;
+    statusPolling = true;
+    backendConnection = "checking";
+    try {
+      await load(id);
+      if (id !== workspaceId) return;
+      backendFailures = 0;
+      backendConnection = "connected";
+      lastBackendSuccess = Date.now();
+    } catch (error) {
+      if (id !== workspaceId) return;
+      const previousFailures = backendFailures;
+      backendFailures += 1;
+      backendConnection = backendFailures >= 3 ? "offline" : "recovering";
+      if (previousFailures === 0 || backendFailures === 3) {
+        showToast(error instanceof Error ? error.message : String(error), {
+          title: backendFailures >= 3 ? "后台连接已离线" : "后台连接暂不可用",
+          kind: backendFailures >= 3 ? "error" : "warning",
+          duration: 6000,
+        });
+      }
+    } finally {
+      statusPolling = false;
+      if (id === workspaceId) scheduleStatusPoll(id, nextStatusPollDelay());
+    }
+  }
+
+  function retryBackendNow() {
+    const id = workspaceId;
+    if (!id) return;
+    if (profile) {
+      void pollRuntimeStatus(id);
+    } else {
+      void initializeWorkspace(id);
+    }
   }
 
   async function load(id = workspaceId) {
@@ -165,7 +291,9 @@
     if (generation !== loadGeneration || id !== workspaceId) return;
     profile = nextProfile;
     if (nextProfile) {
-      await setLastWorkspace(nextProfile.id);
+      void setLastWorkspace(nextProfile.id).catch(() => {
+        // Non-critical preference write. Runtime/config loading must continue.
+      });
     }
     if (generation !== loadGeneration || id !== workspaceId) return;
     if (!nextProfile) {
@@ -537,10 +665,25 @@
     const id = workspaceId;
     if (!id) return;
     profile = null;
-    void load(id);
+    backendFailures = 0;
+    backendConnection = "checking";
+    void initializeWorkspace(id);
+
+    const handleOnline = () => retryBackendNow();
+    const handleVisibility = () => {
+      if (!document.hidden) retryBackendNow();
+    };
+    window.addEventListener("online", handleOnline);
+    document.addEventListener("visibilitychange", handleVisibility);
 
     return () => {
       loadGeneration += 1;
+      if (statusPollTimer !== null) {
+        window.clearTimeout(statusPollTimer);
+        statusPollTimer = null;
+      }
+      window.removeEventListener("online", handleOnline);
+      document.removeEventListener("visibilitychange", handleVisibility);
     };
   });
 </script>
@@ -575,6 +718,34 @@
         <ChatGptSessionPrompt />
       </div>
 
+      {#if backendConnection === "recovering" || backendConnection === "offline"}
+        <div
+          class="tx-alert mt-4"
+          class:tx-alert--warning={backendConnection === "recovering"}
+          class:tx-alert--error={backendConnection === "offline"}
+          role="status"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="font-medium">
+                {backendConnection === "offline" ? "后台连接暂不可用" : "正在恢复后台连接"}
+              </p>
+              <p class="mt-1 text-xs opacity-80">
+                已连续重试 {backendFailures} 次 · {lastSyncLabel()}。当前页面数据会保留，连接恢复后自动同步。
+              </p>
+            </div>
+            <button
+              type="button"
+              class="tx-btn-ghost shrink-0"
+              disabled={statusPolling}
+              onclick={retryBackendNow}
+            >
+              {statusPolling ? "连接中…" : "立即重试"}
+            </button>
+          </div>
+        </div>
+      {/if}
+
       <div class="mt-4 flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -607,6 +778,7 @@
             subtitle="Streamable HTTP · 工具运行时"
             status={mcpStatus}
             statusMessage={mcpStatusMessage}
+            recovery={mcpRecovery}
             port={profile.runtime.local_port}
             portEditable={true}
             busy={mcpBusy}
@@ -699,6 +871,7 @@
             subtitle="OpenAPI 网关 · ChatGPT Actions"
             status={actionsStatus}
             statusMessage={actionsStatusMessage}
+            recovery={actionsRecovery}
             port={actions.local_port}
             portEditable={true}
             busy={actionsBusy}
@@ -778,5 +951,29 @@
     <footer class="border-t border-[var(--color-border)] px-8 py-4 text-xs text-[var(--color-text-muted)]">
       MCP 默认端口 28766，Actions 默认 8787，可同时运行。
     </footer>
+  </section>
+{:else}
+  <section class="page-scroll grid place-items-center p-8">
+    <div class="tx-card w-full max-w-xl p-6 text-center">
+      <div class="mx-auto flex w-fit items-center gap-2">
+        <StatusOrb state={backendConnection === "offline" ? "error" : "recovering"} />
+        <h2 class="text-base font-semibold">
+          {backendConnection === "offline" ? "无法连接应用后台" : "正在连接工作区"}
+        </h2>
+      </div>
+      <p class="mt-3 text-sm leading-6 text-[var(--color-text-muted)]">
+        {backendConnection === "offline"
+          ? "后台暂时没有响应。应用会继续自动重试，也可以立即重新连接。"
+          : "正在读取配置和运行状态，短暂断联会自动恢复。"}
+      </p>
+      <button
+        type="button"
+        class="tx-btn-primary mt-5"
+        disabled={statusPolling}
+        onclick={retryBackendNow}
+      >
+        {statusPolling ? "连接中…" : "立即重试"}
+      </button>
+    </div>
   </section>
 {/if}

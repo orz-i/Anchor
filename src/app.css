@@ -736,10 +736,22 @@ button {
   color: var(--danger);
 }
 
+.tx-alert--warning {
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  background: rgba(245, 158, 11, 0.09);
+  color: var(--warning);
+}
+
 [data-theme="dark"] .tx-alert--error,
 .dark .tx-alert--error {
   border-color: rgba(248, 113, 113, 0.28);
   background: rgba(248, 113, 113, 0.1);
+}
+
+[data-theme="dark"] .tx-alert--warning,
+.dark .tx-alert--warning {
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.1);
 }
 
 @media (prefers-reduced-motion: reduce) {
