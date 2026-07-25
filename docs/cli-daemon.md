@@ -9,6 +9,8 @@
 
 两种模式都读取同一个 WorkspaceProfile；一个 workspace 仍只对应一个 profile。
 
+Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT 连接运维](workspace-cli.md)。
+
 ## 快速开始
 
 ```bash

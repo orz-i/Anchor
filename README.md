@@ -295,6 +295,8 @@ pnpm cli:build
 
 CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` 运维命令。它不会接管已被 GUI 占用的端口；生产自启动仍建议由 systemd 直接监督 `serve`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。
 
+Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`，可直接注册项目、查看脱敏的 GPT 连接配置并验证 MCP/Actions 协议。见 [Workspace CLI 注册与 GPT 连接运维](docs/workspace-cli.md)。
+
 ### 通过 MCP 提请 Agent Skill
 
 每个 workspace/profile 可以配置一个或多个 Agent Skills 根目录。MCP 客户端可先调用 `list_skills` 获取有界元数据，再调用 `load_skill` 加载完整 `SKILL.md`，或通过 `read_skill_resource` / `skill://` 读取关联资源。Skill 脚本不会被服务器执行。

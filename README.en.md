@@ -287,6 +287,8 @@ pnpm cli:build
 
 The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. It will not take over a port already used by the GUI. For production boot-time supervision, systemd should still run `serve` directly. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).
 
+Workspace-level commands include `register`, `unregister`, `show`, `start`, `stop`, `gpt-config`, and `test`, covering profile registration, redacted GPT connection settings, and MCP/Actions protocol checks. See the [Workspace CLI guide](docs/workspace-cli.md).
+
 ### Request Agent Skills through MCP
 
 Each workspace/profile can expose one or more Agent Skills roots. MCP clients can call `list_skills` for bounded metadata, `load_skill` for the complete `SKILL.md`, and `read_skill_resource` or `skill://` resources for supporting files. The server does not execute Skill scripts.

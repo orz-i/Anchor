@@ -46,6 +46,15 @@ coding-tools-mcp --config-dir /etc/coding-tools-mcp list
 
 不要为 CLI 创建第二套 profile。桌面端创建的 workspace/profile 可以直接由 CLI 按 ID、唯一名称或项目路径选择。
 
+CLI 也可以直接注册和注销 profile：
+
+```bash
+coding-tools-mcp workspace register /srv/projects/example --name Example
+coding-tools-mcp workspace unregister Example --force
+```
+
+完整说明见 [Workspace CLI 注册与 GPT 连接运维](workspace-cli.md)。
+
 ## 常用命令
 
 ```bash
