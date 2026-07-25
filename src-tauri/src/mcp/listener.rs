@@ -12,12 +12,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
-use tower_http::cors::CorsLayer;
-
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
-    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    protected_resource_metadata, request_origin_allowed, token_exchange, verify_bearer_header,
+    verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{handle_request, new_state, SharedState};
@@ -91,13 +89,16 @@ pub fn spawn_listener(
             port,
             &configured_public_url,
         );
-        Some(Arc::new(OAuthRuntime::new(
-            oauth_base,
-            auth.oauth_client_id.clone(),
-            oauth_client_secret.clone(),
-            password,
-            token_secret,
-        )))
+        Some(Arc::new(
+            OAuthRuntime::new(
+                oauth_base,
+                auth.oauth_client_id.clone(),
+                oauth_client_secret.clone(),
+                password,
+                token_secret,
+            )
+            .with_redirect_uris(&auth.oauth_redirect_uris)?,
+        ))
     } else {
         None
     };
@@ -160,8 +161,7 @@ async fn serve(
         )
         .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
         .route("/oauth/token", post(oauth_token_post))
-        .with_state(state)
-        .layer(CorsLayer::permissive());
+        .with_state(state);
 
     append_profile_log(
         &profile_id,
@@ -187,7 +187,17 @@ fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
         .map_err(|err| format!("MCP 本地监听器初始化失败: {err}"))
 }
 
-async fn mcp_get_not_supported() -> Response {
+async fn mcp_get_not_supported(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+) -> Response {
+    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    mcp_method_not_allowed_response()
+}
+
+fn mcp_method_not_allowed_response() -> Response {
     let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
     response
         .headers_mut()
@@ -218,6 +228,9 @@ async fn mcp_post(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if let Some(response) = require_mcp_auth(&state, &headers) {
         return response;
     }
@@ -379,6 +392,9 @@ async fn oauth_authorize_get(
     headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
+    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
@@ -395,6 +411,9 @@ async fn oauth_authorize_post(
     headers: HeaderMap,
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
+    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
@@ -443,7 +462,7 @@ mod tests {
     };
     use axum::response::IntoResponse;
 
-    use super::{bind_listener, mcp_get_not_supported};
+    use super::{bind_listener, mcp_method_not_allowed_response};
 
     #[test]
     fn bind_listener_reports_port_conflict_synchronously() {
@@ -453,9 +472,9 @@ mod tests {
         assert!(bind_listener(port).is_err());
     }
 
-    #[tokio::test]
-    async fn unsupported_get_returns_405_and_prevents_caching() {
-        let response = mcp_get_not_supported().await.into_response();
+    #[test]
+    fn unsupported_get_returns_405_and_prevents_caching() {
+        let response = mcp_method_not_allowed_response().into_response();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()[ALLOW], "POST");

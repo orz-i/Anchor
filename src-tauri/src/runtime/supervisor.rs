@@ -435,6 +435,7 @@ impl RuntimeSupervisor {
                     auth_type,
                     api_key,
                     profile.actions.oauth_client_id.clone(),
+                    profile.actions.oauth_redirect_uris.clone(),
                     oauth_client_secret,
                     oauth_password,
                     oauth_token_secret,

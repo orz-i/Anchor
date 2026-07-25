@@ -12,12 +12,10 @@ use axum::{
 };
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex, RwLock};
-use tower_http::cors::CorsLayer;
-
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, token_exchange, AuthorizeForm, AuthorizeParams, OAuthRuntime,
-    TokenForm,
+    protected_resource_metadata, request_origin_allowed, token_exchange, AuthorizeForm,
+    AuthorizeParams, OAuthRuntime, TokenForm,
 };
 use crate::tools::{self, is_allowed_tool, policy::PolicySettings, wrap_tool_result, ToolContext};
 use crate::tunnel::append_profile_log;
@@ -49,6 +47,7 @@ pub fn spawn_listener(
     auth_type: String,
     api_key: Option<String>,
     oauth_client_id: String,
+    oauth_redirect_uris: String,
     oauth_client_secret: Option<String>,
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
@@ -73,13 +72,16 @@ pub fn spawn_listener(
             actions_port,
             &configured_public_url,
         );
-        Some(Arc::new(OAuthRuntime::new(
-            oauth_base,
-            oauth_client_id,
-            oauth_client_secret.clone(),
-            oauth_password.unwrap_or_default(),
-            oauth_token_secret.unwrap_or_default(),
-        )))
+        Some(Arc::new(
+            OAuthRuntime::new(
+                oauth_base,
+                oauth_client_id,
+                oauth_client_secret.clone(),
+                oauth_password.unwrap_or_default(),
+                oauth_token_secret.unwrap_or_default(),
+            )
+            .with_redirect_uris(&oauth_redirect_uris)?,
+        ))
     } else {
         None
     };
@@ -202,8 +204,7 @@ async fn serve(
         .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
         .route("/oauth/token", post(oauth_token_post))
         .merge(protected)
-        .with_state(state)
-        .layer(CorsLayer::permissive());
+        .with_state(state);
 
     append_profile_log(
         profile_id,
@@ -318,6 +319,9 @@ async fn oauth_authorize_get(
     headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
+    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
@@ -334,6 +338,9 @@ async fn oauth_authorize_post(
     headers: HeaderMap,
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
+    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };

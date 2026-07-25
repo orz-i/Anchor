@@ -17,6 +17,7 @@
     workspaceId: string;
     authType: string;
     oauthClientId: string;
+    oauthRedirectUris: string;
     oauthScopes: string;
     openapiUrl: string;
     privacyUrl: string;
@@ -26,10 +27,32 @@
     onSave: (draft: ActionsAuthDraft) => void | Promise<void>;
   }
 
+  function validateRedirectUris(raw: string) {
+    const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (values.length === 0) {
+      throw new Error("OAuth Callback URL 不能为空；请从 ChatGPT 复制完整 URL");
+    }
+    for (const value of values) {
+      if (value.includes("*")) throw new Error(`OAuth Callback URL 不允许通配符：${value}`);
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        throw new Error(`OAuth Callback URL 无效：${value}`);
+      }
+      const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+      if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+        throw new Error(`OAuth Callback URL 必须使用 HTTPS 或 HTTP loopback：${value}`);
+      }
+      if (parsed.hash) throw new Error(`OAuth Callback URL 不能包含 fragment：${value}`);
+    }
+  }
+
   let {
     workspaceId,
     authType,
     oauthClientId,
+    oauthRedirectUris,
     oauthScopes,
     openapiUrl,
     privacyUrl,
@@ -41,6 +64,7 @@
 
   let draftAuthType = $state("api_key");
   let draftOauthClientId = $state("");
+  let draftOauthRedirectUris = $state("");
   let draftOauthScopes = $state("");
   let draftUseShared = $state(false);
   let apiKey = $state("");
@@ -73,6 +97,7 @@
   const dirty = $derived(
     draftAuthType !== authType ||
       draftOauthClientId !== oauthClientId ||
+      draftOauthRedirectUris !== oauthRedirectUris ||
       draftOauthScopes !== oauthScopes ||
       draftUseShared !== useSharedSecrets ||
       secretsDirty,
@@ -83,6 +108,7 @@
   $effect(() => {
     draftAuthType = authType;
     draftOauthClientId = oauthClientId;
+    draftOauthRedirectUris = oauthRedirectUris;
     draftOauthScopes = oauthScopes;
     draftUseShared = useSharedSecrets;
   });
@@ -138,9 +164,11 @@
     saving = true;
     suppressSecretsReload = true;
     try {
+      if (draftAuthType === "oauth") validateRedirectUris(draftOauthRedirectUris);
       await onSave({
         authType: draftAuthType,
         oauthClientId: draftOauthClientId.trim(),
+        oauthRedirectUris: draftOauthRedirectUris.trim(),
         oauthScopes: draftOauthScopes.trim(),
         useSharedSecrets: draftUseShared,
       });
@@ -254,6 +282,18 @@
         onRegenerate={() => void regenerate()}
         regenerating={regenerating}
       />
+    </label>
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--color-text-muted)]">允许的 OAuth Callback URL</span>
+      <textarea
+        rows="3"
+        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+        bind:value={draftOauthRedirectUris}
+        placeholder="https://chatgpt.com/connector/oauth/&lt;callback_id&gt;"
+      ></textarea>
+      <span class="text-xs text-[var(--color-text-muted)]">
+        从 ChatGPT 复制完整 callback URL，每行一个；必须精确匹配。
+      </span>
     </label>
     <p class="text-xs text-[var(--color-text-muted)]">
       在 GPT Actions 认证里选 API Key → Bearer，Key 填这里的值。

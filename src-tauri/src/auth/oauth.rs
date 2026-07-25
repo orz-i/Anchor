@@ -17,117 +17,56 @@ impl AuthConfig {
     }
 }
 
-/// Resolve the external OAuth/MCP base URL for a request.
-/// Prefer trusted reverse-proxy forwarding headers, then the configured URL,
-/// then `Host`, and finally localhost. This prevents quick-tunnel OAuth
-/// metadata from remaining pinned to a stale public hostname.
-pub fn external_base_url(headers: &HeaderMap, bind_port: u16, configured_url: &str) -> String {
+/// Resolve the external OAuth/MCP base URL from trusted configuration.
+/// Request-controlled Host/Forwarded headers are intentionally ignored: the
+/// listener is reachable through local proxy processes and cannot reliably
+/// distinguish a trusted proxy from another local process.
+pub fn external_base_url(_headers: &HeaderMap, bind_port: u16, configured_url: &str) -> String {
     let configured = configured_url.trim().trim_end_matches('/');
-    let proto = {
-        let value = first_header_value(headers, "x-forwarded-proto");
-        if value.is_empty() {
-            forwarded_header_param(headers, "proto")
-        } else {
-            value
-        }
-    };
-    let forwarded_host = {
-        let value = safe_external_host(&first_header_value(headers, "x-forwarded-host"));
-        if !value.is_empty() {
-            value
-        } else {
-            safe_external_host(&forwarded_header_param(headers, "host"))
-        }
-    };
-
-    if !forwarded_host.is_empty() {
-        let proto = resolve_external_proto(
-            if proto.is_empty() {
-                None
-            } else {
-                Some(proto.as_str())
-            },
-            &forwarded_host,
-        );
-        return format!("{proto}://{forwarded_host}");
-    }
-
     if !configured.is_empty() {
         return configured.to_string();
     }
 
-    let host = safe_external_host(&first_header_value(headers, "host"));
+    format!("http://127.0.0.1:{bind_port}")
+}
 
-    let host = if host.is_empty() {
-        format!("127.0.0.1:{bind_port}")
-    } else {
-        host
+pub fn request_origin_allowed(
+    headers: &HeaderMap,
+    bind_port: u16,
+    configured_url: &str,
+) -> bool {
+    let Some(origin) = headers.get("origin") else {
+        return true;
     };
-    let proto = resolve_external_proto(
-        if proto.is_empty() {
-            None
-        } else {
-            Some(proto.as_str())
-        },
-        &host,
-    );
-    format!("{proto}://{host}")
-}
-
-fn first_header_value(headers: &HeaderMap, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(',').next().unwrap_or("").trim().to_string())
-        .unwrap_or_default()
-}
-
-fn forwarded_header_param(headers: &HeaderMap, name: &str) -> String {
-    let first = first_header_value(headers, "forwarded");
-    for part in first.split(';') {
-        let part = part.trim();
-        if let Some((key, value)) = part.split_once('=') {
-            if key.trim().eq_ignore_ascii_case(name) {
-                return value.trim().trim_matches('"').to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-fn safe_external_host(host: &str) -> String {
-    let host = host.trim();
-    if host.is_empty() || host.chars().any(|ch| matches!(ch, '\r' | '\n' | '/' | '\\')) {
-        String::new()
-    } else {
-        host.to_string()
-    }
-}
-
-fn resolve_external_proto(proto: Option<&str>, host: &str) -> &'static str {
-    if let Some(proto) = proto {
-        let proto = proto.trim().to_ascii_lowercase();
-        if proto == "http" {
-            return "http";
-        }
-        if proto == "https" {
-            return "https";
-        }
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(origin) = reqwest::Url::parse(origin.trim()) else {
+        return false;
+    };
+    if !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.path() != "/"
+    {
+        return false;
     }
 
-    let host_without_port = host
-        .rsplit_once(':')
-        .map(|(value, _)| value.trim_matches('[').trim_matches(']'))
-        .unwrap_or_else(|| host.trim_matches('[').trim_matches(']'));
-    if is_loopback_host(host_without_port) {
-        "http"
-    } else {
-        "https"
+    let host = origin.host_str().unwrap_or_default();
+    let local = origin.scheme() == "http"
+        && matches!(host, "127.0.0.1" | "localhost" | "::1")
+        && origin.port_or_known_default() == Some(bind_port);
+    if local {
+        return true;
     }
-}
 
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    let Ok(configured) = reqwest::Url::parse(configured_url.trim()) else {
+        return false;
+    };
+    origin.scheme() == configured.scheme()
+        && origin.host_str() == configured.host_str()
+        && origin.port_or_known_default() == configured.port_or_known_default()
 }
 
 fn token_endpoint_auth_methods(client_secret: Option<&str>) -> Vec<&'static str> {
@@ -217,34 +156,62 @@ mod tests {
     }
 
     #[test]
-    fn external_base_url_prefers_forwarded_host_over_stale_configured_url() {
+    fn external_base_url_ignores_untrusted_forwarded_host() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "new-tunnel.example.com".parse().unwrap());
         assert_eq!(
             external_base_url(&headers, 28767, "https://old-tunnel.example.com"),
-            "https://new-tunnel.example.com"
+            "https://old-tunnel.example.com"
         );
     }
 
     #[test]
-    fn external_base_url_uses_forwarded_host() {
+    fn external_base_url_uses_localhost_without_configuration() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "lb.frp-tx1.evwali.com".parse().unwrap());
         assert_eq!(
             external_base_url(&headers, 28767, ""),
-            "https://lb.frp-tx1.evwali.com"
+            "http://127.0.0.1:28767"
         );
     }
 
     #[test]
-    fn external_base_url_uses_host_header() {
+    fn external_base_url_ignores_host_header() {
         let mut headers = HeaderMap::new();
         headers.insert("host", "lb.frp-tx1.evwali.com".parse().unwrap());
         assert_eq!(
             external_base_url(&headers, 28767, ""),
-            "https://lb.frp-tx1.evwali.com"
+            "http://127.0.0.1:28767"
         );
+    }
+
+    #[test]
+    fn origin_policy_accepts_local_and_configured_origins_only() {
+        let mut headers = HeaderMap::new();
+        assert!(request_origin_allowed(
+            &headers,
+            28767,
+            "https://mcp.example.com/path"
+        ));
+        headers.insert("origin", "http://127.0.0.1:28767".parse().unwrap());
+        assert!(request_origin_allowed(
+            &headers,
+            28767,
+            "https://mcp.example.com/path"
+        ));
+        headers.insert("origin", "https://mcp.example.com".parse().unwrap());
+        assert!(request_origin_allowed(
+            &headers,
+            28767,
+            "https://mcp.example.com/path"
+        ));
+        headers.insert("origin", "https://attacker.example".parse().unwrap());
+        assert!(!request_origin_allowed(
+            &headers,
+            28767,
+            "https://mcp.example.com/path"
+        ));
     }
 }

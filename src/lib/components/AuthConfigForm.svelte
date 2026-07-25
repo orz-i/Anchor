@@ -18,6 +18,27 @@
     onSaveProfile: (auth: AuthConfig) => void | Promise<void>;
   }
 
+  function validateRedirectUris(raw: string) {
+    const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (values.length === 0) {
+      throw new Error("OAuth 回调 URL 不能为空；请从 ChatGPT 复制完整 callback URL");
+    }
+    for (const value of values) {
+      if (value.includes("*")) throw new Error(`OAuth 回调 URL 不允许通配符：${value}`);
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        throw new Error(`OAuth 回调 URL 无效：${value}`);
+      }
+      const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+      if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+        throw new Error(`OAuth 回调 URL 必须使用 HTTPS 或 HTTP loopback：${value}`);
+      }
+      if (parsed.hash) throw new Error(`OAuth 回调 URL 不能包含 fragment：${value}`);
+    }
+  }
+
   const AUTH_OPTIONS = [
     { value: "oauth", label: "OAuth" },
     { value: "bearer", label: "Bearer Token" },
@@ -26,7 +47,12 @@
 
   let { workspaceId, auth, onSaveProfile }: Props = $props();
 
-  let draft = $state<AuthConfig>({ type: "oauth", oauth_client_id: "", use_shared_secrets: false });
+  let draft = $state<AuthConfig>({
+    type: "oauth",
+    oauth_client_id: "",
+    oauth_redirect_uris: "",
+    use_shared_secrets: false,
+  });
   let saving = $state(false);
   let secrets = $state<Partial<Record<WorkspaceSecretKey, string>>>({});
   let loadedSecrets = $state<Partial<Record<WorkspaceSecretKey, string>>>({});
@@ -46,6 +72,7 @@
       (draft.use_shared_secrets
         ? draft.oauth_client_id !== loadedSharedOauthClientId
         : draft.oauth_client_id !== auth.oauth_client_id) ||
+      (draft.oauth_redirect_uris ?? "") !== (auth.oauth_redirect_uris ?? "") ||
       draft.use_shared_secrets !== !!auth.use_shared_secrets ||
       secretsDirty,
   );
@@ -54,7 +81,12 @@
   const showBearer = $derived(draft.type === "bearer");
 
   $effect(() => {
-    draft = { type: auth.type, oauth_client_id: auth.oauth_client_id, use_shared_secrets: !!auth.use_shared_secrets };
+    draft = {
+      type: auth.type,
+      oauth_client_id: auth.oauth_client_id,
+      oauth_redirect_uris: auth.oauth_redirect_uris ?? "",
+      use_shared_secrets: !!auth.use_shared_secrets,
+    };
   });
 
   $effect(() => {
@@ -105,6 +137,9 @@
     saving = true;
     suppressSecretsReload = true;
     try {
+      if (draft.type === "oauth") {
+        validateRedirectUris(draft.oauth_redirect_uris ?? "");
+      }
       if (draft.type === "oauth" && draft.use_shared_secrets) {
         const clientId = draft.oauth_client_id.trim();
         if (!clientId) throw new Error("OAuth Client ID 不能为空");
@@ -182,6 +217,19 @@
         bind:value={draft.oauth_client_id}
         readonly={draft.use_shared_secrets}
       />
+    </label>
+
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--color-text-muted)]">允许的 OAuth Callback URL</span>
+      <textarea
+        rows="3"
+        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+        bind:value={draft.oauth_redirect_uris}
+        placeholder="https://chatgpt.com/connector/oauth/&lt;callback_id&gt;"
+      ></textarea>
+      <span class="text-xs text-[var(--color-text-muted)]">
+        从 ChatGPT 应用配置页复制完整 callback URL，每行一个；必须精确匹配，不支持通配符。
+      </span>
     </label>
 
     <div class="grid gap-1">

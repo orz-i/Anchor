@@ -640,6 +640,7 @@
         ...current,
         auth_type: draft.authType,
         oauth_client_id: draft.oauthClientId || current.oauth_client_id,
+        oauth_redirect_uris: draft.oauthRedirectUris,
         oauth_scopes: draft.oauthScopes,
         use_shared_secrets: draft.useSharedSecrets,
       },
@@ -945,6 +946,7 @@
                 workspaceId={workspaceId!}
                 authType={actions.auth_type}
                 oauthClientId={actions.oauth_client_id ?? ""}
+                oauthRedirectUris={actions.oauth_redirect_uris ?? ""}
                 oauthScopes={actions.oauth_scopes ?? ""}
                 openapiUrl={actionsOpenApiUrl(profile, frpProfiles)}
                 privacyUrl={actionsPrivacyUrl(profile, frpProfiles)}

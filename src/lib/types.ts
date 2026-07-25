@@ -54,6 +54,7 @@ export interface SkillInspection {
 export interface AuthConfig {
   type: string;
   oauth_client_id: string;
+  oauth_redirect_uris?: string;
   use_shared_secrets?: boolean;
 }
 
@@ -85,6 +86,7 @@ export interface ActionsConfig {
   runtime_command?: string;
   auth_type: string;
   oauth_client_id?: string;
+  oauth_redirect_uris?: string;
   oauth_scopes?: string;
   allowed_commands?: string;
   max_patch_bytes?: number;
@@ -148,6 +150,7 @@ export function actionsLocalEndpoint(port: number): string {
 export interface ActionsAuthDraft {
   authType: string;
   oauthClientId: string;
+  oauthRedirectUris: string;
   oauthScopes: string;
   useSharedSecrets?: boolean;
 }

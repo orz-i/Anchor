@@ -41,6 +41,9 @@ pub struct AuthConfig {
     pub auth_type: String,
     #[serde(default = "default_oauth_client_id")]
     pub oauth_client_id: String,
+    /// Exact OAuth callback URLs registered for this MCP client, one per line.
+    #[serde(default)]
+    pub oauth_redirect_uris: String,
     #[serde(default)]
     pub use_shared_secrets: bool,
 }
@@ -103,6 +106,9 @@ pub struct ActionsConfig {
     pub auth_type: String,
     #[serde(default = "default_actions_oauth_client_id")]
     pub oauth_client_id: String,
+    /// Exact OAuth callback URLs registered for this Actions client, one per line.
+    #[serde(default)]
+    pub oauth_redirect_uris: String,
     #[serde(default)]
     pub oauth_scopes: String,
     #[serde(default = "default_allowed_commands")]
@@ -231,6 +237,7 @@ impl Default for AuthConfig {
         Self {
             auth_type: default_auth_type(),
             oauth_client_id: default_oauth_client_id(),
+            oauth_redirect_uris: String::new(),
             use_shared_secrets: false,
         }
     }
@@ -270,6 +277,7 @@ impl Default for ActionsConfig {
             runtime_command: String::new(),
             auth_type: default_actions_auth_type(),
             oauth_client_id: default_actions_oauth_client_id(),
+            oauth_redirect_uris: String::new(),
             oauth_scopes: String::new(),
             allowed_commands: default_allowed_commands(),
             max_patch_bytes: default_max_patch_bytes(),

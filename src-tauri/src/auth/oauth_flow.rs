@@ -27,6 +27,7 @@ pub struct OAuthRuntime {
     pub client_secret: Option<String>,
     pub password: String,
     pub token_secret: String,
+    redirect_uris: Arc<Vec<String>>,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
     used_refresh_tokens: Arc<Mutex<HashMap<String, u64>>>,
 }
@@ -73,7 +74,40 @@ fn default_access_token_kind() -> String {
 fn resource_matches(requested: &str, canonical: &str) -> bool {
     let requested = requested.trim().trim_end_matches('/');
     let canonical = canonical.trim().trim_end_matches('/');
-    requested.is_empty() || constant_time_eq_str(requested, canonical)
+    !requested.is_empty() && constant_time_eq_str(requested, canonical)
+}
+
+pub fn parse_redirect_uris(raw: &str) -> Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    for value in raw.lines().map(str::trim).filter(|value| !value.is_empty()) {
+        if value.contains('*') {
+            return Err(format!(
+                "OAuth redirect URI must be exact and cannot contain wildcards: {value}"
+            ));
+        }
+        let parsed = reqwest::Url::parse(value)
+            .map_err(|error| format!("Invalid OAuth redirect URI `{value}`: {error}"))?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!(
+                "OAuth redirect URI cannot contain user information: {value}"
+            ));
+        }
+        if parsed.fragment().is_some() {
+            return Err(format!("OAuth redirect URI cannot contain a fragment: {value}"));
+        }
+        let host = parsed.host_str().unwrap_or_default();
+        let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+        let secure = parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback);
+        if !secure {
+            return Err(format!(
+                "OAuth redirect URI must use HTTPS or an HTTP loopback host: {value}"
+            ));
+        }
+        if !values.iter().any(|registered| registered == value) {
+            values.push(value.to_string());
+        }
+    }
+    Ok(values)
 }
 
 #[derive(Clone)]
@@ -116,9 +150,24 @@ impl OAuthRuntime {
             client_secret,
             password,
             token_secret,
+            redirect_uris: Arc::new(Vec::new()),
             pending: Arc::new(Mutex::new(HashMap::new())),
             used_refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_redirect_uris(mut self, raw: &str) -> Result<Self, String> {
+        self.redirect_uris = Arc::new(parse_redirect_uris(raw)?);
+        Ok(self)
+    }
+
+    pub fn redirect_uri_allowed(&self, redirect_uri: &str) -> bool {
+        let redirect_uri = redirect_uri.trim();
+        !redirect_uri.is_empty()
+            && self
+                .redirect_uris
+                .iter()
+                .any(|registered| constant_time_eq_str(registered, redirect_uri))
     }
 
     pub fn client_id_allowed(&self, client_id: &str) -> bool {
@@ -199,11 +248,11 @@ fn oauth_unauthorized(
     let mut response = (StatusCode::UNAUTHORIZED, message).into_response();
     let challenge = match error {
         Some(error) => format!(
-            "Bearer error=\"{error}\", resource_metadata=\"{}\"",
+            "Bearer error=\"{error}\", scope=\"mcp\", resource_metadata=\"{}\"",
             resource_metadata_url.trim()
         ),
         None => format!(
-            "Bearer resource_metadata=\"{}\"",
+            "Bearer scope=\"mcp\", resource_metadata=\"{}\"",
             resource_metadata_url.trim()
         ),
     };
@@ -272,6 +321,9 @@ pub fn authorize_get(
     if !oauth.client_id_allowed(&params.client_id) {
         return html_error("Unknown client_id", StatusCode::BAD_REQUEST);
     }
+    if !oauth.redirect_uri_allowed(&params.redirect_uri) {
+        return html_error("redirect_uri is not registered", StatusCode::BAD_REQUEST);
+    }
     if params.code_challenge_method != "S256" || params.code_challenge.is_empty() {
         return html_error(
             "code_challenge_method must be S256 and code_challenge is required",
@@ -312,6 +364,9 @@ pub fn authorize_post(
             None,
         ))
         .into_response();
+    }
+    if !oauth.redirect_uri_allowed(&form.redirect_uri) {
+        return html_error("redirect_uri is not registered", StatusCode::BAD_REQUEST);
     }
     if form.code_challenge_method != "S256" || form.code_challenge.is_empty() {
         return Html(login_page(
@@ -459,6 +514,9 @@ fn exchange_authorization_code(
     }
     if !constant_time_eq_str(&code_data.redirect_uri, &form.redirect_uri) {
         return token_error("invalid_grant", "redirect_uri mismatch");
+    }
+    if !oauth.redirect_uri_allowed(&form.redirect_uri) {
+        return token_error("invalid_grant", "redirect_uri is not registered");
     }
     if !verify_pkce(&form.code_verifier, &code_data.code_challenge) {
         return token_error("invalid_grant", "PKCE verification failed");
@@ -754,7 +812,9 @@ mod tests {
             None,
             "test-password".into(),
             "token-signing-secret".into(),
-        );
+        )
+        .with_redirect_uris("https://chatgpt.com/connector/oauth/test")
+        .expect("redirect URI config");
         let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let redirect_uri = "https://chatgpt.com/connector/oauth/test";
@@ -872,8 +932,33 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             response.headers()[WWW_AUTHENTICATE],
-            "Bearer resource_metadata=\"https://lb.example.com/.well-known/oauth-protected-resource\""
+            "Bearer scope=\"mcp\", resource_metadata=\"https://lb.example.com/.well-known/oauth-protected-resource\""
         );
+    }
+
+    #[test]
+    fn redirect_uri_registration_is_exact_and_secure() {
+        let oauth = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "chatgpt-client-test".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        )
+        .with_redirect_uris(
+            "https://chatgpt.com/connector/oauth/callback-1\nhttp://127.0.0.1:3000/callback",
+        )
+        .expect("redirect URI config");
+
+        assert!(oauth.redirect_uri_allowed(
+            "https://chatgpt.com/connector/oauth/callback-1"
+        ));
+        assert!(!oauth.redirect_uri_allowed(
+            "https://chatgpt.com/connector/oauth/callback-2"
+        ));
+        assert!(parse_redirect_uris("https://*.example.com/callback").is_err());
+        assert!(parse_redirect_uris("http://example.com/callback").is_err());
+        assert!(parse_redirect_uris("http://localhost:3000/callback").is_ok());
     }
 
     #[test]
