@@ -289,6 +289,8 @@ The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `
 
 Workspace-level commands include `register`, `unregister`, `show`, `start`, `stop`, `gpt-config`, and `test`, covering profile registration, redacted GPT connection settings, and MCP/Actions protocol checks. See the [Workspace CLI guide](docs/workspace-cli.md).
 
+Multiple workspaces can share one local Gateway and one public tunnel while remaining separate logical MCP servers at `/w/<workspace-id>/mcp`. Configure it under **Settings → General → Single MCP Gateway**, or use `gateway configure/show/serve` on Linux. See [Single MCP Gateway and multiple workspaces](docs/mcp-gateway.md).
+
 ### Request Agent Skills through MCP
 
 Each workspace/profile can expose one or more Agent Skills roots. MCP clients can call `list_skills` for bounded metadata, `load_skill` for the complete `SKILL.md`, and `read_skill_resource` or `skill://` resources for supporting files. The server does not execute Skill scripts.

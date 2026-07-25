@@ -93,6 +93,18 @@ coding-tools-mcp --json status <workspace>
 
 `serve` 是前台常驻命令；`start` 创建 Linux 后台 daemon。若对应端口已被桌面 GUI 或其他进程占用，两种模式都会报错退出，不会停止、接管或替换现有服务。完整运维说明见 [CLI Daemon 与运维命令](cli-daemon.md)。
 
+### 单 Gateway 多工作区
+
+需要让多个工作区共用一条 MCP 隧道时：
+
+```bash
+coding-tools-mcp gateway configure --enable --port 28765 --owner PROJECT_A
+coding-tools-mcp gateway show
+coding-tools-mcp gateway serve PROJECT_A PROJECT_B PROJECT_C
+```
+
+`gateway serve` 在一个前台进程中管理所选工作区、Gateway 和唯一 MCP 隧道。Gateway 模式下不能再为各工作区分别使用 `start ... --service mcp`，生产环境应由 systemd 直接监督 `gateway serve`。详见 [单一 MCP Gateway 与多工作区](mcp-gateway.md)。
+
 ## systemd 用户服务
 
 推荐由 systemd 负责后台化、重启和日志收集。先通过 `coding-tools-mcp list` 获取稳定的 profile ID，然后创建：
@@ -128,7 +140,7 @@ systemctl --user status coding-tools-mcp.service
 journalctl --user -u coding-tools-mcp.service -f
 ```
 
-systemd 必须直接运行前台 `serve`，不要使用 `start`；内置 daemon 适合人工 SSH 运维，不替代 systemd 的开机自启和进程监督。
+systemd 必须直接运行前台 `serve` 或 `gateway serve`，不要使用 `start`；内置 daemon 适合人工 SSH 运维，不替代 systemd 的开机自启和进程监督。
 
 需要在退出登录后继续运行时，可为该 Linux 用户启用 linger：
 

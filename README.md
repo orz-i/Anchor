@@ -297,6 +297,8 @@ CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` �
 
 Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`，可直接注册项目、查看脱敏的 GPT 连接配置并验证 MCP/Actions 协议。见 [Workspace CLI 注册与 GPT 连接运维](docs/workspace-cli.md)。
 
+多个工作区可以通过一个本地 Gateway 和一条公网隧道暴露为 `/w/<workspace-id>/mcp`。GUI 在 **设置 → 通用 → 单一 MCP Gateway** 配置；Linux 可使用 `gateway configure/show/serve`。完整隔离与运维说明见 [单一 MCP Gateway 与多工作区](docs/mcp-gateway.md)。
+
 ### 通过 MCP 提请 Agent Skill
 
 每个 workspace/profile 可以配置一个或多个 Agent Skills 根目录。MCP 客户端可先调用 `list_skills` 获取有界元数据，再调用 `load_skill` 加载完整 `SKILL.md`，或通过 `read_skill_resource` / `skill://` 读取关联资源。Skill 脚本不会被服务器执行。
