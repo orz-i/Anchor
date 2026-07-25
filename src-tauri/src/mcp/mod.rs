@@ -1,3 +1,4 @@
+pub(crate) mod gateway;
 mod listener;
 pub(crate) mod protocol;
 pub(crate) mod proxy;

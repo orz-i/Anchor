@@ -11,9 +11,11 @@ use crate::app_state::AppState;
 #[cfg(feature = "desktop")]
 use crate::error::AppResult;
 #[cfg(feature = "desktop")]
+use crate::mcp::gateway;
+#[cfg(feature = "desktop")]
 use crate::tunnel::{
     append_profile_log, cleanup_orphan_for_runtime, ensure_for_runtime,
-    is_quick_tunnel_url_change_error, TunnelServiceKind,
+    is_quick_tunnel_url_change_error, reconcile_mcp_gateway, TunnelServiceKind,
 };
 #[cfg(feature = "desktop")]
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
@@ -51,17 +53,21 @@ async fn maintain_all(
     tunnel_retries: &mut HashMap<(String, TunnelServiceKind), TunnelRetryState>,
 ) -> AppResult<()> {
     let state = app.state::<AppState>();
-    let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    let (profiles, settings) = state.with_workspaces(|store| {
+        Ok((store.list().to_vec(), store.settings()))
+    })?;
 
-    for profile in profiles {
+    for profile in &profiles {
         for kind in [TunnelServiceKind::Mcp, TunnelServiceKind::Actions] {
             let result = state.with_runtime(|runtime| match kind {
-                TunnelServiceKind::Mcp => runtime.maintain_mcp(&profile),
-                TunnelServiceKind::Actions => runtime.maintain_actions(&profile),
+                TunnelServiceKind::Mcp => runtime.maintain_mcp(profile),
+                TunnelServiceKind::Actions => runtime.maintain_actions(profile),
             });
             match result {
                 Ok(runtime) => {
-                    maintain_tunnel(&state, &profile, kind, &runtime, tunnel_retries).await;
+                    if kind != TunnelServiceKind::Mcp || !settings.mcp_gateway.enabled {
+                        maintain_tunnel(&state, profile, kind, &runtime, tunnel_retries).await;
+                    }
                 }
                 Err(error) => append_profile_log(
                     &profile.id,
@@ -71,7 +77,62 @@ async fn maintain_all(
             }
         }
     }
+    maintain_mcp_gateway(&state, &profiles, &settings.mcp_gateway).await;
     Ok(())
+}
+
+#[cfg(feature = "desktop")]
+async fn maintain_mcp_gateway(
+    state: &AppState,
+    profiles: &[WorkspaceProfile],
+    config: &crate::settings::McpGatewayConfig,
+) {
+    let active = match state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids())) {
+        Ok(active) => active,
+        Err(error) => {
+            log_gateway_error(config, &format!("读取活动工作区失败：{error}"));
+            return;
+        }
+    };
+    if let Err(error) = gateway::ensure(config, profiles, &active).await {
+        log_gateway_error(config, &format!("Gateway listener 维护失败：{error}"));
+        return;
+    }
+    match reconcile_mcp_gateway(config, profiles, &active).await {
+        Ok(Some(url)) => {
+            if let Err(error) = persist_gateway_public_url(state, &url) {
+                log_gateway_error(config, &format!("保存 Gateway 公网地址失败：{error}"));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => log_gateway_error(config, &format!("Gateway 隧道维护失败：{error}")),
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn persist_gateway_public_url(state: &AppState, url: &str) -> AppResult<()> {
+    let normalized = url.trim().trim_end_matches('/');
+    if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
+        return Ok(());
+    }
+    state.with_settings(|store| {
+        let mut settings = store.settings();
+        if settings.mcp_gateway.public_url == normalized {
+            return Ok(());
+        }
+        settings.mcp_gateway.public_url = normalized.to_string();
+        store.update_settings(settings)
+    })
+}
+
+#[cfg(feature = "desktop")]
+fn log_gateway_error(config: &crate::settings::McpGatewayConfig, message: &str) {
+    let profile_id = if config.owner_workspace_id.trim().is_empty() {
+        "mcp-gateway"
+    } else {
+        config.owner_workspace_id.as_str()
+    };
+    append_profile_log(profile_id, "stderr.log", &format!("[gateway] {message}"));
 }
 
 #[cfg(feature = "desktop")]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{DownloadConfig, FrpProfile, ProxyConfig};
+use crate::settings::{DownloadConfig, FrpProfile, McpGatewayConfig, ProxyConfig};
 use crate::workspace::WorkspaceProfile;
 
 /// Unified on-disk payload stored in `data/profiles.json`.
@@ -16,6 +16,8 @@ pub struct AppData {
     pub download: DownloadConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub mcp_gateway: McpGatewayConfig,
     #[serde(default, skip_serializing)]
     pub shared_secrets: HashMap<String, String>,
     #[serde(default, skip_serializing)]

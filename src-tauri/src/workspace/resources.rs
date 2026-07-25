@@ -47,16 +47,30 @@ pub fn validate_workspace_resources(
 ///
 /// Creating a workspace should not force the user to edit ports first. Defaults
 /// are kept when free; otherwise the next free ports above the defaults are used.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn assign_free_workspace_ports(
     profiles: &[WorkspaceProfile],
     candidate: &mut WorkspaceProfile,
 ) -> AppResult<()> {
-    let reserved: std::collections::HashSet<u16> = profiles
+    assign_free_workspace_ports_with_reserved(
+        profiles,
+        candidate,
+        &std::collections::HashSet::new(),
+    )
+}
+
+pub fn assign_free_workspace_ports_with_reserved(
+    profiles: &[WorkspaceProfile],
+    candidate: &mut WorkspaceProfile,
+    additional_reserved: &std::collections::HashSet<u16>,
+) -> AppResult<()> {
+    let mut reserved: std::collections::HashSet<u16> = profiles
         .iter()
         .filter(|profile| profile.id != candidate.id)
         .flat_map(service_claims)
         .map(|claim| claim.local_port)
         .collect();
+    reserved.extend(additional_reserved.iter().copied());
 
     let mcp_port = next_free_port(candidate.runtime.local_port, &reserved)?;
     let mut reserved_with_mcp = reserved;
@@ -305,8 +319,9 @@ fn subdomain_conflict_error(target: ServiceClaim<'_>, owner: ServiceClaim<'_>) -
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_free_workspace_ports, validate_service_start, validate_workspace_resources,
-        validate_workspace_resources_update, WorkspaceService,
+        assign_free_workspace_ports, assign_free_workspace_ports_with_reserved,
+        validate_service_start, validate_workspace_resources, validate_workspace_resources_update,
+        WorkspaceService,
     };
     use crate::workspace::WorkspaceProfile;
 
@@ -359,6 +374,18 @@ mod tests {
         assert_eq!(candidate.runtime.local_port, 28_767);
         assert_eq!(candidate.actions.local_port, 8_788);
         assert!(validate_workspace_resources(&[owner], &candidate).is_ok());
+    }
+
+    #[test]
+    fn assign_free_ports_skips_gateway_reserved_port() {
+        let mut candidate = WorkspaceProfile::new("C:/workspace/new".into(), Some("new".into()));
+        candidate.runtime.local_port = 28_765;
+        let reserved = std::collections::HashSet::from([28_765]);
+
+        assign_free_workspace_ports_with_reserved(&[], &mut candidate, &reserved)
+            .expect("assign");
+
+        assert_eq!(candidate.runtime.local_port, 28_766);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::platform::open_path_in_file_manager;
 use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::tunnel::append_profile_log;
 use crate::workspace::resources::{
-    assign_free_workspace_ports, validate_workspace_resources_update,
+    assign_free_workspace_ports_with_reserved, validate_workspace_resources_update,
 };
 use crate::workspace::WorkspaceProfile;
 
@@ -46,7 +46,13 @@ pub fn create_workspace(
         let mut profile = WorkspaceProfile::new(path, name);
         // Create should not fail just because default ports are already claimed.
         // Pick free ports now; start/update still enforce conflict checks.
-        assign_free_workspace_ports(store.list(), &mut profile)?;
+        let gateway = store.settings().mcp_gateway;
+        let reserved = if gateway.enabled {
+            std::collections::HashSet::from([gateway.local_port])
+        } else {
+            std::collections::HashSet::new()
+        };
+        assign_free_workspace_ports_with_reserved(store.list(), &mut profile, &reserved)?;
         store.register_workspace(profile.clone())?;
         Ok(profile)
     })
@@ -67,6 +73,7 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
         validate_workspace_resources_update(store.list(), &current, &profile)?;
+        crate::mcp::gateway::validate_workspace_ports(&store.settings().mcp_gateway, &profile)?;
         let mcp_callback_changed = current.auth.oauth_redirect_uris != profile.auth.oauth_redirect_uris
             || current.auth.oauth_redirect_hosts != profile.auth.oauth_redirect_hosts;
         let actions_callback_changed = current.actions.oauth_redirect_uris
@@ -127,6 +134,9 @@ pub fn open_workspace_directory(path: String) -> AppResult<()> {
 
 #[tauri::command]
 pub fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.with_settings(|store| {
+        crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &id)
+    })?;
     let profile = state.with_workspaces(|store| {
         store
             .get(&id)

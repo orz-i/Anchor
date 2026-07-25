@@ -13,6 +13,35 @@ pub struct FrpProfile {
     pub server_port: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpGatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mcp_gateway_port")]
+    pub local_port: u16,
+    /// Workspace whose existing MCP tunnel configuration owns the one public
+    /// gateway tunnel. This does not grant access to other workspaces.
+    #[serde(default)]
+    pub owner_workspace_id: String,
+    /// Public gateway base URL without a workspace path. Quick tunnel URLs are
+    /// persisted here after startup; fixed FRP/named URLs are synchronized from
+    /// the owner workspace.
+    #[serde(default)]
+    pub public_url: String,
+}
+
+impl Default for McpGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            local_port: default_mcp_gateway_port(),
+            owner_workspace_id: String::new(),
+            public_url: String::new(),
+        }
+    }
+}
+
 /// Download settings for fetching frpc / cloudflared binaries.
 ///
 /// GitHub is slow/unreliable from some networks, so downloads try a mirror
@@ -75,6 +104,10 @@ pub struct AppSettings {
     /// Global outbound proxy (Cloudflare tunnel, etc.).
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// One local MCP gateway can expose multiple workspace listeners through
+    /// `/w/<workspace_id>/...` paths and a single public tunnel.
+    #[serde(default)]
+    pub mcp_gateway: McpGatewayConfig,
     /// Shared secrets indexed by key name (e.g. "bearer_token").
     /// Persisted alongside other app settings in app_settings.json.
     #[serde(default)]
@@ -99,6 +132,10 @@ fn default_proxy_mode() -> String {
     "system".to_string()
 }
 
+fn default_mcp_gateway_port() -> u16 {
+    28765
+}
+
 impl AppSettings {
     pub fn from_data(data: &AppData) -> Self {
         Self {
@@ -106,6 +143,7 @@ impl AppSettings {
             last_workspace_id: data.last_workspace_id.clone(),
             download: data.download.clone(),
             proxy: data.proxy.clone(),
+            mcp_gateway: data.mcp_gateway.clone(),
             shared_secrets: data.shared_secrets.clone(),
             workspace_secrets: data.workspace_secrets.clone(),
             app_secrets: data.app_secrets.clone(),
@@ -117,6 +155,7 @@ impl AppSettings {
         data.last_workspace_id = self.last_workspace_id.clone();
         data.download = self.download.clone();
         data.proxy = self.proxy.clone();
+        data.mcp_gateway = self.mcp_gateway.clone();
         data.shared_secrets = self.shared_secrets.clone();
         data.workspace_secrets = self.workspace_secrets.clone();
         data.app_secrets = self.app_secrets.clone();
@@ -149,7 +188,7 @@ impl FrpProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::FrpProfile;
+    use super::{FrpProfile, McpGatewayConfig};
 
     #[test]
     fn accepts_frontend_camel_case_server_port() {
@@ -175,5 +214,13 @@ mod tests {
         .expect("legacy FRP profile should deserialize");
 
         assert_eq!(profile.server_port, 7005);
+    }
+
+    #[test]
+    fn gateway_defaults_to_disabled_reserved_port() {
+        let gateway = McpGatewayConfig::default();
+        assert!(!gateway.enabled);
+        assert_eq!(gateway.local_port, 28765);
+        assert!(gateway.owner_workspace_id.is_empty());
     }
 }

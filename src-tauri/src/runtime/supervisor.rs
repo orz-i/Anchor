@@ -13,6 +13,7 @@ use crate::runtime::port::{
     wait_for_port_free_blocking,
 };
 use crate::secret::SecretStore;
+use crate::settings::AppSettings;
 use crate::tools::policy::PolicySettings;
 use crate::tunnel::{append_profile_log, TunnelServiceKind};
 use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
@@ -133,6 +134,24 @@ impl RuntimeSupervisor {
                     ))
                 }
                 _ => None,
+            })
+            .collect()
+    }
+
+    pub fn active_mcp_workspace_ids(&self) -> HashSet<String> {
+        self.entries
+            .iter()
+            .filter_map(|((workspace_id, kind), entry)| {
+                if *kind == ServiceKind::Mcp
+                    && matches!(
+                        entry.phase,
+                        RuntimePhase::Running | RuntimePhase::Starting | RuntimePhase::Recovering
+                    )
+                {
+                    Some(workspace_id.clone())
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -358,6 +377,7 @@ impl RuntimeSupervisor {
 
         let spawn_result = match kind {
             ServiceKind::Mcp => {
+                let settings = AppSettings::load_or_default();
                 let use_shared = profile.auth.use_shared_secrets;
                 let mut auth = profile.auth.clone();
                 if use_shared {
@@ -383,7 +403,7 @@ impl RuntimeSupervisor {
                     PathBuf::from(&profile.path),
                     profile.id.clone(),
                     auth,
-                    profile.effective_public_url(),
+                    profile.mcp_external_base_url_with(&settings),
                     oauth_client_secret,
                     oauth_password,
                     oauth_token_secret,
@@ -755,7 +775,7 @@ fn endpoints(profile: &WorkspaceProfile, kind: ServiceKind) -> (String, String) 
 
 fn public_message_for(profile: &WorkspaceProfile, kind: ServiceKind) -> String {
     match kind {
-        ServiceKind::Mcp => profile.effective_public_url(),
+        ServiceKind::Mcp => profile.mcp_external_base_url(),
         ServiceKind::Actions => profile.actions_effective_public_url(),
     }
 }

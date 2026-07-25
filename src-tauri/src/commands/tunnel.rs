@@ -17,6 +17,21 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
     })
 }
 
+fn ensure_not_gateway_managed(
+    state: &AppState,
+    kind: TunnelServiceKind,
+) -> AppResult<()> {
+    if kind == TunnelServiceKind::Mcp
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        return Err(AppError::Message(
+            "MCP 隧道当前由单一 Gateway 管理；请在“设置 → 通用 → 单一 MCP Gateway”中操作。"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_tunnel_start_resources(
     state: &AppState,
     id: &str,
@@ -142,8 +157,19 @@ pub fn get_frp_snippet(
     id: String,
     service: String,
 ) -> AppResult<String> {
-    let profile = profile_by_id(&state, &id)?;
+    let mut profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
+    if kind == TunnelServiceKind::Mcp {
+        let gateway = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
+        if gateway.enabled {
+            if gateway.owner_workspace_id != id {
+                return Err(AppError::Message(
+                    "只有 MCP Gateway 隧道所有者工作区可以生成共享 FRP 片段。".into(),
+                ));
+            }
+            profile.runtime.local_port = gateway.local_port;
+        }
+    }
     Ok(frp_snippet(&profile, kind))
 }
 
@@ -155,6 +181,7 @@ pub async fn restart_tunnel(
 ) -> AppResult<TunnelStatus> {
     let profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
+    ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
     sync_tunnel_routes_from_runtime(&state).await?;
     let settings = state.with_settings(|store| Ok(store.settings()))?;
@@ -211,6 +238,7 @@ pub async fn start_tunnel(
 ) -> AppResult<TunnelStatus> {
     let profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
+    ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
     sync_tunnel_routes_from_runtime(&state).await?;
     let settings = state.with_settings(|store| Ok(store.settings()))?;
@@ -232,6 +260,7 @@ pub async fn stop_tunnel(
 ) -> AppResult<TunnelStatus> {
     let profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
+    ensure_not_gateway_managed(&state, kind)?;
     let settings = state.with_settings(|store| Ok(store.settings()))?;
     let mut guard = supervisor().lock().await;
     guard.stop(&profile, kind, &settings).await?;
@@ -267,6 +296,7 @@ pub async fn test_tunnel(
 ) -> AppResult<TunnelTestResult> {
     let profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
+    ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
     sync_tunnel_routes_from_runtime(&state).await?;
     let settings = state.with_settings(|store| Ok(store.settings()))?;

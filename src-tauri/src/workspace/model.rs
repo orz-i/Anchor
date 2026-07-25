@@ -336,8 +336,31 @@ impl WorkspaceProfile {
         )
     }
 
+    /// External base URL used by this logical MCP server. In gateway mode the
+    /// public hostname is shared, while the workspace path remains unique.
+    pub fn mcp_external_base_url(&self) -> String {
+        self.mcp_external_base_url_with(&AppSettings::load_or_default())
+    }
+
+    pub fn mcp_external_base_url_with(&self, settings: &AppSettings) -> String {
+        if settings.mcp_gateway.enabled {
+            let base = if settings.mcp_gateway.public_url.trim().is_empty() {
+                format!("http://127.0.0.1:{}", settings.mcp_gateway.local_port)
+            } else {
+                settings
+                    .mcp_gateway
+                    .public_url
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string()
+            };
+            return format!("{base}/w/{}", self.id);
+        }
+        self.effective_public_url_with(settings)
+    }
+
     pub fn public_endpoint(&self) -> String {
-        let base = self.effective_public_url();
+        let base = self.mcp_external_base_url();
         if base.is_empty() {
             return String::new();
         }
