@@ -9,8 +9,8 @@ pub use oauth::{
     request_origin_allowed,
 };
 pub use oauth_flow::{
-    authorize_get, authorize_post, redirect_uri_log_label, token_exchange,
-    validate_redirect_policy, verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams,
-    OAuthRuntime, TokenForm,
+    authorize_get, authorize_post, builtin_redirect_hosts, redirect_uri_log_label,
+    token_exchange, validate_redirect_policy, verify_oauth_bearer_header, AuthorizeForm,
+    AuthorizeParams, OAuthRuntime, TokenForm,
 };
 pub use oauth_registry::{register_oauth_runtime, update_oauth_redirect_policy};

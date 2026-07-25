@@ -184,9 +184,6 @@
       if (draftAuthType === "oauth") {
         validateRedirectUris(draftOauthRedirectUris);
         validateRedirectHosts(draftOauthRedirectHosts);
-        if (!draftOauthRedirectUris.trim() && !draftOauthRedirectHosts.trim()) {
-          throw new Error("请至少配置一个精确 Callback URL 或 Callback 域名白名单");
-        }
       }
       const callbackPolicyChanged =
         draftOauthRedirectUris !== oauthRedirectUris ||
@@ -320,30 +317,6 @@
         regenerating={regenerating}
       />
     </label>
-    <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">精确 OAuth Callback URL（可选）</span>
-      <textarea
-        rows="3"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
-        bind:value={draftOauthRedirectUris}
-        placeholder="https://chatgpt.com/connector/oauth/&lt;callback_id&gt;"
-      ></textarea>
-      <span class="text-xs text-[var(--color-text-muted)]">
-        每行一个精确 URL；真正发码始终绑定精确 callback。
-      </span>
-    </label>
-    <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Callback 域名登记白名单</span>
-      <textarea
-        rows="3"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
-        bind:value={draftOauthRedirectHosts}
-        placeholder="chatgpt.com&#10;*.chatgpt.com"
-      ></textarea>
-      <span class="text-xs text-[var(--color-text-muted)]">
-        支持 <code>*.example.com</code>。匹配后在授权页确认并热登记完整 URL，不重启服务或隧道。
-      </span>
-    </label>
     <p class="text-xs text-[var(--color-text-muted)]">
       在 GPT Actions 认证里选 API Key → Bearer，Key 填这里的值。
     </p>
@@ -366,6 +339,36 @@
         {/if}
       </div>
     </label>
+    <div class="tx-alert" role="note">
+      ChatGPT 官方 callback 会自动识别并登记，无需中途返回 GUI 填写 Callback URL。
+    </div>
+    <details class="rounded-md border border-[var(--color-border)] px-3 py-2">
+      <summary class="cursor-pointer text-xs text-[var(--color-text-muted)]">
+        高级：其他 OAuth 客户端 Callback 策略
+      </summary>
+      <div class="mt-3 grid gap-3">
+        <label class="grid gap-1">
+          <span class="text-xs text-[var(--color-text-muted)]">附加精确 Callback URL（可选）</span>
+          <textarea
+            rows="3"
+            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            bind:value={draftOauthRedirectUris}
+          ></textarea>
+        </label>
+        <label class="grid gap-1">
+          <span class="text-xs text-[var(--color-text-muted)]">附加 Callback 域名白名单（可选）</span>
+          <textarea
+            rows="3"
+            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            bind:value={draftOauthRedirectHosts}
+            placeholder="oauth.example.com&#10;*.example.com"
+          ></textarea>
+          <span class="text-xs text-[var(--color-text-muted)]">
+            匹配域名会自动登记精确 callback，不显示确认项，也不重启服务。
+          </span>
+        </label>
+      </div>
+    </details>
     <label class="grid gap-1">
       <span class="text-xs text-[var(--color-text-muted)]">OAuth Client Secret（填到 GPT）</span>
       <SecretInput

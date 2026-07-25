@@ -20,6 +20,8 @@ pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60;
 pub const OAUTH_REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 90;
 #[allow(dead_code)]
 pub const OAUTH_MAX_BODY_BYTES: usize = 8_192;
+const BUILTIN_CHATGPT_CALLBACK_HOST: &str = "chatgpt.com";
+const BUILTIN_CHATGPT_CALLBACK_PATH_PREFIX: &str = "/connector/oauth/";
 
 #[derive(Clone)]
 pub struct OAuthRuntime {
@@ -32,6 +34,23 @@ pub struct OAuthRuntime {
     redirect_host_patterns: Arc<RwLock<Vec<String>>>,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
     used_refresh_tokens: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+pub fn builtin_redirect_hosts() -> &'static [&'static str] {
+    &[BUILTIN_CHATGPT_CALLBACK_HOST]
+}
+
+fn builtin_callback_allowed(parsed: &reqwest::Url) -> bool {
+    if parsed.scheme() != "https"
+        || parsed.port().is_some()
+        || parsed.host_str() != Some(BUILTIN_CHATGPT_CALLBACK_HOST)
+    {
+        return false;
+    }
+    parsed
+        .path()
+        .strip_prefix(BUILTIN_CHATGPT_CALLBACK_PATH_PREFIX)
+        .is_some_and(|callback_id| !callback_id.is_empty() && !callback_id.contains('/'))
 }
 
 pub fn validate_redirect_policy(redirect_uris: &str, redirect_hosts: &str) -> Result<(), String> {
@@ -127,7 +146,7 @@ pub fn parse_redirect_host_patterns(raw: &str) -> Result<Vec<String>, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedirectUriStatus {
     Registered,
-    EnrollmentRequired,
+    AutoEnrollmentAllowed,
     Rejected,
 }
 
@@ -313,14 +332,15 @@ impl OAuthRuntime {
             return RedirectUriStatus::Rejected;
         };
         let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
-        if self
-            .redirect_host_patterns
-            .read()
-            .expect("oauth redirect host pattern lock")
-            .iter()
-            .any(|pattern| callback_host_matches(pattern, &host))
+        if builtin_callback_allowed(&parsed)
+            || self
+                .redirect_host_patterns
+                .read()
+                .expect("oauth redirect host pattern lock")
+                .iter()
+                .any(|pattern| callback_host_matches(pattern, &host))
         {
-            RedirectUriStatus::EnrollmentRequired
+            RedirectUriStatus::AutoEnrollmentAllowed
         } else {
             RedirectUriStatus::Rejected
         }
@@ -329,7 +349,7 @@ impl OAuthRuntime {
     fn enroll_redirect_uri(&self, redirect_uri: &str) -> Result<(), &'static str> {
         match self.redirect_uri_status(redirect_uri) {
             RedirectUriStatus::Registered => return Ok(()),
-            RedirectUriStatus::EnrollmentRequired => {}
+            RedirectUriStatus::AutoEnrollmentAllowed => {}
             RedirectUriStatus::Rejected => {
                 return Err("redirect_uri is not eligible for enrollment")
             }
@@ -358,7 +378,7 @@ impl OAuthRuntime {
     pub fn redirect_uri_status_label(&self, redirect_uri: &str) -> &'static str {
         match self.redirect_uri_status(redirect_uri) {
             RedirectUriStatus::Registered => "registered",
-            RedirectUriStatus::EnrollmentRequired => "enrollment_required",
+            RedirectUriStatus::AutoEnrollmentAllowed => "auto_enrollment_allowed",
             RedirectUriStatus::Rejected => "rejected",
         }
     }
@@ -463,8 +483,6 @@ pub struct AuthorizeForm {
     pub state: String,
     #[serde(default)]
     pub resource: String,
-    #[serde(default)]
-    pub trust_redirect_uri: bool,
     pub password: String,
 }
 
@@ -501,10 +519,9 @@ pub fn authorize_get(
     if !oauth.client_id_allowed(&params.client_id) {
         return html_error("Unknown client_id", StatusCode::BAD_REQUEST);
     }
-    let redirect_status = oauth.redirect_uri_status(&params.redirect_uri);
-    if redirect_status == RedirectUriStatus::Rejected {
+    if oauth.redirect_uri_status(&params.redirect_uri) == RedirectUriStatus::Rejected {
         return html_error(
-            "redirect_uri is not registered and its host is not in the callback enrollment allowlist",
+            "redirect_uri is not registered, built in, or covered by the callback host allowlist",
             StatusCode::BAD_REQUEST,
         );
     }
@@ -526,7 +543,6 @@ pub fn authorize_get(
         canonical_resource_url,
         "",
         workspace_path,
-        redirect_status == RedirectUriStatus::EnrollmentRequired,
     ))
     .into_response()
 }
@@ -547,14 +563,12 @@ pub fn authorize_post(
             &form.resource,
             "Invalid client",
             None,
-            false,
         ))
         .into_response();
     }
-    let redirect_status = oauth.redirect_uri_status(&form.redirect_uri);
-    if redirect_status == RedirectUriStatus::Rejected {
+    if oauth.redirect_uri_status(&form.redirect_uri) == RedirectUriStatus::Rejected {
         return html_error(
-            "redirect_uri is not registered and its host is not in the callback enrollment allowlist",
+            "redirect_uri is not registered, built in, or covered by the callback host allowlist",
             StatusCode::BAD_REQUEST,
         );
     }
@@ -568,7 +582,6 @@ pub fn authorize_post(
             &form.resource,
             "Invalid PKCE parameters",
             None,
-            redirect_status == RedirectUriStatus::EnrollmentRequired,
         ))
         .into_response();
     }
@@ -582,7 +595,6 @@ pub fn authorize_post(
             &form.resource,
             "Invalid resource",
             None,
-            redirect_status == RedirectUriStatus::EnrollmentRequired,
         ))
         .into_response();
     }
@@ -598,29 +610,12 @@ pub fn authorize_post(
                 &form.resource,
                 "Invalid password",
                 None,
-                redirect_status == RedirectUriStatus::EnrollmentRequired,
             )),
         )
             .into_response();
     }
-    if redirect_status == RedirectUriStatus::EnrollmentRequired {
-        if !form.trust_redirect_uri {
-            return Html(login_page(
-                &form.client_id,
-                &form.redirect_uri,
-                &form.code_challenge,
-                &form.code_challenge_method,
-                &form.state,
-                &form.resource,
-                "Confirm registration of this exact callback URL",
-                None,
-                true,
-            ))
-            .into_response();
-        }
-        if oauth.enroll_redirect_uri(&form.redirect_uri).is_err() {
-            return html_error("redirect_uri enrollment failed", StatusCode::BAD_REQUEST);
-        }
+    if oauth.enroll_redirect_uri(&form.redirect_uri).is_err() {
+        return html_error("redirect_uri auto-enrollment failed", StatusCode::BAD_REQUEST);
     }
 
     let issuer_url = issuer_url.trim_end_matches('/').to_string();
@@ -920,7 +915,6 @@ fn login_page(
     resource: &str,
     error: &str,
     workspace_path: Option<&str>,
-    enroll_redirect_uri: bool,
 ) -> String {
     let error_block = if error.is_empty() {
         String::new()
@@ -931,20 +925,6 @@ fn login_page(
         .filter(|path| !path.is_empty())
         .map(|path| format!("<p>Workspace: <code>{}</code></p>", html_escape(path)))
         .unwrap_or_default();
-    let enrollment_block = if enroll_redirect_uri {
-        format!(
-            "<div style='border:1px solid #d97706;background:#fffbeb;padding:.75rem;margin:.75rem 0'>\
-            <strong>New callback registration</strong>\
-            <p>This exact URL is not registered yet, but its host matches the configured enrollment allowlist.</p>\
-            <p><code>{}</code></p>\
-            <label style='display:flex;gap:.5rem;align-items:flex-start'>\
-            <input style='width:auto;margin-top:.2rem' type='checkbox' name='trust_redirect_uri' value='true' required>\
-            Trust and register this exact callback URL for the current service runtime.</label></div>",
-            html_escape(redirect_uri)
-        )
-    } else {
-        String::new()
-    };
     format!(
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
         <title>Authorize MCP Server</title>\
@@ -955,7 +935,6 @@ fn login_page(
         <h2>Authorize Coding Tools MCP</h2>\
         {workspace_block}\
         <p>Client: <strong>{}</strong></p>\
-        <p>Redirect URI: <code>{}</code></p>\
         {error_block}\
         <form method='POST' action='/oauth/authorize'>\
         <input type='hidden' name='client_id' value='{}'>\
@@ -964,12 +943,10 @@ fn login_page(
         <input type='hidden' name='code_challenge_method' value='{}'>\
         <input type='hidden' name='state' value='{}'>\
         <input type='hidden' name='resource' value='{}'>\
-        {enrollment_block}\
         <label>Password<input type='password' name='password' autocomplete='current-password' required></label>\
         <button type='submit'>Authorize</button>\
         </form></body></html>",
         html_escape(client_id),
-        html_escape(redirect_uri),
         html_escape(client_id),
         html_escape(redirect_uri),
         html_escape(code_challenge),
@@ -1044,7 +1021,6 @@ mod tests {
                 code_challenge_method: "S256".into(),
                 state: "state".into(),
                 resource: resource_url.into(),
-                trust_redirect_uri: false,
                 password: "test-password".into(),
             },
             "https://lb.example.com",
@@ -1185,22 +1161,44 @@ mod tests {
         assert!(!callback_host_matches("*.chatgpt.com", "evilchatgpt.com"));
         assert!(parse_redirect_host_patterns("https://chatgpt.com").is_err());
         assert!(parse_redirect_host_patterns("*.chatgpt.com/path").is_err());
-    }
 
-    #[test]
-    fn trusted_callback_domain_enrolls_exact_uri_without_restart() {
         let oauth = OAuthRuntime::new(
             "https://lb.example.com".into(),
             "chatgpt-client-test".into(),
             None,
             "test-password".into(),
             "token-signing-secret".into(),
-        )
-        .with_redirect_host_patterns("*.chatgpt.com")
-        .expect("host pattern");
+        );
+        assert_eq!(
+            oauth.redirect_uri_status_label(
+                "https://chatgpt.com/connector/oauth/callback-123"
+            ),
+            "auto_enrollment_allowed"
+        );
+        assert_eq!(
+            oauth.redirect_uri_status_label("https://chatgpt.com/not-connector/callback-123"),
+            "rejected"
+        );
+        assert_eq!(
+            oauth.redirect_uri_status_label(
+                "https://chatgpt.com.attacker.example/connector/oauth/callback-123"
+            ),
+            "rejected"
+        );
+    }
+
+    #[test]
+    fn builtin_chatgpt_callback_auto_enrolls_without_configuration_or_prompt() {
+        let oauth = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "chatgpt-client-test".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        );
         let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let redirect_uri = "https://oauth.chatgpt.com/connector/callback-123";
+        let redirect_uri = "https://chatgpt.com/connector/oauth/callback-123";
         let resource_url = "https://lb.example.com/mcp";
 
         let page = authorize_get(
@@ -1220,24 +1218,6 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         assert!(!oauth.redirect_uri_allowed(redirect_uri));
 
-        let denied = authorize_post(
-            &oauth,
-            AuthorizeForm {
-                client_id: "chatgpt-client-test".into(),
-                redirect_uri: redirect_uri.into(),
-                code_challenge: challenge.clone(),
-                code_challenge_method: "S256".into(),
-                state: "state".into(),
-                resource: resource_url.into(),
-                trust_redirect_uri: false,
-                password: "test-password".into(),
-            },
-            "https://lb.example.com",
-            resource_url,
-        );
-        assert_eq!(denied.status(), StatusCode::OK);
-        assert!(!oauth.redirect_uri_allowed(redirect_uri));
-
         let approved = authorize_post(
             &oauth,
             AuthorizeForm {
@@ -1247,7 +1227,6 @@ mod tests {
                 code_challenge_method: "S256".into(),
                 state: "state".into(),
                 resource: resource_url.into(),
-                trust_redirect_uri: true,
                 password: "test-password".into(),
             },
             "https://lb.example.com",
@@ -1297,24 +1276,54 @@ mod tests {
     }
 
     #[test]
-    fn callback_confirmation_checkbox_is_inside_authorization_form() {
+    fn configured_callback_host_auto_enrolls_without_prompt() {
+        let oauth = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "client".into(),
+            None,
+            "password".into(),
+            "token-secret".into(),
+        )
+        .with_redirect_host_patterns("*.example.com")
+        .expect("host pattern");
+        let verifier = "dBjftJeZ4CVP-mB92Kpru-AEJvkQlLgi3ThpmQ45N_Xyo";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let redirect_uri = "https://oauth.example.com/callback/dynamic";
+        let response = authorize_post(
+            &oauth,
+            AuthorizeForm {
+                client_id: "client".into(),
+                redirect_uri: redirect_uri.into(),
+                code_challenge: challenge,
+                code_challenge_method: "S256".into(),
+                state: "state".into(),
+                resource: "https://lb.example.com/mcp".into(),
+                password: "password".into(),
+            },
+            "https://lb.example.com",
+            "https://lb.example.com/mcp",
+        );
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(oauth.redirect_uri_allowed(redirect_uri));
+    }
+
+    #[test]
+    fn authorization_page_hides_callback_trust_controls() {
+        let callback = "https://chatgpt.com/connector/oauth/callback-123";
         let page = login_page(
             "client",
-            "https://oauth.chatgpt.com/connector/callback",
+            callback,
             "challenge",
             "S256",
             "state",
             "https://service.example/mcp",
             "",
             None,
-            true,
         );
-        let form_start = page.find("<form method='POST'").expect("form start");
-        let checkbox = page
-            .find("name='trust_redirect_uri'")
-            .expect("trust checkbox");
-        let form_end = page.find("</form>").expect("form end");
-        assert!(form_start < checkbox && checkbox < form_end);
+        assert!(page.contains("<form method='POST'"));
+        assert!(!page.contains("trust_redirect_uri"));
+        assert!(!page.contains("Redirect URI"));
+        assert!(page.contains(&format!("name='redirect_uri' value='{callback}'")));
     }
 
     #[test]

@@ -158,9 +158,6 @@
       if (draft.type === "oauth") {
         validateRedirectUris(draft.oauth_redirect_uris ?? "");
         validateRedirectHosts(draft.oauth_redirect_hosts ?? "");
-        if (!(draft.oauth_redirect_uris ?? "").trim() && !(draft.oauth_redirect_hosts ?? "").trim()) {
-          throw new Error("请至少配置一个精确 Callback URL 或 Callback 域名白名单");
-        }
       }
       if (draft.type === "oauth" && draft.use_shared_secrets) {
         const clientId = draft.oauth_client_id.trim();
@@ -253,32 +250,38 @@
       />
     </label>
 
-    <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">精确 OAuth Callback URL（可选）</span>
-      <textarea
-        rows="3"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
-        bind:value={draft.oauth_redirect_uris}
-        placeholder="https://chatgpt.com/connector/oauth/&lt;callback_id&gt;"
-      ></textarea>
-      <span class="text-xs text-[var(--color-text-muted)]">
-        每行一个精确 URL。已知固定 callback 时可直接登记；真正发码始终绑定精确 URL。
-      </span>
-    </label>
+    <div class="tx-alert" role="note">
+      ChatGPT 官方 callback 会自动识别并登记，无需复制 Callback URL，也无需配置域名白名单。
+    </div>
 
-    <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Callback 域名登记白名单</span>
-      <textarea
-        rows="3"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
-        bind:value={draft.oauth_redirect_hosts}
-        placeholder="chatgpt.com&#10;*.chatgpt.com"
-      ></textarea>
-      <span class="text-xs text-[var(--color-text-muted)]">
-        支持精确域名和 <code>*.example.com</code>。通配符只允许授权页登记该域名下出现的完整 callback；
-        用户确认后会热登记精确 URL 并继续授权，不修改 profile、不重启 listener、不更换隧道地址。
-      </span>
-    </label>
+    <details class="rounded-md border border-[var(--color-border)] px-3 py-2">
+      <summary class="cursor-pointer text-xs text-[var(--color-text-muted)]">
+        高级：其他 OAuth 客户端 Callback 策略
+      </summary>
+      <div class="mt-3 grid gap-3">
+        <label class="grid gap-1">
+          <span class="text-xs text-[var(--color-text-muted)]">附加精确 Callback URL（可选）</span>
+          <textarea
+            rows="3"
+            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            bind:value={draft.oauth_redirect_uris}
+          ></textarea>
+        </label>
+
+        <label class="grid gap-1">
+          <span class="text-xs text-[var(--color-text-muted)]">附加 Callback 域名白名单（可选）</span>
+          <textarea
+            rows="3"
+            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            bind:value={draft.oauth_redirect_hosts}
+            placeholder="oauth.example.com&#10;*.example.com"
+          ></textarea>
+          <span class="text-xs text-[var(--color-text-muted)]">
+            匹配域名会自动登记本次精确 callback，不显示确认项，也不重启 listener。
+          </span>
+        </label>
+      </div>
+    </details>
 
     <div class="grid gap-1">
       <span class="text-xs text-[var(--color-text-muted)]">OAuth 客户端密钥</span>

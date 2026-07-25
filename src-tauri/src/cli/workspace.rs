@@ -5,6 +5,7 @@ use reqwest::header::{ALLOW, AUTHORIZATION, WWW_AUTHENTICATE};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::auth::builtin_redirect_hosts;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
@@ -249,8 +250,6 @@ fn mcp_gpt_config(
             let password = secret(store, profile, "oauth_password", shared)?;
             let redirect_uris = redirect_uri_list(&profile.auth.oauth_redirect_uris);
             let redirect_hosts = redirect_uri_list(&profile.auth.oauth_redirect_hosts);
-            let callback_registration_required =
-                redirect_uris.is_empty() && redirect_hosts.is_empty();
             json!({
                 "type": "oauth",
                 "clientId": client_id,
@@ -263,9 +262,10 @@ fn mcp_gpt_config(
                 "scope": "mcp",
                 "usesSharedSecrets": shared,
                 "registeredRedirectUris": redirect_uris,
+                "builtInCallbackHosts": builtin_redirect_hosts(),
                 "callbackEnrollmentHosts": redirect_hosts,
-                "callbackRegistrationRequired": callback_registration_required,
-                "callbackRegistrationNote": "Exact redirect URIs remain authoritative. If the callback host matches callbackEnrollmentHosts, the authorization page can register the exact URL in memory after explicit user confirmation, without restarting the listener or tunnel."
+                "callbackRegistrationRequired": false,
+                "callbackRegistrationNote": "Official ChatGPT callbacks are accepted automatically with no GUI configuration or authorization-page confirmation. Additional configured callback hosts also auto-enroll the exact redirect URI without restarting the listener or tunnel."
             })
         }
         "bearer" => {
@@ -309,8 +309,6 @@ fn actions_gpt_config(
             let secret = secret(store, profile, "actions_oauth_client_secret", shared)?;
             let redirect_uris = redirect_uri_list(&profile.actions.oauth_redirect_uris);
             let redirect_hosts = redirect_uri_list(&profile.actions.oauth_redirect_hosts);
-            let callback_registration_required =
-                redirect_uris.is_empty() && redirect_hosts.is_empty();
             json!({
                 "type": "oauth",
                 "clientId": profile.actions.oauth_client_id,
@@ -320,9 +318,10 @@ fn actions_gpt_config(
                 "scope": profile.actions.oauth_scopes,
                 "usesSharedSecrets": shared,
                 "registeredRedirectUris": redirect_uris,
+                "builtInCallbackHosts": builtin_redirect_hosts(),
                 "callbackEnrollmentHosts": redirect_hosts,
-                "callbackRegistrationRequired": callback_registration_required,
-                "callbackRegistrationNote": "Allowed callback hosts can enroll the exact URL at authorization time after explicit confirmation; no listener or tunnel restart is required."
+                "callbackRegistrationRequired": false,
+                "callbackRegistrationNote": "Official ChatGPT callbacks are accepted automatically. Additional configured callback hosts auto-enroll the exact redirect URI without GUI interaction or service restart."
             })
         }
         other => json!({ "type": other }),
@@ -922,6 +921,11 @@ fn redirect_uri_list(raw: &str) -> Vec<String> {
 }
 
 fn print_redirect_uris(auth: &Value) {
+    let built_in_hosts = auth
+        .get("builtInCallbackHosts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let uris = auth
         .get("registeredRedirectUris")
         .and_then(Value::as_array)
@@ -932,19 +936,14 @@ fn print_redirect_uris(auth: &Value) {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if uris.is_empty() && hosts.is_empty() {
-        if auth["callbackRegistrationRequired"].as_bool() == Some(true) {
-            println!(
-                "Callback: <not configured; add an exact callback URL or a callback enrollment host>"
-            );
-        }
-        return;
+    for host in built_in_hosts.iter().filter_map(Value::as_str) {
+        println!("Built-in Callback Host: {host} (automatic)");
     }
     for uri in uris.iter().filter_map(Value::as_str) {
         println!("Registered Callback: {uri}");
     }
     for host in hosts.iter().filter_map(Value::as_str) {
-        println!("Callback Enrollment Host: {host}");
+        println!("Additional Callback Host: {host} (automatic)");
     }
 }
 

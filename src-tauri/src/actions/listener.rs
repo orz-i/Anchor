@@ -478,13 +478,12 @@ async fn oauth_authorize_post(
     };
     let redirect_label = redirect_uri_log_label(&form.redirect_uri);
     let before_status = oauth.redirect_uri_status_label(&form.redirect_uri);
-    let trust_requested = form.trust_redirect_uri;
     let redirect_uri = form.redirect_uri.clone();
     append_profile_log(
         &state.workspace_id,
         "actions-oauth.log",
         &format!(
-            "[oauth] event=authorize_submitted method=POST {redirect_label} redirect_status={before_status} trust_requested={trust_requested}"
+            "[oauth] event=authorize_submitted method=POST {redirect_label} redirect_status={before_status}"
         ),
     );
     let response = authorize_post(

@@ -71,7 +71,7 @@ mod tests {
         assert!(runtime.redirect_uri_allowed("https://chatgpt.com/callback/new"));
         assert_eq!(
             runtime.redirect_uri_status_label("https://oauth.chatgpt.com/callback/dynamic"),
-            "enrollment_required"
+            "auto_enrollment_allowed"
         );
     }
 }
