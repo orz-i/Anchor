@@ -544,7 +544,9 @@ fn should_skip(path: &Path, root: &Path) -> bool {
 }
 
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    crate::platform::hide_std_console(&mut command);
+    let output = command
         .arg("-C")
         .arg(root)
         .args(args)

@@ -375,6 +375,7 @@ impl McpProxyClient {
         workspace_id: &str,
     ) -> Result<(Arc<Self>, Vec<Value>), String> {
         let mut command = Command::new(&spec.command);
+        crate::platform::hide_tokio_console(&mut command);
         command
             .args(&spec.args)
             .envs(&spec.env)

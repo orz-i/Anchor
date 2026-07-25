@@ -53,8 +53,12 @@ mod windows;
 
 mod open;
 mod paths;
+mod child_process;
 
 pub use open::open_path_in_file_manager;
+pub(crate) use child_process::{
+    configure_supervised_tokio_process, hide_std_console, hide_tokio_console,
+};
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxPlatform;

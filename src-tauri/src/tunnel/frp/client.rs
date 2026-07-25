@@ -313,19 +313,7 @@ pub async fn spawn_frpc(
     cmd.stderr(std::process::Stdio::piped());
     cmd.current_dir(&first_profile.path);
 
-    #[cfg(windows)]
-    {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        // frpc 是控制台程序。显式禁止创建控制台，避免安装版或开发版
-        // 从桌面应用启动时短暂闪出黑色窗口。
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    crate::platform::configure_supervised_tokio_process(&mut cmd);
 
     // 一个聚合 frpc 只有一套进程环境，不能按工作区分别设置代理。
     // 任一路由要求使用代理时，为整个聚合连接启用代理；这样 HashMap

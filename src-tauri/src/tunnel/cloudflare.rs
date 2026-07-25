@@ -254,17 +254,7 @@ pub async fn spawn_cloudflare_tunnel(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    #[cfg(windows)]
-    {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    crate::platform::configure_supervised_tokio_process(&mut cmd);
 
     let settings = crate::settings::AppSettings::load_or_default();
     if use_proxy {

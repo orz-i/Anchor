@@ -237,6 +237,7 @@ async fn run_command(
     let start = Instant::now();
 
     let mut command = command_for_program(&program, &args);
+    crate::platform::hide_tokio_console(&mut command);
     command
         .current_dir(platform_command_path(cwd))
         .stdin(std::process::Stdio::piped())

@@ -472,6 +472,7 @@ struct GitOutput {
 
 fn run_git(cwd: &std::path::Path, args: &[&str], limit: Duration) -> Result<GitOutput, WorkspaceError> {
     let mut cmd = Command::new("git");
+    crate::platform::hide_std_console(&mut cmd);
     cmd.arg("-C").arg(cwd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = cmd
         .output()
