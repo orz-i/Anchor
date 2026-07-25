@@ -285,7 +285,7 @@ pnpm cli:build
 ./src-tauri/target/release/coding-tools-mcp serve <workspace> --service mcp
 ```
 
-The CLI will not take over a port already used by the GUI. Use systemd for background supervision; see the [Linux CLI guide](docs/linux-cli.md).
+The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. It will not take over a port already used by the GUI. For production boot-time supervision, systemd should still run `serve` directly. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).
 
 ### Request Agent Skills through MCP
 

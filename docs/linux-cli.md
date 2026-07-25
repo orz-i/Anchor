@@ -1,6 +1,6 @@
 # Linux CLI
 
-`coding-tools-mcp` 是面向 Linux 服务器和无桌面环境的前台运行入口。它与桌面端读取同一套配置模型：**一个 workspace 对应一个 WorkspaceProfile**。
+`coding-tools-mcp` 是面向 Linux 服务器和无桌面环境的运行入口，支持前台 `serve` 和内置后台 daemon。它与桌面端读取同一套配置模型：**一个 workspace 对应一个 WorkspaceProfile**。
 
 ## 构建
 
@@ -58,6 +58,17 @@ coding-tools-mcp show <workspace>
 # 检查配置端口是否正在监听
 coding-tools-mcp status <workspace>
 
+# 后台启动并返回终端
+coding-tools-mcp start <workspace> --service all --tunnel
+
+# 查看日志和诊断
+coding-tools-mcp logs <workspace> --service daemon
+coding-tools-mcp doctor <workspace>
+
+# 重启或停止后台 daemon
+coding-tools-mcp restart <workspace>
+coding-tools-mcp stop <workspace>
+
 # 前台启动 MCP，Ctrl+C 优雅停止
 coding-tools-mcp serve <workspace>
 
@@ -71,7 +82,7 @@ coding-tools-mcp serve <workspace> --service all --tunnel
 coding-tools-mcp --json status <workspace>
 ```
 
-`serve` 是前台常驻命令，不会脱离终端自行变成 daemon。若对应端口已被桌面 GUI 或其他进程占用，CLI 会报错退出，不会停止、接管或替换现有服务。
+`serve` 是前台常驻命令；`start` 创建 Linux 后台 daemon。若对应端口已被桌面 GUI 或其他进程占用，两种模式都会报错退出，不会停止、接管或替换现有服务。完整运维说明见 [CLI Daemon 与运维命令](cli-daemon.md)。
 
 ## systemd 用户服务
 
@@ -107,6 +118,8 @@ systemctl --user enable --now coding-tools-mcp.service
 systemctl --user status coding-tools-mcp.service
 journalctl --user -u coding-tools-mcp.service -f
 ```
+
+systemd 必须直接运行前台 `serve`，不要使用 `start`；内置 daemon 适合人工 SSH 运维，不替代 systemd 的开机自启和进程监督。
 
 需要在退出登录后继续运行时，可为该 Linux 用户启用 linger：
 

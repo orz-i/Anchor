@@ -293,7 +293,7 @@ pnpm cli:build
 ./src-tauri/target/release/coding-tools-mcp serve <workspace> --service mcp
 ```
 
-CLI 不会接管已被 GUI 占用的端口。后台运行建议交给 systemd，完整说明见 [Linux CLI 使用指南](docs/linux-cli.md)。
+CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` 运维命令。它不会接管已被 GUI 占用的端口；生产自启动仍建议由 systemd 直接监督 `serve`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。
 
 ### 通过 MCP 提请 Agent Skill
 
