@@ -87,7 +87,13 @@ resource: https://mcp.example.com/w/WORKSPACE_A_ID/mcp
 
 ## Quick Tunnel 地址变化
 
-首次启动 Quick Tunnel 时，实际公网基础地址会写入全局 Gateway 配置。运行时 URL 的首次持久化不会触发隧道误重启。
+Gateway 将用户填写的固定公网地址与运行时观测到的隧道地址分开保存：
+
+- `publicUrl`：用户配置的固定入口；
+- `observedPublicUrl`：最近一次成功启动后观测到的运行时入口；
+- observed owner/signature：该观测地址所属的 owner 和隧道身份。
+
+首次启动 Quick Tunnel 时，实际公网基础地址只写入运行时观测字段，不会覆盖用户配置，也不会触发隧道误重启。owner、Gateway 端口、固定地址或 owner 隧道配置变化时，旧观测状态会被清除。
 
 后续若 Quick Tunnel 地址发生变化，服务会拒绝静默迁移并停止无效线路，因为所有 ChatGPT 工作区连接都需要更新。需要稳定地址时应使用 FRP、Cloudflare Named Tunnel 或其他固定域名入口。
 
@@ -134,13 +140,49 @@ RestartSec=3
 - Session ID 只在对应工作区 listener 内有效；
 - 不存在“未知工作区转默认工作区”的 fallback；
 - Gateway 不记录或改写 Access Token、授权码和 PKCE verifier；
+- 远程公网基础地址必须使用 HTTPS，HTTP 只允许 loopback；基础地址不能包含凭据、子路径、查询参数或 fragment；
+- Gateway 只允许 GET、POST、DELETE 和固定 MCP/OAuth 路径；
+- Gateway 内部转发显式禁用系统代理，移除 hop-by-hop 与 `Connection` 动态声明的 Header，并由 HTTP 客户端重算请求长度；
+- Gateway 模式下文件工具拒绝显式绝对路径、父目录路径和解析后越出 Workspace 的路径；子进程命令也拒绝绝对路径与父目录路径参数；
 - Actions 服务与隧道不合并，仍按工作区独立运行；
 - Gateway 端口不能与任何工作区 MCP/Actions 端口冲突。
+
+## 资源与恢复策略
+
+- 请求体上限：1 MiB；
+- Header 预算：32 KiB；
+- 全局并发上限：64；
+- 全局请求速率：每分钟 1200；
+- 单工作区请求速率：每分钟 300；
+- 请求体读取截止时间：15 秒；
+- 内部 listener 连接截止时间：3 秒；
+- 上游响应头截止时间：15 秒；
+- 非 SSE 响应总截止时间：90 秒；
+- SSE 空闲截止时间：5 分钟。
+
+并发许可会保持到响应流结束，不能通过建立长流后提前释放额度。Gateway graceful shutdown 最多等待 3 秒；存在未结束长流时会强制 abort 并等待任务退出。
+
+桌面端 listener 和共享隧道恢复使用有上限的指数退避。Quick Tunnel 地址漂移进入阻断状态，只有修改 Gateway 或 owner 隧道配置后才重新尝试。GUI 每 2 秒刷新 Gateway 与工作区路由状态，但不会覆盖用户正在编辑的草稿。
 
 ## 当前第一阶段边界
 
 - 内部仍是一工作区一 listener；第一阶段优化的是公网入口和隧道数量，而不是内部端口数量；
-- Gateway 请求体上限为 1 MiB，响应使用流式转发以兼容 SSE；
+- 响应使用流式转发以兼容 SSE，并带并发与空闲截止时间；
 - 路由成员由“当前正在运行的 MCP 工作区”决定，尚未提供独立的常驻成员列表；
 - GUI 可以逐个启停工作区；headless 多工作区使用 `gateway serve`，不使用每工作区 daemon；
+- Gateway 模式会强化应用层文件和命令路径边界，但项目仍没有 OS 级文件系统沙箱；允许的子进程自身若存在未被参数策略识别的绕过能力，仍需依赖最小权限账户、容器或系统级沙箱防护；
 - 完全相同 URL 加 DCR `client_id` 的租户路由不属于本阶段。
+
+## 发布验证状态
+
+代码层自动验证已覆盖：
+
+- 双真实 listener 的 Session、cwd、文件读取和路由隔离；
+- OAuth Token 对不同 issuer/resource 的拒绝；
+- 全局及每工作区限流；
+- SSE 并发许可与强制关闭；
+- Header 清理、多值响应 Header 和 URL 负向校验；
+- observed owner/signature 失配；
+- CLI 与桌面构建组合。
+
+仍需在发布候选版本上进行真实新版 GUI、两个 ChatGPT App 的 OAuth 授权、真实固定隧道/Quick Tunnel、Linux systemd 和外部压力测试。代码测试通过不等同于这些外部环境已经验证。

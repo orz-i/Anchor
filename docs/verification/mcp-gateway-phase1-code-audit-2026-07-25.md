@@ -2,7 +2,7 @@
 
 ## 审计结论
 
-结论：**有条件通过，不建议直接标记为生产完成。**
+原始审计结论：**有条件通过，不建议直接标记为生产完成。**
 
 当前实现已经建立正确的路径级隔离骨架。本轮静态审计没有发现可以通过 A 工作区路径直接取得 B 工作区 `SharedState` 的代码路径，也没有发现未知工作区回退到默认工作区的实现。
 
@@ -175,3 +175,44 @@ GUI 为全部 profile 显示 Gateway URL，但路由表只包含 active workspac
 - owner 从 Quick 切换到 Named、从 A 切换到 B 不复用旧 observed URL；
 - Gateway listener 或 tunnel 故障进入明确 degraded 状态；
 - 停止失败不会被报告为成功。
+
+## 整改复核（2026-07-25）
+
+代码层 P1/P2 整改已经完成，审计状态更新为：**代码层通过，外部环境验证待完成。**
+
+### 已修复
+
+- Gateway 增加 32 KiB Header 预算、1 MiB body 上限、15 秒 body 截止时间、3 秒连接截止时间、15 秒响应头截止时间、90 秒非 SSE 总截止时间和 5 分钟 SSE 空闲截止时间。
+- 增加 64 全局并发、每分钟 1200 全局请求和每分钟 300/Workspace 的独立速率限制；流式响应在整个生命周期持有并发许可。
+- 公网基础地址远程只允许 HTTPS，HTTP 仅允许 loopback；拒绝凭据、子路径、query 和 fragment。
+- `publicUrl` 与 `observedPublicUrl` 分离，并增加 observed owner/tunnel signature；Gateway/owner/端口/固定地址/owner 隧道身份变化会清除旧观测状态。
+- 第一阶段旧配置自动迁移到 URL model v2，不把旧运行时地址继续当成用户固定配置。
+- graceful shutdown 超时后强制 abort 并等待任务退出；Axum task 退出原因进入 Gateway 状态。
+- 桌面端 Gateway listener/tunnel 使用指数退避；Quick URL drift 进入配置变化前不再重试的 blocked 状态。
+- `start_runtime` 在 Gateway 启动失败时回滚刚启动的 listener，不再静默报告成功。
+- CLI 启动与关闭错误向上传播；共享隧道或 Gateway 停止失败时不再输出成功停止。
+- 内部 reqwest client 显式 `no_proxy()`；完整处理 hop-by-hop、`Proxy-Connection`、`Connection` 动态字段、请求 `Content-Length` 重算和多值响应 Header。
+- GUI 每 2 秒刷新 Gateway 状态和工作区路由状态；编辑中的配置草稿不会被轮询覆盖。
+- Gateway 模式重启活动 listener 并启用严格 Workspace 读取边界；文件工具和命令字符串拒绝绝对路径、父目录路径及解析后越界路径。
+
+### 自动验证
+
+- Gateway 专项：18 passed，0 failed；
+- 严格 Workspace 命令边界专项：1 passed，0 failed；
+- 全量 Rust：220 passed，1 ignored；
+- 额外集成/安全/历史测试：72 passed，0 failed；
+- 全 target/feature Clippy `-D warnings`：通过；
+- headless CLI Clippy `-D warnings`：通过；
+- `svelte-check`：0 errors，0 warnings。
+
+### 仍需外部验证
+
+- 新版 GUI 的真实启停、owner 切换和错误恢复；
+- 两个真实 ChatGPT App 的 OAuth 授权及跨 App 负向调用；
+- Cloudflare Quick/Named 与 FRP 的真实公网生命周期；
+- Linux systemd 前台监督、信号关闭和重启；
+- 外部 100+ 并发慢请求压力测试。
+
+### 明确限制
+
+严格 Workspace 边界是应用层策略，不是 OS 级文件系统沙箱。已覆盖内置文件工具和常见命令路径参数，但允许的解释器或子进程若存在未被策略识别的访问方式，仍需通过低权限账户、容器或系统沙箱降低风险。因此在真实部署验证完成前，不宣称完整进程级租户隔离。
