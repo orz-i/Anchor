@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use reqwest::header::ALLOW;
 use serde::Serialize;
 
 use crate::workspace::WorkspaceProfile;
@@ -13,6 +14,42 @@ pub struct HealthItem {
     pub ok: bool,
     pub detail: String,
     pub hint: String,
+}
+
+async fn check_mcp_endpoint(client: &reqwest::Client, url: &str) -> (bool, String) {
+    if url.is_empty() {
+        return (false, "URL not configured".to_string());
+    }
+    match client.get(url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let allow = response
+                .headers()
+                .get(ALLOW)
+                .and_then(|value| value.to_str().ok());
+            evaluate_mcp_get_response(status.as_u16(), allow)
+        }
+        Err(err) => (false, err.to_string()),
+    }
+}
+
+fn evaluate_mcp_get_response(status: u16, allow: Option<&str>) -> (bool, String) {
+    let allows_post = allow.is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|method| method.eq_ignore_ascii_case("POST"))
+    });
+    let allow_detail = allow.unwrap_or("missing");
+    let ok = status == 405 && allows_post;
+    let detail = if ok {
+        format!("HTTP 405; Allow={allow_detail}; MCP GET 按规范禁用")
+    } else {
+        format!(
+            "HTTP {status}; Allow={allow_detail}; 预期 GET /mcp 返回 405 且 Allow 包含 POST"
+        )
+    };
+    (ok, detail)
 }
 
 fn http_client() -> reqwest::Client {
@@ -102,8 +139,10 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
         actions_public.clone()
     };
 
-    let (mcp_local_ok, mcp_local_detail) = check_url(&client, &profile.local_endpoint()).await;
-    let (mcp_public_ok, mcp_public_detail) = check_url(&client, &profile.public_endpoint()).await;
+    let (mcp_local_ok, mcp_local_detail) =
+        check_mcp_endpoint(&client, &profile.local_endpoint()).await;
+    let (mcp_public_ok, mcp_public_detail) =
+        check_mcp_endpoint(&client, &profile.public_endpoint()).await;
     let (mcp_oauth_ok, mcp_oauth_detail) = check_json_field(
         &client,
         &well_known_url(&mcp_public, ".well-known/oauth-authorization-server"),
@@ -135,8 +174,8 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
     .await;
 
     vec![
-        health_item("本地 /mcp", mcp_local_ok, mcp_local_detail, "确认 MCP 服务已启动，端口与工作区配置一致。"),
-        health_item("公网 /mcp", mcp_public_ok, mcp_public_detail, "检查隧道是否已连接，或公网 URL 是否填写正确。"),
+        health_item("本地 MCP 协议入口", mcp_local_ok, mcp_local_detail, "确认 MCP 服务已启动；GET /mcp 应返回 405，并包含 Allow: POST。"),
+        health_item("公网 MCP 协议入口", mcp_public_ok, mcp_public_detail, "检查隧道和反向代理；公网 GET /mcp 应保留 405 与 Allow: POST。"),
         health_item("MCP OAuth 授权元数据", mcp_oauth_ok, mcp_oauth_detail, "MCP 认证需设为 OAuth，且公网地址可访问。"),
         health_item("MCP OAuth 受保护资源", mcp_protected_ok, mcp_protected_detail, "确认公网 MCP 根地址与 OAuth 配置一致。"),
         health_item("本地 Actions /health", actions_local_ok, actions_local_detail, "确认 Actions 服务已启动。"),
@@ -152,5 +191,41 @@ fn health_item(label: &str, ok: bool, detail: String, hint: &str) -> HealthItem 
         ok,
         detail,
         hint: if ok { String::new() } else { hint.into() },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evaluate_mcp_get_response;
+
+    #[test]
+    fn mcp_get_405_with_post_allow_is_healthy() {
+        let (ok, detail) = evaluate_mcp_get_response(405, Some("POST"));
+
+        assert!(ok);
+        assert!(detail.contains("MCP GET 按规范禁用"));
+    }
+
+    #[test]
+    fn mcp_get_405_accepts_multi_value_allow_header() {
+        let (ok, _) = evaluate_mcp_get_response(405, Some("OPTIONS, POST"));
+
+        assert!(ok);
+    }
+
+    #[test]
+    fn legacy_mcp_get_200_is_reported_as_drift() {
+        let (ok, detail) = evaluate_mcp_get_response(200, None);
+
+        assert!(!ok);
+        assert!(detail.contains("预期 GET /mcp 返回 405"));
+    }
+
+    #[test]
+    fn mcp_get_405_without_post_allow_is_not_healthy() {
+        let (ok, detail) = evaluate_mcp_get_response(405, Some("OPTIONS"));
+
+        assert!(!ok);
+        assert!(detail.contains("Allow=OPTIONS"));
     }
 }
