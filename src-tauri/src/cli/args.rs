@@ -10,6 +10,80 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayConfigureOptions {
+    pub enabled: Option<bool>,
+    pub local_port: Option<u16>,
+    pub owner_workspace: Option<String>,
+    pub public_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayCommand {
+    Show,
+    Configure(GatewayConfigureOptions),
+    Serve { workspaces: Vec<String> },
+}
+
+fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("show" | "status") => {
+            ensure_empty(args, "gateway show")?;
+            Ok(GatewayCommand::Show)
+        }
+        Some("configure" | "config") => {
+            let mut enabled = None;
+            let mut local_port = None;
+            let mut owner_workspace = None;
+            let mut public_url = None;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--enable" => enabled = Some(true),
+                    "--disable" => enabled = Some(false),
+                    "--port" => {
+                        local_port = Some(parse_u64(args, "--port", 1, 65_535)? as u16)
+                    }
+                    "--owner" => owner_workspace = Some(pop_value(args, "--owner")?),
+                    "--public-url" => public_url = Some(pop_value(args, "--public-url")?),
+                    "--clear-public-url" => public_url = Some(String::new()),
+                    other => return Err(format!("gateway configure 不支持参数：{other}")),
+                }
+            }
+            if enabled.is_none()
+                && local_port.is_none()
+                && owner_workspace.is_none()
+                && public_url.is_none()
+            {
+                return Err("gateway configure 至少需要一个配置参数".into());
+            }
+            Ok(GatewayCommand::Configure(GatewayConfigureOptions {
+                enabled,
+                local_port,
+                owner_workspace,
+                public_url,
+            }))
+        }
+        Some("serve") => {
+            let mut workspaces = Vec::new();
+            while let Some(value) = args.pop_front() {
+                if value.starts_with('-') {
+                    return Err(format!("gateway serve 不支持参数：{value}"));
+                }
+                workspaces.push(value);
+            }
+            if workspaces.is_empty() {
+                return Err("gateway serve 至少需要一个 workspace".into());
+            }
+            Ok(GatewayCommand::Serve { workspaces })
+        }
+        Some(other) => Err(format!(
+            "未知 gateway 命令：{other}\n\n{}",
+            gateway_usage()
+        )),
+        None => Err(format!("gateway 缺少子命令\n\n{}", gateway_usage())),
+    }
+}
+
 fn parse_workspace_command(args: &mut VecDeque<String>) -> Result<WorkspaceCommand, String> {
     match args.pop_front().as_deref() {
         Some("list" | "ls") => {
@@ -410,6 +484,7 @@ pub enum Command {
         workspace: String,
     },
     Workspace(WorkspaceCommand),
+    Gateway(GatewayCommand),
     DaemonRun {
         workspace: String,
         service: ServiceSelection,
@@ -478,6 +553,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
             Command::Doctor { workspace }
         }
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
+        Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
         Some("daemon-run") => parse_daemon_run(&mut args)?,
         Some(other) => return Err(format!("未知命令：{other}\n\n{}", usage())),
     };
@@ -538,8 +614,17 @@ pub fn usage() -> &'static str {
   coding-tools-mcp [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
   coding-tools-mcp [--config-dir PATH] [--json] doctor <workspace>\n\n\
   coding-tools-mcp [--config-dir PATH] [--json] workspace <command> ...\n\n\
+  coding-tools-mcp [--config-dir PATH] [--json] gateway <command> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
 serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+}
+
+pub fn gateway_usage() -> &'static str {
+    "Gateway 命令：\n\
+  coding-tools-mcp gateway show\n\
+  coding-tools-mcp gateway configure [--enable|--disable] [--port PORT] [--owner WORKSPACE] [--public-url URL|--clear-public-url]\n\
+  coding-tools-mcp gateway serve <workspace> [workspace ...]\n\n\
+gateway serve 在一个前台进程内启动所选工作区的 MCP listener、共享 Gateway 和唯一 MCP 隧道，适合由 systemd 监督。"
 }
 
 pub fn workspace_usage() -> &'static str {
@@ -608,6 +693,43 @@ mod tests {
             .expect_err("invalid service");
 
         assert!(error.contains("无效服务类型"));
+    }
+
+    #[test]
+    fn parses_gateway_configuration_and_multi_workspace_serve() {
+        let configure = parse(strings(&[
+            "gateway",
+            "configure",
+            "--enable",
+            "--port",
+            "29000",
+            "--owner",
+            "workspace-a",
+        ]))
+        .expect("gateway configure");
+        assert_eq!(
+            configure.command,
+            Command::Gateway(GatewayCommand::Configure(GatewayConfigureOptions {
+                enabled: Some(true),
+                local_port: Some(29000),
+                owner_workspace: Some("workspace-a".into()),
+                public_url: None,
+            }))
+        );
+
+        let serve = parse(strings(&[
+            "gateway",
+            "serve",
+            "workspace-a",
+            "workspace-b",
+        ]))
+        .expect("gateway serve");
+        assert_eq!(
+            serve.command,
+            Command::Gateway(GatewayCommand::Serve {
+                workspaces: vec!["workspace-a".into(), "workspace-b".into()],
+            })
+        );
     }
 
     #[test]

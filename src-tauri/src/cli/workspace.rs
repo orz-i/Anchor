@@ -10,7 +10,7 @@ use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::tunnel::drop_workspace as drop_tunnel_workspace;
-use crate::workspace::resources::assign_free_workspace_ports;
+use crate::workspace::resources::assign_free_workspace_ports_with_reserved;
 use crate::workspace::WorkspaceProfile;
 
 use super::args::{
@@ -145,7 +145,13 @@ fn register_workspace(path: &str, name: Option<String>, as_json: bool) -> AppRes
             profile.name
         )));
     }
-    assign_free_workspace_ports(store.list(), &mut profile)?;
+    let gateway = store.settings().mcp_gateway;
+    let reserved = if gateway.enabled {
+        std::collections::HashSet::from([gateway.local_port])
+    } else {
+        std::collections::HashSet::new()
+    };
+    assign_free_workspace_ports_with_reserved(store.list(), &mut profile, &reserved)?;
     assign_os_available_ports(store.list(), &mut profile)?;
     store.register_workspace(profile.clone())?;
     print_mutation("registered", &profile, false, Vec::new(), as_json)
@@ -160,6 +166,10 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
     }
     let store = DataStore::load()?;
     let profile = super::resolve_workspace(store.list(), &options.workspace)?.clone();
+    crate::mcp::gateway::ensure_workspace_is_not_owner(
+        &store.settings().mcp_gateway,
+        &profile.id,
+    )?;
     drop(store);
 
     let inspection = super::daemon::inspect(&profile)?;

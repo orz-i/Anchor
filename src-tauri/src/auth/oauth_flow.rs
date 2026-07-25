@@ -36,6 +36,7 @@ pub struct OAuthRuntime {
     used_refresh_tokens: Arc<Mutex<HashMap<String, u64>>>,
 }
 
+#[cfg(feature = "cli")]
 pub fn builtin_redirect_hosts() -> &'static [&'static str] {
     &[BUILTIN_CHATGPT_CALLBACK_HOST]
 }

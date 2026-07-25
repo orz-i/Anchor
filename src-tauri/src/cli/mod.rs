@@ -12,17 +12,21 @@ use serde_json::json;
 
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
+use crate::mcp::gateway;
 use crate::platform::platform;
-use crate::runtime::{await_listener_shutdown, RuntimeSupervisor, ServiceKind};
+use crate::runtime::{
+    await_listener_shutdown, update_public_url, RuntimeSupervisor, ServiceKind,
+};
+use crate::settings::McpGatewayConfig;
 use crate::tunnel::{
     ensure_for_runtime, is_quick_tunnel_url_change_error, log_dir_for_profile,
-    maybe_start_for_runtime, stop_for_runtime, TunnelServiceKind,
+    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime, TunnelServiceKind,
 };
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{
-    CliArgs, Command, LogSelection, LogsOptions, RunOptions, ServiceSelection, StatusOptions,
-    StopOptions,
+    CliArgs, Command, GatewayCommand, GatewayConfigureOptions, LogSelection, LogsOptions,
+    RunOptions, ServiceSelection, StatusOptions, StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -50,12 +54,310 @@ fn port_owner(pid: Option<u32>, daemon_pid: Option<u32>) -> &'static str {
     }
 }
 
+async fn execute_gateway(command: GatewayCommand, as_json: bool) -> AppResult<i32> {
+    match command {
+        GatewayCommand::Show => show_gateway(as_json).map(|_| 0),
+        GatewayCommand::Configure(options) => configure_gateway(options, as_json).map(|_| 0),
+        GatewayCommand::Serve { workspaces } => {
+            serve_gateway(&workspaces, as_json).await.map(|_| 0)
+        }
+    }
+}
+
+fn show_gateway(as_json: bool) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let config = store.settings().mcp_gateway;
+    let routes = store
+        .list()
+        .iter()
+        .map(|profile| {
+            let endpoint = gateway::workspace_base_url(&config, &profile.id)
+                .map(|base| format!("{base}/mcp"))
+                .unwrap_or_default();
+            json!({
+                "workspaceId": profile.id,
+                "workspaceName": profile.name,
+                "endpoint": endpoint
+            })
+        })
+        .collect::<Vec<_>>();
+    let value = json!({ "config": config, "routes": routes });
+    if as_json {
+        print_json(&value)?;
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(())
+}
+
+fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResult<()> {
+    let mut store = DataStore::load()?;
+    let mut settings = store.settings();
+    let mut config = settings.mcp_gateway.clone();
+    if let Some(enabled) = options.enabled {
+        config.enabled = enabled;
+    }
+    if let Some(port) = options.local_port {
+        config.local_port = port;
+    }
+    if let Some(selector) = options.owner_workspace {
+        config.owner_workspace_id = resolve_workspace(store.list(), &selector)?.id.clone();
+    }
+    if let Some(public_url) = options.public_url {
+        config.public_url = public_url.trim().trim_end_matches('/').to_string();
+    }
+    gateway::validate_config(&config, store.list())?;
+    settings.mcp_gateway = config.clone();
+    store.update_settings(settings)?;
+    if as_json {
+        print_json(&json!({ "event": "gateway_configured", "config": config }))?;
+    } else {
+        println!("MCP Gateway 配置已保存。");
+        println!("{}", serde_json::to_string_pretty(&config)?);
+    }
+    Ok(())
+}
+
+async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let all_profiles = store.list().to_vec();
+    let mut config = store.settings().mcp_gateway;
+    if !config.enabled {
+        return Err(AppError::Message(
+            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --owner WORKSPACE"
+                .into(),
+        ));
+    }
+    gateway::validate_config(&config, &all_profiles)?;
+    let mut selected = Vec::new();
+    let mut selected_ids = std::collections::HashSet::new();
+    for selector in selectors {
+        let profile = resolve_workspace(&all_profiles, selector)?.clone();
+        if selected_ids.insert(profile.id.clone()) {
+            ensure_workspace_directory(&profile)?;
+            selected.push(profile);
+        }
+    }
+    if selected.is_empty() {
+        return Err(AppError::Message("Gateway 没有选中的工作区。".into()));
+    }
+    ensure_gateway_ports_available(&config, &selected)?;
+
+    let mut runtime = RuntimeSupervisor::default();
+    let mut started = Vec::new();
+    let startup = async {
+        for profile in &selected {
+            ensure_running(runtime.start_mcp(profile)?, "MCP")?;
+            started.push(profile.clone());
+        }
+        let active = runtime.active_mcp_workspace_ids();
+        gateway::ensure(&config, &all_profiles, &active).await?;
+        if let Some(url) = reconcile_mcp_gateway(&config, &all_profiles, &active).await? {
+            persist_cli_gateway_url(&url)?;
+            config.public_url = url;
+        }
+        Ok::<(), AppError>(())
+    }
+    .await;
+    if let Err(error) = startup {
+        shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await;
+        return Err(error);
+    }
+
+    if as_json {
+        print_json(&json!({
+            "event": "gateway_ready",
+            "localEndpoint": format!("http://127.0.0.1:{}", config.local_port),
+            "publicBaseUrl": config.public_url,
+            "routes": selected.iter().map(|profile| json!({
+                "workspaceId": profile.id,
+                "workspaceName": profile.name,
+                "endpoint": format!("{}/mcp", gateway::workspace_base_url(&config, &profile.id).unwrap_or_default())
+            })).collect::<Vec<_>>()
+        }))?;
+    } else {
+        println!("MCP Gateway 已启动：http://127.0.0.1:{}", config.local_port);
+        for profile in &selected {
+            println!(
+                "{}\t{}/mcp",
+                profile.name,
+                gateway::workspace_base_url(&config, &profile.id)?
+            );
+        }
+        println!("前台运行中，按 Ctrl+C 停止。");
+    }
+
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    let mut maintenance = tokio::time::interval(Duration::from_secs(2));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    maintenance.tick().await;
+    let mut terminal_error = None;
+    let mut gateway_tunnel_retry: Option<CliTunnelRetry> = None;
+    loop {
+        tokio::select! {
+            signal = &mut shutdown_signal => {
+                if let Err(error) = signal {
+                    terminal_error = Some(error);
+                }
+                break;
+            }
+            _ = maintenance.tick() => {
+                for profile in &selected {
+                    match runtime.maintain_mcp(profile) {
+                        Ok(status) if status.state == "error" && !status.recovery.enabled => {
+                            terminal_error = Some(AppError::Message(format!(
+                                "工作区 {} MCP 自动恢复耗尽：{}",
+                                profile.name, status.local_message
+                            )));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if terminal_error.is_some() {
+                    break;
+                }
+                let active = runtime.active_mcp_workspace_ids();
+                if let Err(error) = gateway::ensure(&config, &all_profiles, &active).await {
+                    terminal_error = Some(error);
+                    break;
+                }
+                if gateway_tunnel_retry
+                    .is_some_and(|retry| tokio::time::Instant::now() < retry.next_attempt)
+                {
+                    continue;
+                }
+                match reconcile_mcp_gateway(&config, &all_profiles, &active).await {
+                    Ok(Some(url)) => {
+                        let recovered_attempts = gateway_tunnel_retry.take().map(|retry| retry.attempts);
+                        if url != config.public_url {
+                            persist_cli_gateway_url(&url)?;
+                            config.public_url = url;
+                        }
+                        if let Some(attempts) = recovered_attempts {
+                            if as_json {
+                                print_json_line(&json!({
+                                    "event": "gateway_tunnel_reconnected",
+                                    "attempts": attempts,
+                                    "publicBaseUrl": config.public_url
+                                }))?;
+                            } else {
+                                println!("Gateway 隧道已在第 {attempts} 次重试后恢复。");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        gateway_tunnel_retry = None;
+                    }
+                    Err(error) if is_quick_tunnel_url_change_error(&error) => {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    Err(error) => {
+                        let attempts = gateway_tunnel_retry
+                            .map(|retry| retry.attempts.saturating_add(1))
+                            .unwrap_or(1);
+                        let delay = cli_tunnel_retry_delay(attempts);
+                        gateway_tunnel_retry = Some(CliTunnelRetry {
+                            attempts,
+                            next_attempt: tokio::time::Instant::now() + delay,
+                        });
+                        if as_json {
+                            print_json_line(&json!({
+                                "event": "gateway_tunnel_retry",
+                                "detail": error.to_string(),
+                                "attempt": attempts,
+                                "retryInSeconds": delay.as_secs()
+                            }))?;
+                        } else {
+                            eprintln!(
+                                "Gateway 隧道维护失败，将在 {} 秒后进行第 {} 次重试：{error}",
+                                delay.as_secs(),
+                                attempts
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await;
+    if as_json {
+        print_json(&json!({ "event": "gateway_stopped" }))?;
+    }
+    match terminal_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn ensure_gateway_ports_available(
+    config: &McpGatewayConfig,
+    profiles: &[WorkspaceProfile],
+) -> AppResult<()> {
+    if let Some(pid) = platform().find_pid_listening_on_port(config.local_port)? {
+        return Err(AppError::Message(format!(
+            "Gateway 端口 {} 已被 PID {pid} 占用；CLI 不会接管 GUI 或其他进程",
+            config.local_port
+        )));
+    }
+    for profile in profiles {
+        ensure_selected_ports_available(profile, ServiceSelection::Mcp)?;
+    }
+    Ok(())
+}
+
+fn persist_cli_gateway_url(url: &str) -> AppResult<()> {
+    let normalized = url.trim().trim_end_matches('/');
+    if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
+        return Ok(());
+    }
+    let mut store = DataStore::load()?;
+    let mut settings = store.settings();
+    if settings.mcp_gateway.public_url != normalized {
+        settings.mcp_gateway.public_url = normalized.to_string();
+        store.update_settings(settings)?;
+    }
+    Ok(())
+}
+
+async fn shutdown_gateway_services(
+    runtime: &mut RuntimeSupervisor,
+    profiles: &[WorkspaceProfile],
+    config: &McpGatewayConfig,
+    all_profiles: &[WorkspaceProfile],
+) {
+    for profile in profiles.iter().rev() {
+        let handle = runtime.begin_stop(&profile.id, ServiceKind::Mcp);
+        await_listener_shutdown(handle, profile.runtime.local_port).await;
+        runtime.finish_stop(&profile.id, ServiceKind::Mcp);
+    }
+    let active = runtime.active_mcp_workspace_ids();
+    let _ = reconcile_mcp_gateway(config, all_profiles, &active).await;
+    gateway::stop().await;
+    for profile in profiles {
+        update_public_url(&profile.id, "mcp", "");
+    }
+}
+
 async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
     ensure_workspace_directory(&profile)?;
     let service = options.service.unwrap_or(ServiceSelection::Mcp);
     let tunnel = options.tunnel.unwrap_or(false);
+    if store.settings().mcp_gateway.enabled && service.includes_mcp() {
+        return Err(AppError::Message(
+            "MCP Gateway 模式不支持每工作区独立 daemon；请使用 `coding-tools-mcp gateway serve <workspace ...>` 并交由 systemd 监督。"
+                .into(),
+        ));
+    }
 
     let inspection = daemon::inspect(&profile)?;
     if inspection.running {
@@ -597,6 +899,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             doctor_workspace(&workspace, cli.json).map(|healthy| if healthy { 0 } else { 1 })
         }
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
+        Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::DaemonRun {
             workspace,
             service,
@@ -781,6 +1084,12 @@ async fn serve_workspace(
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
     ensure_workspace_directory(&profile)?;
+    if store.settings().mcp_gateway.enabled && service.includes_mcp() {
+        return Err(AppError::Message(
+            "MCP Gateway 模式请使用 `coding-tools-mcp gateway serve <workspace ...>`；单工作区 serve 不会创建共享路由。"
+                .into(),
+        ));
+    }
 
     let mut runtime = RuntimeSupervisor::default();
     let mut started_services = Vec::new();

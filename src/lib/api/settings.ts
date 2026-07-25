@@ -51,3 +51,33 @@ export async function getProxy(): Promise<ProxyConfigDto> {
 export async function setProxy(proxy: ProxyConfigDto): Promise<void> {
   return invoke("set_proxy", { proxy });
 }
+
+export interface McpGatewayConfigDto {
+  enabled: boolean;
+  localPort: number;
+  ownerWorkspaceId: string;
+  publicUrl: string;
+}
+
+export interface McpGatewayStatusDto {
+  state: "stopped" | "running" | "error";
+  localEndpoint: string;
+  publicBaseUrl: string;
+  routeCount: number;
+  ownerWorkspaceId: string;
+  error: string;
+}
+
+export async function getMcpGateway(): Promise<McpGatewayConfigDto> {
+  return invokeRead<McpGatewayConfigDto>("get_mcp_gateway");
+}
+
+export async function getMcpGatewayStatus(): Promise<McpGatewayStatusDto> {
+  return invokeRead<McpGatewayStatusDto>("get_mcp_gateway_status");
+}
+
+export async function setMcpGateway(
+  config: McpGatewayConfigDto,
+): Promise<McpGatewayStatusDto> {
+  return invoke<McpGatewayStatusDto>("set_mcp_gateway", { config });
+}
