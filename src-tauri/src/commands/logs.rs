@@ -32,7 +32,7 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<WorkspaceProfile> {
 fn log_file_names(profile: &WorkspaceProfile, service: &str) -> AppResult<Vec<&'static str>> {
     match service {
         "mcp" => {
-            let mut names = vec!["stderr.log", "stdout.log"];
+            let mut names = vec!["mcp-oauth.log", "mcp-requests.log", "stderr.log", "stdout.log"];
             if profile.tunnel.tunnel_type == "cloudflare" {
                 names.insert(0, "cloudflared.log");
             }
@@ -42,7 +42,11 @@ fn log_file_names(profile: &WorkspaceProfile, service: &str) -> AppResult<Vec<&'
             Ok(names)
         }
         "actions" => {
-            let mut names = vec!["actions-stderr.log", "actions-stdout.log"];
+            let mut names = vec![
+                "actions-oauth.log",
+                "actions-stderr.log",
+                "actions-stdout.log",
+            ];
             if profile.actions.tunnel_type == "cloudflare" {
                 names.insert(0, "actions-cloudflared.log");
             }
@@ -100,4 +104,19 @@ pub async fn read_workspace_logs(
     }
 
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_diagnostic_logs_are_visible_in_gui_log_lists() {
+        let profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
+        let mcp = log_file_names(&profile, "mcp").expect("mcp logs");
+        let actions = log_file_names(&profile, "actions").expect("actions logs");
+        assert!(mcp.contains(&"mcp-oauth.log"));
+        assert!(mcp.contains(&"mcp-requests.log"));
+        assert!(actions.contains(&"actions-oauth.log"));
+    }
 }

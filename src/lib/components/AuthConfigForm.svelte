@@ -15,7 +15,10 @@
   interface Props {
     workspaceId: string;
     auth: AuthConfig;
-    onSaveProfile: (auth: AuthConfig) => void | Promise<void>;
+    onSaveProfile: (
+      auth: AuthConfig,
+      options: { callbackPolicyOnly: boolean },
+    ) => void | Promise<void>;
   }
 
   function validateRedirectUris(raw: string) {
@@ -149,6 +152,9 @@
     saving = true;
     suppressSecretsReload = true;
     try {
+      const clientIdChanged = draft.use_shared_secrets
+        ? draft.oauth_client_id !== loadedSharedOauthClientId
+        : draft.oauth_client_id !== auth.oauth_client_id;
       if (draft.type === "oauth") {
         validateRedirectUris(draft.oauth_redirect_uris ?? "");
         validateRedirectHosts(draft.oauth_redirect_hosts ?? "");
@@ -162,7 +168,17 @@
         await setSharedSecret("oauth_client_id", clientId);
         loadedSharedOauthClientId = clientId;
       }
-      await onSaveProfile({ ...draft });
+      const callbackPolicyChanged =
+        (draft.oauth_redirect_uris ?? "") !== (auth.oauth_redirect_uris ?? "") ||
+        (draft.oauth_redirect_hosts ?? "") !== (auth.oauth_redirect_hosts ?? "");
+      const callbackPolicyOnly =
+        draft.type === "oauth" &&
+        auth.type === "oauth" &&
+        callbackPolicyChanged &&
+        !clientIdChanged &&
+        draft.use_shared_secrets === !!auth.use_shared_secrets &&
+        !secretsDirty;
+      await onSaveProfile({ ...draft }, { callbackPolicyOnly });
       // Auth save only persists profile fields; secrets are already stored by regenerate.
       loadedSecrets = { ...secrets };
     } catch (error) {

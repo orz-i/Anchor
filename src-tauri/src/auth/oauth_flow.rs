@@ -27,10 +27,27 @@ pub struct OAuthRuntime {
     pub client_secret: Option<String>,
     pub password: String,
     pub token_secret: String,
-    redirect_uris: Arc<RwLock<Vec<String>>>,
-    redirect_host_patterns: Arc<Vec<String>>,
+    configured_redirect_uris: Arc<RwLock<Vec<String>>>,
+    enrolled_redirect_uris: Arc<RwLock<Vec<String>>>,
+    redirect_host_patterns: Arc<RwLock<Vec<String>>>,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
     used_refresh_tokens: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+pub fn validate_redirect_policy(redirect_uris: &str, redirect_hosts: &str) -> Result<(), String> {
+    parse_redirect_uris(redirect_uris)?;
+    parse_redirect_host_patterns(redirect_hosts)?;
+    Ok(())
+}
+
+pub fn redirect_uri_log_label(redirect_uri: &str) -> String {
+    let trimmed = redirect_uri.trim();
+    let host = validate_redirect_uri(trimmed)
+        .ok()
+        .and_then(|uri| uri.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| "invalid".into());
+    let digest = format!("{:x}", Sha256::digest(trimmed.as_bytes()));
+    format!("redirect_host={host} redirect_sha256={}", &digest[..16])
 }
 
 fn validate_redirect_uri(value: &str) -> Result<reqwest::Url, String> {
@@ -42,6 +59,7 @@ fn validate_redirect_uri(value: &str) -> Result<reqwest::Url, String> {
             "OAuth redirect URI cannot contain user information: {value}"
         ));
     }
+
     if parsed.fragment().is_some() {
         return Err(format!(
             "OAuth redirect URI cannot contain a fragment: {value}"
@@ -233,30 +251,56 @@ impl OAuthRuntime {
             client_secret,
             password,
             token_secret,
-            redirect_uris: Arc::new(RwLock::new(Vec::new())),
-            redirect_host_patterns: Arc::new(Vec::new()),
+            configured_redirect_uris: Arc::new(RwLock::new(Vec::new())),
+            enrolled_redirect_uris: Arc::new(RwLock::new(Vec::new())),
+            redirect_host_patterns: Arc::new(RwLock::new(Vec::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             used_refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_redirect_uris(mut self, raw: &str) -> Result<Self, String> {
-        self.redirect_uris = Arc::new(RwLock::new(parse_redirect_uris(raw)?));
+        self.configured_redirect_uris = Arc::new(RwLock::new(parse_redirect_uris(raw)?));
         Ok(self)
     }
 
     pub fn with_redirect_host_patterns(mut self, raw: &str) -> Result<Self, String> {
-        self.redirect_host_patterns = Arc::new(parse_redirect_host_patterns(raw)?);
+        self.redirect_host_patterns = Arc::new(RwLock::new(parse_redirect_host_patterns(raw)?));
         Ok(self)
+    }
+
+    pub fn update_redirect_policy(
+        &self,
+        redirect_uris: &str,
+        redirect_host_patterns: &str,
+    ) -> Result<(), String> {
+        let redirect_uris = parse_redirect_uris(redirect_uris)?;
+        let redirect_host_patterns = parse_redirect_host_patterns(redirect_host_patterns)?;
+        *self
+            .configured_redirect_uris
+            .write()
+            .expect("oauth configured redirect URI lock") = redirect_uris;
+        *self
+            .redirect_host_patterns
+            .write()
+            .expect("oauth redirect host pattern lock") = redirect_host_patterns;
+        Ok(())
     }
 
     pub fn redirect_uri_allowed(&self, redirect_uri: &str) -> bool {
         let redirect_uri = redirect_uri.trim();
-        !redirect_uri.is_empty()
-            && self
-                .redirect_uris
+        if redirect_uri.is_empty() {
+            return false;
+        }
+        self.configured_redirect_uris
+            .read()
+            .expect("oauth configured redirect URI lock")
+            .iter()
+            .any(|registered| constant_time_eq_str(registered, redirect_uri))
+            || self
+                .enrolled_redirect_uris
                 .read()
-                .expect("oauth redirect URI lock")
+                .expect("oauth enrolled redirect URI lock")
                 .iter()
                 .any(|registered| constant_time_eq_str(registered, redirect_uri))
     }
@@ -271,6 +315,8 @@ impl OAuthRuntime {
         let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
         if self
             .redirect_host_patterns
+            .read()
+            .expect("oauth redirect host pattern lock")
             .iter()
             .any(|pattern| callback_host_matches(pattern, &host))
         {
@@ -289,7 +335,10 @@ impl OAuthRuntime {
             }
         }
         let redirect_uri = redirect_uri.trim().to_string();
-        let mut registered = self.redirect_uris.write().expect("oauth redirect URI lock");
+        let mut registered = self
+            .enrolled_redirect_uris
+            .write()
+            .expect("oauth enrolled redirect URI lock");
         if !registered
             .iter()
             .any(|value| constant_time_eq_str(value, &redirect_uri))
@@ -304,6 +353,14 @@ impl OAuthRuntime {
             return false;
         }
         constant_time_eq_str(client_id, &self.client_id)
+    }
+
+    pub fn redirect_uri_status_label(&self, redirect_uri: &str) -> &'static str {
+        match self.redirect_uri_status(redirect_uri) {
+            RedirectUriStatus::Registered => "registered",
+            RedirectUriStatus::EnrollmentRequired => "enrollment_required",
+            RedirectUriStatus::Rejected => "rejected",
+        }
     }
 
     pub fn verify_access_token(&self, token: &str, issuer_url: &str, resource_url: &str) -> bool {
@@ -899,7 +956,6 @@ fn login_page(
         {workspace_block}\
         <p>Client: <strong>{}</strong></p>\
         <p>Redirect URI: <code>{}</code></p>\
-        {enrollment_block}\
         {error_block}\
         <form method='POST' action='/oauth/authorize'>\
         <input type='hidden' name='client_id' value='{}'>\
@@ -908,6 +964,7 @@ fn login_page(
         <input type='hidden' name='code_challenge_method' value='{}'>\
         <input type='hidden' name='state' value='{}'>\
         <input type='hidden' name='resource' value='{}'>\
+        {enrollment_block}\
         <label>Password<input type='password' name='password' autocomplete='current-password' required></label>\
         <button type='submit'>Authorize</button>\
         </form></body></html>",
@@ -1198,6 +1255,77 @@ mod tests {
         );
         assert_eq!(approved.status(), StatusCode::SEE_OTHER);
         assert!(oauth.redirect_uri_allowed(redirect_uri));
+
+        let location = approved
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("callback location");
+        let code = reqwest::Url::parse(location)
+            .expect("callback URL")
+            .query_pairs()
+            .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+            .expect("authorization code");
+
+        oauth
+            .update_redirect_policy(
+                "https://chatgpt.com/connector/oauth/static",
+                "chat.openai.com",
+            )
+            .expect("hot policy update");
+        assert!(oauth.redirect_uri_allowed(redirect_uri));
+        assert!(oauth.redirect_uri_allowed(
+            "https://chatgpt.com/connector/oauth/static"
+        ));
+
+        let token = token_exchange(
+            &oauth,
+            &HeaderMap::new(),
+            TokenForm {
+                grant_type: "authorization_code".into(),
+                code,
+                redirect_uri: redirect_uri.into(),
+                code_verifier: verifier.into(),
+                client_id: "chatgpt-client-test".into(),
+                resource: resource_url.into(),
+                ..TokenForm::default()
+            },
+            "https://lb.example.com",
+            resource_url,
+        );
+        assert_eq!(token.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn callback_confirmation_checkbox_is_inside_authorization_form() {
+        let page = login_page(
+            "client",
+            "https://oauth.chatgpt.com/connector/callback",
+            "challenge",
+            "S256",
+            "state",
+            "https://service.example/mcp",
+            "",
+            None,
+            true,
+        );
+        let form_start = page.find("<form method='POST'").expect("form start");
+        let checkbox = page
+            .find("name='trust_redirect_uri'")
+            .expect("trust checkbox");
+        let form_end = page.find("</form>").expect("form end");
+        assert!(form_start < checkbox && checkbox < form_end);
+    }
+
+    #[test]
+    fn redirect_log_label_exposes_host_but_not_full_callback() {
+        let callback =
+            "https://oauth.chatgpt.com/connector/private-callback-id?opaque=secret-value";
+        let label = redirect_uri_log_label(callback);
+        assert!(label.contains("redirect_host=oauth.chatgpt.com"));
+        assert!(label.contains("redirect_sha256="));
+        assert!(!label.contains("private-callback-id"));
+        assert!(!label.contains("secret-value"));
     }
 
     #[test]

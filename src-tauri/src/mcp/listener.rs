@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, request_origin_allowed, token_exchange, verify_bearer_header,
-    verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    protected_resource_metadata, redirect_uri_log_label, register_oauth_runtime,
+    request_origin_allowed, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
+    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
 };
 use crate::mcp::protocol::{
     negotiate_protocol_version, protocol_version_supported, requested_protocol_version,
@@ -162,6 +163,9 @@ pub fn spawn_listener(
     } else {
         None
     };
+    if let Some(runtime) = oauth.as_ref() {
+        register_oauth_runtime(&workspace_id, "mcp", runtime);
+    }
     let state = ListenerState {
         mcp,
         auth,
@@ -742,12 +746,30 @@ async fn oauth_authorize_get(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_get(
+    let redirect_label = redirect_uri_log_label(&params.redirect_uri);
+    let redirect_status = oauth.redirect_uri_status_label(&params.redirect_uri);
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-oauth.log",
+        &format!(
+            "[oauth] event=authorize_received method=GET {redirect_label} redirect_status={redirect_status}"
+        ),
+    );
+    let response = authorize_get(
         oauth,
         params,
         &resolve_oauth_resource(&state, &headers),
         Some(state.workspace_path.as_str()),
-    )
+    );
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-oauth.log",
+        &format!(
+            "[oauth] event=authorize_page_result method=GET status={} {redirect_label}",
+            response.status().as_u16()
+        ),
+    );
+    response
 }
 
 async fn oauth_authorize_post(
@@ -767,12 +789,33 @@ async fn oauth_authorize_post(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_post(
+    let redirect_label = redirect_uri_log_label(&form.redirect_uri);
+    let before_status = oauth.redirect_uri_status_label(&form.redirect_uri);
+    let trust_requested = form.trust_redirect_uri;
+    let redirect_uri = form.redirect_uri.clone();
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-oauth.log",
+        &format!(
+            "[oauth] event=authorize_submitted method=POST {redirect_label} redirect_status={before_status} trust_requested={trust_requested}"
+        ),
+    );
+    let response = authorize_post(
         oauth,
         form,
         &resolve_oauth_base(&state, &headers),
         &resolve_oauth_resource(&state, &headers),
-    )
+    );
+    let after_status = oauth.redirect_uri_status_label(&redirect_uri);
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-oauth.log",
+        &format!(
+            "[oauth] event=authorize_result method=POST status={} {redirect_label} redirect_status_after={after_status}",
+            response.status().as_u16()
+        ),
+    );
+    response
 }
 
 async fn oauth_token_post(
@@ -796,13 +839,33 @@ async fn oauth_token_post(
         )
             .into_response();
     };
-    token_exchange(
+    let grant_type = form.grant_type.clone();
+    let redirect_label = if form.redirect_uri.trim().is_empty() {
+        "redirect_host=none redirect_sha256=none".to_string()
+    } else {
+        redirect_uri_log_label(&form.redirect_uri)
+    };
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-oauth.log",
+        &format!("[oauth] event=token_exchange_received grant_type={grant_type} {redirect_label}"),
+    );
+    let response = token_exchange(
         oauth,
         &headers,
         form,
         &resolve_oauth_base(&state, &headers),
         &resolve_oauth_resource(&state, &headers),
-    )
+    );
+    append_profile_log(
+        &state.workspace_id,
+        "mcp-oauth.log",
+        &format!(
+            "[oauth] event=token_exchange_result grant_type={grant_type} status={} {redirect_label}",
+            response.status().as_u16()
+        ),
+    );
+    response
 }
 
 fn oauth_not_configured() -> Response {

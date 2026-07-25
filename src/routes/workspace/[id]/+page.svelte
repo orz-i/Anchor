@@ -621,17 +621,25 @@
     await promptServiceRestart(actionsStatus === "running", "Actions 服务");
   }
 
-  async function saveMcpAuth(auth: AuthConfig) {
+  async function saveMcpAuth(
+    auth: AuthConfig,
+    options: { callbackPolicyOnly: boolean },
+  ) {
     if (!profile || !workspaceId) return;
     const next: WorkspaceProfile = { ...profile, auth };
     await updateWorkspace(next);
     profile = next;
-    if (mcpStatus === "running") {
+    if (mcpStatus === "running" && !options.callbackPolicyOnly) {
       try { await restartRuntime(workspaceId); } catch { /* ignore */ }
+    } else if (mcpStatus === "running" && options.callbackPolicyOnly) {
+      showToast("OAuth Callback 信任策略已热更新，当前授权流程不会中断", { kind: "success" });
     }
   }
 
-  async function saveActionsAuth(draft: ActionsAuthDraft) {
+  async function saveActionsAuth(
+    draft: ActionsAuthDraft,
+    options: { callbackPolicyOnly: boolean },
+  ) {
     if (!profile || !workspaceId) return;
     const current = actionsConfig(profile);
     const next: WorkspaceProfile = {
@@ -648,8 +656,10 @@
     };
     await updateWorkspace(next);
     profile = next;
-    if (actionsStatus === "running") {
+    if (actionsStatus === "running" && !options.callbackPolicyOnly) {
       try { await restartActionsRuntime(workspaceId); } catch { /* ignore */ }
+    } else if (actionsStatus === "running" && options.callbackPolicyOnly) {
+      showToast("Actions OAuth Callback 信任策略已热更新，当前授权流程不会中断", { kind: "success" });
     }
   }
 

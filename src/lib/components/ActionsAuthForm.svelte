@@ -25,7 +25,10 @@
     oauthAuthorizeUrl: string;
     oauthTokenUrl: string;
     useSharedSecrets?: boolean;
-    onSave: (draft: ActionsAuthDraft) => void | Promise<void>;
+    onSave: (
+      draft: ActionsAuthDraft,
+      options: { callbackPolicyOnly: boolean },
+    ) => void | Promise<void>;
   }
 
   function validateRedirectUris(raw: string) {
@@ -185,6 +188,17 @@
           throw new Error("请至少配置一个精确 Callback URL 或 Callback 域名白名单");
         }
       }
+      const callbackPolicyChanged =
+        draftOauthRedirectUris !== oauthRedirectUris ||
+        draftOauthRedirectHosts !== oauthRedirectHosts;
+      const callbackPolicyOnly =
+        draftAuthType === "oauth" &&
+        authType === "oauth" &&
+        callbackPolicyChanged &&
+        draftOauthClientId === oauthClientId &&
+        draftOauthScopes === oauthScopes &&
+        draftUseShared === useSharedSecrets &&
+        !secretsDirty;
       await onSave({
         authType: draftAuthType,
         oauthClientId: draftOauthClientId.trim(),
@@ -192,7 +206,7 @@
         oauthRedirectHosts: draftOauthRedirectHosts.trim(),
         oauthScopes: draftOauthScopes.trim(),
         useSharedSecrets: draftUseShared,
-      });
+      }, { callbackPolicyOnly });
       loadedApiKey = apiKey;
       loadedOauthClientSecret = oauthClientSecret;
       loadedOauthPassword = oauthPassword;

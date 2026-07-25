@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use tauri::State;
 
 use crate::app_state::{teardown_workspace, AppState};
+use crate::auth::{update_oauth_redirect_policy, validate_redirect_policy};
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
 use crate::tunnel::drop_workspace as drop_tunnel_workspace;
+use crate::tunnel::append_profile_log;
 use crate::workspace::resources::{
     assign_free_workspace_ports, validate_workspace_resources_update,
 };
@@ -52,14 +54,69 @@ pub fn create_workspace(
 
 #[tauri::command]
 pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -> AppResult<()> {
-    state.with_workspaces(|store| {
+    let profile_id = profile.id.clone();
+    let mcp_redirect_uris = profile.auth.oauth_redirect_uris.clone();
+    let mcp_redirect_hosts = profile.auth.oauth_redirect_hosts.clone();
+    let actions_redirect_uris = profile.actions.oauth_redirect_uris.clone();
+    let actions_redirect_hosts = profile.actions.oauth_redirect_hosts.clone();
+    let mcp_oauth_enabled = profile.auth.oauth_enabled();
+    let actions_oauth_enabled = profile.actions.auth_type == "oauth";
+    let (mcp_callback_changed, actions_callback_changed) = state.with_workspaces(|store| {
         let current = store
             .get(&profile.id)
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
         validate_workspace_resources_update(store.list(), &current, &profile)?;
-        store.update(profile)
-    })
+        let mcp_callback_changed = current.auth.oauth_redirect_uris != profile.auth.oauth_redirect_uris
+            || current.auth.oauth_redirect_hosts != profile.auth.oauth_redirect_hosts;
+        let actions_callback_changed = current.actions.oauth_redirect_uris
+            != profile.actions.oauth_redirect_uris
+            || current.actions.oauth_redirect_hosts != profile.actions.oauth_redirect_hosts;
+        if mcp_callback_changed {
+            validate_redirect_policy(&mcp_redirect_uris, &mcp_redirect_hosts)
+                .map_err(AppError::Message)?;
+        }
+        if actions_callback_changed {
+            validate_redirect_policy(&actions_redirect_uris, &actions_redirect_hosts)
+                .map_err(AppError::Message)?;
+        }
+        store.update(profile)?;
+        Ok((mcp_callback_changed, actions_callback_changed))
+    })?;
+
+    if mcp_callback_changed && mcp_oauth_enabled {
+        let hot_updated = update_oauth_redirect_policy(
+            &profile_id,
+            "mcp",
+            &mcp_redirect_uris,
+            &mcp_redirect_hosts,
+        )
+        .map_err(AppError::Message)?;
+        append_profile_log(
+            &profile_id,
+            "mcp-oauth.log",
+            &format!(
+                "[oauth] event=callback_policy_saved service=mcp runtime_hot_updated={hot_updated}"
+            ),
+        );
+    }
+    if actions_callback_changed && actions_oauth_enabled {
+        let hot_updated = update_oauth_redirect_policy(
+            &profile_id,
+            "actions",
+            &actions_redirect_uris,
+            &actions_redirect_hosts,
+        )
+        .map_err(AppError::Message)?;
+        append_profile_log(
+            &profile_id,
+            "actions-oauth.log",
+            &format!(
+                "[oauth] event=callback_policy_saved service=actions runtime_hot_updated={hot_updated}"
+            ),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
