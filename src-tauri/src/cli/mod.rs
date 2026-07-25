@@ -1,5 +1,6 @@
 mod args;
 mod daemon;
+mod workspace;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
@@ -606,6 +607,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Doctor { workspace } => {
             doctor_workspace(&workspace, cli.json).map(|healthy| if healthy { 0 } else { 1 })
         }
+        Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::DaemonRun {
             workspace,
             service,
@@ -640,7 +642,9 @@ fn list_workspaces(as_json: bool) -> AppResult<()> {
     if as_json {
         print_json(&summaries)?;
     } else if summaries.is_empty() {
-        println!("没有已配置的 workspace。请先通过 GUI 创建 workspace/profile。");
+        println!(
+            "没有已配置的 workspace。请使用 `coding-tools-mcp workspace register PATH` 或 GUI 创建 profile。"
+        );
     } else {
         for item in summaries {
             println!(

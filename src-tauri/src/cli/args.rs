@@ -10,6 +10,204 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+fn parse_workspace_command(args: &mut VecDeque<String>) -> Result<WorkspaceCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("list" | "ls") => {
+            ensure_empty(args, "workspace list")?;
+            Ok(WorkspaceCommand::List)
+        }
+        Some("register" | "add") => {
+            let path = pop_value(args, "workspace register")?;
+            let mut name = None;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--name" => name = Some(pop_value(args, "--name")?),
+                    other => return Err(format!("workspace register 不支持参数：{other}")),
+                }
+            }
+            Ok(WorkspaceCommand::Register(RegisterOptions { path, name }))
+        }
+        Some("unregister" | "delete" | "remove") => {
+            let workspace = pop_value(args, "workspace unregister")?;
+            let mut force = false;
+            let mut timeout_seconds = 10;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--force" => force = true,
+                    "--timeout" => {
+                        timeout_seconds = parse_u64(args, "--timeout", 1, 300)?;
+                    }
+                    other => return Err(format!("workspace unregister 不支持参数：{other}")),
+                }
+            }
+            Ok(WorkspaceCommand::Unregister(UnregisterOptions {
+                workspace,
+                force,
+                timeout_seconds,
+            }))
+        }
+        Some("show" | "view") => {
+            let workspace = pop_value(args, "workspace show")?;
+            ensure_empty(args, "workspace show")?;
+            Ok(WorkspaceCommand::Show { workspace })
+        }
+        Some("start") => Ok(WorkspaceCommand::Start(parse_run_options(
+            args,
+            "workspace start",
+        )?)),
+        Some("stop") => Ok(WorkspaceCommand::Stop(parse_stop_named(
+            args,
+            "workspace stop",
+        )?)),
+        Some("gpt-config" | "gpt") => {
+            let workspace = pop_value(args, "workspace gpt-config")?;
+            let mut service = ServiceSelection::Mcp;
+            let mut endpoint = EndpointSelection::Auto;
+            let mut show_secrets = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--service" => {
+                        service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
+                    }
+                    "--endpoint" => {
+                        endpoint = EndpointSelection::parse(&pop_value(args, "--endpoint")?)?;
+                    }
+                    "--local" => endpoint = EndpointSelection::Local,
+                    "--public" => endpoint = EndpointSelection::Public,
+                    "--show-secrets" => show_secrets = true,
+                    other => return Err(format!("workspace gpt-config 不支持参数：{other}")),
+                }
+            }
+            Ok(WorkspaceCommand::GptConfig(GptConfigOptions {
+                workspace,
+                service,
+                endpoint,
+                show_secrets,
+            }))
+        }
+        Some("test") => {
+            let workspace = pop_value(args, "workspace test")?;
+            let mut service = ServiceSelection::Mcp;
+            let mut endpoint = EndpointSelection::Auto;
+            let mut timeout_seconds = 10;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--service" => {
+                        service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
+                    }
+                    "--endpoint" => {
+                        endpoint = EndpointSelection::parse(&pop_value(args, "--endpoint")?)?;
+                    }
+                    "--local" => endpoint = EndpointSelection::Local,
+                    "--public" => endpoint = EndpointSelection::Public,
+                    "--timeout" => {
+                        timeout_seconds = parse_u64(args, "--timeout", 1, 120)?;
+                    }
+                    other => return Err(format!("workspace test 不支持参数：{other}")),
+                }
+            }
+            Ok(WorkspaceCommand::Test(WorkspaceTestOptions {
+                workspace,
+                service,
+                endpoint,
+                timeout_seconds,
+            }))
+        }
+        Some(other) => Err(format!(
+            "未知 workspace 命令：{other}\n\n{}",
+            workspace_usage()
+        )),
+        None => Err(format!("workspace 缺少子命令\n\n{}", workspace_usage())),
+    }
+}
+
+fn parse_stop_named(args: &mut VecDeque<String>, command: &str) -> Result<StopOptions, String> {
+    let workspace = pop_value(args, command)?;
+    let mut timeout_seconds = 10;
+    let mut force = false;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--timeout" => timeout_seconds = parse_u64(args, "--timeout", 1, 300)?,
+            "--force" => force = true,
+            other => return Err(format!("{command} 不支持参数：{other}")),
+        }
+    }
+    Ok(StopOptions {
+        workspace,
+        timeout_seconds,
+        force,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSelection {
+    Auto,
+    Local,
+    Public,
+}
+
+impl EndpointSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Local => "local",
+            Self::Public => "public",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "local" => Ok(Self::Local),
+            "public" => Ok(Self::Public),
+            _ => Err(format!(
+                "无效 endpoint：{value}；可选值为 auto、local、public"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterOptions {
+    pub path: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnregisterOptions {
+    pub workspace: String,
+    pub force: bool,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GptConfigOptions {
+    pub workspace: String,
+    pub service: ServiceSelection,
+    pub endpoint: EndpointSelection,
+    pub show_secrets: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTestOptions {
+    pub workspace: String,
+    pub service: ServiceSelection,
+    pub endpoint: EndpointSelection,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceCommand {
+    List,
+    Register(RegisterOptions),
+    Unregister(UnregisterOptions),
+    Show { workspace: String },
+    Start(RunOptions),
+    Stop(StopOptions),
+    GptConfig(GptConfigOptions),
+    Test(WorkspaceTestOptions),
+}
+
 fn parse_run_options(args: &mut VecDeque<String>, command: &str) -> Result<RunOptions, String> {
     let workspace = pop_value(args, command)?;
     let mut service = None;
@@ -222,6 +420,7 @@ pub enum Command {
     Doctor {
         workspace: String,
     },
+    Workspace(WorkspaceCommand),
     DaemonRun {
         workspace: String,
         service: ServiceSelection,
@@ -289,6 +488,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
             ensure_empty(&args, "doctor")?;
             Command::Doctor { workspace }
         }
+        Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
         Some("daemon-run") => parse_daemon_run(&mut args)?,
         Some(other) => return Err(format!("未知命令：{other}\n\n{}", usage())),
     };
@@ -348,8 +548,21 @@ pub fn usage() -> &'static str {
   coding-tools-mcp [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
   coding-tools-mcp [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
   coding-tools-mcp [--config-dir PATH] [--json] doctor <workspace>\n\n\
+  coding-tools-mcp [--config-dir PATH] [--json] workspace <command> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
 serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+}
+
+pub fn workspace_usage() -> &'static str {
+    "Workspace 命令：\n\
+  coding-tools-mcp workspace list\n\
+  coding-tools-mcp workspace register <path> [--name NAME]\n\
+  coding-tools-mcp workspace unregister <workspace> --force [--timeout SECONDS]\n\
+  coding-tools-mcp workspace show <workspace>\n\
+  coding-tools-mcp workspace start <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  coding-tools-mcp workspace stop <workspace> [--timeout SECONDS] [--force]\n\
+  coding-tools-mcp workspace gpt-config <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--show-secrets]\n\
+  coding-tools-mcp workspace test <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--timeout SECONDS]"
 }
 
 #[cfg(test)]
@@ -453,5 +666,58 @@ mod tests {
         ]))
         .expect_err("ambiguous follow");
         assert!(error.contains("暂不支持"));
+    }
+
+    #[test]
+    fn parses_workspace_registration_and_gpt_commands() {
+        let register = parse(strings(&[
+            "workspace",
+            "register",
+            "/srv/project",
+            "--name",
+            "Project",
+        ]))
+        .expect("register");
+        assert_eq!(
+            register.command,
+            Command::Workspace(WorkspaceCommand::Register(RegisterOptions {
+                path: "/srv/project".into(),
+                name: Some("Project".into()),
+            }))
+        );
+
+        let gpt = parse(strings(&[
+            "workspace",
+            "gpt-config",
+            "project",
+            "--service",
+            "all",
+            "--public",
+            "--show-secrets",
+        ]))
+        .expect("gpt config");
+        assert_eq!(
+            gpt.command,
+            Command::Workspace(WorkspaceCommand::GptConfig(GptConfigOptions {
+                workspace: "project".into(),
+                service: ServiceSelection::All,
+                endpoint: EndpointSelection::Public,
+                show_secrets: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn unregister_requires_explicit_force_at_execution_not_parse_time() {
+        let parsed = parse(strings(&["workspace", "delete", "project"]))
+            .expect("delete parse");
+        assert_eq!(
+            parsed.command,
+            Command::Workspace(WorkspaceCommand::Unregister(UnregisterOptions {
+                workspace: "project".into(),
+                force: false,
+                timeout_seconds: 10,
+            }))
+        );
     }
 }

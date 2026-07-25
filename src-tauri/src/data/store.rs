@@ -18,6 +18,27 @@ struct DataFileGuard {
     lock_file: File,
 }
 
+fn populate_workspace_secrets(data: &mut AppData, profile_id: &str) {
+    let secrets = data
+        .workspace_secrets
+        .entry(profile_id.to_string())
+        .or_default();
+    // oauth_client_secret is optional for MCP OAuth (ChatGPT PKCE); not auto-generated.
+    for key in [
+        "oauth_password",
+        "oauth_token_secret",
+        "bearer_token",
+        "actions_api_key",
+        "actions_oauth_client_secret",
+        "actions_oauth_password",
+        "actions_oauth_token_secret",
+    ] {
+        secrets
+            .entry(key.to_string())
+            .or_insert_with(random_secret);
+    }
+}
+
 impl Drop for DataFileGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock_file);
@@ -102,7 +123,14 @@ impl DataStore {
         self.data.profiles.iter().find(|profile| profile.id == id)
     }
 
-    pub fn add(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
+    pub fn register_workspace(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
+        if self.data.profiles.iter().any(|item| item.id == profile.id) {
+            return Err(AppError::Message(format!(
+                "workspace already exists: {}",
+                profile.id
+            )));
+        }
+        populate_workspace_secrets(&mut self.data, &profile.id);
         self.data.profiles.push(profile);
         self.save()
     }
@@ -131,18 +159,6 @@ impl DataStore {
         self.data.workspace_secrets.remove(id);
         self.save()?;
         Ok(Some(removed))
-    }
-
-    pub fn init_workspace_secrets(&mut self, profile_id: &str) -> AppResult<()> {
-        // oauth_client_secret is optional for MCP OAuth (ChatGPT PKCE); not auto-generated.
-        self.set_workspace_secret(profile_id, "oauth_password", &random_secret())?;
-        self.set_workspace_secret(profile_id, "oauth_token_secret", &random_secret())?;
-        self.set_workspace_secret(profile_id, "bearer_token", &random_secret())?;
-        self.set_workspace_secret(profile_id, "actions_api_key", &random_secret())?;
-        self.set_workspace_secret(profile_id, "actions_oauth_client_secret", &random_secret())?;
-        self.set_workspace_secret(profile_id, "actions_oauth_password", &random_secret())?;
-        self.set_workspace_secret(profile_id, "actions_oauth_token_secret", &random_secret())?;
-        Ok(())
     }
 
     pub fn init_shared_secrets(&mut self) -> AppResult<()> {
@@ -303,5 +319,22 @@ mod tests {
         let value = shared_value_for_key("oauth_client_id");
         assert!(value.starts_with("chatgpt-client-"));
         assert_eq!(value.len(), "chatgpt-client-".len() + 12);
+    }
+
+    #[test]
+    fn workspace_registration_populates_secrets_without_overwriting_existing_values() {
+        let mut data = AppData::default();
+        data.workspace_secrets
+            .entry("workspace".into())
+            .or_default()
+            .insert("bearer_token".into(), "keep-me".into());
+
+        populate_workspace_secrets(&mut data, "workspace");
+
+        let secrets = &data.workspace_secrets["workspace"];
+        assert_eq!(secrets["bearer_token"], "keep-me");
+        assert!(secrets.contains_key("oauth_password"));
+        assert!(secrets.contains_key("actions_api_key"));
+        assert!(!secrets.contains_key("oauth_client_secret"));
     }
 }
