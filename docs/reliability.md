@@ -138,3 +138,13 @@ Refresh Token 的已使用列表目前保存在服务进程内存中。服务重
 ```
 
 自动重试只处理连接建立、listener 重启、隧道恢复和只读状态同步。业务写入与可能产生副作用的 MCP 工具调用保持显式失败。
+
+## Windows 桌面子进程
+
+Windows GUI 启动的内部控制台程序默认使用无窗口模式：远程命令、Git、Harness 检测、下游 MCP、FRP 和 Cloudflare 不应弹出或闪现命令行窗口。stdout/stderr 仍通过工具结果、session 和日志读取。
+
+详细审计见：
+
+```text
+docs/verification/windows-console-window-flash-analysis-2026-07-25.md
+```
