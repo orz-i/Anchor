@@ -1,11 +1,204 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliArgs {
     pub config_dir: Option<PathBuf>,
     pub json: bool,
     pub command: Command,
+}
+
+fn parse_run_options(args: &mut VecDeque<String>, command: &str) -> Result<RunOptions, String> {
+    let workspace = pop_value(args, command)?;
+    let mut service = None;
+    let mut tunnel = None;
+    let mut wait_seconds = 10;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--service" => {
+                service = Some(ServiceSelection::parse(&pop_value(args, "--service")?)?);
+            }
+            "--tunnel" => tunnel = Some(true),
+            "--no-tunnel" => tunnel = Some(false),
+            "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 300)?,
+            other => return Err(format!("{command} 不支持参数：{other}")),
+        }
+    }
+    Ok(RunOptions {
+        workspace,
+        service,
+        tunnel,
+        wait_seconds,
+    })
+}
+
+fn parse_stop(args: &mut VecDeque<String>) -> Result<StopOptions, String> {
+    let workspace = pop_value(args, "stop")?;
+    let mut timeout_seconds = 10;
+    let mut force = false;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--timeout" => timeout_seconds = parse_u64(args, "--timeout", 1, 300)?,
+            "--force" => force = true,
+            other => return Err(format!("stop 不支持参数：{other}")),
+        }
+    }
+    Ok(StopOptions {
+        workspace,
+        timeout_seconds,
+        force,
+    })
+}
+
+fn parse_status(args: &mut VecDeque<String>) -> Result<StatusOptions, String> {
+    let workspace = pop_value(args, "status")?;
+    let mut watch = false;
+    let mut interval_seconds = 2;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--watch" => watch = true,
+            "--interval" => interval_seconds = parse_u64(args, "--interval", 1, 60)?,
+            other => return Err(format!("status 不支持参数：{other}")),
+        }
+    }
+    Ok(StatusOptions {
+        workspace,
+        watch,
+        interval_seconds,
+    })
+}
+
+fn parse_logs(args: &mut VecDeque<String>) -> Result<LogsOptions, String> {
+    let workspace = pop_value(args, "logs")?;
+    let mut service = LogSelection::Daemon;
+    let mut lines = 100usize;
+    let mut follow = false;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--service" => service = LogSelection::parse(&pop_value(args, "--service")?)?,
+            "--lines" => lines = parse_u64(args, "--lines", 1, 10_000)? as usize,
+            "--follow" | "-f" => follow = true,
+            other => return Err(format!("logs 不支持参数：{other}")),
+        }
+    }
+    if follow && service == LogSelection::All {
+        return Err("logs --follow 暂不支持 --service all，请选择单个服务".into());
+    }
+    Ok(LogsOptions {
+        workspace,
+        service,
+        lines,
+        follow,
+    })
+}
+
+fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
+    let options = parse_run_options(args, "daemon-run")?;
+    Ok(Command::DaemonRun {
+        workspace: options.workspace,
+        service: options.service.unwrap_or(ServiceSelection::Mcp),
+        tunnel: options.tunnel.unwrap_or(false),
+    })
+}
+
+fn parse_u64(
+    args: &mut VecDeque<String>,
+    option: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    let raw = pop_value(args, option)?;
+    let value = raw
+        .parse::<u64>()
+        .map_err(|_| format!("{option} 必须是整数：{raw}"))?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(format!("{option} 必须在 {minimum}-{maximum} 之间"));
+    }
+    Ok(value)
+}
+
+impl ServiceSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Actions => "actions",
+            Self::All => "all",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "mcp" => Ok(Self::Mcp),
+            "actions" => Ok(Self::Actions),
+            "all" => Ok(Self::All),
+            _ => Err(format!(
+                "无效服务类型：{value}；可选值为 mcp、actions、all"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOptions {
+    pub workspace: String,
+    pub service: Option<ServiceSelection>,
+    pub tunnel: Option<bool>,
+    pub wait_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopOptions {
+    pub workspace: String,
+    pub timeout_seconds: u64,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusOptions {
+    pub workspace: String,
+    pub watch: bool,
+    pub interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSelection {
+    Daemon,
+    Mcp,
+    Actions,
+    All,
+}
+
+impl LogSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Daemon => "daemon",
+            Self::Mcp => "mcp",
+            Self::Actions => "actions",
+            Self::All => "all",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "daemon" => Ok(Self::Daemon),
+            "mcp" => Ok(Self::Mcp),
+            "actions" => Ok(Self::Actions),
+            "all" => Ok(Self::All),
+            _ => Err(format!(
+                "无效日志类型：{value}；可选值为 daemon、mcp、actions、all"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogsOptions {
+    pub workspace: String,
+    pub service: LogSelection,
+    pub lines: usize,
+    pub follow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,17 +209,28 @@ pub enum Command {
     Show {
         workspace: String,
     },
-    Status {
+    Status(StatusOptions),
+    Serve {
+        workspace: String,
+        service: ServiceSelection,
+        tunnel: bool,
+    },
+    Start(RunOptions),
+    Stop(StopOptions),
+    Restart(RunOptions),
+    Logs(LogsOptions),
+    Doctor {
         workspace: String,
     },
-    Serve {
+    DaemonRun {
         workspace: String,
         service: ServiceSelection,
         tunnel: bool,
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ServiceSelection {
     Mcp,
     Actions,
@@ -74,12 +278,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
             ensure_empty(&args, "show")?;
             Command::Show { workspace }
         }
-        Some("status") => {
-            let workspace = pop_value(&mut args, "status")?;
-            ensure_empty(&args, "status")?;
-            Command::Status { workspace }
-        }
+        Some("status") => Command::Status(parse_status(&mut args)?),
         Some("serve") => parse_serve(&mut args)?,
+        Some("start") => Command::Start(parse_run_options(&mut args, "start")?),
+        Some("stop") => Command::Stop(parse_stop(&mut args)?),
+        Some("restart") => Command::Restart(parse_run_options(&mut args, "restart")?),
+        Some("logs") => Command::Logs(parse_logs(&mut args)?),
+        Some("doctor") => {
+            let workspace = pop_value(&mut args, "doctor")?;
+            ensure_empty(&args, "doctor")?;
+            Command::Doctor { workspace }
+        }
+        Some("daemon-run") => parse_daemon_run(&mut args)?,
         Some(other) => return Err(format!("未知命令：{other}\n\n{}", usage())),
     };
 
@@ -98,14 +308,7 @@ fn parse_serve(args: &mut VecDeque<String>) -> Result<Command, String> {
     while let Some(option) = args.pop_front() {
         match option.as_str() {
             "--service" => {
-                service = match pop_value(args, "--service")?.as_str() {
-                    "mcp" => ServiceSelection::Mcp,
-                    "actions" => ServiceSelection::Actions,
-                    "all" => ServiceSelection::All,
-                    value => {
-                        return Err(format!("无效服务类型：{value}；可选值为 mcp、actions、all"))
-                    }
-                };
+                service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
             }
             "--tunnel" => tunnel = true,
             other => return Err(format!("serve 不支持参数：{other}")),
@@ -138,10 +341,15 @@ pub fn usage() -> &'static str {
 用法：\n\
   coding-tools-mcp [--config-dir PATH] [--json] list\n\
   coding-tools-mcp [--config-dir PATH] [--json] show <workspace>\n\
-  coding-tools-mcp [--config-dir PATH] [--json] status <workspace>\n\
+  coding-tools-mcp [--config-dir PATH] [--json] status <workspace> [--watch]\n\
   coding-tools-mcp [--config-dir PATH] [--json] serve <workspace> [--service mcp|actions|all] [--tunnel]\n\n\
+  coding-tools-mcp [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  coding-tools-mcp [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
+  coding-tools-mcp [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  coding-tools-mcp [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
+  coding-tools-mcp [--config-dir PATH] [--json] doctor <workspace>\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
-serve 为前台常驻模式，按 Ctrl+C 优雅停止；默认只启动 MCP，本地端口已被 GUI 占用时不会接管。"
+serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
 
 #[cfg(test)]
@@ -198,5 +406,52 @@ mod tests {
             .expect_err("invalid service");
 
         assert!(error.contains("无效服务类型"));
+    }
+
+    #[test]
+    fn parses_daemon_operations() {
+        let start = parse(strings(&[
+            "start",
+            "workspace-a",
+            "--service",
+            "all",
+            "--tunnel",
+            "--wait",
+            "20",
+        ]))
+        .expect("start parse");
+        assert_eq!(
+            start.command,
+            Command::Start(RunOptions {
+                workspace: "workspace-a".into(),
+                service: Some(ServiceSelection::All),
+                tunnel: Some(true),
+                wait_seconds: 20,
+            })
+        );
+
+        let stop = parse(strings(&["stop", "workspace-a", "--timeout", "15", "--force"]))
+            .expect("stop parse");
+        assert_eq!(
+            stop.command,
+            Command::Stop(StopOptions {
+                workspace: "workspace-a".into(),
+                timeout_seconds: 15,
+                force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_following_all_logs() {
+        let error = parse(strings(&[
+            "logs",
+            "workspace-a",
+            "--service",
+            "all",
+            "--follow",
+        ]))
+        .expect_err("ambiguous follow");
+        assert!(error.contains("暂不支持"));
     }
 }
