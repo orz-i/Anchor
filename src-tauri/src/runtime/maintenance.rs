@@ -33,14 +33,32 @@ struct TunnelRetryState {
 }
 
 #[cfg(feature = "desktop")]
+#[derive(Debug, Clone)]
+enum GatewayRetryKind {
+    Listener,
+    Tunnel,
+}
+
+#[cfg(feature = "desktop")]
+#[derive(Debug, Clone)]
+struct GatewayRetryState {
+    signature: String,
+    kind: GatewayRetryKind,
+    attempts: u8,
+    next_attempt: tokio::time::Instant,
+    blocked: bool,
+}
+
+#[cfg(feature = "desktop")]
 pub fn spawn_desktop_maintenance(app: tauri::AppHandle) {
     crate::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tunnel_retries = HashMap::new();
+        let mut gateway_retry = None;
         loop {
             ticker.tick().await;
-            if let Err(error) = maintain_all(&app, &mut tunnel_retries).await {
+            if let Err(error) = maintain_all(&app, &mut tunnel_retries, &mut gateway_retry).await {
                 eprintln!("runtime maintenance failed: {error}");
             }
         }
@@ -51,11 +69,11 @@ pub fn spawn_desktop_maintenance(app: tauri::AppHandle) {
 async fn maintain_all(
     app: &tauri::AppHandle,
     tunnel_retries: &mut HashMap<(String, TunnelServiceKind), TunnelRetryState>,
+    gateway_retry: &mut Option<GatewayRetryState>,
 ) -> AppResult<()> {
     let state = app.state::<AppState>();
-    let (profiles, settings) = state.with_workspaces(|store| {
-        Ok((store.list().to_vec(), store.settings()))
-    })?;
+    let (profiles, settings) =
+        state.with_workspaces(|store| Ok((store.list().to_vec(), store.settings())))?;
 
     for profile in &profiles {
         for kind in [TunnelServiceKind::Mcp, TunnelServiceKind::Actions] {
@@ -77,7 +95,7 @@ async fn maintain_all(
             }
         }
     }
-    maintain_mcp_gateway(&state, &profiles, &settings.mcp_gateway).await;
+    maintain_mcp_gateway(&state, &profiles, &settings.mcp_gateway, gateway_retry).await;
     Ok(())
 }
 
@@ -86,6 +104,7 @@ async fn maintain_mcp_gateway(
     state: &AppState,
     profiles: &[WorkspaceProfile],
     config: &crate::settings::McpGatewayConfig,
+    retry: &mut Option<GatewayRetryState>,
 ) {
     let active = match state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids())) {
         Ok(active) => active,
@@ -94,33 +113,182 @@ async fn maintain_mcp_gateway(
             return;
         }
     };
+    let signature = gateway_retry_signature(config, profiles, &active);
+    if retry
+        .as_ref()
+        .is_some_and(|current| current.signature != signature)
+    {
+        *retry = None;
+    }
+    if !config.enabled || active.is_empty() {
+        *retry = None;
+    } else if retry.as_ref().is_some_and(|current| {
+        matches!(current.kind, GatewayRetryKind::Listener)
+            && (current.blocked || current.next_attempt > tokio::time::Instant::now())
+    }) {
+        return;
+    }
     if let Err(error) = gateway::ensure(config, profiles, &active).await {
-        log_gateway_error(config, &format!("Gateway listener 维护失败：{error}"));
+        gateway::record_runtime_error(format!("Gateway listener 维护失败：{error}")).await;
+        schedule_gateway_retry(
+            config,
+            retry,
+            signature,
+            GatewayRetryKind::Listener,
+            false,
+            &format!("Gateway listener 维护失败：{error}"),
+        );
+        return;
+    }
+    if retry
+        .as_ref()
+        .is_some_and(|current| matches!(current.kind, GatewayRetryKind::Listener))
+    {
+        *retry = None;
+    }
+    if retry.as_ref().is_some_and(|current| {
+        matches!(current.kind, GatewayRetryKind::Tunnel)
+            && (current.blocked || current.next_attempt > tokio::time::Instant::now())
+    }) {
         return;
     }
     match reconcile_mcp_gateway(config, profiles, &active).await {
         Ok(Some(url)) => {
-            if let Err(error) = persist_gateway_public_url(state, &url) {
+            *retry = None;
+            gateway::clear_runtime_error().await;
+            if let Err(error) = persist_gateway_observation(state, config, profiles, &url) {
                 log_gateway_error(config, &format!("保存 Gateway 公网地址失败：{error}"));
             }
         }
-        Ok(None) => {}
-        Err(error) => log_gateway_error(config, &format!("Gateway 隧道维护失败：{error}")),
+        Ok(None) => {
+            *retry = None;
+            gateway::clear_runtime_error().await;
+        }
+        Err(error) => {
+            gateway::record_runtime_error(format!("Gateway 隧道维护失败：{error}")).await;
+            let blocked = is_quick_tunnel_url_change_error(&error);
+            schedule_gateway_retry(
+                config,
+                retry,
+                signature,
+                GatewayRetryKind::Tunnel,
+                blocked,
+                &format!("Gateway 隧道维护失败：{error}"),
+            );
+        }
     }
 }
 
 #[cfg(feature = "desktop")]
-fn persist_gateway_public_url(state: &AppState, url: &str) -> AppResult<()> {
+fn gateway_retry_signature(
+    config: &crate::settings::McpGatewayConfig,
+    profiles: &[WorkspaceProfile],
+    active: &std::collections::HashSet<String>,
+) -> String {
+    let owner = profiles
+        .iter()
+        .find(|profile| profile.id == config.owner_workspace_id);
+    let mut active = active.iter().cloned().collect::<Vec<_>>();
+    active.sort();
+    serde_json::to_string(&serde_json::json!({
+        "enabled": config.enabled,
+        "localPort": config.local_port,
+        "owner": config.owner_workspace_id,
+        "configuredUrl": config.public_url,
+        "observedUrl": config.observed_public_url,
+        "observedOwner": config.observed_owner_workspace_id,
+        "observedTunnelSignature": config.observed_tunnel_signature,
+        "active": active,
+        "tunnel": owner.map(|profile| serde_json::json!({
+            "type": profile.tunnel.tunnel_type,
+            "publicUrl": profile.tunnel.public_url,
+            "frpServer": profile.tunnel.frp_server,
+            "frpSubdomain": profile.tunnel.frp_subdomain,
+            "frpProfileId": profile.tunnel.frp_profile_id,
+            "frpServerPort": profile.tunnel.frp_server_port,
+            "cloudflareMode": profile.tunnel.cloudflare_mode,
+            "useProxy": profile.tunnel.use_proxy,
+        })),
+    }))
+    .unwrap_or_default()
+}
+
+#[cfg(feature = "desktop")]
+fn schedule_gateway_retry(
+    config: &crate::settings::McpGatewayConfig,
+    retry: &mut Option<GatewayRetryState>,
+    signature: String,
+    kind: GatewayRetryKind,
+    blocked: bool,
+    message: &str,
+) {
+    let attempts = retry
+        .as_ref()
+        .map(|current| current.attempts.saturating_add(1))
+        .unwrap_or(1);
+    let delay = tunnel_retry_delay(attempts);
+    *retry = Some(GatewayRetryState {
+        signature,
+        kind,
+        attempts,
+        next_attempt: tokio::time::Instant::now() + delay,
+        blocked,
+    });
+    if blocked {
+        log_gateway_error(
+            config,
+            &format!("{message}；已阻断自动重试，修改 Gateway/owner 隧道配置后才会恢复"),
+        );
+    } else {
+        log_gateway_error(
+            config,
+            &format!(
+                "{message}；第 {attempts} 次失败，{} 秒后重试",
+                delay.as_secs()
+            ),
+        );
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn persist_gateway_observation(
+    state: &AppState,
+    config: &crate::settings::McpGatewayConfig,
+    profiles: &[WorkspaceProfile],
+    url: &str,
+) -> AppResult<()> {
     let normalized = url.trim().trim_end_matches('/');
     if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
         return Ok(());
     }
+    let owner = profiles
+        .iter()
+        .find(|profile| profile.id == config.owner_workspace_id)
+        .ok_or_else(|| {
+            crate::error::AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into())
+        })?;
+    let signature = gateway::tunnel_identity_signature(config, owner)?;
+    let mut candidate = config.clone();
+    candidate.url_model_version = 2;
+    candidate.observed_public_url = normalized.to_string();
+    candidate.observed_owner_workspace_id = config.owner_workspace_id.clone();
+    candidate.observed_tunnel_signature = signature.clone();
+    gateway::validate_config(&candidate, profiles)?;
     state.with_settings(|store| {
         let mut settings = store.settings();
-        if settings.mcp_gateway.public_url == normalized {
+        if settings.mcp_gateway.identity_changed(config) {
             return Ok(());
         }
-        settings.mcp_gateway.public_url = normalized.to_string();
+        if settings.mcp_gateway.observed_public_url == normalized
+            && settings.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
+            && settings.mcp_gateway.observed_tunnel_signature == signature
+        {
+            return Ok(());
+        }
+        settings.mcp_gateway.url_model_version = 2;
+        settings.mcp_gateway.observed_public_url = normalized.to_string();
+        settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
+        settings.mcp_gateway.observed_tunnel_signature = signature;
         store.update_settings(settings)
     })
 }

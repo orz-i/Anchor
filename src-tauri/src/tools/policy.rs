@@ -239,6 +239,14 @@ pub fn validate_command_for_workspace(
             "Shell chaining, redirection and expansion are not allowed".into(),
         ));
     }
+    if workspace.is_some_and(Workspace::strict_read_boundary)
+        && command_contains_external_path(command)
+    {
+        return Err(PolicyError(
+            "WORKSPACE_PATH_PROTECTED: Gateway workspace scope 禁止通过子进程访问绝对路径或父目录路径"
+                .into(),
+        ));
+    }
     if (dangerous_command_pattern().is_match(command)
         || interpreter_mutation_pattern().is_match(command))
         && command_targets_protected_repository_asset(command)
@@ -491,6 +499,33 @@ fn command_targets_protected_repository_asset(command: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn strict_workspace_rejects_external_paths_in_commands() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let workspace = Workspace::new(dir.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(true);
+        let policy = PolicySettings::default();
+        assert!(validate_command_for_workspace(
+            &json!({"cmd": "cat ../other/secret.txt"}),
+            &policy,
+            Some(&workspace),
+        )
+        .is_err());
+        assert!(validate_command_for_workspace(
+            &json!({"cmd": "python -c \"print(open('/tmp/secret').read())\""}),
+            &policy,
+            Some(&workspace),
+        )
+        .is_err());
+        assert!(validate_command_for_workspace(
+            &json!({"cmd": "cat local.txt"}),
+            &policy,
+            Some(&workspace),
+        )
+        .is_ok());
+    }
 
     #[test]
     fn workspace_allowed_commands_override_defaults() {

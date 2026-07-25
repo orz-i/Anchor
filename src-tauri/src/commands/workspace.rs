@@ -6,8 +6,8 @@ use crate::app_state::{teardown_workspace, AppState};
 use crate::auth::{update_oauth_redirect_policy, validate_redirect_policy};
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
-use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::tunnel::append_profile_log;
+use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::workspace::resources::{
     assign_free_workspace_ports_with_reserved, validate_workspace_resources_update,
 };
@@ -73,8 +73,12 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
         validate_workspace_resources_update(store.list(), &current, &profile)?;
-        crate::mcp::gateway::validate_workspace_ports(&store.settings().mcp_gateway, &profile)?;
-        let mcp_callback_changed = current.auth.oauth_redirect_uris != profile.auth.oauth_redirect_uris
+        let gateway = store.settings().mcp_gateway;
+        crate::mcp::gateway::validate_workspace_ports(&gateway, &profile)?;
+        let reset_gateway_observed =
+            crate::mcp::gateway::owner_tunnel_identity_changed(&gateway, &current, &profile);
+        let mcp_callback_changed = current.auth.oauth_redirect_uris
+            != profile.auth.oauth_redirect_uris
             || current.auth.oauth_redirect_hosts != profile.auth.oauth_redirect_hosts;
         let actions_callback_changed = current.actions.oauth_redirect_uris
             != profile.actions.oauth_redirect_uris
@@ -88,6 +92,11 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
                 .map_err(AppError::Message)?;
         }
         store.update(profile)?;
+        if reset_gateway_observed {
+            let mut settings = store.settings();
+            settings.mcp_gateway.clear_observation();
+            store.update_settings(settings)?;
+        }
         Ok((mcp_callback_changed, actions_callback_changed))
     })?;
 

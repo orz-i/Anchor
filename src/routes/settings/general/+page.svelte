@@ -11,7 +11,7 @@
     type McpGatewayStatusDto,
     type ProxyConfigDto,
   } from "$lib/api/settings";
-  import { listWorkspaces } from "$lib/api/workspaces";
+  import { getRuntimeStatus, listWorkspaces } from "$lib/api/workspaces";
   import type { WorkspaceProfile } from "$lib/types";
 
   let proxy = $state<ProxyConfigDto>({ mode: "none", url: "" });
@@ -19,14 +19,58 @@
   let saving = $state(false);
   let workspaces = $state<WorkspaceProfile[]>([]);
   let gateway = $state<McpGatewayConfigDto>({
+    urlModelVersion: 2,
     enabled: false,
     localPort: 28765,
     ownerWorkspaceId: "",
     publicUrl: "",
+    observedPublicUrl: "",
+    observedOwnerWorkspaceId: "",
+    observedTunnelSignature: "",
   });
   let gatewayStatus = $state<McpGatewayStatusDto | null>(null);
+  let workspaceRuntimeStates = $state<Record<string, string>>({});
   let gatewayChanged = $state(false);
   let gatewaySaving = $state(false);
+  let gatewayRefreshing = false;
+
+  async function loadWorkspaceRuntimeStates(
+    profiles: WorkspaceProfile[],
+  ): Promise<Record<string, string>> {
+    return Object.fromEntries(
+      await Promise.all(
+        profiles.map(async (workspace) => {
+          try {
+            return [workspace.id, (await getRuntimeStatus(workspace.id)).state];
+          } catch {
+            return [workspace.id, "stopped"];
+          }
+        }),
+      ),
+    );
+  }
+
+  async function refreshGatewayRuntimeStatus() {
+    if (gatewayRefreshing) return;
+    gatewayRefreshing = true;
+    try {
+      const [nextGateway, nextStatus, nextWorkspaces] = await Promise.all([
+        getMcpGateway(),
+        getMcpGatewayStatus(),
+        listWorkspaces(),
+      ]);
+      gatewayStatus = nextStatus;
+      workspaces = nextWorkspaces;
+      workspaceRuntimeStates = await loadWorkspaceRuntimeStates(nextWorkspaces);
+      if (!gatewayChanged && !gatewaySaving) {
+        gateway = nextGateway;
+      }
+    } catch {
+      // Background polling is best-effort; explicit refresh/save still reports errors.
+    } finally {
+      gatewayRefreshing = false;
+    }
+  }
 
   async function refresh() {
     try {
@@ -41,6 +85,7 @@
       gateway = nextGateway;
       gatewayStatus = nextGatewayStatus;
       workspaces = nextWorkspaces;
+      workspaceRuntimeStates = await loadWorkspaceRuntimeStates(nextWorkspaces);
       changed = false;
       gatewayChanged = false;
     } catch (e) {
@@ -88,6 +133,7 @@
 
   function gatewayBaseUrl(): string {
     return (
+      gateway.observedPublicUrl.trim().replace(/\/$/, "") ||
       gateway.publicUrl.trim().replace(/\/$/, "") ||
       `http://127.0.0.1:${gateway.localPort}`
     );
@@ -97,7 +143,19 @@
     return `${gatewayBaseUrl()}/w/${workspaceId}/mcp`;
   }
 
-  onMount(refresh);
+  function gatewayRouteActive(workspaceId: string): boolean {
+    return ["starting", "running", "recovering"].includes(
+      workspaceRuntimeStates[workspaceId] ?? "stopped",
+    );
+  }
+
+  onMount(() => {
+    void refresh();
+    const timer = window.setInterval(() => {
+      void refreshGatewayRuntimeStatus();
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  });
 </script>
 
 <section class="page-scroll">
@@ -234,9 +292,16 @@
             oninput={handleGatewayChange}
           />
           <span class="text-xs text-[var(--color-text-muted)]">
-            不包含 <code>/w/&lt;workspace&gt;/mcp</code>。留空时先使用本地 Gateway 地址；隧道成功后自动写入实际公网地址。
+            不包含 <code>/w/&lt;workspace&gt;/mcp</code>。远程地址必须使用 HTTPS 且不能包含子路径。留空时由隧道运行结果决定。
           </span>
         </label>
+
+        {#if gateway.observedPublicUrl}
+          <div class="grid gap-1">
+            <span class="text-xs text-[var(--color-text-muted)]">当前观测到的公网地址</span>
+            <code class="break-all text-xs">{gateway.observedPublicUrl}</code>
+          </div>
+        {/if}
 
         {#if gateway.enabled}
           <div class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg-subtle)] p-3">
@@ -244,7 +309,14 @@
             <div class="mt-2 grid max-h-48 gap-2 overflow-auto">
               {#each workspaces as workspace}
                 <div class="grid gap-0.5 text-xs">
-                  <span class="text-[var(--color-text-muted)]">{workspace.name}</span>
+                  <span class="flex flex-wrap items-center gap-2 text-[var(--color-text-muted)]">
+                    <span>{workspace.name}</span>
+                    <span>
+                      {gatewayRouteActive(workspace.id)
+                        ? "路由已注册"
+                        : "未启动 · 当前返回 404"}
+                    </span>
+                  </span>
                   <code class="break-all">{gatewayWorkspaceUrl(workspace.id)}</code>
                 </div>
               {/each}

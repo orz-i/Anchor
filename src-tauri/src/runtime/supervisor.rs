@@ -378,6 +378,8 @@ impl RuntimeSupervisor {
         let spawn_result = match kind {
             ServiceKind::Mcp => {
                 let settings = AppSettings::load_or_default();
+                let mut runtime_config = profile.runtime.clone();
+                runtime_config.strict_workspace_reads = settings.mcp_gateway.enabled;
                 let use_shared = profile.auth.use_shared_secrets;
                 let mut auth = profile.auth.clone();
                 if use_shared {
@@ -407,7 +409,7 @@ impl RuntimeSupervisor {
                     oauth_client_secret,
                     oauth_password,
                     oauth_token_secret,
-                    profile.runtime.clone(),
+                    runtime_config,
                 )
             }
             ServiceKind::Actions => {

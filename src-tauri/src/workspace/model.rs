@@ -77,6 +77,10 @@ pub struct RuntimeConfig {
     /// Newline-separated Skill roots. Relative paths resolve from the workspace root.
     #[serde(default = "default_skill_roots")]
     pub skill_roots: String,
+    /// Runtime-enforced read boundary. Gateway mode overrides this to true so
+    /// one logical MCP server cannot explicitly read another workspace path.
+    #[serde(default)]
+    pub strict_workspace_reads: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +267,7 @@ impl Default for RuntimeConfig {
             workspace_script_extensions: default_workspace_script_extensions(),
             skill_service_enabled: default_skill_service_enabled(),
             skill_roots: default_skill_roots(),
+            strict_workspace_reads: false,
         }
     }
 }
@@ -344,16 +349,7 @@ impl WorkspaceProfile {
 
     pub fn mcp_external_base_url_with(&self, settings: &AppSettings) -> String {
         if settings.mcp_gateway.enabled {
-            let base = if settings.mcp_gateway.public_url.trim().is_empty() {
-                format!("http://127.0.0.1:{}", settings.mcp_gateway.local_port)
-            } else {
-                settings
-                    .mcp_gateway
-                    .public_url
-                    .trim()
-                    .trim_end_matches('/')
-                    .to_string()
-            };
+            let base = settings.mcp_gateway.effective_public_url();
             return format!("{base}/w/{}", self.id);
         }
         self.effective_public_url_with(settings)

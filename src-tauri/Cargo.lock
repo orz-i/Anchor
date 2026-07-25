@@ -456,6 +456,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
+ "futures-util",
  "glob",
  "image",
  "jsonwebtoken",

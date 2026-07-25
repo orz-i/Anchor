@@ -95,6 +95,7 @@ export interface RuntimeConfig {
   workspace_script_extensions?: string;
   skill_service_enabled?: boolean;
   skill_roots?: string;
+  strict_workspace_reads?: boolean;
 }
 
 export interface ActionsConfig {

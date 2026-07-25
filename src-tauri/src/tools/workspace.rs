@@ -161,6 +161,7 @@ pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    allow_external_reads: bool,
 }
 
 impl Workspace {
@@ -173,7 +174,15 @@ impl Workspace {
                 "Workspace root must be a directory",
             ));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            allow_external_reads: true,
+        })
+    }
+
+    pub fn with_strict_read_boundary(mut self, strict: bool) -> Self {
+        self.allow_external_reads = !strict;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -182,6 +191,10 @@ impl Workspace {
 
     pub fn root_display(&self) -> String {
         self.root.to_string_lossy().into_owned()
+    }
+
+    pub fn strict_read_boundary(&self) -> bool {
+        !self.allow_external_reads
     }
 
     pub fn reject_unsafe_text(&self, raw_path: &str) -> WorkspaceResult<()> {
@@ -269,6 +282,10 @@ impl Workspace {
         let raw = if raw_path.is_empty() { "." } else { raw_path };
         self.validate_read_text(raw)?;
         let input = Path::new(raw);
+        let explicit_external = input.is_absolute()
+            || input
+                .components()
+                .any(|part| matches!(part, Component::ParentDir));
         let candidate = if input.is_absolute() {
             input.to_path_buf()
         } else {
@@ -278,10 +295,9 @@ impl Workspace {
         let resolved = candidate
             .canonicalize()
             .map_err(|_| WorkspaceError::not_found(format!("Path not found: {raw}")))?;
-        let explicit_external = input.is_absolute()
-            || input
-                .components()
-                .any(|part| matches!(part, Component::ParentDir));
+        if !self.allow_external_reads && !resolved.starts_with(&self.root) {
+            return Err(WorkspaceError::path_outside_workspace());
+        }
         if !explicit_external && candidate.starts_with(&self.root) {
             self.ensure_inside_workspace(&candidate, &resolved)?;
         }
@@ -561,4 +577,32 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
         "structuredContent": structured,
         "isError": is_error
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Workspace;
+
+    #[test]
+    fn strict_read_boundary_rejects_explicit_external_paths() {
+        let root = tempfile::tempdir().expect("workspace");
+        let external = tempfile::NamedTempFile::new().expect("external file");
+        let strict = Workspace::new(root.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(true);
+        let error = strict
+            .resolve_read_path(&external.path().display().to_string())
+            .expect_err("external read must be rejected");
+        assert_eq!(error.to_error_value()["code"], "PATH_OUTSIDE_WORKSPACE");
+    }
+
+    #[test]
+    fn legacy_read_boundary_still_allows_explicit_external_paths() {
+        let root = tempfile::tempdir().expect("workspace");
+        let external = tempfile::NamedTempFile::new().expect("external file");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        assert!(workspace
+            .resolve_read_path(&external.path().display().to_string())
+            .is_ok());
+    }
 }

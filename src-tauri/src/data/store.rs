@@ -18,6 +18,10 @@ struct DataFileGuard {
     lock_file: File,
 }
 
+fn migrate_gateway_url_state(data: &mut AppData) -> bool {
+    data.mcp_gateway.migrate_legacy_url_state()
+}
+
 fn populate_workspace_secrets(data: &mut AppData, profile_id: &str) {
     let secrets = data
         .workspace_secrets
@@ -33,9 +37,7 @@ fn populate_workspace_secrets(data: &mut AppData, profile_id: &str) {
         "actions_oauth_password",
         "actions_oauth_token_secret",
     ] {
-        secrets
-            .entry(key.to_string())
-            .or_insert_with(random_secret);
+        secrets.entry(key.to_string()).or_insert_with(random_secret);
     }
 }
 
@@ -68,9 +70,10 @@ impl DataStore {
         let path = data_file_path()?;
         let existed_before = path.exists();
         let mut data = load_or_migrate()?;
+        let gateway_migrated = migrate_gateway_url_state(&mut data);
         let imported = import_legacy_profiles_if_empty(&mut data)?;
         let store = Self { data };
-        if !existed_before || imported > 0 {
+        if !existed_before || imported > 0 || gateway_migrated {
             store.persist_unlocked()?;
         }
         if !existed_before {
@@ -81,13 +84,17 @@ impl DataStore {
 
     pub fn read_file<R>(f: impl FnOnce(&AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
-        let data = load_or_migrate()?;
+        let mut data = load_or_migrate()?;
+        if migrate_gateway_url_state(&mut data) {
+            save(&data)?;
+        }
         f(&data)
     }
 
     pub fn update_file<R>(f: impl FnOnce(&mut AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
         let mut data = load_or_migrate()?;
+        migrate_gateway_url_state(&mut data);
         let result = f(&mut data)?;
         save(&data)?;
         Ok(result)
@@ -201,7 +208,11 @@ impl DataStore {
         self.save()
     }
 
-    pub fn regenerate_workspace_secret(&mut self, profile_id: &str, key: &str) -> AppResult<String> {
+    pub fn regenerate_workspace_secret(
+        &mut self,
+        profile_id: &str,
+        key: &str,
+    ) -> AppResult<String> {
         let value = shared_value_for_key(key);
         self.set_workspace_secret(profile_id, key, &value)?;
         Ok(value)
@@ -256,7 +267,6 @@ impl DataStore {
         }
         self.save()
     }
-
 }
 
 fn lock_data_file() -> AppResult<DataFileGuard> {
@@ -264,9 +274,9 @@ fn lock_data_file() -> AppResult<DataFileGuard> {
         .lock()
         .map_err(|_| AppError::Message("data file lock poisoned".into()))?;
     let data_path = data_file_path()?;
-    let parent = data_path.parent().ok_or_else(|| {
-        AppError::Message(format!("配置路径缺少父目录：{}", data_path.display()))
-    })?;
+    let parent = data_path
+        .parent()
+        .ok_or_else(|| AppError::Message(format!("配置路径缺少父目录：{}", data_path.display())))?;
     std::fs::create_dir_all(parent)?;
     let lock_path = parent.join(".profiles.lock");
     let mut options = OpenOptions::new();

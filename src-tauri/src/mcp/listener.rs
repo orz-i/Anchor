@@ -93,7 +93,9 @@ pub fn spawn_listener(
 ) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
     let workspace_display = workspace_path.display().to_string();
     let proxy_specs = parse_mcp_proxy_config(&runtime.mcp_config, &workspace_path)?;
-    let workspace = Workspace::new(workspace_path).map_err(|e| e.message())?;
+    let workspace = Workspace::new(workspace_path)
+        .map_err(|e| e.message())?
+        .with_strict_read_boundary(runtime.strict_workspace_reads);
     let policy = PolicySettings::from_runtime(&runtime);
     let mcp = new_state(
         workspace,

@@ -616,7 +616,10 @@ pub fn authorize_post(
             .into_response();
     }
     if oauth.enroll_redirect_uri(&form.redirect_uri).is_err() {
-        return html_error("redirect_uri auto-enrollment failed", StatusCode::BAD_REQUEST);
+        return html_error(
+            "redirect_uri auto-enrollment failed",
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     let issuer_url = issuer_url.trim_end_matches('/').to_string();
@@ -1056,6 +1059,11 @@ mod tests {
         let access_token = issued["access_token"].as_str().expect("access token");
         let refresh_token = issued["refresh_token"].as_str().expect("refresh token");
         assert!(oauth.verify_access_token(access_token, "https://lb.example.com", resource_url));
+        assert!(!oauth.verify_access_token(
+            access_token,
+            "https://lb.example.com/w/workspace-b",
+            "https://lb.example.com/w/workspace-b/mcp"
+        ));
         assert!(!oauth.verify_access_token(refresh_token, "https://lb.example.com", resource_url));
 
         let refreshed_response = token_exchange(
@@ -1171,9 +1179,7 @@ mod tests {
             "token-signing-secret".into(),
         );
         assert_eq!(
-            oauth.redirect_uri_status_label(
-                "https://chatgpt.com/connector/oauth/callback-123"
-            ),
+            oauth.redirect_uri_status_label("https://chatgpt.com/connector/oauth/callback-123"),
             "auto_enrollment_allowed"
         );
         assert_eq!(
@@ -1254,9 +1260,7 @@ mod tests {
             )
             .expect("hot policy update");
         assert!(oauth.redirect_uri_allowed(redirect_uri));
-        assert!(oauth.redirect_uri_allowed(
-            "https://chatgpt.com/connector/oauth/static"
-        ));
+        assert!(oauth.redirect_uri_allowed("https://chatgpt.com/connector/oauth/static"));
 
         let token = token_exchange(
             &oauth,

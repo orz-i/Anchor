@@ -14,9 +14,7 @@ use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::mcp::gateway;
 use crate::platform::platform;
-use crate::runtime::{
-    await_listener_shutdown, update_public_url, RuntimeSupervisor, ServiceKind,
-};
+use crate::runtime::{await_listener_shutdown, update_public_url, RuntimeSupervisor, ServiceKind};
 use crate::settings::McpGatewayConfig;
 use crate::tunnel::{
     ensure_for_runtime, is_quick_tunnel_url_change_error, log_dir_for_profile,
@@ -93,7 +91,8 @@ fn show_gateway(as_json: bool) -> AppResult<()> {
 fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResult<()> {
     let mut store = DataStore::load()?;
     let mut settings = store.settings();
-    let mut config = settings.mcp_gateway.clone();
+    let previous = settings.mcp_gateway.clone();
+    let mut config = previous.clone();
     if let Some(enabled) = options.enabled {
         config.enabled = enabled;
     }
@@ -105,6 +104,14 @@ fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResu
     }
     if let Some(public_url) = options.public_url {
         config.public_url = public_url.trim().trim_end_matches('/').to_string();
+    }
+    config.url_model_version = 2;
+    if previous.identity_changed(&config) {
+        config.clear_observation();
+    } else {
+        config.observed_public_url = previous.observed_public_url;
+        config.observed_owner_workspace_id = previous.observed_owner_workspace_id;
+        config.observed_tunnel_signature = previous.observed_tunnel_signature;
     }
     gateway::validate_config(&config, store.list())?;
     settings.mcp_gateway = config.clone();
@@ -124,8 +131,7 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
     let mut config = store.settings().mcp_gateway;
     if !config.enabled {
         return Err(AppError::Message(
-            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --owner WORKSPACE"
-                .into(),
+            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --owner WORKSPACE".into(),
         ));
     }
     gateway::validate_config(&config, &all_profiles)?;
@@ -153,22 +159,27 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
         let active = runtime.active_mcp_workspace_ids();
         gateway::ensure(&config, &all_profiles, &active).await?;
         if let Some(url) = reconcile_mcp_gateway(&config, &all_profiles, &active).await? {
-            persist_cli_gateway_url(&url)?;
-            config.public_url = url;
+            persist_cli_gateway_observation(&mut config, &all_profiles, &url)?;
         }
         Ok::<(), AppError>(())
     }
     .await;
     if let Err(error) = startup {
-        shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await;
-        return Err(error);
+        let cleanup =
+            shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await;
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(AppError::Message(format!(
+                "Gateway 启动失败：{error}；清理已启动服务也失败：{cleanup_error}"
+            ))),
+        };
     }
 
     if as_json {
         print_json(&json!({
             "event": "gateway_ready",
             "localEndpoint": format!("http://127.0.0.1:{}", config.local_port),
-            "publicBaseUrl": config.public_url,
+            "publicBaseUrl": config.effective_public_url(),
             "routes": selected.iter().map(|profile| json!({
                 "workspaceId": profile.id,
                 "workspaceName": profile.name,
@@ -235,16 +246,16 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
                 match reconcile_mcp_gateway(&config, &all_profiles, &active).await {
                     Ok(Some(url)) => {
                         let recovered_attempts = gateway_tunnel_retry.take().map(|retry| retry.attempts);
-                        if url != config.public_url {
-                            persist_cli_gateway_url(&url)?;
-                            config.public_url = url;
+                        gateway::clear_runtime_error().await;
+                        if url != config.observed_public_url {
+                            persist_cli_gateway_observation(&mut config, &all_profiles, &url)?;
                         }
                         if let Some(attempts) = recovered_attempts {
                             if as_json {
                                 print_json_line(&json!({
                                     "event": "gateway_tunnel_reconnected",
                                     "attempts": attempts,
-                                    "publicBaseUrl": config.public_url
+                                    "publicBaseUrl": config.effective_public_url()
                                 }))?;
                             } else {
                                 println!("Gateway 隧道已在第 {attempts} 次重试后恢复。");
@@ -253,12 +264,15 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
                     }
                     Ok(None) => {
                         gateway_tunnel_retry = None;
+                        gateway::clear_runtime_error().await;
                     }
                     Err(error) if is_quick_tunnel_url_change_error(&error) => {
+                        gateway::record_runtime_error(format!("Gateway 隧道维护失败：{error}")).await;
                         terminal_error = Some(error);
                         break;
                     }
                     Err(error) => {
+                        gateway::record_runtime_error(format!("Gateway 隧道维护失败：{error}")).await;
                         let attempts = gateway_tunnel_retry
                             .map(|retry| retry.attempts.saturating_add(1))
                             .unwrap_or(1);
@@ -287,7 +301,7 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
         }
     }
 
-    shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await;
+    shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await?;
     if as_json {
         print_json(&json!({ "event": "gateway_stopped" }))?;
     }
@@ -313,18 +327,41 @@ fn ensure_gateway_ports_available(
     Ok(())
 }
 
-fn persist_cli_gateway_url(url: &str) -> AppResult<()> {
+fn persist_cli_gateway_observation(
+    config: &mut McpGatewayConfig,
+    profiles: &[WorkspaceProfile],
+    url: &str,
+) -> AppResult<()> {
     let normalized = url.trim().trim_end_matches('/');
     if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
         return Ok(());
     }
+    let owner = profiles
+        .iter()
+        .find(|profile| profile.id == config.owner_workspace_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
+    let signature = gateway::tunnel_identity_signature(config, owner)?;
+    config.url_model_version = 2;
+    config.observed_public_url = normalized.to_string();
+    config.observed_owner_workspace_id = config.owner_workspace_id.clone();
+    config.observed_tunnel_signature = signature.clone();
+    gateway::validate_config(config, profiles)?;
     let mut store = DataStore::load()?;
     let mut settings = store.settings();
-    if settings.mcp_gateway.public_url != normalized {
-        settings.mcp_gateway.public_url = normalized.to_string();
-        store.update_settings(settings)?;
+    if settings.mcp_gateway.identity_changed(config) {
+        return Ok(());
     }
-    Ok(())
+    if settings.mcp_gateway.observed_public_url == normalized
+        && settings.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
+        && settings.mcp_gateway.observed_tunnel_signature == signature
+    {
+        return Ok(());
+    }
+    settings.mcp_gateway.url_model_version = 2;
+    settings.mcp_gateway.observed_public_url = normalized.to_string();
+    settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
+    settings.mcp_gateway.observed_tunnel_signature = signature;
+    store.update_settings(settings)
 }
 
 async fn shutdown_gateway_services(
@@ -332,18 +369,20 @@ async fn shutdown_gateway_services(
     profiles: &[WorkspaceProfile],
     config: &McpGatewayConfig,
     all_profiles: &[WorkspaceProfile],
-) {
+) -> AppResult<()> {
     for profile in profiles.iter().rev() {
         let handle = runtime.begin_stop(&profile.id, ServiceKind::Mcp);
         await_listener_shutdown(handle, profile.runtime.local_port).await;
         runtime.finish_stop(&profile.id, ServiceKind::Mcp);
     }
     let active = runtime.active_mcp_workspace_ids();
-    let _ = reconcile_mcp_gateway(config, all_profiles, &active).await;
-    gateway::stop().await;
+    let tunnel_result = reconcile_mcp_gateway(config, all_profiles, &active).await;
+    let gateway_result = gateway::stop().await;
     for profile in profiles {
         update_public_url(&profile.id, "mcp", "");
     }
+    tunnel_result?;
+    gateway_result
 }
 
 async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {

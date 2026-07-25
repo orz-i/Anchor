@@ -16,13 +16,13 @@ use crate::mcp::gateway::{self, McpGatewayStatus};
 use crate::platform::platform;
 
 use crate::tunnel::{
-    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime,
-    sync_managed_runtime_routes, TunnelServiceKind,
+    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime, sync_managed_runtime_routes,
+    TunnelServiceKind,
 };
 
+use crate::settings::{AppSettings, McpGatewayConfig};
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
 use crate::workspace::RuntimeStatusDto;
-use crate::settings::{AppSettings, McpGatewayConfig};
 
 fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::WorkspaceProfile> {
     state.with_workspaces(|store| {
@@ -33,17 +33,49 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
     })
 }
 
+async fn rollback_started_mcp_runtime(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+) -> AppResult<()> {
+    let handle =
+        state.with_runtime(|runtime| Ok(runtime.begin_stop(&profile.id, ServiceKind::Mcp)))?;
+    await_listener_shutdown(handle, profile.runtime.local_port).await;
+    state.with_runtime(|runtime| {
+        runtime.finish_stop(&profile.id, ServiceKind::Mcp);
+        Ok(())
+    })?;
+    sync_tunnel_routes_from_runtime(state).await
+}
+
 #[tauri::command]
 pub fn get_mcp_gateway(state: State<'_, AppState>) -> AppResult<McpGatewayConfig> {
     state.with_settings(|store| Ok(store.settings().mcp_gateway))
 }
 
 #[tauri::command]
-pub async fn get_mcp_gateway_status(
-    state: State<'_, AppState>,
-) -> AppResult<McpGatewayStatus> {
+pub async fn get_mcp_gateway_status(state: State<'_, AppState>) -> AppResult<McpGatewayStatus> {
     let config = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
     Ok(gateway::status(&config).await)
+}
+
+fn restart_active_mcp_listeners(
+    state: &AppState,
+    profiles: &[crate::workspace::WorkspaceProfile],
+    active: &std::collections::HashSet<String>,
+) -> AppResult<()> {
+    for profile in profiles
+        .iter()
+        .filter(|profile| active.contains(&profile.id))
+    {
+        let status = state.with_runtime(|runtime| runtime.restart_mcp(profile))?;
+        if status.state != "running" {
+            return Err(AppError::Message(format!(
+                "重启工作区“{}”的 MCP listener 后状态为 {}：{}",
+                profile.name, status.state, status.local_message
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -51,35 +83,55 @@ pub async fn set_mcp_gateway(
     state: State<'_, AppState>,
     mut config: McpGatewayConfig,
 ) -> AppResult<McpGatewayStatus> {
+    config.url_model_version = 2;
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
-    gateway::validate_config(&config, &profiles)?;
+    let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
     let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
+    let listener_policy_changed = previous.enabled != config.enabled;
+    if previous.identity_changed(&config) {
+        config.clear_observation();
+    } else {
+        config.observed_public_url = previous.observed_public_url.clone();
+        config.observed_owner_workspace_id = previous.observed_owner_workspace_id.clone();
+        config.observed_tunnel_signature = previous.observed_tunnel_signature.clone();
+    }
+    gateway::validate_config(&config, &profiles)?;
     state.with_settings(|store| {
         let mut settings = store.settings();
         settings.mcp_gateway = config.clone();
         store.update_settings(settings)
     })?;
 
-    let applied = if config.enabled {
-        reconcile_gateway_state(&state).await
-    } else {
-        match restore_direct_mcp_exposure(&state).await {
-            Ok(()) => Ok(gateway::status(&config).await),
-            Err(error) => Err(error),
+    let applied = async {
+        if listener_policy_changed {
+            restart_active_mcp_listeners(&state, &profiles, &active)?;
         }
-    };
+        if config.enabled {
+            reconcile_gateway_state(&state).await
+        } else {
+            restore_direct_mcp_exposure(&state).await?;
+            Ok(gateway::status(&config).await)
+        }
+    }
+    .await;
     if let Err(error) = applied {
         state.with_settings(|store| {
             let mut settings = store.settings();
             settings.mcp_gateway = previous.clone();
             store.update_settings(settings)
         })?;
-        let rollback = if previous.enabled {
-            reconcile_gateway_state(&state).await.map(|_| ())
-        } else {
-            restore_direct_mcp_exposure(&state).await
-        };
+        let rollback = async {
+            if listener_policy_changed {
+                restart_active_mcp_listeners(&state, &profiles, &active)?;
+            }
+            if previous.enabled {
+                reconcile_gateway_state(&state).await.map(|_| ())
+            } else {
+                restore_direct_mcp_exposure(&state).await
+            }
+        }
+        .await;
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(AppError::Message(format!(
@@ -92,26 +144,53 @@ pub async fn set_mcp_gateway(
 
 fn gateway_context(
     state: &AppState,
-) -> AppResult<(AppSettings, Vec<crate::workspace::WorkspaceProfile>, std::collections::HashSet<String>)>
-{
-    let (settings, profiles) = state.with_settings(|store| {
-        Ok((store.settings(), store.list().to_vec()))
-    })?;
+) -> AppResult<(
+    AppSettings,
+    Vec<crate::workspace::WorkspaceProfile>,
+    std::collections::HashSet<String>,
+)> {
+    let (settings, profiles) =
+        state.with_settings(|store| Ok((store.settings(), store.list().to_vec())))?;
     let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
     Ok((settings, profiles, active))
 }
 
-fn persist_gateway_public_url(state: &AppState, url: &str) -> AppResult<()> {
+fn persist_gateway_observation(
+    state: &AppState,
+    config: &McpGatewayConfig,
+    profiles: &[crate::workspace::WorkspaceProfile],
+    url: &str,
+) -> AppResult<()> {
     let normalized = url.trim().trim_end_matches('/');
     if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
         return Ok(());
     }
+    let owner = profiles
+        .iter()
+        .find(|profile| profile.id == config.owner_workspace_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
+    let signature = gateway::tunnel_identity_signature(config, owner)?;
+    let mut candidate = config.clone();
+    candidate.url_model_version = 2;
+    candidate.observed_public_url = normalized.to_string();
+    candidate.observed_owner_workspace_id = config.owner_workspace_id.clone();
+    candidate.observed_tunnel_signature = signature.clone();
+    gateway::validate_config(&candidate, profiles)?;
     state.with_settings(|store| {
         let mut settings = store.settings();
-        if settings.mcp_gateway.public_url == normalized {
+        if settings.mcp_gateway.identity_changed(config) {
             return Ok(());
         }
-        settings.mcp_gateway.public_url = normalized.to_string();
+        if settings.mcp_gateway.observed_public_url == normalized
+            && settings.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
+            && settings.mcp_gateway.observed_tunnel_signature == signature
+        {
+            return Ok(());
+        }
+        settings.mcp_gateway.url_model_version = 2;
+        settings.mcp_gateway.observed_public_url = normalized.to_string();
+        settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
+        settings.mcp_gateway.observed_tunnel_signature = signature;
         store.update_settings(settings)
     })
 }
@@ -121,15 +200,16 @@ async fn reconcile_gateway_state(state: &AppState) -> AppResult<McpGatewayStatus
     let mut status = gateway::ensure(&settings.mcp_gateway, &profiles, &active).await?;
     let public_url = reconcile_mcp_gateway(&settings.mcp_gateway, &profiles, &active).await?;
     if let Some(public_url) = public_url {
-        persist_gateway_public_url(state, &public_url)?;
+        persist_gateway_observation(state, &settings.mcp_gateway, &profiles, &public_url)?;
         status.public_base_url = public_url;
     }
+    gateway::clear_runtime_error().await;
     Ok(status)
 }
 
 async fn restore_direct_mcp_exposure(state: &AppState) -> AppResult<()> {
     let (settings, profiles, active) = gateway_context(state)?;
-    gateway::stop().await;
+    gateway::stop().await?;
     reconcile_mcp_gateway(&settings.mcp_gateway, &profiles, &active).await?;
     for profile in profiles
         .iter()
@@ -231,7 +311,15 @@ pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<
     let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
     if gateway_enabled {
         if let Err(error) = reconcile_gateway_state(&state).await {
-            eprintln!("mcp gateway auto-start failed for {id}: {error}");
+            let rollback = rollback_started_mcp_runtime(&state, &profile).await;
+            return match rollback {
+                Ok(()) => Err(AppError::Message(format!(
+                    "MCP Gateway 启动失败，已回滚工作区 listener：{error}"
+                ))),
+                Err(rollback_error) => Err(AppError::Message(format!(
+                    "MCP Gateway 启动失败：{error}；回滚工作区 listener 也失败：{rollback_error}"
+                ))),
+            };
         }
     } else {
         match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
