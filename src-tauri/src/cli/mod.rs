@@ -15,8 +15,8 @@ use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::runtime::{await_listener_shutdown, RuntimeSupervisor, ServiceKind};
 use crate::tunnel::{
-    ensure_for_runtime, log_dir_for_profile, maybe_start_for_runtime, stop_for_runtime,
-    TunnelServiceKind,
+    ensure_for_runtime, is_quick_tunnel_url_change_error, log_dir_for_profile,
+    maybe_start_for_runtime, stop_for_runtime, TunnelServiceKind,
 };
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
@@ -172,11 +172,7 @@ async fn show_logs(options: LogsOptions, as_json: bool) -> AppResult<()> {
     follow_logs(files, options.lines, as_json).await
 }
 
-async fn follow_logs(
-    files: Vec<(String, PathBuf)>,
-    lines: usize,
-    as_json: bool,
-) -> AppResult<()> {
+async fn follow_logs(files: Vec<(String, PathBuf)>, lines: usize, as_json: bool) -> AppResult<()> {
     let mut offsets = std::collections::HashMap::new();
     for (name, path) in &files {
         if path.exists() {
@@ -261,14 +257,8 @@ fn selected_log_files(
         if profile.actions.tunnel_type == "frp" {
             files.push(("actions-frp".into(), log_dir.join("frpc-actions.log")));
         }
-        files.push((
-            "actions-stdout".into(),
-            log_dir.join("actions-stdout.log"),
-        ));
-        files.push((
-            "actions-stderr".into(),
-            log_dir.join("actions-stderr.log"),
-        ));
+        files.push(("actions-stdout".into(), log_dir.join("actions-stdout.log")));
+        files.push(("actions-stderr".into(), log_dir.join("actions-stderr.log")));
     }
     files
 }
@@ -302,7 +292,9 @@ fn read_log_since(path: &Path, offset: u64) -> AppResult<(u64, String)> {
 }
 
 fn fs_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|value| value.len()).unwrap_or(0)
+    std::fs::metadata(path)
+        .map(|value| value.len())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Serialize)]
@@ -407,12 +399,7 @@ fn append_tunnel_doctor_checks(profile: &WorkspaceProfile, checks: &mut Vec<Doct
                 crate::tunnel::resolve_cloudflared().map(|path| path.display().to_string())
             }
             _ => {
-                checks.push(doctor_check(
-                    label,
-                    true,
-                    "未配置隧道".into(),
-                    "",
-                ));
+                checks.push(doctor_check(label, true, "未配置隧道".into(), ""));
                 continue;
             }
         };
@@ -451,11 +438,7 @@ async fn restart_daemon(mut options: RunOptions, as_json: bool) -> AppResult<()>
     start_daemon(options, as_json).await
 }
 
-async fn run_daemon(
-    selector: &str,
-    service: ServiceSelection,
-    tunnel: bool,
-) -> AppResult<()> {
+async fn run_daemon(selector: &str, service: ServiceSelection, tunnel: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
     let _guard = daemon::acquire(&profile, service, tunnel)?;
@@ -499,11 +482,17 @@ fn print_daemon_result(
             "log_path": daemon::daemon_log_path(&profile.id)
         }))?;
     } else {
-        let pid = pid.map(|value| value.to_string()).unwrap_or_else(|| "-".into());
+        let pid = pid
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into());
         println!(
             "workspace {} daemon {}：PID {pid}，service={}，tunnel={tunnel}",
             profile.name,
-            if event == "started" { "已启动" } else { "已在运行" },
+            if event == "started" {
+                "已启动"
+            } else {
+                "已在运行"
+            },
             service.as_str()
         );
         println!("日志：{}", daemon::daemon_log_path(&profile.id).display());
@@ -955,6 +944,11 @@ async fn serve_workspace(
                             }
                         }
                         Err(error) => {
+                            if is_quick_tunnel_url_change_error(&error) {
+                                tunnel_retries.remove(&kind);
+                                terminal_error = Some(error);
+                                break;
+                            }
                             let attempts = tunnel_retries
                                 .get(&kind)
                                 .map(|retry| retry.attempts.saturating_add(1))
@@ -1144,14 +1138,12 @@ fn print_json_line(value: &impl Serialize) -> AppResult<()> {
 async fn wait_for_shutdown_signal() -> AppResult<()> {
     #[cfg(unix)]
     {
-        let mut terminate = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .map_err(|error| AppError::Message(format!("无法监听 SIGTERM：{error}")))?;
-        let mut interrupt = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt(),
-        )
-        .map_err(|error| AppError::Message(format!("无法监听 SIGINT：{error}")))?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| AppError::Message(format!("无法监听 SIGTERM：{error}")))?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|error| AppError::Message(format!("无法监听 SIGINT：{error}")))?;
         tokio::select! {
             _ = terminate.recv() => Ok(()),
             _ = interrupt.recv() => Ok(()),

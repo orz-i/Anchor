@@ -331,9 +331,7 @@ impl ServiceSelection {
             "mcp" => Ok(Self::Mcp),
             "actions" => Ok(Self::Actions),
             "all" => Ok(Self::All),
-            _ => Err(format!(
-                "无效服务类型：{value}；可选值为 mcp、actions、all"
-            )),
+            _ => Err(format!("无效服务类型：{value}；可选值为 mcp、actions、all")),
         }
     }
 }
@@ -369,15 +367,6 @@ pub enum LogSelection {
 }
 
 impl LogSelection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Daemon => "daemon",
-            Self::Mcp => "mcp",
-            Self::Actions => "actions",
-            Self::All => "all",
-        }
-    }
-
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "daemon" => Ok(Self::Daemon),
@@ -643,8 +632,14 @@ mod tests {
             })
         );
 
-        let stop = parse(strings(&["stop", "workspace-a", "--timeout", "15", "--force"]))
-            .expect("stop parse");
+        let stop = parse(strings(&[
+            "stop",
+            "workspace-a",
+            "--timeout",
+            "15",
+            "--force",
+        ]))
+        .expect("stop parse");
         assert_eq!(
             stop.command,
             Command::Stop(StopOptions {
@@ -709,8 +704,7 @@ mod tests {
 
     #[test]
     fn unregister_requires_explicit_force_at_execution_not_parse_time() {
-        let parsed = parse(strings(&["workspace", "delete", "project"]))
-            .expect("delete parse");
+        let parsed = parse(strings(&["workspace", "delete", "project"])).expect("delete parse");
         assert_eq!(
             parsed.command,
             Command::Workspace(WorkspaceCommand::Unregister(UnregisterOptions {

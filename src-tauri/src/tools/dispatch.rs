@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::tools::context::ToolContext;
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
 use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
-use crate::tools::{exec, file, git, history, image_tool, patch, session};
+use crate::tools::{exec, file, git, history, image_tool, patch, session, CancellationToken};
 
 fn policy_tool_err(err: PolicyError) -> Value {
     let dangerous = err
@@ -49,10 +49,129 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn skill_script_confirmation_error(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+) -> Option<WorkspaceError> {
+    if name != "exec_command" {
+        return None;
+    }
+    let command = args.get("cmd").and_then(Value::as_str)?;
+    let workdir = args.get("workdir").and_then(Value::as_str).unwrap_or(".");
+    let workdir = ctx
+        .workspace
+        .resolve_existing(workdir)
+        .ok()
+        .filter(|resolved| resolved.path.is_dir())
+        .map(|resolved| resolved.path)
+        .unwrap_or_else(|| ctx.workspace.root().to_path_buf());
+    let script = ctx.skills.match_script_command(command, &workdir)?;
+    if !script.reviewable {
+        return Some(WorkspaceError::ToolDetails {
+            code: "SKILL_SCRIPT_UNREVIEWABLE",
+            message: format!(
+                "Skill {} 的脚本 {} 过大或无法生成完整快照摘要，禁止执行",
+                script.skill, script.path
+            ),
+            category: "security",
+            retryable: false,
+            details: json!({
+                "stage": "skill_script_policy",
+                "reason": "script_not_reviewable",
+                "skill": script.skill,
+                "script": script.path,
+                "snapshot_digest": script.snapshot_digest,
+                "suggestion": "Reduce the script below the Skill resource limit and restart the MCP listener"
+            }),
+        });
+    }
+    if script.stale {
+        return Some(WorkspaceError::ToolDetails {
+            code: "SKILL_SCRIPT_SNAPSHOT_STALE",
+            message: format!(
+                "Skill {} 的脚本 {} 在目录快照建立后已变化；请重启 MCP listener 后重新审查",
+                script.skill, script.path
+            ),
+            category: "security",
+            retryable: false,
+            details: json!({
+                "stage": "skill_script_policy",
+                "reason": "snapshot_digest_mismatch",
+                "skill": script.skill,
+                "script": script.path,
+                "snapshot_digest": script.snapshot_digest,
+                "current_digest": script.current_digest,
+                "suggestion": "Restart the MCP listener to rebuild the Skill snapshot, then review the script again"
+            }),
+        });
+    }
+    if args.get("confirm").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(WorkspaceError::ToolDetails {
+        code: "SKILL_SCRIPT_CONFIRMATION_REQUIRED",
+        message: format!(
+            "执行 Skill {} 的脚本 {} 需要 confirm=true",
+            script.skill, script.path
+        ),
+        category: "permission",
+        retryable: false,
+        details: json!({
+            "stage": "skill_script_policy",
+            "reason": "explicit_confirmation_required",
+            "skill": script.skill,
+            "script": script.path,
+            "digest": script.snapshot_digest,
+            "dedicated_skill_execution": false,
+            "suggestion": "Review the script source and digest, then retry exec_command with confirm=true"
+        }),
+    })
+}
+
 /// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
+    call_tool_impl(ctx, name, args, &CancellationToken::default(), true)
+}
+
+pub fn call_tool_with_cancellation(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Value {
+    call_tool_impl(ctx, name, args, cancellation, true)
+}
+
+pub(crate) fn call_tool_prevalidated_with_cancellation(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Value {
+    call_tool_impl(ctx, name, args, cancellation, false)
+}
+
+fn call_tool_impl(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    cancellation: &CancellationToken,
+    validate_schema: bool,
+) -> Value {
+    if cancellation.is_cancelled() {
+        return cancelled_tool_result();
+    }
+    if validate_schema {
+        if let Err(error) = crate::tools::schema::validate_tool_input(name, args) {
+            return tool_err(error);
+        }
+    }
     let effective_args = apply_default_cwd(ctx, name, args);
+    if let Some(error) = skill_script_confirmation_error(ctx, name, &effective_args) {
+        return tool_err(error);
+    }
     if let Err(e) = validate_tool_arguments_for_workspace(
         name,
         &effective_args,
@@ -115,11 +234,9 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
         "history_session_validate" => history::validate(ctx, &effective_args),
         "server_info" => server_info(ctx),
-        "list_skills" => crate::skills::list_tool(&ctx.skills, &effective_args),
-        "load_skill" => crate::skills::load_tool(&ctx.skills, &effective_args),
-        "read_skill_resource" => {
-            crate::skills::read_resource_tool(&ctx.skills, &effective_args)
-        }
+        "list_skills" => crate::skills::list_tool(ctx, &effective_args),
+        "load_skill" => crate::skills::load_tool(ctx, &effective_args),
+        "read_skill_resource" => crate::skills::read_resource_tool(&ctx.skills, &effective_args),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),
         "get_default_cwd" => get_default_cwd(ctx),
@@ -130,7 +247,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "search_text" | "grep_text" | "grep" => file::search_text(ws, &effective_args),
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
-        "exec_command" => exec::exec_command(ctx, &effective_args),
+        "exec_command" => exec::exec_command_with_cancellation(ctx, &effective_args, cancellation),
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
         "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
@@ -185,6 +302,9 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         Ok(v) => v,
         Err(e) => tool_err(e),
     };
+    if cancellation.is_cancelled() && output.get("ok").and_then(Value::as_bool) != Some(false) {
+        output = cancelled_tool_result();
+    }
     if task_id.is_none()
         && standalone_operation(name)
         && output.get("ok") == Some(&Value::Bool(true))
@@ -231,6 +351,19 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         );
     }
     output
+}
+
+fn cancelled_tool_result() -> Value {
+    tool_err(WorkspaceError::ToolDetails {
+        code: "REQUEST_CANCELLED",
+        message: "The MCP request was cancelled.".into(),
+        category: "runtime",
+        retryable: true,
+        details: json!({
+            "reason": "request_cancelled",
+            "termination_reason": "cancelled"
+        }),
+    })
 }
 
 fn apply_default_cwd(ctx: &ToolContext, name: &str, args: &Value) -> Value {
@@ -392,7 +525,7 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "server": "coding-tools-mcp",
         "title": "Coding Tools MCP",
         "version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": "2025-06-18",
+        "protocol_version": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
         "default_cwd": ctx.default_cwd_display(),
@@ -409,9 +542,7 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
 pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     let boundary_error = ctx.workspace.ensure_child_process_boundary().err();
     let workspace_exec_available = boundary_error.is_none();
-    let mut warnings = vec![
-        "Workspace 子进程尚未启用操作系统级文件系统沙箱".to_string(),
-    ];
+    let mut warnings = vec!["Workspace 子进程尚未启用操作系统级文件系统沙箱".to_string()];
     if let Some(error) = &boundary_error {
         warnings.push(error.message());
     }

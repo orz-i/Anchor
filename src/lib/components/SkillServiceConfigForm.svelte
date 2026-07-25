@@ -111,7 +111,8 @@
   <p class="text-xs leading-5 text-[var(--color-text-muted)]">
     相对路径以当前 workspace 为基准，支持 <code class="font-mono">~/</code>。根目录可以直接是一个
     Skill，也可以包含两层以内的 Skill 子目录；每个 Skill 必须包含合法的
-    <code class="font-mono">SKILL.md</code>。脚本源码可读取，但不会执行。
+    <code class="font-mono">SKILL.md</code>。没有专用脚本执行器；通过
+    <code class="font-mono">exec_command</code> 引用 Skill 脚本时必须显式确认，且脚本摘要必须与目录快照一致。
   </p>
 
   {#if error}
@@ -125,7 +126,7 @@
           {inspection.enabled ? `发现 ${inspection.skills.length} 个 Skill` : "Skill 服务已关闭"}
         </p>
         <span class="text-xs text-[var(--color-text-muted)]">
-          脚本执行：{inspection.scriptExecutionEnabled ? "已启用" : "已禁用"}
+          脚本策略：{inspection.scriptExecutionPolicy}
         </span>
       </div>
 
@@ -140,11 +141,20 @@
                 </span>
               </div>
               <p class="mt-1 text-xs leading-5 text-[var(--color-text-secondary)]">{skill.description}</p>
+              <p class="mt-1 text-[11px] text-[var(--color-text-muted)]">
+                来源：{skill.sourceId}/{skill.relativePath} · 包摘要：{skill.digest.slice(0, 22)}…
+              </p>
               <p class="mt-1 truncate font-mono text-[10px] text-[var(--color-text-muted)]">{skill.uri}</p>
+              {#if skill.resourceTruncated}
+                <p class="mt-1 text-xs text-[var(--color-warning)]">资源清单已达到单 Skill 上限。</p>
+              {/if}
             </div>
           {/each}
         </div>
       {/if}
+      <p class="border-t border-[var(--color-border)] pt-2 font-mono text-[10px] text-[var(--color-text-muted)]">
+        snapshot={inspection.snapshotMode} · catalog={inspection.catalogDigest.slice(0, 26)}…
+      </p>
 
       {#if inspection.warnings.length}
         <div class="grid gap-1 border-t border-[var(--color-border)] pt-2">

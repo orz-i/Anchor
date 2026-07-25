@@ -2,32 +2,43 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Form, Query, State};
+use crate::auth::{
+    authorization_server_metadata, authorize_get, authorize_post, external_base_url,
+    protected_resource_metadata, request_origin_allowed, token_exchange, verify_bearer_header,
+    verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+};
+use crate::mcp::protocol::{
+    negotiate_protocol_version, protocol_version_supported, requested_protocol_version,
+    validate_client_message, ClientMessage, InFlightRequests, RateLimiter, SessionStore,
+};
+use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
+use crate::mcp::server::{handle_request_with_protocol_and_cancellation, new_state, SharedState};
+use crate::runtime::{read_public_url, register_public_url, SharedPublicUrl};
+use crate::secret::SecretStore;
+use crate::tools::policy::PolicySettings;
+use crate::tools::Workspace;
+use crate::tunnel::append_profile_log;
+use crate::workspace::{AuthConfig, RuntimeConfig};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{
-    header::{ALLOW, CACHE_CONTROL},
+    header::{ACCEPT, ALLOW, CACHE_CONTROL},
     HeaderMap, HeaderValue, StatusCode,
 };
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
-use crate::auth::{
-    authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, request_origin_allowed, token_exchange, verify_bearer_header,
-    verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
-};
-use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
-use crate::mcp::server::{handle_request, new_state, SharedState};
-use crate::secret::SecretStore;
-use crate::tools::Workspace;
-use crate::tunnel::append_profile_log;
-use crate::tools::policy::PolicySettings;
-use crate::workspace::{AuthConfig, RuntimeConfig};
+use tokio::sync::{oneshot, Semaphore};
 
 pub type ShutdownSender = oneshot::Sender<()>;
 
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const MCP_MAX_BODY_BYTES: usize = 1_048_576;
+const OAUTH_MAX_BODY_BYTES: usize = 8_192;
+const MCP_MAX_CONCURRENT_REQUESTS: usize = 16;
+const MCP_MAX_REQUESTS_PER_MINUTE: usize = 240;
+const OAUTH_MAX_REQUESTS_PER_MINUTE: usize = 30;
 
 #[derive(Clone)]
 struct ListenerState {
@@ -36,11 +47,35 @@ struct ListenerState {
     workspace_id: String,
     workspace_path: String,
     bind_port: u16,
-    configured_public_url: String,
+    configured_public_url: SharedPublicUrl,
     bearer_token: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     proxy_specs: Vec<McpProxyServerSpec>,
+    sessions: SessionStore,
+    mcp_rate_limiter: RateLimiter,
+    oauth_rate_limiter: RateLimiter,
+    concurrency: Arc<Semaphore>,
+    in_flight: InFlightRequests,
+}
+
+fn accepts_streamable_http(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(ACCEPT).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let accepted = value
+        .split(',')
+        .map(|item| {
+            item.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    accepted.iter().any(|item| item == "*/*")
+        || (accepted.iter().any(|item| item == "application/json")
+            && accepted.iter().any(|item| item == "text/event-stream"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66,10 +101,11 @@ pub fn spawn_listener(
         runtime.tool_profile.clone(),
         runtime.permission_mode.clone(),
     );
-    mcp.skills.configure(crate::skills::SkillSettings::from_text(
-        runtime.skill_service_enabled,
-        &runtime.skill_roots,
-    ));
+    mcp.skills
+        .configure(crate::skills::SkillSettings::from_text(
+            runtime.skill_service_enabled,
+            &runtime.skill_roots,
+        ));
     let bearer_token = if auth.bearer_enabled() {
         let key = "bearer_token";
         if auth.use_shared_secrets {
@@ -80,14 +116,37 @@ pub fn spawn_listener(
     } else {
         None
     };
-    let configured_public_url = public_base_url.trim().to_string();
+    if auth.bearer_enabled()
+        && bearer_token
+            .as_ref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("MCP Bearer token is not configured".into());
+    }
+
+    if auth.oauth_enabled() {
+        if auth.oauth_client_id.trim().is_empty() {
+            return Err("MCP OAuth client_id is not configured".into());
+        }
+        if oauth_password.as_ref().is_none_or(|value| value.is_empty()) {
+            return Err("MCP OAuth authorization password is not configured".into());
+        }
+        if oauth_token_secret
+            .as_ref()
+            .is_none_or(|value| value.is_empty())
+        {
+            return Err("MCP OAuth token signing secret is not configured".into());
+        }
+    }
+    let configured_public_url =
+        register_public_url(&workspace_id, "mcp", public_base_url.trim().to_string());
     let oauth = if auth.oauth_enabled() {
         let password = oauth_password.unwrap_or_default();
         let token_secret = oauth_token_secret.unwrap_or_default();
         let oauth_base = external_base_url(
             &HeaderMap::new(),
             port,
-            &configured_public_url,
+            &read_public_url(&configured_public_url),
         );
         Some(Arc::new(
             OAuthRuntime::new(
@@ -97,7 +156,8 @@ pub fn spawn_listener(
                 password,
                 token_secret,
             )
-            .with_redirect_uris(&auth.oauth_redirect_uris)?,
+            .with_redirect_uris(&auth.oauth_redirect_uris)?
+            .with_redirect_host_patterns(&auth.oauth_redirect_hosts)?,
         ))
     } else {
         None
@@ -113,6 +173,14 @@ pub fn spawn_listener(
         oauth,
         oauth_client_secret,
         proxy_specs,
+        sessions: SessionStore::default(),
+        mcp_rate_limiter: RateLimiter::new(MCP_MAX_REQUESTS_PER_MINUTE, Duration::from_secs(60)),
+        oauth_rate_limiter: RateLimiter::new(
+            OAUTH_MAX_REQUESTS_PER_MINUTE,
+            Duration::from_secs(60),
+        ),
+        concurrency: Arc::new(Semaphore::new(MCP_MAX_CONCURRENT_REQUESTS)),
+        in_flight: InFlightRequests::default(),
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
     let listener = bind_listener(port)?;
@@ -144,13 +212,19 @@ async fn serve(
     let proxy_registry = state.mcp.mcp_proxies.clone();
     let proxy_specs = state.proxy_specs.clone();
     let proxy_profile_id = profile_id.clone();
+    proxy_registry.begin_configuration();
     tokio::spawn(async move {
         proxy_registry
             .configure(proxy_specs, &proxy_profile_id)
             .await;
     });
-    let app = Router::new()
-        .route("/mcp", get(mcp_get_not_supported).post(mcp_post))
+    let mcp_routes = Router::new()
+        .route(
+            "/mcp",
+            get(mcp_get_not_supported).post(mcp_post).delete(mcp_delete),
+        )
+        .layer(DefaultBodyLimit::max(MCP_MAX_BODY_BYTES));
+    let oauth_routes = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server_metadata),
@@ -159,8 +233,15 @@ async fn serve(
             "/.well-known/oauth-protected-resource",
             get(oauth_protected_resource_metadata),
         )
-        .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize_get).post(oauth_authorize_post),
+        )
         .route("/oauth/token", post(oauth_token_post))
+        .layer(DefaultBodyLimit::max(OAUTH_MAX_BODY_BYTES));
+    let app = Router::new()
+        .merge(mcp_routes)
+        .merge(oauth_routes)
         .with_state(state);
 
     append_profile_log(
@@ -187,11 +268,8 @@ fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
         .map_err(|err| format!("MCP 本地监听器初始化失败: {err}"))
 }
 
-async fn mcp_get_not_supported(
-    State(state): State<ListenerState>,
-    headers: HeaderMap,
-) -> Response {
-    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+async fn mcp_get_not_supported(State(state): State<ListenerState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
     mcp_method_not_allowed_response()
@@ -201,7 +279,7 @@ fn mcp_method_not_allowed_response() -> Response {
     let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
     response
         .headers_mut()
-        .insert(ALLOW, HeaderValue::from_static("POST"));
+        .insert(ALLOW, HeaderValue::from_static("POST, DELETE"));
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -209,11 +287,26 @@ fn mcp_method_not_allowed_response() -> Response {
 }
 
 fn resolve_oauth_base(state: &ListenerState, headers: &HeaderMap) -> String {
-    external_base_url(headers, state.bind_port, &state.configured_public_url)
+    external_base_url(
+        headers,
+        state.bind_port,
+        &read_public_url(&state.configured_public_url),
+    )
+}
+
+fn origin_allowed(state: &ListenerState, headers: &HeaderMap) -> bool {
+    request_origin_allowed(
+        headers,
+        state.bind_port,
+        &read_public_url(&state.configured_public_url),
+    )
 }
 
 fn resolve_oauth_resource(state: &ListenerState, headers: &HeaderMap) -> String {
-    format!("{}/mcp", resolve_oauth_base(state, headers).trim_end_matches('/'))
+    format!(
+        "{}/mcp",
+        resolve_oauth_base(state, headers).trim_end_matches('/')
+    )
 }
 
 fn resolve_oauth_resource_metadata(state: &ListenerState, headers: &HeaderMap) -> String {
@@ -226,20 +319,212 @@ fn resolve_oauth_resource_metadata(state: &ListenerState, headers: &HeaderMap) -
 async fn mcp_post(
     State(state): State<ListenerState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+    if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.mcp_rate_limiter.allow() {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "MCP request rate limit exceeded",
+        );
+    }
+    if !accepts_streamable_http(&headers) {
+        return http_error(
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept must allow application/json and text/event-stream",
+        );
     }
     if let Some(response) = require_mcp_auth(&state, &headers) {
         return response;
     }
-    let method = body
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let request_id = body.get("id").cloned().unwrap_or(Value::Null);
+    let _permit = match state.concurrency.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return http_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many concurrent MCP requests",
+            )
+        }
+    };
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(error) => {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid JSON request body: {}", error.body_text()),
+            )
+        }
+    };
+    let message = match validate_client_message(&body) {
+        Ok(message) => message,
+        Err(error) => return jsonrpc_error_response(StatusCode::BAD_REQUEST, Value::Null, error),
+    };
+
+    if message == ClientMessage::Response {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    let (request_id, method) = match &message {
+        ClientMessage::Request { id, method } => (id.clone(), method.clone()),
+        ClientMessage::Notification { method } => (Value::Null, method.clone()),
+        ClientMessage::Response => unreachable!(),
+    };
+
+    if method == "initialize" {
+        if !matches!(message, ClientMessage::Request { .. }) {
+            return jsonrpc_error_response(
+                StatusCode::BAD_REQUEST,
+                request_id,
+                json!({ "code": -32600, "message": "initialize must be a request" }),
+            );
+        }
+        if session_id_from_headers(&headers).is_some() {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "Initialize requests must not include MCP-Session-Id",
+            );
+        }
+        let requested = match requested_protocol_version(&body) {
+            Ok(version) => version,
+            Err(error) => {
+                return jsonrpc_error_response(StatusCode::BAD_REQUEST, request_id, error)
+            }
+        };
+        let negotiated = negotiate_protocol_version(requested);
+        let session_id = state.sessions.create(negotiated, &request_id);
+        let cancellation = crate::tools::CancellationToken::default();
+        let response = execute_mcp_request(
+            &state,
+            &body,
+            &request_id,
+            &method,
+            negotiated,
+            &cancellation,
+        )
+        .await;
+        return with_session_headers(response, &session_id, negotiated);
+    }
+
+    let Some(session_id) = session_id_from_headers(&headers) else {
+        return http_error(
+            StatusCode::BAD_REQUEST,
+            "MCP-Session-Id is required after initialization",
+        );
+    };
+    let Some((session_version, initialized)) = state.sessions.get(session_id) else {
+        return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
+    };
+    if let Some(version) = protocol_version_from_headers(&headers) {
+        let Ok(version) = version else {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid MCP-Protocol-Version header",
+            );
+        };
+        if !protocol_version_supported(version) || version != session_version {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "MCP-Protocol-Version does not match the negotiated session version",
+            );
+        }
+    }
+
+    if matches!(message, ClientMessage::Notification { .. }) {
+        if method == "notifications/initialized" {
+            state.sessions.mark_initialized(session_id);
+        } else if method == "notifications/cancelled" {
+            if let Some(request_id) = body
+                .get("params")
+                .and_then(|params| params.get("requestId"))
+            {
+                state.in_flight.cancel(session_id, request_id);
+            }
+        }
+        append_profile_log(
+            &state.workspace_id,
+            "mcp-requests.log",
+            &format!("[rpc] accepted_notification method={method} duration_ms=0"),
+        );
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    if !initialized && method != "ping" {
+        return jsonrpc_error_response(
+            StatusCode::OK,
+            request_id,
+            json!({
+                "code": -32002,
+                "message": "MCP session is not initialized",
+                "data": { "reason": "initialized_notification_required" }
+            }),
+        );
+    }
+
+    if !state.sessions.reserve_request_id(session_id, &request_id) {
+        return jsonrpc_error_response(
+            StatusCode::OK,
+            request_id,
+            json!({
+                "code": -32600,
+                "message": "Request id has already been used in this MCP session"
+            }),
+        );
+    }
+
+    let Some(cancellation) = state.in_flight.insert(session_id, &request_id) else {
+        return jsonrpc_error_response(
+            StatusCode::OK,
+            request_id,
+            json!({ "code": -32600, "message": "Duplicate in-flight request id" }),
+        );
+    };
+    let response = execute_mcp_request(
+        &state,
+        &body,
+        &request_id,
+        &method,
+        &session_version,
+        &cancellation,
+    )
+    .await;
+    state.in_flight.remove(session_id, &request_id);
+    response
+}
+
+async fn mcp_delete(State(state): State<ListenerState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.mcp_rate_limiter.allow() {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "MCP request rate limit exceeded",
+        );
+    }
+    if let Some(response) = require_mcp_auth(&state, &headers) {
+        return response;
+    }
+    let Some(session_id) = session_id_from_headers(&headers) else {
+        return http_error(StatusCode::BAD_REQUEST, "MCP-Session-Id is required");
+    };
+    if state.sessions.remove(session_id) {
+        state.in_flight.cancel_session(session_id);
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session")
+    }
+}
+
+async fn execute_mcp_request(
+    state: &ListenerState,
+    body: &Value,
+    request_id: &Value,
+    method: &str,
+    protocol_version: &str,
+    cancellation: &crate::tools::CancellationToken,
+) -> Response {
     let tool_name = body
         .get("params")
         .and_then(|params| params.get("name"))
@@ -255,27 +540,35 @@ async fn mcp_post(
         ),
     );
 
-    if request_id.is_null() && method.starts_with("notifications/") {
-        append_profile_log(
-            &state.workspace_id,
-            "mcp-requests.log",
-            &format!(
-                "[rpc] accepted_notification method={} duration_ms=0",
-                method
-            ),
-        );
-        return StatusCode::ACCEPTED.into_response();
-    }
-
     let started = Instant::now();
-    let (response, outcome) = match tokio::time::timeout(
+    let execution = tokio::time::timeout(
         MCP_REQUEST_TIMEOUT,
-        handle_request(&state.mcp, &body),
-    )
-    .await
-    {
-        Ok(response) => (response, "ok"),
-        Err(_) => (
+        handle_request_with_protocol_and_cancellation(
+            &state.mcp,
+            body,
+            protocol_version,
+            cancellation,
+        ),
+    );
+    tokio::pin!(execution);
+    let (response, outcome) = tokio::select! {
+        _ = cancellation.cancelled() => (
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32800,
+                    "message": "Request cancelled",
+                    "data": { "reason": "request_cancelled", "retryable": true }
+                }
+            }),
+            "cancelled",
+        ),
+        result = &mut execution => match result {
+            Ok(response) => (response, "ok"),
+            Err(_) => {
+                cancellation.cancel();
+                (
             json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -290,7 +583,9 @@ async fn mcp_post(
                 }
             }),
             "timeout",
-        ),
+                )
+            }
+        }
     };
     let duration_ms = started.elapsed().as_millis();
     append_profile_log(
@@ -332,6 +627,49 @@ async fn mcp_post(
         );
     }
     Json(response).into_response()
+}
+
+fn session_id_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn protocol_version_from_headers(headers: &HeaderMap) -> Option<Result<&str, ()>> {
+    headers
+        .get("mcp-protocol-version")
+        .map(|value| value.to_str().map(str::trim).map_err(|_| ()))
+}
+
+fn with_session_headers(
+    mut response: Response,
+    session_id: &str,
+    protocol_version: &str,
+) -> Response {
+    if let Ok(value) = HeaderValue::from_str(session_id) {
+        response.headers_mut().insert("mcp-session-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(protocol_version) {
+        response.headers_mut().insert("mcp-protocol-version", value);
+    }
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn http_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
+fn jsonrpc_error_response(status: StatusCode, id: Value, error: Value) -> Response {
+    (
+        status,
+        Json(json!({ "jsonrpc": "2.0", "id": id, "error": error })),
+    )
+        .into_response()
 }
 
 fn require_mcp_auth(state: &ListenerState, headers: &HeaderMap) -> Option<Response> {
@@ -392,8 +730,14 @@ async fn oauth_authorize_get(
     headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+    if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
     }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
@@ -411,8 +755,14 @@ async fn oauth_authorize_post(
     headers: HeaderMap,
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
-    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+    if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
     }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
@@ -430,6 +780,15 @@ async fn oauth_token_post(
     headers: HeaderMap,
     Form(form): Form<TokenForm>,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -456,13 +815,30 @@ fn oauth_not_configured() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::extract::State;
     use axum::http::{
         header::{ALLOW, CACHE_CONTROL},
-        StatusCode,
+        HeaderMap, StatusCode,
     };
     use axum::response::IntoResponse;
+    use axum::Json;
+    use serde_json::{json, Value};
+    use tokio::sync::Semaphore;
 
-    use super::{bind_listener, mcp_method_not_allowed_response};
+    use crate::mcp::protocol::{InFlightRequests, RateLimiter, SessionStore};
+    use crate::mcp::server::new_state;
+    use crate::runtime::{register_public_url, update_public_url};
+    use crate::tools::policy::PolicySettings;
+    use crate::tools::Workspace;
+    use crate::workspace::AuthConfig;
+
+    use super::{
+        accepts_streamable_http, bind_listener, mcp_delete, mcp_method_not_allowed_response,
+        mcp_post, origin_allowed, resolve_oauth_base, ListenerState,
+    };
 
     #[test]
     fn bind_listener_reports_port_conflict_synchronously() {
@@ -477,7 +853,227 @@ mod tests {
         let response = mcp_method_not_allowed_response().into_response();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(response.headers()[ALLOW], "POST");
+        assert_eq!(response.headers()[ALLOW], "POST, DELETE");
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn post_accept_must_allow_json_and_event_stream() {
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_streamable_http(&headers));
+        headers.insert("accept", "application/json".parse().unwrap());
+        assert!(!accepts_streamable_http(&headers));
+        headers.insert(
+            "accept",
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        assert!(accepts_streamable_http(&headers));
+        headers.insert("accept", "*/*".parse().unwrap());
+        assert!(accepts_streamable_http(&headers));
+    }
+
+    fn test_listener_state() -> (tempfile::TempDir, ListenerState) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let auth = AuthConfig {
+            auth_type: "noauth".into(),
+            ..AuthConfig::default()
+        };
+        let mcp = new_state(
+            Workspace::new(workspace.path().to_path_buf()).expect("workspace state"),
+            auth.clone(),
+            PolicySettings::default(),
+            "core".into(),
+            "trusted".into(),
+        );
+        let workspace_id = format!("listener-test-{}", uuid::Uuid::new_v4());
+        (
+            workspace,
+            ListenerState {
+                mcp,
+                auth,
+                workspace_id: workspace_id.clone(),
+                workspace_path: "listener-test".into(),
+                bind_port: 28766,
+                configured_public_url: register_public_url(
+                    &workspace_id,
+                    "mcp",
+                    "https://mcp.example.com".into(),
+                ),
+                bearer_token: None,
+                oauth: None,
+                oauth_client_secret: None,
+                proxy_specs: Vec::new(),
+                sessions: SessionStore::default(),
+                mcp_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+                oauth_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+                concurrency: Arc::new(Semaphore::new(4)),
+                in_flight: InFlightRequests::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn public_url_hot_update_changes_oauth_base_without_restarting_listener() {
+        let (_workspace, state) = test_listener_state();
+        assert_eq!(
+            resolve_oauth_base(&state, &HeaderMap::new()),
+            "https://mcp.example.com"
+        );
+        assert!(update_public_url(
+            &state.workspace_id,
+            "mcp",
+            "https://new.example.com"
+        ));
+        assert_eq!(
+            resolve_oauth_base(&state, &HeaderMap::new()),
+            "https://new.example.com"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://new.example.com".parse().unwrap());
+        assert!(origin_allowed(&state, &headers));
+        headers.insert("origin", "https://mcp.example.com".parse().unwrap());
+        assert!(!origin_allowed(&state, &headers));
+    }
+
+    fn request_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        headers
+    }
+
+    fn initialize_request(version: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": version,
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1" }
+            }
+        })
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("json response")
+    }
+
+    #[tokio::test]
+    async fn streamable_http_enforces_session_lifecycle() {
+        let (_workspace, state) = test_listener_state();
+        let response = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response.headers()["mcp-session-id"]
+            .to_str()
+            .expect("session header")
+            .to_string();
+        assert_eq!(response.headers()["mcp-protocol-version"], "2025-11-25");
+        let initialized = response_json(response).await;
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+
+        let missing_session = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))),
+        )
+        .await;
+        assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+
+        let mut session_headers = request_headers();
+        session_headers.insert("mcp-session-id", session_id.parse().unwrap());
+        session_headers.insert("mcp-protocol-version", "2025-11-25".parse().unwrap());
+        let before_initialized = mcp_post(
+            State(state.clone()),
+            session_headers.clone(),
+            Ok(Json(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}))),
+        )
+        .await;
+        assert_eq!(before_initialized.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(before_initialized).await["error"]["data"]["reason"],
+            "initialized_notification_required"
+        );
+
+        let notification = mcp_post(
+            State(state.clone()),
+            session_headers.clone(),
+            Ok(Json(json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/initialized",
+                "params": {}
+            }))),
+        )
+        .await;
+        assert_eq!(notification.status(), StatusCode::ACCEPTED);
+
+        let tools = mcp_post(
+            State(state.clone()),
+            session_headers.clone(),
+            Ok(Json(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}))),
+        )
+        .await;
+        assert_eq!(tools.status(), StatusCode::OK);
+        assert!(response_json(tools).await["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()));
+
+        let deleted = mcp_delete(State(state.clone()), session_headers.clone()).await;
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let deleted_again = mcp_delete(State(state), session_headers).await;
+        assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_rejects_bad_origin_accept_and_protocol_version() {
+        let (_workspace, state) = test_listener_state();
+        let mut bad_origin = request_headers();
+        bad_origin.insert("origin", "https://attacker.example".parse().unwrap());
+        let response = mcp_post(
+            State(state.clone()),
+            bad_origin,
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = mcp_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+
+        let initialized = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        let session_id = initialized.headers()["mcp-session-id"]
+            .to_str()
+            .expect("session")
+            .to_string();
+        let mut headers = request_headers();
+        headers.insert("mcp-session-id", session_id.parse().unwrap());
+        headers.insert("mcp-protocol-version", "2025-06-18".parse().unwrap());
+        let response = mcp_post(
+            State(state),
+            headers,
+            Ok(Json(json!({"jsonrpc":"2.0","id":2,"method":"ping"}))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

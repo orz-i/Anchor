@@ -48,7 +48,13 @@ fn persist_public_url(
         }
         store.update(profile)?;
         Ok(())
-    })
+    })?;
+    let service = match kind {
+        TunnelServiceKind::Mcp => "mcp",
+        TunnelServiceKind::Actions => "actions",
+    };
+    crate::runtime::update_public_url(id, service, public_url);
+    Ok(())
 }
 
 async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {

@@ -10,8 +10,35 @@ use tokio::process::Command;
 use crate::tools::context::ToolContext;
 use crate::tools::session::ExecSession;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
+use crate::tools::CancellationToken;
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    exec_command_with_cancellation(ctx, args, &CancellationToken::default())
+}
+
+fn cancelled_error(session: Option<Value>) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "REQUEST_CANCELLED",
+        message: "Command execution was cancelled.".into(),
+        category: "runtime",
+        retryable: true,
+        details: json!({
+            "termination_reason": "cancelled",
+            "recoverable": true,
+            "suggestion": "Retry the request if it is still needed",
+            "session": session
+        }),
+    }
+}
+
+pub fn exec_command_with_cancellation(
+    ctx: &ToolContext,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_error(None));
+    }
     let cmd = args
         .get("cmd")
         .and_then(Value::as_str)
@@ -34,6 +61,9 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .to_string();
     validate_child_process_scope(ctx, args)?;
     if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_error(None));
+        }
         let mut result = result;
         if let Some(object) = result.as_object_mut() {
             object.insert(
@@ -79,6 +109,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
             max_output,
             tty,
             stdin_text,
+            cancellation,
         )
         .await
     });
@@ -232,7 +263,11 @@ async fn run_command(
     max_output: usize,
     tty: bool,
     stdin_text: &str,
+    cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_error(None));
+    }
     let (program, args) = parse_and_resolve(cmd, cwd, ctx.workspace.root(), &ctx.policy)?;
     let start = Instant::now();
 
@@ -295,6 +330,15 @@ async fn run_command(
 
     loop {
         session.refresh_status().await;
+        if cancellation.is_cancelled() {
+            session.mark_termination_reason("cancelled");
+            session.kill_and_wait().await;
+            session.refresh_status().await;
+            session.wait_for_readers().await;
+            let snapshot = session.snapshot(max_output);
+            ctx.sessions.remove(&session.session_id);
+            return Err(cancelled_error(Some(snapshot)));
+        }
         if session.has_exited() {
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
@@ -360,6 +404,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         16_384,
         false,
         "",
+        &CancellationToken::default(),
     ));
 
     let mut response = json!({
@@ -601,9 +646,13 @@ fn resolve_program(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
     use crate::tools::context::ToolContext;
-    use crate::tools::dispatch::call_tool;
+    use crate::tools::dispatch::{call_tool, call_tool_with_cancellation};
+    use crate::tools::CancellationToken;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -659,6 +708,102 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&resolved),
             entry.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn skill_script_requires_explicit_confirmation() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let skill = workspace.path().join(".agents/skills/example");
+        std::fs::create_dir_all(skill.join("scripts")).expect("skill scripts");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: example\ndescription: Example skill.\n---\nUse it.\n",
+        )
+        .expect("skill");
+        std::fs::write(skill.join("scripts/run.py"), "print('ok')\n").expect("script");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+
+        let output = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({"cmd": "python .agents/skills/example/scripts/run.py"}),
+        );
+        assert_eq!(output["ok"], false, "{output}");
+        assert_eq!(
+            output["error"]["code"], "SKILL_SCRIPT_CONFIRMATION_REQUIRED",
+            "{output}"
+        );
+        assert_eq!(output["error"]["details"]["skill"], "example");
+        assert_eq!(output["error"]["details"]["script"], "scripts/run.py");
+
+        let indirect = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": "python -c \"import runpy; runpy.run_path('run.py')\"",
+                "workdir": ".agents/skills/example/scripts"
+            }),
+        );
+        assert_eq!(
+            indirect["error"]["code"], "SKILL_SCRIPT_CONFIRMATION_REQUIRED",
+            "{indirect}"
+        );
+
+        std::fs::write(skill.join("scripts/run.py"), "print('changed')\n").expect("change");
+        let stale = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": "python .agents/skills/example/scripts/run.py",
+                "confirm": true
+            }),
+        );
+        assert_eq!(stale["ok"], false, "{stale}");
+        assert_eq!(
+            stale["error"]["code"], "SKILL_SCRIPT_SNAPSHOT_STALE",
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn cancellation_terminates_a_running_command() {
+        if which::which("python").is_err() {
+            return;
+        }
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context"),
+        );
+        let token = CancellationToken::default();
+        let worker_ctx = ctx.clone();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            call_tool_with_cancellation(
+                worker_ctx.as_ref(),
+                "exec_command",
+                &json!({
+                    "cmd": "python -c \"import time; time.sleep(30)\"",
+                    "timeout_ms": 60_000,
+                    "yield_time_ms": 30_000
+                }),
+                &worker_token,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(250));
+        token.cancel();
+        let output = worker.join().expect("worker");
+        assert_eq!(output["ok"], false, "{output}");
+        assert_eq!(output["error"]["code"], "REQUEST_CANCELLED", "{output}");
+        assert_eq!(
+            output["error"]["details"]["termination_reason"], "cancelled",
+            "{output}"
         );
     }
 

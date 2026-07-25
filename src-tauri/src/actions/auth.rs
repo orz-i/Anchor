@@ -9,6 +9,7 @@ use axum::{
 };
 
 use crate::auth::{external_base_url, verify_oauth_bearer_header, OAuthRuntime};
+use crate::runtime::{read_public_url, SharedPublicUrl};
 
 use super::bearer::constant_time_eq;
 
@@ -18,7 +19,7 @@ pub struct AuthConfig {
     pub api_key: Option<String>,
     pub oauth: Option<Arc<OAuthRuntime>>,
     pub bind_port: u16,
-    pub configured_public_url: String,
+    pub configured_public_url: SharedPublicUrl,
 }
 
 impl AuthConfig {
@@ -27,7 +28,7 @@ impl AuthConfig {
         api_key: Option<String>,
         oauth: Option<Arc<OAuthRuntime>>,
         bind_port: u16,
-        configured_public_url: String,
+        configured_public_url: SharedPublicUrl,
     ) -> Self {
         Self {
             auth_type,
@@ -99,7 +100,7 @@ pub async fn require_actions_auth(
         let issuer_url = external_base_url(
             request.headers(),
             auth.bind_port,
-            &auth.configured_public_url,
+            &read_public_url(&auth.configured_public_url),
         );
         let resource_url = issuer_url.trim_end_matches('/').to_string();
         let resource_metadata_url = format!(

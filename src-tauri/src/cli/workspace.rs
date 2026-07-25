@@ -13,8 +13,7 @@ use crate::workspace::resources::assign_free_workspace_ports;
 use crate::workspace::WorkspaceProfile;
 
 use super::args::{
-    EndpointSelection, GptConfigOptions, ServiceSelection, UnregisterOptions, WorkspaceCommand,
-    WorkspaceTestOptions,
+    EndpointSelection, GptConfigOptions, UnregisterOptions, WorkspaceCommand, WorkspaceTestOptions,
 };
 
 #[derive(Debug, Serialize)]
@@ -110,15 +109,9 @@ pub async fn execute(command: WorkspaceCommand, as_json: bool) -> AppResult<i32>
         WorkspaceCommand::Show { workspace } => {
             super::show_workspace(&workspace, as_json).map(|_| 0)
         }
-        WorkspaceCommand::Start(options) => {
-            super::start_daemon(options, as_json).await.map(|_| 0)
-        }
-        WorkspaceCommand::Stop(options) => {
-            super::stop_daemon(options, as_json).await.map(|_| 0)
-        }
-        WorkspaceCommand::GptConfig(options) => {
-            show_gpt_config(options, as_json).map(|_| 0)
-        }
+        WorkspaceCommand::Start(options) => super::start_daemon(options, as_json).await.map(|_| 0),
+        WorkspaceCommand::Stop(options) => super::stop_daemon(options, as_json).await.map(|_| 0),
+        WorkspaceCommand::GptConfig(options) => show_gpt_config(options, as_json).map(|_| 0),
         WorkspaceCommand::Test(options) => test_workspace(options, as_json).await,
     }
 }
@@ -134,13 +127,7 @@ fn register_workspace(path: &str, name: Option<String>, as_json: bool) -> AppRes
         .find(|profile| same_workspace_path(&profile.path, &canonical))
         .cloned()
     {
-        return print_mutation(
-            "already_registered",
-            &existing,
-            false,
-            Vec::new(),
-            as_json,
-        );
+        return print_mutation("already_registered", &existing, false, Vec::new(), as_json);
     }
 
     let requested_name = name
@@ -176,12 +163,7 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
 
     let inspection = super::daemon::inspect(&profile)?;
     if inspection.running {
-        super::daemon::stop(
-            &profile,
-            Duration::from_secs(options.timeout_seconds),
-            true,
-        )
-        .await?;
+        super::daemon::stop(&profile, Duration::from_secs(options.timeout_seconds), true).await?;
     } else if inspection.ambiguous {
         return Err(AppError::Message(inspection.detail));
     }
@@ -201,9 +183,9 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
     drop_tunnel_workspace(&profile.id).await?;
     super::daemon::cleanup(&profile)?;
     let mut store = DataStore::load()?;
-    let removed = store.remove(&profile.id)?.ok_or_else(|| {
-        AppError::Message(format!("workspace 已不存在：{}", profile.id))
-    })?;
+    let removed = store
+        .remove(&profile.id)?
+        .ok_or_else(|| AppError::Message(format!("workspace 已不存在：{}", profile.id)))?;
     print_mutation("unregistered", &removed, false, warnings, as_json)?;
     Ok(0)
 }
@@ -265,6 +247,10 @@ fn mcp_gpt_config(
             };
             let client_secret = secret(store, profile, "oauth_client_secret", shared)?;
             let password = secret(store, profile, "oauth_password", shared)?;
+            let redirect_uris = redirect_uri_list(&profile.auth.oauth_redirect_uris);
+            let redirect_hosts = redirect_uri_list(&profile.auth.oauth_redirect_hosts);
+            let callback_registration_required =
+                redirect_uris.is_empty() && redirect_hosts.is_empty();
             json!({
                 "type": "oauth",
                 "clientId": client_id,
@@ -275,7 +261,11 @@ fn mcp_gpt_config(
                 "authorizationServerMetadata": format!("{base}/.well-known/oauth-authorization-server"),
                 "protectedResourceMetadata": format!("{base}/.well-known/oauth-protected-resource"),
                 "scope": "mcp",
-                "usesSharedSecrets": shared
+                "usesSharedSecrets": shared,
+                "registeredRedirectUris": redirect_uris,
+                "callbackEnrollmentHosts": redirect_hosts,
+                "callbackRegistrationRequired": callback_registration_required,
+                "callbackRegistrationNote": "Exact redirect URIs remain authoritative. If the callback host matches callbackEnrollmentHosts, the authorization page can register the exact URL in memory after explicit user confirmation, without restarting the listener or tunnel."
             })
         }
         "bearer" => {
@@ -317,6 +307,10 @@ fn actions_gpt_config(
         }
         "oauth" => {
             let secret = secret(store, profile, "actions_oauth_client_secret", shared)?;
+            let redirect_uris = redirect_uri_list(&profile.actions.oauth_redirect_uris);
+            let redirect_hosts = redirect_uri_list(&profile.actions.oauth_redirect_hosts);
+            let callback_registration_required =
+                redirect_uris.is_empty() && redirect_hosts.is_empty();
             json!({
                 "type": "oauth",
                 "clientId": profile.actions.oauth_client_id,
@@ -324,7 +318,11 @@ fn actions_gpt_config(
                 "authorizationUrl": format!("{base}/oauth/authorize"),
                 "tokenUrl": format!("{base}/oauth/token"),
                 "scope": profile.actions.oauth_scopes,
-                "usesSharedSecrets": shared
+                "usesSharedSecrets": shared,
+                "registeredRedirectUris": redirect_uris,
+                "callbackEnrollmentHosts": redirect_hosts,
+                "callbackRegistrationRequired": callback_registration_required,
+                "callbackRegistrationNote": "Allowed callback hosts can enroll the exact URL at authorization time after explicit confirmation; no listener or tunnel restart is required."
             })
         }
         other => json!({ "type": other }),
@@ -388,7 +386,12 @@ async fn test_mcp(
     let endpoint = match select_mcp_endpoint(profile, mode) {
         Ok((endpoint, _)) => endpoint,
         Err(error) => {
-            return vec![failed_check("mcp", "Endpoint", error.to_string(), "配置公网 URL 或改用 --local")]
+            return vec![failed_check(
+                "mcp",
+                "Endpoint",
+                error.to_string(),
+                "配置公网 URL 或改用 --local",
+            )]
         }
     };
     let base = endpoint.trim_end_matches("/mcp").trim_end_matches('/');
@@ -445,6 +448,7 @@ async fn test_mcp(
             );
             let response = client
                 .post(&endpoint)
+                .header("Accept", "application/json, text/event-stream")
                 .json(&initialize_request())
                 .send()
                 .await;
@@ -499,7 +503,12 @@ async fn test_actions(
     let base = match select_actions_base(profile, mode) {
         Ok((base, _)) => base,
         Err(error) => {
-            return vec![failed_check("actions", "Endpoint", error.to_string(), "配置公网 URL 或改用 --local")]
+            return vec![failed_check(
+                "actions",
+                "Endpoint",
+                error.to_string(),
+                "配置公网 URL 或改用 --local",
+            )]
         }
     };
     let mut checks = vec![
@@ -634,14 +643,36 @@ async fn test_mcp_initialize(
     match request.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
+            let session_id = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let protocol_version = response
+                .headers()
+                .get("mcp-protocol-version")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
             let text = response.text().await.unwrap_or_default();
-            let ok = status == 200 && text.contains("serverInfo");
+            let ok = status == 200
+                && text.contains("serverInfo")
+                && !session_id.is_empty()
+                && protocol_version == crate::mcp::protocol::CURRENT_PROTOCOL_VERSION;
             check(
                 "mcp",
                 "Initialize",
                 ok,
-                format!("POST initialize → HTTP {status}"),
-                "确认认证密钥正确，且服务返回 JSON-RPC initialize 结果",
+                format!(
+                    "POST initialize → HTTP {status}; session={}; protocol={protocol_version}",
+                    if session_id.is_empty() {
+                        "missing"
+                    } else {
+                        "present"
+                    }
+                ),
+                "确认认证密钥正确，且服务返回 JSON-RPC initialize、MCP-Session-Id 与协议版本",
             )
         }
         Err(error) => failed_check(
@@ -664,7 +695,10 @@ async fn test_json_url(
         Ok(response) => {
             let status = response.status().as_u16();
             let value = response.json::<Value>().await.ok();
-            let ok = status == 200 && value.as_ref().is_some_and(|value| value.get(field).is_some());
+            let ok = status == 200
+                && value
+                    .as_ref()
+                    .is_some_and(|value| value.get(field).is_some());
             check(
                 service,
                 name,
@@ -725,9 +759,9 @@ fn select_endpoint(
 ) -> AppResult<(String, &'static str)> {
     match mode {
         EndpointSelection::Local => Ok((local, "local")),
-        EndpointSelection::Public if public.is_empty() => Err(AppError::Message(format!(
-            "{label} 未配置公网入口"
-        ))),
+        EndpointSelection::Public if public.is_empty() => {
+            Err(AppError::Message(format!("{label} 未配置公网入口")))
+        }
         EndpointSelection::Public => Ok((public, "public")),
         EndpointSelection::Auto if public.is_empty() => Ok((local, "local")),
         EndpointSelection::Auto => Ok((public, "public")),
@@ -741,7 +775,9 @@ fn canonical_workspace_path(raw: &str) -> AppResult<PathBuf> {
     }
     let path = PathBuf::from(trimmed);
     let canonical = path.canonicalize().map_err(|error| {
-        AppError::Message(format!("workspace 目录不存在或无法访问：{trimmed}（{error}）"))
+        AppError::Message(format!(
+            "workspace 目录不存在或无法访问：{trimmed}（{error}）"
+        ))
     })?;
     if !canonical.is_dir() {
         return Err(AppError::Message(format!(
@@ -756,7 +792,9 @@ fn same_workspace_path(existing: &str, canonical: &Path) -> bool {
     Path::new(existing)
         .canonicalize()
         .map(|path| path == canonical)
-        .unwrap_or_else(|_| super::normalize_path(existing) == super::normalize_path(&canonical.to_string_lossy()))
+        .unwrap_or_else(|_| {
+            super::normalize_path(existing) == super::normalize_path(&canonical.to_string_lossy())
+        })
 }
 
 fn secret(
@@ -790,7 +828,7 @@ fn initialize_request() -> Value {
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "coding-tools-mcp-cli-test", "version": env!("CARGO_PKG_VERSION") }
         }
@@ -825,11 +863,7 @@ fn print_mutation(
     } else {
         println!(
             "{}\t{}\t{}\tMCP:{}\tActions:{}",
-            event,
-            result.workspace.id,
-            result.workspace.path,
-            result.mcp_port,
-            result.actions_port
+            event, result.workspace.id, result.workspace.path, result.mcp_port, result.actions_port
         );
         if event == "unregistered" {
             println!("项目文件未删除。");
@@ -854,8 +888,12 @@ fn print_human_gpt_config(value: &Value) {
         println!("Auth: {}", mcp["auth"]["type"].as_str().unwrap_or(""));
         print_optional("Client ID", &mcp["auth"]["clientId"]);
         print_secret("Client Secret", &mcp["auth"]["clientSecret"]);
-        print_secret("Authorization Password", &mcp["auth"]["authorizationPassword"]);
+        print_secret(
+            "Authorization Password",
+            &mcp["auth"]["authorizationPassword"],
+        );
         print_secret("Bearer Token", &mcp["auth"]["bearerToken"]);
+        print_redirect_uris(&mcp["auth"]);
     }
     if let Some(actions) = value.get("actions") {
         println!("\n[GPT Actions]");
@@ -871,6 +909,42 @@ fn print_human_gpt_config(value: &Value) {
         print_optional("Client ID", &actions["auth"]["clientId"]);
         print_secret("Client Secret", &actions["auth"]["clientSecret"]);
         print_secret("API Key", &actions["auth"]["apiKey"]);
+        print_redirect_uris(&actions["auth"]);
+    }
+}
+
+fn redirect_uri_list(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn print_redirect_uris(auth: &Value) {
+    let uris = auth
+        .get("registeredRedirectUris")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let hosts = auth
+        .get("callbackEnrollmentHosts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if uris.is_empty() && hosts.is_empty() {
+        if auth["callbackRegistrationRequired"].as_bool() == Some(true) {
+            println!(
+                "Callback: <not configured; add an exact callback URL or a callback enrollment host>"
+            );
+        }
+        return;
+    }
+    for uri in uris.iter().filter_map(Value::as_str) {
+        println!("Registered Callback: {uri}");
+    }
+    for host in hosts.iter().filter_map(Value::as_str) {
+        println!("Callback Enrollment Host: {host}");
     }
 }
 
@@ -914,12 +988,7 @@ fn check(
     }
 }
 
-fn failed_check(
-    service: &'static str,
-    name: &str,
-    detail: String,
-    hint: &str,
-) -> ConnectionCheck {
+fn failed_check(service: &'static str, name: &str, detail: String, hint: &str) -> ConnectionCheck {
     check(service, name, false, detail, hint)
 }
 
@@ -930,13 +999,23 @@ mod tests {
     #[test]
     fn endpoint_auto_prefers_public_and_falls_back_to_local() {
         assert_eq!(
-            select_endpoint("local".into(), "public".into(), EndpointSelection::Auto, "MCP")
-                .expect("public"),
+            select_endpoint(
+                "local".into(),
+                "public".into(),
+                EndpointSelection::Auto,
+                "MCP"
+            )
+            .expect("public"),
             ("public".into(), "public")
         );
         assert_eq!(
-            select_endpoint("local".into(), String::new(), EndpointSelection::Auto, "MCP")
-                .expect("local"),
+            select_endpoint(
+                "local".into(),
+                String::new(),
+                EndpointSelection::Auto,
+                "MCP"
+            )
+            .expect("local"),
             ("local".into(), "local")
         );
     }

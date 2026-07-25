@@ -641,6 +641,7 @@
         auth_type: draft.authType,
         oauth_client_id: draft.oauthClientId || current.oauth_client_id,
         oauth_redirect_uris: draft.oauthRedirectUris,
+        oauth_redirect_hosts: draft.oauthRedirectHosts,
         oauth_scopes: draft.oauthScopes,
         use_shared_secrets: draft.useSharedSecrets,
       },
@@ -947,6 +948,7 @@
                 authType={actions.auth_type}
                 oauthClientId={actions.oauth_client_id ?? ""}
                 oauthRedirectUris={actions.oauth_redirect_uris ?? ""}
+                oauthRedirectHosts={actions.oauth_redirect_hosts ?? ""}
                 oauthScopes={actions.oauth_scopes ?? ""}
                 openapiUrl={actionsOpenApiUrl(profile, frpProfiles)}
                 privacyUrl={actionsPrivacyUrl(profile, frpProfiles)}

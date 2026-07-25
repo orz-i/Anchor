@@ -2,7 +2,10 @@
 name: mcp-probe-kit
 description: >-
   将用户意图路由到 mcp-probe-kit MCP 工具（start_feature、start_bugfix、code_insight、workflow、gencommit 等）。在已配置 MCP 且准备写代码前读取；仅说明调哪个 MCP，不是项目研发流程本身。Routes intent to mcp-probe-kit MCP tools; read before coding when MCP is configured.
-mcp-probe-kit-version: "3.6.11"
+compatibility: Requires mcp-probe-kit MCP 3.6.11. Memory tools additionally require the MEMORY service.
+metadata:
+  mcp-probe-kit-version: "3.6.11"
+allowed-tools: start_feature start_bugfix start_ui start_onboard start_product start_ralph workflow init_project_context init_project add_feature check_spec estimate code_insight fix_bug gentest code_review refactor gencommit git_work_report ui_design_system ui_search sync_ui_data search_memory read_memory_asset memorize_asset update_memory_asset delete_memory_asset scan_and_extract_patterns ask_user interview
 ---
 
 # MCP 调用时机 — mcp-probe-kit

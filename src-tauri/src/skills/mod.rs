@@ -2,39 +2,59 @@ mod catalog;
 mod model;
 mod resource;
 
+use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::tools::workspace::{tool_ok, WorkspaceError};
+use crate::tools::ToolContext;
 
 pub use catalog::{SkillCatalog, SkillSettings};
 
 pub const TOOL_NAMES: &[&str] = &["list_skills", "load_skill", "read_skill_resource"];
+const RESOURCE_PAGE_SIZE: usize = 200;
+const MAX_RESOURCE_ENTRIES: usize = 5000;
 
-pub fn list_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let query = args.get("query").and_then(Value::as_str);
     let max_results = args
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(100) as usize;
-    Ok(tool_ok(
-        serde_json::to_value(catalog.list(query, max_results)).map_err(skill_error)?,
-    ))
+    let mut listed = ctx.skills.list(query, max_results);
+    let available = available_tools(ctx);
+    for skill in &mut listed.skills {
+        skill.resolve_tools(&available);
+        if !skill.tool_compatible {
+            skill.warnings.push(format!(
+                "工具依赖不完整：missing={:?}, ambiguous={:?}",
+                skill.missing_tools, skill.ambiguous_tools
+            ));
+        }
+    }
+    Ok(tool_ok(serde_json::to_value(listed).map_err(skill_error)?))
 }
 
-pub fn load_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn load_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let name = required_string(args, "name")?;
     let max_bytes = args
         .get("max_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(262_144);
-    let loaded = catalog.load(name, max_bytes).map_err(skill_not_found_or_invalid)?;
+        .unwrap_or(65_536);
+    let mut loaded = ctx
+        .skills
+        .load(name, max_bytes)
+        .map_err(skill_not_found_or_invalid)?;
+    loaded.summary.resolve_tools(&available_tools(ctx));
+    if !loaded.summary.tool_compatible {
+        loaded.summary.warnings.push(format!(
+            "当前 MCP 工具目录不能完整满足该 Skill：missing={:?}, ambiguous={:?}",
+            loaded.summary.missing_tools, loaded.summary.ambiguous_tools
+        ));
+    }
     Ok(tool_ok(serde_json::to_value(loaded).map_err(skill_error)?))
 }
 
-pub fn read_resource_tool(
-    catalog: &SkillCatalog,
-    args: &Value,
-) -> Result<Value, WorkspaceError> {
+pub fn read_resource_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
     let name = required_string(args, "name")?;
     let path = required_string(args, "path")?;
     let start_line = args
@@ -57,19 +77,31 @@ pub fn read_resource_tool(
     ))
 }
 
-pub fn resources_list(catalog: &SkillCatalog) -> Value {
+pub fn resources_list(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
     if !catalog.is_enabled() {
-        return json!({ "resources": [] });
+        return Ok(json!({ "resources": [] }));
     }
+    let offset = params
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(decode_cursor)
+        .transpose()
+        .map_err(|error| rpc_error(-32602, &error))?
+        .unwrap_or(0);
     let listed = catalog.list(None, 200);
+    let catalog_truncated =
+        listed.truncated || listed.skills.iter().any(|skill| skill.resource_truncated);
     let mut resources = vec![json!({
         "uri": "skill://index.json",
         "name": "Agent Skills index",
         "title": "Agent Skills discovery index",
-        "description": "Progressive-disclosure index for skills exposed by this workspace/profile.",
+        "description": "Snapshot discovery index for skills exposed by this workspace/profile.",
         "mimeType": "application/json"
     })];
     for skill in listed.skills {
+        if resources.len() >= MAX_RESOURCE_ENTRIES {
+            break;
+        }
         resources.push(json!({
             "uri": skill.uri,
             "name": skill.name,
@@ -78,20 +110,44 @@ pub fn resources_list(catalog: &SkillCatalog) -> Value {
             "mimeType": "text/markdown"
         }));
         for item in skill.resources.iter().chain(skill.scripts.iter()) {
+            if resources.len() >= MAX_RESOURCE_ENTRIES {
+                break;
+            }
             resources.push(json!({
-                "uri": format!("skill://{}/{}", skill.name, item.path),
+                "uri": resource::skill_resource_uri(&skill.name, &item.path),
                 "name": format!("{}/{}", skill.name, item.path),
                 "title": item.path,
                 "description": if item.kind == "script" {
-                    "Skill script source; execution is disabled by this server."
+                    "Skill script source. Direct Skill execution is disabled; generic exec_command requires explicit confirmation."
                 } else {
                     "Skill supporting resource."
                 },
-                "mimeType": item.mime_type
+                "mimeType": item.mime_type,
+                "annotations": {
+                    "audience": ["assistant"],
+                    "priority": if item.kind == "script" { 0.3 } else { 0.5 }
+                }
             }));
         }
     }
-    json!({ "resources": resources })
+    if offset > resources.len() {
+        return Err(rpc_error(-32602, "Invalid resources/list cursor"));
+    }
+    let end = (offset + RESOURCE_PAGE_SIZE).min(resources.len());
+    let page = resources[offset..end].to_vec();
+    let mut result = json!({
+        "resources": page,
+        "_meta": {
+            "snapshotMode": listed.snapshot_mode,
+            "catalogDigest": listed.catalog_digest,
+            "catalogTruncated": catalog_truncated || resources.len() >= MAX_RESOURCE_ENTRIES,
+            "maximumResourceEntries": MAX_RESOURCE_ENTRIES
+        }
+    });
+    if end < resources.len() {
+        result["nextCursor"] = Value::String(encode_cursor(end));
+    }
+    Ok(result)
 }
 
 pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
@@ -118,23 +174,22 @@ pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Va
         }));
     }
 
-    let (name, path) = parse_skill_uri(uri)
-        .ok_or_else(|| rpc_error(-32602, "Skill resource URI must use skill://<name>/<path>"))?;
+    let (name, path) = parse_skill_uri(uri).map_err(|error| rpc_error(-32602, &error))?;
     if path == "SKILL.md" {
-        let loaded = catalog
-            .load(name, 1_048_576)
+        let skill_md = catalog
+            .skill_markdown(&name)
             .map_err(|error| rpc_error(-32002, &error))?;
         return Ok(json!({
             "contents": [{
                 "uri": uri,
                 "mimeType": "text/markdown",
-                "text": loaded.skill_md
+                "text": skill_md
             }]
         }));
     }
 
     let resource = catalog
-        .read_resource(name, path, None, None, 1_048_576)
+        .read_resource(&name, &path, None, None, 1_048_576)
         .map_err(|error| rpc_error(-32002, &error))?;
     let content = if resource.encoding == "base64" {
         json!({
@@ -154,6 +209,22 @@ pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Va
 
 pub fn is_skill_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
+}
+
+fn available_tools(ctx: &ToolContext) -> Vec<String> {
+    let mut tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tools.extend(
+        ctx.mcp_proxies
+            .list_tools()
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string)),
+    );
+    tools.sort();
+    tools.dedup();
+    tools
 }
 
 fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, WorkspaceError> {
@@ -193,13 +264,36 @@ fn skill_not_found_or_invalid(message: String) -> WorkspaceError {
     }
 }
 
-fn parse_skill_uri(uri: &str) -> Option<(&str, &str)> {
-    let remainder = uri.strip_prefix("skill://")?;
-    let (name, path) = remainder.split_once('/')?;
-    if name.is_empty() || path.is_empty() {
-        return None;
+fn parse_skill_uri(uri: &str) -> Result<(String, String), String> {
+    if uri.contains(['?', '#']) {
+        return Err("Skill resource URI must not contain query or fragment".into());
     }
-    Some((name, path))
+    let remainder = uri
+        .strip_prefix("skill://")
+        .ok_or_else(|| "Skill resource URI must use skill://<name>/<path>".to_string())?;
+    let (name, encoded_path) = remainder
+        .split_once('/')
+        .ok_or_else(|| "Skill resource URI must use skill://<name>/<path>".to_string())?;
+    if name.is_empty() || encoded_path.is_empty() {
+        return Err("Skill resource URI must use skill://<name>/<path>".into());
+    }
+    let path = resource::percent_decode_path(encoded_path)?;
+    Ok((name.to_string(), path))
+}
+
+fn encode_cursor(offset: usize) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(offset.to_string())
+}
+
+fn decode_cursor(cursor: &str) -> Result<usize, String> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| "Invalid resources/list cursor".to_string())?;
+    let value =
+        String::from_utf8(bytes).map_err(|_| "Invalid resources/list cursor".to_string())?;
+    value
+        .parse::<usize>()
+        .map_err(|_| "Invalid resources/list cursor".to_string())
 }
 
 fn rpc_error(code: i32, message: &str) -> Value {
@@ -230,12 +324,12 @@ mod tests {
     fn index_and_resources_use_skill_uri_scheme() {
         let (_temp, catalog) = catalog_with_skill();
 
-        let index: Value = serde_json::from_str(&catalog.index_json().expect("index"))
-            .expect("index json");
+        let index: Value =
+            serde_json::from_str(&catalog.index_json().expect("index")).expect("index json");
         assert_eq!(index["skills"][0]["type"], "skill-md");
         assert_eq!(index["skills"][0]["url"], "skill://example/SKILL.md");
 
-        let listed = resources_list(&catalog);
+        let listed = resources_list(&catalog, &json!({})).expect("resources");
         assert!(listed["resources"]
             .as_array()
             .expect("resources")
@@ -261,9 +355,32 @@ mod tests {
         let (_temp, catalog) = catalog_with_skill();
         catalog.configure(SkillSettings::from_text(false, "skills"));
 
-        assert_eq!(resources_list(&catalog)["resources"], json!([]));
+        assert_eq!(
+            resources_list(&catalog, &json!({})).unwrap()["resources"],
+            json!([])
+        );
         let error = resource_read(&catalog, &json!({"uri": "skill://index.json"}))
             .expect_err("disabled resource read");
         assert_eq!(error["code"], -32602);
+    }
+
+    #[test]
+    fn resources_list_supports_opaque_cursor_pagination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..205 {
+            let skill_dir = temp.path().join(format!("skills/s{index}"));
+            fs::create_dir_all(&skill_dir).expect("skill dir");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: s{index}\ndescription: Skill {index}.\n---\nUse it.\n"),
+            )
+            .expect("skill");
+        }
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        let first = resources_list(&catalog, &json!({})).expect("first page");
+        assert_eq!(first["resources"].as_array().unwrap().len(), 200);
+        let cursor = first["nextCursor"].as_str().expect("cursor");
+        let second = resources_list(&catalog, &json!({"cursor": cursor})).expect("second");
+        assert!(!second["resources"].as_array().unwrap().is_empty());
     }
 }

@@ -9,10 +9,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use crate::tools::CancellationToken;
 use crate::tunnel::append_profile_log;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
@@ -29,16 +30,42 @@ pub struct McpProxyServerSpec {
     request_timeout: Duration,
 }
 
+fn catalog_tool_names(catalog: &[Value]) -> Vec<String> {
+    let mut names = catalog
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 async fn connect_initial_with_retry(
     spec: McpProxyServerSpec,
     workspace_id: String,
 ) -> Result<(Arc<ProxyServer>, Vec<Value>), String> {
     let mut last_error = String::new();
     for attempt in 1u8..=3 {
-        match ProxyServer::connect_initial(spec.clone(), workspace_id.clone()).await {
-            Ok(connected) => return Ok(connected),
-            Err(error) => {
+        let attempt_timeout = spec.request_timeout.min(Duration::from_secs(20));
+        match timeout(
+            attempt_timeout,
+            ProxyServer::connect_initial(spec.clone(), workspace_id.clone()),
+        )
+        .await
+        {
+            Ok(Ok(connected)) => return Ok(connected),
+            Ok(Err(error)) => {
                 last_error = error;
+                if attempt < 3 {
+                    tokio::time::sleep(proxy_reconnect_delay(attempt)).await;
+                }
+            }
+            Err(_) => {
+                last_error = format!(
+                    "initial connection attempt timed out after {} seconds",
+                    attempt_timeout.as_secs()
+                );
                 if attempt < 3 {
                     tokio::time::sleep(proxy_reconnect_delay(attempt)).await;
                 }
@@ -53,6 +80,7 @@ async fn connect_initial_with_retry(
 struct ProxyServer {
     spec: McpProxyServerSpec,
     workspace_id: String,
+    catalog_names: Vec<String>,
     client: Mutex<Option<Arc<McpProxyClient>>>,
     reconnect_scheduled: AtomicBool,
 }
@@ -89,9 +117,21 @@ struct RegistryState {
     routes: HashMap<String, ProxyRoute>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct McpProxyRegistry {
     state: Arc<RwLock<RegistryState>>,
+    configured: Arc<AtomicBool>,
+    configured_notify: Arc<Notify>,
+}
+
+impl Default for McpProxyRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(RegistryState::default())),
+            configured: Arc::new(AtomicBool::new(true)),
+            configured_notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 struct McpProxyClient {
@@ -107,16 +147,32 @@ struct ProxyConnection {
 }
 
 impl McpProxyRegistry {
-    pub fn list_tools(&self) -> Vec<Value> {
-        self.state.read().expect("mcp proxy registry read").tools.clone()
+    pub fn begin_configuration(&self) {
+        self.configured.store(false, Ordering::Release);
+        *self.state.write().expect("mcp proxy registry write") = RegistryState::default();
     }
 
-    pub async fn configure(
-        &self,
-        specs: Vec<McpProxyServerSpec>,
-        workspace_id: &str,
-    ) {
-        *self.state.write().expect("mcp proxy registry write") = RegistryState::default();
+    pub async fn wait_until_configured(&self, limit: Duration) -> bool {
+        if self.configured.load(Ordering::Acquire) {
+            return true;
+        }
+        let notified = self.configured_notify.notified();
+        if self.configured.load(Ordering::Acquire) {
+            return true;
+        }
+        timeout(limit, notified).await.is_ok() && self.configured.load(Ordering::Acquire)
+    }
+
+    pub fn list_tools(&self) -> Vec<Value> {
+        self.state
+            .read()
+            .expect("mcp proxy registry read")
+            .tools
+            .clone()
+    }
+
+    pub async fn configure(&self, specs: Vec<McpProxyServerSpec>, workspace_id: &str) {
+        self.begin_configuration();
         let mut tasks = JoinSet::new();
         for spec in specs {
             let server_name = spec.name.clone();
@@ -174,11 +230,8 @@ impl McpProxyRegistry {
                             format!("[{server_name}] {description}")
                         });
                         if merged.get("title").is_none() {
-                            merged["title"] = Value::String(format!(
-                                "{} · {}",
-                                server_name,
-                                downstream_name
-                            ));
+                            merged["title"] =
+                                Value::String(format!("{} · {}", server_name, downstream_name));
                         }
 
                         state.routes.insert(
@@ -205,9 +258,7 @@ impl McpProxyRegistry {
                     append_profile_log(
                         &workspace_id,
                         "stdout.log",
-                        &format!(
-                            "[mcp-proxy:{server_name}] connected; merged {added} tools"
-                        ),
+                        &format!("[mcp-proxy:{server_name}] connected; merged {added} tools"),
                     );
                 }
                 Err(error) => append_profile_log(
@@ -217,9 +268,25 @@ impl McpProxyRegistry {
                 ),
             }
         }
+        self.configured.store(true, Ordering::Release);
+        self.configured_notify.notify_waiters();
     }
 
-    pub async fn call_tool(&self, public_name: &str, arguments: &Value) -> Option<Result<Value, Value>> {
+    pub async fn call_tool(
+        &self,
+        public_name: &str,
+        arguments: &Value,
+    ) -> Option<Result<Value, Value>> {
+        self.call_tool_with_cancellation(public_name, arguments, &CancellationToken::default())
+            .await
+    }
+
+    pub async fn call_tool_with_cancellation(
+        &self,
+        public_name: &str,
+        arguments: &Value,
+        cancellation: &CancellationToken,
+    ) -> Option<Result<Value, Value>> {
         let route = self
             .state
             .read()
@@ -240,37 +307,47 @@ impl McpProxyRegistry {
                     "proxy_reconnect_failed",
                     message,
                     true,
+                    true,
                 )));
             }
         };
         let result = client
-            .request(
+            .request_with_cancellation(
                 "tools/call",
                 json!({
                     "name": route.downstream_name,
                     "arguments": arguments
                 }),
+                cancellation,
             )
             .await;
         if let Err(message) = &result {
+            let cancelled = message == "request cancelled";
             server.invalidate_client(&client).await;
-            server.clone().schedule_reconnect();
-            append_profile_log(
-                &server.workspace_id,
-                "stderr.log",
-                &format!(
-                    "[mcp-proxy:{server_name}] connection lost; reconnect scheduled: {message}"
-                ),
-            );
+            if !cancelled {
+                server.clone().schedule_reconnect();
+            }
+            let log_message = if cancelled {
+                format!("[mcp-proxy:{server_name}] request cancelled; next call will reconnect")
+            } else {
+                format!("[mcp-proxy:{server_name}] connection lost; reconnect scheduled: {message}")
+            };
+            append_profile_log(&server.workspace_id, "stderr.log", &log_message);
         }
 
         Some(result.map_err(|message| {
+            let cancelled = message == "request cancelled";
             proxy_call_error(
                 &server_name,
                 public_name,
-                "proxy_call_failed",
+                if cancelled {
+                    "proxy_call_cancelled"
+                } else {
+                    "proxy_call_failed"
+                },
                 message,
-                true,
+                !cancelled,
+                !cancelled,
             )
         }))
     }
@@ -282,10 +359,12 @@ impl ProxyServer {
         workspace_id: String,
     ) -> Result<(Arc<Self>, Vec<Value>), String> {
         let (client, catalog) = McpProxyClient::connect(spec.clone(), &workspace_id).await?;
+        let catalog_names = catalog_tool_names(&catalog);
         Ok((
             Arc::new(Self {
                 spec,
                 workspace_id,
+                catalog_names,
                 client: Mutex::new(Some(client)),
                 reconnect_scheduled: AtomicBool::new(false),
             }),
@@ -298,7 +377,15 @@ impl ProxyServer {
         if let Some(current) = client.as_ref() {
             return Ok(current.clone());
         }
-        let (connected, _) = McpProxyClient::connect(self.spec.clone(), &self.workspace_id).await?;
+        let (connected, catalog) =
+            McpProxyClient::connect(self.spec.clone(), &self.workspace_id).await?;
+        let reconnected_names = catalog_tool_names(&catalog);
+        if reconnected_names != self.catalog_names {
+            return Err(format!(
+                "downstream tool catalog changed from {:?} to {:?}; restart the MCP listener to renegotiate tools/list",
+                self.catalog_names, reconnected_names
+            ));
+        }
         *client = Some(connected.clone());
         append_profile_log(
             &self.workspace_id,
@@ -353,6 +440,7 @@ fn proxy_call_error(
     reason: &str,
     detail: String,
     retryable: bool,
+    reconnect_scheduled: bool,
 ) -> Value {
     json!({
         "code": -32603,
@@ -364,7 +452,7 @@ fn proxy_call_error(
             "detail": detail,
             "retryable": retryable,
             "request_replayed": false,
-            "reconnect_scheduled": true
+            "reconnect_scheduled": reconnect_scheduled
         }
     })
 }
@@ -430,7 +518,7 @@ impl McpProxyClient {
             .request(
                 "initialize",
                 json!({
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "coding-tools-mcp-proxy",
@@ -439,7 +527,9 @@ impl McpProxyClient {
                 }),
             )
             .await?;
-        client.notify("notifications/initialized", json!({})).await?;
+        client
+            .notify("notifications/initialized", json!({}))
+            .await?;
         let tools = client.list_tools().await?;
         Ok((client, tools))
     }
@@ -471,8 +561,21 @@ impl McpProxyClient {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_cancellation(method, params, &CancellationToken::default())
+            .await
+    }
+
+    async fn request_with_cancellation(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, String> {
         let result = timeout(self.request_timeout, async {
-            let mut connection = self.connection.lock().await;
+            let mut connection = tokio::select! {
+                _ = cancellation.cancelled() => return Err("request cancelled".to_string()),
+                connection = self.connection.lock() => connection,
+            };
             let id = connection.next_id;
             connection.next_id += 1;
             let request = json!({
@@ -481,7 +584,21 @@ impl McpProxyClient {
                 "method": method,
                 "params": params
             });
-            request_over_stdio(&mut connection, id, &request).await
+            let cancelled = {
+                let response = request_over_stdio(&mut connection, id, &request);
+                tokio::pin!(response);
+                tokio::select! {
+                    result = &mut response => return result,
+                    _ = cancellation.cancelled() => true,
+                }
+            };
+            if cancelled {
+                let _ = connection.child.kill().await;
+                let _ = connection.child.wait().await;
+                Err("request cancelled".to_string())
+            } else {
+                unreachable!()
+            }
         })
         .await;
 
@@ -584,11 +701,9 @@ async fn request_over_stdio(
                     .write_all(&encoded)
                     .await
                     .map_err(|error| format!("failed to reject downstream request: {error}"))?;
-                connection
-                    .stdin
-                    .write_all(b"\n")
-                    .await
-                    .map_err(|error| format!("failed to terminate downstream rejection: {error}"))?;
+                connection.stdin.write_all(b"\n").await.map_err(|error| {
+                    format!("failed to terminate downstream rejection: {error}")
+                })?;
                 connection
                     .stdin
                     .flush()
@@ -618,8 +733,8 @@ pub fn parse_mcp_proxy_config(
         return Ok(Vec::new());
     }
 
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|error| format!("MCP 聚合配置不是有效 JSON: {error}"))?;
+    let value: Value =
+        serde_json::from_str(raw).map_err(|error| format!("MCP 聚合配置不是有效 JSON: {error}"))?;
     let servers_value = value
         .get("mcpServers")
         .cloned()
@@ -663,11 +778,16 @@ pub fn parse_mcp_proxy_config(
             .cwd
             .map(|cwd| expand_workspace_placeholders(&cwd, &workspace_display))
             .map(PathBuf::from)
-            .map(|cwd| if cwd.is_absolute() { cwd } else { workspace_path.join(cwd) })
+            .map(|cwd| {
+                if cwd.is_absolute() {
+                    cwd
+                } else {
+                    workspace_path.join(cwd)
+                }
+            })
             .unwrap_or_else(|| workspace_path.to_path_buf());
-        let tool_prefix = sanitize_tool_segment(
-            config.tool_prefix.as_deref().unwrap_or(name.as_str()),
-        );
+        let tool_prefix =
+            sanitize_tool_segment(config.tool_prefix.as_deref().unwrap_or(name.as_str()));
 
         specs.push(McpProxyServerSpec {
             name,
@@ -722,6 +842,8 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::tools::CancellationToken;
+
     use super::{parse_mcp_proxy_config, McpProxyRegistry, McpProxyServerSpec};
 
     #[test]
@@ -755,6 +877,90 @@ mod tests {
         .expect_err("reject unsupported transport");
 
         assert!(error.contains("only stdio is supported"));
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_initial_configuration() {
+        let registry = McpProxyRegistry::default();
+        registry.begin_configuration();
+        assert!(
+            !registry
+                .wait_until_configured(Duration::from_millis(10))
+                .await
+        );
+
+        let configured = registry.clone();
+        tokio::spawn(async move {
+            configured.configure(Vec::new(), "readiness-test").await;
+        });
+        assert!(registry.wait_until_configured(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_downstream_call_without_replaying() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("slow_mcp.py");
+        fs::write(
+            &script,
+            r#"import json
+import sys
+import time
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "slow", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "slow", "description": "Slow", "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        time.sleep(30)
+        result = {"content": [{"type": "text", "text": "too late"}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .expect("write fixture");
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![McpProxyServerSpec {
+                    name: "slow".into(),
+                    command: python.display().to_string(),
+                    args: vec![script.display().to_string()],
+                    env: BTreeMap::new(),
+                    cwd: temp.path().to_path_buf(),
+                    tool_prefix: "slow".into(),
+                    request_timeout: Duration::from_secs(5),
+                }],
+                "proxy-cancellation-test",
+            )
+            .await;
+
+        let token = CancellationToken::default();
+        let worker_registry = registry.clone();
+        let worker_token = token.clone();
+        let worker = tokio::spawn(async move {
+            worker_registry
+                .call_tool_with_cancellation("slow__slow", &json!({}), &worker_token)
+                .await
+                .expect("known route")
+                .expect_err("cancelled call")
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        token.cancel();
+        let error = worker.await.expect("worker");
+        assert_eq!(error["data"]["reason"], "proxy_call_cancelled");
+        assert_eq!(error["data"]["request_replayed"], false);
+        assert_eq!(error["data"]["reconnect_scheduled"], false);
     }
 
     #[tokio::test]
@@ -800,10 +1006,7 @@ for raw in sys.stdin:
                 vec![McpProxyServerSpec {
                     name: "unstable".into(),
                     command: python.display().to_string(),
-                    args: vec![
-                        script.display().to_string(),
-                        marker.display().to_string(),
-                    ],
+                    args: vec![script.display().to_string(), marker.display().to_string()],
                     env: BTreeMap::new(),
                     cwd: temp.path().to_path_buf(),
                     tool_prefix: "unstable".into(),
@@ -832,5 +1035,77 @@ for raw in sys.stdin:
             .expect("known route")
             .expect("second call reconnects");
         assert_eq!(second["structuredContent"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_a_changed_tool_catalog() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("catalog_drift_mcp.py");
+        let marker = temp.path().join("catalog-drift");
+        fs::write(
+            &script,
+            r#"import json
+import os
+import sys
+
+marker = sys.argv[1]
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "drift", "version": "1"}}
+    elif method == "tools/list":
+        tools = [{"name": "ping", "inputSchema": {"type": "object", "properties": {}}}]
+        if os.path.exists(marker):
+            tools.append({"name": "new_tool", "inputSchema": {"type": "object", "properties": {}}})
+        result = {"tools": tools}
+    elif method == "tools/call":
+        open(marker, "w", encoding="utf-8").write("drift")
+        sys.exit(0)
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .expect("write fixture");
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![McpProxyServerSpec {
+                    name: "drift".into(),
+                    command: python.display().to_string(),
+                    args: vec![script.display().to_string(), marker.display().to_string()],
+                    env: BTreeMap::new(),
+                    cwd: temp.path().to_path_buf(),
+                    tool_prefix: "drift".into(),
+                    request_timeout: Duration::from_secs(5),
+                }],
+                "proxy-catalog-drift-test",
+            )
+            .await;
+
+        let first = registry
+            .call_tool("drift__ping", &json!({}))
+            .await
+            .expect("known route")
+            .expect_err("first call disconnects");
+        assert_eq!(first["data"]["request_replayed"], false);
+
+        let second = registry
+            .call_tool("drift__ping", &json!({}))
+            .await
+            .expect("known route")
+            .expect_err("catalog drift rejects reconnect");
+        assert_eq!(second["data"]["reason"], "proxy_reconnect_failed");
+        assert!(second["data"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("tool catalog changed")));
     }
 }

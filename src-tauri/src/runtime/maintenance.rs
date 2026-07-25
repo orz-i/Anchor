@@ -12,7 +12,8 @@ use crate::app_state::AppState;
 use crate::error::AppResult;
 #[cfg(feature = "desktop")]
 use crate::tunnel::{
-    append_profile_log, cleanup_orphan_for_runtime, ensure_for_runtime, TunnelServiceKind,
+    append_profile_log, cleanup_orphan_for_runtime, ensure_for_runtime,
+    is_quick_tunnel_url_change_error, TunnelServiceKind,
 };
 #[cfg(feature = "desktop")]
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
@@ -104,6 +105,17 @@ async fn maintain_tunnel(
                 retries.remove(&key);
             }
             Err(error) => {
+                if is_quick_tunnel_url_change_error(&error) {
+                    retries.remove(&key);
+                    append_profile_log(
+                        &profile.id,
+                        stderr_log_name(kind),
+                        &format!(
+                            "[recovery] Quick Tunnel 地址发生变化，已停止自动重试，需要人工更新 ChatGPT 地址：{error}"
+                        ),
+                    );
+                    return;
+                }
                 let attempts = retries
                     .get(&key)
                     .map(|retry| retry.attempts.saturating_add(1))
@@ -182,4 +194,3 @@ fn stderr_log_name(kind: TunnelServiceKind) -> &'static str {
         TunnelServiceKind::Actions => "actions-stderr.log",
     }
 }
-

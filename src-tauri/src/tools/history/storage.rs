@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -12,6 +13,8 @@ use super::markdown;
 use super::model::{HistoryDocument, HistoryIndex, IndexEntry, ScanReport};
 
 pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
+const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const HISTORY_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 pub struct HistoryLock {
     file: File,
@@ -99,8 +102,39 @@ pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
         .write(true)
         .open(lock_path)
         .map_err(|error| io_error("HISTORY_LOCK_FAILED", error, true))?;
-    FileExt::lock_exclusive(&file).map_err(|error| io_error("HISTORY_LOCK_FAILED", error, true))?;
+    let started = Instant::now();
+    loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(error) if lock_is_contended(&error) => {
+                if started.elapsed() >= HISTORY_LOCK_TIMEOUT {
+                    return Err(WorkspaceError::ToolDetails {
+                        code: "HISTORY_LOCK_TIMEOUT",
+                        message: format!(
+                            "History directory lock was not available after {} seconds",
+                            HISTORY_LOCK_TIMEOUT.as_secs()
+                        ),
+                        category: "runtime",
+                        retryable: true,
+                        details: serde_json::json!({
+                            "termination_reason": "timeout",
+                            "timeout_ms": HISTORY_LOCK_TIMEOUT.as_millis(),
+                            "recoverable": true
+                        }),
+                    });
+                }
+                std::thread::sleep(HISTORY_LOCK_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(io_error("HISTORY_LOCK_FAILED", error, true));
+            }
+        }
+    }
     Ok(HistoryLock { file })
+}
+
+fn lock_is_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock || matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanReport> {

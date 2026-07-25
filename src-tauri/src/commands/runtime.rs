@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult};
 
 use crate::runtime::{
     await_listener_shutdown, port_busy_message, try_reclaim_previous_macos_app_port,
-    wait_for_port_free, ServiceKind,
+    update_public_url, wait_for_port_free, ServiceKind,
 };
 
 use crate::platform::platform;
@@ -61,7 +61,13 @@ fn persist_tunnel_url(
         store.update(profile)?;
 
         Ok(())
-    })
+    })?;
+    let service = match kind {
+        TunnelServiceKind::Mcp => "mcp",
+        TunnelServiceKind::Actions => "actions",
+    };
+    update_public_url(id, service, url);
+    Ok(())
 }
 
 async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {

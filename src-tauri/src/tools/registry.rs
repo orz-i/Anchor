@@ -36,7 +36,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "load_skill",
         "Load Agent Skill",
-        "Load the complete SKILL.md instructions for one discovered skill. Skill scripts are not executed.",
+        "Load bounded instructions for one discovered skill and resolve its declared tool dependencies against the current MCP catalog. Declarations never grant permissions.",
         true,
         false,
         false,
@@ -173,7 +173,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "set_default_cwd",
         "Set default cwd",
         "Set the default cwd for relative tool paths inside the workspace.",
-        true,
+        false,
         false,
         false,
     ),
@@ -361,7 +361,6 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "read_skill_resource",
     "check_exec_environment",
     "get_default_cwd",
-    "set_default_cwd",
     "read_file",
     "list_dir",
     "list_files",
@@ -544,7 +543,7 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "name": { "type": "string", "minLength": 1 },
-                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 262144 }
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 131072, "default": 65536 }
             },
             "required": ["name"],
             "additionalProperties": false
@@ -960,5 +959,20 @@ mod tests {
             assert!(schema.get("anyOf").is_none(), "{name} anyOf");
             assert!(schema.get("$ref").is_none(), "{name} ref");
         }
+    }
+
+    #[test]
+    fn read_only_catalog_excludes_state_mutation_tools() {
+        let tools = list_tools_for_profile("read-only");
+        let names: Vec<_> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect();
+
+        assert!(!names.contains(&"set_default_cwd"));
+        assert!(!names.contains(&"apply_patch"));
+        assert!(!names.contains(&"exec_command"));
+        assert!(names.contains(&"get_default_cwd"));
+        assert!(names.contains(&"read_file"));
     }
 }

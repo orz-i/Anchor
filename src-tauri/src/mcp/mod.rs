@@ -1,4 +1,5 @@
 mod listener;
+pub(crate) mod protocol;
 pub(crate) mod proxy;
 mod server;
 

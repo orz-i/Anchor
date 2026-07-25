@@ -20,9 +20,6 @@
 
   function validateRedirectUris(raw: string) {
     const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-    if (values.length === 0) {
-      throw new Error("OAuth 回调 URL 不能为空；请从 ChatGPT 复制完整 callback URL");
-    }
     for (const value of values) {
       if (value.includes("*")) throw new Error(`OAuth 回调 URL 不允许通配符：${value}`);
       let parsed: URL;
@@ -39,6 +36,18 @@
     }
   }
 
+  function validateRedirectHosts(raw: string) {
+    const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    for (const value of values) {
+      if (!/^(\*\.)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(value) || value.includes("..")) {
+        throw new Error(`Callback 域名格式无效：${value}`);
+      }
+      if (value.includes(":") || value.includes("/") || value.includes("?")) {
+        throw new Error(`Callback 域名只能填写主机名或 *.域名：${value}`);
+      }
+    }
+  }
+
   const AUTH_OPTIONS = [
     { value: "oauth", label: "OAuth" },
     { value: "bearer", label: "Bearer Token" },
@@ -51,6 +60,7 @@
     type: "oauth",
     oauth_client_id: "",
     oauth_redirect_uris: "",
+    oauth_redirect_hosts: "",
     use_shared_secrets: false,
   });
   let saving = $state(false);
@@ -73,6 +83,7 @@
         ? draft.oauth_client_id !== loadedSharedOauthClientId
         : draft.oauth_client_id !== auth.oauth_client_id) ||
       (draft.oauth_redirect_uris ?? "") !== (auth.oauth_redirect_uris ?? "") ||
+      (draft.oauth_redirect_hosts ?? "") !== (auth.oauth_redirect_hosts ?? "") ||
       draft.use_shared_secrets !== !!auth.use_shared_secrets ||
       secretsDirty,
   );
@@ -85,6 +96,7 @@
       type: auth.type,
       oauth_client_id: auth.oauth_client_id,
       oauth_redirect_uris: auth.oauth_redirect_uris ?? "",
+      oauth_redirect_hosts: auth.oauth_redirect_hosts ?? "",
       use_shared_secrets: !!auth.use_shared_secrets,
     };
   });
@@ -139,6 +151,10 @@
     try {
       if (draft.type === "oauth") {
         validateRedirectUris(draft.oauth_redirect_uris ?? "");
+        validateRedirectHosts(draft.oauth_redirect_hosts ?? "");
+        if (!(draft.oauth_redirect_uris ?? "").trim() && !(draft.oauth_redirect_hosts ?? "").trim()) {
+          throw new Error("请至少配置一个精确 Callback URL 或 Callback 域名白名单");
+        }
       }
       if (draft.type === "oauth" && draft.use_shared_secrets) {
         const clientId = draft.oauth_client_id.trim();
@@ -149,6 +165,8 @@
       await onSaveProfile({ ...draft });
       // Auth save only persists profile fields; secrets are already stored by regenerate.
       loadedSecrets = { ...secrets };
+    } catch (error) {
+      await message(String(error), { title: "认证配置保存失败", kind: "error" });
     } finally {
       suppressSecretsReload = false;
       saving = false;
@@ -220,7 +238,7 @@
     </label>
 
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">允许的 OAuth Callback URL</span>
+      <span class="text-xs text-[var(--color-text-muted)]">精确 OAuth Callback URL（可选）</span>
       <textarea
         rows="3"
         class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
@@ -228,7 +246,21 @@
         placeholder="https://chatgpt.com/connector/oauth/&lt;callback_id&gt;"
       ></textarea>
       <span class="text-xs text-[var(--color-text-muted)]">
-        从 ChatGPT 应用配置页复制完整 callback URL，每行一个；必须精确匹配，不支持通配符。
+        每行一个精确 URL。已知固定 callback 时可直接登记；真正发码始终绑定精确 URL。
+      </span>
+    </label>
+
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--color-text-muted)]">Callback 域名登记白名单</span>
+      <textarea
+        rows="3"
+        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+        bind:value={draft.oauth_redirect_hosts}
+        placeholder="chatgpt.com&#10;*.chatgpt.com"
+      ></textarea>
+      <span class="text-xs text-[var(--color-text-muted)]">
+        支持精确域名和 <code>*.example.com</code>。通配符只允许授权页登记该域名下出现的完整 callback；
+        用户确认后会热登记精确 URL 并继续授权，不修改 profile、不重启 listener、不更换隧道地址。
       </span>
     </label>
 

@@ -18,6 +18,7 @@
     authType: string;
     oauthClientId: string;
     oauthRedirectUris: string;
+    oauthRedirectHosts: string;
     oauthScopes: string;
     openapiUrl: string;
     privacyUrl: string;
@@ -29,9 +30,6 @@
 
   function validateRedirectUris(raw: string) {
     const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-    if (values.length === 0) {
-      throw new Error("OAuth Callback URL 不能为空；请从 ChatGPT 复制完整 URL");
-    }
     for (const value of values) {
       if (value.includes("*")) throw new Error(`OAuth Callback URL 不允许通配符：${value}`);
       let parsed: URL;
@@ -48,11 +46,24 @@
     }
   }
 
+  function validateRedirectHosts(raw: string) {
+    const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    for (const value of values) {
+      if (!/^(\*\.)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(value) || value.includes("..")) {
+        throw new Error(`Callback 域名格式无效：${value}`);
+      }
+      if (value.includes(":") || value.includes("/") || value.includes("?")) {
+        throw new Error(`Callback 域名只能填写主机名或 *.域名：${value}`);
+      }
+    }
+  }
+
   let {
     workspaceId,
     authType,
     oauthClientId,
     oauthRedirectUris,
+    oauthRedirectHosts,
     oauthScopes,
     openapiUrl,
     privacyUrl,
@@ -65,6 +76,7 @@
   let draftAuthType = $state("api_key");
   let draftOauthClientId = $state("");
   let draftOauthRedirectUris = $state("");
+  let draftOauthRedirectHosts = $state("");
   let draftOauthScopes = $state("");
   let draftUseShared = $state(false);
   let apiKey = $state("");
@@ -98,6 +110,7 @@
     draftAuthType !== authType ||
       draftOauthClientId !== oauthClientId ||
       draftOauthRedirectUris !== oauthRedirectUris ||
+      draftOauthRedirectHosts !== oauthRedirectHosts ||
       draftOauthScopes !== oauthScopes ||
       draftUseShared !== useSharedSecrets ||
       secretsDirty,
@@ -109,6 +122,7 @@
     draftAuthType = authType;
     draftOauthClientId = oauthClientId;
     draftOauthRedirectUris = oauthRedirectUris;
+    draftOauthRedirectHosts = oauthRedirectHosts;
     draftOauthScopes = oauthScopes;
     draftUseShared = useSharedSecrets;
   });
@@ -164,11 +178,18 @@
     saving = true;
     suppressSecretsReload = true;
     try {
-      if (draftAuthType === "oauth") validateRedirectUris(draftOauthRedirectUris);
+      if (draftAuthType === "oauth") {
+        validateRedirectUris(draftOauthRedirectUris);
+        validateRedirectHosts(draftOauthRedirectHosts);
+        if (!draftOauthRedirectUris.trim() && !draftOauthRedirectHosts.trim()) {
+          throw new Error("请至少配置一个精确 Callback URL 或 Callback 域名白名单");
+        }
+      }
       await onSave({
         authType: draftAuthType,
         oauthClientId: draftOauthClientId.trim(),
         oauthRedirectUris: draftOauthRedirectUris.trim(),
+        oauthRedirectHosts: draftOauthRedirectHosts.trim(),
         oauthScopes: draftOauthScopes.trim(),
         useSharedSecrets: draftUseShared,
       });
@@ -176,6 +197,8 @@
       loadedOauthClientSecret = oauthClientSecret;
       loadedOauthPassword = oauthPassword;
       loadedOauthTokenSecret = oauthTokenSecret;
+    } catch (error) {
+      await message(String(error), { title: "认证配置保存失败", kind: "error" });
     } finally {
       suppressSecretsReload = false;
       saving = false;
@@ -284,7 +307,7 @@
       />
     </label>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">允许的 OAuth Callback URL</span>
+      <span class="text-xs text-[var(--color-text-muted)]">精确 OAuth Callback URL（可选）</span>
       <textarea
         rows="3"
         class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
@@ -292,7 +315,19 @@
         placeholder="https://chatgpt.com/connector/oauth/&lt;callback_id&gt;"
       ></textarea>
       <span class="text-xs text-[var(--color-text-muted)]">
-        从 ChatGPT 复制完整 callback URL，每行一个；必须精确匹配。
+        每行一个精确 URL；真正发码始终绑定精确 callback。
+      </span>
+    </label>
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--color-text-muted)]">Callback 域名登记白名单</span>
+      <textarea
+        rows="3"
+        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+        bind:value={draftOauthRedirectHosts}
+        placeholder="chatgpt.com&#10;*.chatgpt.com"
+      ></textarea>
+      <span class="text-xs text-[var(--color-text-muted)]">
+        支持 <code>*.example.com</code>。匹配后在授权页确认并热登记完整 URL，不重启服务或隧道。
       </span>
     </label>
     <p class="text-xs text-[var(--color-text-muted)]">

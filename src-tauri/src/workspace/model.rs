@@ -44,6 +44,9 @@ pub struct AuthConfig {
     /// Exact OAuth callback URLs registered for this MCP client, one per line.
     #[serde(default)]
     pub oauth_redirect_uris: String,
+    /// Callback host enrollment allowlist, one host or `*.suffix` per line.
+    #[serde(default)]
+    pub oauth_redirect_hosts: String,
     #[serde(default)]
     pub use_shared_secrets: bool,
 }
@@ -109,6 +112,9 @@ pub struct ActionsConfig {
     /// Exact OAuth callback URLs registered for this Actions client, one per line.
     #[serde(default)]
     pub oauth_redirect_uris: String,
+    /// Callback host enrollment allowlist, one host or `*.suffix` per line.
+    #[serde(default)]
+    pub oauth_redirect_hosts: String,
     #[serde(default)]
     pub oauth_scopes: String,
     #[serde(default = "default_allowed_commands")]
@@ -238,6 +244,7 @@ impl Default for AuthConfig {
             auth_type: default_auth_type(),
             oauth_client_id: default_oauth_client_id(),
             oauth_redirect_uris: String::new(),
+            oauth_redirect_hosts: String::new(),
             use_shared_secrets: false,
         }
     }
@@ -278,6 +285,7 @@ impl Default for ActionsConfig {
             auth_type: default_actions_auth_type(),
             oauth_client_id: default_actions_oauth_client_id(),
             oauth_redirect_uris: String::new(),
+            oauth_redirect_hosts: String::new(),
             oauth_scopes: String::new(),
             allowed_commands: default_allowed_commands(),
             max_patch_bytes: default_max_patch_bytes(),
@@ -424,13 +432,10 @@ mod tests {
 
     #[test]
     fn legacy_runtime_config_enables_default_skill_roots() {
-        let runtime: RuntimeConfig = serde_json::from_value(serde_json::json!({}))
-            .expect("legacy runtime config");
+        let runtime: RuntimeConfig =
+            serde_json::from_value(serde_json::json!({})).expect("legacy runtime config");
 
         assert!(runtime.skill_service_enabled);
-        assert_eq!(
-            runtime.skill_roots,
-            ".agents/skills\n.codex/skills\nskills"
-        );
+        assert_eq!(runtime.skill_roots, ".agents/skills\n.codex/skills\nskills");
     }
 }

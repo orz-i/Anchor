@@ -26,6 +26,14 @@ export interface SkillFileSummary {
   sizeBytes: number;
   mimeType: string;
   readable: boolean;
+  digest: string;
+}
+
+export interface SkillToolResolution {
+  declared: string;
+  status: "resolved" | "missing" | "ambiguous";
+  resolved?: string | null;
+  candidates: string[];
 }
 
 export interface SkillSummary {
@@ -33,13 +41,27 @@ export interface SkillSummary {
   description: string;
   license?: string | null;
   compatibility?: string | null;
-  sourceRoot: string;
-  skillDir: string;
+  metadata: Record<string, string>;
+  allowedTools: string[];
+  resolvedTools: string[];
+  missingTools: string[];
+  ambiguousTools: string[];
+  toolResolution: SkillToolResolution[];
+  toolDependenciesEvaluated: boolean;
+  toolCompatible: boolean;
+  toolEnforcementMode: string;
+  toolGrantsPermissions: boolean;
+  source: "workspace" | "home" | "external";
+  sourceId: string;
+  relativePath: string;
   uri: string;
   digest: string;
   resources: SkillFileSummary[];
   scripts: SkillFileSummary[];
   scriptExecutionEnabled: boolean;
+  scriptExecutionPolicy: string;
+  resourceTruncated: boolean;
+  warnings: string[];
 }
 
 export interface SkillInspection {
@@ -49,12 +71,16 @@ export interface SkillInspection {
   warnings: string[];
   truncated: boolean;
   scriptExecutionEnabled: boolean;
+  scriptExecutionPolicy: string;
+  snapshotMode: string;
+  catalogDigest: string;
 }
 
 export interface AuthConfig {
   type: string;
   oauth_client_id: string;
   oauth_redirect_uris?: string;
+  oauth_redirect_hosts?: string;
   use_shared_secrets?: boolean;
 }
 
@@ -87,6 +113,7 @@ export interface ActionsConfig {
   auth_type: string;
   oauth_client_id?: string;
   oauth_redirect_uris?: string;
+  oauth_redirect_hosts?: string;
   oauth_scopes?: string;
   allowed_commands?: string;
   max_patch_bytes?: number;
@@ -151,6 +178,7 @@ export interface ActionsAuthDraft {
   authType: string;
   oauthClientId: string;
   oauthRedirectUris: string;
+  oauthRedirectHosts: string;
   oauthScopes: string;
   useSharedSecrets?: boolean;
 }

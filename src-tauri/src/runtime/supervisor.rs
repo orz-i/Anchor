@@ -123,13 +123,15 @@ impl RuntimeSupervisor {
         self.entries
             .iter()
             .filter_map(|((workspace_id, kind), entry)| match entry.phase {
-                RuntimePhase::Running | RuntimePhase::Starting | RuntimePhase::Recovering => Some((
-                    workspace_id.clone(),
-                    match kind {
-                        ServiceKind::Mcp => TunnelServiceKind::Mcp,
-                        ServiceKind::Actions => TunnelServiceKind::Actions,
-                    },
-                )),
+                RuntimePhase::Running | RuntimePhase::Starting | RuntimePhase::Recovering => {
+                    Some((
+                        workspace_id.clone(),
+                        match kind {
+                            ServiceKind::Mcp => TunnelServiceKind::Mcp,
+                            ServiceKind::Actions => TunnelServiceKind::Actions,
+                        },
+                    ))
+                }
                 _ => None,
             })
             .collect()
@@ -273,16 +275,20 @@ impl RuntimeSupervisor {
         recovery: bool,
     ) -> AppResult<RuntimeStatusDto> {
         let key = (profile.id.clone(), kind);
-        if !recovery && matches!(
-            self.entries.get(&key).map(|e| &e.phase),
-            Some(RuntimePhase::Running) | Some(RuntimePhase::Starting)
-        ) {
+        if !recovery
+            && matches!(
+                self.entries.get(&key).map(|e| &e.phase),
+                Some(RuntimePhase::Running) | Some(RuntimePhase::Starting)
+            )
+        {
             return Ok(self.status(profile, kind));
         }
-        if !recovery && matches!(
-            self.entries.get(&key).map(|e| &e.phase),
-            Some(RuntimePhase::Stopping)
-        ) {
+        if !recovery
+            && matches!(
+                self.entries.get(&key).map(|e| &e.phase),
+                Some(RuntimePhase::Stopping)
+            )
+        {
             return Err(crate::error::AppError::Message(format!(
                 "{}正在停止，请稍后再试",
                 service_label(kind).trim()
@@ -436,6 +442,7 @@ impl RuntimeSupervisor {
                     api_key,
                     profile.actions.oauth_client_id.clone(),
                     profile.actions.oauth_redirect_uris.clone(),
+                    profile.actions.oauth_redirect_hosts.clone(),
                     oauth_client_secret,
                     oauth_password,
                     oauth_token_secret,
@@ -548,9 +555,8 @@ impl RuntimeSupervisor {
                 missing_port_checks: 0,
                 desired_running: !exhausted,
                 recovery_attempt: attempt,
-                next_retry_at: (!exhausted).then(|| {
-                    std::time::Instant::now() + recovery_delay(attempt)
-                }),
+                next_retry_at: (!exhausted)
+                    .then(|| std::time::Instant::now() + recovery_delay(attempt)),
                 recovered_count,
             },
         );
@@ -658,9 +664,7 @@ impl RuntimeSupervisor {
                     entry.started_at = None;
                     entry.desired_running = true;
                     entry.recovery_attempt = 0;
-                    entry.next_retry_at = Some(
-                        std::time::Instant::now() + recovery_delay(0),
-                    );
+                    entry.next_retry_at = Some(std::time::Instant::now() + recovery_delay(0));
                     append_profile_log(
                         &profile.id,
                         stderr_log_name(kind),
@@ -696,7 +700,10 @@ fn recovery_delay(completed_attempts: u8) -> Duration {
 }
 
 fn recovery_message(service_label: &str, recovery: &RuntimeRecoveryDto) -> String {
-    let next_attempt = recovery.attempt.saturating_add(1).min(recovery.max_attempts);
+    let next_attempt = recovery
+        .attempt
+        .saturating_add(1)
+        .min(recovery.max_attempts);
     match recovery.retry_in_ms {
         Some(ms) => format!(
             "{}连接中断，{} 秒后进行第 {next_attempt}/{} 次自动恢复",

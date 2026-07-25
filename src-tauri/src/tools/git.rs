@@ -1,8 +1,9 @@
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use regex::Regex;
 use serde_json::{json, Value};
+use tokio::process::Command;
 
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 
@@ -96,9 +97,37 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::run_process_with_timeout;
+
+    #[test]
+    fn git_process_helper_enforces_deadline() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Instant::now();
+        let error = run_process_with_timeout(
+            &python.display().to_string(),
+            temp.path(),
+            &["-c".into(), "import time; time.sleep(30)".into()],
+            Duration::from_millis(100),
+        )
+        .expect_err("timeout");
+        assert_eq!(error.to_error_value()["code"], "GIT_TIMEOUT");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+}
+
 pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-    let unstaged = args.get("unstaged").and_then(Value::as_bool).unwrap_or(true);
+    let unstaged = args
+        .get("unstaged")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let context = args
         .get("context_lines")
         .and_then(Value::as_u64)
@@ -346,7 +375,10 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let end_line_arg = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line_arg = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_u64)
@@ -418,10 +450,7 @@ fn parse_git_blame_porcelain(output: &str) -> Vec<Value> {
         let parts: Vec<&str> = raw.split_whitespace().collect();
         if parts.len() >= 3 && commit_re.is_match(parts[0]) {
             current = serde_json::Map::new();
-            current.insert(
-                "commit".into(),
-                json!(parts[0].trim_start_matches('^')),
-            );
+            current.insert("commit".into(), json!(parts[0].trim_start_matches('^')));
             if parts[1].chars().all(|c| c.is_ascii_digit()) {
                 current.insert("original_line".into(), json!(parts[1].parse::<i64>().ok()));
             }
@@ -463,6 +492,7 @@ fn parse_git_blame_porcelain(output: &str) -> Vec<Value> {
     rows
 }
 
+#[derive(Debug)]
 struct GitOutput {
     success: bool,
     exit_code: i32,
@@ -470,14 +500,50 @@ struct GitOutput {
     stderr: String,
 }
 
-fn run_git(cwd: &std::path::Path, args: &[&str], limit: Duration) -> Result<GitOutput, WorkspaceError> {
-    let mut cmd = Command::new("git");
-    crate::platform::hide_std_console(&mut cmd);
-    cmd.arg("-C").arg(cwd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = cmd
-        .output()
-        .map_err(|e| git_error(&format!("git not available: {e}")))?;
-    let _ = limit;
+fn run_git(
+    cwd: &std::path::Path,
+    args: &[&str],
+    limit: Duration,
+) -> Result<GitOutput, WorkspaceError> {
+    let mut process_args = vec!["-C".to_string(), cwd.display().to_string()];
+    process_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    run_process_with_timeout("git", cwd, &process_args, limit)
+}
+
+fn run_process_with_timeout(
+    program: &str,
+    cwd: &std::path::Path,
+    args: &[String],
+    limit: Duration,
+) -> Result<GitOutput, WorkspaceError> {
+    let output = crate::async_runtime::block_on(async {
+        let mut cmd = Command::new(program);
+        crate::platform::hide_tokio_console(&mut cmd);
+        cmd.current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        match tokio::time::timeout(limit, cmd.output()).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(git_error(&format!("git not available: {error}"))),
+            Err(_) => Err(WorkspaceError::ToolDetails {
+                code: "GIT_TIMEOUT",
+                message: format!(
+                    "Git command timed out after {} seconds",
+                    limit.as_secs_f64()
+                ),
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "termination_reason": "timeout",
+                    "timeout_ms": limit.as_millis(),
+                    "recoverable": true
+                }),
+            }),
+        }
+    })?;
     Ok(GitOutput {
         success: output.status.success(),
         exit_code: output.status.code().unwrap_or(-1),

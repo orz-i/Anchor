@@ -79,6 +79,7 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_daemon_args(args: &[&str], workspace_id: &str) -> Option<(ServiceSelection, bool)> {
     let daemon_index = args.iter().position(|arg| *arg == "daemon-run")?;
     if args.get(daemon_index + 1).copied()? != workspace_id {
@@ -107,10 +108,7 @@ fn parse_daemon_args(args: &[&str], workspace_id: &str) -> Option<(ServiceSelect
     Some((service, tunnel))
 }
 
-pub async fn terminate_spawned(
-    profile: &WorkspaceProfile,
-    pid: u32,
-) -> AppResult<()> {
+pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResult<()> {
     ensure_linux()?;
     if !platform().is_process_alive(pid) {
         cleanup(profile)?;
@@ -217,8 +215,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
     };
     let state = match state {
         Some(state)
-            if state.schema_version != STATE_SCHEMA_VERSION
-                || state.workspace_id != profile.id =>
+            if state.schema_version != STATE_SCHEMA_VERSION || state.workspace_id != profile.id =>
         {
             state_error = Some(format!(
                 "状态文件与当前 workspace/schema 不匹配：workspace={} schema={}",
@@ -277,10 +274,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
         ambiguous: false,
         pid_matches,
         detail: if alive {
-            format!(
-                "状态文件中的 PID {} 属于其他进程，拒绝接管",
-                state.pid
-            )
+            format!("状态文件中的 PID {} 属于其他进程，拒绝接管", state.pid)
         } else {
             format!("daemon 状态已过期，PID {} 不存在", state.pid)
         },
@@ -300,7 +294,11 @@ fn running_inspection(state: DaemonState, recovered: bool) -> DaemonInspection {
             state.pid,
             state.service.as_str(),
             state.tunnel,
-            if recovered { "（从 /proc 恢复）" } else { "" }
+            if recovered {
+                "（从 /proc 恢复）"
+            } else {
+                ""
+            }
         ),
         state: Some(state),
     }
@@ -399,9 +397,9 @@ pub fn spawn(
         }
     }
 
-    let child = command.spawn().map_err(|error| {
-        AppError::Message(format!("启动 daemon 子进程失败：{error}"))
-    })?;
+    let child = command
+        .spawn()
+        .map_err(|error| AppError::Message(format!("启动 daemon 子进程失败：{error}")))?;
     Ok(child.id())
 }
 
@@ -486,8 +484,7 @@ pub async fn stop(
         }
         platform().terminate_process_tree(state.pid)?;
         let force_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while platform().is_process_alive(state.pid)
-            && tokio::time::Instant::now() < force_deadline
+        while platform().is_process_alive(state.pid) && tokio::time::Instant::now() < force_deadline
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -546,22 +543,19 @@ fn runtime_dir() -> AppResult<PathBuf> {
     #[cfg(unix)]
     {
         let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-        return Ok(select_runtime_dir(
-            config_dir,
-            xdg_runtime,
-            unsafe { libc::geteuid() },
-        ));
+        return Ok(select_runtime_dir(config_dir, xdg_runtime, unsafe {
+            libc::geteuid()
+        }));
     }
     #[cfg(not(unix))]
     if let Some(path) = config_dir {
         return Ok(path.join("run"));
     }
     #[allow(unreachable_code)]
-    Err(AppError::Message(
-        "无法确定 daemon 运行目录".into(),
-    ))
+    Err(AppError::Message("无法确定 daemon 运行目录".into()))
 }
 
+#[cfg(any(unix, test))]
 fn select_runtime_dir(
     config_dir: Option<PathBuf>,
     xdg_runtime: Option<PathBuf>,
@@ -677,7 +671,11 @@ fn ensure_private_dir(path: &Path) -> AppResult<()> {
 
 fn open_private_file(path: &Path, append: bool) -> AppResult<File> {
     let mut options = OpenOptions::new();
-    options.create(true).write(true).append(append).truncate(!append);
+    options
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

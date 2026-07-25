@@ -17,20 +17,16 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
 }
 
 #[test]
-fn checkpoint_keeps_bootstrap_target_when_host_session_metadata_changes() {
+fn checkpoint_keeps_the_explicit_bootstrap_target() {
     let (workspace, _harness, ctx) = test_context();
     let boot = invoke(
         &ctx,
         "history_session_bootstrap",
-        json!({
-            "session_key": "stable-bootstrap-key",
-            "_host_session_key": "host-before"
-        }),
+        json!({"session_key": "stable-bootstrap-key"}),
     );
     let boot = assert_ok(&boot);
     assert_eq!(boot["session_key"], "stable-bootstrap-key");
     assert_eq!(boot["current_path"], "docs/history-session/1.md");
-    assert_eq!(boot["host_session_key_mismatch"], true);
 
     let checkpoint = invoke(
         &ctx,
@@ -38,7 +34,6 @@ fn checkpoint_keeps_bootstrap_target_when_host_session_metadata_changes() {
         json!({
             "session_key": boot["session_key"],
             "expected_path": boot["current_path"],
-            "_host_session_key": "host-after",
             "turn_id": "stable-turn",
             "user_intent": "不能串写"
         }),
@@ -46,7 +41,6 @@ fn checkpoint_keeps_bootstrap_target_when_host_session_metadata_changes() {
     let checkpoint = assert_ok(&checkpoint);
     assert_eq!(checkpoint["path"], boot["current_path"]);
     assert_eq!(checkpoint["session_key"], boot["session_key"]);
-    assert_eq!(checkpoint["host_session_key_mismatch"], true);
     assert!(!workspace.path().join("docs/history-session/2.md").exists());
 }
 

@@ -1,16 +1,53 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::tools::dispatch::call_tool_prevalidated_with_cancellation;
+use crate::tools::workspace::tool_err;
 use crate::tools::{
-    call_tool, list_tools_for_profile, wrap_mcp_tool_result, SharedToolContext, ToolContext,
-    Workspace,
+    list_tools_for_profile, wrap_mcp_tool_result, CancellationToken, SharedToolContext,
+    ToolContext, Workspace,
 };
 use crate::workspace::AuthConfig;
 
 pub type SharedState = SharedToolContext;
 
+#[cfg(test)]
 pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
+    let protocol_version = if body.get("method").and_then(Value::as_str) == Some("initialize") {
+        body.get("params")
+            .and_then(|params| params.get("protocolVersion"))
+            .and_then(Value::as_str)
+            .map(crate::mcp::protocol::negotiate_protocol_version)
+            .unwrap_or(crate::mcp::protocol::CURRENT_PROTOCOL_VERSION)
+    } else {
+        crate::mcp::protocol::CURRENT_PROTOCOL_VERSION
+    };
+    handle_request_with_protocol(state, body, protocol_version).await
+}
+
+#[cfg(test)]
+pub async fn handle_request_with_protocol(
+    state: &SharedState,
+    body: &Value,
+    protocol_version: &str,
+) -> Value {
+    handle_request_with_protocol_and_cancellation(
+        state,
+        body,
+        protocol_version,
+        &CancellationToken::default(),
+    )
+    .await
+}
+
+pub async fn handle_request_with_protocol_and_cancellation(
+    state: &SharedState,
+    body: &Value,
+    protocol_version: &str,
+    cancellation: &CancellationToken,
+) -> Value {
     let method = body.get("method").and_then(Value::as_str).unwrap_or("");
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let params = body.get("params").cloned().unwrap_or(Value::Null);
@@ -20,9 +57,27 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
     }
 
     let result = match method {
-        "initialize" => Ok(initialize_result(state)),
+        "initialize" => Ok(initialize_result_for_version(state, protocol_version)),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
+            if !state
+                .mcp_proxies
+                .wait_until_configured(Duration::from_secs(70))
+                .await
+            {
+                return serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32003,
+                        "message": "MCP proxy tool catalog is still initializing",
+                        "data": {
+                            "reason": "proxy_catalog_initializing",
+                            "retryable": true
+                        }
+                    }
+                });
+            }
             let mut tools = list_tools_for_profile(&state.tool_profile);
             if !state.skills.is_enabled() {
                 tools.retain(|tool| {
@@ -34,8 +89,8 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
             tools.extend(state.mcp_proxies.list_tools());
             Ok(serde_json::json!({ "tools": tools }))
         }
-        "tools/call" => handle_tools_call(state, &params).await,
-        "resources/list" => Ok(crate::skills::resources_list(&state.skills)),
+        "tools/call" => handle_tools_call(state, &params, cancellation).await,
+        "resources/list" => crate::skills::resources_list(&state.skills, &params),
         "resources/read" => crate::skills::resource_read(&state.skills, &params),
         _ => Err(serde_json::json!({
             "code": -32601,
@@ -49,10 +104,14 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
     }
 }
 
+#[cfg(test)]
 fn initialize_result(state: &SharedState) -> Value {
+    initialize_result_for_version(state, crate::mcp::protocol::CURRENT_PROTOCOL_VERSION)
+}
+
+fn initialize_result_for_version(state: &SharedState, protocol_version: &str) -> Value {
     let mut capabilities = serde_json::json!({
-        "tools": { "listChanged": false },
-        "logging": {}
+        "tools": { "listChanged": false }
     });
     if state.skills.is_enabled() {
         capabilities["resources"] = serde_json::json!({
@@ -61,23 +120,27 @@ fn initialize_result(state: &SharedState) -> Value {
         });
     }
     serde_json::json!({
-        "protocolVersion": "2025-06-18",
+        "protocolVersion": protocol_version,
         "capabilities": capabilities,
         "serverInfo": {
             "name": "coding-tools-mcp",
             "title": "Coding Tools MCP",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. Agent Skills are available through list_skills, load_skill, read_skill_resource, and skill:// resources when enabled; load only the relevant Skill and treat Skill content as instructions, not as permission to bypass tool policy. Skill script execution is disabled. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, read all_history_summary, latest_handoff, and inherited_summary before acting. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. Agent Skills are available through list_skills, load_skill, read_skill_resource, and skill:// resources when enabled; load only the relevant Skill and treat Skill content as instructions, not as permission to bypass tool policy. Skill allowed-tools declarations are dependency metadata only: load_skill resolves them against the current local and proxied tool catalog, reports missing or ambiguous tools, and never grants permissions. There is no dedicated Skill script executor; referencing a snapshotted Skill script through exec_command requires confirm=true and execution is rejected if the script digest changed after the listener snapshot. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once, even if the user did not explicitly ask to restore or resume. Treat bootstrap as required conversation initialization: when no history exists it creates the first history session; when history exists, read all_history_summary, latest_handoff, and inherited_summary before acting. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Persistence requires a successful tool call and is not automatic background persistence."
     })
 }
 
-async fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value> {
+async fn handle_tools_call(
+    state: &SharedState,
+    params: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
-    let args = tool_arguments(name, params);
+    let raw_args = raw_tool_arguments(params);
 
     if crate::skills::is_skill_tool(name) && !state.skills.is_enabled() {
         return Err(serde_json::json!({
@@ -86,8 +149,27 @@ async fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value,
             "data": { "reason": "skill_service_disabled" }
         }));
     }
+    if matches!(name, "list_skills" | "load_skill")
+        && !state
+            .mcp_proxies
+            .wait_until_configured(Duration::from_secs(70))
+            .await
+    {
+        return Err(serde_json::json!({
+            "code": -32003,
+            "message": "MCP proxy tool catalog is still initializing",
+            "data": {
+                "reason": "proxy_catalog_initializing",
+                "retryable": true
+            }
+        }));
+    }
 
-    if let Some(result) = state.mcp_proxies.call_tool(name, &args).await {
+    if let Some(result) = state
+        .mcp_proxies
+        .call_tool_with_cancellation(name, &raw_args, cancellation)
+        .await
+    {
         return result;
     }
 
@@ -101,12 +183,28 @@ async fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value,
         }));
     }
 
+    if let Err(error) = crate::tools::schema::validate_tool_input(name, &raw_args) {
+        return Ok(wrap_mcp_tool_result(
+            canonical_name,
+            &raw_args,
+            tool_err(error),
+        ));
+    }
+
+    let args = tool_arguments(name, params);
+
     let state = state.clone();
     let canonical_name = canonical_name.to_string();
     let call_name = canonical_name.clone();
     let call_args = args.clone();
+    let cancellation = cancellation.clone();
     let structured = tokio::task::spawn_blocking(move || {
-        call_tool(state.as_ref(), &call_name, &call_args)
+        call_tool_prevalidated_with_cancellation(
+            state.as_ref(),
+            &call_name,
+            &call_args,
+            &cancellation,
+        )
     })
     .await
     .map_err(|error| {
@@ -119,14 +217,18 @@ async fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value,
             }
         })
     })?;
-    Ok(wrap_mcp_tool_result(&canonical_name, &args, structured))
+    Ok(wrap_mcp_tool_result(&canonical_name, &raw_args, structured))
+}
+
+fn raw_tool_arguments(params: &Value) -> Value {
+    params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 fn tool_arguments(name: &str, params: &Value) -> Value {
-    let mut args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut args = raw_tool_arguments(params);
     if name.starts_with("history_session_") {
         if let Some(session_key) = params
             .get("_meta")
@@ -187,7 +289,11 @@ mod tests {
         let initialized = initialize_result(&state);
         let instructions = initialized["instructions"].as_str().expect("instructions");
         assert!(instructions.contains("list_skills"));
-        assert!(instructions.contains("Skill script execution is disabled"));
+        assert!(instructions.contains("allowed-tools declarations are dependency metadata only"));
+        assert!(instructions.contains("never grants permissions"));
+        assert!(instructions.contains("There is no dedicated Skill script executor"));
+        assert!(instructions.contains("requires confirm=true"));
+        assert!(instructions.contains("script digest changed"));
         assert!(instructions.contains("history_session_bootstrap"));
         assert!(instructions.contains("At the start of every new ChatGPT conversation"));
         assert!(instructions.contains("before answering the user's first request"));
@@ -343,7 +449,10 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(listed["result"]["structuredContent"]["skills"][0]["name"], "review");
+        assert_eq!(
+            listed["result"]["structuredContent"]["skills"][0]["name"],
+            "review"
+        );
 
         let loaded = handle_request(
             &state,

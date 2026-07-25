@@ -2,8 +2,18 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::auth::{
+    authorization_server_metadata, authorize_get, authorize_post, external_base_url,
+    protected_resource_metadata, request_origin_allowed, token_exchange, AuthorizeForm,
+    AuthorizeParams, OAuthRuntime, TokenForm,
+};
+use crate::mcp::protocol::RateLimiter;
+use crate::runtime::{read_public_url, register_public_url, SharedPublicUrl};
+use crate::tools::{self, is_allowed_tool, policy::PolicySettings, wrap_tool_result, ToolContext};
+use crate::tunnel::append_profile_log;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::rejection::JsonRejection,
+    extract::{DefaultBodyLimit, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::{Html, IntoResponse, Json, Response},
@@ -11,19 +21,18 @@ use axum::{
     Extension, Router,
 };
 use serde_json::{json, Value};
-use tokio::sync::{oneshot, Mutex, RwLock};
-use crate::auth::{
-    authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, request_origin_allowed, token_exchange, AuthorizeForm,
-    AuthorizeParams, OAuthRuntime, TokenForm,
-};
-use crate::tools::{self, is_allowed_tool, policy::PolicySettings, wrap_tool_result, ToolContext};
-use crate::tunnel::append_profile_log;
+use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 
 use super::auth::{require_actions_auth, AuthConfig};
 use super::openapi;
 
 pub type ShutdownSender = oneshot::Sender<()>;
+
+const ACTIONS_MAX_BODY_BYTES: usize = 1_048_576;
+const OAUTH_MAX_BODY_BYTES: usize = 8_192;
+const ACTIONS_MAX_REQUESTS_PER_MINUTE: usize = 240;
+const OAUTH_MAX_REQUESTS_PER_MINUTE: usize = 30;
+const ACTIONS_MAX_CONCURRENT_REQUESTS: usize = 16;
 
 #[derive(Clone)]
 struct AppState {
@@ -32,10 +41,17 @@ struct AppState {
     auth: Arc<AuthConfig>,
     workspace_path: String,
     bind_port: u16,
-    configured_public_url: String,
+    configured_public_url: SharedPublicUrl,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     write_lock: Arc<Mutex<()>>,
+    action_rate_limiter: RateLimiter,
+    oauth_rate_limiter: RateLimiter,
+    concurrency: Arc<Semaphore>,
+}
+
+fn actions_http_error(status: StatusCode, detail: &str) -> Response {
+    (status, Json(json!({ "detail": detail }))).into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48,6 +64,7 @@ pub fn spawn_listener(
     api_key: Option<String>,
     oauth_client_id: String,
     oauth_redirect_uris: String,
+    oauth_redirect_hosts: String,
     oauth_client_secret: Option<String>,
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
@@ -57,6 +74,9 @@ pub fn spawn_listener(
         return Err("Actions API key is not configured".into());
     }
     if auth_type == "oauth" {
+        if oauth_client_id.trim().is_empty() {
+            return Err("Actions OAuth client_id is not configured".into());
+        }
         if oauth_password.as_ref().is_none_or(String::is_empty) {
             return Err("Actions OAuth password is not configured".into());
         }
@@ -65,12 +85,13 @@ pub fn spawn_listener(
         }
     }
 
-    let configured_public_url = public_base_url.trim().to_string();
+    let configured_public_url =
+        register_public_url(workspace_id, "actions", public_base_url.trim().to_string());
     let oauth = if auth_type == "oauth" {
         let oauth_base = external_base_url(
             &HeaderMap::new(),
             actions_port,
-            &configured_public_url,
+            &read_public_url(&configured_public_url),
         );
         Some(Arc::new(
             OAuthRuntime::new(
@@ -80,7 +101,8 @@ pub fn spawn_listener(
                 oauth_password.unwrap_or_default(),
                 oauth_token_secret.unwrap_or_default(),
             )
-            .with_redirect_uris(&oauth_redirect_uris)?,
+            .with_redirect_uris(&oauth_redirect_uris)?
+            .with_redirect_host_patterns(&oauth_redirect_hosts)?,
         ))
     } else {
         None
@@ -129,7 +151,7 @@ async fn serve(
     actions_port: u16,
     profile_id: &str,
     workspace_path: PathBuf,
-    configured_public_url: String,
+    configured_public_url: SharedPublicUrl,
     auth_type: String,
     api_key: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
@@ -157,10 +179,11 @@ async fn serve(
                 .unwrap_or(false)
         })
         .collect();
-    let public_base_url = if configured_public_url.is_empty() {
+    let current_public_url = read_public_url(&configured_public_url);
+    let public_base_url = if current_public_url.is_empty() {
         format!("http://127.0.0.1:{actions_port}")
     } else {
-        configured_public_url.clone()
+        current_public_url
     };
     let openapi_doc = openapi::build_openapi(&tools, &public_base_url, &auth_type);
 
@@ -182,17 +205,24 @@ async fn serve(
         oauth,
         oauth_client_secret,
         write_lock: Arc::new(Mutex::new(())),
+        action_rate_limiter: RateLimiter::new(
+            ACTIONS_MAX_REQUESTS_PER_MINUTE,
+            std::time::Duration::from_secs(60),
+        ),
+        oauth_rate_limiter: RateLimiter::new(
+            OAUTH_MAX_REQUESTS_PER_MINUTE,
+            std::time::Duration::from_secs(60),
+        ),
+        concurrency: Arc::new(Semaphore::new(ACTIONS_MAX_CONCURRENT_REQUESTS)),
     };
 
     let protected = Router::new()
         .route("/actions/{tool_name}", post(execute_action))
         .layer(middleware::from_fn(require_actions_auth))
-        .layer(Extension(auth));
+        .layer(Extension(auth))
+        .layer(DefaultBodyLimit::max(ACTIONS_MAX_BODY_BYTES));
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/openapi.json", get(openapi_json))
-        .route("/privacy", get(privacy))
+    let oauth_routes = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server_metadata),
@@ -201,8 +231,17 @@ async fn serve(
             "/.well-known/oauth-protected-resource",
             get(oauth_protected_resource_metadata),
         )
-        .route("/oauth/authorize", get(oauth_authorize_get).post(oauth_authorize_post))
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize_get).post(oauth_authorize_post),
+        )
         .route("/oauth/token", post(oauth_token_post))
+        .layer(DefaultBodyLimit::max(OAUTH_MAX_BODY_BYTES));
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/openapi.json", get(openapi_json))
+        .route("/privacy", get(privacy))
+        .merge(oauth_routes)
         .merge(protected)
         .with_state(state);
 
@@ -252,7 +291,34 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn openapi_json(State(state): State<AppState>) -> Json<Value> {
-    Json(state.openapi.read().await.clone())
+    let document = state.openapi.read().await.clone();
+    Json(openapi_with_current_public_url(
+        document,
+        state.bind_port,
+        &state.configured_public_url,
+    ))
+}
+
+fn openapi_with_current_public_url(
+    mut document: Value,
+    bind_port: u16,
+    configured_public_url: &SharedPublicUrl,
+) -> Value {
+    let configured = read_public_url(configured_public_url);
+    let public_url = if configured.is_empty() {
+        format!("http://127.0.0.1:{bind_port}")
+    } else {
+        configured
+    };
+    if let Some(server) = document
+        .get_mut("servers")
+        .and_then(Value::as_array_mut)
+        .and_then(|servers| servers.first_mut())
+        .and_then(Value::as_object_mut)
+    {
+        server.insert("url".into(), Value::String(public_url));
+    }
+    document
 }
 
 async fn privacy() -> Html<&'static str> {
@@ -275,7 +341,19 @@ async fn privacy() -> Html<&'static str> {
 }
 
 fn resolve_oauth_base(state: &AppState, headers: &HeaderMap) -> String {
-    external_base_url(headers, state.bind_port, &state.configured_public_url)
+    external_base_url(
+        headers,
+        state.bind_port,
+        &read_public_url(&state.configured_public_url),
+    )
+}
+
+fn origin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
+    request_origin_allowed(
+        headers,
+        state.bind_port,
+        &read_public_url(&state.configured_public_url),
+    )
 }
 
 fn resolve_oauth_resource(state: &AppState, headers: &HeaderMap) -> String {
@@ -288,6 +366,15 @@ async fn oauth_authorization_server_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return actions_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
+    }
     if !state.auth.oauth_enabled() {
         return oauth_not_configured();
     }
@@ -302,6 +389,15 @@ async fn oauth_protected_resource_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return actions_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
+    }
     if !state.auth.oauth_enabled() {
         return oauth_not_configured();
     }
@@ -319,8 +415,14 @@ async fn oauth_authorize_get(
     headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+    if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return actions_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
     }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
@@ -338,8 +440,14 @@ async fn oauth_authorize_post(
     headers: HeaderMap,
     Form(form): Form<AuthorizeForm>,
 ) -> Response {
-    if !request_origin_allowed(&headers, state.bind_port, &state.configured_public_url) {
+    if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return actions_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
     }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
@@ -357,6 +465,15 @@ async fn oauth_token_post(
     headers: HeaderMap,
     Form(form): Form<TokenForm>,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !state.oauth_rate_limiter.allow() {
+        return actions_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth request rate limit exceeded",
+        );
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -384,8 +501,32 @@ fn oauth_not_configured() -> Response {
 async fn execute_action(
     State(state): State<AppState>,
     Path(tool_name): Path<String>,
-    body: Option<Json<Value>>,
+    body: Result<Option<Json<Value>>, JsonRejection>,
 ) -> Response {
+    if !state.action_rate_limiter.allow() {
+        return actions_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Actions request rate limit exceeded",
+        );
+    }
+    let _permit = match state.concurrency.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return actions_http_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many concurrent Actions requests",
+            )
+        }
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return actions_http_error(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid JSON request body: {}", error.body_text()),
+            )
+        }
+    };
     let arguments = match body {
         Some(Json(value)) if value.is_object() || value.is_null() => {
             if value.is_null() {
@@ -443,7 +584,11 @@ async fn execute_action(
 
 #[cfg(test)]
 mod tests {
-    use super::bind_listener;
+    use serde_json::json;
+
+    use crate::runtime::{register_public_url, update_public_url};
+
+    use super::{bind_listener, openapi_with_current_public_url};
 
     #[test]
     fn bind_listener_reports_port_conflict_synchronously() {
@@ -451,5 +596,27 @@ mod tests {
         let port = occupied.local_addr().expect("读取测试端口").port();
 
         assert!(bind_listener(port).is_err());
+    }
+
+    #[test]
+    fn openapi_public_url_hot_updates_without_listener_restart() {
+        let workspace_id = format!("actions-test-{}", uuid::Uuid::new_v4());
+        let public_url =
+            register_public_url(&workspace_id, "actions", "https://old.example.com".into());
+        let document = json!({ "servers": [{ "url": "http://127.0.0.1:28767" }] });
+        assert_eq!(
+            openapi_with_current_public_url(document.clone(), 28767, &public_url)["servers"][0]
+                ["url"],
+            "https://old.example.com"
+        );
+        assert!(update_public_url(
+            &workspace_id,
+            "actions",
+            "https://new.example.com"
+        ));
+        assert_eq!(
+            openapi_with_current_public_url(document, 28767, &public_url)["servers"][0]["url"],
+            "https://new.example.com"
+        );
     }
 }
