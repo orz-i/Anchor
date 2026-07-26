@@ -10,7 +10,8 @@ use crate::auth::{
 };
 use crate::mcp::protocol::{
     negotiate_protocol_version, protocol_version_supported, requested_protocol_version,
-    validate_client_message, ClientMessage, InFlightRequests, RateLimiter, SessionStore,
+    validate_client_message, ClientMessage, InFlightRequests, RateLimiter, RequestReservation,
+    SessionStore,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{
@@ -60,6 +61,13 @@ struct ListenerState {
     oauth_rate_limiter: RateLimiter,
     concurrency: Arc<Semaphore>,
     in_flight: InFlightRequests,
+}
+
+fn cleanup_retired_sessions(state: &ListenerState) {
+    for session_id in state.sessions.take_retired() {
+        state.in_flight.cancel_session(&session_id);
+        state.mcp.clear_session_state(&session_id);
+    }
 }
 
 fn accepts_streamable_http(headers: &HeaderMap) -> bool {
@@ -370,14 +378,10 @@ async fn mcp_post(
         Err(error) => return jsonrpc_error_response(StatusCode::BAD_REQUEST, Value::Null, error),
     };
 
-    if message == ClientMessage::Response {
-        return StatusCode::ACCEPTED.into_response();
-    }
-
     let (request_id, method) = match &message {
         ClientMessage::Request { id, method } => (id.clone(), method.clone()),
         ClientMessage::Notification { method } => (Value::Null, method.clone()),
-        ClientMessage::Response => unreachable!(),
+        ClientMessage::Response => (Value::Null, String::new()),
     };
 
     if method == "initialize" {
@@ -402,6 +406,7 @@ async fn mcp_post(
         };
         let negotiated = negotiate_protocol_version(requested);
         let session_id = state.sessions.create(negotiated, &request_id);
+        cleanup_retired_sessions(&state);
         let cancellation = crate::tools::CancellationToken::default();
         let response = execute_mcp_request(
             &state,
@@ -422,9 +427,13 @@ async fn mcp_post(
             "MCP-Session-Id is required after initialization",
         );
     };
-    let Some((session_version, initialized)) = state.sessions.get(session_id) else {
+    let session = state.sessions.inspect(session_id);
+    cleanup_retired_sessions(&state);
+    let Some(session) = session else {
         return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
     };
+    let session_version = session.protocol_version;
+    let initialized = session.initialized;
     if let Some(version) = protocol_version_from_headers(&headers) {
         let Ok(version) = version else {
             return http_error(
@@ -440,9 +449,29 @@ async fn mcp_post(
         }
     }
 
+    if message == ClientMessage::Response {
+        if !initialized {
+            return http_error(StatusCode::BAD_REQUEST, "MCP session is not initialized");
+        }
+        if !state.sessions.touch(session_id) {
+            cleanup_retired_sessions(&state);
+            return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
+        }
+        cleanup_retired_sessions(&state);
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     if matches!(message, ClientMessage::Notification { .. }) {
         if method == "notifications/initialized" {
-            state.sessions.mark_initialized(session_id);
+            if !state.sessions.mark_initialized(session_id) {
+                cleanup_retired_sessions(&state);
+                return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
+            }
+        } else if !initialized {
+            return http_error(
+                StatusCode::BAD_REQUEST,
+                "Only notifications/initialized is accepted before MCP initialization completes",
+            );
         } else if method == "notifications/cancelled" {
             if let Some(request_id) = body
                 .get("params")
@@ -450,7 +479,11 @@ async fn mcp_post(
             {
                 state.in_flight.cancel(session_id, request_id);
             }
+            state.sessions.touch(session_id);
+        } else {
+            state.sessions.touch(session_id);
         }
+        cleanup_retired_sessions(&state);
         append_profile_log(
             &state.workspace_id,
             "mcp-requests.log",
@@ -471,16 +504,43 @@ async fn mcp_post(
         );
     }
 
-    if !state.sessions.reserve_request_id(session_id, &request_id) {
-        return jsonrpc_error_response(
-            StatusCode::OK,
-            request_id,
-            json!({
-                "code": -32600,
-                "message": "Request id has already been used in this MCP session"
-            }),
-        );
+    match state.sessions.reserve_request_id(session_id, &request_id) {
+        RequestReservation::Reserved => {}
+        RequestReservation::Duplicate => {
+            cleanup_retired_sessions(&state);
+            return jsonrpc_error_response(
+                StatusCode::OK,
+                request_id,
+                json!({
+                    "code": -32600,
+                    "message": "Request id has already been used in this MCP session"
+                }),
+            );
+        }
+        RequestReservation::Exhausted => {
+            state.sessions.remove(session_id);
+            state.in_flight.cancel_session(session_id);
+            state.mcp.clear_session_state(session_id);
+            cleanup_retired_sessions(&state);
+            return jsonrpc_error_response(
+                StatusCode::OK,
+                request_id,
+                json!({
+                    "code": -32003,
+                    "message": "MCP session request-id budget is exhausted; initialize a new session",
+                    "data": {
+                        "reason": "session_request_budget_exhausted",
+                        "retryable": true
+                    }
+                }),
+            );
+        }
+        RequestReservation::UnknownSession => {
+            cleanup_retired_sessions(&state);
+            return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
+        }
     }
+    cleanup_retired_sessions(&state);
 
     let Some(cancellation) = state.in_flight.insert(session_id, &request_id) else {
         return jsonrpc_error_response(
@@ -500,6 +560,8 @@ async fn mcp_post(
     )
     .await;
     state.in_flight.remove(session_id, &request_id);
+    state.sessions.touch(session_id);
+    cleanup_retired_sessions(&state);
     response
 }
 
@@ -519,6 +581,7 @@ async fn mcp_delete(State(state): State<ListenerState>, headers: HeaderMap) -> R
     let Some(session_id) = session_id_from_headers(&headers) else {
         return http_error(StatusCode::BAD_REQUEST, "MCP-Session-Id is required");
     };
+    cleanup_retired_sessions(&state);
     if state.sessions.remove(session_id) {
         state.in_flight.cancel_session(session_id);
         state.mcp.clear_session_state(session_id);
@@ -1090,6 +1153,30 @@ mod tests {
             "initialized_notification_required"
         );
 
+        let premature_notification = mcp_post(
+            State(state.clone()),
+            session_headers.clone(),
+            Ok(Json(json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/cancelled",
+                "params":{"requestId": 3}
+            }))),
+        )
+        .await;
+        assert_eq!(premature_notification.status(), StatusCode::BAD_REQUEST);
+
+        let response_without_session = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(json!({
+                "jsonrpc":"2.0",
+                "id": 3,
+                "result": {}
+            }))),
+        )
+        .await;
+        assert_eq!(response_without_session.status(), StatusCode::BAD_REQUEST);
+
         let notification = mcp_post(
             State(state.clone()),
             session_headers.clone(),
@@ -1117,6 +1204,46 @@ mod tests {
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
         let deleted_again = mcp_delete(State(state), session_headers).await;
         assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn expired_transport_session_clears_session_scoped_tool_state() {
+        let (workspace, mut state) = test_listener_state();
+        state.sessions = SessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 16);
+        let response = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response.headers()["mcp-session-id"]
+            .to_str()
+            .expect("session header")
+            .to_string();
+        let session_dir = workspace.path().join("expired-session");
+        std::fs::create_dir_all(&session_dir).expect("session directory");
+        state
+            .mcp
+            .set_default_cwd_for(Some(&session_id), session_dir);
+        assert!(state
+            .mcp
+            .default_cwd_display_for(Some(&session_id))
+            .replace('\\', "/")
+            .ends_with("/expired-session"));
+        std::thread::sleep(Duration::from_millis(1));
+
+        let mut headers = request_headers();
+        headers.insert("mcp-session-id", session_id.parse().unwrap());
+        headers.insert("mcp-protocol-version", "2025-11-25".parse().unwrap());
+        let expired = mcp_post(
+            State(state.clone()),
+            headers,
+            Ok(Json(json!({"jsonrpc":"2.0","id":2,"method":"ping"}))),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+        assert_eq!(state.mcp.default_cwd_display_for(Some(&session_id)), ".");
     }
 
     #[tokio::test]

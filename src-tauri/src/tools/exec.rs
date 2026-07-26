@@ -297,7 +297,14 @@ async fn run_command(
         }),
     })?;
 
-    let session = ctx.sessions.insert(ExecSession::new_with_mode(child, tty));
+    let session = match ctx.sessions.insert(ExecSession::new_with_mode(child, tty)) {
+        Ok(session) => session,
+        Err(rejected) => {
+            rejected.mark_termination_reason("session_limit");
+            rejected.kill_and_wait().await;
+            return Err(ctx.sessions.capacity_error());
+        }
+    };
     session.spawn_readers().await;
     let deadline = start + limit;
 
@@ -375,14 +382,21 @@ async fn run_command(
 
 fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant) {
     crate::async_runtime::spawn(async move {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(remaining).await;
-        session.refresh_status().await;
-        if !session.has_exited() {
-            session.mark_termination_reason("timeout");
-            session.kill_and_wait().await;
+        loop {
             session.refresh_status().await;
-            session.wait_for_readers().await;
+            if session.has_exited() {
+                session.wait_for_readers().await;
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                session.mark_termination_reason("timeout");
+                session.kill_and_wait().await;
+                session.refresh_status().await;
+                session.wait_for_readers().await;
+                break;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
         }
     });
 }

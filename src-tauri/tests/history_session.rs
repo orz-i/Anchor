@@ -281,7 +281,21 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(first["created"], true);
     assert_eq!(first["resumed"], false);
     assert_eq!(first["sequence_valid"], true);
-    assert_eq!(first["history_read_mode"], "all_summaries_plus_latest_full");
+    assert_eq!(
+        first["history_read_mode"],
+        "bounded_recent_summaries_plus_latest_handoff"
+    );
+    assert_eq!(first["history_numbers_total"], 2);
+    assert_eq!(first["history_numbers_truncated"], false);
+    assert_eq!(first["history_summaries_returned"], 2);
+    assert_eq!(first["history_summaries_omitted"], 0);
+    assert_eq!(first["history_summary_truncated"], false);
+    assert_eq!(first["latest_handoff_truncated"], false);
+    assert!(first["latest_handoff_total_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(first["session_status"], "active");
+    assert_eq!(first["previous_status"], "active");
+    assert_eq!(first["reactivated"], false);
+    assert_eq!(first["checkpoint_count"], 0);
     assert_eq!(first["full_history_included"], false);
     assert!(first["total_history_bytes"].as_u64().unwrap_or(0) > 0);
     assert_eq!(first["history_digest"].as_str().unwrap_or("").len(), 64);
@@ -361,7 +375,163 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(second["current_number"], 3);
     assert_eq!(second["created"], false);
     assert_eq!(second["resumed"], true);
+    assert_eq!(second["reactivated"], false);
     assert!(!workspace.path().join("docs/history-session/4.md").exists());
+}
+
+#[test]
+fn completed_history_session_reactivates_without_losing_content() {
+    let (workspace, _harness, ctx) = test_context();
+    let boot = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "lifecycle-session"}),
+    );
+    let boot = assert_ok(&boot);
+    let checkpoint = invoke(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "turn_id": "finish-phase",
+            "user_intent": "完成当前阶段",
+            "findings": ["关键内容必须保留"],
+            "session_status": "completed"
+        }),
+    );
+    let checkpoint = assert_ok(&checkpoint);
+    assert_eq!(checkpoint["previous_status"], "active");
+    assert_eq!(checkpoint["session_status"], "completed");
+    assert_eq!(checkpoint["status_changed"], true);
+    assert_eq!(checkpoint["checkpoint_count"], 1);
+
+    let completed = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+        .expect("completed history");
+    assert!(completed.contains("**Status:** completed"));
+    assert!(completed.contains("关键内容必须保留"));
+
+    let resumed = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "lifecycle-session"}),
+    );
+    let resumed = assert_ok(&resumed);
+    assert_eq!(resumed["created"], false);
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["previous_status"], "completed");
+    assert_eq!(resumed["session_status"], "active");
+    assert_eq!(resumed["reactivated"], true);
+    assert_eq!(resumed["checkpoint_count"], 1);
+    let active = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+        .expect("reactivated history");
+    assert!(active.contains("**Status:** active"));
+    assert!(active.contains("关键内容必须保留"));
+    assert_eq!(active.matches("### finish-phase").count(), 1);
+}
+
+#[test]
+fn bootstrap_bounds_large_archives_and_latest_handoff() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("history dir");
+    for number in 1..=269 {
+        fs::write(
+            dir.join(format!("{number}.md")),
+            history_file(
+                number,
+                &format!("archive-{number}"),
+                &format!("阶段-{number}"),
+            ),
+        )
+        .expect("history file");
+    }
+    let large_marker = format!("LATEST-BEGIN-{}-LATEST-END", "X".repeat(12_000));
+    fs::write(
+        dir.join("270.md"),
+        history_file(270, "archive-270", &large_marker),
+    )
+    .expect("large latest history");
+
+    let boot = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "bounded-archive"}),
+    );
+    let boot = assert_ok(&boot);
+    assert_eq!(boot["history_count"], 270);
+    assert_eq!(boot["history_numbers_total"], 270);
+    assert_eq!(boot["history_numbers_truncated"], true);
+    assert_eq!(boot["history_numbers"].as_array().unwrap().len(), 256);
+    assert!(boot["history_summaries_returned"].as_u64().unwrap() <= 64);
+    assert!(boot["history_summaries_omitted"].as_u64().unwrap() > 0);
+    assert_eq!(boot["history_summary_truncated"], true);
+    assert!(
+        boot["all_history_summary"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= 48_000
+    );
+    assert_eq!(boot["latest_handoff_truncated"], true);
+    let handoff = boot["latest_handoff"].as_str().expect("bounded handoff");
+    assert!(handoff.chars().count() <= 64_000);
+    assert!(handoff.contains("LATEST-BEGIN"));
+    assert!(handoff.contains("LATEST-END"));
+    assert!(handoff.contains("handoff 中部内容已按响应预算省略"));
+}
+
+#[test]
+fn checkpoint_rejects_oversized_content_fields() {
+    let (_workspace, _harness, ctx) = test_context();
+    let boot = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "bounded-checkpoint"}),
+    );
+    let boot = assert_ok(&boot);
+    let oversized = invoke(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "user_intent": "X".repeat(4_001)
+        }),
+    );
+    let oversized = assert_err(&oversized);
+    assert_eq!(oversized["error"]["category"], "validation");
+
+    let too_many = invoke(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "findings": (0..65).map(|index| format!("item-{index}")).collect::<Vec<_>>()
+        }),
+    );
+    let too_many = assert_err(&too_many);
+    assert_eq!(too_many["error"]["category"], "validation");
+}
+
+#[test]
+fn archive_rejects_a_history_file_over_four_mib() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("history dir");
+    let prefix = history_file(1, "oversized-history", "oversized");
+    let target = 4 * 1024 * 1024 + 1;
+    let content = format!("{prefix}{}", "X".repeat(target - prefix.len()));
+    assert_eq!(content.len(), target);
+    fs::write(dir.join("1.md"), content).expect("oversized history");
+
+    let result = invoke(&ctx, "history_session_validate", json!({"repair": false}));
+    assert_eq!(
+        assert_err(&result)["error"]["code"],
+        "HISTORY_CAPACITY_EXCEEDED"
+    );
 }
 
 #[test]
@@ -510,6 +680,15 @@ fn validate_reports_gaps_and_can_rebuild_a_missing_index() {
         .contains(&json!("4.md")));
     assert_eq!(readonly["latest_number"], 4);
     assert_eq!(readonly["latest_path"], "docs/history-session/4.md");
+    assert_eq!(readonly["document_count"], 3);
+    assert_eq!(readonly["status_counts"]["completed"], 2);
+    assert_eq!(readonly["status_counts"]["active"], 1);
+    assert_eq!(readonly["status_counts"]["unknown"], 0);
+    assert!(readonly["total_history_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(readonly["largest_document_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(readonly["max_document_bytes"], 4 * 1024 * 1024);
+    assert_eq!(readonly["max_total_history_bytes"], 64 * 1024 * 1024);
+    assert_eq!(readonly["max_documents"], 4096);
     assert!(!dir.join("index.json").exists());
     assert!(!dir.join("2.md").exists());
     fs::write(dir.join("index.json"), "{broken-json").expect("write broken index");

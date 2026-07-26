@@ -32,9 +32,11 @@ pub struct HistoryDocument {
     pub number: u64,
     pub path: String,
     pub content: String,
+    pub size_bytes: u64,
     pub session_key: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

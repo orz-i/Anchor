@@ -225,6 +225,11 @@ fn invalid_params(message: &str) -> Value {
     json!({ "code": -32602, "message": message })
 }
 
+const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_UNINITIALIZED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_MAX_SESSIONS: usize = 512;
+const DEFAULT_MAX_REQUEST_IDS_PER_SESSION: usize = 16_384;
+
 #[derive(Debug, Clone)]
 struct Session {
     protocol_version: String,
@@ -233,21 +238,83 @@ struct Session {
     used_request_ids: HashSet<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Default)]
+struct SessionStoreState {
+    sessions: HashMap<String, Session>,
+    retired: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub protocol_version: String,
+    pub initialized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestReservation {
+    Reserved,
+    Duplicate,
+    Exhausted,
+    UnknownSession,
+}
+
+#[derive(Clone)]
 pub struct SessionStore {
-    inner: Arc<Mutex<HashMap<String, Session>>>,
+    inner: Arc<Mutex<SessionStoreState>>,
+    session_idle_ttl: Duration,
+    uninitialized_ttl: Duration,
+    max_sessions: usize,
+    max_request_ids_per_session: usize,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::with_limits(
+            DEFAULT_SESSION_IDLE_TTL,
+            DEFAULT_UNINITIALIZED_SESSION_TTL,
+            DEFAULT_MAX_SESSIONS,
+            DEFAULT_MAX_REQUEST_IDS_PER_SESSION,
+        )
+    }
 }
 
 impl SessionStore {
+    pub fn with_limits(
+        session_idle_ttl: Duration,
+        uninitialized_ttl: Duration,
+        max_sessions: usize,
+        max_request_ids_per_session: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SessionStoreState::default())),
+            session_idle_ttl,
+            uninitialized_ttl,
+            max_sessions: max_sessions.max(1),
+            max_request_ids_per_session: max_request_ids_per_session.max(1),
+        }
+    }
+
     pub fn create(&self, protocol_version: &str, initialize_request_id: &Value) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let mut sessions = self.inner.lock().expect("MCP session lock");
-        prune_sessions(&mut sessions);
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        while state.sessions.len() >= self.max_sessions {
+            let Some(oldest) = state
+                .sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_seen)
+                .map(|(session_id, _)| session_id.clone())
+            else {
+                break;
+            };
+            state.sessions.remove(&oldest);
+            retire_session(&mut state, oldest);
+        }
         let mut used_request_ids = HashSet::new();
         if let Some(request_id) = serialized_request_id(initialize_request_id) {
             used_request_ids.insert(request_id);
         }
-        sessions.insert(
+        state.sessions.insert(
             id.clone(),
             Session {
                 protocol_version: protocol_version.to_string(),
@@ -259,17 +326,20 @@ impl SessionStore {
         id
     }
 
-    pub fn get(&self, id: &str) -> Option<(String, bool)> {
-        let mut sessions = self.inner.lock().expect("MCP session lock");
-        prune_sessions(&mut sessions);
-        let session = sessions.get_mut(id)?;
-        session.last_seen = Instant::now();
-        Some((session.protocol_version.clone(), session.initialized))
+    pub fn inspect(&self, id: &str) -> Option<SessionInfo> {
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        let session = state.sessions.get(id)?;
+        Some(SessionInfo {
+            protocol_version: session.protocol_version.clone(),
+            initialized: session.initialized,
+        })
     }
 
     pub fn mark_initialized(&self, id: &str) -> bool {
-        let mut sessions = self.inner.lock().expect("MCP session lock");
-        let Some(session) = sessions.get_mut(id) else {
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        let Some(session) = state.sessions.get_mut(id) else {
             return false;
         };
         session.initialized = true;
@@ -277,30 +347,79 @@ impl SessionStore {
         true
     }
 
-    pub fn reserve_request_id(&self, session_id: &str, request_id: &Value) -> bool {
-        let Some(request_id) = serialized_request_id(request_id) else {
-            return false;
-        };
-        let mut sessions = self.inner.lock().expect("MCP session lock");
-        let Some(session) = sessions.get_mut(session_id) else {
+    pub fn touch(&self, id: &str) -> bool {
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        let Some(session) = state.sessions.get_mut(id) else {
             return false;
         };
         session.last_seen = Instant::now();
-        session.used_request_ids.insert(request_id)
+        true
+    }
+
+    pub fn reserve_request_id(&self, session_id: &str, request_id: &Value) -> RequestReservation {
+        let Some(request_id) = serialized_request_id(request_id) else {
+            return RequestReservation::Duplicate;
+        };
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        let Some(session) = state.sessions.get_mut(session_id) else {
+            return RequestReservation::UnknownSession;
+        };
+        if session.used_request_ids.contains(&request_id) {
+            return RequestReservation::Duplicate;
+        }
+        if session.used_request_ids.len() >= self.max_request_ids_per_session {
+            return RequestReservation::Exhausted;
+        }
+        session.used_request_ids.insert(request_id);
+        session.last_seen = Instant::now();
+        RequestReservation::Reserved
     }
 
     pub fn remove(&self, id: &str) -> bool {
         self.inner
             .lock()
             .expect("MCP session lock")
+            .sessions
             .remove(id)
             .is_some()
     }
+
+    pub fn take_retired(&self) -> Vec<String> {
+        std::mem::take(&mut self.inner.lock().expect("MCP session lock").retired)
+    }
+
+    fn prune_locked(&self, state: &mut SessionStoreState) {
+        let now = Instant::now();
+        let expired = state
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                let ttl = if session.initialized {
+                    self.session_idle_ttl
+                } else {
+                    self.uninitialized_ttl
+                };
+                (now.duration_since(session.last_seen) > ttl).then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in expired {
+            state.sessions.remove(&id);
+            retire_session(state, id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().expect("MCP session lock").sessions.len()
+    }
 }
 
-fn prune_sessions(sessions: &mut HashMap<String, Session>) {
-    const SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-    sessions.retain(|_, session| session.last_seen.elapsed() <= SESSION_IDLE_TTL);
+fn retire_session(state: &mut SessionStoreState, id: String) {
+    if !state.retired.iter().any(|existing| existing == &id) {
+        state.retired.push(id);
+    }
 }
 
 #[derive(Clone)]
@@ -384,20 +503,69 @@ mod tests {
     fn session_store_tracks_initialized_state() {
         let store = SessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
-        assert_eq!(store.get(&id), Some(("2025-11-25".into(), false)));
+        assert_eq!(
+            store.inspect(&id),
+            Some(SessionInfo {
+                protocol_version: "2025-11-25".into(),
+                initialized: false
+            })
+        );
         assert!(store.mark_initialized(&id));
-        assert_eq!(store.get(&id), Some(("2025-11-25".into(), true)));
+        assert_eq!(
+            store.inspect(&id).map(|session| session.initialized),
+            Some(true)
+        );
         assert!(store.remove(&id));
-        assert!(store.get(&id).is_none());
+        assert!(store.inspect(&id).is_none());
     }
 
     #[test]
     fn session_rejects_reused_request_ids() {
         let store = SessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
-        assert!(!store.reserve_request_id(&id, &json!(1)));
-        assert!(store.reserve_request_id(&id, &json!(2)));
-        assert!(!store.reserve_request_id(&id, &json!(2)));
+        assert_eq!(
+            store.reserve_request_id(&id, &json!(1)),
+            RequestReservation::Duplicate
+        );
+        assert_eq!(
+            store.reserve_request_id(&id, &json!(2)),
+            RequestReservation::Reserved
+        );
+        assert_eq!(
+            store.reserve_request_id(&id, &json!(2)),
+            RequestReservation::Duplicate
+        );
+    }
+
+    #[test]
+    fn session_store_bounds_request_ids_and_total_sessions() {
+        let store =
+            SessionStore::with_limits(Duration::from_secs(60), Duration::from_secs(60), 2, 2);
+        let first = store.create("2025-11-25", &json!(1));
+        assert_eq!(
+            store.reserve_request_id(&first, &json!(2)),
+            RequestReservation::Reserved
+        );
+        assert_eq!(
+            store.reserve_request_id(&first, &json!(3)),
+            RequestReservation::Exhausted
+        );
+        let second = store.create("2025-11-25", &json!(1));
+        let third = store.create("2025-11-25", &json!(1));
+        assert_eq!(store.len(), 2);
+        assert!(store.inspect(&first).is_none());
+        assert!(store.inspect(&second).is_some());
+        assert!(store.inspect(&third).is_some());
+        assert_eq!(store.take_retired(), vec![first]);
+    }
+
+    #[test]
+    fn uninitialized_sessions_expire_without_touching_other_sessions() {
+        let store = SessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 4);
+        let expired = store.create("2025-11-25", &json!(1));
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(store.inspect(&expired).is_none());
+        assert_eq!(store.take_retired(), vec![expired]);
     }
 
     #[test]

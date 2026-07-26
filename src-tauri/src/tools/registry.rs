@@ -520,6 +520,87 @@ fn nullable_integer_property() -> Value {
     json!({ "type": ["integer", "null"] })
 }
 
+fn merge_schema_properties(chunks: Vec<Value>) -> Value {
+    let mut properties = serde_json::Map::new();
+    for chunk in chunks {
+        properties.extend(
+            chunk
+                .as_object()
+                .cloned()
+                .expect("schema property chunk is an object"),
+        );
+    }
+    Value::Object(properties)
+}
+
+fn history_bootstrap_output_properties() -> Value {
+    merge_schema_properties(vec![
+        json!({
+            "is_new_session": { "type": "boolean" },
+            "session_key": { "type": "string", "minLength": 1 },
+            "session_key_source": { "type": "string", "minLength": 1 },
+            "host_session_key_mismatch": { "type": "boolean" },
+            "history_numbers": { "type": "array", "maxItems": 256, "items": { "type": "integer", "minimum": 1 } },
+            "history_numbers_total": { "type": "integer", "minimum": 0 },
+            "history_numbers_truncated": { "type": "boolean" },
+            "history_count": { "type": "integer", "minimum": 0 },
+            "history_summaries_returned": { "type": "integer", "minimum": 0 },
+            "history_summaries_omitted": { "type": "integer", "minimum": 0 },
+            "history_summary_truncated": { "type": "boolean" },
+            "latest_prior_number": nullable_integer_property(),
+            "latest_prior_path": { "type": ["string", "null"] },
+            "latest_prior_status": { "type": ["string", "null"], "enum": ["active", "paused", "completed", "unknown", null] },
+            "latest_completed_number": nullable_integer_property(),
+            "latest_completed_path": { "type": ["string", "null"] }
+        }),
+        json!({
+            "current_number": { "type": "integer", "minimum": 1 },
+            "current_path": { "type": "string", "minLength": 1 },
+            "session_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
+            "previous_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
+            "reactivated": { "type": "boolean" },
+            "checkpoint_count": { "type": "integer", "minimum": 0 },
+            "created": { "type": "boolean" },
+            "resumed": { "type": "boolean" },
+            "sequence_valid": { "type": "boolean" },
+            "all_history_summary": { "type": "string", "maxLength": 60000 },
+            "inherited_summary": { "type": ["string", "null"] },
+            "latest_handoff": { "type": ["string", "null"], "maxLength": 64000 },
+            "latest_handoff_truncated": { "type": "boolean" },
+            "latest_handoff_total_bytes": { "type": "integer", "minimum": 0 }
+        }),
+        json!({
+            "session_summaries": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "number": { "type": "integer", "minimum": 1 },
+                        "path": { "type": "string", "minLength": 1 },
+                        "status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
+                        "updated_at": { "type": ["string", "null"] },
+                        "size_bytes": { "type": "integer", "minimum": 0 },
+                        "summary": { "type": "string", "maxLength": 3000 },
+                        "summary_truncated": { "type": "boolean" }
+                    },
+                    "required": ["number", "path", "status", "updated_at", "size_bytes", "summary", "summary_truncated"],
+                    "additionalProperties": false
+                }
+            },
+            "history_read_mode": { "type": "string", "minLength": 1 },
+            "total_history_bytes": { "type": "integer", "minimum": 0 },
+            "full_history_included": { "type": "boolean", "const": false },
+            "history_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+            "persistence_mode": { "type": "string", "minLength": 1 },
+            "assistant_instructions": { "type": "string", "minLength": 1 },
+            "required_next_actions": { "type": "array", "items": { "type": "string" } },
+            "checkpoint_policy": { "type": "object" },
+            "warnings": warnings_property()
+        }),
+    ])
+}
+
 fn session_snapshot_output_schema() -> Value {
     success_output_schema(
         json!({
@@ -809,6 +890,7 @@ pub fn output_schema(name: &str) -> Value {
                 "stream": { "type": "string", "enum": ["stdout", "stderr"] },
                 "offset": { "type": "integer", "minimum": 0 },
                 "requested_offset": { "type": "integer", "minimum": 0 },
+                "retained_start_offset": { "type": "integer", "minimum": 0 },
                 "limit": { "type": "integer", "minimum": 1 },
                 "content": { "type": "string" },
                 "next_offset": nullable_integer_property(),
@@ -823,6 +905,7 @@ pub fn output_schema(name: &str) -> Value {
                 "stream",
                 "offset",
                 "requested_offset",
+                "retained_start_offset",
                 "limit",
                 "content",
                 "next_offset",
@@ -848,47 +931,46 @@ pub fn output_schema(name: &str) -> Value {
             &["is_repo", "clean", "entries", "warnings"],
         ),
         "history_session_bootstrap" => success_output_schema(
-            json!({
-                "is_new_session": { "type": "boolean" },
-                "session_key": { "type": "string", "minLength": 1 },
-                "session_key_source": { "type": "string", "minLength": 1 },
-                "host_session_key_mismatch": { "type": "boolean" },
-                "history_numbers": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
-                "history_count": { "type": "integer", "minimum": 0 },
-                "current_number": { "type": "integer", "minimum": 1 },
-                "current_path": { "type": "string", "minLength": 1 },
-                "created": { "type": "boolean" },
-                "resumed": { "type": "boolean" },
-                "sequence_valid": { "type": "boolean" },
-                "all_history_summary": { "type": "string" },
-                "inherited_summary": { "type": ["string", "null"] },
-                "session_summaries": { "type": "array" },
-                "history_read_mode": { "type": "string", "minLength": 1 },
-                "total_history_bytes": { "type": "integer", "minimum": 0 },
-                "history_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
-                "persistence_mode": { "type": "string", "minLength": 1 },
-                "checkpoint_policy": { "type": "object" },
-                "warnings": warnings_property()
-            }),
+            history_bootstrap_output_properties(),
             &[
                 "is_new_session",
                 "session_key",
                 "session_key_source",
                 "host_session_key_mismatch",
                 "history_numbers",
+                "history_numbers_total",
+                "history_numbers_truncated",
                 "history_count",
+                "history_summaries_returned",
+                "history_summaries_omitted",
+                "history_summary_truncated",
+                "latest_prior_number",
+                "latest_prior_path",
+                "latest_prior_status",
+                "latest_completed_number",
+                "latest_completed_path",
                 "current_number",
                 "current_path",
+                "session_status",
+                "previous_status",
+                "reactivated",
+                "checkpoint_count",
                 "created",
                 "resumed",
                 "sequence_valid",
                 "all_history_summary",
                 "inherited_summary",
                 "session_summaries",
+                "latest_handoff",
+                "latest_handoff_truncated",
+                "latest_handoff_total_bytes",
                 "history_read_mode",
                 "total_history_bytes",
+                "full_history_included",
                 "history_digest",
                 "persistence_mode",
+                "assistant_instructions",
+                "required_next_actions",
                 "checkpoint_policy",
                 "warnings",
             ],
@@ -901,6 +983,12 @@ pub fn output_schema(name: &str) -> Value {
                 "expected_path": { "type": "string", "minLength": 1 },
                 "host_session_key_mismatch": { "type": "boolean" },
                 "turn_id": { "type": "string", "minLength": 1 },
+                "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
+                "previous_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
+                "status_changed": { "type": "boolean" },
+                "checkpoint_count": { "type": "integer", "minimum": 0 },
+                "content_bytes": { "type": "integer", "minimum": 0 },
+                "max_content_bytes": { "type": "integer", "minimum": 1 },
                 "created": { "type": "boolean" },
                 "updated": { "type": "boolean" },
                 "duplicate_ignored": { "type": "boolean" },
@@ -914,6 +1002,12 @@ pub fn output_schema(name: &str) -> Value {
                 "expected_path",
                 "host_session_key_mismatch",
                 "turn_id",
+                "session_status",
+                "previous_status",
+                "status_changed",
+                "checkpoint_count",
+                "content_bytes",
+                "max_content_bytes",
                 "created",
                 "updated",
                 "duplicate_ignored",
@@ -931,6 +1025,23 @@ pub fn output_schema(name: &str) -> Value {
                 "empty_files": { "type": "array", "items": { "type": "string" } },
                 "latest_number": nullable_integer_property(),
                 "latest_path": { "type": ["string", "null"] },
+                "document_count": { "type": "integer", "minimum": 0 },
+                "status_counts": {
+                    "type": "object",
+                    "properties": {
+                        "active": { "type": "integer", "minimum": 0 },
+                        "paused": { "type": "integer", "minimum": 0 },
+                        "completed": { "type": "integer", "minimum": 0 },
+                        "unknown": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["active", "paused", "completed", "unknown"],
+                    "additionalProperties": false
+                },
+                "total_history_bytes": { "type": "integer", "minimum": 0 },
+                "largest_document_bytes": { "type": "integer", "minimum": 0 },
+                "max_document_bytes": { "type": "integer", "minimum": 1 },
+                "max_total_history_bytes": { "type": "integer", "minimum": 1 },
+                "max_documents": { "type": "integer", "minimum": 1 },
                 "index_status": { "type": "string", "minLength": 1 },
                 "repaired": { "type": "boolean" },
                 "warnings": warnings_property()
@@ -944,6 +1055,13 @@ pub fn output_schema(name: &str) -> Value {
                 "empty_files",
                 "latest_number",
                 "latest_path",
+                "document_count",
+                "status_counts",
+                "total_history_bytes",
+                "largest_document_bytes",
+                "max_document_bytes",
+                "max_total_history_bytes",
+                "max_documents",
                 "index_status",
                 "repaired",
                 "warnings",
@@ -1071,8 +1189,8 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_key": { "type": "string", "minLength": 1 },
-                "title": { "type": "string" },
+                "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "title": { "type": "string", "maxLength": 200 },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "create_if_missing": { "type": "boolean", "default": true }
             },
@@ -1083,20 +1201,21 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["session_key", "expected_path"],
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_key": { "type": "string", "minLength": 1 },
-                "expected_path": { "type": "string", "minLength": 1 },
+                "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
-                "turn_id": { "type": "string", "minLength": 1 },
-                "timestamp": { "type": "string" },
-                "user_intent": { "type": "string" },
-                "findings": { "type": "array", "items": { "type": "string" } },
-                "decisions": { "type": "array", "items": { "type": "string" } },
-                "files_changed": { "type": "array", "items": { "type": "string" } },
-                "tests": { "type": "array", "items": { "type": "string" } },
-                "runtime_state": { "type": "array", "items": { "type": "string" } },
-                "remaining_issues": { "type": "array", "items": { "type": "string" } },
-                "next_actions": { "type": "array", "items": { "type": "string" } },
-                "notes": { "type": "string" }
+                "turn_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "timestamp": { "type": "string", "maxLength": 128 },
+                "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
+                "user_intent": { "type": "string", "maxLength": 4000 },
+                "findings": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "decisions": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "files_changed": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "tests": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "runtime_state": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "remaining_issues": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "next_actions": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 2000 } },
+                "notes": { "type": "string", "maxLength": 8000 }
             },
             "additionalProperties": false
         }),

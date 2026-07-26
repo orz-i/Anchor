@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin};
@@ -12,10 +12,82 @@ use crate::tools::workspace::{tool_ok, WorkspaceError};
 use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
+const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
+const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Default)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
+    max_sessions: usize,
+    terminal_retention: Duration,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::with_limits(DEFAULT_MAX_EXEC_SESSIONS, DEFAULT_TERMINAL_RETENTION)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_output_offsets_are_absolute_after_ring_buffer_eviction() {
+        let retained = b"uvwxyz";
+        let page = page_retained_output(retained, 26, 0, 3);
+        assert_eq!(page.retained_start_offset, 20);
+        assert_eq!(page.effective_offset, 20);
+        assert_eq!(page.content, b"uvw");
+        assert_eq!(page.next_offset, Some(23));
+        assert!(page.evicted_before_offset);
+
+        let next = page_retained_output(retained, 26, 23, 10);
+        assert_eq!(next.effective_offset, 23);
+        assert_eq!(next.content, b"xyz");
+        assert_eq!(next.next_offset, None);
+        assert!(!next.evicted_before_offset);
+    }
+
+    #[test]
+    fn retained_output_offsets_clamp_past_the_end() {
+        let page = page_retained_output(b"abc", 3, 99, 10);
+        assert_eq!(page.effective_offset, 3);
+        assert!(page.content.is_empty());
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn stream_buffer_keeps_total_and_retained_tail_consistent() {
+        let mut buffer = StreamBuffer::default();
+        buffer.append(b"abc", 4);
+        buffer.append(b"def", 4);
+        assert_eq!(buffer.total, 6);
+        assert_eq!(buffer.data, b"cdef");
+        let page = page_retained_output(&buffer.data, buffer.total, 0, 10);
+        assert_eq!(page.retained_start_offset, 2);
+        assert_eq!(page.content, b"cdef");
+    }
+}
+
+fn page_retained_output(
+    data: &[u8],
+    total_stream_bytes: usize,
+    requested_offset: usize,
+    limit: usize,
+) -> OutputPage<'_> {
+    let retained_start_offset = total_stream_bytes.saturating_sub(data.len());
+    let effective_offset = requested_offset.clamp(retained_start_offset, total_stream_bytes);
+    let buffer_offset = effective_offset.saturating_sub(retained_start_offset);
+    let content = &data[buffer_offset..data.len().min(buffer_offset + limit)];
+    let next_absolute_offset = effective_offset + content.len();
+    OutputPage {
+        content,
+        effective_offset,
+        retained_start_offset,
+        next_offset: (next_absolute_offset < total_stream_bytes)
+            .then_some(next_absolute_offset as u64),
+        evicted_before_offset: requested_offset < retained_start_offset,
+    }
 }
 
 impl SessionStore {
@@ -23,19 +95,29 @@ impl SessionStore {
         Self::default()
     }
 
-    pub fn insert(&self, session: ExecSession) -> Arc<ExecSession> {
+    pub fn with_limits(max_sessions: usize, terminal_retention: Duration) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            max_sessions: max_sessions.max(1),
+            terminal_retention,
+        }
+    }
+
+    pub fn insert(&self, session: ExecSession) -> Result<Arc<ExecSession>, Box<ExecSession>> {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        prune_terminal_sessions(&mut sessions, self.terminal_retention);
+        if sessions.len() >= self.max_sessions {
+            return Err(Box::new(session));
+        }
         let arc = Arc::new(session);
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .insert(arc.session_id.clone(), arc.clone());
-        arc
+        sessions.insert(arc.session_id.clone(), arc.clone());
+        Ok(arc)
     }
 
     pub fn get(&self, session_id: &str) -> Result<Arc<ExecSession>, WorkspaceError> {
-        self.sessions
-            .lock()
-            .expect("sessions lock")
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        prune_terminal_sessions(&mut sessions, self.terminal_retention);
+        let session = sessions
             .get(session_id)
             .cloned()
             .ok_or_else(|| WorkspaceError::Tool {
@@ -43,7 +125,9 @@ impl SessionStore {
                 message: format!("Session not found: {session_id}"),
                 category: "not_found",
                 retryable: false,
-            })
+            })?;
+        session.touch();
+        Ok(session)
     }
 
     pub fn remove(&self, session_id: &str) {
@@ -52,6 +136,35 @@ impl SessionStore {
             .expect("sessions lock")
             .remove(session_id);
     }
+
+    pub fn capacity_error(&self) -> WorkspaceError {
+        WorkspaceError::ToolDetails {
+            code: "SESSION_LIMIT_REACHED",
+            message: format!(
+                "Too many retained command sessions; the limit is {}",
+                self.max_sessions
+            ),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "max_sessions": self.max_sessions,
+                "terminal_retention_ms": self.terminal_retention.as_millis(),
+                "suggestion": "结束不再需要的运行会话，或等待已结束会话的保留期到期后重试"
+            }),
+        }
+    }
+}
+
+fn prune_terminal_sessions(
+    sessions: &mut HashMap<String, Arc<ExecSession>>,
+    terminal_retention: Duration,
+) {
+    sessions.retain(|_, session| {
+        !session.has_exited()
+            || session
+                .last_access_elapsed()
+                .is_some_and(|elapsed| elapsed <= terminal_retention)
+    });
 }
 
 pub struct ExecSession {
@@ -60,13 +173,12 @@ pub struct ExecSession {
     pub stdin: AsyncMutex<Option<ChildStdin>>,
     stdin_open: Mutex<bool>,
     interactive: bool,
-    stdout: Mutex<Vec<u8>>,
-    stderr: Mutex<Vec<u8>>,
-    stdout_total: Mutex<usize>,
-    stderr_total: Mutex<usize>,
+    stdout: Mutex<StreamBuffer>,
+    stderr: Mutex<StreamBuffer>,
     pub started_at: Instant,
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
+    last_access: Mutex<Instant>,
     termination_reason: Mutex<Option<String>>,
     reader_tasks: AsyncMutex<Vec<crate::async_runtime::JoinHandle<()>>>,
 }
@@ -86,13 +198,12 @@ impl ExecSession {
             stdin: AsyncMutex::new(stdin),
             stdin_open: Mutex::new(stdin_open),
             interactive,
-            stdout: Mutex::new(Vec::new()),
-            stderr: Mutex::new(Vec::new()),
-            stdout_total: Mutex::new(0),
-            stderr_total: Mutex::new(0),
+            stdout: Mutex::new(StreamBuffer::default()),
+            stderr: Mutex::new(StreamBuffer::default()),
             started_at: Instant::now(),
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
+            last_access: Mutex::new(Instant::now()),
             termination_reason: Mutex::new(None),
             reader_tasks: AsyncMutex::new(Vec::new()),
         }
@@ -141,15 +252,15 @@ impl ExecSession {
                 Ok(n) => {
                     let chunk = &buf[..n];
                     if is_stdout {
-                        let mut data = self.stdout.lock().expect("stdout lock");
-                        data.extend_from_slice(chunk);
-                        *self.stdout_total.lock().expect("stdout_total lock") += n;
-                        trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        self.stdout
+                            .lock()
+                            .expect("stdout lock")
+                            .append(chunk, SESSION_BUFFER_BYTES);
                     } else {
-                        let mut data = self.stderr.lock().expect("stderr lock");
-                        data.extend_from_slice(chunk);
-                        *self.stderr_total.lock().expect("stderr_total lock") += n;
-                        trim_buffer(&mut data, SESSION_BUFFER_BYTES);
+                        self.stderr
+                            .lock()
+                            .expect("stderr lock")
+                            .append(chunk, SESSION_BUFFER_BYTES);
                     }
                 }
                 Err(_) => break,
@@ -183,10 +294,20 @@ impl ExecSession {
         if reason.is_none() {
             *reason = Some("exited".into());
         }
+        self.touch();
     }
 
     pub(crate) fn has_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+
+    fn touch(&self) {
+        *self.last_access.lock().expect("last_access lock") = Instant::now();
+    }
+
+    fn last_access_elapsed(&self) -> Option<Duration> {
+        self.has_exited()
+            .then(|| self.last_access.lock().expect("last_access lock").elapsed())
     }
 
     pub fn mark_termination_reason(&self, reason: &str) {
@@ -205,21 +326,19 @@ impl ExecSession {
     pub fn retained_stream_bytes(&self, stream: &str) -> (Vec<u8>, usize) {
         match stream {
             "stderr" => {
-                let data = self.stderr.lock().expect("stderr lock").clone();
-                let total = *self.stderr_total.lock().expect("stderr_total lock");
-                (data, total)
+                let buffer = self.stderr.lock().expect("stderr lock");
+                (buffer.data.clone(), buffer.total)
             }
             _ => {
-                let data = self.stdout.lock().expect("stdout lock").clone();
-                let total = *self.stdout_total.lock().expect("stdout_total lock");
-                (data, total)
+                let buffer = self.stdout.lock().expect("stdout lock");
+                (buffer.data.clone(), buffer.total)
             }
         }
     }
 
     pub fn snapshot(&self, max_output_bytes: usize) -> Value {
-        let stdout_bytes = self.stdout.lock().expect("stdout lock").clone();
-        let stderr_bytes = self.stderr.lock().expect("stderr lock").clone();
+        let stdout_bytes = self.stdout.lock().expect("stdout lock").data.clone();
+        let stderr_bytes = self.stderr.lock().expect("stderr lock").data.clone();
         let stdout = truncate_tail(&stdout_bytes, max_output_bytes);
         let stderr = truncate_tail(&stderr_bytes, max_output_bytes);
         let exit_code = *self.exit_code.lock().expect("exit_code lock");
@@ -269,16 +388,34 @@ impl ExecSession {
     }
 }
 
-fn trim_buffer(buf: &mut Vec<u8>, limit: usize) {
-    if buf.len() > limit {
-        let drop = buf.len() - limit;
-        buf.drain(..drop);
+#[derive(Default)]
+struct StreamBuffer {
+    data: Vec<u8>,
+    total: usize,
+}
+
+impl StreamBuffer {
+    fn append(&mut self, chunk: &[u8], limit: usize) {
+        self.data.extend_from_slice(chunk);
+        self.total = self.total.saturating_add(chunk.len());
+        if self.data.len() > limit {
+            let drop = self.data.len() - limit;
+            self.data.drain(..drop);
+        }
     }
 }
 
 struct Truncated {
     content: String,
     truncated: bool,
+}
+
+struct OutputPage<'a> {
+    content: &'a [u8],
+    effective_offset: usize,
+    retained_start_offset: usize,
+    next_offset: Option<u64>,
+    evicted_before_offset: bool,
 }
 
 fn truncate_tail(bytes: &[u8], max_bytes: usize) -> Truncated {
@@ -327,31 +464,33 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         .and_then(Value::as_u64)
         .unwrap_or(4096)
         .clamp(1, 1_048_576) as usize;
-    let buffer_offset = requested_offset.min(data.len());
-    let chunk = &data[buffer_offset..data.len().min(buffer_offset + limit)];
-    let next_offset = if buffer_offset + chunk.len() < total_stream_bytes {
-        Some((buffer_offset + chunk.len()) as u64)
-    } else {
-        None
-    };
+    let page = page_retained_output(&data, total_stream_bytes, requested_offset, limit);
+    let mut warnings = Vec::<&str>::new();
+    if page.evicted_before_offset {
+        warnings.push(
+            "requested offset is no longer retained; response starts at retained_start_offset",
+        );
+    }
+    if ref_stream == "full" {
+        warnings.push(
+            "legacy full output_ref defaults to stdout; use output_refs for stable stream paging",
+        );
+    }
 
     Ok(tool_ok(json!({
         "output_ref": output_ref,
         "stream_output_ref": format!("session:{session_id}:{stream}"),
         "stream": stream,
-        "offset": buffer_offset,
+        "offset": page.effective_offset,
         "requested_offset": requested_offset,
+        "retained_start_offset": page.retained_start_offset,
         "limit": limit,
-        "content": String::from_utf8_lossy(chunk),
-        "next_offset": next_offset,
+        "content": String::from_utf8_lossy(page.content),
+        "next_offset": page.next_offset,
         "total_retained_bytes": data.len(),
         "total_stream_bytes": total_stream_bytes,
-        "truncated": next_offset.is_some(),
-        "warnings": if ref_stream == "full" {
-            vec!["legacy full output_ref defaults to stdout; use output_refs for stable stream paging"]
-        } else {
-            Vec::<&str>::new()
-        }
+        "truncated": page.evicted_before_offset || page.next_offset.is_some(),
+        "warnings": warnings
     })))
 }
 

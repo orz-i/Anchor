@@ -13,6 +13,10 @@ use super::markdown;
 use super::model::{HistoryDocument, HistoryIndex, IndexEntry, ScanReport};
 
 pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
+pub const MAX_HISTORY_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_HISTORY_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_HISTORY_DOCUMENTS: usize = 4096;
+const MAX_HISTORY_INDEX_BYTES: u64 = 1024 * 1024;
 const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const HISTORY_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -23,6 +27,16 @@ pub struct HistoryLock {
 impl Drop for HistoryLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn history_capacity_error(message: &str, details: serde_json::Value) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "HISTORY_CAPACITY_EXCEEDED",
+        message: message.into(),
+        category: "validation",
+        retryable: false,
+        details,
     }
 }
 
@@ -143,6 +157,7 @@ pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanRe
     }
     ensure_safe_candidate(workspace, history_dir)?;
     let mut report = ScanReport::default();
+    let mut total_bytes = 0_u64;
     let entries =
         fs::read_dir(history_dir).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
     for entry in entries {
@@ -175,6 +190,38 @@ pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanRe
             continue;
         }
         let number = number.expect("validated number");
+        if report.documents.len() >= MAX_HISTORY_DOCUMENTS {
+            return Err(history_capacity_error(
+                "History archive contains too many session documents.",
+                serde_json::json!({
+                    "max_documents": MAX_HISTORY_DOCUMENTS,
+                    "history_dir": relative_display(workspace.root(), history_dir)
+                }),
+            ));
+        }
+        let metadata =
+            fs::metadata(&path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
+        let size_bytes = metadata.len();
+        if size_bytes > MAX_HISTORY_FILE_BYTES {
+            return Err(history_capacity_error(
+                "History Markdown exceeds the per-session size limit.",
+                serde_json::json!({
+                    "file": name,
+                    "size_bytes": size_bytes,
+                    "max_file_bytes": MAX_HISTORY_FILE_BYTES
+                }),
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(size_bytes);
+        if total_bytes > MAX_HISTORY_TOTAL_BYTES {
+            return Err(history_capacity_error(
+                "History archive exceeds the total size limit.",
+                serde_json::json!({
+                    "total_bytes": total_bytes,
+                    "max_total_bytes": MAX_HISTORY_TOTAL_BYTES
+                }),
+            ));
+        }
         let bytes =
             fs::read(&path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
         let content = String::from_utf8(bytes).map_err(|error| WorkspaceError::ToolDetails {
@@ -190,9 +237,11 @@ pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanRe
         report.documents.push(HistoryDocument {
             number,
             path: relative_display(workspace.root(), &path),
+            size_bytes,
             session_key: markdown::metadata(&content, "Session key"),
             created_at: markdown::metadata(&content, "Created"),
             updated_at: markdown::metadata(&content, "Updated"),
+            status: markdown::metadata(&content, "Status"),
             content,
         });
     }
@@ -259,6 +308,18 @@ pub fn read_index(history_dir: &Path) -> WorkspaceResult<Option<HistoryIndex>> {
     if !path.exists() {
         return Ok(None);
     }
+    let size_bytes = fs::metadata(&path)
+        .map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?
+        .len();
+    if size_bytes > MAX_HISTORY_INDEX_BYTES {
+        return Err(history_capacity_error(
+            "History index exceeds its size limit.",
+            serde_json::json!({
+                "size_bytes": size_bytes,
+                "max_index_bytes": MAX_HISTORY_INDEX_BYTES
+            }),
+        ));
+    }
     let content =
         fs::read_to_string(&path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
     serde_json::from_str(&content)
@@ -281,11 +342,59 @@ pub fn write_index(history_dir: &Path, index: &HistoryIndex) -> WorkspaceResult<
             retryable: true,
             details: serde_json::json!({"error": error.to_string()}),
         })?;
+    if content.len() as u64 > MAX_HISTORY_INDEX_BYTES {
+        return Err(history_capacity_error(
+            "History index would exceed its size limit.",
+            serde_json::json!({
+                "size_bytes": content.len(),
+                "max_index_bytes": MAX_HISTORY_INDEX_BYTES
+            }),
+        ));
+    }
     atomic_write(&history_dir.join("index.json"), &content)
 }
 
 pub fn write_markdown(path: &Path, content: &str) -> WorkspaceResult<()> {
+    ensure_history_document_capacity(content)?;
     atomic_write(path, content.as_bytes())
+}
+
+pub fn ensure_history_document_capacity(content: &str) -> WorkspaceResult<()> {
+    let size_bytes = content.len() as u64;
+    if size_bytes <= MAX_HISTORY_FILE_BYTES {
+        return Ok(());
+    }
+    Err(history_capacity_error(
+        "History Markdown would exceed the per-session size limit.",
+        serde_json::json!({
+            "size_bytes": size_bytes,
+            "max_file_bytes": MAX_HISTORY_FILE_BYTES,
+            "suggestion": "减少单次 checkpoint 内容，或使用新的显式 session_key 开始后续归档"
+        }),
+    ))
+}
+
+pub fn ensure_history_archive_capacity(
+    current_total_bytes: u64,
+    previous_document_bytes: u64,
+    new_document_bytes: u64,
+) -> WorkspaceResult<()> {
+    let projected = current_total_bytes
+        .saturating_sub(previous_document_bytes)
+        .saturating_add(new_document_bytes);
+    if projected <= MAX_HISTORY_TOTAL_BYTES {
+        return Ok(());
+    }
+    Err(history_capacity_error(
+        "History archive write would exceed the total size limit.",
+        serde_json::json!({
+            "current_total_bytes": current_total_bytes,
+            "previous_document_bytes": previous_document_bytes,
+            "new_document_bytes": new_document_bytes,
+            "projected_total_bytes": projected,
+            "max_total_bytes": MAX_HISTORY_TOTAL_BYTES
+        }),
+    ))
 }
 
 pub fn sha256(content: &[u8]) -> String {

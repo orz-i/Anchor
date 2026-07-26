@@ -8,6 +8,14 @@ use super::model::CheckpointRecord;
 
 const CHECKPOINT_HEADING: &str = "## 本轮检查点";
 const INHERITED_SUMMARY_HEADING: &str = "继承的历史摘要";
+pub(super) const MAX_TURN_ID_CHARS: usize = 128;
+pub(super) const MAX_TIMESTAMP_CHARS: usize = 128;
+pub(super) const MAX_USER_INTENT_CHARS: usize = 4_000;
+pub(super) const MAX_NOTES_CHARS: usize = 8_000;
+pub(super) const MAX_ARRAY_ITEMS: usize = 64;
+pub(super) const MAX_ARRAY_ITEM_CHARS: usize = 2_000;
+pub(super) const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
+pub(super) const VALID_SESSION_STATUSES: &[&str] = &["active", "paused", "completed"];
 
 pub fn metadata(content: &str, label: &str) -> Option<String> {
     let prefix = format!("**{label}:**");
@@ -18,6 +26,44 @@ pub fn metadata(content: &str, label: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+pub fn validate_checkpoint_record(record: &CheckpointRecord) -> Result<(), String> {
+    validate_checkpoint_size(record)
+}
+
+pub fn update_document_lifecycle(content: &str, updated_at: &str, status: &str) -> String {
+    let mut output = String::with_capacity(content.len() + updated_at.len() + status.len());
+    let mut updated_written = false;
+    let mut status_written = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("**Updated:**") {
+            output.push_str(&format!("**Updated:** {updated_at}\n"));
+            updated_written = true;
+        } else if line.trim_start().starts_with("**Status:**") {
+            output.push_str(&format!("**Status:** {status}\n"));
+            status_written = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !updated_written || !status_written {
+        return content.to_string();
+    }
+    output
+}
+
+pub fn validate_session_status(value: &str) -> Result<&str, String> {
+    let status = value.trim();
+    if VALID_SESSION_STATUSES.contains(&status) {
+        Ok(status)
+    } else {
+        Err(format!(
+            "session_status must be one of: {}",
+            VALID_SESSION_STATUSES.join(", ")
+        ))
+    }
 }
 
 pub fn document_title(content: &str, number: u64) -> String {
@@ -233,18 +279,17 @@ fn section_body<'a>(content: &'a str, heading: &str) -> Option<&'a str> {
 
 pub fn checkpoint_from_args(
     args: &Value,
-    default_timestamp: &str,
+    _default_timestamp: &str,
 ) -> Result<CheckpointRecord, String> {
-    let explicit_turn_id = args
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
+    let explicit_turn_id = bounded_string_field(args, "turn_id", MAX_TURN_ID_CHARS)?
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let explicit_timestamp = string_field(args, "timestamp");
-    let mut record = CheckpointRecord {
-        turn_id: explicit_turn_id.unwrap_or_default().to_string(),
+    let explicit_timestamp = bounded_string_field(args, "timestamp", MAX_TIMESTAMP_CHARS)?;
+    let record = CheckpointRecord {
+        turn_id: explicit_turn_id.unwrap_or_default(),
         timestamp: explicit_timestamp.clone().unwrap_or_default(),
-        user_intent: string_field(args, "user_intent").unwrap_or_default(),
+        user_intent: bounded_string_field(args, "user_intent", MAX_USER_INTENT_CHARS)?
+            .unwrap_or_default(),
         findings: string_array(args, "findings")?,
         decisions: string_array(args, "decisions")?,
         files_changed: string_array(args, "files_changed")?,
@@ -252,13 +297,16 @@ pub fn checkpoint_from_args(
         runtime_state: string_array(args, "runtime_state")?,
         remaining_issues: string_array(args, "remaining_issues")?,
         next_actions: string_array(args, "next_actions")?,
-        notes: string_field(args, "notes").unwrap_or_default(),
+        notes: bounded_string_field(args, "notes", MAX_NOTES_CHARS)?.unwrap_or_default(),
     };
-    if record.turn_id.is_empty() {
-        record.turn_id = automatic_turn_id(&record);
-    }
-    record.timestamp = explicit_timestamp.unwrap_or_else(|| default_timestamp.to_string());
+    validate_checkpoint_size(&record)?;
     Ok(record)
+}
+
+pub fn ensure_turn_id(record: &mut CheckpointRecord) {
+    if record.turn_id.is_empty() {
+        record.turn_id = automatic_turn_id(record);
+    }
 }
 
 fn automatic_turn_id(record: &CheckpointRecord) -> String {
@@ -267,8 +315,21 @@ fn automatic_turn_id(record: &CheckpointRecord) -> String {
     format!("auto-{}", &hash[..16])
 }
 
-fn string_field(args: &Value, name: &str) -> Option<String> {
-    args.get(name).and_then(Value::as_str).map(str::to_string)
+fn bounded_string_field(
+    args: &Value,
+    name: &str,
+    max_chars: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("{name} must be a string"))?;
+    if value.chars().count() > max_chars {
+        return Err(format!("{name} cannot exceed {max_chars} characters"));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn string_array(args: &Value, name: &str) -> Result<Vec<String>, String> {
@@ -278,14 +339,36 @@ fn string_array(args: &Value, name: &str) -> Result<Vec<String>, String> {
     let array = value
         .as_array()
         .ok_or_else(|| format!("{name} must be an array of strings"))?;
+    if array.len() > MAX_ARRAY_ITEMS {
+        return Err(format!(
+            "{name} cannot contain more than {MAX_ARRAY_ITEMS} items"
+        ));
+    }
     array
         .iter()
         .map(|item| {
-            item.as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("{name} must contain only strings"))
+            let value = item
+                .as_str()
+                .ok_or_else(|| format!("{name} must contain only strings"))?;
+            if value.chars().count() > MAX_ARRAY_ITEM_CHARS {
+                return Err(format!(
+                    "{name} items cannot exceed {MAX_ARRAY_ITEM_CHARS} characters"
+                ));
+            }
+            Ok(value.to_string())
         })
         .collect()
+}
+
+fn validate_checkpoint_size(record: &CheckpointRecord) -> Result<(), String> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| format!("checkpoint record cannot be serialized: {error}"))?;
+    if bytes.len() > MAX_CHECKPOINT_BYTES {
+        return Err(format!(
+            "checkpoint content cannot exceed {MAX_CHECKPOINT_BYTES} bytes"
+        ));
+    }
+    Ok(())
 }
 
 pub fn redact_record(record: &mut CheckpointRecord) -> bool {
