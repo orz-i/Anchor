@@ -352,7 +352,7 @@ mod tests {
             resources: Vec::new(),
             scripts: Vec::new(),
             script_execution_enabled: false,
-            script_execution_policy: "confirm-via-exec-command".into(),
+            script_execution_policy: "operator-dangerous-mode".into(),
             resource_truncated: false,
             warnings: Vec::new(),
         };

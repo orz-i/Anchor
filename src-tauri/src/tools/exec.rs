@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_script_requires_explicit_confirmation() {
+    fn skill_script_requires_operator_dangerous_mode() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
         let skill = workspace.path().join(".agents/skills/example");
@@ -723,7 +723,7 @@ mod tests {
         )
         .expect("skill");
         std::fs::write(skill.join("scripts/run.py"), "print('ok')\n").expect("script");
-        let ctx =
+        let mut ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
 
@@ -734,7 +734,7 @@ mod tests {
         );
         assert_eq!(output["ok"], false, "{output}");
         assert_eq!(
-            output["error"]["code"], "SKILL_SCRIPT_CONFIRMATION_REQUIRED",
+            output["error"]["code"], "SKILL_SCRIPT_REQUIRES_DANGEROUS_MODE",
             "{output}"
         );
         assert_eq!(output["error"]["details"]["skill"], "example");
@@ -749,8 +749,20 @@ mod tests {
             }),
         );
         assert_eq!(
-            indirect["error"]["code"], "SKILL_SCRIPT_CONFIRMATION_REQUIRED",
+            indirect["error"]["code"], "SKILL_SCRIPT_REQUIRES_DANGEROUS_MODE",
             "{indirect}"
+        );
+
+        ctx.permission_mode = "dangerous".into();
+        ctx.policy.permission_mode = "dangerous".into();
+        let approved_by_control_plane = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({"cmd": "python .agents/skills/example/scripts/run.py"}),
+        );
+        assert_eq!(
+            approved_by_control_plane["ok"], true,
+            "{approved_by_control_plane}"
         );
 
         std::fs::write(skill.join("scripts/run.py"), "print('changed')\n").expect("change");
@@ -758,8 +770,7 @@ mod tests {
             &ctx,
             "exec_command",
             &json!({
-                "cmd": "python .agents/skills/example/scripts/run.py",
-                "confirm": true
+                "cmd": "python .agents/skills/example/scripts/run.py"
             }),
         );
         assert_eq!(stale["ok"], false, "{stale}");

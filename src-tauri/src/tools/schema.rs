@@ -159,16 +159,19 @@ mod tests {
     }
 
     #[test]
-    fn permits_open_arguments_objects() {
+    fn rejects_removed_model_confirmation_arguments() {
         assert!(validate_tool_input(
-            "request_permissions",
+            "exec_command",
+            &json!({"cmd": "cargo check", "confirm": true})
+        )
+        .is_err());
+        assert!(validate_tool_input(
+            "apply_patch",
             &json!({
-                "tool_name": "exec_command",
-                "permission": "network",
-                "reason": "test",
-                "arguments": {"cmd": "cargo check", "custom": true}
+                "patch": "*** Begin Patch\n*** Add File: probe.txt\n+probe\n*** End Patch\n",
+                "confirm": true
             })
         )
-        .is_ok());
+        .is_err());
     }
 }

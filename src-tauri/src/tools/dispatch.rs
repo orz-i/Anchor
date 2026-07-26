@@ -10,20 +10,20 @@ use crate::tools::{exec, file, git, history, image_tool, patch, session, Cancell
 fn policy_tool_err(err: PolicyError) -> Value {
     let dangerous = err
         .0
-        .strip_prefix("DANGEROUS_OPERATION_REQUIRES_CONFIRMATION: ");
+        .strip_prefix("DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE: ");
     let protected = err.0.strip_prefix("PROTECTED_REPOSITORY_ASSET: ");
     let code = if protected.is_some() {
         "PROTECTED_REPOSITORY_ASSET"
     } else if dangerous.is_some() {
-        "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION"
+        "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
     } else {
         "POLICY_REJECTED"
     };
     let message = protected.or(dangerous).unwrap_or(&err.0).to_string();
     let (reason, suggestion) = if dangerous.is_some() {
         (
-            "confirmation_required",
-            "为危险操作补充 confirm=true，确认后再重试",
+            "dangerous_mode_required",
+            "模型参数不能作为用户批准凭证；请由操作者在受信任控制面将权限模式切换为 dangerous 后重试",
         )
     } else if message.contains("allowlisted") {
         ("command_rejected", "改用允许的命令，或调整工作区命令白名单")
@@ -43,13 +43,13 @@ fn policy_tool_err(err: PolicyError) -> Value {
         details: json!({
             "stage": "policy",
             "reason": reason,
-            "recoverable": reason != "confirmation_required",
+            "recoverable": false,
             "suggestion": suggestion
         }),
     })
 }
 
-fn skill_script_confirmation_error(
+fn skill_script_permission_error(
     ctx: &ToolContext,
     name: &str,
     args: &Value,
@@ -106,25 +106,25 @@ fn skill_script_confirmation_error(
             }),
         });
     }
-    if args.get("confirm").and_then(Value::as_bool) == Some(true) {
+    if ctx.policy.skip_permission_gates() {
         return None;
     }
     Some(WorkspaceError::ToolDetails {
-        code: "SKILL_SCRIPT_CONFIRMATION_REQUIRED",
+        code: "SKILL_SCRIPT_REQUIRES_DANGEROUS_MODE",
         message: format!(
-            "执行 Skill {} 的脚本 {} 需要 confirm=true",
+            "执行 Skill {} 的脚本 {} 需要操作者在受信任控制面启用 dangerous 权限模式",
             script.skill, script.path
         ),
         category: "permission",
         retryable: false,
         details: json!({
             "stage": "skill_script_policy",
-            "reason": "explicit_confirmation_required",
+            "reason": "dangerous_mode_required",
             "skill": script.skill,
             "script": script.path,
             "digest": script.snapshot_digest,
             "dedicated_skill_execution": false,
-            "suggestion": "Review the script source and digest, then retry exec_command with confirm=true"
+            "suggestion": "Review the script source and digest, then enable dangerous mode through the trusted GUI or CLI control plane"
         }),
     })
 }
@@ -169,7 +169,7 @@ fn call_tool_impl(
         }
     }
     let effective_args = apply_default_cwd(ctx, name, args);
-    if let Some(error) = skill_script_confirmation_error(ctx, name, &effective_args) {
+    if let Some(error) = skill_script_permission_error(ctx, name, &effective_args) {
         return tool_err(error);
     }
     if let Err(e) = validate_tool_arguments_for_workspace(
@@ -257,39 +257,6 @@ fn call_tool_impl(
         "git_show" => git::git_show(ws, &effective_args),
         "git_blame" => git::git_blame(ws, &effective_args),
         "view_image" => image_tool::view_image(ws, &effective_args),
-        "request_permissions" => {
-            if ctx.policy.skip_permission_gates() {
-                Ok(tool_ok(json!({
-                    "ok": true,
-                    "status": "granted",
-                    "grant_id": "dangerously-skip-all-permissions",
-                    "expires_at": null,
-                    "constraints": {
-                        "mode": "dangerous",
-                        "workspace": ctx.workspace.root_display(),
-                        "requested": effective_args
-                    },
-                    "warnings": [
-                        "dangerous permission mode is enabled; permission-gated operations are auto-granted"
-                    ]
-                })))
-            } else {
-                Ok(tool_ok(json!({
-                    "ok": false,
-                    "status": "unsupported",
-                    "grant_id": null,
-                    "expires_at": null,
-                    "next_actions": [],
-                    "error": {
-                        "code": "ELICITATION_UNSUPPORTED",
-                        "message": "Permission elicitation is not available for this client.",
-                        "category": "permission",
-                        "retryable": false,
-                        "details": { "requested": effective_args }
-                    }
-                })))
-            }
-        }
         _ => {
             return tool_err_code(
                 "INVALID_ARGUMENT",
@@ -302,9 +269,10 @@ fn call_tool_impl(
         Ok(v) => v,
         Err(e) => tool_err(e),
     };
-    if cancellation.is_cancelled() && output.get("ok").and_then(Value::as_bool) != Some(false) {
-        output = cancelled_tool_result();
-    }
+    // Cancellation is checked before execution and by cooperative long-running
+    // tools. Once a synchronous mutation returns, preserve its committed result
+    // instead of reporting a false cancellation that could trigger a retry.
+    output = preserve_completed_result(output, cancellation);
     if task_id.is_none()
         && standalone_operation(name)
         && output.get("ok") == Some(&Value::Bool(true))
@@ -349,6 +317,24 @@ fn call_tool_impl(
                 "affected_files": output.get("affected_files")
             }),
         );
+    }
+    output
+}
+
+fn preserve_completed_result(mut output: Value, cancellation: &CancellationToken) -> Value {
+    if cancellation.is_cancelled() && output.get("ok").and_then(Value::as_bool) == Some(true) {
+        if let Some(object) = output.as_object_mut() {
+            object.insert("cancellation_after_completion".into(), Value::Bool(true));
+            let warnings = object
+                .entry("warnings")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(warnings) = warnings.as_array_mut() {
+                warnings.push(Value::String(
+                    "Cancellation arrived after the tool had completed; the committed result is authoritative."
+                        .into(),
+                ));
+            }
+        }
     }
     output
 }
@@ -600,4 +586,25 @@ pub fn set_default_cwd(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
         "default_cwd": resolved.display,
         "resolved_cwd": resolved.path.display().to_string()
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::preserve_completed_result;
+    use crate::tools::CancellationToken;
+
+    #[test]
+    fn late_cancellation_preserves_a_committed_success_result() {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let result = preserve_completed_result(
+            json!({"ok": true, "status": "success", "affected_files": ["probe.txt"]}),
+            &cancellation,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["cancellation_after_completion"], true);
+        assert_eq!(result["affected_files"], json!(["probe.txt"]));
+    }
 }

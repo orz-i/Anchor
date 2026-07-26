@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, Notify};
@@ -18,6 +19,18 @@ use crate::tunnel::append_profile_log;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_TOOL_LIST_PAGES: usize = 100;
+const MAX_PROXY_TOOLS_PER_SERVER: usize = 256;
+const MAX_PROXY_TOOLS_TOTAL: usize = 512;
+const MAX_PROXY_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
+
+#[derive(Clone)]
+struct SanitizedProxyTool {
+    public_name: String,
+    downstream_name: String,
+    definition: Value,
+    input_schema: Value,
+    output_schema: Option<Value>,
+}
 
 #[derive(Debug, Clone)]
 pub struct McpProxyServerSpec {
@@ -30,21 +43,167 @@ pub struct McpProxyServerSpec {
     request_timeout: Duration,
 }
 
-fn catalog_tool_names(catalog: &[Value]) -> Vec<String> {
-    let mut names = catalog
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+fn validate_schema_document(schema: &Value, label: &str) -> Result<(), String> {
+    let Some(object) = schema.as_object() else {
+        return Err(format!("{label} must be a JSON Schema object"));
+    };
+    if object.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(format!("{label} root type must be object"));
+    }
+    if schema_contains_external_ref(schema) {
+        return Err(format!(
+            "{label} contains an external JSON Schema reference"
+        ));
+    }
+    jsonschema::meta::validate(schema)
+        .map_err(|error| format!("{label} is not a valid JSON Schema: {error}"))
+}
+
+fn schema_contains_external_ref(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            if matches!(key.as_str(), "$ref" | "$dynamicRef") {
+                return value
+                    .as_str()
+                    .is_some_and(|reference| !reference.starts_with('#'));
+            }
+            schema_contains_external_ref(value)
+        }),
+        Value::Array(items) => items.iter().any(schema_contains_external_ref),
+        _ => false,
+    }
+}
+
+fn valid_public_tool_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn bounded_text(value: Option<&Value>, maximum: usize) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && text.len() <= maximum)
         .map(str::to_string)
+}
+
+fn sanitize_proxy_catalog(
+    spec: &McpProxyServerSpec,
+    catalog: Vec<Value>,
+) -> Result<Vec<SanitizedProxyTool>, String> {
+    if catalog.len() > MAX_PROXY_TOOLS_PER_SERVER {
+        return Err(format!(
+            "downstream MCP `{}` returned {} tools; maximum is {MAX_PROXY_TOOLS_PER_SERVER}",
+            spec.name,
+            catalog.len()
+        ));
+    }
+    let mut sanitized = Vec::with_capacity(catalog.len());
+    let mut names = std::collections::HashSet::new();
+    for (index, tool) in catalog.into_iter().enumerate() {
+        let Some(object) = tool.as_object() else {
+            return Err(format!("downstream tool #{index} is not an object"));
+        };
+        if serde_json::to_vec(&tool)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_PROXY_TOOL_DEFINITION_BYTES
+        {
+            return Err(format!("downstream tool #{index} definition is too large"));
+        }
+        let downstream_name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && name.len() <= 128)
+            .ok_or_else(|| format!("downstream tool #{index} has an invalid name"))?
+            .to_string();
+        let public_name = format!(
+            "{}__{}",
+            sanitize_tool_segment(&spec.tool_prefix),
+            sanitize_tool_segment(&downstream_name)
+        );
+        if !valid_public_tool_name(&public_name) {
+            return Err(format!(
+                "proxied tool name `{public_name}` is invalid or too long"
+            ));
+        }
+        if !names.insert(public_name.clone()) {
+            return Err(format!(
+                "downstream tools map to duplicate public name `{public_name}`"
+            ));
+        }
+        let input_schema = object
+            .get("inputSchema")
+            .ok_or_else(|| format!("downstream tool `{downstream_name}` is missing inputSchema"))?
+            .clone();
+        validate_schema_document(
+            &input_schema,
+            &format!("downstream tool `{downstream_name}` inputSchema"),
+        )?;
+        let output_schema = object.get("outputSchema").cloned();
+        if let Some(schema) = output_schema.as_ref() {
+            validate_schema_document(
+                schema,
+                &format!("downstream tool `{downstream_name}` outputSchema"),
+            )?;
+        }
+        let title = bounded_text(object.get("title"), 512)
+            .unwrap_or_else(|| format!("{} · {}", spec.name, downstream_name));
+        let description = bounded_text(object.get("description"), 8192)
+            .map(|description| format!("[{}] {description}", spec.name))
+            .unwrap_or_else(|| format!("Proxied from MCP server {}", spec.name));
+        let mut definition = json!({
+            "name": public_name,
+            "title": title,
+            "description": description,
+            "inputSchema": input_schema,
+            // A proxy cannot independently attest downstream side effects.
+            // Publish conservative annotations rather than trusting claims.
+            "annotations": {
+                "title": title,
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
+            "execution": { "taskSupport": "forbidden" }
+        });
+        if let Some(schema) = output_schema.as_ref() {
+            definition["outputSchema"] = schema.clone();
+        }
+        sanitized.push(SanitizedProxyTool {
+            public_name,
+            downstream_name,
+            definition,
+            input_schema,
+            output_schema,
+        });
+    }
+    sanitized.sort_by(|left, right| left.public_name.cmp(&right.public_name));
+    Ok(sanitized)
+}
+
+fn proxy_catalog_digest(catalog: &[SanitizedProxyTool]) -> Result<String, String> {
+    let contracts = catalog
+        .iter()
+        .map(|tool| {
+            json!({
+                "publicName": tool.public_name,
+                "downstreamName": tool.downstream_name,
+                "definition": tool.definition
+            })
+        })
         .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    names
+    let encoded = serde_json::to_vec(&contracts)
+        .map_err(|error| format!("failed to encode proxied tool catalog: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
 async fn connect_initial_with_retry(
     spec: McpProxyServerSpec,
     workspace_id: String,
-) -> Result<(Arc<ProxyServer>, Vec<Value>), String> {
+) -> Result<(Arc<ProxyServer>, Vec<SanitizedProxyTool>), String> {
     let mut last_error = String::new();
     for attempt in 1u8..=3 {
         let attempt_timeout = spec.request_timeout.min(Duration::from_secs(20));
@@ -80,7 +239,7 @@ async fn connect_initial_with_retry(
 struct ProxyServer {
     spec: McpProxyServerSpec,
     workspace_id: String,
-    catalog_names: Vec<String>,
+    catalog_digest: String,
     client: Mutex<Option<Arc<McpProxyClient>>>,
     reconnect_scheduled: AtomicBool,
 }
@@ -109,6 +268,8 @@ struct ProxyRoute {
     server: Arc<ProxyServer>,
     server_name: String,
     downstream_name: String,
+    input_schema: Value,
+    output_schema: Option<Value>,
 }
 
 #[derive(Default)]
@@ -198,51 +359,32 @@ impl McpProxyRegistry {
                     let mut skipped_duplicates = Vec::new();
                     let mut state = self.state.write().expect("mcp proxy registry write");
                     for tool in catalog {
-                        if !tool.is_object() {
-                            continue;
+                        if state.tools.len() >= MAX_PROXY_TOOLS_TOTAL {
+                            append_profile_log(
+                                &workspace_id,
+                                "stderr.log",
+                                &format!(
+                                    "[mcp-proxy:{server_name}] global proxied tool limit {MAX_PROXY_TOOLS_TOTAL} reached"
+                                ),
+                            );
+                            break;
                         }
-                        let Some(downstream_name) = tool
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string)
-                        else {
-                            continue;
-                        };
-                        let public_name = format!(
-                            "{}__{}",
-                            sanitize_tool_segment(&server.spec.tool_prefix),
-                            sanitize_tool_segment(&downstream_name)
-                        );
+                        let public_name = tool.public_name.clone();
                         if state.routes.contains_key(&public_name) {
                             skipped_duplicates.push(public_name);
                             continue;
                         }
-
-                        let mut merged = tool;
-                        merged["name"] = Value::String(public_name.clone());
-                        let description = merged
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        merged["description"] = Value::String(if description.is_empty() {
-                            format!("Proxied from MCP server {server_name}")
-                        } else {
-                            format!("[{server_name}] {description}")
-                        });
-                        if merged.get("title").is_none() {
-                            merged["title"] =
-                                Value::String(format!("{} · {}", server_name, downstream_name));
-                        }
-
                         state.routes.insert(
                             public_name,
                             ProxyRoute {
                                 server: server.clone(),
                                 server_name: server_name.clone(),
-                                downstream_name,
+                                downstream_name: tool.downstream_name,
+                                input_schema: tool.input_schema,
+                                output_schema: tool.output_schema,
                             },
                         );
-                        state.tools.push(merged);
+                        state.tools.push(tool.definition);
                         added += 1;
                     }
                     drop(state);
@@ -268,6 +410,15 @@ impl McpProxyRegistry {
                 ),
             }
         }
+        self.state
+            .write()
+            .expect("mcp proxy registry write")
+            .tools
+            .sort_by(|left, right| {
+                left.get("name")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("name").and_then(Value::as_str))
+            });
         self.configured.store(true, Ordering::Release);
         self.configured_notify.notify_waiters();
     }
@@ -297,11 +448,34 @@ impl McpProxyRegistry {
 
         let server = route.server.clone();
         let server_name = route.server_name.clone();
+        let input_validator = match jsonschema::validator_for(&route.input_schema) {
+            Ok(validator) => validator,
+            Err(error) => {
+                return Some(Ok(proxy_call_error_result(
+                    &server_name,
+                    public_name,
+                    "proxy_input_schema_invalid",
+                    error.to_string(),
+                    false,
+                    false,
+                )))
+            }
+        };
+        if let Err(error) = input_validator.validate(arguments) {
+            return Some(Ok(proxy_call_error_result(
+                &server_name,
+                public_name,
+                "proxy_input_invalid",
+                error.to_string(),
+                false,
+                false,
+            )));
+        }
         let client = match server.ensure_client().await {
             Ok(client) => client,
             Err(message) => {
                 server.clone().schedule_reconnect();
-                return Some(Err(proxy_call_error(
+                return Some(Ok(proxy_call_error_result(
                     &server_name,
                     public_name,
                     "proxy_reconnect_failed",
@@ -335,20 +509,38 @@ impl McpProxyRegistry {
             append_profile_log(&server.workspace_id, "stderr.log", &log_message);
         }
 
-        Some(result.map_err(|message| {
-            let cancelled = message == "request cancelled";
-            proxy_call_error(
+        Some(Ok(match result {
+            Ok(result) => normalize_proxy_tool_result(
                 &server_name,
                 public_name,
-                if cancelled {
-                    "proxy_call_cancelled"
-                } else {
-                    "proxy_call_failed"
-                },
-                message,
-                !cancelled,
-                !cancelled,
+                result,
+                route.output_schema.as_ref(),
             )
+            .unwrap_or_else(|message| {
+                proxy_call_error_result(
+                    &server_name,
+                    public_name,
+                    "proxy_result_invalid",
+                    message,
+                    false,
+                    false,
+                )
+            }),
+            Err(message) => {
+                let cancelled = message == "request cancelled";
+                proxy_call_error_result(
+                    &server_name,
+                    public_name,
+                    if cancelled {
+                        "proxy_call_cancelled"
+                    } else {
+                        "proxy_call_failed"
+                    },
+                    message,
+                    !cancelled,
+                    !cancelled,
+                )
+            }
         }))
     }
 }
@@ -357,14 +549,15 @@ impl ProxyServer {
     async fn connect_initial(
         spec: McpProxyServerSpec,
         workspace_id: String,
-    ) -> Result<(Arc<Self>, Vec<Value>), String> {
+    ) -> Result<(Arc<Self>, Vec<SanitizedProxyTool>), String> {
         let (client, catalog) = McpProxyClient::connect(spec.clone(), &workspace_id).await?;
-        let catalog_names = catalog_tool_names(&catalog);
+        let catalog = sanitize_proxy_catalog(&spec, catalog)?;
+        let catalog_digest = proxy_catalog_digest(&catalog)?;
         Ok((
             Arc::new(Self {
                 spec,
                 workspace_id,
-                catalog_names,
+                catalog_digest,
                 client: Mutex::new(Some(client)),
                 reconnect_scheduled: AtomicBool::new(false),
             }),
@@ -379,12 +572,13 @@ impl ProxyServer {
         }
         let (connected, catalog) =
             McpProxyClient::connect(self.spec.clone(), &self.workspace_id).await?;
-        let reconnected_names = catalog_tool_names(&catalog);
-        if reconnected_names != self.catalog_names {
-            return Err(format!(
-                "downstream tool catalog changed from {:?} to {:?}; restart the MCP listener to renegotiate tools/list",
-                self.catalog_names, reconnected_names
-            ));
+        let catalog = sanitize_proxy_catalog(&self.spec, catalog)?;
+        let reconnected_digest = proxy_catalog_digest(&catalog)?;
+        if reconnected_digest != self.catalog_digest {
+            return Err(
+                "downstream tool catalog contract changed; restart the MCP listener to renegotiate tools/list"
+                    .to_string(),
+            );
         }
         *client = Some(connected.clone());
         append_profile_log(
@@ -434,7 +628,7 @@ fn proxy_reconnect_delay(attempt: u8) -> Duration {
     Duration::from_millis(250 * (1u64 << attempt.saturating_sub(1).min(4)))
 }
 
-fn proxy_call_error(
+fn proxy_call_error_result(
     server_name: &str,
     public_name: &str,
     reason: &str,
@@ -442,19 +636,84 @@ fn proxy_call_error(
     retryable: bool,
     reconnect_scheduled: bool,
 ) -> Value {
-    json!({
-        "code": -32603,
-        "message": format!("Proxied MCP tool failed: {server_name} / {public_name}"),
-        "data": {
-            "reason": reason,
-            "server": server_name,
-            "tool": public_name,
-            "detail": detail,
+    crate::tools::wrap_tool_result(json!({
+        "ok": false,
+        "status": "error",
+        "summary": format!("Proxied MCP tool failed: {server_name} / {public_name}"),
+        "error": {
+            "code": "PROXIED_TOOL_FAILED",
+            "message": format!("Proxied MCP tool failed: {server_name} / {public_name}"),
+            "category": "runtime",
             "retryable": retryable,
-            "request_replayed": false,
-            "reconnect_scheduled": reconnect_scheduled
+            "details": {
+                "reason": reason,
+                "server": server_name,
+                "tool": public_name,
+                "detail": detail,
+                "request_replayed": false,
+                "reconnect_scheduled": reconnect_scheduled
+            }
         }
-    })
+    }))
+}
+
+fn normalize_proxy_tool_result(
+    server_name: &str,
+    public_name: &str,
+    result: Value,
+    output_schema: Option<&Value>,
+) -> Result<Value, String> {
+    let Some(object) = result.as_object() else {
+        return Err("downstream tools/call result is not an object".into());
+    };
+    let mut content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "downstream tools/call result is missing content array".to_string())?;
+    if !content.iter().all(|item| {
+        item.as_object()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some()
+    }) {
+        return Err("downstream tools/call content contains an invalid item".into());
+    }
+    let structured = object.get("structuredContent").cloned();
+    if structured.as_ref().is_some_and(|value| !value.is_object()) {
+        return Err("downstream structuredContent must be an object".into());
+    }
+    if let Some(schema) = output_schema {
+        let structured = structured.as_ref().ok_or_else(|| {
+            "downstream tool declared outputSchema but omitted structuredContent".to_string()
+        })?;
+        jsonschema::validator_for(schema)
+            .map_err(|error| format!("failed to compile downstream outputSchema: {error}"))?
+            .validate(structured)
+            .map_err(|error| {
+                format!("downstream structuredContent violates outputSchema: {error}")
+            })?;
+    }
+    if let Some(structured) = structured.as_ref() {
+        let has_text = content
+            .iter()
+            .any(|item| item.get("type") == Some(&json!("text")));
+        if !has_text {
+            content.push(json!({"type": "text", "text": structured.to_string()}));
+        }
+    }
+    let mut normalized = json!({
+        "content": content,
+        "isError": object.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        "_meta": {
+            "proxyServer": server_name,
+            "proxyTool": public_name
+        }
+    });
+    if let Some(structured) = structured {
+        normalized["structuredContent"] = structured;
+    }
+    Ok(normalized)
 }
 
 impl McpProxyClient {
@@ -844,7 +1103,141 @@ mod tests {
 
     use crate::tools::CancellationToken;
 
-    use super::{parse_mcp_proxy_config, McpProxyRegistry, McpProxyServerSpec};
+    use super::{
+        normalize_proxy_tool_result, parse_mcp_proxy_config, proxy_catalog_digest,
+        sanitize_proxy_catalog, McpProxyRegistry, McpProxyServerSpec,
+    };
+
+    fn test_spec() -> McpProxyServerSpec {
+        McpProxyServerSpec {
+            name: "test".into(),
+            command: "noop".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: Path::new(".").to_path_buf(),
+            tool_prefix: "test".into(),
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_is_validated_and_published_conservatively() {
+        let catalog = sanitize_proxy_catalog(
+            &test_spec(),
+            vec![json!({
+                "name": "read_secret",
+                "title": "Untrusted title",
+                "description": "Untrusted description",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "additionalProperties": false
+                },
+                "annotations": {
+                    "readOnlyHint": true,
+                    "destructiveHint": false,
+                    "openWorldHint": false
+                },
+                "_meta": {"untrusted": true}
+            })],
+        )
+        .expect("valid catalog");
+        assert_eq!(catalog.len(), 1);
+        let definition = &catalog[0].definition;
+        assert_eq!(definition["name"], "test__read_secret");
+        assert_eq!(definition["annotations"]["readOnlyHint"], false);
+        assert_eq!(definition["annotations"]["destructiveHint"], true);
+        assert_eq!(definition["annotations"]["openWorldHint"], true);
+        assert_eq!(definition["execution"]["taskSupport"], "forbidden");
+        assert!(definition.get("_meta").is_none());
+        let validator = jsonschema::validator_for(&catalog[0].input_schema).unwrap();
+        assert!(validator.validate(&json!({"path": "README.md"})).is_ok());
+        assert!(validator.validate(&json!({"unknown": true})).is_err());
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_invalid_or_external_schemas() {
+        assert!(sanitize_proxy_catalog(
+            &test_spec(),
+            vec![json!({
+                "name": "bad",
+                "inputSchema": {"type": "string"}
+            })],
+        )
+        .is_err());
+        assert!(sanitize_proxy_catalog(
+            &test_spec(),
+            vec![json!({
+                "name": "external",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "https://example.com/schema.json"}}
+                }
+            })],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn proxy_catalog_digest_changes_when_schema_changes() {
+        let first = sanitize_proxy_catalog(
+            &test_spec(),
+            vec![json!({
+                "name": "ping",
+                "inputSchema": {"type": "object", "properties": {}}
+            })],
+        )
+        .expect("first catalog");
+        let second = sanitize_proxy_catalog(
+            &test_spec(),
+            vec![json!({
+                "name": "ping",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }
+            })],
+        )
+        .expect("second catalog");
+        assert_ne!(
+            proxy_catalog_digest(&first).unwrap(),
+            proxy_catalog_digest(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn proxy_results_enforce_output_schema_and_add_text_fallback() {
+        let output_schema = json!({
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        let valid = normalize_proxy_tool_result(
+            "test",
+            "test__ping",
+            json!({
+                "content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}],
+                "structuredContent": {"value": "ok"}
+            }),
+            Some(&output_schema),
+        )
+        .expect("valid result");
+        assert!(valid["content"]
+            .as_array()
+            .is_some_and(|content| content.iter().any(|item| item["type"] == "text")));
+        assert!(normalize_proxy_tool_result(
+            "test",
+            "test__ping",
+            json!({
+                "content": [{"type": "text", "text": "bad"}],
+                "structuredContent": {"value": 1}
+            }),
+            Some(&output_schema),
+        )
+        .is_err());
+    }
 
     #[test]
     fn parses_standard_mcp_servers_and_expands_workspace_folder() {
@@ -953,14 +1346,24 @@ for raw in sys.stdin:
                 .call_tool_with_cancellation("slow__slow", &json!({}), &worker_token)
                 .await
                 .expect("known route")
-                .expect_err("cancelled call")
+                .expect("cancelled call is a tool result")
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
         token.cancel();
         let error = worker.await.expect("worker");
-        assert_eq!(error["data"]["reason"], "proxy_call_cancelled");
-        assert_eq!(error["data"]["request_replayed"], false);
-        assert_eq!(error["data"]["reconnect_scheduled"], false);
+        assert_eq!(error["isError"], true);
+        assert_eq!(
+            error["structuredContent"]["error"]["details"]["reason"],
+            "proxy_call_cancelled"
+        );
+        assert_eq!(
+            error["structuredContent"]["error"]["details"]["request_replayed"],
+            false
+        );
+        assert_eq!(
+            error["structuredContent"]["error"]["details"]["reconnect_scheduled"],
+            false
+        );
     }
 
     #[tokio::test]
@@ -1025,9 +1428,16 @@ for raw in sys.stdin:
             .call_tool("unstable__ping", &json!({}))
             .await
             .expect("known route")
-            .expect_err("first call disconnects");
-        assert_eq!(first["data"]["request_replayed"], false);
-        assert_eq!(first["data"]["reconnect_scheduled"], true);
+            .expect("first failure is a tool result");
+        assert_eq!(first["isError"], true);
+        assert_eq!(
+            first["structuredContent"]["error"]["details"]["request_replayed"],
+            false
+        );
+        assert_eq!(
+            first["structuredContent"]["error"]["details"]["reconnect_scheduled"],
+            true
+        );
 
         let second = registry
             .call_tool("unstable__ping", &json!({}))
@@ -1061,10 +1471,10 @@ for raw in sys.stdin:
     if method == "initialize":
         result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "drift", "version": "1"}}
     elif method == "tools/list":
-        tools = [{"name": "ping", "inputSchema": {"type": "object", "properties": {}}}]
+        schema = {"type": "object", "properties": {}}
         if os.path.exists(marker):
-            tools.append({"name": "new_tool", "inputSchema": {"type": "object", "properties": {}}})
-        result = {"tools": tools}
+            schema = {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}
+        result = {"tools": [{"name": "ping", "inputSchema": schema}]}
     elif method == "tools/call":
         open(marker, "w", encoding="utf-8").write("drift")
         sys.exit(0)
@@ -1095,17 +1505,25 @@ for raw in sys.stdin:
             .call_tool("drift__ping", &json!({}))
             .await
             .expect("known route")
-            .expect_err("first call disconnects");
-        assert_eq!(first["data"]["request_replayed"], false);
+            .expect("first failure is a tool result");
+        assert_eq!(first["isError"], true);
+        assert_eq!(
+            first["structuredContent"]["error"]["details"]["request_replayed"],
+            false
+        );
 
         let second = registry
             .call_tool("drift__ping", &json!({}))
             .await
             .expect("known route")
-            .expect_err("catalog drift rejects reconnect");
-        assert_eq!(second["data"]["reason"], "proxy_reconnect_failed");
-        assert!(second["data"]["detail"]
+            .expect("catalog drift is a tool result");
+        assert_eq!(second["isError"], true);
+        assert_eq!(
+            second["structuredContent"]["error"]["details"]["reason"],
+            "proxy_reconnect_failed"
+        );
+        assert!(second["structuredContent"]["error"]["details"]["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("tool catalog changed")));
+            .is_some_and(|detail| detail.contains("catalog contract changed")));
     }
 }

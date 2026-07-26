@@ -195,7 +195,7 @@ fn exec_command_allows_workspace_child_process_during_transition() {
 }
 
 #[test]
-fn exec_command_rejects_host_scope_even_with_confirmation() {
+fn exec_command_rejects_host_scope() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let out = invoke(
@@ -203,8 +203,7 @@ fn exec_command_rejects_host_scope_even_with_confirmation() {
         "exec_command",
         json!({
             "cmd": "python --version",
-            "filesystem_scope": "host",
-            "confirm": true
+            "filesystem_scope": "host"
         }),
     );
     assert_eq!(out["error"]["code"], "INVALID_TOOL_ARGUMENTS");
@@ -224,19 +223,33 @@ fn exec_command_rejects_disallowed_destructive_command() {
 }
 
 #[test]
-fn dangerous_command_requires_explicit_confirmation() {
-    let policy = coding_tools_mcp_desktop_lib::tools::policy::PolicySettings::default();
-    let accepted = coding_tools_mcp_desktop_lib::tools::policy::validate_tool_arguments(
+fn dangerous_command_requires_operator_dangerous_mode() {
+    let trusted = coding_tools_mcp_desktop_lib::tools::policy::PolicySettings::default();
+    let rejected = coding_tools_mcp_desktop_lib::tools::policy::validate_tool_arguments(
         "exec_command",
         &json!({"cmd": "git reset --hard HEAD", "confirm": true}),
-        &policy,
+        &trusted,
     );
-    assert!(accepted.is_ok());
+    assert!(rejected.is_err());
+
+    let dangerous = coding_tools_mcp_desktop_lib::tools::policy::PolicySettings {
+        permission_mode: "dangerous".into(),
+        ..Default::default()
+    };
+    assert!(
+        coding_tools_mcp_desktop_lib::tools::policy::validate_tool_arguments(
+            "exec_command",
+            &json!({"cmd": "git reset --hard HEAD"}),
+            &dangerous,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
-fn deleting_readme_requires_explicit_confirmation() {
+fn deleting_readme_requires_operator_dangerous_mode() {
     let fx = tiny_js_fixture();
+    fs::write(fx.root.join("README.md"), "project\n").expect("创建 README");
     let ctx = ctx_for(&fx.root);
     let out = invoke(
         &ctx,
@@ -247,8 +260,21 @@ fn deleting_readme_requires_explicit_confirmation() {
     );
     assert_eq!(
         out["error"]["code"],
-        "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION"
+        "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
     );
+
+    let mut dangerous_ctx = ctx_for(&fx.root);
+    dangerous_ctx.permission_mode = "dangerous".into();
+    dangerous_ctx.policy.permission_mode = "dangerous".into();
+    let allowed = invoke(
+        &dangerous_ctx,
+        "apply_patch",
+        json!({
+            "patch": "--- a/README.md\n+++ /dev/null\n@@\n-project\n"
+        }),
+    );
+    assert_ok(&allowed);
+    assert!(!fx.root.join("README.md").exists());
 }
 
 #[test]
@@ -262,7 +288,6 @@ fn deleting_git_assets_is_always_rejected() {
         &ctx,
         "apply_patch",
         json!({
-            "confirm": true,
             "patch": "--- a/.git/config\n+++ /dev/null\n@@\n-[core]\n"
         }),
     );
@@ -291,7 +316,7 @@ fn destructive_command_targeting_git_is_always_rejected() {
     let policy = coding_tools_mcp_desktop_lib::tools::policy::PolicySettings::default();
     let error = coding_tools_mcp_desktop_lib::tools::policy::validate_tool_arguments(
         "exec_command",
-        &json!({"cmd": "rm -rf .git", "confirm": true}),
+        &json!({"cmd": "rm -rf .git"}),
         &policy,
     )
     .expect_err("删除 .git 必须拒绝");
@@ -304,8 +329,7 @@ fn interpreter_command_cannot_delete_git_assets() {
     let error = coding_tools_mcp_desktop_lib::tools::policy::validate_tool_arguments(
         "exec_command",
         &json!({
-            "cmd": "python -c \"import shutil; shutil.rmtree('.git')\"",
-            "confirm": true
+            "cmd": "python -c \"import shutil; shutil.rmtree('.git')\""
         }),
         &policy,
     )
@@ -319,8 +343,7 @@ fn interpreter_command_cannot_delete_github_assets() {
     let error = coding_tools_mcp_desktop_lib::tools::policy::validate_tool_arguments(
         "exec_command",
         &json!({
-            "cmd": "python -c \"import os; os.remove('.github/workflows/ci.yml')\"",
-            "confirm": true
+            "cmd": "python -c \"import os; os.remove('.github/workflows/ci.yml')\""
         }),
         &policy,
     )

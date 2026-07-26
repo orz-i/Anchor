@@ -19,7 +19,7 @@
   const TOOL_PROFILE_OPTIONS = [
     { value: "full", label: "完整工具" },
     { value: "read-only", label: "只读工具" },
-    { value: "compat-readonly-all", label: "兼容只读" },
+    { value: "compat-readonly-all", label: "兼容只读（实际只读）" },
   ] as const;
 
   const PERMISSION_MODE_OPTIONS = [
@@ -102,7 +102,7 @@
     </select>
   </label>
   <p class="text-xs text-[var(--color-text-muted)]">
-    Workspace 本地入口按当前工作目录解析；系统命令与脚本类型均可按项目配置。当前执行边界仍为 policy_only。
+    Workspace 本地入口按当前工作目录解析；系统命令与脚本类型均可按项目配置。dangerous 只能由操作者在此控制面启用，模型参数不能作为用户批准凭证。当前执行边界仍为 policy_only。
   </p>
   <div class="flex justify-end pt-1">
     <button

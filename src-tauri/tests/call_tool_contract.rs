@@ -57,56 +57,15 @@ fn read_file_explicit_parent_path_is_read_only() {
 }
 
 #[test]
-fn request_permissions_is_unsupported_not_silent_grant() {
-    let fx = tiny_js_fixture();
-    let ctx = ctx_for(&fx.root);
-    let out = invoke(
-        &ctx,
-        "request_permissions",
-        json!({
-            "tool_name": "exec_command",
-            "permission": "network",
-            "reason": "verify compliance denial shape",
-            "arguments": {"cmd": "curl https://example.com"}
-        }),
-    );
-    assert_err(&out);
-    assert_eq!(out["error"]["code"], "ELICITATION_UNSUPPORTED");
-    assert_eq!(out["status"], "unsupported");
-}
-
-#[test]
-fn request_permissions_exposes_public_schema_and_grants_in_dangerous_mode() {
+fn model_controlled_permission_tool_is_not_exposed() {
     let tools = list_tools_for_profile("core");
-    let tool = tools
+    assert!(!tools
         .iter()
-        .find(|tool| tool["name"] == "request_permissions")
-        .expect("request_permissions descriptor");
-    let schema = &tool["inputSchema"];
-    assert_eq!(
-        schema["required"],
-        json!(["tool_name", "permission", "reason", "arguments"])
-    );
-    assert!(schema["properties"]["permission"]["enum"]
-        .as_array()
-        .expect("permission enum")
-        .contains(&json!("network")));
+        .any(|tool| tool["name"] == "request_permissions"));
 
     let fx = tiny_js_fixture();
-    let mut ctx = ctx_for(&fx.root);
-    ctx.permission_mode = "dangerous".into();
-    ctx.policy.permission_mode = "dangerous".into();
-    let args = json!({
-        "tool_name": "exec_command",
-        "permission": "network",
-        "reason": "verify dangerous-mode compatibility",
-        "arguments": {"cmd": "curl https://example.com"}
-    });
-    let out = invoke(&ctx, "request_permissions", args.clone());
-    let payload = assert_ok(&out);
-    assert_eq!(payload["status"], "granted");
-    assert_eq!(payload["constraints"]["mode"], "dangerous");
-    assert_eq!(payload["constraints"]["requested"], args);
+    let out = invoke(&ctx_for(&fx.root), "request_permissions", json!({}));
+    assert_eq!(assert_err(&out)["error"]["code"], "INVALID_ARGUMENT");
 }
 
 #[test]
@@ -208,7 +167,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 27);
+    assert_eq!(names.len(), 26);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));

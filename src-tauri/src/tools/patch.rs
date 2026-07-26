@@ -18,11 +18,6 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let confirm = args
-        .get("confirm")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
     let file_patches = parse_unified_diff(patch)?;
     if file_patches.is_empty() {
         return Err(patch_failed("No files were modified."));
@@ -36,14 +31,14 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             "禁止删除仓库保护资产: {path}"
         )));
     }
-    if !confirm {
+    if !ctx.policy.skip_permission_gates() {
         if let Some(path) = file_patches
             .iter()
             .find(|file| file.is_deleted && is_critical_file(&file.path))
             .map(|file| file.path.as_str())
         {
             return Err(dangerous_operation(format!(
-                "删除关键项目文件需要 confirm=true: {path}"
+                "删除关键项目文件需要操作者在受信任控制面启用 dangerous 权限模式: {path}"
             )));
         }
     }
@@ -554,7 +549,7 @@ fn is_protected_repository_asset(path: &str) -> bool {
 
 fn dangerous_operation(message: impl Into<String>) -> WorkspaceError {
     WorkspaceError::Tool {
-        code: "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION",
+        code: "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
         message: message.into(),
         category: "permission",
         retryable: false,

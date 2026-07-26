@@ -118,7 +118,7 @@ pub fn resources_list(catalog: &SkillCatalog, params: &Value) -> Result<Value, V
                 "name": format!("{}/{}", skill.name, item.path),
                 "title": item.path,
                 "description": if item.kind == "script" {
-                    "Skill script source. Direct Skill execution is disabled; generic exec_command requires explicit confirmation."
+                    "Skill script source. Direct Skill execution is disabled; generic exec_command requires operator-enabled dangerous mode."
                 } else {
                     "Skill supporting resource."
                 },

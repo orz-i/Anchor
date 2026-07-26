@@ -246,7 +246,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Write stdin",
         "Write characters to a server-managed running command session.",
         false,
-        false,
+        true,
         false,
     ),
     (
@@ -306,14 +306,6 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
-        "request_permissions",
-        "Request permissions",
-        "Request a scoped permission grant for dangerous runtime operations.",
-        true,
-        false,
-        false,
-    ),
-    (
         "view_image",
         "View image",
         "Return a workspace image as MCP image content.",
@@ -350,7 +342,6 @@ pub const CORE_TOOLS: &[&str] = &[
     "git_log",
     "git_show",
     "git_blame",
-    "request_permissions",
     "view_image",
 ];
 
@@ -372,7 +363,6 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "git_log",
     "git_show",
     "git_blame",
-    "request_permissions",
     "view_image",
 ];
 
@@ -416,7 +406,6 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "task_context",
     "list_task_events",
     "change_summary",
-    "request_permissions",
     "view_image",
 ];
 
@@ -458,7 +447,6 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "git_log",
     "git_show",
     "git_blame",
-    "request_permissions",
     "view_image",
     "patch_check",
     "project_state",
@@ -482,7 +470,9 @@ pub fn normalize_tool_profile(profile: &str) -> &'static str {
     match profile {
         "advanced" => "advanced",
         "read-only" => "read-only",
-        "compat-readonly-all" => "compat-readonly-all",
+        // Legacy compatibility profile used to expose mutating tools with false
+        // read-only annotations. Preserve the stored value as a safe alias.
+        "compat-readonly-all" => "read-only",
         _ => "core",
     }
 }
@@ -490,7 +480,7 @@ pub fn normalize_tool_profile(profile: &str) -> &'static str {
 pub fn exposed_tool_names(tool_profile: &str) -> Vec<&'static str> {
     match normalize_tool_profile(tool_profile) {
         "read-only" => CORE_READ_ONLY_TOOLS.to_vec(),
-        "advanced" | "compat-readonly-all" => P0_TOOLS.iter().map(|(name, ..)| *name).collect(),
+        "advanced" => P0_TOOLS.iter().map(|(name, ..)| *name).collect(),
         _ => CORE_TOOLS.to_vec(),
     }
 }
@@ -500,17 +490,11 @@ pub fn list_tools() -> Vec<Value> {
 }
 
 pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
-    let compat = tool_profile == "compat-readonly-all";
     exposed_tool_names(tool_profile)
         .into_iter()
         .filter_map(|name| {
             P0_TOOLS.iter().find(|(n, ..)| *n == name).map(|entry| {
                 let (name, title, description, read_only, destructive, open_world) = *entry;
-                let (read_only, destructive, open_world) = if compat {
-                    (true, false, false)
-                } else {
-                    (read_only, destructive, open_world)
-                };
                 json!({
                     "name": name,
                     "title": title,
@@ -742,7 +726,6 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "patch": { "type": "string", "minLength": 1 },
                 "dry_run": { "type": "boolean", "default": false },
-                "confirm": { "type": "boolean", "default": false },
                 "reason": { "type": "string", "default": "" }
             },
             "required": ["patch"],
@@ -766,7 +749,6 @@ pub fn input_schema(name: &str) -> Value {
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
                 "stdin": { "type": "string", "default": "" },
-                "confirm": { "type": "boolean", "default": false },
                 "filesystem_scope": { "type": "string", "enum": ["workspace"], "default": "workspace" },
                 "reason": { "type": "string", "default": "" }
             },
@@ -860,43 +842,6 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["path"],
             "additionalProperties": false
         }),
-        "request_permissions" => json!({
-            "type": "object",
-            "properties": {
-                "tool_name": {
-                    "type": "string",
-                    "enum": ["exec_command", "apply_patch"]
-                },
-                "permission": {
-                    "type": "string",
-                    "enum": [
-                        "network",
-                        "destructive_command",
-                        "long_timeout",
-                        "sensitive_env",
-                        "shell_expansion",
-                        "inline_script",
-                        "privileged_executable",
-                        "write_generated_or_ignored"
-                    ]
-                },
-                "reason": { "type": "string", "minLength": 1 },
-                "arguments": { "type": "object", "additionalProperties": true },
-                "scope": {
-                    "type": "string",
-                    "enum": ["once", "session"],
-                    "default": "once"
-                },
-                "ttl_seconds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 3600,
-                    "default": 300
-                }
-            },
-            "required": ["tool_name", "permission", "reason", "arguments"],
-            "additionalProperties": false
-        }),
         "set_default_cwd" => json!({
             "type": "object",
             "properties": {
@@ -932,7 +877,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile};
 
     #[test]
-    fn core_catalog_exposes_27_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_26_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -940,7 +885,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 26);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -950,6 +895,7 @@ mod tests {
         assert!(names.contains(&"history_session_validate"));
         assert!(names.contains(&"grep_text"));
         assert!(!names.contains(&"grep"));
+        assert!(!names.contains(&"request_permissions"));
 
         for name in names {
             let schema = input_schema(name);
@@ -974,5 +920,18 @@ mod tests {
         assert!(!names.contains(&"exec_command"));
         assert!(names.contains(&"get_default_cwd"));
         assert!(names.contains(&"read_file"));
+    }
+
+    #[test]
+    fn legacy_compat_profile_is_a_truthful_read_only_alias() {
+        let read_only = list_tools_for_profile("read-only");
+        let compat = list_tools_for_profile("compat-readonly-all");
+        assert_eq!(compat, read_only);
+        assert!(compat.iter().all(|tool| {
+            tool["annotations"]["readOnlyHint"] == true
+                && tool["annotations"]["destructiveHint"] == false
+        }));
+        assert!(!compat.iter().any(|tool| tool["name"] == "apply_patch"));
+        assert!(!compat.iter().any(|tool| tool["name"] == "exec_command"));
     }
 }

@@ -218,7 +218,7 @@ impl SkillCatalog {
             warnings: snapshot.warnings.clone(),
             truncated,
             script_execution_enabled: false,
-            script_execution_policy: "confirm-via-exec-command".into(),
+            script_execution_policy: "operator-dangerous-mode".into(),
             snapshot_mode: "listener-fixed".into(),
             catalog_digest: snapshot.digest.clone(),
         }
@@ -508,7 +508,7 @@ fn read_skill_record(
         resources: discovered.resources,
         scripts: discovered.scripts,
         script_execution_enabled: false,
-        script_execution_policy: "confirm-via-exec-command".into(),
+        script_execution_policy: "operator-dangerous-mode".into(),
         resource_truncated: discovered.truncated,
         warnings: discovered.warnings,
     };

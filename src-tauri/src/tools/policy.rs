@@ -261,14 +261,9 @@ pub fn validate_command_for_workspace(
                 .into(),
         ));
     }
-    if dangerous_command_pattern().is_match(command)
-        && !arguments
-            .get("confirm")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
+    if dangerous_command_pattern().is_match(command) && !policy.skip_permission_gates() {
         return Err(PolicyError(
-            "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION: dangerous command requires confirm=true"
+            "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE: dangerous commands require operator-enabled dangerous mode; model-supplied confirmation is not accepted"
                 .into(),
         ));
     }
@@ -613,6 +608,25 @@ mod tests {
         )
         .is_err());
         assert!(validate_command(&json!({"cmd": "echo hello > output.txt"}), &policy).is_err());
+    }
+
+    #[test]
+    fn model_supplied_confirmation_cannot_unlock_dangerous_commands() {
+        let trusted = PolicySettings::default();
+        let error = validate_command(
+            &json!({"cmd": "git reset --hard HEAD", "confirm": true}),
+            &trusted,
+        )
+        .expect_err("trusted mode must reject destructive commands");
+        assert!(error
+            .0
+            .contains("DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"));
+
+        let dangerous = PolicySettings {
+            permission_mode: "dangerous".into(),
+            ..PolicySettings::default()
+        };
+        assert!(validate_command(&json!({"cmd": "git reset --hard HEAD"}), &dangerous).is_ok());
     }
 
     #[test]
