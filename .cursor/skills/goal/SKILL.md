@@ -1,7 +1,7 @@
 ---
 name: goal
 description: >-
-  Drives Coding Tools MCP desktop development to completion against old/ parity.
+  Drives Anchor desktop development to completion against old/ parity.
   Use when the user invokes /goal, says 开始开发直到完成, or asks to finish the
   rust-desktop-client spec with shared MCP/Actions tool core aligned to old/.
 disable-model-invocation: true
@@ -15,7 +15,7 @@ disable-model-invocation: true
 
 - **工具共用底层**：MCP 与 Actions 必须且只能调用 `tools::call_tool`（一点不能差）；策略校验在 `call_tool` 内统一完成。
 - **Actions 暴露层**：`validate_actions_exposure` 仅判断工具是否在 OpenAPI 白名单，不得重复做 exec/patch 参数校验。
-- **旧版对齐**：工具名、schema、ALLOWED_TOOLS、行为以 `old/coding_tools_mcp/server.py` 与 `old/coding_tools_actions/policies.py` 为准。
+- **旧版对齐**：工具名、schema、ALLOWED_TOOLS、行为以 legacy archive `old/coding_tools_mcp/server.py` 与 `old/coding_tools_actions/policies.py` 为准。
 - **exec_command**：禁止默认「整条命令丢进 bash/sh」；优先 **argv 直启**（`Command::new(exe).args(...)`），扩大白名单（pytest/python/cargo/npm/go/msbuild/dotnet/gradle…），与旧版 allowlist 一致并覆盖 Windows 可执行名。
 - **单文件 <500 行**；用 `platform` trait，禁止 PowerShell。
 - **双端口**：MCP 与 Actions 默认 28766，用户可改；占用时弹窗提醒。

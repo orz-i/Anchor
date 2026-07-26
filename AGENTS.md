@@ -25,7 +25,7 @@ Memory (requires MEMORY_* env):
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **coding-tools-mcp** (2497 symbols, 5234 relationships, 210 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **anchor** (2497 symbols, 5234 relationships, 210 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -48,10 +48,10 @@ This project is indexed by GitNexus as **coding-tools-mcp** (2497 symbols, 5234 
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/coding-tools-mcp/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/coding-tools-mcp/clusters` | All functional areas |
-| `gitnexus://repo/coding-tools-mcp/processes` | All execution flows |
-| `gitnexus://repo/coding-tools-mcp/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/anchor/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/anchor/clusters` | All functional areas |
+| `gitnexus://repo/anchor/processes` | All execution flows |
+| `gitnexus://repo/anchor/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

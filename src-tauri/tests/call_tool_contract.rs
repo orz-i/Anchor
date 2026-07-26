@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::process::Command;
 
-use coding_tools_mcp_desktop_lib::tools::list_tools_for_profile;
+use anchor_lib::tools::list_tools_for_profile;
 use common::*;
 use serde_json::{json, Value};
 
@@ -18,7 +18,7 @@ fn server_info_returns_workspace_and_tools() {
     let ctx = ctx_for(&fx.root);
     let out = invoke(&ctx, "server_info", json!({}));
     let payload = assert_ok(&out);
-    assert_eq!(payload["server"], "coding-tools-mcp");
+    assert_eq!(payload["server"], "anchor");
     assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     assert!(payload["tools"].is_array());
     assert!(payload["tool_count"].as_u64().unwrap_or(0) > 0);
@@ -139,11 +139,11 @@ fn git_log_root_does_not_pass_empty_pathspec() {
 
 #[test]
 fn advanced_profile_exposes_every_declared_tool() {
-    let declared = coding_tools_mcp_desktop_lib::tools::registry::P0_TOOLS
+    let declared = anchor_lib::tools::registry::P0_TOOLS
         .iter()
         .map(|(name, ..)| *name)
         .collect::<std::collections::HashSet<_>>();
-    let tool_values = coding_tools_mcp_desktop_lib::tools::list_tools_for_profile("advanced");
+    let tool_values = anchor_lib::tools::list_tools_for_profile("advanced");
     let exposed = tool_values
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -152,17 +152,17 @@ fn advanced_profile_exposes_every_declared_tool() {
     assert_eq!(declared, exposed);
     assert!(declared
         .iter()
-        .all(|name| coding_tools_mcp_desktop_lib::tools::is_allowed_tool(name)));
+        .all(|name| anchor_lib::tools::is_allowed_tool(name)));
 }
 
 #[test]
 fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
-    let tools = coding_tools_mcp_desktop_lib::tools::list_tools_for_profile("core");
+    let tools = anchor_lib::tools::list_tools_for_profile("core");
     let names = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<std::collections::HashSet<_>>();
-    let expected = coding_tools_mcp_desktop_lib::tools::registry::CORE_TOOLS
+    let expected = anchor_lib::tools::registry::CORE_TOOLS
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
@@ -376,10 +376,10 @@ fn search_text_filters_by_glob() {
 
 #[test]
 fn grep_reuses_search_text_schema_and_behavior() {
-    let schema = coding_tools_mcp_desktop_lib::tools::registry::input_schema("grep");
+    let schema = anchor_lib::tools::registry::input_schema("grep");
     assert_eq!(
         schema,
-        coding_tools_mcp_desktop_lib::tools::registry::input_schema("search_text")
+        anchor_lib::tools::registry::input_schema("search_text")
     );
 
     let fx = tiny_js_fixture();

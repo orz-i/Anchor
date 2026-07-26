@@ -40,9 +40,7 @@ fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, 
                 match option.as_str() {
                     "--enable" => enabled = Some(true),
                     "--disable" => enabled = Some(false),
-                    "--port" => {
-                        local_port = Some(parse_u64(args, "--port", 1, 65_535)? as u16)
-                    }
+                    "--port" => local_port = Some(parse_u64(args, "--port", 1, 65_535)? as u16),
                     "--owner" => owner_workspace = Some(pop_value(args, "--owner")?),
                     "--public-url" => public_url = Some(pop_value(args, "--public-url")?),
                     "--clear-public-url" => public_url = Some(String::new()),
@@ -76,10 +74,7 @@ fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, 
             }
             Ok(GatewayCommand::Serve { workspaces })
         }
-        Some(other) => Err(format!(
-            "未知 gateway 命令：{other}\n\n{}",
-            gateway_usage()
-        )),
+        Some(other) => Err(format!("未知 gateway 命令：{other}\n\n{}", gateway_usage())),
         None => Err(format!("gateway 缺少子命令\n\n{}", gateway_usage())),
     }
 }
@@ -602,41 +597,41 @@ fn ensure_empty(args: &VecDeque<String>, command: &str) -> Result<(), String> {
 }
 
 pub fn usage() -> &'static str {
-    "Coding Tools MCP CLI\n\n\
+    "Anchor CLI\n\n\
 用法：\n\
-  coding-tools-mcp [--config-dir PATH] [--json] list\n\
-  coding-tools-mcp [--config-dir PATH] [--json] show <workspace>\n\
-  coding-tools-mcp [--config-dir PATH] [--json] status <workspace> [--watch]\n\
-  coding-tools-mcp [--config-dir PATH] [--json] serve <workspace> [--service mcp|actions|all] [--tunnel]\n\n\
-  coding-tools-mcp [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
-  coding-tools-mcp [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
-  coding-tools-mcp [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
-  coding-tools-mcp [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
-  coding-tools-mcp [--config-dir PATH] [--json] doctor <workspace>\n\n\
-  coding-tools-mcp [--config-dir PATH] [--json] workspace <command> ...\n\n\
-  coding-tools-mcp [--config-dir PATH] [--json] gateway <command> ...\n\n\
+  anchor [--config-dir PATH] [--json] list\n\
+  anchor [--config-dir PATH] [--json] show <workspace>\n\
+  anchor [--config-dir PATH] [--json] status <workspace> [--watch]\n\
+  anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|actions|all] [--tunnel]\n\n\
+  anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
+  anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
+  anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
+  anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
+  anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
 serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
 
 pub fn gateway_usage() -> &'static str {
     "Gateway 命令：\n\
-  coding-tools-mcp gateway show\n\
-  coding-tools-mcp gateway configure [--enable|--disable] [--port PORT] [--owner WORKSPACE] [--public-url URL|--clear-public-url]\n\
-  coding-tools-mcp gateway serve <workspace> [workspace ...]\n\n\
+  anchor gateway show\n\
+  anchor gateway configure [--enable|--disable] [--port PORT] [--owner WORKSPACE] [--public-url URL|--clear-public-url]\n\
+  anchor gateway serve <workspace> [workspace ...]\n\n\
 gateway serve 在一个前台进程内启动所选工作区的 MCP listener、共享 Gateway 和唯一 MCP 隧道，适合由 systemd 监督。"
 }
 
 pub fn workspace_usage() -> &'static str {
     "Workspace 命令：\n\
-  coding-tools-mcp workspace list\n\
-  coding-tools-mcp workspace register <path> [--name NAME]\n\
-  coding-tools-mcp workspace unregister <workspace> --force [--timeout SECONDS]\n\
-  coding-tools-mcp workspace show <workspace>\n\
-  coding-tools-mcp workspace start <workspace> [--service mcp|actions|all] [--tunnel]\n\
-  coding-tools-mcp workspace stop <workspace> [--timeout SECONDS] [--force]\n\
-  coding-tools-mcp workspace gpt-config <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--show-secrets]\n\
-  coding-tools-mcp workspace test <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--timeout SECONDS]"
+  anchor workspace list\n\
+  anchor workspace register <path> [--name NAME]\n\
+  anchor workspace unregister <workspace> --force [--timeout SECONDS]\n\
+  anchor workspace show <workspace>\n\
+  anchor workspace start <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor workspace stop <workspace> [--timeout SECONDS] [--force]\n\
+  anchor workspace gpt-config <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--show-secrets]\n\
+  anchor workspace test <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--timeout SECONDS]"
 }
 
 #[cfg(test)]
@@ -651,7 +646,7 @@ mod tests {
     fn parses_foreground_all_services_with_tunnel() {
         let parsed = parse(strings(&[
             "--config-dir",
-            "/tmp/coding-tools",
+            "/tmp/anchor",
             "--json",
             "serve",
             "workspace-a",
@@ -661,7 +656,7 @@ mod tests {
         ]))
         .expect("parse");
 
-        assert_eq!(parsed.config_dir, Some(PathBuf::from("/tmp/coding-tools")));
+        assert_eq!(parsed.config_dir, Some(PathBuf::from("/tmp/anchor")));
         assert!(parsed.json);
         assert_eq!(
             parsed.command,
@@ -717,13 +712,8 @@ mod tests {
             }))
         );
 
-        let serve = parse(strings(&[
-            "gateway",
-            "serve",
-            "workspace-a",
-            "workspace-b",
-        ]))
-        .expect("gateway serve");
+        let serve = parse(strings(&["gateway", "serve", "workspace-a", "workspace-b"]))
+            .expect("gateway serve");
         assert_eq!(
             serve.command,
             Command::Gateway(GatewayCommand::Serve {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a live Coding Tools MCP release-candidate endpoint.
+"""Validate a live Anchor release-candidate endpoint.
 
 The script uses only the Python standard library. It performs a real
 Streamable HTTP MCP session, validates the effective catalog digest, invokes
@@ -88,7 +88,7 @@ class Validator:
     ) -> tuple[int, dict[str, str], bytes]:
         request_headers = {
             "Accept": "application/json, text/event-stream",
-            "User-Agent": "coding-tools-mcp-rc-validator/1",
+            "User-Agent": "anchor-rc-validator/1",
         }
         if payload is not None:
             request_headers["Content-Type"] = "application/json"
@@ -124,7 +124,7 @@ class Validator:
         request_headers = {
             "Accept": "application/json, text/html, */*",
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "coding-tools-mcp-rc-validator/1",
+            "User-Agent": "anchor-rc-validator/1",
         }
         data = urllib.parse.urlencode(form).encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
@@ -426,7 +426,7 @@ class Validator:
         info = self.call_tool("server_info", {})
         self.add(
             "oauth_refreshed_access_token",
-            info.get("server") == "coding-tools-mcp",
+            info.get("server") == "anchor",
             f"server={info.get('server')}",
         )
         reused_status, _, reused_body = self.request_form(
@@ -448,7 +448,7 @@ class Validator:
             {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "coding-tools-mcp-rc-validator", "version": "1"},
+                "clientInfo": {"name": "anchor-rc-validator", "version": "1"},
             },
         )
         negotiated = result.get("protocolVersion")
@@ -456,7 +456,7 @@ class Validator:
         ok = (
             negotiated == PROTOCOL_VERSION
             and bool(self.session_id)
-            and server.get("name") == "coding-tools-mcp"
+            and server.get("name") == "anchor"
         )
         self.add(
             "initialize",

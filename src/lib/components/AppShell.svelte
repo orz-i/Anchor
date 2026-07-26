@@ -18,7 +18,7 @@
     <div class="tx-sidebar-header">
       <div class="flex items-start justify-between gap-2">
         <div>
-          <p class="tx-brand-kicker">Coding Tools</p>
+          <p class="tx-brand-kicker">Anchor</p>
           <h1 class="tx-brand-title">桌面控制台</h1>
         </div>
         <ThemeToggle />
@@ -56,5 +56,5 @@
 </div>
 
 <svelte:head>
-  <title>Coding Tools MCP</title>
+  <title>Anchor</title>
 </svelte:head>

@@ -11,6 +11,10 @@ pub trait Platform: Send + Sync {
 
     fn app_config_dir(&self) -> AppResult<PathBuf>;
 
+    fn legacy_app_config_dirs(&self) -> AppResult<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>>;
 
     /// Best-effort reclaim of a TCP listener on the given port. Windows uses
@@ -39,9 +43,18 @@ pub trait Platform: Send + Sync {
 }
 
 pub(crate) fn app_config_dir_override() -> Option<PathBuf> {
-    std::env::var_os("CODING_TOOLS_MCP_CONFIG_DIR")
+    std::env::var_os(crate::brand::CONFIG_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os(crate::brand::LEGACY_CONFIG_DIR_ENV))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+}
+
+pub(crate) fn has_app_config_dir_override() -> bool {
+    std::env::var_os(crate::brand::CONFIG_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os(crate::brand::LEGACY_CONFIG_DIR_ENV))
+        .is_some()
 }
 
 #[cfg(target_os = "linux")]
@@ -51,14 +64,14 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+mod child_process;
 mod open;
 mod paths;
-mod child_process;
 
-pub use open::open_path_in_file_manager;
 pub(crate) use child_process::{
     configure_supervised_tokio_process, hide_std_console, hide_tokio_console,
 };
+pub use open::open_path_in_file_manager;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxPlatform;

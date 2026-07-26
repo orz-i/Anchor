@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="src-tauri/icons/128x128.png" width="96" alt="Coding Tools MCP icon">
+  <img src="src-tauri/icons/128x128.png" width="96" alt="Anchor icon">
 </p>
 
-<h1 align="center">Coding Tools MCP</h1>
+<h1 align="center">Anchor</h1>
 
 <p align="center">
   Turn a local project into a persistent AI development workspace that carries context across conversations.
@@ -19,9 +19,11 @@
   <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest">Download latest</a>
 </p>
 
-Coding Tools MCP is a Rust + Tauri 2 desktop application. Select a project directory and start the service; an AI agent can then read files, edit code, run commands and tests, inspect Git, and preserve development progress inside the project through MCP. It behaves like an AI opening an IDE workspace that remembers where the last conversation stopped.
+Anchor is a Rust + Tauri 2 desktop application. Select a project directory and start the service; an AI agent can then read files, edit code, run commands and tests, inspect Git, and preserve development progress inside the project through MCP. It behaves like an AI opening an IDE workspace that remembers where the last conversation stopped.
 
-![Coding Tools MCP workspace overview](docs/images/workspace-overview.png)
+When upgrading from the previous product name, Anchor migrates workspaces, secrets, software caches, and managed FRP state. See [Anchor rename and upgrade migration](docs/anchor-migration.md).
+
+![Anchor workspace overview](docs/images/workspace-overview.png)
 
 *One desktop app manages workspaces, MCP services, connection details, and the session-recovery prompt.*
 
@@ -50,8 +52,8 @@ Open [Releases](https://github.com/mybolide/coding-tools-mcp/releases/latest) an
 
 | Platform | Package |
 | --- | --- |
-| Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` |
-| macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` |
+| Windows 10/11 x64 | `Anchor_*_x64-setup.exe` |
+| macOS Apple Silicon | `Anchor_*_aarch64.dmg` |
 
 The macOS build is currently unsigned. If macOS blocks the first launch, allow it from System Settings → Privacy & Security.
 
@@ -146,7 +148,7 @@ Open **Plugins** from the ChatGPT sidebar, click the `+` button, select the MCP 
 
 | ChatGPT field | Value |
 | --- | --- |
-| Name | A recognizable name such as `Coding Tools MCP` |
+| Name | A recognizable name such as `Anchor` |
 | Description | A short description of the connected project or purpose |
 | Connection | The public MCP URL from the desktop **GPT configuration** card; it should end in `/mcp` |
 | Authentication | The same mode configured in the desktop app; the screenshot uses OAuth |
@@ -162,7 +164,7 @@ For OAuth, open the advanced OAuth settings, select static/manual OAuth credenti
 Start a new conversation with the plugin enabled and ask:
 
 ```text
-Use Coding Tools MCP to call server_info, get_default_cwd, and git_status.
+Use Anchor to call server_info, get_default_cwd, and git_status.
 Tell me which workspace is connected, its default directory, and its Git status.
 ```
 
@@ -199,7 +201,7 @@ MCP and Actions can run together for the same workspace, with separate ports and
 
 ## Let the project remember every conversation
 
-Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Coding Tools MCP stores progress in `docs/history-session/` under the current project, so context follows the repository instead of staying trapped in one chat window.
+Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Anchor stores progress in `docs/history-session/` under the current project, so context follows the repository instead of staying trapped in one chat window.
 
 ![ChatGPT new-conversation startup prompt](docs/images/history-session-prompt.png)
 
@@ -277,12 +279,12 @@ On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone t
 
 ### Headless Linux CLI
 
-Linux servers can build `coding-tools-mcp` without the Tauri desktop feature. It reads the same one-workspace/one-profile configuration as the GUI and runs MCP or Actions in the foreground:
+Linux servers can build `anchor` without the Tauri desktop feature. It reads the same one-workspace/one-profile configuration as the GUI and runs MCP or Actions in the foreground:
 
 ```bash
 pnpm cli:build
-./src-tauri/target/release/coding-tools-mcp list
-./src-tauri/target/release/coding-tools-mcp serve <workspace> --service mcp
+./src-tauri/target/release/anchor list
+./src-tauri/target/release/anchor serve <workspace> --service mcp
 ```
 
 The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. It will not take over a port already used by the GUI. For production boot-time supervision, systemd should still run `serve` directly. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).

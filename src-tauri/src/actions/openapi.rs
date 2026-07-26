@@ -28,12 +28,12 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
         let description_raw = tool
             .get("description")
             .and_then(Value::as_str)
-            .unwrap_or("Call coding tool");
+            .unwrap_or("Call Anchor tool");
         let description: String = description_raw.chars().take(700).collect();
         let summary: String = description.chars().take(300).collect();
 
         let mut operation = json!({
-            "operationId": format!("coding_{name}"),
+            "operationId": format!("anchor_{name}"),
             "summary": summary,
             "description": description,
             "requestBody": {
@@ -74,9 +74,12 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
     let mut document = json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Coding Tools Actions",
+            "title": format!("{} Actions", crate::brand::PRODUCT_NAME),
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Read, modify and test a workspace through coding-tools-mcp."
+            "description": format!(
+                "Read, modify and test a workspace through {}.",
+                crate::brand::PRODUCT_NAME
+            )
         },
         "servers": [{ "url": public_base_url.trim_end_matches('/') }],
         "paths": paths,
@@ -224,7 +227,7 @@ mod tests {
         let schema = build_openapi(&tools, "https://actions.example.com", "none");
         let operation = &schema["paths"]["/actions/grep_text"]["post"];
 
-        assert_eq!(operation["operationId"], "coding_grep_text");
+        assert_eq!(operation["operationId"], "anchor_grep_text");
         assert_eq!(operation["x-openai-isConsequential"], false);
         assert_eq!(
             operation["requestBody"]["content"]["application/json"]["schema"],

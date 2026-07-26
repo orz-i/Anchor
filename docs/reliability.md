@@ -1,6 +1,6 @@
 # 连接恢复、自动重试与 OAuth 续约
 
-Coding Tools MCP 对本地服务、隧道、下游 MCP 和桌面后台连接采用分层恢复。恢复遵循两个原则：
+Anchor 对本地服务、隧道、下游 MCP 和桌面后台连接采用分层恢复。恢复遵循两个原则：
 
 1. 能安全重复的连接与读取操作自动重试；
 2. 结果可能已经生效的写入和工具调用不盲目重放。
@@ -43,10 +43,10 @@ Linux CLI 的 `serve --tunnel` 同样会持续维护隧道，重试间隔最高�
 
 ## Linux CLI
 
-`coding-tools-mcp serve` 不再只等待 `Ctrl+C`，而是持续维护已启动服务：
+`anchor serve` 不再只等待 `Ctrl+C`，而是持续维护已启动服务：
 
 ```bash
-coding-tools-mcp serve PROFILE_ID --service all --tunnel
+anchor serve PROFILE_ID --service all --tunnel
 ```
 
 状态变化会输出：

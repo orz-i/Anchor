@@ -19,7 +19,15 @@ impl Platform for WindowsPlatform {
         if let Some(path) = crate::platform::app_config_dir_override() {
             return Ok(path);
         }
-        paths::roaming_app_data().map(|dir| dir.join("coding-tools-mcp-desktop"))
+        paths::roaming_app_data().map(|dir| dir.join(crate::brand::APP_CONFIG_DIR_NAME))
+    }
+
+    fn legacy_app_config_dirs(&self) -> AppResult<Vec<PathBuf>> {
+        if crate::platform::has_app_config_dir_override() {
+            return Ok(Vec::new());
+        }
+        paths::roaming_app_data()
+            .map(|dir| vec![dir.join(crate::brand::LEGACY_APP_CONFIG_DIR_NAME)])
     }
 
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>> {

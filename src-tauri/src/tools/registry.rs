@@ -655,7 +655,7 @@ pub fn output_schema(name: &str) -> Value {
     match canonical_tool_name(name) {
         "server_info" => success_output_schema(
             json!({
-                "server": { "type": "string", "const": "coding-tools-mcp" },
+                "server": { "type": "string", "const": crate::brand::SERVER_NAME },
                 "title": { "type": "string", "minLength": 1 },
                 "version": { "type": "string", "minLength": 1 },
                 "protocol_version": { "type": "string", "minLength": 1 },

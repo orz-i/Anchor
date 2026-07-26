@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-为 Coding Tools MCP 增加 Agent 熟悉的 `grep` 工具入口，并复用现有 `search_text` 搜索内核；同时建立 macOS 通用安装包的 GitHub 手动构建流程，使 Windows 与 macOS 用户使用同一版本功能，且任何 macOS 构建都必须由用户明确要求后手动触发。
+为 Anchor 增加 Agent 熟悉的 `grep` 工具入口，并复用现有 `search_text` 搜索内核；同时建立 macOS 通用安装包的 GitHub 手动构建流程，使 Windows 与 macOS 用户使用同一版本功能，且任何 macOS 构建都必须由用户明确要求后手动触发。
 
 ## 历史经验与坑
 

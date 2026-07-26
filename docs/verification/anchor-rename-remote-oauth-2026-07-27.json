@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "base_url": "https://bundle-quantity-hockey-finished.trycloudflare.com",
+  "auth": "oauth",
+  "protocol_version": "2025-11-25",
+  "started_at": 1785086218.2379353,
+  "duration_seconds": 12.43,
+  "ok": true,
+  "checks": [
+    {
+      "name": "mcp_get_405",
+      "ok": true,
+      "detail": "HTTP 405, Allow='POST, DELETE'",
+      "evidence": {
+        "response_preview": ""
+      }
+    },
+    {
+      "name": "wrong_origin_rejected",
+      "ok": true,
+      "detail": "HTTP 403",
+      "evidence": {}
+    },
+    {
+      "name": "oauth_protected_resource_metadata",
+      "ok": true,
+      "detail": "HTTP 200",
+      "evidence": {
+        "keys": [
+          "authorization_servers",
+          "bearer_methods_supported",
+          "resource",
+          "scopes_supported"
+        ]
+      }
+    },
+    {
+      "name": "oauth_authorization_server_metadata",
+      "ok": true,
+      "detail": "HTTP 200",
+      "evidence": {
+        "keys": [
+          "authorization_endpoint",
+          "code_challenge_methods_supported",
+          "grant_types_supported",
+          "issuer",
+          "response_types_supported",
+          "scopes_supported",
+          "token_endpoint",
+          "token_endpoint_auth_methods_supported"
+        ]
+      }
+    },
+    {
+      "name": "oauth_unauthenticated_challenge",
+      "ok": true,
+      "detail": "HTTP 401; WWW-Authenticate present=True",
+      "evidence": {}
+    },
+    {
+      "name": "oauth_authorization_page",
+      "ok": true,
+      "detail": "HTTP 200",
+      "evidence": {}
+    },
+    {
+      "name": "oauth_authorization_code",
+      "ok": true,
+      "detail": "HTTP 303; callback_host=chatgpt.com",
+      "evidence": {
+        "response_preview": ""
+      }
+    },
+    {
+      "name": "oauth_token_exchange",
+      "ok": true,
+      "detail": "HTTP 200; token_type=Bearer",
+      "evidence": {
+        "expires_in": 3600,
+        "scope": "mcp"
+      }
+    },
+    {
+      "name": "initialize",
+      "ok": true,
+      "detail": "protocol=2025-11-25, session=True",
+      "evidence": {
+        "server_info": {
+          "name": "anchor",
+          "title": "Anchor",
+          "version": "0.1.23"
+        }
+      }
+    },
+    {
+      "name": "tools_list_contract",
+      "ok": true,
+      "detail": "count=26, digest=4dd2cf70826b6ac00b1e84950da64d2c54195eb3ec3e67c0fff8e4a16965f200",
+      "evidence": {
+        "names": [
+          "apply_patch",
+          "check_exec_environment",
+          "exec_command",
+          "get_default_cwd",
+          "git_blame",
+          "git_diff",
+          "git_log",
+          "git_show",
+          "git_status",
+          "grep_text",
+          "history_session_bootstrap",
+          "history_session_checkpoint",
+          "history_session_validate",
+          "kill_session",
+          "list_dir",
+          "list_files",
+          "list_skills",
+          "load_skill",
+          "read_file",
+          "read_output",
+          "read_skill_resource",
+          "search_text",
+          "server_info",
+          "set_default_cwd",
+          "view_image",
+          "write_stdin"
+        ],
+        "digest": "4dd2cf70826b6ac00b1e84950da64d2c54195eb3ec3e67c0fff8e4a16965f200"
+      }
+    },
+    {
+      "name": "server_info_catalog_digest",
+      "ok": true,
+      "detail": "server=4dd2cf70826b6ac00b1e84950da64d2c54195eb3ec3e67c0fff8e4a16965f200, computed=4dd2cf70826b6ac00b1e84950da64d2c54195eb3ec3e67c0fff8e4a16965f200",
+      "evidence": {
+        "tool_profile": "core",
+        "catalog_bytes": 47815
+      }
+    },
+    {
+      "name": "expected_tool_profile",
+      "ok": true,
+      "detail": "actual=core, expected=core",
+      "evidence": {}
+    },
+    {
+      "name": "read_file",
+      "ok": true,
+      "detail": "path=README.md, bytes=37",
+      "evidence": {}
+    },
+    {
+      "name": "isolated_write_and_rollback",
+      "ok": true,
+      "detail": "file=.rc-validator-1785086226.txt",
+      "evidence": {
+        "add_change_id": "20952f7e31d644ed8fa6a548b1026e31",
+        "remove_change_id": "939ecbb49fef46bd99c79f471a09f4fe"
+      }
+    },
+    {
+      "name": "oauth_refresh_rotation",
+      "ok": true,
+      "detail": "HTTP 200; rotated=True",
+      "evidence": {}
+    },
+    {
+      "name": "oauth_refreshed_access_token",
+      "ok": true,
+      "detail": "server=anchor",
+      "evidence": {}
+    },
+    {
+      "name": "oauth_old_refresh_rejected",
+      "ok": true,
+      "detail": "HTTP 400; error=invalid_grant",
+      "evidence": {}
+    },
+    {
+      "name": "session_delete",
+      "ok": true,
+      "detail": "HTTP 204",
+      "evidence": {
+        "response_preview": ""
+      }
+    }
+  ],
+  "chatgpt_manual_gates": [
+    {
+      "name": "tool_scan_and_oauth",
+      "status": "pending_human_ui",
+      "evidence_required": "ChatGPT web developer mode scans tools and completes OAuth without callback enrollment prompts"
+    },
+    {
+      "name": "read_tool_invocation",
+      "status": "pending_human_ui",
+      "evidence_required": "A new chat invokes server_info/read_file and displays a successful result"
+    },
+    {
+      "name": "write_confirmation_and_execution",
+      "status": "pending_human_ui",
+      "evidence_required": "ChatGPT presents the expected write confirmation and apply_patch completes exactly once"
+    },
+    {
+      "name": "frozen_catalog_refresh",
+      "status": "pending_human_ui",
+      "evidence_required": "The approved app snapshot digest matches this report or the app is explicitly refreshed"
+    }
+  ]
+}

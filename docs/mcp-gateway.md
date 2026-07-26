@@ -65,10 +65,10 @@ one public hostname / one tunnel
 为每个工作区创建独立 App/MCP 连接，例如：
 
 ```text
-Coding Tools - Project A
+Anchor - Project A
 https://mcp.example.com/w/WORKSPACE_A_ID/mcp
 
-Coding Tools - Project B
+Anchor - Project B
 https://mcp.example.com/w/WORKSPACE_B_ID/mcp
 ```
 
@@ -102,13 +102,13 @@ Gateway 将用户填写的固定公网地址与运行时观测到的隧道地址
 查看配置和所有工作区 URL：
 
 ```bash
-coding-tools-mcp gateway show
+anchor gateway show
 ```
 
 启用并指定 owner：
 
 ```bash
-coding-tools-mcp gateway configure \
+anchor gateway configure \
   --enable \
   --port 28765 \
   --owner PROJECT_A
@@ -117,7 +117,7 @@ coding-tools-mcp gateway configure \
 启动多个工作区：
 
 ```bash
-coding-tools-mcp gateway serve PROJECT_A PROJECT_B PROJECT_C
+anchor gateway serve PROJECT_A PROJECT_B PROJECT_C
 ```
 
 该命令在一个前台进程中管理全部所选 MCP listener、Gateway 和共享隧道，适合由 systemd 监督。Gateway 模式下不允许为每个工作区分别启动 MCP daemon，否则多个 daemon 会争用同一个 Gateway 端口。
@@ -127,7 +127,7 @@ systemd 示例：
 ```ini
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/coding-tools-mcp gateway serve PROJECT_A PROJECT_B
+ExecStart=/usr/local/bin/anchor gateway serve PROJECT_A PROJECT_B
 Restart=on-failure
 RestartSec=3
 ```

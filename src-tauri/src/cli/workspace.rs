@@ -166,10 +166,7 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
     }
     let store = DataStore::load()?;
     let profile = super::resolve_workspace(store.list(), &options.workspace)?.clone();
-    crate::mcp::gateway::ensure_workspace_is_not_owner(
-        &store.settings().mcp_gateway,
-        &profile.id,
-    )?;
+    crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &profile.id)?;
     drop(store);
 
     let inspection = super::daemon::inspect(&profile)?;
@@ -839,7 +836,7 @@ fn initialize_request() -> Value {
         "params": {
             "protocolVersion": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": { "name": "coding-tools-mcp-cli-test", "version": env!("CARGO_PKG_VERSION") }
+            "clientInfo": { "name": "anchor-cli-test", "version": env!("CARGO_PKG_VERSION") }
         }
     })
 }

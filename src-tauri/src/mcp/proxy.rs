@@ -780,7 +780,7 @@ impl McpProxyClient {
                     "protocolVersion": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
-                        "name": "coding-tools-mcp-proxy",
+                        "name": "anchor-proxy",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 }),

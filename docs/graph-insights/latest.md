@@ -10,7 +10,7 @@
 
 ## 项目定位
 
-这是一个 Rust + Tauri 2 + Svelte 的桌面客户端，将 Coding Tools MCP 能力以内嵌 HTTP 服务形式暴露，并同时提供 ChatGPT Actions OpenAPI 网关。每个工作区可以独立运行 MCP 服务、Actions 服务和 FRP/Cloudflare 隧道。
+这是一个 Rust + Tauri 2 + Svelte 的 Anchor 桌面客户端，以内嵌 HTTP 服务暴露 MCP 能力，并同时提供 ChatGPT Actions OpenAPI 网关。每个工作区可以独立运行 MCP 服务、Actions 服务和 FRP/Cloudflare 隧道。
 
 ## 主执行链路
 

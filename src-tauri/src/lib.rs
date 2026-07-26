@@ -9,6 +9,7 @@ mod actions;
 mod app_state;
 mod async_runtime;
 mod auth;
+mod brand;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "desktop")]
@@ -32,15 +33,15 @@ use app_state::AppState;
 #[cfg(feature = "desktop")]
 use commands::{
     create_workspace, delete_frp_profile, delete_workspace, get_actions_runtime_status,
-    get_app_settings, get_download_config, get_frp_snippet, get_last_workspace_id,
-    get_mcp_gateway, get_mcp_gateway_status, get_proxy, get_runtime_status, get_shared_secret,
-    get_workspace_secret, inspect_workspace_skills, install_software, list_frp_profiles,
-    list_software, list_workspaces, open_workspace_directory, read_workspace_logs,
-    regenerate_shared_secret, regenerate_workspace_secret, restart_actions_runtime,
-    restart_runtime, restart_tunnel, run_health_checks, save_frp_profile, set_download_config,
-    set_last_workspace, set_mcp_gateway, set_proxy, set_shared_secret, set_workspace_secret,
-    start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
-    stop_tunnel, test_tunnel, uninstall_software, update_workspace,
+    get_app_settings, get_download_config, get_frp_snippet, get_last_workspace_id, get_mcp_gateway,
+    get_mcp_gateway_status, get_proxy, get_runtime_status, get_shared_secret, get_workspace_secret,
+    inspect_workspace_skills, install_software, list_frp_profiles, list_software, list_workspaces,
+    open_workspace_directory, read_workspace_logs, regenerate_shared_secret,
+    regenerate_workspace_secret, restart_actions_runtime, restart_runtime, restart_tunnel,
+    run_health_checks, save_frp_profile, set_download_config, set_last_workspace, set_mcp_gateway,
+    set_proxy, set_shared_secret, set_workspace_secret, start_actions_runtime, start_runtime,
+    start_tunnel, stop_actions_runtime, stop_runtime, stop_tunnel, test_tunnel, uninstall_software,
+    update_workspace,
 };
 #[cfg(feature = "desktop")]
 use tauri::Manager;
@@ -51,20 +52,33 @@ fn acquire_single_instance() -> bool {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
 
-    // 保持 mutex HANDLE 到进程退出，由 Windows 自动回收。第二个实例必须在
-    // cleanup_managed_frpc_instances 之前退出，否则会清理第一个实例的 frpc。
-    let Ok(handle) = (unsafe {
+    // 同时占用 Anchor 与旧产品名的 mutex，防止升级期间两个版本同时管理同一组
+    // Workspace/FRP 进程。HANDLE 保持到进程退出，由 Windows 自动回收。
+    let Ok(anchor_handle) =
+        (unsafe { CreateMutexW(None, false, w!("Local\\Anchor-SingleInstance")) })
+    else {
+        eprintln!("创建应用单实例锁失败，为避免误清理其他实例的 frpc，本次启动已取消");
+        return false;
+    };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(anchor_handle) };
+        return false;
+    }
+
+    let Ok(legacy_handle) = (unsafe {
         CreateMutexW(
             None,
             false,
             w!("Local\\CodingToolsMcpDesktop-SingleInstance"),
         )
     }) else {
-        eprintln!("创建应用单实例锁失败，为避免误清理其他实例的 frpc，本次启动已取消");
+        let _ = unsafe { CloseHandle(anchor_handle) };
+        eprintln!("创建旧版本兼容单实例锁失败，本次启动已取消");
         return false;
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let _ = unsafe { CloseHandle(handle) };
+        let _ = unsafe { CloseHandle(anchor_handle) };
+        let _ = unsafe { CloseHandle(legacy_handle) };
         return false;
     }
     true

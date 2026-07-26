@@ -1,20 +1,20 @@
 # Workspace CLI 注册与 GPT 连接运维
 
-`coding-tools-mcp workspace` 将 WorkspaceProfile 的生命周期集中到一个命令组：注册、注销、查看、后台启停、输出 GPT 连接配置和连接测试。
+`anchor workspace` 将 WorkspaceProfile 的生命周期集中到一个命令组：注册、注销、查看、后台启停、输出 GPT 连接配置和连接测试。
 
-数据模型保持不变：**一个 workspace 目录对应一个 WorkspaceProfile**。注册和注销只修改 Coding Tools MCP 的配置，不创建、移动或删除项目文件。
+数据模型保持不变：**一个 workspace 目录对应一个 WorkspaceProfile**。注册和注销只修改 Anchor 的配置，不创建、移动或删除项目文件。
 
 ## 命令概览
 
 ```bash
-coding-tools-mcp workspace list
-coding-tools-mcp workspace register PATH [--name NAME]
-coding-tools-mcp workspace unregister WORKSPACE --force
-coding-tools-mcp workspace show WORKSPACE
-coding-tools-mcp workspace start WORKSPACE [--service mcp|actions|all] [--tunnel]
-coding-tools-mcp workspace stop WORKSPACE [--timeout SECONDS] [--force]
-coding-tools-mcp workspace gpt-config WORKSPACE [--service mcp|actions|all]
-coding-tools-mcp workspace test WORKSPACE [--service mcp|actions|all]
+anchor workspace list
+anchor workspace register PATH [--name NAME]
+anchor workspace unregister WORKSPACE --force
+anchor workspace show WORKSPACE
+anchor workspace start WORKSPACE [--service mcp|actions|all] [--tunnel]
+anchor workspace stop WORKSPACE [--timeout SECONDS] [--force]
+anchor workspace gpt-config WORKSPACE [--service mcp|actions|all]
+anchor workspace test WORKSPACE [--service mcp|actions|all]
 ```
 
 别名：
@@ -33,7 +33,7 @@ ws                   = workspace
 ## 注册
 
 ```bash
-coding-tools-mcp workspace register /srv/projects/example --name Example
+anchor workspace register /srv/projects/example --name Example
 ```
 
 注册流程：
@@ -70,7 +70,7 @@ coding-tools-mcp workspace register /srv/projects/example --name Example
 注销是破坏性配置操作，必须显式确认：
 
 ```bash
-coding-tools-mcp workspace unregister Example --force
+anchor workspace unregister Example --force
 ```
 
 行为：
@@ -87,8 +87,8 @@ coding-tools-mcp workspace unregister Example --force
 ## 查看
 
 ```bash
-coding-tools-mcp workspace list
-coding-tools-mcp workspace show Example
+anchor workspace list
+anchor workspace show Example
 ```
 
 `show` 输出 profile 配置，不读取或输出独立密钥文件。历史内联的 Cloudflare Token 也会被移除。
@@ -96,8 +96,8 @@ coding-tools-mcp workspace show Example
 ## 启动与停止
 
 ```bash
-coding-tools-mcp workspace start Example --service all --tunnel
-coding-tools-mcp workspace stop Example
+anchor workspace start Example --service all --tunnel
+anchor workspace stop Example
 ```
 
 这两个命令是顶层 `start/stop` 的 workspace 级别名，管理 Linux CLI daemon。Windows/macOS 使用 GUI 或 `serve` 前台模式。
@@ -109,7 +109,7 @@ coding-tools-mcp workspace stop Example
 ### MCP Connector
 
 ```bash
-coding-tools-mcp workspace gpt-config Example
+anchor workspace gpt-config Example
 ```
 
 默认输出 MCP Connector 配置，包括：
@@ -126,7 +126,7 @@ coding-tools-mcp workspace gpt-config Example
 ### GPT Actions
 
 ```bash
-coding-tools-mcp workspace gpt-config Example --service actions
+anchor workspace gpt-config Example --service actions
 ```
 
 输出：
@@ -139,7 +139,7 @@ coding-tools-mcp workspace gpt-config Example --service actions
 ### 同时查看
 
 ```bash
-coding-tools-mcp workspace gpt-config Example --service all --public
+anchor workspace gpt-config Example --service all --public
 ```
 
 Endpoint 选择：
@@ -168,7 +168,7 @@ Endpoint 选择：
 确需复制完整配置时显式执行：
 
 ```bash
-coding-tools-mcp workspace gpt-config Example --show-secrets
+anchor workspace gpt-config Example --show-secrets
 ```
 
 该输出可能包含 OAuth Client Secret、Authorization Password、Bearer Token 或 Actions API Key。不要写入日志、CI artifact、工单或公共聊天。
@@ -176,7 +176,7 @@ coding-tools-mcp workspace gpt-config Example --show-secrets
 ## 连接测试
 
 ```bash
-coding-tools-mcp workspace test Example --service all --public --timeout 15
+anchor workspace test Example --service all --public --timeout 15
 ```
 
 ### MCP 检查
@@ -213,24 +213,24 @@ coding-tools-mcp workspace test Example --service all --public --timeout 15
 
 ```bash
 # 1. 注册
-coding-tools-mcp workspace register /srv/projects/example --name Example
+anchor workspace register /srv/projects/example --name Example
 
 # 2. 查看配置
-coding-tools-mcp workspace show Example
+anchor workspace show Example
 
 # 3. 后台启动
-coding-tools-mcp workspace start Example --service all --tunnel
+anchor workspace start Example --service all --tunnel
 
 # 4. 测试本地服务
-coding-tools-mcp workspace test Example --service all --local
+anchor workspace test Example --service all --local
 
 # 5. 查看 GPT 公网配置
-coding-tools-mcp workspace gpt-config Example --service all --public
+anchor workspace gpt-config Example --service all --public
 
 # 6. 测试公网连接
-coding-tools-mcp workspace test Example --service all --public
+anchor workspace test Example --service all --public
 
 # 7. 停止
-coding-tools-mcp workspace stop Example
+anchor workspace stop Example
 ```
 

@@ -527,8 +527,8 @@ fn server_info_for_session(
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
     Ok(tool_ok(json!({
-        "server": "coding-tools-mcp",
-        "title": "Coding Tools MCP",
+        "server": crate::brand::SERVER_NAME,
+        "title": crate::brand::PRODUCT_NAME,
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
         "workspace": ctx.workspace.root_display(),

@@ -1,12 +1,12 @@
 # 技术栈
 
-> 本文档描述 Coding Tools MCP Rust 的技术栈信息。
+> 本文档描述 Anchor Rust 的技术栈信息。
 
 ## 基本信息
 
 | 属性 | 值 |
 |------|-----|
-| 项目名称 | Coding Tools MCP Rust |
+| 项目名称 | Anchor Rust |
 | 版本 | 0.0.0 |
 | 语言 | Rust 1.77+ / TypeScript |
 | 框架 | Tauri 2 |
@@ -39,7 +39,7 @@
 
 | 类别 | 技术 | 说明 |
 |------|------|------|
-| MCP 核心 | Python 3.11+ | `coding_tools_mcp/server.py` |
+| MCP 核心 | Python 3.11+ | legacy archive `coding_tools_mcp/server.py` |
 | 桌面客户端 | PySide6 | `apps/desktop-client/` |
 | Actions 网关 | FastAPI + uvicorn | `coding_tools_actions/` |
 | 测试 | pytest + unittest | `tests/compliance/` |

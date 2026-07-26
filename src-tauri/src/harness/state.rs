@@ -10,9 +10,9 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::model::{
-    BaselineEntry, CapabilityStatus, FileChangeRecord, HarnessEvent, HarnessStatus, OperationRecord,
-    ProjectBaseline, ProjectFileState, ProjectState, TaskSession,
-    TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
+    BaselineEntry, CapabilityStatus, FileChangeRecord, HarnessEvent, HarnessStatus,
+    OperationRecord, ProjectBaseline, ProjectFileState, ProjectState, TaskSession, TaskStatus,
+    WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 
@@ -40,7 +40,7 @@ impl Harness {
         let root = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| HarnessError::new("STORE_UNAVAILABLE", "无法确定应用数据目录"))?;
-        Ok(root.join("coding-tools-mcp").join("harness"))
+        Ok(root.join("anchor").join("harness"))
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -242,7 +242,8 @@ impl Harness {
             affected_files: Vec::new(),
             created_at: timestamp(),
         };
-        self.store.append_operation(&self.workspace_id, &operation)?;
+        self.store
+            .append_operation(&self.workspace_id, &operation)?;
         Ok(operation)
     }
 
@@ -546,12 +547,7 @@ fn should_skip(path: &Path, root: &Path) -> bool {
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     crate::platform::hide_std_console(&mut command);
-    let output = command
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
+    let output = command.arg("-C").arg(root).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }

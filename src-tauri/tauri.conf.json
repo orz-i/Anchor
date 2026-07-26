@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Coding Tools MCP",
+  "productName": "Anchor",
   "version": "0.1.23",
-  "identifier": "com.codingtools.mcp.desktop",
+  "identifier": "com.anchor.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Coding Tools MCP",
+        "title": "Anchor",
         "width": 1280,
         "height": 800,
         "minWidth": 960,

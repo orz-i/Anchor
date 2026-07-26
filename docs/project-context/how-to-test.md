@@ -1,6 +1,6 @@
 # 如何编写测试
 
-> 本文档描述 Coding Tools MCP Rust 的测试策略。
+> 本文档描述 Anchor Rust 的测试策略。
 
 ## 概述
 

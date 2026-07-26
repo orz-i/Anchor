@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-为首次使用 Coding Tools MCP 的 ChatGPT 用户补充可按图完成的 GPT 端配置教程，将桌面端启动、公网 MCP 地址、ChatGPT 开发人员模式、插件创建、OAuth 授权和连接验证串成完整流程。
+为首次使用 Anchor 的 ChatGPT 用户补充可按图完成的 GPT 端配置教程，将桌面端启动、公网 MCP 地址、ChatGPT 开发人员模式、插件创建、OAuth 授权和连接验证串成完整流程。
 
 ## 历史经验与坑
 

@@ -66,7 +66,7 @@
   - _需求：FR-1, FR-2, FR-3, FR-4_ ｜ _设计：全部章节_
 
 - [ ] 4.2 上传 Windows 安装包并按用户本次明确要求手动触发 macOS 打包
-  - **证据块**：Windows NSIS 路径为 `src-tauri/target/release/bundle/nsis/Coding Tools MCP_0.1.5_x64-setup.exe`。
+  - **证据块**：Windows NSIS 路径为 `src-tauri/target/release/bundle/nsis/Anchor_0.1.5_x64-setup.exe`。
   - **涉及文件**：GitHub Release 资产与 Actions artifact。
   - _需求：FR-3, FR-4_ ｜ _设计：手动发布流程_
 

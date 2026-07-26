@@ -1,6 +1,6 @@
 # 如何开发
 
-> 本文档描述 Coding Tools MCP Rust 的开发流程。
+> 本文档描述 Anchor Rust 的开发流程。
 
 ## 概述
 
@@ -16,7 +16,7 @@
 {
   "feature_name": "my-feature",
   "description": "功能描述",
-  "project_root": "e:/workspace/github/coding-tools-mcp-rust"
+  "project_root": "e:/workspace/github/anchor-rust"
 }
 ```
 
@@ -70,7 +70,7 @@ pnpm dev
 1. `package.json`
 2. `package-lock.json` 的根 `version` 和根包 `version`
 3. `src-tauri/Cargo.toml`
-4. `src-tauri/Cargo.lock` 中 `coding-tools-mcp-desktop` 包的 `version`
+4. `src-tauri/Cargo.lock` 中 `anchor-desktop` 包的 `version`
 5. `src-tauri/tauri.conf.json`
 
 不要修改依赖自身恰好相同的版本号；只更新本项目包的版本字段。
@@ -86,7 +86,7 @@ pnpm dev
 构建后必须：
 
 1. 校验 App 内部版本（macOS 为 `CFBundleShortVersionString`）。
-2. 校验安装包文件名包含当前版本，例如 `Coding Tools MCP_<version>_aarch64.dmg`。
+2. 校验安装包文件名包含当前版本，例如 `Anchor_<version>_aarch64.dmg`。
 3. 校验已安装应用显示的版本与安装包一致；不得把旧包误报为新包。
 4. 清理同一构建目录中旧版本的安装包和临时构建日志，但保留当前版本产物。
 

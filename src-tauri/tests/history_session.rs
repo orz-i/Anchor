@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::sync::{Arc, Barrier};
 
-use coding_tools_mcp_desktop_lib::tools::{list_tools_for_profile, ToolContext};
+use anchor_lib::tools::{list_tools_for_profile, ToolContext};
 use serde_json::{json, Value};
 
 use common::{assert_err, assert_ok, invoke};

@@ -12,9 +12,25 @@ pub fn is_own_process(pid: u32) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
-const DESKTOP_EXECUTABLE_NAME: &str = "coding-tools-mcp-desktop";
+struct DesktopIdentity {
+    executable_name: &'static str,
+    bundle_name: &'static str,
+    bundle_id: &'static str,
+}
+
 #[cfg(any(target_os = "macos", test))]
-const DESKTOP_BUNDLE_ID: &str = "com.codingtools.mcp.desktop";
+const DESKTOP_IDENTITIES: &[DesktopIdentity] = &[
+    DesktopIdentity {
+        executable_name: crate::brand::DESKTOP_EXECUTABLE_NAME,
+        bundle_name: "Anchor.app",
+        bundle_id: crate::brand::BUNDLE_ID,
+    },
+    DesktopIdentity {
+        executable_name: crate::brand::LEGACY_DESKTOP_EXECUTABLE_NAME,
+        bundle_name: "Coding Tools MCP.app",
+        bundle_id: crate::brand::LEGACY_BUNDLE_ID,
+    },
+];
 
 /// Reclaim a port only when it belongs to an older macOS instance of this app.
 ///
@@ -57,32 +73,29 @@ pub fn try_reclaim_previous_macos_app_port(port: u16) -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 fn is_managed_macos_desktop_executable(image: &Path) -> bool {
-    if image.file_name().and_then(|name| name.to_str()) != Some(DESKTOP_EXECUTABLE_NAME) {
-        return false;
-    }
-
     let Some(bundle) = image
         .ancestors()
         .find(|ancestor| ancestor.extension().and_then(|ext| ext.to_str()) == Some("app"))
     else {
         return false;
     };
-    if bundle.file_name().and_then(|name| name.to_str()) != Some("Coding Tools MCP.app")
-        || !image.starts_with(bundle.join("Contents").join("MacOS"))
-    {
+    if !image.starts_with(bundle.join("Contents").join("MacOS")) {
         return false;
     }
 
     let Ok(info_plist) = std::fs::read_to_string(bundle.join("Contents").join("Info.plist")) else {
         return false;
     };
-    let pattern = format!(
-        r"(?s)<key>\s*CFBundleIdentifier\s*</key>\s*<string>\s*{}\s*</string>",
-        regex::escape(DESKTOP_BUNDLE_ID)
-    );
-    regex::Regex::new(&pattern)
-        .map(|regex| regex.is_match(&info_plist))
-        .unwrap_or(false)
+    DESKTOP_IDENTITIES.iter().any(|identity| {
+        image.file_name().and_then(|name| name.to_str()) == Some(identity.executable_name)
+            && bundle.file_name().and_then(|name| name.to_str()) == Some(identity.bundle_name)
+            && regex::Regex::new(&format!(
+                r"(?s)<key>\s*CFBundleIdentifier\s*</key>\s*<string>\s*{}\s*</string>",
+                regex::escape(identity.bundle_id)
+            ))
+            .map(|regex| regex.is_match(&info_plist))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -227,10 +240,15 @@ mod tests {
 
     use super::*;
 
-    fn write_bundle(root: &std::path::Path, identifier: &str) -> std::path::PathBuf {
-        let bundle = root.join("Coding Tools MCP.app");
+    fn write_bundle(
+        root: &std::path::Path,
+        bundle_name: &str,
+        executable_name: &str,
+        identifier: &str,
+    ) -> std::path::PathBuf {
+        let bundle = root.join(bundle_name);
         let contents = bundle.join("Contents");
-        let executable = contents.join("MacOS/coding-tools-mcp-desktop");
+        let executable = contents.join("MacOS").join(executable_name);
         fs::create_dir_all(executable.parent().expect("MacOS dir")).expect("create bundle");
         fs::write(
             contents.join("Info.plist"),
@@ -244,17 +262,35 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_a_previous_coding_tools_macos_bundle() {
+    fn recognizes_anchor_and_legacy_macos_bundles() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let executable = write_bundle(temp.path(), "com.codingtools.mcp.desktop");
+        let anchor = write_bundle(
+            temp.path(),
+            "Anchor.app",
+            crate::brand::DESKTOP_EXECUTABLE_NAME,
+            crate::brand::BUNDLE_ID,
+        );
+        let legacy_root = temp.path().join("legacy");
+        let legacy = write_bundle(
+            &legacy_root,
+            "Coding Tools MCP.app",
+            crate::brand::LEGACY_DESKTOP_EXECUTABLE_NAME,
+            crate::brand::LEGACY_BUNDLE_ID,
+        );
 
-        assert!(is_managed_macos_desktop_executable(&executable));
+        assert!(is_managed_macos_desktop_executable(&anchor));
+        assert!(is_managed_macos_desktop_executable(&legacy));
     }
 
     #[test]
     fn rejects_a_different_macos_bundle_identifier() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let executable = write_bundle(temp.path(), "com.example.other-app");
+        let executable = write_bundle(
+            temp.path(),
+            "Anchor.app",
+            crate::brand::DESKTOP_EXECUTABLE_NAME,
+            "com.example.other-app",
+        );
 
         assert!(!is_managed_macos_desktop_executable(&executable));
     }
@@ -262,10 +298,13 @@ mod tests {
     #[test]
     fn rejects_a_matching_identifier_from_a_different_app_bundle() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let executable = write_bundle(temp.path(), "com.codingtools.mcp.desktop");
-        let other = temp
-            .path()
-            .join("Other.app/Contents/MacOS/coding-tools-mcp-desktop");
+        let executable = write_bundle(
+            temp.path(),
+            "Anchor.app",
+            crate::brand::DESKTOP_EXECUTABLE_NAME,
+            crate::brand::BUNDLE_ID,
+        );
+        let other = temp.path().join("Other.app/Contents/MacOS/anchor-desktop");
         fs::create_dir_all(other.parent().expect("MacOS dir")).expect("create other bundle");
         fs::copy(
             executable

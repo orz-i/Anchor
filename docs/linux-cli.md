@@ -1,6 +1,6 @@
 # Linux CLI
 
-`coding-tools-mcp` 是面向 Linux 服务器和无桌面环境的运行入口，支持前台 `serve` 和内置后台 daemon。它与桌面端读取同一套配置模型：**一个 workspace 对应一个 WorkspaceProfile**。
+`anchor` 是面向 Linux 服务器和无桌面环境的运行入口，支持前台 `serve` 和内置后台 daemon。它与桌面端读取同一套配置模型：**一个 workspace 对应一个 WorkspaceProfile**。
 
 ## 构建
 
@@ -12,21 +12,21 @@ cargo build \
   --release \
   --no-default-features \
   --features cli \
-  --bin coding-tools-mcp
+  --bin anchor
 ```
 
 产物位于：
 
 ```text
-src-tauri/target/release/coding-tools-mcp
+src-tauri/target/release/anchor
 ```
 
 安装到系统路径：
 
 ```bash
 sudo install -m 0755 \
-  src-tauri/target/release/coding-tools-mcp \
-  /usr/local/bin/coding-tools-mcp
+  src-tauri/target/release/anchor \
+  /usr/local/bin/anchor
 ```
 
 ## 配置位置
@@ -34,14 +34,14 @@ sudo install -m 0755 \
 Linux 默认使用：
 
 ```text
-~/.config/coding-tools-mcp-desktop/data/profiles.json
-~/.config/coding-tools-mcp-desktop/data/secrets.json
+~/.config/anchor-desktop/data/profiles.json
+~/.config/anchor-desktop/data/secrets.json
 ```
 
 普通工作区配置和敏感值分别保存；两个文件均使用当前用户权限。可以通过全局参数覆盖配置根目录：
 
 ```bash
-coding-tools-mcp --config-dir /etc/coding-tools-mcp list
+anchor --config-dir /etc/anchor list
 ```
 
 不要为 CLI 创建第二套 profile。桌面端创建的 workspace/profile 可以直接由 CLI 按 ID、唯一名称或项目路径选择。
@@ -49,8 +49,8 @@ coding-tools-mcp --config-dir /etc/coding-tools-mcp list
 CLI 也可以直接注册和注销 profile：
 
 ```bash
-coding-tools-mcp workspace register /srv/projects/example --name Example
-coding-tools-mcp workspace unregister Example --force
+anchor workspace register /srv/projects/example --name Example
+anchor workspace unregister Example --force
 ```
 
 完整说明见 [Workspace CLI 注册与 GPT 连接运维](workspace-cli.md)。
@@ -59,36 +59,36 @@ coding-tools-mcp workspace unregister Example --force
 
 ```bash
 # 列出 workspace/profile
-coding-tools-mcp list
+anchor list
 
 # 查看配置；输出不包含 secrets.json 中的密钥
-coding-tools-mcp show <workspace>
+anchor show <workspace>
 
 # 检查配置端口是否正在监听
-coding-tools-mcp status <workspace>
+anchor status <workspace>
 
 # 后台启动并返回终端
-coding-tools-mcp start <workspace> --service all --tunnel
+anchor start <workspace> --service all --tunnel
 
 # 查看日志和诊断
-coding-tools-mcp logs <workspace> --service daemon
-coding-tools-mcp doctor <workspace>
+anchor logs <workspace> --service daemon
+anchor doctor <workspace>
 
 # 重启或停止后台 daemon
-coding-tools-mcp restart <workspace>
-coding-tools-mcp stop <workspace>
+anchor restart <workspace>
+anchor stop <workspace>
 
 # 前台启动 MCP，Ctrl+C 优雅停止
-coding-tools-mcp serve <workspace>
+anchor serve <workspace>
 
 # 同时启动 MCP 与 Actions
-coding-tools-mcp serve <workspace> --service all
+anchor serve <workspace> --service all
 
 # 按 profile 中的隧道配置一并启动隧道
-coding-tools-mcp serve <workspace> --service all --tunnel
+anchor serve <workspace> --service all --tunnel
 
 # 自动化使用结构化输出
-coding-tools-mcp --json status <workspace>
+anchor --json status <workspace>
 ```
 
 `serve` 是前台常驻命令；`start` 创建 Linux 后台 daemon。若对应端口已被桌面 GUI 或其他进程占用，两种模式都会报错退出，不会停止、接管或替换现有服务。完整运维说明见 [CLI Daemon 与运维命令](cli-daemon.md)。
@@ -98,32 +98,32 @@ coding-tools-mcp --json status <workspace>
 需要让多个工作区共用一条 MCP 隧道时：
 
 ```bash
-coding-tools-mcp gateway configure --enable --port 28765 --owner PROJECT_A
-coding-tools-mcp gateway show
-coding-tools-mcp gateway serve PROJECT_A PROJECT_B PROJECT_C
+anchor gateway configure --enable --port 28765 --owner PROJECT_A
+anchor gateway show
+anchor gateway serve PROJECT_A PROJECT_B PROJECT_C
 ```
 
 `gateway serve` 在一个前台进程中管理所选工作区、Gateway 和唯一 MCP 隧道。Gateway 模式下不能再为各工作区分别使用 `start ... --service mcp`，生产环境应由 systemd 直接监督 `gateway serve`。详见 [单一 MCP Gateway 与多工作区](mcp-gateway.md)。
 
 ## systemd 用户服务
 
-推荐由 systemd 负责后台化、重启和日志收集。先通过 `coding-tools-mcp list` 获取稳定的 profile ID，然后创建：
+推荐由 systemd 负责后台化、重启和日志收集。先通过 `anchor list` 获取稳定的 profile ID，然后创建：
 
 ```text
-~/.config/systemd/user/coding-tools-mcp.service
+~/.config/systemd/user/anchor.service
 ```
 
 内容示例：
 
 ```ini
 [Unit]
-Description=Coding Tools MCP
+Description=Anchor
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/coding-tools-mcp serve PROFILE_ID --service mcp
+ExecStart=/usr/local/bin/anchor serve PROFILE_ID --service mcp
 Restart=on-failure
 RestartSec=3
 
@@ -135,9 +135,9 @@ WantedBy=default.target
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now coding-tools-mcp.service
-systemctl --user status coding-tools-mcp.service
-journalctl --user -u coding-tools-mcp.service -f
+systemctl --user enable --now anchor.service
+systemctl --user status anchor.service
+journalctl --user -u anchor.service -f
 ```
 
 systemd 必须直接运行前台 `serve` 或 `gateway serve`，不要使用 `start`；内置 daemon 适合人工 SSH 运维，不替代 systemd 的开机自启和进程监督。
@@ -162,7 +162,7 @@ sudo loginctl enable-linger "$USER"
 Linux CLI 启动 MCP 时会读取同一个 WorkspaceProfile 中的 Skill 服务配置，不需要额外参数：
 
 ```bash
-coding-tools-mcp serve PROFILE_ID --service mcp
+anchor serve PROFILE_ID --service mcp
 ```
 
 确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 将提供 `list_skills`、`load_skill`、`read_skill_resource` 和 `skill://` resources；Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。

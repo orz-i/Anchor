@@ -1,6 +1,6 @@
 mod common;
 
-use coding_tools_mcp_desktop_lib::tools::registry::output_schema;
+use anchor_lib::tools::registry::output_schema;
 use common::{assert_ok, ctx_for, invoke, tiny_js_fixture};
 use serde_json::{json, Value};
 

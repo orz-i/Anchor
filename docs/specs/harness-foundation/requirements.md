@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-Coding Tools MCP Desktop 需要从“可调用的本地工具集合”升级为面向 ChatGPT 的本地 Coding Harness。Harness 必须在聊天上下文之外持续维护项目状态、任务进度、变更原因、验证证据和恢复点，并以统一、安全、可观察的方式向 MCP 与 Actions 暴露文件、命令和 Git 能力。
+Anchor Desktop 需要从“可调用的本地工具集合”升级为面向 ChatGPT 的本地 Coding Harness。Harness 必须在聊天上下文之外持续维护项目状态、任务进度、变更原因、验证证据和恢复点，并以统一、安全、可观察的方式向 MCP 与 Actions 暴露文件、命令和 Git 能力。
 
 目标工作流为：
 
@@ -240,7 +240,7 @@ Coding Tools MCP Desktop 需要从“可调用的本地工具集合”升级为�
 - **NFR-1 性能**：普通规模仓库（10,000 个工作树条目以内）的 `project_state` P95 响应时间不超过 2 秒；超过限制时必须截断并标记。
 - **NFR-2 持久性**：Task Session、审批和事件写入采用原子替换或追加日志；进程异常退出后不得产生无法解析的主状态文件。
 - **NFR-3 安全**：敏感字段脱敏测试覆盖率为 100%；safe/trusted 模式下破坏性 Git 命令执行成功次数必须为 0。
-- **NFR-4 隔离**：Harness 状态默认存储在应用数据目录，仓库内不得自动生成 `.coding-tools` 或类似目录。
+- **NFR-4 隔离**：Harness 状态默认存储在应用数据目录，仓库内不得自动生成 `.anchor` 或类似目录。
 - **NFR-5 兼容性**：保留现有 MCP 工具名称和输入字段；新增字段默认可选，旧客户端仍可完成只读操作。
 - **NFR-6 可观测性**：每次工具调用必须拥有 operation_id；任务、Change Set、Verification 和 Pending Action 可通过 ID 串联。
 - **NFR-7 容量**：单任务事件默认保留 10,000 条或 50 MiB，以先达到者为准；超限后归档并生成摘要。

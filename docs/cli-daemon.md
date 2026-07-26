@@ -1,6 +1,6 @@
 # Linux CLI Daemon 与运维命令
 
-`coding-tools-mcp` 提供两种运行方式：
+`anchor` 提供两种运行方式：
 
 | 模式 | 命令 | 适用场景 |
 | --- | --- | --- |
@@ -15,31 +15,31 @@ Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT �
 
 ```bash
 # 后台启动 MCP
-coding-tools-mcp start PROFILE_ID
+anchor start PROFILE_ID
 
 # 后台启动 MCP + Actions + 隧道
-coding-tools-mcp start PROFILE_ID --service all --tunnel
+anchor start PROFILE_ID --service all --tunnel
 
 # 查看 daemon、PID 与端口所有权
-coding-tools-mcp status PROFILE_ID
+anchor status PROFILE_ID
 
 # 持续观察状态
-coding-tools-mcp status PROFILE_ID --watch
+anchor status PROFILE_ID --watch
 
 # 查看 daemon 日志
-coding-tools-mcp logs PROFILE_ID
+anchor logs PROFILE_ID
 
 # 跟随 MCP 日志
-coding-tools-mcp logs PROFILE_ID --service mcp --follow
+anchor logs PROFILE_ID --service mcp --follow
 
 # 重启并沿用当前 service/tunnel 参数
-coding-tools-mcp restart PROFILE_ID
+anchor restart PROFILE_ID
 
 # 优雅停止
-coding-tools-mcp stop PROFILE_ID
+anchor stop PROFILE_ID
 
 # 检查环境、端口、状态和隧道依赖
-coding-tools-mcp doctor PROFILE_ID
+anchor doctor PROFILE_ID
 ```
 
 ## 命令语义
@@ -47,7 +47,7 @@ coding-tools-mcp doctor PROFILE_ID
 ### `start`
 
 ```bash
-coding-tools-mcp start <workspace> \
+anchor start <workspace> \
   [--service mcp|actions|all] \
   [--tunnel|--no-tunnel] \
   [--wait SECONDS]
@@ -65,7 +65,7 @@ coding-tools-mcp start <workspace> \
 ### `stop`
 
 ```bash
-coding-tools-mcp stop <workspace> [--timeout SECONDS] [--force]
+anchor stop <workspace> [--timeout SECONDS] [--force]
 ```
 
 - 根据状态文件读取 PID；
@@ -78,7 +78,7 @@ coding-tools-mcp stop <workspace> [--timeout SECONDS] [--force]
 ### `restart`
 
 ```bash
-coding-tools-mcp restart <workspace> [--service ...] [--tunnel|--no-tunnel]
+anchor restart <workspace> [--service ...] [--tunnel|--no-tunnel]
 ```
 
 未提供 service/tunnel 参数时，沿用当前 daemon 状态文件中的参数。没有当前状态时回退为 MCP、无隧道。
@@ -86,7 +86,7 @@ coding-tools-mcp restart <workspace> [--service ...] [--tunnel|--no-tunnel]
 ### `status`
 
 ```bash
-coding-tools-mcp status <workspace> [--watch] [--interval SECONDS]
+anchor status <workspace> [--watch] [--interval SECONDS]
 ```
 
 输出同时包含：
@@ -104,7 +104,7 @@ coding-tools-mcp status <workspace> [--watch] [--interval SECONDS]
 ### `logs`
 
 ```bash
-coding-tools-mcp logs <workspace> \
+anchor logs <workspace> \
   [--service daemon|mcp|actions|all] \
   [--lines N] \
   [--follow|-f]
@@ -134,15 +134,15 @@ coding-tools-mcp logs <workspace> \
 Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优先级选择：
 
 1. 使用 `--config-dir` 时：`<config-dir>/run/`；
-2. 设置 `XDG_RUNTIME_DIR` 时：`$XDG_RUNTIME_DIR/coding-tools-mcp/`；
-3. 回退：`/tmp/coding-tools-mcp-<uid>/`。
+2. 设置 `XDG_RUNTIME_DIR` 时：`$XDG_RUNTIME_DIR/anchor/`；
+3. 回退：`/tmp/anchor-<uid>/`。
 
 目录权限为 `0700`，状态、PID 和锁文件使用当前用户权限。每个 workspace 使用独立文件名。
 
 日志继续存放在 profile 日志目录：
 
 ```text
-~/.config/coding-tools-mcp-desktop/logs/<profile-id>/daemon.log
+~/.config/anchor-desktop/logs/<profile-id>/daemon.log
 ```
 
 正常退出会移除 PID 和状态文件；锁文件保留并复用。崩溃留下的状态会在下一次 `start/stop` 时识别为 stale 并安全重建或清理。
@@ -156,7 +156,7 @@ Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优�
 ```ini
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/coding-tools-mcp serve PROFILE_ID --service all --tunnel
+ExecStart=/usr/local/bin/anchor serve PROFILE_ID --service all --tunnel
 Restart=on-failure
 RestartSec=3
 ```
@@ -168,10 +168,10 @@ RestartSec=3
 所有运维命令支持全局 `--json`：
 
 ```bash
-coding-tools-mcp --json start PROFILE_ID
-coding-tools-mcp --json status PROFILE_ID
-coding-tools-mcp --json logs PROFILE_ID --service daemon
-coding-tools-mcp --json doctor PROFILE_ID
+anchor --json start PROFILE_ID
+anchor --json status PROFILE_ID
+anchor --json logs PROFILE_ID --service daemon
+anchor --json doctor PROFILE_ID
 ```
 
 失败时返回非零退出码，并输出：
@@ -194,9 +194,9 @@ coding-tools-mcp --json doctor PROFILE_ID
 Windows 开发机已完成 headless feature 编译、参数测试和严格 Clippy。当前 Rust 工具链未安装 `x86_64-unknown-linux-gnu` 标准库，因此 Linux 专用 `setsid`、`/proc` PID 校验和真实后台生命周期仍需在 Linux CI 或 Linux 主机执行 smoke：
 
 ```bash
-coding-tools-mcp start PROFILE_ID
-coding-tools-mcp status PROFILE_ID
-coding-tools-mcp logs PROFILE_ID --follow
-coding-tools-mcp restart PROFILE_ID
-coding-tools-mcp stop PROFILE_ID
+anchor start PROFILE_ID
+anchor status PROFILE_ID
+anchor logs PROFILE_ID --follow
+anchor restart PROFILE_ID
+anchor stop PROFILE_ID
 ```

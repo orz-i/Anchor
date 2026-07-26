@@ -1,6 +1,6 @@
 use std::fs;
 
-use coding_tools_mcp_desktop_lib::harness::{Harness, TaskStatus};
+use anchor_lib::harness::{Harness, TaskStatus};
 use serde_json::json;
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {

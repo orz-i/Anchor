@@ -120,7 +120,7 @@ enum RuntimeState {
 ## 文件结构
 
 ```
-coding-tools-mcp-rust/
+anchor-rust/
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs

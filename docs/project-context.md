@@ -1,4 +1,4 @@
-# Coding Tools MCP Rust - 项目上下文
+# Anchor Rust - 项目上下文
 
 > 本文档是项目上下文的索引文件，提供项目概览和文档导航。
 
@@ -6,12 +6,12 @@
 
 | 属性 | 值 |
 |------|-----|
-| 项目名称 | Coding Tools MCP Rust |
+| 项目名称 | Anchor Rust |
 | 版本 | 0.0.0（重构中） |
 | 语言 | Rust + TypeScript |
 | 框架 | Tauri 2 + Svelte |
 | 类型 | 桌面客户端 + 内嵌 MCP 运行时 |
-| 描述 | 用 Rust/Tauri 重构 Coding Tools MCP 桌面客户端，内嵌 MCP 核心，单二进制分发 |
+| 描述 | 用 Rust/Tauri 重构 Anchor 桌面客户端，内嵌 MCP 核心，单二进制分发 |
 
 ## 文档导航
 
@@ -37,7 +37,7 @@
 
 旧版 Python 实现完整归档在 `old/` 目录：
 
-- `old/coding_tools_mcp/server.py` — MCP 核心（~5400 行）
+- `old/coding_tools_mcp/server.py` — legacy MCP 核心（~5400 行）
 - `old/apps/desktop-client/` — PySide6 桌面客户端
 - `old/docs/profile-v0.1.md` — MCP 协议契约
 - `old/tests/compliance/` — 71 项合规测试

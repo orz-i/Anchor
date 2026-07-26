@@ -51,7 +51,7 @@ mod tests {
 
     use super::*;
 
-    const PROBE_OUTPUT_ENV: &str = "CODING_TOOLS_CONSOLE_PROBE_OUTPUT";
+    const PROBE_OUTPUT_ENV: &str = "ANCHOR_CONSOLE_PROBE_OUTPUT";
 
     #[link(name = "Kernel32")]
     extern "system" {
@@ -91,10 +91,7 @@ mod tests {
     fn supervised_children_keep_console_hidden_and_use_a_process_group() {
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
         assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0000_0200);
-        assert_eq!(
-            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
-            0x0800_0200
-        );
+        assert_eq!(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, 0x0800_0200);
     }
 
     #[test]

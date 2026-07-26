@@ -393,7 +393,7 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let tunnel = options.tunnel.unwrap_or(false);
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
-            "MCP Gateway 模式不支持每工作区独立 daemon；请使用 `coding-tools-mcp gateway serve <workspace ...>` 并交由 systemd 监督。"
+            "MCP Gateway 模式不支持每工作区独立 daemon；请使用 `anchor gateway serve <workspace ...>` 并交由 systemd 监督。"
                 .into(),
         ));
     }
@@ -875,7 +875,7 @@ pub fn run() -> i32 {
         }
     };
     if let Some(path) = &parsed.config_dir {
-        std::env::set_var("CODING_TOOLS_MCP_CONFIG_DIR", path);
+        std::env::set_var(crate::brand::CONFIG_DIR_ENV, path);
     }
 
     let as_json = parsed.json;
@@ -917,7 +917,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             Ok(0)
         }
         Command::Version => {
-            println!("coding-tools-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("{} {}", crate::brand::CLI_NAME, env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
         Command::List => list_workspaces(cli.json).map(|_| 0),
@@ -974,7 +974,7 @@ fn list_workspaces(as_json: bool) -> AppResult<()> {
         print_json(&summaries)?;
     } else if summaries.is_empty() {
         println!(
-            "没有已配置的 workspace。请使用 `coding-tools-mcp workspace register PATH` 或 GUI 创建 profile。"
+            "没有已配置的 workspace。请使用 `anchor workspace register PATH` 或 GUI 创建 profile。"
         );
     } else {
         for item in summaries {
@@ -1125,7 +1125,7 @@ async fn serve_workspace(
     ensure_workspace_directory(&profile)?;
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
-            "MCP Gateway 模式请使用 `coding-tools-mcp gateway serve <workspace ...>`；单工作区 serve 不会创建共享路由。"
+            "MCP Gateway 模式请使用 `anchor gateway serve <workspace ...>`；单工作区 serve 不会创建共享路由。"
                 .into(),
         ));
     }

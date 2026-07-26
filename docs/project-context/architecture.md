@@ -1,11 +1,11 @@
 # 架构设计
 
-> 本文档描述 Coding Tools MCP Rust 的架构和项目结构。
+> 本文档描述 Anchor Rust 的架构和项目结构。
 
 ## 项目结构（目标）
 
 ```
-coding-tools-mcp-rust/
+anchor-rust/
 ├── src-tauri/              # Tauri Rust 后端
 │   ├── src/
 │   │   ├── main.rs         # 入口
@@ -81,7 +81,7 @@ coding-tools-mcp-rust/
 
 ### mcp/
 - **职责**: MCP 协议实现、17 个工具、HTTP transport
-- **参考**: `old/coding_tools_mcp/server.py`, `old/docs/profile-v0.1.md`
+- **参考**: legacy archive `old/coding_tools_mcp/server.py`, `old/docs/profile-v0.1.md`
 
 ### tunnel/
 - **职责**: FRP 配置生成、Cloudflare 隧道进程监督

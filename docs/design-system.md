@@ -1,4 +1,4 @@
-# 设计系统：Coding Tools MCP Desktop
+# 设计系统：Anchor Desktop
 
 > 2026 开发者工具审美 — 克制、精致、有呼吸感
 

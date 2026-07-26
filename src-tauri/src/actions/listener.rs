@@ -291,7 +291,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 
     Json(json!({
         "ok": true,
-        "service": "coding-tools-actions",
+        "service": crate::brand::ACTIONS_SERVER_NAME,
         "workspace": state.workspace_path,
         "auth_type": state.auth.auth_type,
         "tools_loaded": tools_loaded
@@ -335,7 +335,7 @@ async fn privacy() -> Html<&'static str> {
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <title>Coding Tools Actions Privacy</title>
+    <title>Anchor Actions Privacy</title>
   </head>
   <body>
     <h1>隐私政策</h1>

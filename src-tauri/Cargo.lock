@@ -64,6 +64,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "anchor"
+version = "0.1.23"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "dirs",
+ "flate2",
+ "fs2",
+ "futures-util",
+ "glob",
+ "image",
+ "jsonschema",
+ "jsonwebtoken",
+ "libc",
+ "proptest",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "shell-words",
+ "shlex 1.3.0",
+ "tar",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-http",
+ "uuid",
+ "walkdir",
+ "which",
+ "windows",
+ "zip",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -477,45 +516,6 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
-]
-
-[[package]]
-name = "coding-tools-mcp-desktop"
-version = "0.1.23"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "dirs",
- "flate2",
- "fs2",
- "futures-util",
- "glob",
- "image",
- "jsonschema",
- "jsonwebtoken",
- "libc",
- "proptest",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "shell-words",
- "shlex 1.3.0",
- "tar",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower-http",
- "uuid",
- "walkdir",
- "which",
- "windows",
- "zip",
 ]
 
 [[package]]

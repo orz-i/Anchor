@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="src-tauri/icons/128x128.png" width="96" alt="Coding Tools MCP 图标">
+  <img src="src-tauri/icons/128x128.png" width="96" alt="Anchor 图标">
 </p>
 
-<h1 align="center">Coding Tools MCP</h1>
+<h1 align="center">Anchor</h1>
 
 <p align="center">
   把本地项目变成 AI 可直接开发、能够跨会话延续上下文的持久工作区。
@@ -19,9 +19,11 @@
   <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest">下载最新版</a>
 </p>
 
-Coding Tools MCP 是一个 Rust + Tauri 2 桌面应用。选择项目目录并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存为项目内的历史会话。它更接近“AI 打开一个会记住开发进度的 IDE 工作区”；普通开发工具不要求先创建 Task，历史会话则负责在新对话中恢复上下文。
+Anchor 是一个 Rust + Tauri 2 桌面应用。选择项目目录并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存为项目内的历史会话。它更接近“AI 打开一个会记住开发进度的 IDE 工作区”；普通开发工具不要求先创建 Task，历史会话则负责在新对话中恢复上下文。
 
-![Coding Tools MCP 工作区总览](docs/images/workspace-overview.png)
+从旧版本升级时，Anchor 会迁移 Workspace、密钥、软件缓存和受管 FRP 状态；详见 [Anchor 更名与升级迁移](docs/anchor-migration.md)。
+
+![Anchor 工作区总览](docs/images/workspace-overview.png)
 
 *一个桌面端同时管理工作区、MCP 服务、连接信息与会话恢复提示词。*
 
@@ -50,8 +52,8 @@ Coding Tools MCP 是一个 Rust + Tauri 2 桌面应用。选择项目目录并�
 
 | 系统 | 安装包 |
 | --- | --- |
-| Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` |
-| macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` |
+| Windows 10/11 x64 | `Anchor_*_x64-setup.exe` |
+| macOS Apple Silicon | `Anchor_*_aarch64.dmg` |
 
 macOS 安装包目前未签名。如果系统阻止首次打开，请在“系统设置 → 隐私与安全性”中确认打开。
 
@@ -146,7 +148,7 @@ check_exec_environment
 
 | ChatGPT 字段 | 填写内容 |
 | --- | --- |
-| 名称 | 自定义一个容易识别的名称，例如 `Coding Tools MCP` |
+| 名称 | 自定义一个容易识别的名称，例如 `Anchor` |
 | 描述 | 简要说明它连接的项目或用途 |
 | 连接 | 粘贴桌面端“GPT 配置”中的公网 MCP 地址，URL 应以 `/mcp` 结尾 |
 | 身份验证 | 与桌面端保持一致；截图以 OAuth 为例 |
@@ -162,7 +164,7 @@ check_exec_environment
 创建一个启用了该插件的新对话，并发送：
 
 ```text
-请使用 Coding Tools MCP 调用 server_info、get_default_cwd 和 git_status，
+请使用 Anchor 调用 server_info、get_default_cwd 和 git_status，
 告诉我当前连接的工作区、默认目录和 Git 状态。
 ```
 
@@ -199,7 +201,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 ## 让项目记住每次对话
 
-普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Coding Tools MCP 将会话进度写入当前项目的 `docs/history-session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。
+普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Anchor 将会话进度写入当前项目的 `docs/history-session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。
 
 ![ChatGPT 新会话启动提示词](docs/images/history-session-prompt.png)
 
@@ -285,12 +287,12 @@ Windows 也可以双击 `dev-desktop.cmd`。不要只用 `npm run dev` 验证桌
 
 ### Linux 无界面 CLI
 
-Linux 服务器可以构建不含桌面壳的 `coding-tools-mcp`，直接读取桌面端相同的 workspace/profile 配置，并以前台模式运行 MCP 或 Actions：
+Linux 服务器可以构建不含桌面壳的 `anchor`，直接读取桌面端相同的 workspace/profile 配置，并以前台模式运行 MCP 或 Actions：
 
 ```bash
 pnpm cli:build
-./src-tauri/target/release/coding-tools-mcp list
-./src-tauri/target/release/coding-tools-mcp serve <workspace> --service mcp
+./src-tauri/target/release/anchor list
+./src-tauri/target/release/anchor serve <workspace> --service mcp
 ```
 
 CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` 运维命令。它不会接管已被 GUI 占用的端口；生产自启动仍建议由 systemd 直接监督 `serve`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。

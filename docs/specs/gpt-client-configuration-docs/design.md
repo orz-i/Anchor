@@ -38,7 +38,7 @@
 ## 文件结构
 
 ```text
-coding-tools-mcp-rust/
+anchor-rust/
 ├── README.md
 ├── README.en.md
 ├── docs/images/gpt-config-1.png

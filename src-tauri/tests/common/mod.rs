@@ -3,8 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use coding_tools_mcp_desktop_lib::tools::policy::{validate_tool_arguments, PolicySettings};
-use coding_tools_mcp_desktop_lib::tools::{call_tool, ToolContext};
+use anchor_lib::tools::policy::{validate_tool_arguments, PolicySettings};
+use anchor_lib::tools::{call_tool, ToolContext};
 use serde_json::{json, Value};
 
 pub struct FixtureWorkspace {

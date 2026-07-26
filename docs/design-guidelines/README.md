@@ -1,6 +1,6 @@
 # 设计指南索引
 
-Coding Tools MCP Desktop 设计系统文档集。
+Anchor Desktop 设计系统文档集。
 
 ## 文档列表
 

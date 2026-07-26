@@ -435,7 +435,7 @@
       <input
         type="text"
         class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
-        placeholder="例如：coding-tools"
+        placeholder="例如：anchor"
         bind:value={draftOauthScopes}
       />
     </label>

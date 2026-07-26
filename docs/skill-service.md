@@ -1,6 +1,6 @@
 # MCP Agent Skills 服务
 
-Coding Tools MCP 可以从当前 workspace/profile 配置的目录中发现 Agent Skills，并通过 MCP 工具和资源按需提供给客户端。
+Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills，并通过 MCP 工具和资源按需提供给客户端。
 
 数据模型保持不变：**一个 workspace 对应一个 WorkspaceProfile**。Skill 服务开关和目录列表保存在该 profile 的 `runtime` 配置中，GUI 与 Linux CLI 启动的 MCP 使用同一份配置。
 
@@ -164,8 +164,8 @@ Skill 服务关闭时，Skill 工具不会出现在 `tools/list`，MCP 也不会
 Linux 无界面模式读取同一个 workspace/profile：
 
 ```bash
-coding-tools-mcp list
-coding-tools-mcp serve PROFILE_ID --service mcp
+anchor list
+anchor serve PROFILE_ID --service mcp
 ```
 
 Skill 服务不需要额外 CLI 参数。MCP 启动时会读取 profile 中的 `skill_service_enabled` 和 `skill_roots`。使用 systemd 时，确保服务用户对 Skill 目录具有读取权限。
@@ -191,4 +191,4 @@ Skill 服务不需要额外 CLI 参数。MCP 启动时会读取 profile 中的 `
 2. 选择与当前任务匹配的 Skill；
 3. 调用 `load_skill` 读取指令；较长正文按 `nextStartLine` 分页；
 4. 仅在指令引用关联文件时调用 `read_skill_resource`；
-5. 所有实际文件、Git 和命令操作仍通过原有 Coding Tools MCP 工具执行。
+5. 所有实际文件、Git 和命令操作仍通过原有 Anchor 工具执行。

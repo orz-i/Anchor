@@ -8,7 +8,7 @@ fn fallback_runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .thread_name("coding-tools-runtime")
+            .thread_name("anchor-runtime")
             .build()
             .expect("failed to build async runtime")
     })

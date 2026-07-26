@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-用 Rust/Tauri 2 重构 Coding Tools MCP 桌面客户端。目标是单二进制跨平台桌面应用，内嵌 MCP 核心（不再依赖外部 Python 子进程），提供 Workspace-first 管理界面、本地 HTTP `/mcp` 端点、FRP/Cloudflare 公网隧道、OAuth/Bearer/NoAuth 认证、健康检查与日志查看。参考 `old/` 目录中的 Python 实现，以 `old/docs/profile-v0.1.md` 和 `old/tests/compliance/` 为行为契约。
+用 Rust/Tauri 2 重构 Anchor 桌面客户端。目标是单二进制跨平台桌面应用，内嵌 MCP 核心（不再依赖外部 Python 子进程），提供 Workspace-first 管理界面、本地 HTTP `/mcp` 端点、FRP/Cloudflare 公网隧道、OAuth/Bearer/NoAuth 认证、健康检查与日志查看。参考 `old/` 目录中的 Python 实现，以 `old/docs/profile-v0.1.md` 和 `old/tests/compliance/` 为行为契约。
 
 ## 历史经验与坑
 

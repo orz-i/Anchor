@@ -1,13 +1,13 @@
 {
-  "name": "coding-tools-mcp-desktop",
+  "name": "anchor-desktop",
   "version": "0.1.23",
-  "description": "Coding Tools MCP desktop client",
+  "description": "Anchor desktop workspace gateway",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
-    "cli:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin coding-tools-mcp",
+    "cli:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
     "start": "tauri dev",
     "build": "vite build",
     "preview": "vite preview",

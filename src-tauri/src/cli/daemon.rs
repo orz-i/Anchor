@@ -201,41 +201,43 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
             detail: "daemon 目前仅支持 Linux".into(),
         });
     }
-    let paths = daemon_paths(&profile.id)?;
-    let mut state_error;
-    let state = match read_state(&paths.state) {
-        Ok(state) => {
-            state_error = None;
-            state
-        }
-        Err(error) => {
-            state_error = Some(error.to_string());
-            None
-        }
-    };
-    let state = match state {
-        Some(state)
-            if state.schema_version != STATE_SCHEMA_VERSION || state.workspace_id != profile.id =>
-        {
+    let mut state_error = None;
+    let mut stale_state = None;
+    for (index, paths) in daemon_path_candidates(&profile.id)?.into_iter().enumerate() {
+        let state = match read_state(&paths.state) {
+            Ok(state) => state,
+            Err(error) => {
+                state_error = Some(error.to_string());
+                continue;
+            }
+        };
+        let Some(state) = state else {
+            continue;
+        };
+        if state.schema_version != STATE_SCHEMA_VERSION || state.workspace_id != profile.id {
             state_error = Some(format!(
                 "状态文件与当前 workspace/schema 不匹配：workspace={} schema={}",
                 state.workspace_id, state.schema_version
             ));
-            None
+            continue;
         }
-        other => other,
-    };
-    if let Some(state) = state.as_ref() {
         let alive = platform().is_process_alive(state.pid);
         let pid_matches = alive && process_matches_daemon(state.pid, &profile.id);
         if alive && pid_matches {
-            return Ok(running_inspection(state.clone(), false));
+            return Ok(running_inspection(
+                state,
+                (index > 0).then_some("（从旧版运行目录恢复）"),
+            ));
         }
+        stale_state.get_or_insert(state);
     }
 
     let discovered = discover_daemon_states(profile)?;
     if discovered.len() == 1 {
-        return Ok(running_inspection(discovered[0].clone(), true));
+        return Ok(running_inspection(
+            discovered[0].clone(),
+            Some("（从 /proc 恢复）"),
+        ));
     }
     if discovered.len() > 1 {
         return Ok(DaemonInspection {
@@ -252,7 +254,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
         });
     }
 
-    let Some(state) = state else {
+    let Some(state) = stale_state else {
         return Ok(DaemonInspection {
             supported: true,
             running: false,
@@ -282,7 +284,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
     })
 }
 
-fn running_inspection(state: DaemonState, recovered: bool) -> DaemonInspection {
+fn running_inspection(state: DaemonState, recovery_note: Option<&str>) -> DaemonInspection {
     DaemonInspection {
         supported: true,
         running: true,
@@ -294,11 +296,7 @@ fn running_inspection(state: DaemonState, recovered: bool) -> DaemonInspection {
             state.pid,
             state.service.as_str(),
             state.tunnel,
-            if recovered {
-                "（从 /proc 恢复）"
-            } else {
-                ""
-            }
+            recovery_note.unwrap_or("")
         ),
         state: Some(state),
     }
@@ -503,8 +501,10 @@ pub fn cleanup(profile: &WorkspaceProfile) -> AppResult<()> {
     if !supported() {
         return Ok(());
     }
-    let paths = daemon_paths(&profile.id)?;
-    cleanup_stale_files(&paths)
+    for paths in daemon_path_candidates(&profile.id)? {
+        cleanup_stale_files(&paths)?;
+    }
+    Ok(())
 }
 
 fn selected_ports_owned_by(
@@ -528,18 +528,33 @@ fn selected_ports_owned_by(
 }
 
 fn daemon_paths(profile_id: &str) -> AppResult<DaemonPaths> {
-    let dir = runtime_dir()?;
+    Ok(daemon_paths_in(runtime_dir()?, profile_id))
+}
+
+fn daemon_path_candidates(profile_id: &str) -> AppResult<Vec<DaemonPaths>> {
+    let current = daemon_paths(profile_id)?;
+    let mut paths = vec![current.clone()];
+    if let Some(legacy_dir) = legacy_runtime_dir() {
+        let legacy = daemon_paths_in(legacy_dir, profile_id);
+        if legacy.dir != current.dir {
+            paths.push(legacy);
+        }
+    }
+    Ok(paths)
+}
+
+fn daemon_paths_in(dir: PathBuf, profile_id: &str) -> DaemonPaths {
     let safe = sanitize_id(profile_id);
-    Ok(DaemonPaths {
+    DaemonPaths {
         lock: dir.join(format!("{safe}.lock")),
         pid: dir.join(format!("{safe}.pid")),
         state: dir.join(format!("{safe}.json")),
         dir,
-    })
+    }
 }
 
 fn runtime_dir() -> AppResult<PathBuf> {
-    let config_dir = std::env::var_os("CODING_TOOLS_MCP_CONFIG_DIR").map(PathBuf::from);
+    let config_dir = crate::platform::app_config_dir_override();
     #[cfg(unix)]
     {
         let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
@@ -555,6 +570,22 @@ fn runtime_dir() -> AppResult<PathBuf> {
     Err(AppError::Message("无法确定 daemon 运行目录".into()))
 }
 
+#[cfg(unix)]
+fn legacy_runtime_dir() -> Option<PathBuf> {
+    if crate::platform::has_app_config_dir_override() {
+        return None;
+    }
+    let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    Some(select_legacy_runtime_dir(xdg_runtime, unsafe {
+        libc::geteuid()
+    }))
+}
+
+#[cfg(not(unix))]
+fn legacy_runtime_dir() -> Option<PathBuf> {
+    None
+}
+
 #[cfg(any(unix, test))]
 fn select_runtime_dir(
     config_dir: Option<PathBuf>,
@@ -564,6 +595,14 @@ fn select_runtime_dir(
     if let Some(config_dir) = config_dir {
         return config_dir.join("run");
     }
+    if let Some(runtime) = xdg_runtime {
+        return runtime.join(crate::brand::SERVER_NAME);
+    }
+    PathBuf::from(format!("/tmp/{}-{uid}", crate::brand::SERVER_NAME))
+}
+
+#[cfg(any(unix, test))]
+fn select_legacy_runtime_dir(xdg_runtime: Option<PathBuf>, uid: u32) -> PathBuf {
     if let Some(runtime) = xdg_runtime {
         return runtime.join("coding-tools-mcp");
     }
@@ -743,10 +782,18 @@ mod tests {
     fn xdg_runtime_is_preferred_over_tmp_fallback() {
         assert_eq!(
             select_runtime_dir(None, Some(PathBuf::from("/run/user/1000")), 1000),
-            PathBuf::from("/run/user/1000/coding-tools-mcp")
+            PathBuf::from("/run/user/1000/anchor")
         );
         assert_eq!(
             select_runtime_dir(None, None, 1000),
+            PathBuf::from("/tmp/anchor-1000")
+        );
+        assert_eq!(
+            select_legacy_runtime_dir(Some(PathBuf::from("/run/user/1000")), 1000),
+            PathBuf::from("/run/user/1000/coding-tools-mcp")
+        );
+        assert_eq!(
+            select_legacy_runtime_dir(None, 1000),
             PathBuf::from("/tmp/coding-tools-mcp-1000")
         );
     }
@@ -778,7 +825,7 @@ mod tests {
         assert_eq!(
             parse_daemon_args(
                 &[
-                    "/usr/local/bin/coding-tools-mcp",
+                    "/usr/local/bin/anchor",
                     "daemon-run",
                     "workspace",
                     "--service",
@@ -790,7 +837,7 @@ mod tests {
             Some((ServiceSelection::All, true))
         );
         assert_eq!(
-            parse_daemon_args(&["coding-tools-mcp", "daemon-run", "other"], "workspace"),
+            parse_daemon_args(&["anchor", "daemon-run", "other"], "workspace"),
             None
         );
     }

@@ -1,6 +1,6 @@
 # Session 生命周期与内容管理
 
-Coding Tools MCP 同时存在三类用途不同的 Session。它们必须分开管理，不能共享标识、过期策略或内容预算。
+Anchor 同时存在三类用途不同的 Session。它们必须分开管理，不能共享标识、过期策略或内容预算。
 
 ## 1. MCP 传输 Session
 

@@ -2,7 +2,7 @@
 
 ## 功能概述
 
-面向首次接触 Coding Tools MCP 的 ChatGPT、Codex 和其他 MCP 客户端用户，重写中英文 GitHub README，并用真实桌面客户端截图说明从安装、创建工作区到启动公网 MCP/Actions 的完整路径。
+面向首次接触 Anchor 的 ChatGPT、Codex 和其他 MCP 客户端用户，重写中英文 GitHub README，并用真实桌面客户端截图说明从安装、创建工作区到启动公网 MCP/Actions 的完整路径。
 
 ## 历史经验与边界
 

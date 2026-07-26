@@ -52,22 +52,22 @@
   - _需求: FR-3_ ｜ _设计: RuntimeState 状态机_
 
 - [x] 2.2 实现内嵌 MCP HTTP server（axum），支持 initialize / tools/list / tools/call
-  - **证据块**: 先读 `old/coding_tools_mcp/server.py:38-39`（协议版本）和 `old/docs/profile-v0.1.md:17-27`（Transport 规范）
+  - **证据块**: 先读 legacy archive `old/coding_tools_mcp/server.py:38-39`（协议版本）和 `old/docs/profile-v0.1.md:17-27`（Transport 规范）
   - **涉及文件**: src-tauri/src/mcp/server.rs（约 250 行）, src-tauri/src/mcp/mod.rs（约 20 行）。server.rs 超 500 行时拆出 transport.rs
   - _需求: FR-3, FR-4_ ｜ _设计: 架构设计 MCP Core_
 
 - [x] 2.3 实现 P0 文件工具（read_file, list_dir, list_files, search_text）
-  - **证据块**: 先读 `old/docs/profile-v0.1.md` 中 read_file/list_dir 章节和 `old/coding_tools_mcp/server.py:1198-1325`（Workspace 路径校验）
+  - **证据块**: 先读 `old/docs/profile-v0.1.md` 中 read_file/list_dir 章节和 legacy archive `old/coding_tools_mcp/server.py:1198-1325`（Workspace 路径校验）
   - **涉及文件**: src-tauri/src/mcp/tools/file.rs（约 300 行）, src-tauri/src/mcp/workspace.rs（约 150 行，路径边界）
   - _需求: FR-4_ ｜ _设计: 决策 3_
 
 - [x] 2.4 实现 P0 补丁工具（apply_patch）
-  - **证据块**: 先读 `old/coding_tools_mcp/server.py:3349-3470`（parse_patch / apply_update_hunks）
+  - **证据块**: 先读 legacy archive `old/coding_tools_mcp/server.py:3349-3470`（parse_patch / apply_update_hunks）
   - **涉及文件**: src-tauri/src/mcp/tools/patch.rs（约 250 行）
   - _需求: FR-4_ ｜ _设计: 决策 3_
 
 - [x] 2.5 实现 P0 执行工具（exec_command）和 Git 工具（git_status, git_diff）
-  - **证据块**: 先读 `old/coding_tools_mcp/server.py:1346-1513`（ExecSession）和 git 相关 handler
+  - **证据块**: 先读 legacy archive `old/coding_tools_mcp/server.py:1346-1513`（ExecSession）和 git 相关 handler
   - **涉及文件**: src-tauri/src/mcp/tools/exec.rs（约 300 行）, src-tauri/src/mcp/tools/git.rs（约 150 行）
   - _需求: FR-4_ ｜ _设计: 决策 3_
 
@@ -84,7 +84,7 @@
   - _需求: FR-5_ ｜ _设计: 架构 Tunnel Supervisor_
 
 - [x] 3.2 实现 OAuth / Bearer / NoAuth 认证配置
-  - **证据块**: 先读 `old/coding_tools_mcp/server.py:293-337`（OAuth 配置）和 `old/apps/desktop-client/mcp_desktop_client/models.py:32-38`（AuthConfig）
+  - **证据块**: 先读 legacy archive `old/coding_tools_mcp/server.py:293-337`（OAuth 配置）和 `old/apps/desktop-client/mcp_desktop_client/models.py:32-38`（AuthConfig）
   - **涉及文件**: src-tauri/src/auth/oauth.rs（约 150 行）, src-tauri/src/auth/mod.rs（约 20 行）
   - _需求: FR-6_ ｜ _设计: 数据模型 auth 字段_
 

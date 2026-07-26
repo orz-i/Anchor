@@ -22,7 +22,17 @@ impl Platform for LinuxPlatform {
         let base = dirs::config_dir()
             .or_else(dirs::home_dir)
             .ok_or_else(|| crate::error::AppError::Message("config dir not found".into()))?;
-        Ok(base.join("coding-tools-mcp-desktop"))
+        Ok(base.join(crate::brand::APP_CONFIG_DIR_NAME))
+    }
+
+    fn legacy_app_config_dirs(&self) -> AppResult<Vec<PathBuf>> {
+        if crate::platform::has_app_config_dir_override() {
+            return Ok(Vec::new());
+        }
+        let base = dirs::config_dir()
+            .or_else(dirs::home_dir)
+            .ok_or_else(|| crate::error::AppError::Message("config dir not found".into()))?;
+        Ok(vec![base.join(crate::brand::LEGACY_APP_CONFIG_DIR_NAME)])
     }
 
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>> {
