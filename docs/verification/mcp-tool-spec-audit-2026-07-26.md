@@ -2,7 +2,7 @@
 
 ## 结论
 
-结论：**核心本地 Tool 的基础协议形态通过，但 Tool 安全语义、聚合代理信任边界和状态模型仍需整改；当前不建议把全部工具档位标记为规范完成。**
+结论：**本轮列出的七个 P1 问题已经完成代码整改和专项回归；核心本地 Tool 与聚合代理 Tool 的发布/调用契约可以进入后续发布验证。非 P1 的 outputSchema 覆盖、图片响应体和 Session 级 cwd 等问题仍保留。**
 
 审计基线为 MCP 稳定规范 `2025-11-25`，并参考当前 draft 中的聚合命名、状态型 Tool 和 Tool schema 演进指南。
 
@@ -22,10 +22,30 @@
 
 代码基线：`532586f462546f7110052939d7ca3248b6751074`。
 
+## P1 整改结果
+
+| 原问题 | 整改结果 |
+|---|---|
+| `compat-readonly-all` 伪造只读 annotations | 旧配置现规范化为真实 `read-only` 档位，不再暴露写入和进程控制 Tool；GUI 标明“实际只读” |
+| 代理 Tool metadata 未验证 | 下游 definition 增加 JSON Schema 元校验、外部 `$ref` 拒绝、名称/大小/数量上限和字段白名单；安全 annotations 统一采用保守值 |
+| 代理重连只比较名称 | 改为对规范化后的完整 Tool contract 计算 SHA-256 摘要；同名 schema、输出契约或描述变化均阻断重连 |
+| 代理执行失败返回 JSON-RPC error | 已知代理 Tool 的连接、超时、取消、重连和结果校验失败统一返回 `CallToolResult.isError=true` |
+| `request_permissions` 没有真实 grant | 删除该 Tool 及其虚假 scope/TTL schema；不再声称存在未实现的 grant store |
+| `confirm=true` 不是人类批准 | 从公共 Tool schema 删除 `confirm`；危险命令、关键文件删除和 Skill 脚本只接受操作者通过受信任 GUI/CLI 预先启用的 `dangerous` 模式 |
+| 取消覆盖已提交写入结果 | 完成后的结果保持权威；若取消在完成后到达，返回成功并附加 `cancellation_after_completion=true` 和 warning，不触发误重试 |
+
+额外加固：
+
+- `write_stdin` 现在发布 `destructiveHint: true`；
+- 代理参数在调用下游前按已发布 `inputSchema` 校验；
+- 代理 `outputSchema` 在返回时校验 `structuredContent`；
+- 代理结构化结果缺少 TextContent 时自动补充兼容回退；
+- 多个下游异步初始化后的 Tool catalog 按公共名称稳定排序。
+
 ## 已确认符合的基础项
 
 - 当前主协议版本为 `2025-11-25`。
-- 核心档位暴露 27 个名称唯一的本地 Tool。
+- 核心档位暴露 26 个名称唯一的本地 Tool；已移除未实现的 `request_permissions`。
 - 本地 Tool 名称仅使用 ASCII 字母、数字、下划线或连字符，且均远小于 128 字符。
 - 每个本地 Tool 都提供 `name`、`title`、`description`、根级 object `inputSchema` 和 `annotations`。
 - 无参数 Tool 使用 object schema，并通过 `additionalProperties: false` 拒绝额外参数。
@@ -37,7 +57,7 @@
 - `read-only` 档位实际移除了 `apply_patch`、`exec_command`、`write_stdin`、`kill_session` 和 `set_default_cwd`。
 - `write_stdin`、`read_output`、`kill_session` 使用显式 `session_id`；Task 和历史工具也使用显式 handle。
 
-## P1 问题
+## P1 原始问题（已整改）
 
 ### P1-1：`compat-readonly-all` 提供虚假的安全 annotations
 
@@ -304,41 +324,42 @@ GUI 保存的值是 `full`，但 `normalize_tool_profile()` 未识别 `full`，�
 
 ## 验证结果
 
-- `tools::registry::tests`：2 passed。
+- `tools::registry::tests`：3 passed。
 - `tools::schema::tests`：3 passed。
-- `mcp::proxy::tests`：6 passed。
-- 既有全量回归在上一轮为 220 passed、1 ignored，额外集成/安全/历史测试 72 passed。
+- `mcp::proxy::tests`：10 passed。
+- `call_tool_contract`：19 passed。
+- `call_tool_security`：25 passed。
+- Rust `--all-features`：library 227 passed、1 ignored；额外集成/安全/历史测试 71 passed。
+- 全 target/feature 严格 Clippy：通过，0 warning。
+- headless CLI 严格 Clippy：通过，0 warning。
+- `svelte-check`：0 errors、0 warnings。
+- 前端生产构建：通过。
 
-现有测试确认了基础结构，但未覆盖以下审计问题：
+本轮新增测试覆盖：
 
 - compat 档位 annotations 与实际副作用一致性；
 - 代理 Tool definition 的 schema/annotation 验证；
 - 同名但 schema 变化的代理重连；
 - 代理 Tool error 的 `isError` 层级；
 - 取消发生在副作用提交后的结果语义；
+- 模型提供 `confirm=true` 不能解锁危险命令；
+- 操作者配置 dangerous 模式后关键文件删除和 Skill 脚本的正向路径。
+
+仍未覆盖且不属于本轮七个 P1 的项目：
+
 - 多 MCP Session 的 default cwd 隔离；
-- `request_permissions` grant 的 scope/TTL/消费行为；
-- view_image 响应体大小和 TextContent 回退。
+- view_image 响应体大小和 TextContent 回退；
+- 本地 Tool 的 outputSchema 覆盖。
 
-## 推荐整改顺序
+## 后续整改顺序
 
-第一批安全阻断项：
+第一批协议与契约一致性：
 
-1. 删除或实质化 `compat-readonly-all`；
-2. 验证并重新分类代理 Tool metadata；
-3. 代理重连改为完整 catalog digest；
-4. 实现真实 permission grant，或移除 `request_permissions`；
-5. 修复写 Tool 的取消后提交语义。
+1. 动态生成 initialize instructions；
+2. 统一 full/core/advanced profile；
+3. 修正 view_image content 和 payload。
 
-第二批协议与契约一致性：
-
-1. 代理 Tool error 返回 `isError: true`；
-2. 动态生成 initialize instructions；
-3. 统一 full/core/advanced profile；
-4. 修正 view_image content 和 payload；
-5. 修正 write_stdin annotations。
-
-第三批可维护性和前向兼容：
+第二批可维护性和前向兼容：
 
 1. 引入 outputSchema；
 2. 使用完整 JSON Schema validator；
@@ -350,9 +371,10 @@ GUI 保存的值是 `full`，但 `normalize_tool_profile()` 未识别 `full`，�
 
 - **本地 core Tool 的 wire format：通过。**
 - **read-only Tool 集的实际写入边界：通过。**
-- **annotations 真实性：不通过。**
-- **代理 Tool catalog 信任边界：不通过。**
-- **代理 Tool error 层级：不通过。**
-- **真实 permission grant：未实现。**
+- **annotations 真实性：通过。**
+- **代理 Tool catalog 信任边界：通过。**
+- **代理 Tool error 层级：通过。**
+- **权限批准语义：通过；未实现的 grant Tool 已移除，危险能力仅由受信任控制面配置。**
+- **取消后提交语义：通过。**
 - **结构化输出强类型契约：部分通过。**
 - **多 Session 状态隔离：部分通过。**
