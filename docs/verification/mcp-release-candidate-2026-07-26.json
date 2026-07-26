@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "base_url": "https://pensions-nat-version-sacramento.trycloudflare.com",
+  "auth": "noauth",
+  "protocol_version": "2025-11-25",
+  "started_at": 1785051061.1367264,
+  "duration_seconds": 6.928,
+  "ok": true,
+  "checks": [
+    {
+      "name": "mcp_get_405",
+      "ok": true,
+      "detail": "HTTP 405, Allow='POST, DELETE'",
+      "evidence": {
+        "response_preview": ""
+      }
+    },
+    {
+      "name": "wrong_origin_rejected",
+      "ok": true,
+      "detail": "HTTP 403",
+      "evidence": {}
+    },
+    {
+      "name": "initialize",
+      "ok": true,
+      "detail": "protocol=2025-11-25, session=True",
+      "evidence": {
+        "server_info": {
+          "name": "coding-tools-mcp",
+          "title": "Coding Tools MCP",
+          "version": "0.1.23"
+        }
+      }
+    },
+    {
+      "name": "tools_list_contract",
+      "ok": true,
+      "detail": "count=26, digest=a3e3150111918dab27af33f83068d6cc2ce4e921e96187ff97147b1b47b6244a",
+      "evidence": {
+        "names": [
+          "apply_patch",
+          "check_exec_environment",
+          "exec_command",
+          "get_default_cwd",
+          "git_blame",
+          "git_diff",
+          "git_log",
+          "git_show",
+          "git_status",
+          "grep_text",
+          "history_session_bootstrap",
+          "history_session_checkpoint",
+          "history_session_validate",
+          "kill_session",
+          "list_dir",
+          "list_files",
+          "list_skills",
+          "load_skill",
+          "read_file",
+          "read_output",
+          "read_skill_resource",
+          "search_text",
+          "server_info",
+          "set_default_cwd",
+          "view_image",
+          "write_stdin"
+        ],
+        "digest": "a3e3150111918dab27af33f83068d6cc2ce4e921e96187ff97147b1b47b6244a"
+      }
+    },
+    {
+      "name": "server_info_catalog_digest",
+      "ok": true,
+      "detail": "server=a3e3150111918dab27af33f83068d6cc2ce4e921e96187ff97147b1b47b6244a, computed=a3e3150111918dab27af33f83068d6cc2ce4e921e96187ff97147b1b47b6244a",
+      "evidence": {
+        "tool_profile": "core",
+        "catalog_bytes": 43852
+      }
+    },
+    {
+      "name": "expected_tool_profile",
+      "ok": true,
+      "detail": "actual=core, expected=core",
+      "evidence": {}
+    },
+    {
+      "name": "read_file",
+      "ok": true,
+      "detail": "path=README.md, bytes=21",
+      "evidence": {}
+    },
+    {
+      "name": "isolated_write_and_rollback",
+      "ok": true,
+      "detail": "file=.rc-validator-1785051065.txt",
+      "evidence": {
+        "add_change_id": "c37819729364412085e4514ffb1235dc",
+        "remove_change_id": "cb7c10e1f6f24271a1ed4ef0b15faeaf"
+      }
+    },
+    {
+      "name": "session_delete",
+      "ok": true,
+      "detail": "HTTP 204",
+      "evidence": {
+        "response_preview": ""
+      }
+    }
+  ],
+  "chatgpt_manual_gates": [
+    {
+      "name": "tool_scan_and_oauth",
+      "status": "pending_human_ui",
+      "evidence_required": "ChatGPT web developer mode scans tools and completes OAuth without callback enrollment prompts"
+    },
+    {
+      "name": "read_tool_invocation",
+      "status": "pending_human_ui",
+      "evidence_required": "A new chat invokes server_info/read_file and displays a successful result"
+    },
+    {
+      "name": "write_confirmation_and_execution",
+      "status": "pending_human_ui",
+      "evidence_required": "ChatGPT presents the expected write confirmation and apply_patch completes exactly once"
+    },
+    {
+      "name": "frozen_catalog_refresh",
+      "status": "pending_human_ui",
+      "evidence_required": "The approved app snapshot digest matches this report or the app is explicitly refreshed"
+    }
+  ]
+}
