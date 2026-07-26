@@ -29,6 +29,9 @@ description: Review a code change for correctness, security, and regressions.
 allowed-tools: read_file git_diff search_text
 metadata:
   version: "1"
+  policy:
+    strict: true
+  priority: 5
 ---
 
 # Code review
@@ -91,14 +94,18 @@ skills
 
 ### `load_skill`
 
-按名称加载完整 `SKILL.md` 和正文指令：
+按名称加载正文指令。较长 Skill 支持按行和返回字节预算渐进加载：
 
 ```json
 {
   "name": "code-review",
-  "max_bytes": 262144
+  "start_line": 1,
+  "end_line": 400,
+  "max_bytes": 65536
 }
 ```
+
+返回值包含 `startLine`、`endLine`、`totalLines`、`totalBytes`、`returnedBytes`、`truncated` 和 `nextStartLine`。如果 `truncated=true`，使用 `nextStartLine` 继续读取。`max_bytes` 最大为 131072。
 
 推荐工作流是先调用 `list_skills`，仅在任务确实需要时调用 `load_skill`。
 
@@ -129,6 +136,14 @@ skill://<skill-name>/references/<file>
 skill://<skill-name>/scripts/<file>
 skill://<skill-name>/assets/<file>
 ```
+
+读取较大的 `SKILL.md` 时，服务默认最多返回 65536 字节，并在 `_meta.nextUri` 中提供续页 URI，例如：
+
+```text
+skill://code-review/SKILL.md?start_line=401&max_bytes=65536
+```
+
+仅允许 `start_line`、`end_line` 和 `max_bytes` 三个查询参数，且 `max_bytes` 不得超过 131072。
 
 `skill://index.json` 是渐进式发现索引，条目包含：
 
@@ -163,6 +178,8 @@ Skill 服务不需要额外 CLI 参数。MCP 启动时会读取 profile 中的 `
 - 扫描不跟随目录遍历中的符号链接；Skill 目录必须保留在配置根目录内。
 - 资源读取会再次 canonicalize 路径，拒绝 `..`、绝对路径和符号链接越界。
 - `SKILL.md` 和单个资源默认受大小限制，工具参数可以在上限内进一步收紧返回大小。
+- `SKILL.md` 的 128 KiB 文件上限是安全硬边界。正文超过建议的 500 行或估算 5000 tokens 时不会被拒绝，而是在 `list_skills` 和 `load_skill` 中返回 `oversized`、大小统计及 `qualityWarnings`。
+- token 数量是用于上下文预算提示的近似估算，不作为格式有效性、权限或执行判断依据。
 - 不要把密钥、Token、客户数据或其他敏感信息放入 Skill 文件。
 - 外部来源的 Skill 应先审查其 `SKILL.md`、resources 和 scripts，再加入共享目录。
 
@@ -172,6 +189,6 @@ Skill 服务不需要额外 CLI 参数。MCP 启动时会读取 profile 中的 `
 
 1. 使用 `list_skills` 或 `skill://index.json` 获取名称和描述；
 2. 选择与当前任务匹配的 Skill；
-3. 调用 `load_skill` 读取完整指令；
+3. 调用 `load_skill` 读取指令；较长正文按 `nextStartLine` 分页；
 4. 仅在指令引用关联文件时调用 `read_skill_resource`；
 5. 所有实际文件、Git 和命令操作仍通过原有 Coding Tools MCP 工具执行。

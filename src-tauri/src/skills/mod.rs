@@ -13,6 +13,16 @@ pub use catalog::{SkillCatalog, SkillSettings};
 pub const TOOL_NAMES: &[&str] = &["list_skills", "load_skill", "read_skill_resource"];
 const RESOURCE_PAGE_SIZE: usize = 200;
 const MAX_RESOURCE_ENTRIES: usize = 5000;
+const DEFAULT_SKILL_PAGE_BYTES: u64 = 65_536;
+
+#[derive(Debug)]
+struct SkillUriRequest {
+    name: String,
+    path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_bytes: u64,
+}
 
 pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let query = args.get("query").and_then(Value::as_str);
@@ -36,13 +46,21 @@ pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
 
 pub fn load_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let name = required_string(args, "name")?;
+    let start_line = args
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let end_line = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
     let max_bytes = args
         .get("max_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(65_536);
+        .unwrap_or(DEFAULT_SKILL_PAGE_BYTES);
     let mut loaded = ctx
         .skills
-        .load(name, max_bytes)
+        .load(name, start_line, end_line, max_bytes)
         .map_err(skill_not_found_or_invalid)?;
     loaded.summary.resolve_tools(&available_tools(ctx)?);
     if !loaded.summary.tool_compatible {
@@ -174,22 +192,43 @@ pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Va
         }));
     }
 
-    let (name, path) = parse_skill_uri(uri).map_err(|error| rpc_error(-32602, &error))?;
-    if path == "SKILL.md" {
+    let request = parse_skill_uri(uri).map_err(|error| rpc_error(-32602, &error))?;
+    if request.path == "SKILL.md" {
         let skill_md = catalog
-            .skill_markdown(&name)
+            .read_skill_markdown(
+                &request.name,
+                request.start_line,
+                request.end_line,
+                request.max_bytes,
+            )
             .map_err(|error| rpc_error(-32002, &error))?;
-        return Ok(json!({
+        let mut result = json!({
             "contents": [{
                 "uri": uri,
                 "mimeType": "text/markdown",
-                "text": skill_md
-            }]
-        }));
+                "text": skill_md.content
+            }],
+            "_meta": {
+                "startLine": skill_md.start_line,
+                "endLine": skill_md.end_line,
+                "totalLines": skill_md.total_lines,
+                "totalBytes": skill_md.size_bytes,
+                "returnedBytes": skill_md.returned_bytes,
+                "truncated": skill_md.truncated
+            }
+        });
+        if let Some(next_start_line) = skill_md.next_start_line {
+            result["_meta"]["nextStartLine"] = json!(next_start_line);
+            result["_meta"]["nextUri"] = Value::String(format!(
+                "skill://{}/SKILL.md?start_line={next_start_line}&max_bytes={}",
+                request.name, request.max_bytes
+            ));
+        }
+        return Ok(result);
     }
 
     let resource = catalog
-        .read_resource(&name, &path, None, None, 1_048_576)
+        .read_resource(&request.name, &request.path, None, None, 1_048_576)
         .map_err(|error| rpc_error(-32002, &error))?;
     let content = if resource.encoding == "base64" {
         json!({
@@ -256,11 +295,14 @@ fn skill_not_found_or_invalid(message: String) -> WorkspaceError {
     }
 }
 
-fn parse_skill_uri(uri: &str) -> Result<(String, String), String> {
-    if uri.contains(['?', '#']) {
-        return Err("Skill resource URI must not contain query or fragment".into());
+fn parse_skill_uri(uri: &str) -> Result<SkillUriRequest, String> {
+    if uri.contains('#') {
+        return Err("Skill resource URI must not contain a fragment".into());
     }
-    let remainder = uri
+    let (base_uri, query) = uri
+        .split_once('?')
+        .map_or((uri, None), |(base, query)| (base, Some(query)));
+    let remainder = base_uri
         .strip_prefix("skill://")
         .ok_or_else(|| "Skill resource URI must use skill://<name>/<path>".to_string())?;
     let (name, encoded_path) = remainder
@@ -270,7 +312,65 @@ fn parse_skill_uri(uri: &str) -> Result<(String, String), String> {
         return Err("Skill resource URI must use skill://<name>/<path>".into());
     }
     let path = resource::percent_decode_path(encoded_path)?;
-    Ok((name.to_string(), path))
+    let mut request = SkillUriRequest {
+        name: name.to_string(),
+        path,
+        start_line: None,
+        end_line: None,
+        max_bytes: DEFAULT_SKILL_PAGE_BYTES,
+    };
+    let Some(query) = query else {
+        return Ok(request);
+    };
+    if request.path != "SKILL.md" {
+        return Err("Skill resource query parameters are supported only for SKILL.md".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| "Skill resource query parameters must use key=value".to_string())?;
+        if !seen.insert(key) {
+            return Err(format!("Duplicate Skill resource query parameter: {key}"));
+        }
+        match key {
+            "start_line" => {
+                request.start_line = Some(parse_positive_query_usize(key, value)?);
+            }
+            "end_line" => {
+                request.end_line = Some(parse_positive_query_usize(key, value)?);
+            }
+            "max_bytes" => {
+                let parsed = parse_positive_query_usize(key, value)? as u64;
+                if parsed > catalog::MAX_SKILL_MD_BYTES {
+                    return Err(format!(
+                        "max_bytes cannot exceed {}",
+                        catalog::MAX_SKILL_MD_BYTES
+                    ));
+                }
+                request.max_bytes = parsed;
+            }
+            _ => return Err(format!("Unknown Skill resource query parameter: {key}")),
+        }
+    }
+    if request
+        .end_line
+        .zip(request.start_line)
+        .is_some_and(|(end, start)| end < start)
+    {
+        return Err("end_line cannot be smaller than start_line".into());
+    }
+    Ok(request)
+}
+
+fn parse_positive_query_usize(name: &str, value: &str) -> Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be a positive integer"))?;
+    if value == 0 {
+        return Err(format!("{name} must be a positive integer"));
+    }
+    Ok(value)
 }
 
 fn encode_cursor(offset: usize) -> String {
@@ -340,6 +440,52 @@ mod tests {
             .as_str()
             .expect("text")
             .contains("Use this skill"));
+        assert_eq!(result["_meta"]["truncated"], false);
+    }
+
+    #[test]
+    fn resource_read_pages_large_skill_markdown_with_a_next_uri() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("skills/large");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        let body = (1..=700)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: large\ndescription: Large skill.\n---\n{body}"),
+        )
+        .expect("skill");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let first = resource_read(
+            &catalog,
+            &json!({"uri": "skill://large/SKILL.md?start_line=1&max_bytes=512"}),
+        )
+        .expect("first page");
+        assert_eq!(first["_meta"]["truncated"], true);
+        let next_uri = first["_meta"]["nextUri"].as_str().expect("next URI");
+        let second = resource_read(&catalog, &json!({"uri": next_uri})).expect("second page");
+        assert!(second["_meta"]["startLine"].as_u64().unwrap() > 1);
+        assert_ne!(first["contents"][0]["text"], second["contents"][0]["text"]);
+    }
+
+    #[test]
+    fn resource_read_rejects_unbounded_or_unknown_skill_queries() {
+        let (_temp, catalog) = catalog_with_skill();
+        let too_large = resource_read(
+            &catalog,
+            &json!({"uri": "skill://example/SKILL.md?max_bytes=131073"}),
+        )
+        .expect_err("bounded max bytes");
+        assert_eq!(too_large["code"], -32602);
+
+        let unknown = resource_read(
+            &catalog,
+            &json!({"uri": "skill://example/SKILL.md?offset=1"}),
+        )
+        .expect_err("unknown query");
+        assert_eq!(unknown["code"], -32602);
     }
 
     #[test]

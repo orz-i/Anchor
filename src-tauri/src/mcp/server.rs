@@ -438,7 +438,7 @@ mod tests {
         fs::create_dir_all(skill_dir.join("references")).expect("create skill");
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: review\ndescription: Review a change.\n---\nRead the diff carefully.\n",
+            "---\nname: review\ndescription: Review a change.\n---\nRead the diff carefully.\nCheck tests.\nReport findings.\n",
         )
         .expect("write skill");
         fs::write(skill_dir.join("references/RULES.md"), "No regressions.\n")
@@ -473,6 +473,10 @@ mod tests {
             listed["result"]["structuredContent"]["skills"][0]["name"],
             "review"
         );
+        assert_eq!(
+            listed["result"]["structuredContent"]["skills"][0]["oversized"],
+            false
+        );
 
         let loaded = handle_request(
             &state,
@@ -480,14 +484,22 @@ mod tests {
                 "jsonrpc":"2.0",
                 "id":3,
                 "method":"tools/call",
-                "params":{"name":"load_skill","arguments":{"name":"review"}}
+                "params":{
+                    "name":"load_skill",
+                    "arguments":{"name":"review","start_line":2,"end_line":2}
+                }
             }),
         )
         .await;
-        assert!(loaded["result"]["structuredContent"]["instructions"]
-            .as_str()
-            .expect("instructions")
-            .contains("Read the diff"));
+        assert_eq!(
+            loaded["result"]["structuredContent"]["instructions"],
+            "Check tests.\n"
+        );
+        assert_eq!(loaded["result"]["structuredContent"]["startLine"], 2);
+        assert_eq!(loaded["result"]["structuredContent"]["endLine"], 2);
+        assert_eq!(loaded["result"]["structuredContent"]["totalLines"], 3);
+        assert_eq!(loaded["result"]["structuredContent"]["nextStartLine"], 3);
+        assert_eq!(loaded["result"]["structuredContent"]["truncated"], true);
 
         let index = handle_request(
             &state,
@@ -503,6 +515,23 @@ mod tests {
             .as_str()
             .expect("index text");
         assert!(index_text.contains("skill://review/SKILL.md"));
+
+        let page = handle_request(
+            &state,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":5,
+                "method":"resources/read",
+                "params":{"uri":"skill://review/SKILL.md?start_line=2&end_line=2"}
+            }),
+        )
+        .await;
+        assert!(page["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("skill page")
+            .contains("name: review"));
+        assert_eq!(page["result"]["_meta"]["startLine"], 2);
+        assert_eq!(page["result"]["_meta"]["endLine"], 2);
     }
 
     #[tokio::test]

@@ -1048,6 +1048,8 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "name": { "type": "string", "minLength": 1 },
+                "start_line": { "type": "integer", "minimum": 1, "default": 1 },
+                "end_line": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": 131072, "default": 65536 }
             },
             "required": ["name"],

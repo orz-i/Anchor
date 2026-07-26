@@ -7,12 +7,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use super::model::{parse_skill_markdown, SkillLoadResult, SkillReadResult, SkillSummary};
+use super::model::{
+    paginate_text, parse_skill_markdown, SkillLoadResult, SkillReadResult, SkillSummary,
+};
 use super::resource::{discover_files, read_resource, ResourceReadRequest, MAX_RESOURCE_BYTES};
 
 const DEFAULT_SKILL_ROOTS: &str = ".agents/skills\n.codex/skills\nskills";
 const MAX_SKILLS: usize = 200;
-const MAX_SKILL_MD_BYTES: u64 = 131_072;
+pub(super) const MAX_SKILL_MD_BYTES: u64 = 131_072;
 
 #[derive(Debug, Clone)]
 pub struct SkillSettings {
@@ -224,19 +226,26 @@ impl SkillCatalog {
         }
     }
 
-    pub fn load(&self, name: &str, max_bytes: u64) -> Result<SkillLoadResult, String> {
+    pub fn load(
+        &self,
+        name: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        max_bytes: u64,
+    ) -> Result<SkillLoadResult, String> {
         let record = self.find(name)?;
-        let limit = max_bytes.clamp(1, MAX_SKILL_MD_BYTES);
-        let size = record.instructions.len() as u64;
-        if size > limit {
-            return Err(format!(
-                "Skill {} 的 instructions 大小为 {size} 字节，超过 max_bytes={limit}",
-                record.summary.name
-            ));
-        }
+        let limit = max_bytes.clamp(1, MAX_SKILL_MD_BYTES) as usize;
+        let page = paginate_text(&record.instructions, start_line, end_line, limit)?;
         Ok(SkillLoadResult {
             summary: record.summary,
-            instructions: record.instructions,
+            instructions: page.content,
+            start_line: page.start_line,
+            end_line: page.end_line,
+            total_lines: page.total_lines,
+            total_bytes: page.total_bytes,
+            returned_bytes: page.returned_bytes,
+            truncated: page.truncated,
+            next_start_line: page.next_start_line,
         })
     }
 
@@ -290,8 +299,31 @@ impl SkillCatalog {
         .map_err(|error| format!("Skill index 序列化失败：{error}"))
     }
 
-    pub fn skill_markdown(&self, name: &str) -> Result<String, String> {
-        Ok(self.find(name)?.raw)
+    pub fn read_skill_markdown(
+        &self,
+        name: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        max_bytes: u64,
+    ) -> Result<SkillReadResult, String> {
+        let record = self.find(name)?;
+        let limit = max_bytes.clamp(1, MAX_SKILL_MD_BYTES) as usize;
+        let page = paginate_text(&record.raw, start_line, end_line, limit)?;
+        Ok(SkillReadResult {
+            skill: record.summary.name.clone(),
+            path: "SKILL.md".into(),
+            uri: record.summary.uri.clone(),
+            mime_type: "text/markdown".into(),
+            encoding: "utf-8".into(),
+            content: page.content,
+            size_bytes: page.total_bytes,
+            returned_bytes: page.returned_bytes,
+            total_lines: Some(page.total_lines),
+            start_line: Some(page.start_line),
+            end_line: Some(page.end_line),
+            truncated: page.truncated,
+            next_start_line: page.next_start_line,
+        })
     }
 
     pub fn match_script_command(&self, command: &str, workdir: &Path) -> Option<SkillScriptMatch> {
@@ -505,6 +537,12 @@ fn read_skill_record(
         relative_path,
         uri,
         digest,
+        instruction_lines: parsed.instruction_lines,
+        instruction_chars: parsed.instruction_chars,
+        instruction_bytes: parsed.instruction_bytes,
+        estimated_tokens: parsed.estimated_tokens,
+        oversized: parsed.oversized,
+        quality_warnings: parsed.quality_warnings,
         resources: discovered.resources,
         scripts: discovered.scripts,
         script_execution_enabled: false,
@@ -656,9 +694,12 @@ mod tests {
             .source_id
             .contains(temp.path().to_string_lossy().as_ref()));
 
-        let loaded = catalog.load("code-review", 1024).expect("load skill");
+        let loaded = catalog
+            .load("code-review", None, None, 1024)
+            .expect("load skill");
         assert!(loaded.instructions.contains("Use it"));
         assert!(loaded.summary.digest.starts_with("sha256:"));
+        assert!(!loaded.truncated);
 
         let resource = catalog
             .read_resource(
@@ -754,5 +795,77 @@ mod tests {
             .is_some_and(|value| value.contains("3.6.11")));
         assert!(skill.allowed_tools.contains(&"start_feature".to_string()));
         assert!(skill.allowed_tools.contains(&"workflow".to_string()));
+    }
+
+    #[test]
+    fn load_skill_pages_long_instructions_without_rejecting_the_skill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("skills/long-skill");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        let body = (1..=700)
+            .map(|line| format!("instruction line {line}\n"))
+            .collect::<String>();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: long-skill\ndescription: Long skill.\n---\n{body}"),
+        )
+        .expect("skill");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let listed = catalog.list(None, 10);
+        assert_eq!(listed.skills.len(), 1, "{:?}", listed.warnings);
+        assert!(listed.skills[0].oversized);
+        assert_eq!(listed.skills[0].instruction_lines, 700);
+
+        let first = catalog
+            .load("long-skill", Some(1), Some(400), 4096)
+            .expect("first page");
+        assert!(first.truncated);
+        assert!(first.end_line < 400);
+        let next = first.next_start_line.expect("continuation");
+        let second = catalog
+            .load("long-skill", Some(next), None, 131_072)
+            .expect("second page");
+        assert_eq!(second.start_line, next);
+        assert_eq!(second.end_line, 700);
+    }
+
+    #[test]
+    fn skill_markdown_keeps_the_128_kib_hard_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = temp.path().join("skills");
+        let accepted_dir = skills.join("accepted");
+        fs::create_dir_all(&accepted_dir).expect("accepted dir");
+        let prefix = "---\nname: accepted\ndescription: Accepted.\n---\n";
+        let accepted = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_SKILL_MD_BYTES as usize - prefix.len())
+        );
+        assert_eq!(accepted.len(), MAX_SKILL_MD_BYTES as usize);
+        fs::write(accepted_dir.join("SKILL.md"), accepted).expect("accepted skill");
+
+        let rejected_dir = skills.join("rejected");
+        fs::create_dir_all(&rejected_dir).expect("rejected dir");
+        let rejected_prefix = "---\nname: rejected\ndescription: Rejected.\n---\n";
+        let rejected = format!(
+            "{rejected_prefix}{}",
+            "b".repeat(MAX_SKILL_MD_BYTES as usize + 1 - rejected_prefix.len())
+        );
+        fs::write(rejected_dir.join("SKILL.md"), rejected).expect("rejected skill");
+
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        let listed = catalog.list(None, 10);
+        assert_eq!(
+            listed
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accepted"]
+        );
+        assert!(listed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("131072")));
     }
 }

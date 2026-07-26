@@ -81,8 +81,9 @@ pub(super) fn read_resource(request: ResourceReadRequest<'_>) -> Result<SkillRea
     if is_text_path(&canonical) {
         let text = String::from_utf8(data)
             .map_err(|_| "Skill 文本资源不是有效 UTF-8；请通过二进制资源 URI 读取".to_string())?;
-        let (content, actual_start, actual_end, truncated) =
+        let (content, actual_start, actual_end, total_lines, truncated, next_start_line) =
             slice_lines(&text, request.start_line, request.end_line);
+        let returned_bytes = content.len();
         Ok(SkillReadResult {
             skill: request.skill_name.to_string(),
             path,
@@ -91,9 +92,12 @@ pub(super) fn read_resource(request: ResourceReadRequest<'_>) -> Result<SkillRea
             encoding: "utf-8".into(),
             content,
             size_bytes: metadata.len(),
+            returned_bytes,
+            total_lines: Some(total_lines),
             start_line: Some(actual_start),
             end_line: Some(actual_end),
             truncated,
+            next_start_line,
         })
     } else {
         if request.start_line.is_some() || request.end_line.is_some() {
@@ -107,9 +111,12 @@ pub(super) fn read_resource(request: ResourceReadRequest<'_>) -> Result<SkillRea
             encoding: "base64".into(),
             content: base64::engine::general_purpose::STANDARD.encode(data),
             size_bytes: metadata.len(),
+            returned_bytes: metadata.len() as usize,
+            total_lines: None,
             start_line: None,
             end_line: None,
             truncated: false,
+            next_start_line: None,
         })
     }
 }
@@ -285,7 +292,7 @@ fn slice_lines(
     text: &str,
     start_line: Option<usize>,
     end_line: Option<usize>,
-) -> (String, usize, usize, bool) {
+) -> (String, usize, usize, usize, bool, Option<usize>) {
     let lines = text.lines().collect::<Vec<_>>();
     let start = start_line.unwrap_or(1).max(1).min(lines.len().max(1));
     let end = end_line
@@ -297,7 +304,9 @@ fn slice_lines(
     } else {
         lines[start - 1..end].join("\n")
     };
-    (content, start, end, start > 1 || end < lines.len())
+    let truncated = start > 1 || end < lines.len();
+    let next_start_line = (end < lines.len()).then_some(end + 1);
+    (content, start, end, lines.len(), truncated, next_start_line)
 }
 
 pub(super) fn skill_resource_uri(skill_name: &str, path: &str) -> String {

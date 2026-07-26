@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub(super) const RECOMMENDED_INSTRUCTION_LINES: usize = 500;
+pub(super) const RECOMMENDED_INSTRUCTION_TOKENS: usize = 5_000;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillFileSummary {
@@ -45,6 +48,12 @@ pub struct SkillSummary {
     pub relative_path: String,
     pub uri: String,
     pub digest: String,
+    pub instruction_lines: usize,
+    pub instruction_chars: usize,
+    pub instruction_bytes: u64,
+    pub estimated_tokens: usize,
+    pub oversized: bool,
+    pub quality_warnings: Vec<String>,
     pub resources: Vec<SkillFileSummary>,
     pub scripts: Vec<SkillFileSummary>,
     pub script_execution_enabled: bool,
@@ -132,6 +141,13 @@ pub struct SkillLoadResult {
     #[serde(flatten)]
     pub summary: SkillSummary,
     pub instructions: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+    pub total_bytes: u64,
+    pub returned_bytes: usize,
+    pub truncated: bool,
+    pub next_start_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,9 +160,24 @@ pub struct SkillReadResult {
     pub encoding: String,
     pub content: String,
     pub size_bytes: u64,
+    pub returned_bytes: usize,
+    pub total_lines: Option<usize>,
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
     pub truncated: bool,
+    pub next_start_line: Option<usize>,
+}
+
+#[derive(Debug)]
+pub(super) struct TextPage {
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+    pub total_bytes: u64,
+    pub returned_bytes: usize,
+    pub truncated: bool,
+    pub next_start_line: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,7 +190,7 @@ struct RawSkillFrontmatter {
     #[serde(default)]
     compatibility: Option<String>,
     #[serde(default)]
-    metadata: BTreeMap<String, String>,
+    metadata: BTreeMap<String, serde_yaml::Value>,
     #[serde(rename = "allowed-tools", default)]
     allowed_tools: String,
 }
@@ -173,6 +204,12 @@ pub struct ParsedSkillMarkdown {
     pub metadata: Value,
     pub allowed_tools: Vec<String>,
     pub instructions: String,
+    pub instruction_lines: usize,
+    pub instruction_chars: usize,
+    pub instruction_bytes: u64,
+    pub estimated_tokens: usize,
+    pub oversized: bool,
+    pub quality_warnings: Vec<String>,
 }
 
 pub fn parse_skill_markdown(
@@ -198,10 +235,6 @@ pub fn parse_skill_markdown(
     {
         return Err("SKILL.md compatibility 不能超过 500 个字符".into());
     }
-    if instructions.lines().count() > 500 || instructions.chars().count() > 20_000 {
-        return Err("SKILL.md instructions 必须控制在 500 行且约 20,000 字符以内".into());
-    }
-
     let mut allowed_tools = Vec::new();
     for value in parsed.allowed_tools.split_whitespace() {
         if value.len() > 128
@@ -224,6 +257,24 @@ pub fn parse_skill_markdown(
 
     let metadata = serde_json::to_value(parsed.metadata)
         .map_err(|error| format!("SKILL.md metadata 无法序列化：{error}"))?;
+    let instructions = instructions.trim_start().to_string();
+    let instruction_lines = instructions.lines().count();
+    let instruction_chars = instructions.chars().count();
+    let instruction_bytes = instructions.len() as u64;
+    let estimated_tokens = estimate_instruction_tokens(&instructions);
+    let mut quality_warnings = Vec::new();
+    if instruction_lines > RECOMMENDED_INSTRUCTION_LINES {
+        quality_warnings.push(format!(
+            "SKILL.md instructions 为 {instruction_lines} 行，超过建议的 {RECOMMENDED_INSTRUCTION_LINES} 行；建议将详细资料拆分到 references/"
+        ));
+    }
+    if estimated_tokens > RECOMMENDED_INSTRUCTION_TOKENS {
+        quality_warnings.push(format!(
+            "SKILL.md instructions 预计约 {estimated_tokens} tokens，超过建议的 {RECOMMENDED_INSTRUCTION_TOKENS} tokens；建议采用渐进式资源加载"
+        ));
+    }
+    let oversized = !quality_warnings.is_empty();
+
     Ok(ParsedSkillMarkdown {
         name: parsed.name,
         description,
@@ -233,8 +284,96 @@ pub fn parse_skill_markdown(
             .filter(|value| !value.trim().is_empty()),
         metadata,
         allowed_tools,
-        instructions: instructions.trim_start().to_string(),
+        instructions,
+        instruction_lines,
+        instruction_chars,
+        instruction_bytes,
+        estimated_tokens,
+        oversized,
+        quality_warnings,
     })
+}
+
+pub(super) fn paginate_text(
+    text: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_bytes: usize,
+) -> Result<TextPage, String> {
+    let total_bytes = text.len() as u64;
+    let lines = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_inclusive('\n').collect::<Vec<_>>()
+    };
+    let total_lines = lines.len();
+    if total_lines == 0 {
+        return Ok(TextPage {
+            content: String::new(),
+            start_line: 1,
+            end_line: 0,
+            total_lines: 0,
+            total_bytes,
+            returned_bytes: 0,
+            truncated: false,
+            next_start_line: None,
+        });
+    }
+
+    let start = start_line.unwrap_or(1).max(1);
+    if start > total_lines {
+        return Err(format!(
+            "start_line={start} 超过 instructions 总行数 {total_lines}"
+        ));
+    }
+    let requested_end = end_line.unwrap_or(total_lines);
+    if requested_end < start {
+        return Err("end_line 不能小于 start_line".into());
+    }
+    let end = requested_end.min(total_lines);
+    let mut content = String::new();
+    let mut actual_end = start.saturating_sub(1);
+    for (index, line) in lines[start - 1..end].iter().enumerate() {
+        if content.len().saturating_add(line.len()) > max_bytes {
+            if content.is_empty() {
+                return Err(format!(
+                    "第 {start} 行大小为 {} 字节，超过 max_bytes={max_bytes}；请提高 max_bytes 后重试",
+                    line.len()
+                ));
+            }
+            break;
+        }
+        content.push_str(line);
+        actual_end = start + index;
+    }
+    let returned_bytes = content.len();
+    let next_start_line = (actual_end < total_lines).then_some(actual_end + 1);
+    Ok(TextPage {
+        content,
+        start_line: start,
+        end_line: actual_end,
+        total_lines,
+        total_bytes,
+        returned_bytes,
+        truncated: start > 1 || actual_end < total_lines,
+        next_start_line,
+    })
+}
+
+fn estimate_instruction_tokens(text: &str) -> usize {
+    let mut ascii_word_like = 0usize;
+    let mut ascii_symbols = 0usize;
+    let mut non_ascii = 0usize;
+    for character in text.chars() {
+        if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+            ascii_word_like += 1;
+        } else if character.is_ascii() {
+            ascii_symbols += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ascii_word_like.div_ceil(4) + ascii_symbols.div_ceil(2) + non_ascii
 }
 
 fn split_frontmatter(raw: &str) -> Result<(&str, &str), String> {
@@ -311,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_frontmatter_and_non_string_metadata() {
+    fn rejects_unknown_frontmatter_and_accepts_structured_metadata() {
         let unknown = parse_skill_markdown(
             "---\nname: example\ndescription: Test.\ncustom-field: true\n---\nBody",
             "example",
@@ -320,11 +459,63 @@ mod tests {
         assert!(unknown.contains("unknown field"));
 
         let metadata = parse_skill_markdown(
-            "---\nname: example\ndescription: Test.\nmetadata:\n  nested:\n    value: true\n---\nBody",
+            "---\nname: example\ndescription: Test.\nmetadata:\n  nested:\n    value: true\n  priority: 5\n  tags: [one, two]\n---\nBody",
             "example",
         )
-        .expect_err("string metadata");
-        assert!(metadata.contains("metadata"));
+        .expect("structured metadata");
+        assert_eq!(metadata.metadata["nested"]["value"], true);
+        assert_eq!(metadata.metadata["priority"], 5);
+        assert_eq!(metadata.metadata["tags"][1], "two");
+    }
+
+    #[test]
+    fn long_instructions_are_accepted_with_quality_warnings() {
+        let short_lines = (0..600)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_skill_markdown(
+            &format!("---\nname: example\ndescription: Test.\n---\n{short_lines}"),
+            "example",
+        )
+        .expect("long line count remains valid");
+        assert_eq!(parsed.instruction_lines, 600);
+        assert!(parsed.oversized);
+        assert!(parsed
+            .quality_warnings
+            .iter()
+            .any(|warning| warning.contains("500")));
+
+        let english = "This is a detailed reusable instruction for the agent. ".repeat(600);
+        assert!(english.chars().count() > 20_000);
+        let parsed = parse_skill_markdown(
+            &format!("---\nname: example\ndescription: Test.\n---\n{english}"),
+            "example",
+        )
+        .expect("more than the legacy character limit remains valid");
+        assert!(parsed.instruction_lines < RECOMMENDED_INSTRUCTION_LINES);
+        assert!(parsed.estimated_tokens > RECOMMENDED_INSTRUCTION_TOKENS);
+        assert!(parsed.oversized);
+
+        let chinese = "这是一个用于验证中文上下文预算的技能指令。".repeat(300);
+        let parsed = parse_skill_markdown(
+            &format!("---\nname: example\ndescription: Test.\n---\n{chinese}"),
+            "example",
+        )
+        .expect("long Chinese remains valid");
+        assert!(parsed.estimated_tokens > RECOMMENDED_INSTRUCTION_TOKENS);
+        assert!(parsed.oversized);
+    }
+
+    #[test]
+    fn text_pagination_returns_complete_lines_and_continuation() {
+        let page = paginate_text("one\ntwo\nthree\n", Some(1), None, 8).expect("page");
+        assert_eq!(page.content, "one\ntwo\n");
+        assert_eq!(page.start_line, 1);
+        assert_eq!(page.end_line, 2);
+        assert_eq!(page.total_lines, 3);
+        assert_eq!(page.next_start_line, Some(3));
+        assert!(page.truncated);
     }
 
     #[test]
@@ -349,6 +540,12 @@ mod tests {
             relative_path: "example".into(),
             uri: "skill://example/SKILL.md".into(),
             digest: "sha256:test".into(),
+            instruction_lines: 1,
+            instruction_chars: 7,
+            instruction_bytes: 7,
+            estimated_tokens: 2,
+            oversized: false,
+            quality_warnings: Vec::new(),
             resources: Vec::new(),
             scripts: Vec::new(),
             script_execution_enabled: false,
