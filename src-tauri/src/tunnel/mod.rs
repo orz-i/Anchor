@@ -10,16 +10,16 @@ use crate::workspace::WorkspaceProfile;
 
 pub use access::{
     cleanup_orphan_for_runtime, drop_workspace, ensure_for_runtime,
-    is_quick_tunnel_url_change_error, maybe_start_for_runtime, stop_for_runtime, supervisor,
-    reconcile_mcp_gateway, sync_managed_runtime_routes,
+    is_quick_tunnel_url_change_error, maybe_start_for_runtime, reconcile_mcp_gateway,
+    stop_for_runtime, supervisor, sync_managed_runtime_routes,
 };
 
 #[allow(unused_imports)]
 pub use cloudflare::{
     extract_trycloudflare_url, resolve_cloudflared, spawn_cloudflare_tunnel, stop_child,
 };
-#[allow(unused_imports)]
-pub use frp::{actions_frp_snippet, mcp_frp_snippet, resolve_frpc};
+#[cfg(feature = "cli")]
+pub use frp::resolve_frpc;
 #[allow(unused_imports)]
 pub use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 #[allow(unused_imports)]

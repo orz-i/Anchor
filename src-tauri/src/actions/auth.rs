@@ -2,16 +2,17 @@ use std::sync::Arc;
 
 use axum::{
     extract::Request,
-    http::{header::AUTHORIZATION, StatusCode},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     Extension,
 };
 
-use crate::auth::{external_base_url, verify_oauth_bearer_header, OAuthRuntime};
+use crate::auth::{
+    bearer_token, constant_time_eq_str, external_base_url, verify_oauth_bearer_header,
+    BearerHeaderError, OAuthRuntime,
+};
 use crate::runtime::{read_public_url, SharedPublicUrl};
-
-use super::bearer::constant_time_eq;
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -70,19 +71,20 @@ pub async fn require_actions_auth(
                 .into_response();
         };
 
-        let Some(header_value) = request.headers().get(AUTHORIZATION) else {
-            return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response();
+        let token = match bearer_token(request.headers()) {
+            Ok(token) => token,
+            Err(BearerHeaderError::Missing) => {
+                return (StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response()
+            }
+            Err(BearerHeaderError::InvalidHeader) => {
+                return (StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response()
+            }
+            Err(BearerHeaderError::InvalidToken) => {
+                return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response()
+            }
         };
 
-        let Ok(header_str) = header_value.to_str() else {
-            return (StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response();
-        };
-
-        let Some(token) = header_str.strip_prefix("Bearer ").map(str::trim) else {
-            return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
-        };
-
-        if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+        if !constant_time_eq_str(token, expected) {
             return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
         }
 

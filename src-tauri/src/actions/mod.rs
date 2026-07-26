@@ -1,5 +1,4 @@
 mod auth;
-mod bearer;
 mod listener;
 mod openapi;
 

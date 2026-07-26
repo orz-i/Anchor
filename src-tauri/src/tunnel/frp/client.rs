@@ -372,11 +372,6 @@ fn aggregate_uses_proxy(routes: &[(&WorkspaceProfile, TunnelServiceKind)]) -> bo
     })
 }
 
-#[allow(dead_code)]
-pub async fn stop_frpc(child: Child, pid: Option<u32>) -> AppResult<()> {
-    stop_child(child, pid).await
-}
-
 fn validate_frp_config(config: &FrpServerConfig) -> AppResult<()> {
     if config.server_addr.trim().is_empty() {
         return Err(AppError::Message("FRP 模式需要填写服务器域名。".into()));

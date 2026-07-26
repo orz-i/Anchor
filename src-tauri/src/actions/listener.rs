@@ -6,7 +6,7 @@ use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
     protected_resource_metadata, redirect_uri_log_label, register_oauth_runtime,
     request_origin_allowed, token_exchange, AuthorizeForm, AuthorizeParams, OAuthRuntime,
-    TokenForm,
+    TokenForm, OAUTH_MAX_BODY_BYTES,
 };
 use crate::mcp::protocol::RateLimiter;
 use crate::runtime::{read_public_url, register_public_url, SharedPublicUrl};
@@ -30,7 +30,6 @@ use super::openapi;
 pub type ShutdownSender = oneshot::Sender<()>;
 
 const ACTIONS_MAX_BODY_BYTES: usize = 1_048_576;
-const OAUTH_MAX_BODY_BYTES: usize = 8_192;
 const ACTIONS_MAX_REQUESTS_PER_MINUTE: usize = 240;
 const OAUTH_MAX_REQUESTS_PER_MINUTE: usize = 30;
 const ACTIONS_MAX_CONCURRENT_REQUESTS: usize = 16;

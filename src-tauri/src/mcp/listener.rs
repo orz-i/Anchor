@@ -6,7 +6,7 @@ use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
     protected_resource_metadata, redirect_uri_log_label, register_oauth_runtime,
     request_origin_allowed, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
-    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm, OAUTH_MAX_BODY_BYTES,
 };
 use crate::mcp::protocol::{
     negotiate_protocol_version, protocol_version_supported, requested_protocol_version,
@@ -39,7 +39,6 @@ pub type ShutdownSender = oneshot::Sender<()>;
 
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MCP_MAX_BODY_BYTES: usize = 1_048_576;
-const OAUTH_MAX_BODY_BYTES: usize = 8_192;
 const MCP_MAX_CONCURRENT_REQUESTS: usize = 16;
 const MCP_MAX_REQUESTS_PER_MINUTE: usize = 240;
 const OAUTH_MAX_REQUESTS_PER_MINUTE: usize = 30;
@@ -63,10 +62,20 @@ struct ListenerState {
     in_flight: InFlightRequests,
 }
 
+fn clear_session_associations(state: &ListenerState, session_id: &str) {
+    state.in_flight.cancel_session(session_id);
+    state.mcp.clear_session_state(session_id);
+}
+
+fn remove_session(state: &ListenerState, session_id: &str) -> bool {
+    let removed = state.sessions.remove(session_id);
+    clear_session_associations(state, session_id);
+    removed
+}
+
 fn cleanup_retired_sessions(state: &ListenerState) {
     for session_id in state.sessions.take_retired() {
-        state.in_flight.cancel_session(&session_id);
-        state.mcp.clear_session_state(&session_id);
+        clear_session_associations(state, &session_id);
     }
 }
 
@@ -518,9 +527,7 @@ async fn mcp_post(
             );
         }
         RequestReservation::Exhausted => {
-            state.sessions.remove(session_id);
-            state.in_flight.cancel_session(session_id);
-            state.mcp.clear_session_state(session_id);
+            remove_session(&state, session_id);
             cleanup_retired_sessions(&state);
             return jsonrpc_error_response(
                 StatusCode::OK,
@@ -582,9 +589,7 @@ async fn mcp_delete(State(state): State<ListenerState>, headers: HeaderMap) -> R
         return http_error(StatusCode::BAD_REQUEST, "MCP-Session-Id is required");
     };
     cleanup_retired_sessions(&state);
-    if state.sessions.remove(session_id) {
-        state.in_flight.cancel_session(session_id);
-        state.mcp.clear_session_state(session_id);
+    if remove_session(&state, session_id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
         http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session")

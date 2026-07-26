@@ -369,58 +369,44 @@
     }
   }
 
-  async function toggleMcp() {
+  async function toggleService(service: ServiceTab) {
     const id = workspaceId;
-    if (!id || mcpBusy) return;
-    const wasRunning = mcpStatus === "running";
-    mcpBusy = true;
+    const isMcp = service === "mcp";
+    if (!id || (isMcp ? mcpBusy : actionsBusy)) return;
+    const label = isMcp ? "MCP" : "Actions";
+    const wasRunning = (isMcp ? mcpStatus : actionsStatus) === "running";
+    if (isMcp) mcpBusy = true;
+    else actionsBusy = true;
     try {
       const runtime = await runServiceToggle(
         wasRunning,
-        () => startRuntime(id),
-        () => stopRuntime(id),
-        "MCP",
+        () => (isMcp ? startRuntime(id) : startActionsRuntime(id)),
+        () => (isMcp ? stopRuntime(id) : stopActionsRuntime(id)),
+        label,
       );
       if (runtime && id === workspaceId) {
-        applyMcpRuntime(runtime, id);
+        if (isMcp) applyMcpRuntime(runtime, id);
+        else applyActionsRuntime(runtime, id);
         if (!wasRunning) {
           if (runtime.state === "running") {
-            await afterServiceStart("mcp", runtime, id);
+            await afterServiceStart(service, runtime, id);
           } else {
-            notifyStartFailure("MCP", runtime);
+            notifyStartFailure(label, runtime);
           }
         }
       }
     } finally {
-      mcpBusy = false;
+      if (isMcp) mcpBusy = false;
+      else actionsBusy = false;
     }
   }
 
+  async function toggleMcp() {
+    await toggleService("mcp");
+  }
+
   async function toggleActions() {
-    const id = workspaceId;
-    if (!id || actionsBusy) return;
-    const wasRunning = actionsStatus === "running";
-    actionsBusy = true;
-    try {
-      const runtime = await runServiceToggle(
-        wasRunning,
-        () => startActionsRuntime(id),
-        () => stopActionsRuntime(id),
-        "Actions",
-      );
-      if (runtime && id === workspaceId) {
-        applyActionsRuntime(runtime, id);
-        if (!wasRunning) {
-          if (runtime.state === "running") {
-            await afterServiceStart("actions", runtime, id);
-          } else {
-            notifyStartFailure("Actions", runtime);
-          }
-        }
-      }
-    } finally {
-      actionsBusy = false;
-    }
+    await toggleService("actions");
   }
 
   async function saveMcpPort(port: number) {

@@ -18,8 +18,7 @@ use super::bearer::constant_time_eq_str;
 pub const OAUTH_CODE_TTL_SECONDS: u64 = 300;
 pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60;
 pub const OAUTH_REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 90;
-#[allow(dead_code)]
-pub const OAUTH_MAX_BODY_BYTES: usize = 8_192;
+pub(crate) const OAUTH_MAX_BODY_BYTES: usize = 8_192;
 const BUILTIN_CHATGPT_CALLBACK_HOST: &str = "chatgpt.com";
 const BUILTIN_CHATGPT_CALLBACK_PATH_PREFIX: &str = "/connector/oauth/";
 
@@ -232,12 +231,10 @@ pub fn parse_redirect_uris(raw: &str) -> Result<Vec<String>, String> {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct PendingCode {
     code_challenge: String,
     client_id: String,
     redirect_uri: String,
-    state: String,
     expires_at: u64,
     issuer_url: String,
     resource_url: String,
@@ -635,7 +632,6 @@ pub fn authorize_post(
                 code_challenge: form.code_challenge.clone(),
                 client_id: form.client_id.clone(),
                 redirect_uri: form.redirect_uri.clone(),
-                state: form.state.clone(),
                 expires_at: now + OAUTH_CODE_TTL_SECONDS,
                 issuer_url: issuer_url.clone(),
                 resource_url,

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "base_url": "https://remedy-sin-spoke-merchandise.trycloudflare.com",
+  "auth": "oauth",
+  "protocol_version": "2025-11-25",
+  "duration_seconds": 13.043,
+  "ok": true,
+  "checks": [
+    {"name": "mcp_get_405", "ok": true, "detail": "HTTP 405, Allow='POST, DELETE'"},
+    {"name": "wrong_origin_rejected", "ok": true, "detail": "HTTP 403"},
+    {"name": "oauth_protected_resource_metadata", "ok": true, "detail": "HTTP 200"},
+    {"name": "oauth_authorization_server_metadata", "ok": true, "detail": "HTTP 200"},
+    {"name": "oauth_unauthenticated_challenge", "ok": true, "detail": "HTTP 401 with WWW-Authenticate resource_metadata"},
+    {"name": "oauth_authorization_page", "ok": true, "detail": "HTTP 200"},
+    {
+      "name": "oauth_authorization_code",
+      "ok": true,
+      "detail": "HTTP 303; callback_host=chatgpt.com; built-in callback accepted without enrollment UI"
+    },
+    {"name": "oauth_token_exchange", "ok": true, "detail": "HTTP 200; token_type=Bearer; S256 PKCE"},
+    {"name": "initialize", "ok": true, "detail": "protocol=2025-11-25, session=True"},
+    {
+      "name": "tools_list_contract",
+      "ok": true,
+      "detail": "count=26, digest=7c78514945c5b6d200fabb0f59180a339ce7a07772595704761bda1f1c5053b5"
+    },
+    {
+      "name": "server_info_catalog_digest",
+      "ok": true,
+      "detail": "server=7c78514945c5b6d200fabb0f59180a339ce7a07772595704761bda1f1c5053b5, computed=7c78514945c5b6d200fabb0f59180a339ce7a07772595704761bda1f1c5053b5"
+    },
+    {"name": "expected_tool_profile", "ok": true, "detail": "actual=core, expected=core"},
+    {"name": "read_file", "ok": true, "detail": "path=README.md, bytes=31"},
+    {"name": "isolated_write_and_rollback", "ok": true, "detail": "temporary file added, verified, and removed"},
+    {"name": "oauth_refresh_rotation", "ok": true, "detail": "HTTP 200; refresh token rotated"},
+    {"name": "oauth_refreshed_access_token", "ok": true, "detail": "new access token successfully called server_info"},
+    {"name": "oauth_old_refresh_rejected", "ok": true, "detail": "HTTP 400; error=invalid_grant"},
+    {"name": "session_delete", "ok": true, "detail": "HTTP 204"}
+  ],
+  "chatgpt_workspace_ui": "skipped_by_request",
+  "secrets_in_report": false
+}

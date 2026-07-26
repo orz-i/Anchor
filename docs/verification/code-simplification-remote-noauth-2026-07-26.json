@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "base_url": "https://large-contacting-disclosure-proven.trycloudflare.com",
+  "auth": "noauth",
+  "protocol_version": "2025-11-25",
+  "duration_seconds": 6.981,
+  "ok": true,
+  "checks": [
+    {"name": "mcp_get_405", "ok": true, "detail": "HTTP 405, Allow='POST, DELETE'"},
+    {"name": "wrong_origin_rejected", "ok": true, "detail": "HTTP 403"},
+    {"name": "initialize", "ok": true, "detail": "protocol=2025-11-25, session=True"},
+    {
+      "name": "tools_list_contract",
+      "ok": true,
+      "detail": "count=26, digest=7c78514945c5b6d200fabb0f59180a339ce7a07772595704761bda1f1c5053b5"
+    },
+    {
+      "name": "server_info_catalog_digest",
+      "ok": true,
+      "detail": "server=7c78514945c5b6d200fabb0f59180a339ce7a07772595704761bda1f1c5053b5, computed=7c78514945c5b6d200fabb0f59180a339ce7a07772595704761bda1f1c5053b5"
+    },
+    {"name": "expected_tool_profile", "ok": true, "detail": "actual=core, expected=core"},
+    {"name": "read_file", "ok": true, "detail": "path=README.md, bytes=31"},
+    {"name": "isolated_write_and_rollback", "ok": true, "detail": "temporary file added, verified, and removed"},
+    {"name": "session_delete", "ok": true, "detail": "HTTP 204"}
+  ],
+  "chatgpt_workspace_ui": "skipped_by_request",
+  "secrets_in_report": false
+}

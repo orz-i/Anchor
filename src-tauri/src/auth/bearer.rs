@@ -1,17 +1,39 @@
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BearerHeaderError {
+    Missing,
+    InvalidHeader,
+    InvalidToken,
+}
+
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<&str, BearerHeaderError> {
+    let header_value = headers
+        .get(AUTHORIZATION)
+        .ok_or(BearerHeaderError::Missing)?;
+    let header = header_value
+        .to_str()
+        .map_err(|_| BearerHeaderError::InvalidHeader)?;
+    header
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or(BearerHeaderError::InvalidToken)
+}
+
 pub fn verify_bearer_header(headers: &HeaderMap, expected: &str) -> Option<Response> {
-    let Some(header_value) = headers.get(AUTHORIZATION) else {
-        return Some((StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response());
-    };
-
-    let Ok(header_str) = header_value.to_str() else {
-        return Some((StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response());
-    };
-
-    let Some(token) = header_str.strip_prefix("Bearer ").map(str::trim) else {
-        return Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response());
+    let token = match bearer_token(headers) {
+        Ok(token) => token,
+        Err(BearerHeaderError::Missing) => {
+            return Some((StatusCode::UNAUTHORIZED, "Missing Authorization header").into_response())
+        }
+        Err(BearerHeaderError::InvalidHeader) => {
+            return Some((StatusCode::UNAUTHORIZED, "Invalid Authorization header").into_response())
+        }
+        Err(BearerHeaderError::InvalidToken) => {
+            return Some((StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response())
+        }
     };
 
     if !constant_time_eq_str(token, expected) {

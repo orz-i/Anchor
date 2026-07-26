@@ -1,15 +1,6 @@
 import { showToast } from "$lib/stores/toast";
 import type { RuntimeStatus } from "$lib/types";
 
-export function isPortConflictError(error: unknown): boolean {
-  const text = error instanceof Error ? error.message : String(error);
-  return (
-    text.includes("已被占用") ||
-    text.includes("未能成功启动") ||
-    text.includes("上一次服务占用")
-  );
-}
-
 export function serviceErrorMessage(status: RuntimeStatus): string {
   return status.localMessage || status.publicMessage || "服务未能启动";
 }

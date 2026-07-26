@@ -1,8 +1,6 @@
 mod client;
 
 use crate::settings::AppSettings;
-#[allow(unused_imports)]
-use crate::settings::FrpProfile;
 use crate::workspace::WorkspaceProfile;
 use std::collections::HashSet;
 
@@ -17,23 +15,6 @@ pub use client::{resolve_frpc, spawn_frpc};
 
 const FRP_VERSION: &str = "0.61.2";
 pub(crate) const VERSION: &str = FRP_VERSION;
-
-#[allow(dead_code)]
-pub(crate) fn frp_version() -> &'static str {
-    FRP_VERSION
-}
-
-/// FRP proxy snippet for the MCP listener (`profile.tunnel` + `profile.runtime`).
-#[allow(dead_code)]
-pub fn mcp_frp_snippet(profile: &WorkspaceProfile, settings: &AppSettings) -> String {
-    frp_snippet(profile, TunnelServiceKind::Mcp, settings)
-}
-
-/// FRP proxy snippet for the Actions listener (`profile.actions`).
-#[allow(dead_code)]
-pub fn actions_frp_snippet(profile: &WorkspaceProfile, settings: &AppSettings) -> String {
-    frp_snippet(profile, TunnelServiceKind::Actions, settings)
-}
 
 pub fn frp_snippet(
     profile: &WorkspaceProfile,
@@ -162,22 +143,6 @@ fn resolve_frp_token(
     None
 }
 
-#[allow(dead_code)]
-pub fn build_frpc_toml(config: &FrpServerConfig) -> String {
-    let mut lines = vec![
-        format!("serverAddr = \"{}\"", config.server_addr.trim()),
-        format!("serverPort = {}", config.server_port),
-        String::new(),
-    ];
-    if let Some(token) = config.token.as_ref().filter(|t| !t.trim().is_empty()) {
-        lines.push("auth.method = \"token\"".to_string());
-        lines.push(format!("auth.token = \"{}\"", token.trim()));
-        lines.push(String::new());
-    }
-    lines.push(build_proxy_snippet(&config.proxy));
-    lines.join("\n")
-}
-
 /// Build one frpc configuration containing all active proxies.
 ///
 /// A single frpc process can serve multiple workspaces, but all proxies must
@@ -292,7 +257,7 @@ mod tests {
         };
         profile.tunnel.frp_profile_id = "p1".into();
 
-        let snippet = mcp_frp_snippet(&profile, &settings);
+        let snippet = frp_snippet(&profile, TunnelServiceKind::Mcp, &settings);
         let proxy_name = frp_server_config(&profile, TunnelServiceKind::Mcp, &settings, None)
             .proxy
             .proxy_name;
@@ -321,7 +286,7 @@ mod tests {
             &settings,
             Some("secret".into()),
         );
-        let toml = build_frpc_toml(&config);
+        let toml = build_frpc_toml_for_routes(std::slice::from_ref(&config));
         assert!(toml.contains("serverAddr = \"frp.example.com\""));
         assert!(toml.contains("auth.token = \"secret\""));
     }
