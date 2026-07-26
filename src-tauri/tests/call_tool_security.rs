@@ -175,7 +175,8 @@ fn view_image_allows_explicit_external_read_only_path() {
             .replace('\\', "/")
             .trim_start_matches("//?/")
     );
-    assert!(payload["base64"].as_str().is_some());
+    assert!(payload["data_url"].as_str().is_some());
+    assert!(payload.get("base64").is_none());
 }
 
 #[test]

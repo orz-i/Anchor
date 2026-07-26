@@ -27,7 +27,14 @@ pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("max_height")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_MAX_DIMENSION as u64) as u32;
-    let auto_resize = args.get("auto_resize").and_then(Value::as_bool).unwrap_or(true);
+    let auto_resize = args
+        .get("auto_resize")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let output = args
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("mcp_image");
 
     let resolved = ws.resolve_read_path(path)?;
     let mut data = std::fs::read(&resolved.path).map_err(|e| WorkspaceError::Tool {
@@ -55,9 +62,8 @@ pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
                 (mime_type, width, height) = identify_image(&data)?;
                 resized = true;
             }
-            Ok(None) => warnings.push(
-                "auto_resize requested but image resize failed or format unsupported".into(),
-            ),
+            Ok(None) => warnings
+                .push("auto_resize requested but image resize failed or format unsupported".into()),
             Err(err) => warnings.push(format!("auto_resize failed: {err}")),
         }
     }
@@ -72,7 +78,7 @@ pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     }
 
     let encoded = STANDARD.encode(&data);
-    Ok(tool_ok(json!({
+    let mut result = tool_ok(json!({
         "path": resolved.display,
         "mime_type": mime_type,
         "bytes": data.len(),
@@ -80,10 +86,14 @@ pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "height": height,
         "resized": resized,
         "original": original,
-        "base64": encoded,
-        "data_url": format!("data:{mime_type};base64,{encoded}"),
         "warnings": warnings
-    })))
+    }));
+    if output == "data_url" {
+        result["data_url"] = Value::String(format!("data:{mime_type};base64,{encoded}"));
+    } else {
+        result["base64"] = Value::String(encoded);
+    }
+    Ok(result)
 }
 
 fn identify_image(data: &[u8]) -> Result<(String, u32, u32), WorkspaceError> {
@@ -140,9 +150,7 @@ fn resize_image(
     match mime_type {
         "image/png" => {
             let enc = PngEncoder::new(&mut out);
-            thumb
-                .write_with_encoder(enc)
-                .map_err(|e| e.to_string())?;
+            thumb.write_with_encoder(enc).map_err(|e| e.to_string())?;
             if out.len() > max_bytes {
                 return encode_jpeg(&thumb, max_bytes);
             }
@@ -158,8 +166,7 @@ fn encode_jpeg(img: &DynamicImage, max_bytes: usize) -> Result<Option<(Vec<u8>, 
     for quality in [85u8, 70, 55, 40] {
         let mut out = Vec::new();
         let enc = JpegEncoder::new_with_quality(&mut out, quality);
-        img.write_with_encoder(enc)
-            .map_err(|e| e.to_string())?;
+        img.write_with_encoder(enc).map_err(|e| e.to_string())?;
         if out.len() <= max_bytes {
             return Ok(Some((out, "image/jpeg".into())));
         }

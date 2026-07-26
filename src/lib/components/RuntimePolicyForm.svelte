@@ -17,9 +17,9 @@
   }
 
   const TOOL_PROFILE_OPTIONS = [
-    { value: "full", label: "完整工具" },
+    { value: "core", label: "核心工具" },
+    { value: "advanced", label: "完整工具" },
     { value: "read-only", label: "只读工具" },
-    { value: "compat-readonly-all", label: "兼容只读（实际只读）" },
   ] as const;
 
   const PERMISSION_MODE_OPTIONS = [
@@ -30,19 +30,26 @@
 
   let { toolProfile, permissionMode, allowedCommands, workspaceLocalEntries, workspaceScriptExtensions, onSave }: Props = $props();
 
-  let draftProfile = $state("full");
+  let draftProfile = $state("core");
   let draftMode = $state("trusted");
   let draftCommands = $state("");
   let draftLocalEntries = $state(true);
   let draftExtensions = $state(".exe,.bat,.cmd,.ps1");
   let saving = $state(false);
 
+  function canonicalProfile(value: string) {
+    if (value === "full") return "advanced";
+    if (value === "compat-readonly-all") return "read-only";
+    if (value === "advanced" || value === "read-only") return value;
+    return "core";
+  }
+
   const dirty = $derived(
-    draftProfile !== toolProfile || draftMode !== permissionMode || draftCommands !== allowedCommands || draftLocalEntries !== workspaceLocalEntries || draftExtensions !== workspaceScriptExtensions,
+    draftProfile !== canonicalProfile(toolProfile) || draftMode !== permissionMode || draftCommands !== allowedCommands || draftLocalEntries !== workspaceLocalEntries || draftExtensions !== workspaceScriptExtensions,
   );
 
   $effect(() => {
-    draftProfile = toolProfile;
+    draftProfile = canonicalProfile(toolProfile);
     draftMode = permissionMode;
     draftCommands = allowedCommands;
     draftLocalEntries = workspaceLocalEntries;

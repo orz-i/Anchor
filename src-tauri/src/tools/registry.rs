@@ -459,6 +459,38 @@ pub fn is_allowed_tool(name: &str) -> bool {
     ALLOWED_TOOLS.contains(&name)
 }
 
+pub fn output_schema(name: &str) -> Value {
+    if name == "view_image" {
+        return json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "path": { "type": "string" },
+                "mime_type": { "type": "string" },
+                "bytes": { "type": "integer", "minimum": 0 },
+                "width": { "type": "integer", "minimum": 1 },
+                "height": { "type": "integer", "minimum": 1 },
+                "resized": { "type": "boolean" },
+                "original": { "type": "object" },
+                "data_url": { "type": "string" },
+                "warnings": { "type": "array", "items": { "type": "string" } },
+                "error": { "type": "object" }
+            },
+            "required": ["ok"],
+            "additionalProperties": true
+        });
+    }
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": { "type": "boolean" },
+            "error": { "type": "object" }
+        },
+        "required": ["ok"],
+        "additionalProperties": true
+    })
+}
+
 pub fn canonical_tool_name(name: &str) -> &str {
     match name {
         "grep" => "grep_text",
@@ -468,7 +500,8 @@ pub fn canonical_tool_name(name: &str) -> &str {
 
 pub fn normalize_tool_profile(profile: &str) -> &'static str {
     match profile {
-        "advanced" => "advanced",
+        "advanced" | "full" => "advanced",
+        "core" => "core",
         "read-only" => "read-only",
         // Legacy compatibility profile used to expose mutating tools with false
         // read-only annotations. Preserve the stored value as a safe alias.
@@ -486,7 +519,7 @@ pub fn exposed_tool_names(tool_profile: &str) -> Vec<&'static str> {
 }
 
 pub fn list_tools() -> Vec<Value> {
-    list_tools_for_profile("full")
+    list_tools_for_profile("advanced")
 }
 
 pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
@@ -500,6 +533,7 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                     "title": title,
                     "description": description,
                     "inputSchema": input_schema(name),
+                    "outputSchema": output_schema(name),
                     "annotations": {
                         "title": title,
                         "readOnlyHint": read_only,
@@ -874,7 +908,9 @@ pub fn input_schema(name: &str) -> Value {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{input_schema, list_tools_for_profile};
+    use serde_json::json;
+
+    use super::{input_schema, list_tools_for_profile, normalize_tool_profile, output_schema};
 
     #[test]
     fn core_catalog_exposes_26_chatgpt_compatible_tools() {
@@ -904,6 +940,30 @@ mod tests {
             assert!(schema.get("oneOf").is_none(), "{name} oneOf");
             assert!(schema.get("anyOf").is_none(), "{name} anyOf");
             assert!(schema.get("$ref").is_none(), "{name} ref");
+            let output = output_schema(name);
+            assert_eq!(output["type"], "object", "{name} output type");
+            assert!(output["properties"].is_object(), "{name} output properties");
+            assert_eq!(output["required"], json!(["ok"]));
+        }
+    }
+
+    #[test]
+    fn profile_aliases_map_to_canonical_profiles() {
+        assert_eq!(normalize_tool_profile("core"), "core");
+        assert_eq!(normalize_tool_profile("advanced"), "advanced");
+        assert_eq!(normalize_tool_profile("full"), "advanced");
+        assert_eq!(normalize_tool_profile("read-only"), "read-only");
+        assert_eq!(normalize_tool_profile("compat-readonly-all"), "read-only");
+    }
+
+    #[test]
+    fn every_advanced_tool_has_a_valid_output_schema() {
+        for tool in list_tools_for_profile("advanced") {
+            let name = tool["name"].as_str().expect("tool name");
+            let schema = tool.get("outputSchema").expect("output schema");
+            assert_eq!(schema["type"], "object", "{name} output root");
+            jsonschema::meta::validate(schema)
+                .unwrap_or_else(|error| panic!("{name} output schema: {error}"));
         }
     }
 

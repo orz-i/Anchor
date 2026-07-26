@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::tools::dispatch::call_tool_prevalidated_with_cancellation;
+use crate::tools::dispatch::call_tool_prevalidated_with_session_cancellation;
 use crate::tools::workspace::tool_err;
 use crate::tools::{
     list_tools_for_profile, wrap_mcp_tool_result, CancellationToken, SharedToolContext,
@@ -42,11 +42,29 @@ pub async fn handle_request_with_protocol(
     .await
 }
 
+#[cfg(test)]
 pub async fn handle_request_with_protocol_and_cancellation(
     state: &SharedState,
     body: &Value,
     protocol_version: &str,
     cancellation: &CancellationToken,
+) -> Value {
+    handle_request_with_protocol_session_and_cancellation(
+        state,
+        body,
+        protocol_version,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+pub async fn handle_request_with_protocol_session_and_cancellation(
+    state: &SharedState,
+    body: &Value,
+    protocol_version: &str,
+    cancellation: &CancellationToken,
+    session_id: Option<&str>,
 ) -> Value {
     let method = body.get("method").and_then(Value::as_str).unwrap_or("");
     let id = body.get("id").cloned().unwrap_or(Value::Null);
@@ -89,7 +107,7 @@ pub async fn handle_request_with_protocol_and_cancellation(
             tools.extend(state.mcp_proxies.list_tools());
             Ok(serde_json::json!({ "tools": tools }))
         }
-        "tools/call" => handle_tools_call(state, &params, cancellation).await,
+        "tools/call" => handle_tools_call(state, &params, cancellation, session_id).await,
         "resources/list" => crate::skills::resources_list(&state.skills, &params),
         "resources/read" => crate::skills::resource_read(&state.skills, &params),
         _ => Err(serde_json::json!({
@@ -135,6 +153,7 @@ async fn handle_tools_call(
     state: &SharedState,
     params: &Value,
     cancellation: &CancellationToken,
+    session_id: Option<&str>,
 ) -> Result<Value, Value> {
     let name = params
         .get("name")
@@ -198,12 +217,14 @@ async fn handle_tools_call(
     let call_name = canonical_name.clone();
     let call_args = args.clone();
     let cancellation = cancellation.clone();
+    let session_id = session_id.map(str::to_string);
     let structured = tokio::task::spawn_blocking(move || {
-        call_tool_prevalidated_with_cancellation(
+        call_tool_prevalidated_with_session_cancellation(
             state.as_ref(),
             &call_name,
             &call_args,
             &cancellation,
+            session_id.as_deref(),
         )
     })
     .await

@@ -172,10 +172,10 @@ async fn serve(
             ..crate::workspace::AuthConfig::default()
         },
         policy.clone(),
-        "full".into(),
+        "core".into(),
         policy.permission_mode.clone(),
     ));
-    let tools: Vec<Value> = tools::list_tools()
+    let tools: Vec<Value> = tools::list_tools_for_profile("core")
         .into_iter()
         .filter(|tool| {
             tool.get("name")

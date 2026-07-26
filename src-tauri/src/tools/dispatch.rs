@@ -132,7 +132,7 @@ fn skill_script_permission_error(
 /// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
-    call_tool_impl(ctx, name, args, &CancellationToken::default(), true)
+    call_tool_impl(ctx, name, args, &CancellationToken::default(), true, None)
 }
 
 pub fn call_tool_with_cancellation(
@@ -141,16 +141,17 @@ pub fn call_tool_with_cancellation(
     args: &Value,
     cancellation: &CancellationToken,
 ) -> Value {
-    call_tool_impl(ctx, name, args, cancellation, true)
+    call_tool_impl(ctx, name, args, cancellation, true, None)
 }
 
-pub(crate) fn call_tool_prevalidated_with_cancellation(
+pub(crate) fn call_tool_prevalidated_with_session_cancellation(
     ctx: &ToolContext,
     name: &str,
     args: &Value,
     cancellation: &CancellationToken,
+    session_id: Option<&str>,
 ) -> Value {
-    call_tool_impl(ctx, name, args, cancellation, false)
+    call_tool_impl(ctx, name, args, cancellation, false, session_id)
 }
 
 fn call_tool_impl(
@@ -159,6 +160,7 @@ fn call_tool_impl(
     args: &Value,
     cancellation: &CancellationToken,
     validate_schema: bool,
+    session_id: Option<&str>,
 ) -> Value {
     if cancellation.is_cancelled() {
         return cancelled_tool_result();
@@ -168,7 +170,7 @@ fn call_tool_impl(
             return tool_err(error);
         }
     }
-    let effective_args = apply_default_cwd(ctx, name, args);
+    let effective_args = apply_default_cwd(ctx, session_id, name, args);
     if let Some(error) = skill_script_permission_error(ctx, name, &effective_args) {
         return tool_err(error);
     }
@@ -233,14 +235,14 @@ fn call_tool_impl(
         "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
         "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
         "history_session_validate" => history::validate(ctx, &effective_args),
-        "server_info" => server_info(ctx),
+        "server_info" => server_info_for_session(ctx, session_id),
         "list_skills" => crate::skills::list_tool(ctx, &effective_args),
         "load_skill" => crate::skills::load_tool(ctx, &effective_args),
         "read_skill_resource" => crate::skills::read_resource_tool(&ctx.skills, &effective_args),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),
-        "get_default_cwd" => get_default_cwd(ctx),
-        "set_default_cwd" => set_default_cwd(ctx, &effective_args),
+        "get_default_cwd" => get_default_cwd_for_session(ctx, session_id),
+        "set_default_cwd" => set_default_cwd_for_session(ctx, session_id, &effective_args),
         "read_file" => file::read_file(ws, &effective_args),
         "list_dir" => file::list_dir(ws, &effective_args),
         "list_files" => file::list_files(ws, &effective_args),
@@ -352,11 +354,16 @@ fn cancelled_tool_result() -> Value {
     })
 }
 
-fn apply_default_cwd(ctx: &ToolContext, name: &str, args: &Value) -> Value {
-    let base = if ctx.default_cwd_path() == ctx.workspace.root() {
+fn apply_default_cwd(
+    ctx: &ToolContext,
+    session_id: Option<&str>,
+    name: &str,
+    args: &Value,
+) -> Value {
+    let base = if ctx.default_cwd_path_for(session_id) == ctx.workspace.root() {
         ".".to_string()
     } else {
-        ctx.default_cwd_display()
+        ctx.default_cwd_display_for(session_id)
     };
     if base == "." {
         return args.clone();
@@ -506,6 +513,13 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
 }
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    server_info_for_session(ctx, None)
+}
+
+fn server_info_for_session(
+    ctx: &ToolContext,
+    session_id: Option<&str>,
+) -> Result<Value, WorkspaceError> {
     let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
     Ok(tool_ok(json!({
         "server": "coding-tools-mcp",
@@ -514,7 +528,7 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "protocol_version": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
-        "default_cwd": ctx.default_cwd_display(),
+        "default_cwd": ctx.default_cwd_display_for(session_id),
         "network_allowed": ctx.policy.network_allowed(),
         "tool_profile": ctx.tool_profile,
         "auth_enabled": ctx.auth.auth_enabled(),
@@ -565,14 +579,29 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
 }
 
 pub fn get_default_cwd(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    get_default_cwd_for_session(ctx, None)
+}
+
+fn get_default_cwd_for_session(
+    ctx: &ToolContext,
+    session_id: Option<&str>,
+) -> Result<Value, WorkspaceError> {
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
-        "default_cwd": ctx.default_cwd_display(),
-        "resolved_cwd": ctx.default_cwd_path().display().to_string()
+        "default_cwd": ctx.default_cwd_display_for(session_id),
+        "resolved_cwd": ctx.default_cwd_path_for(session_id).display().to_string()
     })))
 }
 
 pub fn set_default_cwd(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    set_default_cwd_for_session(ctx, None, args)
+}
+
+fn set_default_cwd_for_session(
+    ctx: &ToolContext,
+    session_id: Option<&str>,
+    args: &Value,
+) -> Result<Value, WorkspaceError> {
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = ctx.workspace.resolve_existing(path)?;
     if !resolved.path.is_dir() {
@@ -580,7 +609,7 @@ pub fn set_default_cwd(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
             "Default cwd must be a directory",
         ));
     }
-    ctx.set_default_cwd(resolved.path.clone());
+    ctx.set_default_cwd_for(session_id, resolved.path.clone());
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
         "default_cwd": resolved.display,

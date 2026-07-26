@@ -22,6 +22,25 @@ fn migrate_gateway_url_state(data: &mut AppData) -> bool {
     data.mcp_gateway.migrate_legacy_url_state()
 }
 
+fn migrate_tool_profiles(data: &mut AppData) -> bool {
+    let mut changed = false;
+    for profile in &mut data.profiles {
+        let canonical =
+            crate::tools::registry::normalize_tool_profile(&profile.runtime.tool_profile);
+        if profile.runtime.tool_profile != canonical {
+            profile.runtime.tool_profile = canonical.to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn normalize_workspace_profile(mut profile: WorkspaceProfile) -> WorkspaceProfile {
+    profile.runtime.tool_profile =
+        crate::tools::registry::normalize_tool_profile(&profile.runtime.tool_profile).to_string();
+    profile
+}
+
 fn populate_workspace_secrets(data: &mut AppData, profile_id: &str) {
     let secrets = data
         .workspace_secrets
@@ -71,9 +90,10 @@ impl DataStore {
         let existed_before = path.exists();
         let mut data = load_or_migrate()?;
         let gateway_migrated = migrate_gateway_url_state(&mut data);
+        let tool_profiles_migrated = migrate_tool_profiles(&mut data);
         let imported = import_legacy_profiles_if_empty(&mut data)?;
         let store = Self { data };
-        if !existed_before || imported > 0 || gateway_migrated {
+        if !existed_before || imported > 0 || gateway_migrated || tool_profiles_migrated {
             store.persist_unlocked()?;
         }
         if !existed_before {
@@ -85,7 +105,7 @@ impl DataStore {
     pub fn read_file<R>(f: impl FnOnce(&AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
         let mut data = load_or_migrate()?;
-        if migrate_gateway_url_state(&mut data) {
+        if migrate_gateway_url_state(&mut data) | migrate_tool_profiles(&mut data) {
             save(&data)?;
         }
         f(&data)
@@ -95,6 +115,7 @@ impl DataStore {
         let _guard = lock_data_file()?;
         let mut data = load_or_migrate()?;
         migrate_gateway_url_state(&mut data);
+        migrate_tool_profiles(&mut data);
         let result = f(&mut data)?;
         save(&data)?;
         Ok(result)
@@ -131,6 +152,7 @@ impl DataStore {
     }
 
     pub fn register_workspace(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
+        let profile = normalize_workspace_profile(profile);
         if self.data.profiles.iter().any(|item| item.id == profile.id) {
             return Err(AppError::Message(format!(
                 "workspace already exists: {}",
@@ -143,6 +165,7 @@ impl DataStore {
     }
 
     pub fn update(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
+        let profile = normalize_workspace_profile(profile);
         let Some(index) = self
             .data
             .profiles
@@ -346,5 +369,39 @@ mod tests {
         assert!(secrets.contains_key("oauth_password"));
         assert!(secrets.contains_key("actions_api_key"));
         assert!(!secrets.contains_key("oauth_client_secret"));
+    }
+
+    #[test]
+    fn legacy_tool_profiles_are_migrated_to_canonical_values() {
+        let mut data = AppData::default();
+        data.profiles.push(WorkspaceProfile {
+            id: "full-profile".into(),
+            name: "full".into(),
+            path: ".".into(),
+            tunnel: Default::default(),
+            auth: Default::default(),
+            runtime: crate::workspace::RuntimeConfig {
+                tool_profile: "full".into(),
+                ..Default::default()
+            },
+            actions: Default::default(),
+        });
+        data.profiles.push(WorkspaceProfile {
+            id: "compat-profile".into(),
+            name: "compat".into(),
+            path: ".".into(),
+            tunnel: Default::default(),
+            auth: Default::default(),
+            runtime: crate::workspace::RuntimeConfig {
+                tool_profile: "compat-readonly-all".into(),
+                ..Default::default()
+            },
+            actions: Default::default(),
+        });
+
+        assert!(migrate_tool_profiles(&mut data));
+        assert_eq!(data.profiles[0].runtime.tool_profile, "advanced");
+        assert_eq!(data.profiles[1].runtime.tool_profile, "read-only");
+        assert!(!migrate_tool_profiles(&mut data));
     }
 }

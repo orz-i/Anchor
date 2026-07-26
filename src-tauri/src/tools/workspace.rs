@@ -548,9 +548,9 @@ pub fn wrap_tool_result(structured: Value) -> Value {
     wrap_mcp_tool_result("", &serde_json::json!({}), structured)
 }
 
-pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) -> Value {
+pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, mut structured: Value) -> Value {
     let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
-    let content = if tool_name == "view_image"
+    let image_payload = if tool_name == "view_image"
         && args
             .get("output")
             .and_then(Value::as_str)
@@ -558,20 +558,55 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
             == "mcp_image"
         && !is_error
     {
-        vec![json!({
-            "type": "image",
-            "data": structured.get("base64").and_then(Value::as_str).unwrap_or(""),
-            "mimeType": structured
-                .get("mime_type")
-                .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream")
-        })]
+        let data = structured
+            .as_object_mut()
+            .and_then(|object| object.remove("base64"))
+            .and_then(|value| value.as_str().map(str::to_string));
+        data.map(|data| {
+            json!({
+                "type": "image",
+                "data": data,
+                "mimeType": structured
+                    .get("mime_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+            })
+        })
     } else {
-        vec![json!({
-            "type": "text",
-            "text": structured.to_string()
-        })]
+        None
     };
+
+    if let Err(error) = jsonschema::validator_for(&crate::tools::registry::output_schema(tool_name))
+        .and_then(|validator| validator.validate(&structured))
+    {
+        structured = tool_err(WorkspaceError::ToolDetails {
+            code: "TOOL_OUTPUT_SCHEMA_VIOLATION",
+            message: format!("Tool output violates outputSchema: {error}"),
+            category: "internal",
+            retryable: false,
+            details: json!({"tool": tool_name}),
+        });
+    }
+
+    let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
+    let text_value = if tool_name == "view_image" && !is_error {
+        let mut metadata = structured.clone();
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove("data_url");
+            object.remove("base64");
+        }
+        metadata
+    } else {
+        structured.clone()
+    };
+    let mut content = Vec::new();
+    if let Some(image) = image_payload {
+        content.push(image);
+    }
+    content.push(json!({
+        "type": "text",
+        "text": text_value.to_string()
+    }));
     json!({
         "content": content,
         "structuredContent": structured,
@@ -581,7 +616,9 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
 
 #[cfg(test)]
 mod tests {
-    use super::Workspace;
+    use serde_json::json;
+
+    use super::{wrap_mcp_tool_result, Workspace};
 
     #[test]
     fn strict_read_boundary_rejects_explicit_external_paths() {
@@ -604,5 +641,76 @@ mod tests {
         assert!(workspace
             .resolve_read_path(&external.path().display().to_string())
             .is_ok());
+    }
+
+    #[test]
+    fn image_result_contains_binary_payload_only_once() {
+        let result = wrap_mcp_tool_result(
+            "view_image",
+            &json!({"output": "mcp_image"}),
+            json!({
+                "ok": true,
+                "path": "image.png",
+                "mime_type": "image/png",
+                "bytes": 1,
+                "width": 1,
+                "height": 1,
+                "resized": false,
+                "original": {},
+                "warnings": [],
+                "base64": "AA=="
+            }),
+        );
+        assert_eq!(result["content"][0]["type"], "image");
+        assert_eq!(result["content"][0]["data"], "AA==");
+        assert_eq!(result["content"][1]["type"], "text");
+        assert!(result["structuredContent"].get("base64").is_none());
+        assert!(!result["content"][1]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("AA=="));
+    }
+
+    #[test]
+    fn data_url_result_does_not_duplicate_payload_in_text_fallback() {
+        let result = wrap_mcp_tool_result(
+            "view_image",
+            &json!({"output": "data_url"}),
+            json!({
+                "ok": true,
+                "path": "image.png",
+                "mime_type": "image/png",
+                "bytes": 1,
+                "width": 1,
+                "height": 1,
+                "resized": false,
+                "original": {},
+                "warnings": [],
+                "data_url": "data:image/png;base64,AA=="
+            }),
+        );
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        assert!(result["structuredContent"]["data_url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("AA=="));
+        assert!(!result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("AA=="));
+    }
+
+    #[test]
+    fn invalid_local_structured_output_becomes_a_tool_error() {
+        let result = wrap_mcp_tool_result(
+            "read_file",
+            &json!({"path": "README.md"}),
+            json!({"content": "missing ok"}),
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "TOOL_OUTPUT_SCHEMA_VIOLATION"
+        );
     }
 }

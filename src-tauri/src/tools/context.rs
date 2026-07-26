@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +18,7 @@ pub struct ToolContext {
     pub mcp_proxies: crate::mcp::proxy::McpProxyRegistry,
     pub skills: crate::skills::SkillCatalog,
     default_cwd: Mutex<PathBuf>,
+    session_default_cwds: Mutex<HashMap<String, PathBuf>>,
     pub sessions: SessionStore,
 }
 
@@ -33,7 +35,7 @@ impl ToolContext {
             workspace,
             auth,
             PolicySettings::default(),
-            "full".into(),
+            "core".into(),
             "trusted".into(),
         ))
     }
@@ -75,6 +77,7 @@ impl ToolContext {
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
             default_cwd: Mutex::new(root),
+            session_default_cwds: Mutex::new(HashMap::new()),
             sessions: SessionStore::new(),
         }
     }
@@ -88,7 +91,7 @@ impl ToolContext {
                 ..AuthConfig::default()
             },
             PolicySettings::default(),
-            "full".into(),
+            "core".into(),
             "trusted".into(),
             harness_root,
         ))
@@ -99,15 +102,57 @@ impl ToolContext {
     }
 
     pub fn default_cwd_display(&self) -> String {
-        let cwd = self.default_cwd.lock().expect("cwd lock");
-        relative_display(self.workspace.root(), &cwd)
+        self.default_cwd_display_for(None)
     }
 
     pub fn set_default_cwd(&self, path: PathBuf) {
-        *self.default_cwd.lock().expect("cwd lock") = path;
+        self.set_default_cwd_for(None, path);
     }
 
     pub fn default_cwd_path(&self) -> PathBuf {
+        self.default_cwd_path_for(None)
+    }
+
+    pub fn default_cwd_display_for(&self, session_id: Option<&str>) -> String {
+        let display = relative_display(
+            self.workspace.root(),
+            &self.default_cwd_path_for(session_id),
+        );
+        if display.is_empty() {
+            ".".to_string()
+        } else {
+            display
+        }
+    }
+
+    pub fn default_cwd_path_for(&self, session_id: Option<&str>) -> PathBuf {
+        if let Some(session_id) = session_id {
+            return self
+                .session_default_cwds
+                .lock()
+                .expect("session cwd lock")
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| self.workspace.root().to_path_buf());
+        }
         self.default_cwd.lock().expect("cwd lock").clone()
+    }
+
+    pub fn set_default_cwd_for(&self, session_id: Option<&str>, path: PathBuf) {
+        if let Some(session_id) = session_id {
+            self.session_default_cwds
+                .lock()
+                .expect("session cwd lock")
+                .insert(session_id.to_string(), path);
+        } else {
+            *self.default_cwd.lock().expect("cwd lock") = path;
+        }
+    }
+
+    pub fn clear_session_state(&self, session_id: &str) {
+        self.session_default_cwds
+            .lock()
+            .expect("session cwd lock")
+            .remove(session_id);
     }
 }

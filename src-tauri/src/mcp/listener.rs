@@ -13,7 +13,9 @@ use crate::mcp::protocol::{
     validate_client_message, ClientMessage, InFlightRequests, RateLimiter, SessionStore,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
-use crate::mcp::server::{handle_request_with_protocol_and_cancellation, new_state, SharedState};
+use crate::mcp::server::{
+    handle_request_with_protocol_session_and_cancellation, new_state, SharedState,
+};
 use crate::runtime::{read_public_url, register_public_url, SharedPublicUrl};
 use crate::secret::SecretStore;
 use crate::tools::policy::PolicySettings;
@@ -408,6 +410,7 @@ async fn mcp_post(
             &method,
             negotiated,
             &cancellation,
+            &session_id,
         )
         .await;
         return with_session_headers(response, &session_id, negotiated);
@@ -493,6 +496,7 @@ async fn mcp_post(
         &method,
         &session_version,
         &cancellation,
+        session_id,
     )
     .await;
     state.in_flight.remove(session_id, &request_id);
@@ -517,6 +521,7 @@ async fn mcp_delete(State(state): State<ListenerState>, headers: HeaderMap) -> R
     };
     if state.sessions.remove(session_id) {
         state.in_flight.cancel_session(session_id);
+        state.mcp.clear_session_state(session_id);
         StatusCode::NO_CONTENT.into_response()
     } else {
         http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session")
@@ -530,6 +535,7 @@ async fn execute_mcp_request(
     method: &str,
     protocol_version: &str,
     cancellation: &crate::tools::CancellationToken,
+    session_id: &str,
 ) -> Response {
     let tool_name = body
         .get("params")
@@ -549,48 +555,34 @@ async fn execute_mcp_request(
     let started = Instant::now();
     let execution = tokio::time::timeout(
         MCP_REQUEST_TIMEOUT,
-        handle_request_with_protocol_and_cancellation(
+        handle_request_with_protocol_session_and_cancellation(
             &state.mcp,
             body,
             protocol_version,
             cancellation,
+            Some(session_id),
         ),
     );
-    tokio::pin!(execution);
-    let (response, outcome) = tokio::select! {
-        _ = cancellation.cancelled() => (
-            json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32800,
-                    "message": "Request cancelled",
-                    "data": { "reason": "request_cancelled", "retryable": true }
-                }
-            }),
-            "cancelled",
-        ),
-        result = &mut execution => match result {
-            Ok(response) => (response, "ok"),
-            Err(_) => {
-                cancellation.cancel();
-                (
-            json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32001,
-                    "message": "MCP request timed out",
-                    "data": {
-                        "reason": "request_timeout",
-                        "timeout_seconds": MCP_REQUEST_TIMEOUT.as_secs(),
-                        "retryable": true
+    let (response, outcome) = match execution.await {
+        Ok(response) => (response, "ok"),
+        Err(_) => {
+            cancellation.cancel();
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32001,
+                        "message": "MCP request timed out",
+                        "data": {
+                            "reason": "request_timeout",
+                            "timeout_seconds": MCP_REQUEST_TIMEOUT.as_secs(),
+                            "retryable": true
+                        }
                     }
-                }
-            }),
-            "timeout",
-                )
-            }
+                }),
+                "timeout",
+            )
         }
     };
     let duration_ms = started.elapsed().as_millis();
@@ -1028,6 +1020,35 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json response")
     }
 
+    async fn initialized_session(state: &ListenerState) -> (String, HeaderMap) {
+        let response = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response.headers()["mcp-session-id"]
+            .to_str()
+            .expect("session header")
+            .to_string();
+        let mut headers = request_headers();
+        headers.insert("mcp-session-id", session_id.parse().unwrap());
+        headers.insert("mcp-protocol-version", "2025-11-25".parse().unwrap());
+        let notification = mcp_post(
+            State(state.clone()),
+            headers.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }))),
+        )
+        .await;
+        assert_eq!(notification.status(), StatusCode::ACCEPTED);
+        (session_id, headers)
+    }
+
     #[tokio::test]
     async fn streamable_http_enforces_session_lifecycle() {
         let (_workspace, state) = test_listener_state();
@@ -1096,6 +1117,91 @@ mod tests {
         assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
         let deleted_again = mcp_delete(State(state), session_headers).await;
         assert_eq!(deleted_again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn default_cwd_is_isolated_between_mcp_sessions() {
+        let (workspace, state) = test_listener_state();
+        std::fs::create_dir_all(workspace.path().join("session-a")).expect("session directory");
+        std::fs::write(workspace.path().join("session-a/inside.txt"), "session-a")
+            .expect("session file");
+        let (session_a, headers_a) = initialized_session(&state).await;
+        let (_session_b, headers_b) = initialized_session(&state).await;
+
+        let set_a = mcp_post(
+            State(state.clone()),
+            headers_a.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "set_default_cwd",
+                    "arguments": {"path": "session-a"}
+                }
+            }))),
+        )
+        .await;
+        assert_eq!(
+            response_json(set_a).await["result"]["structuredContent"]["default_cwd"],
+            "session-a"
+        );
+
+        let get_a = mcp_post(
+            State(state.clone()),
+            headers_a.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "get_default_cwd", "arguments": {}}
+            }))),
+        )
+        .await;
+        assert_eq!(
+            response_json(get_a).await["result"]["structuredContent"]["default_cwd"],
+            "session-a"
+        );
+
+        let get_b = mcp_post(
+            State(state.clone()),
+            headers_b,
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "get_default_cwd", "arguments": {}}
+            }))),
+        )
+        .await;
+        assert_eq!(
+            response_json(get_b).await["result"]["structuredContent"]["default_cwd"],
+            "."
+        );
+        assert_eq!(state.mcp.default_cwd_display(), ".");
+
+        let read_a = mcp_post(
+            State(state.clone()),
+            headers_a.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_file",
+                    "arguments": {"path": "inside.txt"}
+                }
+            }))),
+        )
+        .await;
+        assert_eq!(
+            response_json(read_a).await["result"]["structuredContent"]["content"],
+            "session-a"
+        );
+
+        let deleted = mcp_delete(State(state.clone()), headers_a).await;
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(state.mcp.default_cwd_display_for(Some(&session_a)), ".");
     }
 
     #[tokio::test]
