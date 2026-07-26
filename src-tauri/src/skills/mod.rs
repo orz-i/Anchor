@@ -21,7 +21,7 @@ pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         .and_then(Value::as_u64)
         .unwrap_or(100) as usize;
     let mut listed = ctx.skills.list(query, max_results);
-    let available = available_tools(ctx);
+    let available = available_tools(ctx)?;
     for skill in &mut listed.skills {
         skill.resolve_tools(&available);
         if !skill.tool_compatible {
@@ -44,7 +44,7 @@ pub fn load_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         .skills
         .load(name, max_bytes)
         .map_err(skill_not_found_or_invalid)?;
-    loaded.summary.resolve_tools(&available_tools(ctx));
+    loaded.summary.resolve_tools(&available_tools(ctx)?);
     if !loaded.summary.tool_compatible {
         loaded.summary.warnings.push(format!(
             "当前 MCP 工具目录不能完整满足该 Skill：missing={:?}, ambiguous={:?}",
@@ -211,20 +211,12 @@ pub fn is_skill_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }
 
-fn available_tools(ctx: &ToolContext) -> Vec<String> {
-    let mut tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile)
+fn available_tools(ctx: &ToolContext) -> Result<Vec<String>, WorkspaceError> {
+    Ok(crate::tools::catalog::build_effective_catalog(ctx)?
+        .tools
         .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    tools.extend(
-        ctx.mcp_proxies
-            .list_tools()
-            .into_iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string)),
-    );
-    tools.sort();
-    tools.dedup();
-    tools
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect())
 }
 
 fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, WorkspaceError> {

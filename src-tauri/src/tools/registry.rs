@@ -459,11 +459,498 @@ pub fn is_allowed_tool(name: &str) -> bool {
     ALLOWED_TOOLS.contains(&name)
 }
 
+fn error_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "code": { "type": "string", "minLength": 1 },
+            "message": { "type": "string", "minLength": 1 },
+            "category": { "type": "string", "minLength": 1 },
+            "retryable": { "type": "boolean" },
+            "details": { "type": "object" }
+        },
+        "required": ["code", "message", "category", "retryable"],
+        "additionalProperties": true
+    })
+}
+
+fn success_output_schema(properties: Value, success_required: &[&str]) -> Value {
+    let mut properties = properties.as_object().cloned().unwrap_or_default();
+    properties.insert("ok".into(), json!({ "type": "boolean" }));
+    properties.insert("error".into(), error_output_schema());
+    let mut required = vec!["ok"];
+    required.extend_from_slice(success_required);
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["ok"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": { "ok": { "const": true } },
+                    "required": ["ok"]
+                },
+                "then": { "required": required }
+            },
+            {
+                "if": {
+                    "properties": { "ok": { "const": false } },
+                    "required": ["ok"]
+                },
+                "then": { "required": ["error"] }
+            }
+        ],
+        "additionalProperties": true
+    })
+}
+
+fn append_output_condition(mut schema: Value, condition: Value) -> Value {
+    schema["allOf"]
+        .as_array_mut()
+        .expect("output schema allOf")
+        .push(condition);
+    schema
+}
+
+fn warnings_property() -> Value {
+    json!({ "type": "array", "items": { "type": "string" } })
+}
+
+fn nullable_integer_property() -> Value {
+    json!({ "type": ["integer", "null"] })
+}
+
+fn session_snapshot_output_schema() -> Value {
+    success_output_schema(
+        json!({
+            "session_id": { "type": "string", "minLength": 1 },
+            "interactive": { "type": "boolean" },
+            "stdin_open": { "type": "boolean" },
+            "status": { "type": "string", "minLength": 1 },
+            "termination_reason": { "type": "string", "minLength": 1 },
+            "recoverable": { "type": "boolean" },
+            "suggestion": { "type": "string" },
+            "exit_code": nullable_integer_property(),
+            "transport_ok": { "type": "boolean" },
+            "command_ok": { "type": ["boolean", "null"] },
+            "stdout": { "type": "string" },
+            "stderr": { "type": "string" },
+            "stdout_truncated": { "type": "boolean" },
+            "stderr_truncated": { "type": "boolean" },
+            "elapsed_ms": { "type": "integer", "minimum": 0 },
+            "output_refs": {
+                "type": "object",
+                "properties": {
+                    "stdout": { "type": "string", "minLength": 1 },
+                    "stderr": { "type": "string", "minLength": 1 }
+                },
+                "required": ["stdout", "stderr"],
+                "additionalProperties": false
+            },
+            "warnings": warnings_property()
+        }),
+        &[
+            "session_id",
+            "interactive",
+            "stdin_open",
+            "status",
+            "termination_reason",
+            "recoverable",
+            "suggestion",
+            "exit_code",
+            "transport_ok",
+            "command_ok",
+            "stdout",
+            "stderr",
+            "stdout_truncated",
+            "stderr_truncated",
+            "elapsed_ms",
+            "output_refs",
+        ],
+    )
+}
+
 pub fn output_schema(name: &str) -> Value {
-    if name == "view_image" {
-        return json!({
-            "type": "object",
-            "properties": {
+    match canonical_tool_name(name) {
+        "server_info" => success_output_schema(
+            json!({
+                "server": { "type": "string", "const": "coding-tools-mcp" },
+                "title": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1 },
+                "protocol_version": { "type": "string", "minLength": 1 },
+                "workspace": { "type": "string", "minLength": 1 },
+                "permission_mode": { "type": "string", "minLength": 1 },
+                "default_cwd": { "type": "string", "minLength": 1 },
+                "network_allowed": { "type": "boolean" },
+                "tool_profile": { "type": "string", "enum": ["core", "read-only", "advanced"] },
+                "auth_enabled": { "type": "boolean" },
+                "auth_type": { "type": "string", "minLength": 1 },
+                "endpoint_path": { "type": "string", "const": "/mcp" },
+                "tools": { "type": "array", "items": { "type": "string" } },
+                "tool_count": { "type": "integer", "minimum": 0 },
+                "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 }
+            }),
+            &[
+                "server",
+                "title",
+                "version",
+                "protocol_version",
+                "workspace",
+                "permission_mode",
+                "default_cwd",
+                "network_allowed",
+                "tool_profile",
+                "auth_enabled",
+                "auth_type",
+                "endpoint_path",
+                "tools",
+                "tool_count",
+                "catalog_digest",
+            ],
+        ),
+        "read_file" => success_output_schema(
+            json!({
+                "path": { "type": "string" },
+                "content": { "type": "string" },
+                "encoding": { "type": "string", "const": "utf-8" },
+                "start_line": { "type": "integer", "minimum": 1 },
+                "end_line": { "type": "integer", "minimum": 0 },
+                "total_lines": { "type": "integer", "minimum": 0 },
+                "total_bytes": { "type": "integer", "minimum": 0 },
+                "bytes_read": { "type": "integer", "minimum": 0 },
+                "truncated": { "type": "boolean" },
+                "truncated_by": { "type": ["string", "null"] },
+                "warnings": warnings_property()
+            }),
+            &[
+                "path",
+                "content",
+                "encoding",
+                "start_line",
+                "end_line",
+                "total_lines",
+                "total_bytes",
+                "bytes_read",
+                "truncated",
+                "truncated_by",
+                "warnings",
+            ],
+        ),
+        "search_text" | "grep_text" => success_output_schema(
+            json!({
+                "query": { "type": "string" },
+                "matches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 1 },
+                            "column": { "type": "integer", "minimum": 1 },
+                            "preview": { "type": "string" },
+                            "before": { "type": "array", "items": { "type": "string" } },
+                            "after": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["path", "line", "column", "preview"],
+                        "additionalProperties": true
+                    }
+                },
+                "total_matches": { "type": "integer", "minimum": 0 },
+                "truncated": { "type": "boolean" },
+                "warnings": warnings_property()
+            }),
+            &["query", "matches", "total_matches", "truncated", "warnings"],
+        ),
+        "apply_patch" => append_output_condition(
+            append_output_condition(
+                success_output_schema(
+                    json!({
+                        "dry_run": { "type": "boolean" },
+                        "preflight": { "type": "boolean" },
+                        "clean": { "type": "boolean" },
+                        "change_id": { "type": "string", "minLength": 1 },
+                        "summary": { "type": "string" },
+                        "affected_files": { "type": "array", "items": { "type": "object" } },
+                        "files_created": { "type": "array", "items": { "type": "string" } },
+                        "files_modified": { "type": "array", "items": { "type": "string" } },
+                        "files_deleted": { "type": "array", "items": { "type": "string" } },
+                        "would_create": { "type": "array", "items": { "type": "string" } },
+                        "would_modify": { "type": "array", "items": { "type": "string" } },
+                        "would_delete": { "type": "array", "items": { "type": "string" } },
+                        "recovery": { "type": "string", "minLength": 1 },
+                        "warnings": warnings_property()
+                    }),
+                    &["dry_run", "clean", "summary", "affected_files", "warnings"],
+                ),
+                json!({
+                    "if": {
+                        "properties": {
+                            "ok": { "const": true },
+                            "dry_run": { "const": true }
+                        },
+                        "required": ["ok", "dry_run"]
+                    },
+                    "then": {
+                        "required": ["preflight", "would_create", "would_modify", "would_delete"]
+                    }
+                }),
+            ),
+            json!({
+                "if": {
+                    "properties": {
+                        "ok": { "const": true },
+                        "dry_run": { "const": false }
+                    },
+                    "required": ["ok", "dry_run"]
+                },
+                "then": {
+                    "required": [
+                        "change_id", "files_created", "files_modified", "files_deleted", "recovery"
+                    ]
+                }
+            }),
+        ),
+        "patch_check" => success_output_schema(
+            json!({
+                "dry_run": { "type": "boolean", "const": true },
+                "preflight": { "type": "boolean", "const": true },
+                "clean": { "type": "boolean" },
+                "summary": { "type": "string" },
+                "affected_files": { "type": "array", "items": { "type": "object" } },
+                "would_create": { "type": "array", "items": { "type": "string" } },
+                "would_modify": { "type": "array", "items": { "type": "string" } },
+                "would_delete": { "type": "array", "items": { "type": "string" } },
+                "warnings": warnings_property()
+            }),
+            &[
+                "dry_run",
+                "preflight",
+                "clean",
+                "summary",
+                "affected_files",
+                "would_create",
+                "would_modify",
+                "would_delete",
+                "warnings",
+            ],
+        ),
+        "exec_command" => success_output_schema(
+            json!({
+                "command": { "type": "string", "minLength": 1 },
+                "resolved_cwd": { "type": "string", "minLength": 1 },
+                "status": { "type": "string", "minLength": 1 },
+                "termination_reason": { "type": "string", "minLength": 1 },
+                "recoverable": { "type": "boolean" },
+                "suggestion": { "type": "string" },
+                "exit_code": nullable_integer_property(),
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" },
+                "stdout_truncated": { "type": "boolean" },
+                "stderr_truncated": { "type": "boolean" },
+                "duration_ms": { "type": "integer", "minimum": 0 },
+                "elapsed_ms": { "type": "integer", "minimum": 0 },
+                "execution_mode": { "type": "string", "minLength": 1 },
+                "filesystem_scope": { "type": "string", "const": "workspace" },
+                "sandbox_enforced": { "type": "boolean" },
+                "execution_boundary": { "type": "string", "minLength": 1 },
+                "child_process": { "type": "boolean" },
+                "transport_ok": { "type": "boolean" },
+                "command_ok": { "type": ["boolean", "null"] },
+                "warnings": warnings_property()
+            }),
+            &[
+                "command",
+                "resolved_cwd",
+                "status",
+                "termination_reason",
+                "recoverable",
+                "suggestion",
+                "exit_code",
+                "stdout",
+                "stderr",
+                "stdout_truncated",
+                "stderr_truncated",
+                "duration_ms",
+                "elapsed_ms",
+                "execution_mode",
+                "filesystem_scope",
+                "sandbox_enforced",
+                "execution_boundary",
+                "child_process",
+                "transport_ok",
+                "command_ok",
+                "warnings",
+            ],
+        ),
+        "write_stdin" => session_snapshot_output_schema(),
+        "kill_session" => {
+            let schema = session_snapshot_output_schema();
+            append_output_condition(
+                schema,
+                json!({
+                    "if": {
+                        "properties": { "ok": { "const": true } },
+                        "required": ["ok"]
+                    },
+                    "then": {
+                        "properties": {
+                            "killed": { "type": "boolean" },
+                            "evicted": { "type": "boolean" }
+                        },
+                        "required": ["killed", "evicted"]
+                    }
+                }),
+            )
+        }
+        "read_output" => success_output_schema(
+            json!({
+                "output_ref": { "type": "string", "minLength": 1 },
+                "stream_output_ref": { "type": "string", "minLength": 1 },
+                "stream": { "type": "string", "enum": ["stdout", "stderr"] },
+                "offset": { "type": "integer", "minimum": 0 },
+                "requested_offset": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1 },
+                "content": { "type": "string" },
+                "next_offset": nullable_integer_property(),
+                "total_retained_bytes": { "type": "integer", "minimum": 0 },
+                "total_stream_bytes": { "type": "integer", "minimum": 0 },
+                "truncated": { "type": "boolean" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "output_ref",
+                "stream_output_ref",
+                "stream",
+                "offset",
+                "requested_offset",
+                "limit",
+                "content",
+                "next_offset",
+                "total_retained_bytes",
+                "total_stream_bytes",
+                "truncated",
+                "warnings",
+            ],
+        ),
+        "git_status" => success_output_schema(
+            json!({
+                "is_repo": { "type": "boolean" },
+                "branch": { "type": "string" },
+                "head": { "type": "string" },
+                "upstream": { "type": "string" },
+                "ahead": { "type": "integer", "minimum": 0 },
+                "behind": { "type": "integer", "minimum": 0 },
+                "clean": { "type": "boolean" },
+                "entries": { "type": "array", "items": { "type": "object" } },
+                "truncated": { "type": "boolean" },
+                "warnings": warnings_property()
+            }),
+            &["is_repo", "clean", "entries", "warnings"],
+        ),
+        "history_session_bootstrap" => success_output_schema(
+            json!({
+                "is_new_session": { "type": "boolean" },
+                "session_key": { "type": "string", "minLength": 1 },
+                "session_key_source": { "type": "string", "minLength": 1 },
+                "host_session_key_mismatch": { "type": "boolean" },
+                "history_numbers": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+                "history_count": { "type": "integer", "minimum": 0 },
+                "current_number": { "type": "integer", "minimum": 1 },
+                "current_path": { "type": "string", "minLength": 1 },
+                "created": { "type": "boolean" },
+                "resumed": { "type": "boolean" },
+                "sequence_valid": { "type": "boolean" },
+                "all_history_summary": { "type": "string" },
+                "inherited_summary": { "type": ["string", "null"] },
+                "session_summaries": { "type": "array" },
+                "history_read_mode": { "type": "string", "minLength": 1 },
+                "total_history_bytes": { "type": "integer", "minimum": 0 },
+                "history_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "persistence_mode": { "type": "string", "minLength": 1 },
+                "checkpoint_policy": { "type": "object" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "is_new_session",
+                "session_key",
+                "session_key_source",
+                "host_session_key_mismatch",
+                "history_numbers",
+                "history_count",
+                "current_number",
+                "current_path",
+                "created",
+                "resumed",
+                "sequence_valid",
+                "all_history_summary",
+                "inherited_summary",
+                "session_summaries",
+                "history_read_mode",
+                "total_history_bytes",
+                "history_digest",
+                "persistence_mode",
+                "checkpoint_policy",
+                "warnings",
+            ],
+        ),
+        "history_session_checkpoint" => success_output_schema(
+            json!({
+                "session_number": { "type": "integer", "minimum": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "session_key": { "type": "string", "minLength": 1 },
+                "expected_path": { "type": "string", "minLength": 1 },
+                "host_session_key_mismatch": { "type": "boolean" },
+                "turn_id": { "type": "string", "minLength": 1 },
+                "created": { "type": "boolean" },
+                "updated": { "type": "boolean" },
+                "duplicate_ignored": { "type": "boolean" },
+                "content_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "warnings": warnings_property()
+            }),
+            &[
+                "session_number",
+                "path",
+                "session_key",
+                "expected_path",
+                "host_session_key_mismatch",
+                "turn_id",
+                "created",
+                "updated",
+                "duplicate_ignored",
+                "content_hash",
+                "warnings",
+            ],
+        ),
+        "history_session_validate" => success_output_schema(
+            json!({
+                "sequence_valid": { "type": "boolean" },
+                "numbers": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+                "missing_numbers": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+                "duplicate_session_keys": { "type": "array", "items": { "type": "string" } },
+                "invalid_files": { "type": "array", "items": { "type": "string" } },
+                "empty_files": { "type": "array", "items": { "type": "string" } },
+                "latest_number": nullable_integer_property(),
+                "latest_path": { "type": ["string", "null"] },
+                "index_status": { "type": "string", "minLength": 1 },
+                "repaired": { "type": "boolean" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "sequence_valid",
+                "numbers",
+                "missing_numbers",
+                "duplicate_session_keys",
+                "invalid_files",
+                "empty_files",
+                "latest_number",
+                "latest_path",
+                "index_status",
+                "repaired",
+                "warnings",
+            ],
+        ),
+        "view_image" => success_output_schema(
+            json!({
                 "ok": { "type": "boolean" },
                 "path": { "type": "string" },
                 "mime_type": { "type": "string" },
@@ -475,20 +962,20 @@ pub fn output_schema(name: &str) -> Value {
                 "data_url": { "type": "string" },
                 "warnings": { "type": "array", "items": { "type": "string" } },
                 "error": { "type": "object" }
-            },
-            "required": ["ok"],
-            "additionalProperties": true
-        });
+            }),
+            &[
+                "path",
+                "mime_type",
+                "bytes",
+                "width",
+                "height",
+                "resized",
+                "original",
+                "warnings",
+            ],
+        ),
+        _ => success_output_schema(json!({}), &[]),
     }
-    json!({
-        "type": "object",
-        "properties": {
-            "ok": { "type": "boolean" },
-            "error": { "type": "object" }
-        },
-        "required": ["ok"],
-        "additionalProperties": true
-    })
 }
 
 pub fn canonical_tool_name(name: &str) -> &str {

@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::tools::dispatch::call_tool_prevalidated_with_session_cancellation;
 use crate::tools::workspace::tool_err;
 use crate::tools::{
-    list_tools_for_profile, wrap_mcp_tool_result, CancellationToken, SharedToolContext,
+    build_effective_catalog, wrap_mcp_tool_result, CancellationToken, SharedToolContext,
     ToolContext, Workspace,
 };
 use crate::workspace::AuthConfig;
@@ -96,16 +96,14 @@ pub async fn handle_request_with_protocol_session_and_cancellation(
                     }
                 });
             }
-            let mut tools = list_tools_for_profile(&state.tool_profile);
-            if !state.skills.is_enabled() {
-                tools.retain(|tool| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .is_none_or(|name| !crate::skills::is_skill_tool(name))
-                });
+            match build_effective_catalog(state.as_ref()) {
+                Ok(catalog) => Ok(serde_json::json!({ "tools": catalog.tools })),
+                Err(error) => Err(serde_json::json!({
+                    "code": -32603,
+                    "message": "Failed to build effective MCP tool catalog",
+                    "data": error.to_error_value()
+                })),
             }
-            tools.extend(state.mcp_proxies.list_tools());
-            Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => handle_tools_call(state, &params, cancellation, session_id).await,
         "resources/list" => crate::skills::resources_list(&state.skills, &params),

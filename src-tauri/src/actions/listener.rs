@@ -175,7 +175,10 @@ async fn serve(
         "core".into(),
         policy.permission_mode.clone(),
     ));
-    let tools: Vec<Value> = tools::list_tools_for_profile("core")
+    let effective_catalog = tools::build_effective_catalog_from_parts("core", false, Vec::new())
+        .map_err(|error| std::io::Error::other(error.message()))?;
+    let tools: Vec<Value> = effective_catalog
+        .tools
         .into_iter()
         .filter(|tool| {
             tool.get("name")

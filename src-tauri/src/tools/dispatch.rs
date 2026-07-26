@@ -520,7 +520,12 @@ fn server_info_for_session(
     ctx: &ToolContext,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
-    let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
+    let catalog = crate::tools::catalog::build_effective_catalog(ctx)?;
+    let tools = catalog
+        .tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
     Ok(tool_ok(json!({
         "server": "coding-tools-mcp",
         "title": "Coding Tools MCP",
@@ -535,7 +540,11 @@ fn server_info_for_session(
         "auth_type": ctx.auth.auth_type,
         "endpoint_path": "/mcp",
         "tools": tools,
-        "tool_count": tools.len()
+        "tool_count": tools.len(),
+        "catalog_digest": catalog.digest,
+        "catalog_bytes": catalog.total_bytes,
+        "local_tool_count": catalog.local_count,
+        "proxy_tool_count": catalog.proxy_count
     })))
 }
 

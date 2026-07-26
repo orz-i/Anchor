@@ -1,0 +1,158 @@
+mod common;
+
+use coding_tools_mcp_desktop_lib::tools::registry::output_schema;
+use common::{assert_ok, ctx_for, invoke, tiny_js_fixture};
+use serde_json::{json, Value};
+
+#[cfg(windows)]
+const TEST_PYTHON: &str = "python";
+#[cfg(not(windows))]
+const TEST_PYTHON: &str = "python3";
+
+fn assert_matches_output_schema(tool: &str, value: &Value) {
+    let schema = output_schema(tool);
+    let validator = jsonschema::validator_for(&schema).expect("compile output schema");
+    validator
+        .validate(value)
+        .unwrap_or_else(|error| panic!("{tool} output schema violation: {error}\n{value}"));
+}
+
+#[test]
+fn high_value_local_tool_successes_match_published_output_schemas() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    let cases = [
+        ("server_info", json!({})),
+        ("read_file", json!({"path": "src/math.js"})),
+        (
+            "search_text",
+            json!({"query": "add", "path": "src", "max_results": 20}),
+        ),
+        (
+            "grep_text",
+            json!({"query": "add", "path": "src", "max_results": 20}),
+        ),
+        (
+            "patch_check",
+            json!({
+                "patch": "*** Begin Patch\n*** Add File: schema-probe.txt\n+probe\n*** End Patch\n"
+            }),
+        ),
+        (
+            "exec_command",
+            json!({"cmd": "echo schema-contract", "yield_time_ms": 10_000}),
+        ),
+        ("git_status", json!({})),
+    ];
+
+    for (tool, args) in cases {
+        let output = invoke(&ctx, tool, args);
+        assert_ok(&output);
+        assert_matches_output_schema(tool, &output);
+    }
+
+    let applied = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Add File: schema-probe.txt\n+probe\n*** End Patch\n"
+        }),
+    );
+    assert_ok(&applied);
+    assert_matches_output_schema("apply_patch", &applied);
+}
+
+#[test]
+fn history_successes_match_published_output_schemas() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let session_key = "output-schema-contract-session";
+    let bootstrap = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": session_key,
+            "history_dir": "docs/history-session"
+        }),
+    );
+    assert_ok(&bootstrap);
+    assert_matches_output_schema("history_session_bootstrap", &bootstrap);
+
+    let current_path = bootstrap["current_path"]
+        .as_str()
+        .expect("bootstrap current_path");
+    let checkpoint = invoke(
+        &ctx,
+        "history_session_checkpoint",
+        json!({
+            "session_key": session_key,
+            "expected_path": current_path,
+            "turn_id": "schema-contract-turn",
+            "user_intent": "validate output schema",
+            "tests": ["schema contract"]
+        }),
+    );
+    assert_ok(&checkpoint);
+    assert_matches_output_schema("history_session_checkpoint", &checkpoint);
+
+    let validate = invoke(
+        &ctx,
+        "history_session_validate",
+        json!({"history_dir": "docs/history-session"}),
+    );
+    assert_ok(&validate);
+    assert_matches_output_schema("history_session_validate", &validate);
+}
+
+#[test]
+fn retained_session_tools_match_published_output_schemas() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let command = format!(
+        "{TEST_PYTHON} -c \"import sys,time; print('ready', flush=True); line=sys.stdin.readline(); print('got:'+line.strip(), flush=True); time.sleep(30)\""
+    );
+    let started = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": command, "yield_time_ms": 500}),
+    );
+    assert_ok(&started);
+    assert_matches_output_schema("exec_command", &started);
+    let session_id = started["session_id"].as_str().expect("retained session id");
+    let stdout_ref = started["output_refs"]["stdout"]
+        .as_str()
+        .expect("stdout ref");
+
+    let written = invoke(
+        &ctx,
+        "write_stdin",
+        json!({
+            "session_id": session_id,
+            "chars": "hello\n",
+            "yield_time_ms": 1_000
+        }),
+    );
+    assert_ok(&written);
+    assert_matches_output_schema("write_stdin", &written);
+
+    let output = invoke(
+        &ctx,
+        "read_output",
+        json!({"output_ref": stdout_ref, "stream": "stdout", "limit": 4096}),
+    );
+    assert_ok(&output);
+    assert_matches_output_schema("read_output", &output);
+    assert!(output["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("got:hello"));
+
+    let killed = invoke(
+        &ctx,
+        "kill_session",
+        json!({"session_id": session_id, "signal": "TERM", "wait_ms": 5_000}),
+    );
+    assert_ok(&killed);
+    assert_matches_output_schema("kill_session", &killed);
+}
