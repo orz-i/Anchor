@@ -2,7 +2,7 @@
 
 ## 结论
 
-结论：**本轮列出的七个 P1 问题已经完成代码整改和专项回归；核心本地 Tool 与聚合代理 Tool 的发布/调用契约可以进入后续发布验证。非 P1 的 outputSchema 覆盖、图片响应体和 Session 级 cwd 等问题仍保留。**
+结论：**七个 P1 问题及后续保留的 outputSchema、图片响应体、MCP Session cwd 和 Tool 档位命名问题均已完成代码整改与回归。当前 Tool 发布、调用、错误、输出和 Session 状态契约可以进入发布候选验证。**
 
 审计基线为 MCP 稳定规范 `2025-11-25`，并参考当前 draft 中的聚合命名、状态型 Tool 和 Tool schema 演进指南。
 
@@ -42,12 +42,23 @@
 - 代理结构化结果缺少 TextContent 时自动补充兼容回退；
 - 多个下游异步初始化后的 Tool catalog 按公共名称稳定排序。
 
+## 后续保留问题整改结果
+
+| 原问题 | 整改结果 |
+|---|---|
+| 本地 Tool 缺少 `outputSchema` | core/read-only/advanced 中每个本地 Tool 均发布根级 object `outputSchema`；MCP 包装层运行时校验 structuredContent，内部违约转换为 `TOOL_OUTPUT_SCHEMA_VIOLATION` |
+| `view_image` 重复携带 base64 | `mcp_image` 模式只在 ImageContent 中携带 base64；structuredContent 与 TextContent 仅保留元数据；`data_url` 模式只在 structuredContent 中携带一次数据 |
+| `view_image` 缺少 TextContent 回退 | 两种输出模式均提供小型元数据 TextContent，不再复制大载荷 |
+| default cwd 为 listener 全局状态 | MCP 请求将 `MCP-Session-Id` 传入唯一 Tool 分发入口；每个 Session 独立保存 cwd，DELETE Session 时同步清理；Actions/直接调用继续使用独立的非 Session cwd |
+| `full/core/advanced` 命名不一致 | 规范值统一为 `core`、`read-only`、`advanced`；旧 `full` 自动迁移为 `advanced`，旧 `compat-readonly-all` 自动迁移为 `read-only`；GUI 只保存规范值 |
+| listener 外层取消可能覆盖已提交结果 | listener 不再以取消分支抢先丢弃 worker 结果；取消通过协作 token 进入 Tool，最终以 Tool 返回的成功或 `isError` 结果为准 |
+
 ## 已确认符合的基础项
 
 - 当前主协议版本为 `2025-11-25`。
 - 核心档位暴露 26 个名称唯一的本地 Tool；已移除未实现的 `request_permissions`。
 - 本地 Tool 名称仅使用 ASCII 字母、数字、下划线或连字符，且均远小于 128 字符。
-- 每个本地 Tool 都提供 `name`、`title`、`description`、根级 object `inputSchema` 和 `annotations`。
+- 每个本地 Tool 都提供 `name`、`title`、`description`、根级 object `inputSchema`、根级 object `outputSchema` 和 `annotations`。
 - 无参数 Tool 使用 object schema，并通过 `additionalProperties: false` 拒绝额外参数。
 - 本地 input schema 覆盖 required、enum、类型、字符串长度和数值上下限。
 - 本地 Tool 执行错误通常返回 `CallToolResult`，包含 `content`、`structuredContent` 和 `isError: true`。
@@ -324,12 +335,12 @@ GUI 保存的值是 `full`，但 `normalize_tool_profile()` 未识别 `full`，�
 
 ## 验证结果
 
-- `tools::registry::tests`：3 passed。
+- `tools::registry::tests`：5 passed。
 - `tools::schema::tests`：3 passed。
 - `mcp::proxy::tests`：10 passed。
 - `call_tool_contract`：19 passed。
 - `call_tool_security`：25 passed。
-- Rust `--all-features`：library 227 passed、1 ignored；额外集成/安全/历史测试 71 passed。
+- Rust `--all-features`：library 232 passed、1 ignored；额外集成/安全/历史测试 71 passed。
 - 全 target/feature 严格 Clippy：通过，0 warning。
 - headless CLI 严格 Clippy：通过，0 warning。
 - `svelte-check`：0 errors、0 warnings。
@@ -344,28 +355,21 @@ GUI 保存的值是 `full`，但 `normalize_tool_profile()` 未识别 `full`，�
 - 取消发生在副作用提交后的结果语义；
 - 模型提供 `confirm=true` 不能解锁危险命令；
 - 操作者配置 dangerous 模式后关键文件删除和 Skill 脚本的正向路径。
-
-仍未覆盖且不属于本轮七个 P1 的项目：
-
-- 多 MCP Session 的 default cwd 隔离；
-- view_image 响应体大小和 TextContent 回退；
-- 本地 Tool 的 outputSchema 覆盖。
+- 全部 advanced 本地 Tool 的 `outputSchema` 元校验；
+- 本地 structuredContent 运行时输出校验及违约错误；
+- `view_image` 两种模式的大载荷单份传输和小型 TextContent 回退；
+- 两个真实 HTTP MCP Session 的 cwd 与相对路径解析隔离；
+- Session DELETE 后 cwd 状态清理；
+- `full`/`compat-readonly-all` 到规范档位的持久化迁移。
 
 ## 后续整改顺序
 
-第一批协议与契约一致性：
+可维护性和前向兼容建议：
 
-1. 动态生成 initialize instructions；
-2. 统一 full/core/advanced profile；
-3. 修正 view_image content 和 payload。
-
-第二批可维护性和前向兼容：
-
-1. 引入 outputSchema；
-2. 使用完整 JSON Schema validator；
-3. effective catalog 单一构建入口；
-4. 显式化 cwd 和其他跨调用状态；
-5. 增加 catalog snapshot、schema conformance 和代理 fuzz 测试。
+1. 为高价值 Tool 继续细化 success 字段的 required 约束；
+2. effective catalog 单一构建入口；
+3. 增加 catalog snapshot、schema conformance 和代理 fuzz 测试；
+4. 对 Session 附加状态增加长期运行容量监控。
 
 ## 当前门禁判断
 
@@ -376,5 +380,7 @@ GUI 保存的值是 `full`，但 `normalize_tool_profile()` 未识别 `full`，�
 - **代理 Tool error 层级：通过。**
 - **权限批准语义：通过；未实现的 grant Tool 已移除，危险能力仅由受信任控制面配置。**
 - **取消后提交语义：通过。**
-- **结构化输出强类型契约：部分通过。**
-- **多 Session 状态隔离：部分通过。**
+- **结构化输出契约：通过；全部本地 Tool 有 outputSchema 并执行运行时校验。**
+- **多 Session cwd 状态隔离：通过。**
+- **Tool 档位命名与迁移：通过。**
+- **图片响应体去重与兼容回退：通过。**
