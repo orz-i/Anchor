@@ -17,6 +17,7 @@ use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{
     handle_request_with_protocol_session_and_cancellation, new_state, SharedState,
 };
+use crate::mcp::{register_activity, McpActivityTracker};
 use crate::runtime::{read_public_url, register_public_url, SharedPublicUrl};
 use crate::secret::SecretStore;
 use crate::tools::policy::PolicySettings;
@@ -60,10 +61,12 @@ struct ListenerState {
     oauth_rate_limiter: RateLimiter,
     concurrency: Arc<Semaphore>,
     in_flight: InFlightRequests,
+    activity: McpActivityTracker,
 }
 
 fn clear_session_associations(state: &ListenerState, session_id: &str) {
     state.in_flight.cancel_session(session_id);
+    state.activity.cancel_session(session_id);
     state.mcp.clear_session_state(session_id);
 }
 
@@ -187,6 +190,7 @@ pub fn spawn_listener(
     if let Some(runtime) = oauth.as_ref() {
         register_oauth_runtime(&workspace_id, "mcp", runtime);
     }
+    let activity = register_activity(&workspace_id);
     let state = ListenerState {
         mcp,
         auth,
@@ -206,6 +210,7 @@ pub fn spawn_listener(
         ),
         concurrency: Arc::new(Semaphore::new(MCP_MAX_CONCURRENT_REQUESTS)),
         in_flight: InFlightRequests::default(),
+        activity,
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
     let listener = bind_listener(port)?;
@@ -611,6 +616,9 @@ async fn execute_mcp_request(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    state
+        .activity
+        .request_started(session_id, request_id, method, &tool_name);
     append_profile_log(
         &state.workspace_id,
         "mcp-requests.log",
@@ -662,6 +670,7 @@ async fn execute_mcp_request(
             request_id, method, tool_name, outcome, duration_ms
         ),
     );
+    state.activity.request_finished(session_id, request_id);
     if tool_name == "exec_command" || tool_name == "exec_health_check" {
         let structured = response
             .get("result")
@@ -954,6 +963,7 @@ mod tests {
 
     use crate::mcp::protocol::{InFlightRequests, RateLimiter, SessionStore};
     use crate::mcp::server::new_state;
+    use crate::mcp::McpActivityTracker;
     use crate::runtime::{register_public_url, update_public_url};
     use crate::tools::policy::PolicySettings;
     use crate::tools::Workspace;
@@ -1032,6 +1042,7 @@ mod tests {
                 oauth_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
                 concurrency: Arc::new(Semaphore::new(4)),
                 in_flight: InFlightRequests::default(),
+                activity: McpActivityTracker::default(),
             },
         )
     }
@@ -1115,6 +1126,86 @@ mod tests {
         .await;
         assert_eq!(notification.status(), StatusCode::ACCEPTED);
         (session_id, headers)
+    }
+
+    #[tokio::test]
+    async fn real_mcp_requests_update_activity_snapshot() {
+        let (_workspace, state) = test_listener_state();
+        assert_eq!(state.activity.snapshot().state, "idle");
+
+        let (_session_id, headers) = initialized_session(&state).await;
+        assert_eq!(state.activity.snapshot().state, "idle");
+
+        let response = mcp_post(
+            State(state.clone()),
+            headers,
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "server_info", "arguments": {}}
+            }))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = state.activity.snapshot();
+        assert_eq!(snapshot.state, "recent");
+        assert_eq!(snapshot.in_flight_requests, 0);
+        assert_eq!(snapshot.completed_requests, 1);
+        assert!(snapshot.last_activity_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn long_running_tool_call_is_visible_while_in_flight() {
+        if which::which("python").is_err() {
+            return;
+        }
+        let (_workspace, state) = test_listener_state();
+        let (_session_id, headers) = initialized_session(&state).await;
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move {
+            mcp_post(
+                State(worker_state),
+                headers,
+                Ok(Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "exec_command",
+                        "arguments": {
+                            "cmd": "python -c \"import time; time.sleep(2)\"",
+                            "timeout_ms": 10_000,
+                            "yield_time_ms": 3_000
+                        }
+                    }
+                }))),
+            )
+            .await
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = state.activity.snapshot();
+            if snapshot.in_flight_requests == 1 {
+                assert_eq!(snapshot.state, "active");
+                assert_eq!(snapshot.current_method, "tools/call");
+                assert_eq!(snapshot.current_tool, "exec_command");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "activity was never observed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = worker.await.expect("tool call task");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = state.activity.snapshot();
+        assert_eq!(snapshot.state, "recent");
+        assert_eq!(snapshot.in_flight_requests, 0);
+        assert_eq!(snapshot.completed_requests, 1);
     }
 
     #[tokio::test]

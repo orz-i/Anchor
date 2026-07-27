@@ -66,7 +66,11 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     pub fn mcp_status(&self, profile: &WorkspaceProfile) -> RuntimeStatusDto {
-        self.status(profile, ServiceKind::Mcp)
+        let mut status = self.status(profile, ServiceKind::Mcp);
+        if status.state == "running" {
+            status.activity = Some(mcp::activity_snapshot(&profile.id));
+        }
+        status
     }
 
     pub fn actions_status(&self, profile: &WorkspaceProfile) -> RuntimeStatusDto {
@@ -197,6 +201,7 @@ impl RuntimeSupervisor {
                 local_endpoint,
                 public_endpoint,
                 recovery,
+                activity: None,
             },
             RuntimePhase::Starting => RuntimeStatusDto {
                 state: "starting".into(),
@@ -206,6 +211,7 @@ impl RuntimeSupervisor {
                 local_endpoint,
                 public_endpoint,
                 recovery,
+                activity: None,
             },
             RuntimePhase::Recovering => RuntimeStatusDto {
                 state: "recovering".into(),
@@ -215,6 +221,7 @@ impl RuntimeSupervisor {
                 local_endpoint,
                 public_endpoint,
                 recovery,
+                activity: None,
             },
             RuntimePhase::Stopping => RuntimeStatusDto {
                 state: "stopping".into(),
@@ -224,6 +231,7 @@ impl RuntimeSupervisor {
                 local_endpoint,
                 public_endpoint,
                 recovery,
+                activity: None,
             },
             RuntimePhase::Error => {
                 let message = self
@@ -239,6 +247,7 @@ impl RuntimeSupervisor {
                     local_endpoint,
                     public_endpoint,
                     recovery,
+                    activity: None,
                 }
             }
             RuntimePhase::Stopped => RuntimeStatusDto {
@@ -249,6 +258,7 @@ impl RuntimeSupervisor {
                 local_endpoint,
                 public_endpoint,
                 recovery,
+                activity: None,
             },
         }
     }
@@ -815,6 +825,7 @@ fn actions_oauth_secret(profile_id: &str, key: &str) -> AppResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn entry(phase: RuntimePhase, started_at: Option<std::time::Instant>) -> RuntimeEntry {
         RuntimeEntry {
@@ -909,5 +920,24 @@ mod tests {
             RuntimePhase::Starting,
             Some(std::time::Instant::now()),
         )));
+    }
+
+    #[test]
+    fn running_mcp_status_exposes_registered_activity() {
+        let profile = WorkspaceProfile::new(".".into(), Some("activity".into()));
+        let tracker = mcp::register_activity(&profile.id);
+        let mut supervisor = RuntimeSupervisor::default();
+        supervisor.entries.insert(
+            (profile.id.clone(), ServiceKind::Mcp),
+            entry(RuntimePhase::Running, Some(std::time::Instant::now())),
+        );
+
+        let idle = supervisor.mcp_status(&profile).activity.expect("activity");
+        assert_eq!(idle.state, "idle");
+
+        tracker.request_started("session", &json!(1), "tools/call", "read_file");
+        let active = supervisor.mcp_status(&profile).activity.expect("activity");
+        assert_eq!(active.state, "active");
+        assert_eq!(active.current_tool, "read_file");
     }
 }

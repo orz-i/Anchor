@@ -139,6 +139,29 @@ export interface RuntimeStatus {
   localEndpoint: string;
   publicEndpoint: string;
   recovery: RuntimeRecovery;
+  activity?: McpActivity | null;
+}
+
+export type McpActivityState =
+  | "unknown"
+  | "idle"
+  | "recent"
+  | "active"
+  | "suspected_stalled";
+
+export interface McpActivity {
+  state: McpActivityState;
+  message: string;
+  inFlightRequests: number;
+  oldestInFlightMs: number | null;
+  lastActivityAt: string | null;
+  lastActivityAgeMs: number | null;
+  lastCompletedAt: string | null;
+  currentMethod: string;
+  currentTool: string;
+  completedRequests: number;
+  recentWindowMs: number;
+  suspectedStallAfterMs: number;
 }
 
 export interface RuntimeRecovery {

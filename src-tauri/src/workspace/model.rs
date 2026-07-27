@@ -139,6 +139,25 @@ pub struct RuntimeStatusDto {
     pub local_endpoint: String,
     pub public_endpoint: String,
     pub recovery: RuntimeRecoveryDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<McpActivityDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpActivityDto {
+    pub state: String,
+    pub message: String,
+    pub in_flight_requests: u64,
+    pub oldest_in_flight_ms: Option<u64>,
+    pub last_activity_at: Option<String>,
+    pub last_activity_age_ms: Option<u64>,
+    pub last_completed_at: Option<String>,
+    pub current_method: String,
+    pub current_tool: String,
+    pub completed_requests: u64,
+    pub recent_window_ms: u64,
+    pub suspected_stall_after_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

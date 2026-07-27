@@ -1,7 +1,7 @@
 <script lang="ts">
   import CopyButton from "$lib/components/CopyButton.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
-  import type { RuntimeRecovery, RuntimeState } from "$lib/types";
+  import type { McpActivity, McpActivityState, RuntimeRecovery, RuntimeState } from "$lib/types";
 
   const EMPTY_RECOVERY: RuntimeRecovery = {
     enabled: false,
@@ -18,6 +18,7 @@
     status: RuntimeState;
     statusMessage?: string;
     recovery?: RuntimeRecovery;
+    activity?: McpActivity | null;
     port: number;
     portEditable?: boolean;
     busy?: boolean;
@@ -35,6 +36,7 @@
     status,
     statusMessage = "",
     recovery = EMPTY_RECOVERY,
+    activity = null,
     port,
     portEditable = false,
     busy = false,
@@ -58,6 +60,35 @@
   const canEditPort = $derived(
     portEditable && !running && !recovering && status !== "starting" && status !== "stopping",
   );
+
+  function activityLabel(state: McpActivityState): string {
+    switch (state) {
+      case "active":
+        return "调用中";
+      case "recent":
+        return "刚刚活跃";
+      case "suspected_stalled":
+        return "疑似卡住";
+      case "idle":
+        return "空闲";
+      default:
+        return "未知";
+    }
+  }
+
+  function activityColor(state: McpActivityState): string {
+    if (state === "suspected_stalled") return "var(--color-warning)";
+    if (state === "active" || state === "recent") return "var(--color-success)";
+    return "var(--color-text-muted)";
+  }
+
+  function durationLabel(milliseconds: number | null): string {
+    if (milliseconds === null) return "-";
+    if (milliseconds < 1_000) return `${milliseconds}ms`;
+    const seconds = Math.floor(milliseconds / 1_000);
+    if (seconds < 60) return `${seconds}s`;
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  }
   const retrySeconds = $derived(
     recovery.retryInMs === null ? null : Math.max(1, Math.ceil(recovery.retryInMs / 1000)),
   );
@@ -87,6 +118,11 @@
       {#if tunnelEnabled}
         <p class="mt-1 text-xs text-[var(--color-text-muted)]">
           {tunnelLabel} 隧道随服务自动连接，停止服务时一并断开
+        </p>
+      {/if}
+      {#if running && activity}
+        <p class="mt-1 text-xs" style={`color: ${activityColor(activity.state)}`}>
+          上游调用：{activityLabel(activity.state)}
         </p>
       {/if}
       {#if running && recovery.recoveredCount > 0}
@@ -153,6 +189,30 @@
         {/if}
       </div>
     </div>
+
+    {#if activity}
+      <div class="tx-info-block">
+        <div class="tx-info-row">
+          <span class="tx-info-label">上游调用</span>
+          <span class="text-sm font-semibold" style={`color: ${activityColor(activity.state)}`}>
+            {activityLabel(activity.state)}
+          </span>
+        </div>
+        <p class="mt-1.5 text-sm text-[var(--color-text-secondary)]">{activity.message}</p>
+        <p class="mt-1 text-xs text-[var(--color-text-muted)]">
+          在途 {activity.inFlightRequests} · 最久 {durationLabel(activity.oldestInFlightMs)} ·
+          最近活动 {durationLabel(activity.lastActivityAgeMs)} 前
+        </p>
+        {#if activity.currentTool || activity.currentMethod}
+          <p class="tx-mono mt-1 truncate text-xs text-[var(--color-text-muted)]">
+            {activity.currentTool || activity.currentMethod}
+          </p>
+        {/if}
+        <p class="mt-1.5 text-xs text-[var(--color-text-muted)]">
+          仅统计 tools/call、resources/read、prompts/get；模型纯推理或 MCP 外等待无法识别。
+        </p>
+      </div>
+    {/if}
 
     <div class="tx-info-block">
       <div class="tx-info-row">

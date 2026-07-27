@@ -54,6 +54,7 @@
     mcpLocalEndpoint,
     type AuthConfig,
     type ActionsAuthDraft,
+    type McpActivity,
     type RuntimeRecovery,
     type RuntimeStatus,
     type RuntimeState,
@@ -81,6 +82,7 @@
   let mcpStatusMessage = $state("");
   let actionsStatusMessage = $state("");
   let mcpRecovery = $state<RuntimeRecovery>({ ...EMPTY_RECOVERY });
+  let mcpActivity = $state<McpActivity | null>(null);
   let actionsRecovery = $state<RuntimeRecovery>({ ...EMPTY_RECOVERY });
   let mcpBusy = $state(false);
   let actionsBusy = $state(false);
@@ -174,14 +176,33 @@
   function applyMcpRuntime(runtime: RuntimeStatus, id = workspaceId) {
     if (!id || id !== workspaceId) return;
     const previous = mcpStatus;
+    const previousActivity = mcpActivity?.state;
     mcpStatus = runtime.state;
     mcpStatusMessage = runtime.localMessage ?? "";
     mcpRecovery = runtime.recovery ?? { ...EMPTY_RECOVERY };
+    mcpActivity = runtime.activity ?? null;
     mcpLocal = runtime.localEndpoint;
     mcpPublic = runtime.publicEndpoint;
     mcpRuntimeStates.update((current) => ({ ...current, [id]: runtime.state }));
     if (previous === "recovering" && runtime.state === "running") {
       showToast("MCP 连接已自动恢复", { title: "连接已恢复", kind: "success" });
+    }
+    if (previousActivity !== "suspected_stalled" && mcpActivity?.state === "suspected_stalled") {
+      const seconds = Math.max(1, Math.floor((mcpActivity.oldestInFlightMs ?? 0) / 1_000));
+      showToast(`最早的 MCP 调用已持续 ${seconds} 秒，请检查上游对话是否卡住`, {
+        title: "上游调用疑似卡住",
+        kind: "warning",
+        duration: 10_000,
+      });
+    } else if (
+      previousActivity === "suspected_stalled" &&
+      mcpActivity &&
+      mcpActivity.state !== "suspected_stalled"
+    ) {
+      showToast("MCP 调用已结束或恢复活动", {
+        title: "上游调用已恢复",
+        kind: "success",
+      });
     }
   }
 
@@ -805,6 +826,7 @@
             status={mcpStatus}
             statusMessage={mcpStatusMessage}
             recovery={mcpRecovery}
+            activity={mcpActivity}
             port={profile.runtime.local_port}
             portEditable={true}
             busy={mcpBusy}
