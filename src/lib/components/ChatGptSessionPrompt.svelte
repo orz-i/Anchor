@@ -3,11 +3,14 @@
   import { onDestroy } from "svelte";
   import { showToast } from "$lib/stores/toast";
 
-  const sessionPrompt = `请初始化或恢复当前项目会话，先调用 history_session_bootstrap。
-如果没有历史记录，则创建首个 history-session；
-如果已有历史记录，则读取 all_history_summary 和 latest_handoff 后继续工作。
-本会话每轮任务完成后调用 history_session_checkpoint，并原样传入 bootstrap 返回的 session_key 和 current_path；
-只有 checkpoint 返回 ok=true 且会话目标一致后才能确认进度已保存。`;
+  const sessionPrompt = `请使用当前工作区的 Anchor MCP 初始化或恢复项目会话。
+在回答本会话的第一个用户请求前，先且仅调用一次 history_session_bootstrap；即使用户没有明确要求恢复，也必须执行。
+如果没有历史记录，由 bootstrap 创建首个 history-session；如果已有历史记录，先阅读响应中的 all_history_summary、latest_handoff 和 inherited_summary，再继续工作。
+检查 history_summaries_omitted、history_summary_truncated 和 latest_handoff_truncated；只有当前任务确实需要被省略的细节时，才用 read_file 读取对应的精确归档路径。
+不要在同一 ChatGPT 会话中重复调用 bootstrap 或创建重复历史会话。
+保存 bootstrap 返回的 session_key 和 current_path；每次调用 history_session_checkpoint 时，将 session_key 原样传入 session_key，并将 current_path 原样作为 expected_path。
+每个用户任务完成后、发送最终答复前调用 history_session_checkpoint，记录已脱敏的结论、决策、文件变更、验证结果、遗留问题和下一步。
+只有 checkpoint 返回 ok=true，且返回的 session_key、path 和 expected_path 仍指向同一会话目标时，才能说明进度已保存；保存不是后台自动完成的。`;
 
   let copying = $state(false);
   let copied = $state(false);

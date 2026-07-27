@@ -346,10 +346,20 @@ mod tests {
         let component = include_str!("../../../src/lib/components/ChatGptSessionPrompt.svelte");
 
         assert!(component.contains("ChatGPT 新会话启动提示词"));
-        assert!(component.contains("请初始化或恢复当前项目会话"));
+        assert!(component.contains("请使用当前工作区的 Anchor MCP 初始化或恢复项目会话"));
+        assert!(component.contains("先且仅调用一次 history_session_bootstrap"));
         assert!(component.contains("如果没有历史记录"));
         assert!(component.contains("all_history_summary"));
+        assert!(component.contains("latest_handoff"));
+        assert!(component.contains("inherited_summary"));
+        assert!(component.contains("history_summaries_omitted"));
+        assert!(component.contains("history_summary_truncated"));
+        assert!(component.contains("latest_handoff_truncated"));
+        assert!(component.contains("current_path"));
+        assert!(component.contains("expected_path"));
         assert!(component.contains("history_session_checkpoint"));
+        assert!(component.contains("发送最终答复前"));
+        assert!(component.contains("保存不是后台自动完成的"));
         assert!(!component.contains("打开连接器设置"));
     }
 
