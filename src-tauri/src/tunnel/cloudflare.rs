@@ -431,7 +431,8 @@ async fn stream_cloudflare_output<R, E>(
     }
 
     while let Some(line) = line_rx.recv().await {
-        let _ = log.write_all(line.as_bytes()).await;
+        let timestamped = crate::logging::timestamped_line(&line);
+        let _ = log.write_all(timestamped.as_bytes()).await;
         let _ = log.write_all(b"\n").await;
         let _ = log.flush().await;
         handle_line(&line, &mut public_url, &mut ready_tx);

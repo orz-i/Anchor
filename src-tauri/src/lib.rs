@@ -18,6 +18,7 @@ mod data;
 mod error;
 pub mod harness;
 mod health;
+mod logging;
 mod mcp;
 mod platform;
 mod runtime;

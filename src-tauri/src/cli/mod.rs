@@ -879,6 +879,7 @@ pub fn run() -> i32 {
     }
 
     let as_json = parsed.json;
+    let daemon_mode = matches!(&parsed.command, Command::DaemonRun { .. });
     match crate::async_runtime::block_on(execute(parsed)) {
         Ok(exit_code) => exit_code,
         Err(error) => {
@@ -892,7 +893,12 @@ pub fn run() -> i32 {
                     .unwrap_or_else(|_| "{\"ok\":false}".into())
                 );
             } else {
-                eprintln!("错误：{error}");
+                let message = format!("错误：{error}");
+                if daemon_mode {
+                    eprintln!("{}", crate::logging::timestamped_line(&message));
+                } else {
+                    eprintln!("{message}");
+                }
             }
             1
         }
@@ -1150,7 +1156,11 @@ async fn serve_workspace(
                 managed_tunnels.push(kind);
                 match maybe_start_for_runtime(&profile, kind).await {
                     Ok(Some(url)) if !as_json => {
-                        println!("{} tunnel\t{url}", tunnel_label(kind));
+                        print_runtime_line(
+                            &format!("{} tunnel\t{url}", tunnel_label(kind)),
+                            foreground,
+                            false,
+                        );
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -1172,10 +1182,14 @@ async fn serve_workspace(
                                 "detail": error.to_string()
                             }))?;
                         } else {
-                            eprintln!(
-                                "{} tunnel 暂未连接，{} 秒后自动重试：{error}",
-                                tunnel_label(kind),
-                                delay.as_secs()
+                            print_runtime_line(
+                                &format!(
+                                    "{} tunnel 暂未连接，{} 秒后自动重试：{error}",
+                                    tunnel_label(kind),
+                                    delay.as_secs()
+                                ),
+                                foreground,
+                                true,
                             );
                         }
                     }
@@ -1199,18 +1213,26 @@ async fn serve_workspace(
             "tunnel": with_tunnel
         }))?;
     } else {
-        println!("workspace {} 已启动：", profile.name);
+        print_runtime_line(
+            &format!("workspace {} 已启动：", profile.name),
+            foreground,
+            false,
+        );
         for kind in &started_services {
-            println!(
-                "{}\t{}",
-                service_label(*kind),
-                endpoint_for(&profile, *kind)
+            print_runtime_line(
+                &format!(
+                    "{}\t{}",
+                    service_label(*kind),
+                    endpoint_for(&profile, *kind)
+                ),
+                foreground,
+                false,
             );
         }
         if foreground {
             println!("前台运行中，按 Ctrl+C 停止。");
         } else {
-            println!("daemon 运行中，等待 SIGTERM/SIGINT 停止。");
+            print_runtime_line("daemon 运行中，等待 SIGTERM/SIGINT 停止。", false, false);
         }
     }
 
@@ -1253,9 +1275,13 @@ async fn serve_workspace(
                                 "recovery": status.recovery
                             }))?;
                         } else if status.state == "recovering" {
-                            eprintln!("{}", status.local_message);
+                            print_runtime_line(&status.local_message, foreground, true);
                         } else if status.state == "running" && previous.as_deref() == Some("recovering") {
-                            println!("{} 已自动恢复", service_label(kind));
+                            print_runtime_line(
+                                &format!("{} 已自动恢复", service_label(kind)),
+                                foreground,
+                                false,
+                            );
                         }
                     }
                     if status.state == "error" && !status.recovery.enabled {
@@ -1287,7 +1313,11 @@ async fn serve_workspace(
                                         "attempts": previous.attempts
                                     }))?;
                                 } else {
-                                    println!("{} tunnel 已自动恢复", tunnel_label(kind));
+                                    print_runtime_line(
+                                        &format!("{} tunnel 已自动恢复", tunnel_label(kind)),
+                                        foreground,
+                                        false,
+                                    );
                                 }
                             }
                         }
@@ -1318,10 +1348,14 @@ async fn serve_workspace(
                                     "detail": error.to_string()
                                 }))?;
                             } else {
-                                eprintln!(
-                                    "{} tunnel 自动重连失败，{} 秒后重试：{error}",
-                                    tunnel_label(kind),
-                                    delay.as_secs()
+                                print_runtime_line(
+                                    &format!(
+                                        "{} tunnel 自动重连失败，{} 秒后重试：{error}",
+                                        tunnel_label(kind),
+                                        delay.as_secs()
+                                    ),
+                                    foreground,
+                                    true,
                                 );
                             }
                         }
@@ -1340,6 +1374,19 @@ async fn serve_workspace(
     match terminal_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+fn print_runtime_line(message: &str, foreground: bool, error: bool) {
+    let message = if foreground {
+        message.to_string()
+    } else {
+        crate::logging::timestamped_line(message)
+    };
+    if error {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
     }
 }
 

@@ -851,6 +851,7 @@ pub fn append_profile_log(profile_id: &str, file_name: &str, line: &str) {
         .append(true)
         .open(path)
     {
+        let line = crate::logging::timestamped_line(line);
         let _ = writeln!(file, "{line}");
     }
 }

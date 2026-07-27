@@ -577,8 +577,9 @@ where
     let mut reader = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = reader.next_line().await {
         use tokio::io::AsyncWriteExt;
+        let timestamped = crate::logging::timestamped_line(&line);
         for file in &mut files {
-            let _ = file.write_all(line.as_bytes()).await;
+            let _ = file.write_all(timestamped.as_bytes()).await;
             let _ = file.write_all(b"\n").await;
             let _ = file.flush().await;
         }
