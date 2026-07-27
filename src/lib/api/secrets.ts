@@ -36,18 +36,6 @@ export async function regenerateWorkspaceSecret(
   return invoke<string>("regenerate_workspace_secret", { id, key });
 }
 
-/** @deprecated use WorkspaceSecretKey */
-export type SecretKey = WorkspaceSecretKey;
-
-/** @deprecated use getWorkspaceSecret */
-export const getSecret = getWorkspaceSecret;
-
-/** @deprecated use setWorkspaceSecret */
-export const setSecret = setWorkspaceSecret;
-
-/** @deprecated use regenerateWorkspaceSecret */
-export const regenerateSecret = regenerateWorkspaceSecret;
-
 // ── Shared secrets ───────────────────────────────────────────────────────
 
 export type SharedSecretKey =

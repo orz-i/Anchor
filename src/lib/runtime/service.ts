@@ -1,7 +1,7 @@
 import { showToast } from "$lib/stores/toast";
 import type { RuntimeStatus } from "$lib/types";
 
-export function serviceErrorMessage(status: RuntimeStatus): string {
+function serviceErrorMessage(status: RuntimeStatus): string {
   return status.localMessage || status.publicMessage || "服务未能启动";
 }
 

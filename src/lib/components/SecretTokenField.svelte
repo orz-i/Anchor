@@ -1,10 +1,14 @@
 <script lang="ts">
-  import { secretIsSet, setSecret, type SecretKey } from "$lib/api/secrets";
+  import {
+    secretIsSet,
+    setWorkspaceSecret,
+    type WorkspaceSecretKey,
+  } from "$lib/api/secrets";
   import SecretInput from "$lib/components/SecretInput.svelte";
 
   interface Props {
     workspaceId: string;
-    secretKey: SecretKey;
+    secretKey: WorkspaceSecretKey;
     label?: string;
     onSaved?: () => void;
     hasPending?: boolean;
@@ -46,7 +50,7 @@
 
   export async function saveIfDirty(): Promise<boolean> {
     if (!draft.trim()) return false;
-    await setSecret(workspaceId, secretKey, draft.trim());
+    await setWorkspaceSecret(workspaceId, secretKey, draft.trim());
     saved = true;
     draft = "";
     onSaved?.();

@@ -33,7 +33,7 @@ const TRANSIENT_ERROR_MARKERS = [
   "后台连接",
 ];
 
-export function errorText(error: unknown): string {
+function errorText(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
   if (error && typeof error === "object" && "message" in error) {
@@ -42,7 +42,7 @@ export function errorText(error: unknown): string {
   return String(error);
 }
 
-export function isTransientInvokeError(error: unknown): boolean {
+function isTransientInvokeError(error: unknown): boolean {
   const text = errorText(error).toLowerCase();
   if (TERMINAL_ERROR_MARKERS.some((marker) => text.includes(marker))) return false;
   return TRANSIENT_ERROR_MARKERS.some((marker) => text.includes(marker));

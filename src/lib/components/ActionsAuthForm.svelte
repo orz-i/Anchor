@@ -2,7 +2,12 @@
   import { message } from "@tauri-apps/plugin-dialog";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import SecretInput from "$lib/components/SecretInput.svelte";
-  import { getSecret, regenerateSecret, getSharedSecret, regenerateSharedSecret } from "$lib/api/secrets";
+  import {
+    getWorkspaceSecret,
+    regenerateWorkspaceSecret,
+    getSharedSecret,
+    regenerateSharedSecret,
+  } from "$lib/api/secrets";
   import type { ActionsAuthDraft } from "$lib/types";
 
   export const ACTIONS_AUTH_OPTIONS = [
@@ -147,16 +152,16 @@
       const [key, secret, password, tokenSecret] = await Promise.all([
         draftUseShared
           ? getSharedSecret("actions_api_key")
-          : getSecret(workspaceId, "actions_api_key"),
+          : getWorkspaceSecret(workspaceId, "actions_api_key"),
         draftUseShared
           ? getSharedSecret("actions_oauth_client_secret")
-          : getSecret(workspaceId, "actions_oauth_client_secret"),
+          : getWorkspaceSecret(workspaceId, "actions_oauth_client_secret"),
         draftUseShared
           ? getSharedSecret("actions_oauth_password")
-          : getSecret(workspaceId, "actions_oauth_password"),
+          : getWorkspaceSecret(workspaceId, "actions_oauth_password"),
         draftUseShared
           ? getSharedSecret("actions_oauth_token_secret")
-          : getSecret(workspaceId, "actions_oauth_token_secret"),
+          : getWorkspaceSecret(workspaceId, "actions_oauth_token_secret"),
       ]);
       if (seq !== secretsLoadSeq) return;
       apiKey = key ?? "";
@@ -222,7 +227,7 @@
     try {
       apiKey = draftUseShared
         ? await regenerateSharedSecret("actions_api_key")
-        : await regenerateSecret(workspaceId, "actions_api_key");
+        : await regenerateWorkspaceSecret(workspaceId, "actions_api_key");
     } catch (error) {
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
@@ -236,7 +241,7 @@
     try {
       oauthClientSecret = draftUseShared
         ? await regenerateSharedSecret("actions_oauth_client_secret")
-        : await regenerateSecret(workspaceId, "actions_oauth_client_secret");
+        : await regenerateWorkspaceSecret(workspaceId, "actions_oauth_client_secret");
     } catch (error) {
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
@@ -250,7 +255,7 @@
     try {
       oauthPassword = draftUseShared
         ? await regenerateSharedSecret("actions_oauth_password")
-        : await regenerateSecret(workspaceId, "actions_oauth_password");
+        : await regenerateWorkspaceSecret(workspaceId, "actions_oauth_password");
     } catch (error) {
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
@@ -264,7 +269,7 @@
     try {
       oauthTokenSecret = draftUseShared
         ? await regenerateSharedSecret("actions_oauth_token_secret")
-        : await regenerateSecret(workspaceId, "actions_oauth_token_secret");
+        : await regenerateWorkspaceSecret(workspaceId, "actions_oauth_token_secret");
     } catch (error) {
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {

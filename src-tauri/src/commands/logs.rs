@@ -7,6 +7,7 @@ use tauri::State;
 
 use crate::app_state::AppState;
 use crate::error::{AppError, AppResult};
+use crate::logging::{profile_log_files, ProfileLogService};
 use crate::tunnel::log_dir_for_profile;
 use crate::workspace::WorkspaceProfile;
 
@@ -29,34 +30,12 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<WorkspaceProfile> {
     })
 }
 
-fn log_file_names(profile: &WorkspaceProfile, service: &str) -> AppResult<Vec<&'static str>> {
-    match service {
-        "mcp" => {
-            let mut names = vec!["mcp-oauth.log", "mcp-requests.log", "stderr.log", "stdout.log"];
-            if profile.tunnel.tunnel_type == "cloudflare" {
-                names.insert(0, "cloudflared.log");
-            }
-            if profile.tunnel.tunnel_type == "frp" {
-                names.insert(0, "frpc-mcp.log");
-            }
-            Ok(names)
-        }
-        "actions" => {
-            let mut names = vec![
-                "actions-oauth.log",
-                "actions-stderr.log",
-                "actions-stdout.log",
-            ];
-            if profile.actions.tunnel_type == "cloudflare" {
-                names.insert(0, "actions-cloudflared.log");
-            }
-            if profile.actions.tunnel_type == "frp" {
-                names.insert(0, "frpc-actions.log");
-            }
-            Ok(names)
-        }
-        other => Err(AppError::Message(format!("unknown log service: {other}"))),
-    }
+fn profile_log_service(service: &str) -> AppResult<ProfileLogService> {
+    Ok(match service {
+        "mcp" => ProfileLogService::Mcp,
+        "actions" => ProfileLogService::Actions,
+        other => return Err(AppError::Message(format!("unknown log service: {other}"))),
+    })
 }
 
 fn read_log_tail(path: &Path) -> AppResult<String> {
@@ -88,10 +67,10 @@ pub async fn read_workspace_logs(
 ) -> AppResult<Vec<LogChunk>> {
     let profile = profile_by_id(&state, &id)?;
     let log_dir = log_dir_for_profile(&profile.id);
-    let names = log_file_names(&profile, &service)?;
+    let files = profile_log_files(&profile, profile_log_service(&service)?);
 
     let mut chunks = Vec::new();
-    for name in names {
+    for (_, name) in files {
         let path = log_dir.join(name);
         if !path.exists() {
             continue;
@@ -113,10 +92,10 @@ mod tests {
     #[test]
     fn oauth_diagnostic_logs_are_visible_in_gui_log_lists() {
         let profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
-        let mcp = log_file_names(&profile, "mcp").expect("mcp logs");
-        let actions = log_file_names(&profile, "actions").expect("actions logs");
-        assert!(mcp.contains(&"mcp-oauth.log"));
-        assert!(mcp.contains(&"mcp-requests.log"));
-        assert!(actions.contains(&"actions-oauth.log"));
+        let mcp = profile_log_files(&profile, ProfileLogService::Mcp);
+        let actions = profile_log_files(&profile, ProfileLogService::Actions);
+        assert!(mcp.iter().any(|file| file.1 == "mcp-oauth.log"));
+        assert!(mcp.iter().any(|file| file.1 == "mcp-requests.log"));
+        assert!(actions.iter().any(|file| file.1 == "actions-oauth.log"));
     }
 }

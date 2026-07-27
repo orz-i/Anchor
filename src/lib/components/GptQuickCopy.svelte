@@ -1,6 +1,6 @@
 <script lang="ts">
   import CopyFieldRow from "$lib/components/CopyFieldRow.svelte";
-  import { getSecret, getSharedSecret } from "$lib/api/secrets";
+  import { getWorkspaceSecret, getSharedSecret } from "$lib/api/secrets";
   import type { AuthConfig, WorkspaceProfile } from "$lib/types";
   import {
     actionsOAuthAuthorizeUrl,
@@ -34,7 +34,10 @@
         const fetchSecret = async (key: string, sharedKey: string) => {
           const value = useShared
             ? await getSharedSecret(sharedKey as Parameters<typeof getSharedSecret>[0])
-            : await getSecret(workspaceId, key as Parameters<typeof getSecret>[1]);
+            : await getWorkspaceSecret(
+                workspaceId,
+                key as Parameters<typeof getWorkspaceSecret>[1],
+              );
           return value ?? "";
         };
         if (auth.type === "oauth") {
@@ -58,7 +61,10 @@
         const fetchSecret = async (key: string, sharedKey: string) => {
           const value = useShared
             ? await getSharedSecret(sharedKey as Parameters<typeof getSharedSecret>[0])
-            : await getSecret(workspaceId, key as Parameters<typeof getSecret>[1]);
+            : await getWorkspaceSecret(
+                workspaceId,
+                key as Parameters<typeof getWorkspaceSecret>[1],
+              );
           return value ?? "";
         };
         if (actions.auth_type === "api_key") {

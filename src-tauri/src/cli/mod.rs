@@ -12,6 +12,7 @@ use serde_json::json;
 
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
+use crate::logging::{profile_log_files, ProfileLogService};
 use crate::mcp::gateway;
 use crate::platform::platform;
 use crate::runtime::{await_listener_shutdown, update_public_url, RuntimeSupervisor, ServiceKind};
@@ -579,27 +580,18 @@ fn selected_log_files(
         files.push(("daemon".into(), daemon::daemon_log_path(&profile.id)));
     }
     if matches!(selection, LogSelection::Mcp | LogSelection::All) {
-        if profile.tunnel.tunnel_type == "cloudflare" {
-            files.push(("mcp-cloudflare".into(), log_dir.join("cloudflared.log")));
-        }
-        if profile.tunnel.tunnel_type == "frp" {
-            files.push(("mcp-frp".into(), log_dir.join("frpc-mcp.log")));
-        }
-        files.push(("mcp-stdout".into(), log_dir.join("stdout.log")));
-        files.push(("mcp-stderr".into(), log_dir.join("stderr.log")));
+        files.extend(
+            profile_log_files(profile, ProfileLogService::Mcp)
+                .into_iter()
+                .map(|(label, file_name)| (label.into(), log_dir.join(file_name))),
+        );
     }
     if matches!(selection, LogSelection::Actions | LogSelection::All) {
-        if profile.actions.tunnel_type == "cloudflare" {
-            files.push((
-                "actions-cloudflare".into(),
-                log_dir.join("actions-cloudflared.log"),
-            ));
-        }
-        if profile.actions.tunnel_type == "frp" {
-            files.push(("actions-frp".into(), log_dir.join("frpc-actions.log")));
-        }
-        files.push(("actions-stdout".into(), log_dir.join("actions-stdout.log")));
-        files.push(("actions-stderr".into(), log_dir.join("actions-stderr.log")));
+        files.extend(
+            profile_log_files(profile, ProfileLogService::Actions)
+                .into_iter()
+                .map(|(label, file_name)| (label.into(), log_dir.join(file_name))),
+        );
     }
     files
 }
@@ -1582,6 +1574,20 @@ mod tests {
         let tail = read_tail_lines(&path, 2).expect("tail");
 
         assert_eq!(tail, "three\nfour\n");
+    }
+
+    #[test]
+    fn cli_log_selection_includes_diagnostic_logs() {
+        let mut profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
+        profile.tunnel.tunnel_type = "none".into();
+        profile.actions.tunnel_type = "none".into();
+
+        let mcp = selected_log_files(&profile, LogSelection::Mcp);
+        let actions = selected_log_files(&profile, LogSelection::Actions);
+
+        assert!(mcp.iter().any(|(name, _)| name == "mcp-oauth"));
+        assert!(mcp.iter().any(|(name, _)| name == "mcp-requests"));
+        assert!(actions.iter().any(|(name, _)| name == "actions-oauth"));
     }
 
     #[test]

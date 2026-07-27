@@ -11,6 +11,9 @@ use super::registry::is_allowed_tool;
 static NETWORK_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 static DANGEROUS_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 static INTERPRETER_MUTATION_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static POSIX_ABSOLUTE_PATH_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static WINDOWS_ABSOLUTE_PATH_PATTERN: std::sync::OnceLock<regex::Regex> =
+    std::sync::OnceLock::new();
 
 const BASIC_READ_ONLY_COMMANDS: &[&str] = &[
     "pwd", "ls", "dir", "cat", "head", "tail", "grep", "find", "which", "echo",
@@ -442,11 +445,11 @@ fn command_contains_external_path(command: &str) -> bool {
     let normalized = command.replace('\\', "/");
     normalized.contains("../")
         || normalized.contains("..\\")
-        || regex::Regex::new(r#"(?i)(^|["'\s])/[^"]"#)
-            .expect("valid regex")
+        || POSIX_ABSOLUTE_PATH_PATTERN
+            .get_or_init(|| regex::Regex::new(r#"(?i)(^|["'\s])/[^"]"#).expect("valid regex"))
             .is_match(&normalized)
-        || regex::Regex::new(r"(?i)\b[A-Z]:/")
-            .expect("valid regex")
+        || WINDOWS_ABSOLUTE_PATH_PATTERN
+            .get_or_init(|| regex::Regex::new(r"(?i)\b[A-Z]:/").expect("valid regex"))
             .is_match(&normalized)
 }
 
