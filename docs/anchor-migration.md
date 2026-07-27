@@ -9,7 +9,7 @@
 | Actions service name | `anchor-actions` |
 | CLI | `anchor` |
 | 桌面可执行文件 | `anchor-desktop` |
-| Rust package | `anchor` |
+| Rust package | `anchor-desktop` |
 | Rust library crate | `anchor_lib` |
 | NPM package | `anchor-desktop` |
 | 配置目录 | `anchor` |

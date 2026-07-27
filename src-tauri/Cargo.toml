@@ -1,5 +1,5 @@
 [package]
-name = "anchor"
+name = "anchor-desktop"
 version = "0.1.23"
 description = "Anchor desktop and CLI workspace gateway"
 authors = ["Anchor Contributors"]

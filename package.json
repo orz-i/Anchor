@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite dev",
     "desktop": "tauri dev",
-    "desktop:build": "tauri build",
+    "desktop:build": "node scripts/prepare-desktop-build.mjs && tauri build",
     "cli:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
     "start": "tauri dev",
     "build": "vite build",
