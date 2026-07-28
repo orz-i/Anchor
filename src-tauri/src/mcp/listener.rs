@@ -49,7 +49,7 @@ struct ListenerState {
     mcp: SharedState,
     auth: AuthConfig,
     workspace_id: String,
-    workspace_path: String,
+    workspace_name: String,
     bind_port: u16,
     configured_public_url: SharedPublicUrl,
     bearer_token: Option<String>,
@@ -106,6 +106,7 @@ pub fn spawn_listener(
     port: u16,
     workspace_path: PathBuf,
     workspace_id: String,
+    workspace_name: String,
     auth: AuthConfig,
     public_base_url: String,
     oauth_client_secret: Option<String>,
@@ -113,7 +114,6 @@ pub fn spawn_listener(
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
 ) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
-    let workspace_display = workspace_path.display().to_string();
     let proxy_specs = parse_mcp_proxy_config(&runtime.mcp_config, &workspace_path)?;
     let workspace = Workspace::new(workspace_path)
         .map_err(|e| e.message())?
@@ -195,7 +195,7 @@ pub fn spawn_listener(
         mcp,
         auth,
         workspace_id,
-        workspace_path: workspace_display,
+        workspace_name,
         bind_port: port,
         configured_public_url,
         bearer_token,
@@ -887,7 +887,7 @@ async fn oauth_authorize_get(
         oauth,
         params,
         &resolve_oauth_resource(&state, &headers),
-        Some(state.workspace_path.as_str()),
+        Some(state.workspace_name.as_str()),
     );
     append_profile_log(
         &state.workspace_id,
@@ -1083,7 +1083,7 @@ mod tests {
                 mcp,
                 auth,
                 workspace_id: workspace_id.clone(),
-                workspace_path: "listener-test".into(),
+                workspace_name: "Listener Test".into(),
                 bind_port: 28766,
                 configured_public_url: register_public_url(
                     &workspace_id,

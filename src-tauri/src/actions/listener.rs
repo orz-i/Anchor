@@ -39,6 +39,7 @@ struct AppState {
     ctx: Arc<ToolContext>,
     openapi: Arc<RwLock<Value>>,
     auth: Arc<AuthConfig>,
+    workspace_name: String,
     workspace_path: String,
     workspace_id: String,
     bind_port: u16,
@@ -58,6 +59,7 @@ fn actions_http_error(status: StatusCode, detail: &str) -> Response {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_listener(
     workspace_id: &str,
+    workspace_name: String,
     actions_port: u16,
     workspace_path: PathBuf,
     public_base_url: String,
@@ -121,6 +123,7 @@ pub fn spawn_listener(
             listener,
             actions_port,
             &profile_id,
+            workspace_name,
             workspace_path,
             configured_public_url,
             auth_type,
@@ -154,6 +157,7 @@ async fn serve(
     listener: tokio::net::TcpListener,
     actions_port: u16,
     profile_id: &str,
+    workspace_name: String,
     workspace_path: PathBuf,
     configured_public_url: SharedPublicUrl,
     auth_type: String,
@@ -203,6 +207,7 @@ async fn serve(
     ));
 
     let state = AppState {
+        workspace_name,
         workspace_path: ctx.workspace_path(),
         workspace_id: profile_id.to_string(),
         ctx,
@@ -448,7 +453,7 @@ async fn oauth_authorize_get(
         oauth,
         params,
         &resolve_oauth_resource(&state, &headers),
-        Some(state.workspace_path.as_str()),
+        Some(state.workspace_name.as_str()),
     );
     append_profile_log(
         &state.workspace_id,

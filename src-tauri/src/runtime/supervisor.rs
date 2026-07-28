@@ -414,6 +414,7 @@ impl RuntimeSupervisor {
                     port,
                     PathBuf::from(&profile.path),
                     profile.id.clone(),
+                    profile.name.clone(),
                     auth,
                     profile.mcp_external_base_url_with(&settings),
                     oauth_client_secret,
@@ -467,6 +468,7 @@ impl RuntimeSupervisor {
                 let policy = PolicySettings::from_actions_config(&profile.actions);
                 actions::spawn_listener(
                     &profile.id,
+                    profile.name.clone(),
                     port,
                     PathBuf::from(&profile.path),
                     public_base_url,

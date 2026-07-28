@@ -509,7 +509,7 @@ pub fn authorize_get(
     oauth: &OAuthRuntime,
     params: AuthorizeParams,
     canonical_resource_url: &str,
-    workspace_path: Option<&str>,
+    workspace_name: Option<&str>,
 ) -> Response {
     if params.response_type != "code" {
         return html_error("response_type must be 'code'", StatusCode::BAD_REQUEST);
@@ -540,7 +540,7 @@ pub fn authorize_get(
         &params.state,
         canonical_resource_url,
         "",
-        workspace_path,
+        workspace_name,
     ))
     .into_response()
 }
@@ -914,16 +914,16 @@ fn login_page(
     state: &str,
     resource: &str,
     error: &str,
-    workspace_path: Option<&str>,
+    workspace_name: Option<&str>,
 ) -> String {
     let error_block = if error.is_empty() {
         String::new()
     } else {
         format!("<p style=\"color:red\">{}</p>", html_escape(error))
     };
-    let workspace_block = workspace_path
-        .filter(|path| !path.is_empty())
-        .map(|path| format!("<p>Workspace: <code>{}</code></p>", html_escape(path)))
+    let workspace_block = workspace_name
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("<p>Workspace: <code>{}</code></p>", html_escape(name)))
         .unwrap_or_default();
     format!(
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
@@ -1325,6 +1325,23 @@ mod tests {
         assert!(!page.contains("trust_redirect_uri"));
         assert!(!page.contains("Redirect URI"));
         assert!(page.contains(&format!("name='redirect_uri' value='{callback}'")));
+    }
+
+    #[test]
+    fn authorization_page_displays_workspace_name_without_a_path() {
+        let page = login_page(
+            "client",
+            "https://chatgpt.com/connector/oauth/callback-123",
+            "challenge",
+            "S256",
+            "state",
+            "https://service.example/mcp",
+            "",
+            Some("Anchor 主工作区"),
+        );
+
+        assert!(page.contains("Workspace: <code>Anchor 主工作区</code>"));
+        assert!(!page.contains("D:\\anchor"));
     }
 
     #[test]
