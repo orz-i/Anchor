@@ -934,7 +934,6 @@ fn login_page(
         </head><body>\
         <h2>Authorize Anchor</h2>\
         {workspace_block}\
-        <p>Client: <strong>{}</strong></p>\
         {error_block}\
         <form method='POST' action='/oauth/authorize'>\
         <input type='hidden' name='client_id' value='{}'>\
@@ -946,7 +945,6 @@ fn login_page(
         <label>Password<input type='password' name='password' autocomplete='current-password' required></label>\
         <button type='submit'>Authorize</button>\
         </form></body></html>",
-        html_escape(client_id),
         html_escape(client_id),
         html_escape(redirect_uri),
         html_escape(code_challenge),
@@ -1325,6 +1323,23 @@ mod tests {
         assert!(!page.contains("trust_redirect_uri"));
         assert!(!page.contains("Redirect URI"));
         assert!(page.contains(&format!("name='redirect_uri' value='{callback}'")));
+    }
+
+    #[test]
+    fn authorization_page_hides_client_id_display_but_preserves_form_value() {
+        let page = login_page(
+            "chatgpt-client-test",
+            "https://chatgpt.com/connector/oauth/callback-123",
+            "challenge",
+            "S256",
+            "state",
+            "https://service.example/mcp",
+            "",
+            None,
+        );
+
+        assert!(!page.contains("Client:"));
+        assert!(page.contains("name='client_id' value='chatgpt-client-test'"));
     }
 
     #[test]
