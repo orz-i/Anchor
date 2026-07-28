@@ -172,7 +172,7 @@ pub struct RuntimeRecoveryDto {
 }
 
 fn default_tunnel_type() -> String {
-    "frp".to_string()
+    "cloudflare".to_string()
 }
 
 fn default_cloudflare_mode() -> String {
@@ -466,7 +466,39 @@ fn computed_public_url(
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeConfig;
+    use super::{ActionsConfig, RuntimeConfig, TunnelConfig, WorkspaceProfile};
+
+    #[test]
+    fn workspace_defaults_to_cloudflare_quick_tunnels() {
+        let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+
+        assert_eq!(profile.tunnel.tunnel_type, "cloudflare");
+        assert_eq!(profile.tunnel.cloudflare_mode, "quick");
+        assert_eq!(profile.actions.tunnel_type, "cloudflare");
+        assert_eq!(profile.actions.cloudflare_mode, "quick");
+    }
+
+    #[test]
+    fn missing_tunnel_type_defaults_to_cloudflare_quick() {
+        let tunnel: TunnelConfig =
+            serde_json::from_value(serde_json::json!({})).expect("legacy tunnel config");
+        let actions: ActionsConfig =
+            serde_json::from_value(serde_json::json!({})).expect("legacy actions config");
+
+        assert_eq!(tunnel.tunnel_type, "cloudflare");
+        assert_eq!(tunnel.cloudflare_mode, "quick");
+        assert_eq!(actions.tunnel_type, "cloudflare");
+        assert_eq!(actions.cloudflare_mode, "quick");
+    }
+
+    #[test]
+    fn explicit_frp_tunnel_type_is_preserved() {
+        let tunnel: TunnelConfig = serde_json::from_value(serde_json::json!({ "type": "frp" }))
+            .expect("explicit FRP tunnel config");
+
+        assert_eq!(tunnel.tunnel_type, "frp");
+        assert_eq!(tunnel.cloudflare_mode, "quick");
+    }
 
     #[test]
     fn legacy_runtime_config_enables_default_skill_roots() {

@@ -670,6 +670,9 @@ async fn execute_mcp_request(
             request_id, method, tool_name, outcome, duration_ms
         ),
     );
+    if method == "tools/list" {
+        log_tools_list_catalog(&state.workspace_id, &response);
+    }
     state.activity.request_finished(session_id, request_id);
     if tool_name == "exec_command" || tool_name == "exec_health_check" {
         let structured = response
@@ -702,6 +705,60 @@ async fn execute_mcp_request(
         );
     }
     Json(response).into_response()
+}
+
+fn log_tools_list_catalog(workspace_id: &str, response: &Value) {
+    if let Some(metrics) = response
+        .get("result")
+        .and_then(|result| result.get("_meta"))
+        .and_then(|meta| meta.get("anchor/catalog"))
+    {
+        let page = response
+            .get("result")
+            .and_then(|result| result.get("_meta"))
+            .and_then(|meta| meta.get("anchor/page"));
+        append_profile_log(
+            workspace_id,
+            "mcp-requests.log",
+            &format!(
+                "[catalog] status=ok local_tool_count={} proxy_tool_count={} tool_count={} catalog_bytes={} estimated_tokens={} page_start={} page_end={} has_next_cursor={}",
+                metrics["local_tool_count"],
+                metrics["proxy_tool_count"],
+                metrics["tool_count"],
+                metrics["catalog_bytes"],
+                metrics["estimated_tokens"],
+                page.and_then(|value| value.get("start")).unwrap_or(&Value::Null),
+                page.and_then(|value| value.get("end")).unwrap_or(&Value::Null),
+                response
+                    .get("result")
+                    .and_then(|result| result.get("nextCursor"))
+                    .is_some()
+            ),
+        );
+        return;
+    }
+
+    let data = response.get("error").and_then(|error| error.get("data"));
+    let details = data.and_then(|data| data.get("details"));
+    if data
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        == Some("EFFECTIVE_CATALOG_CHATGPT_BUDGET_EXCEEDED")
+    {
+        append_profile_log(
+            workspace_id,
+            "mcp-requests.log",
+            &format!(
+                "[catalog] status=rejected reason=chatgpt_catalog_budget_exceeded local_tool_count={} proxy_tool_count={} tool_count={} catalog_bytes={} estimated_tokens={} budget={}",
+                details.and_then(|value| value.get("local_tool_count")).unwrap_or(&Value::Null),
+                details.and_then(|value| value.get("proxy_tool_count")).unwrap_or(&Value::Null),
+                details.and_then(|value| value.get("tool_count")).unwrap_or(&Value::Null),
+                details.and_then(|value| value.get("catalog_bytes")).unwrap_or(&Value::Null),
+                details.and_then(|value| value.get("estimated_tokens")).unwrap_or(&Value::Null),
+                details.and_then(|value| value.get("budget")).unwrap_or(&Value::Null)
+            ),
+        );
+    }
 }
 
 fn session_id_from_headers(headers: &HeaderMap) -> Option<&str> {

@@ -669,7 +669,11 @@ pub fn output_schema(name: &str) -> Value {
                 "endpoint_path": { "type": "string", "const": "/mcp" },
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "tool_count": { "type": "integer", "minimum": 0 },
-                "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 }
+                "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "catalog_bytes": { "type": "integer", "minimum": 0 },
+                "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
+                "local_tool_count": { "type": "integer", "minimum": 0 },
+                "proxy_tool_count": { "type": "integer", "minimum": 0 }
             }),
             &[
                 "server",
@@ -687,6 +691,10 @@ pub fn output_schema(name: &str) -> Value {
                 "tools",
                 "tool_count",
                 "catalog_digest",
+                "catalog_bytes",
+                "catalog_estimated_tokens",
+                "local_tool_count",
+                "proxy_tool_count",
             ],
         ),
         "read_file" => success_output_schema(

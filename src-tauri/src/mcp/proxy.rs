@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,17 +19,42 @@ use crate::tunnel::append_profile_log;
 
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_TOOL_LIST_PAGES: usize = 100;
+const MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER: usize = 4_096;
 const MAX_PROXY_TOOLS_PER_SERVER: usize = 256;
 const MAX_PROXY_TOOLS_TOTAL: usize = 512;
 const MAX_PROXY_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SanitizedProxyTool {
     public_name: String,
     downstream_name: String,
     definition: Value,
     input_schema: Value,
-    output_schema: Option<Value>,
+    output_schema: Value,
+    synthesized_output_schema: bool,
+}
+
+fn fallback_proxy_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": { "type": "boolean" },
+            "result": {
+                "type": "object",
+                "additionalProperties": true
+            }
+        },
+        "required": ["ok"],
+        "additionalProperties": true
+    })
+}
+
+#[derive(Debug)]
+struct SanitizedProxyCatalog {
+    tools: Vec<SanitizedProxyTool>,
+    discovered_count: usize,
+    filtered_count: usize,
+    truncated_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +65,9 @@ pub struct McpProxyServerSpec {
     env: BTreeMap<String, String>,
     cwd: PathBuf,
     tool_prefix: String,
+    include_tools: Option<BTreeSet<String>>,
+    exclude_tools: BTreeSet<String>,
+    max_tools: Option<usize>,
     request_timeout: Duration,
 }
 
@@ -91,17 +119,69 @@ fn bounded_text(value: Option<&Value>, maximum: usize) -> Option<String> {
 fn sanitize_proxy_catalog(
     spec: &McpProxyServerSpec,
     catalog: Vec<Value>,
-) -> Result<Vec<SanitizedProxyTool>, String> {
-    if catalog.len() > MAX_PROXY_TOOLS_PER_SERVER {
+) -> Result<SanitizedProxyCatalog, String> {
+    if catalog.len() > MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER {
         return Err(format!(
-            "downstream MCP `{}` returned {} tools; maximum is {MAX_PROXY_TOOLS_PER_SERVER}",
+            "downstream MCP `{}` returned {} tools; discovery maximum is {MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER}",
             spec.name,
             catalog.len()
         ));
     }
-    let mut sanitized = Vec::with_capacity(catalog.len());
-    let mut names = std::collections::HashSet::new();
+    let discovered_count = catalog.len();
+    let mut selected = Vec::with_capacity(catalog.len());
+    let mut discovered_names = BTreeSet::new();
     for (index, tool) in catalog.into_iter().enumerate() {
+        let downstream_name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && name.len() <= 128)
+            .ok_or_else(|| format!("downstream tool #{index} has an invalid name"))?
+            .to_string();
+        discovered_names.insert(downstream_name.clone());
+        if spec
+            .include_tools
+            .as_ref()
+            .is_some_and(|included| !included.contains(&downstream_name))
+            || spec.exclude_tools.contains(&downstream_name)
+        {
+            continue;
+        }
+        selected.push((downstream_name, tool));
+    }
+    if let Some(included) = spec.include_tools.as_ref() {
+        let missing = included
+            .difference(&discovered_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "downstream MCP `{}` did not advertise includeTools entries: {}",
+                spec.name,
+                missing.join(", ")
+            ));
+        }
+    }
+
+    selected.sort_by(|left, right| left.0.cmp(&right.0));
+    let filtered_count = discovered_count.saturating_sub(selected.len());
+    let truncated_count = spec
+        .max_tools
+        .map(|maximum| selected.len().saturating_sub(maximum))
+        .unwrap_or_default();
+    if let Some(maximum) = spec.max_tools {
+        selected.truncate(maximum);
+    }
+    if selected.len() > MAX_PROXY_TOOLS_PER_SERVER {
+        return Err(format!(
+            "downstream MCP `{}` selected {} tools after includeTools/excludeTools; maximum is {MAX_PROXY_TOOLS_PER_SERVER}. Configure maxTools or narrower filters",
+            spec.name,
+            selected.len()
+        ));
+    }
+
+    let mut sanitized = Vec::with_capacity(selected.len());
+    let mut names = std::collections::HashSet::new();
+    for (index, (downstream_name, tool)) in selected.into_iter().enumerate() {
         let Some(object) = tool.as_object() else {
             return Err(format!("downstream tool #{index} is not an object"));
         };
@@ -112,12 +192,6 @@ fn sanitize_proxy_catalog(
         {
             return Err(format!("downstream tool #{index} definition is too large"));
         }
-        let downstream_name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty() && name.len() <= 128)
-            .ok_or_else(|| format!("downstream tool #{index} has an invalid name"))?
-            .to_string();
         let public_name = format!(
             "{}__{}",
             sanitize_tool_segment(&spec.tool_prefix),
@@ -141,13 +215,16 @@ fn sanitize_proxy_catalog(
             &input_schema,
             &format!("downstream tool `{downstream_name}` inputSchema"),
         )?;
-        let output_schema = object.get("outputSchema").cloned();
-        if let Some(schema) = output_schema.as_ref() {
-            validate_schema_document(
-                schema,
-                &format!("downstream tool `{downstream_name}` outputSchema"),
-            )?;
-        }
+        let (output_schema, synthesized_output_schema) =
+            if let Some(schema) = object.get("outputSchema") {
+                validate_schema_document(
+                    schema,
+                    &format!("downstream tool `{downstream_name}` outputSchema"),
+                )?;
+                (schema.clone(), false)
+            } else {
+                (fallback_proxy_output_schema(), true)
+            };
         let title = bounded_text(object.get("title"), 512)
             .unwrap_or_else(|| format!("{} · {}", spec.name, downstream_name));
         let description = bounded_text(object.get("description"), 8192)
@@ -166,22 +243,25 @@ fn sanitize_proxy_catalog(
                 "destructiveHint": true,
                 "idempotentHint": false,
                 "openWorldHint": true
-            },
-            "execution": { "taskSupport": "forbidden" }
+            }
         });
-        if let Some(schema) = output_schema.as_ref() {
-            definition["outputSchema"] = schema.clone();
-        }
+        definition["outputSchema"] = output_schema.clone();
         sanitized.push(SanitizedProxyTool {
             public_name,
             downstream_name,
             definition,
             input_schema,
             output_schema,
+            synthesized_output_schema,
         });
     }
     sanitized.sort_by(|left, right| left.public_name.cmp(&right.public_name));
-    Ok(sanitized)
+    Ok(SanitizedProxyCatalog {
+        tools: sanitized,
+        discovered_count,
+        filtered_count,
+        truncated_count,
+    })
 }
 
 fn proxy_catalog_digest(catalog: &[SanitizedProxyTool]) -> Result<String, String> {
@@ -203,7 +283,7 @@ fn proxy_catalog_digest(catalog: &[SanitizedProxyTool]) -> Result<String, String
 async fn connect_initial_with_retry(
     spec: McpProxyServerSpec,
     workspace_id: String,
-) -> Result<(Arc<ProxyServer>, Vec<SanitizedProxyTool>), String> {
+) -> Result<(Arc<ProxyServer>, SanitizedProxyCatalog), String> {
     let mut last_error = String::new();
     for attempt in 1u8..=3 {
         let attempt_timeout = spec.request_timeout.min(Duration::from_secs(20));
@@ -259,6 +339,12 @@ struct RawMcpServerConfig {
     disabled: bool,
     #[serde(rename = "toolPrefix", default)]
     tool_prefix: Option<String>,
+    #[serde(rename = "includeTools", default)]
+    include_tools: Option<Vec<String>>,
+    #[serde(rename = "excludeTools", default)]
+    exclude_tools: Vec<String>,
+    #[serde(rename = "maxTools", default)]
+    max_tools: Option<usize>,
     #[serde(rename = "requestTimeoutSeconds", default)]
     request_timeout_seconds: Option<u64>,
 }
@@ -269,7 +355,8 @@ struct ProxyRoute {
     server_name: String,
     downstream_name: String,
     input_schema: Value,
-    output_schema: Option<Value>,
+    output_schema: Value,
+    synthesized_output_schema: bool,
 }
 
 #[derive(Default)]
@@ -358,7 +445,7 @@ impl McpProxyRegistry {
                     let mut added = 0usize;
                     let mut skipped_duplicates = Vec::new();
                     let mut state = self.state.write().expect("mcp proxy registry write");
-                    for tool in catalog {
+                    for tool in catalog.tools {
                         if state.tools.len() >= MAX_PROXY_TOOLS_TOTAL {
                             append_profile_log(
                                 &workspace_id,
@@ -382,6 +469,7 @@ impl McpProxyRegistry {
                                 downstream_name: tool.downstream_name,
                                 input_schema: tool.input_schema,
                                 output_schema: tool.output_schema,
+                                synthesized_output_schema: tool.synthesized_output_schema,
                             },
                         );
                         state.tools.push(tool.definition);
@@ -400,7 +488,12 @@ impl McpProxyRegistry {
                     append_profile_log(
                         &workspace_id,
                         "stdout.log",
-                        &format!("[mcp-proxy:{server_name}] connected; merged {added} tools"),
+                        &format!(
+                            "[mcp-proxy:{server_name}] connected; discovered={} filtered={} max_tools_truncated={} merged={added}",
+                            catalog.discovered_count,
+                            catalog.filtered_count,
+                            catalog.truncated_count
+                        ),
                     );
                 }
                 Err(error) => append_profile_log(
@@ -514,7 +607,8 @@ impl McpProxyRegistry {
                 &server_name,
                 public_name,
                 result,
-                route.output_schema.as_ref(),
+                &route.output_schema,
+                route.synthesized_output_schema,
             )
             .unwrap_or_else(|message| {
                 proxy_call_error_result(
@@ -549,10 +643,10 @@ impl ProxyServer {
     async fn connect_initial(
         spec: McpProxyServerSpec,
         workspace_id: String,
-    ) -> Result<(Arc<Self>, Vec<SanitizedProxyTool>), String> {
+    ) -> Result<(Arc<Self>, SanitizedProxyCatalog), String> {
         let (client, catalog) = McpProxyClient::connect(spec.clone(), &workspace_id).await?;
         let catalog = sanitize_proxy_catalog(&spec, catalog)?;
-        let catalog_digest = proxy_catalog_digest(&catalog)?;
+        let catalog_digest = proxy_catalog_digest(&catalog.tools)?;
         Ok((
             Arc::new(Self {
                 spec,
@@ -573,7 +667,7 @@ impl ProxyServer {
         let (connected, catalog) =
             McpProxyClient::connect(self.spec.clone(), &self.workspace_id).await?;
         let catalog = sanitize_proxy_catalog(&self.spec, catalog)?;
-        let reconnected_digest = proxy_catalog_digest(&catalog)?;
+        let reconnected_digest = proxy_catalog_digest(&catalog.tools)?;
         if reconnected_digest != self.catalog_digest {
             return Err(
                 "downstream tool catalog contract changed; restart the MCP listener to renegotiate tools/list"
@@ -661,7 +755,8 @@ fn normalize_proxy_tool_result(
     server_name: &str,
     public_name: &str,
     result: Value,
-    output_schema: Option<&Value>,
+    output_schema: &Value,
+    synthesized_output_schema: bool,
 ) -> Result<Value, String> {
     let Some(object) = result.as_object() else {
         return Err("downstream tools/call result is not an object".into());
@@ -679,40 +774,47 @@ fn normalize_proxy_tool_result(
     }) {
         return Err("downstream tools/call content contains an invalid item".into());
     }
-    let structured = object.get("structuredContent").cloned();
+    let is_error = object.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let mut structured = object.get("structuredContent").cloned();
     if structured.as_ref().is_some_and(|value| !value.is_object()) {
         return Err("downstream structuredContent must be an object".into());
     }
-    if let Some(schema) = output_schema {
+    if synthesized_output_schema {
+        structured = Some(json!({
+            "ok": !is_error,
+            "result": structured.unwrap_or_else(|| json!({}))
+        }));
+    } else {
         let structured = structured.as_ref().ok_or_else(|| {
             "downstream tool declared outputSchema but omitted structuredContent".to_string()
         })?;
-        jsonschema::validator_for(schema)
+        jsonschema::validator_for(output_schema)
             .map_err(|error| format!("failed to compile downstream outputSchema: {error}"))?
             .validate(structured)
             .map_err(|error| {
                 format!("downstream structuredContent violates outputSchema: {error}")
             })?;
     }
-    if let Some(structured) = structured.as_ref() {
-        let has_text = content
-            .iter()
-            .any(|item| item.get("type") == Some(&json!("text")));
-        if !has_text {
-            content.push(json!({"type": "text", "text": structured.to_string()}));
-        }
+    let structured = structured.expect("proxy output normalization always produces an object");
+    jsonschema::validator_for(output_schema)
+        .map_err(|error| format!("failed to compile normalized outputSchema: {error}"))?
+        .validate(&structured)
+        .map_err(|error| format!("normalized structuredContent violates outputSchema: {error}"))?;
+    let has_text = content
+        .iter()
+        .any(|item| item.get("type") == Some(&json!("text")));
+    if !has_text {
+        content.push(json!({"type": "text", "text": structured.to_string()}));
     }
     let mut normalized = json!({
         "content": content,
-        "isError": object.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        "isError": is_error,
         "_meta": {
             "proxyServer": server_name,
             "proxyTool": public_name
         }
     });
-    if let Some(structured) = structured {
-        normalized["structuredContent"] = structured;
-    }
+    normalized["structuredContent"] = structured;
     Ok(normalized)
 }
 
@@ -1047,6 +1149,20 @@ pub fn parse_mcp_proxy_config(
             .unwrap_or_else(|| workspace_path.to_path_buf());
         let tool_prefix =
             sanitize_tool_segment(config.tool_prefix.as_deref().unwrap_or(name.as_str()));
+        let include_tools = config
+            .include_tools
+            .map(|tools| parse_configured_tool_names(&name, "includeTools", tools))
+            .transpose()?;
+        let exclude_tools =
+            parse_configured_tool_names(&name, "excludeTools", config.exclude_tools)?;
+        if config
+            .max_tools
+            .is_some_and(|maximum| maximum > MAX_PROXY_TOOLS_PER_SERVER)
+        {
+            return Err(format!(
+                "MCP server `{name}` maxTools must be at most {MAX_PROXY_TOOLS_PER_SERVER}"
+            ));
+        }
 
         specs.push(McpProxyServerSpec {
             name,
@@ -1055,6 +1171,9 @@ pub fn parse_mcp_proxy_config(
             env,
             cwd,
             tool_prefix,
+            include_tools,
+            exclude_tools,
+            max_tools: config.max_tools,
             request_timeout: Duration::from_secs(
                 config
                     .request_timeout_seconds
@@ -1064,6 +1183,28 @@ pub fn parse_mcp_proxy_config(
         });
     }
     Ok(specs)
+}
+
+fn parse_configured_tool_names(
+    server_name: &str,
+    field: &str,
+    values: Vec<String>,
+) -> Result<BTreeSet<String>, String> {
+    let mut names = BTreeSet::new();
+    for value in values {
+        let name = value.trim();
+        if name.is_empty() || name.len() > 128 {
+            return Err(format!(
+                "MCP server `{server_name}` {field} contains an empty or overlong tool name"
+            ));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!(
+                "MCP server `{server_name}` {field} contains duplicate tool `{name}`"
+            ));
+        }
+    }
+    Ok(names)
 }
 
 fn expand_workspace_placeholders(value: &str, workspace_path: &str) -> String {
@@ -1094,7 +1235,7 @@ fn sanitize_tool_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -1116,8 +1257,23 @@ mod tests {
             env: BTreeMap::new(),
             cwd: Path::new(".").to_path_buf(),
             tool_prefix: "test".into(),
+            include_tools: None,
+            exclude_tools: BTreeSet::new(),
+            max_tools: None,
             request_timeout: Duration::from_secs(5),
         }
+    }
+
+    fn raw_proxy_tool(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "description": format!("Browser action {name}"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        })
     }
 
     #[test]
@@ -1142,15 +1298,24 @@ mod tests {
             })],
         )
         .expect("valid catalog");
-        assert_eq!(catalog.len(), 1);
-        let definition = &catalog[0].definition;
+        assert_eq!(catalog.tools.len(), 1);
+        let definition = &catalog.tools[0].definition;
         assert_eq!(definition["name"], "test__read_secret");
         assert_eq!(definition["annotations"]["readOnlyHint"], false);
         assert_eq!(definition["annotations"]["destructiveHint"], true);
         assert_eq!(definition["annotations"]["openWorldHint"], true);
-        assert_eq!(definition["execution"]["taskSupport"], "forbidden");
+        assert!(definition.get("execution").is_none());
         assert!(definition.get("_meta").is_none());
-        let validator = jsonschema::validator_for(&catalog[0].input_schema).unwrap();
+        assert_eq!(definition["outputSchema"]["required"], json!(["ok"]));
+        assert!(catalog.tools[0].synthesized_output_schema);
+        let effective = crate::tools::build_effective_catalog_from_parts(
+            "core",
+            true,
+            vec![definition.clone()],
+        )
+        .expect("sanitized proxy tool passes the final effective catalog contract");
+        assert_eq!(effective.proxy_count, 1);
+        let validator = jsonschema::validator_for(&catalog.tools[0].input_schema).unwrap();
         assert!(validator.validate(&json!({"path": "README.md"})).is_ok());
         assert!(validator.validate(&json!({"unknown": true})).is_err());
     }
@@ -1201,9 +1366,51 @@ mod tests {
         )
         .expect("second catalog");
         assert_ne!(
-            proxy_catalog_digest(&first).unwrap(),
-            proxy_catalog_digest(&second).unwrap()
+            proxy_catalog_digest(&first.tools).unwrap(),
+            proxy_catalog_digest(&second.tools).unwrap()
         );
+    }
+
+    #[test]
+    fn proxy_catalog_applies_include_exclude_and_max_tools_deterministically() {
+        let mut spec = test_spec();
+        spec.include_tools = Some(
+            ["click", "navigate", "screenshot"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        spec.exclude_tools = ["navigate"].into_iter().map(str::to_string).collect();
+        spec.max_tools = Some(1);
+
+        let catalog = sanitize_proxy_catalog(
+            &spec,
+            vec![
+                raw_proxy_tool("screenshot"),
+                raw_proxy_tool("evaluate"),
+                raw_proxy_tool("navigate"),
+                raw_proxy_tool("click"),
+                raw_proxy_tool("tabs"),
+            ],
+        )
+        .expect("filtered catalog");
+
+        assert_eq!(catalog.discovered_count, 5);
+        assert_eq!(catalog.filtered_count, 3);
+        assert_eq!(catalog.truncated_count, 1);
+        assert_eq!(catalog.tools.len(), 1);
+        assert_eq!(catalog.tools[0].downstream_name, "click");
+        assert_eq!(catalog.tools[0].public_name, "test__click");
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_missing_include_tools_entries() {
+        let mut spec = test_spec();
+        spec.include_tools = Some(["missing"].into_iter().map(str::to_string).collect());
+
+        let error = sanitize_proxy_catalog(&spec, vec![raw_proxy_tool("click")])
+            .expect_err("missing configured tool");
+        assert!(error.contains("did not advertise includeTools entries: missing"));
     }
 
     #[test]
@@ -1221,7 +1428,8 @@ mod tests {
                 "content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}],
                 "structuredContent": {"value": "ok"}
             }),
-            Some(&output_schema),
+            &output_schema,
+            false,
         )
         .expect("valid result");
         assert!(valid["content"]
@@ -1234,9 +1442,36 @@ mod tests {
                 "content": [{"type": "text", "text": "bad"}],
                 "structuredContent": {"value": 1}
             }),
-            Some(&output_schema),
+            &output_schema,
+            false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn proxy_results_synthesize_structured_output_when_downstream_omits_schema() {
+        let catalog = sanitize_proxy_catalog(&test_spec(), vec![raw_proxy_tool("click")])
+            .expect("proxy catalog");
+        let tool = &catalog.tools[0];
+
+        let normalized = normalize_proxy_tool_result(
+            "browser",
+            "test__click",
+            json!({
+                "content": [{"type": "text", "text": "clicked"}]
+            }),
+            &tool.output_schema,
+            tool.synthesized_output_schema,
+        )
+        .expect("normalized result");
+
+        assert_eq!(normalized["structuredContent"]["ok"], true);
+        assert_eq!(normalized["structuredContent"]["result"], json!({}));
+        assert_eq!(normalized["isError"], false);
+        assert!(jsonschema::validator_for(&tool.output_schema)
+            .expect("fallback output schema")
+            .validate(&normalized["structuredContent"])
+            .is_ok());
     }
 
     #[test]
@@ -1259,6 +1494,49 @@ mod tests {
         assert_eq!(specs[0].name, "code graph");
         assert_eq!(specs[0].tool_prefix, "code_graph");
         assert_eq!(specs[0].args[2], "/tmp/example");
+    }
+
+    #[test]
+    fn parses_proxy_tool_selection_controls() {
+        let specs = parse_mcp_proxy_config(
+            r#"{
+                "mcpServers": {
+                    "browser": {
+                        "command": "browser-mcp",
+                        "includeTools": ["navigate", "click", "screenshot"],
+                        "excludeTools": ["screenshot"],
+                        "maxTools": 2
+                    }
+                }
+            }"#,
+            Path::new("/tmp/example"),
+        )
+        .expect("parse selection controls");
+
+        let spec = &specs[0];
+        assert_eq!(spec.max_tools, Some(2));
+        assert!(spec
+            .include_tools
+            .as_ref()
+            .is_some_and(|tools| tools.contains("navigate") && tools.contains("click")));
+        assert!(spec.exclude_tools.contains("screenshot"));
+    }
+
+    #[test]
+    fn rejects_invalid_proxy_tool_selection_controls() {
+        let duplicate = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"browser":{"command":"browser-mcp","includeTools":["click","click"]}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("duplicate includeTools");
+        assert!(duplicate.contains("includeTools contains duplicate tool `click`"));
+
+        let excessive = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"browser":{"command":"browser-mcp","maxTools":257}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("excessive maxTools");
+        assert!(excessive.contains("maxTools must be at most 256"));
     }
 
     #[test]
@@ -1332,6 +1610,9 @@ for raw in sys.stdin:
                     env: BTreeMap::new(),
                     cwd: temp.path().to_path_buf(),
                     tool_prefix: "slow".into(),
+                    include_tools: None,
+                    exclude_tools: BTreeSet::new(),
+                    max_tools: None,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-cancellation-test",
@@ -1413,16 +1694,21 @@ for raw in sys.stdin:
                     env: BTreeMap::new(),
                     cwd: temp.path().to_path_buf(),
                     tool_prefix: "unstable".into(),
+                    include_tools: None,
+                    exclude_tools: BTreeSet::new(),
+                    max_tools: None,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-reconnect-test",
             )
             .await;
 
-        assert!(registry
-            .list_tools()
+        let exposed_tools = registry.list_tools();
+        let exposed = exposed_tools
             .iter()
-            .any(|tool| tool["name"] == "unstable__ping"));
+            .find(|tool| tool["name"] == "unstable__ping")
+            .expect("proxied tool is exposed");
+        assert_eq!(exposed["outputSchema"]["required"], json!(["ok"]));
 
         let first = registry
             .call_tool("unstable__ping", &json!({}))
@@ -1495,6 +1781,9 @@ for raw in sys.stdin:
                     env: BTreeMap::new(),
                     cwd: temp.path().to_path_buf(),
                     tool_prefix: "drift".into(),
+                    include_tools: None,
+                    exclude_tools: BTreeSet::new(),
+                    max_tools: None,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-catalog-drift-test",

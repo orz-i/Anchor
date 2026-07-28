@@ -543,6 +543,7 @@ fn server_info_for_session(
         "tool_count": tools.len(),
         "catalog_digest": catalog.digest,
         "catalog_bytes": catalog.total_bytes,
+        "catalog_estimated_tokens": catalog.estimated_tokens,
         "local_tool_count": catalog.local_count,
         "proxy_tool_count": catalog.proxy_count
     })))

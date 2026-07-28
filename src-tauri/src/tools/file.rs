@@ -268,10 +268,11 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             if matches.len() >= max_results {
                 continue;
             }
-            let preview = if line.len() > max_preview {
-                format!("{}...", &line[..max_preview])
+            let (preview, truncated, _) = truncate_bytes(line, max_preview);
+            let preview = if truncated {
+                format!("{preview}...")
             } else {
-                line.clone()
+                preview
             };
             let mut item = json!({
                 "path": rel,

@@ -15,7 +15,10 @@
       "command": "node",
       "args": [
         "C:\\\\Users\\\\mouta\\\\.agents\\\\skills\\\\my-agent-browser\\\\scripts\\\\start-mcp.js"
-      ]
+      ],
+      "includeTools": ["navigate", "click", "screenshot", "get_text"],
+      "excludeTools": ["evaluate"],
+      "maxTools": 12
     }
   }
 }`;
@@ -86,6 +89,9 @@
     当前支持 stdio MCP。启动 MCP 服务时会拉起这些进程，并将工具以
     <code class="font-mono">服务器名__工具名</code> 合并到公网 MCP；
     <code class="font-mono">{"${workspaceFolder}"}</code> 会替换为当前工作区路径。
+    可用 <code class="font-mono">includeTools</code>、<code class="font-mono">excludeTools</code>
+    和 <code class="font-mono">maxTools</code> 控制下游工具数量；工具名使用下游 MCP
+    原始名称，不包含服务器前缀。
   </p>
 
   {#if error}

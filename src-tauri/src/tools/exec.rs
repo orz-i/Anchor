@@ -12,6 +12,9 @@ use crate::tools::session::ExecSession;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::CancellationToken;
 
+const COMPLETION_GRACE: Duration = Duration::from_millis(50);
+const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     exec_command_with_cancellation(ctx, args, &CancellationToken::default())
 }
@@ -372,6 +375,29 @@ async fn run_command(
             });
         }
         if Instant::now() - start >= yield_time || tty {
+            if !tty && !yield_time.is_zero() {
+                let grace =
+                    COMPLETION_GRACE.min(deadline.saturating_duration_since(Instant::now()));
+                let grace_deadline = Instant::now() + grace;
+                while !session.has_exited()
+                    && !cancellation.is_cancelled()
+                    && Instant::now() < grace_deadline
+                {
+                    tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
+                    session.refresh_status().await;
+                }
+                if cancellation.is_cancelled()
+                    || (!session.has_exited() && Instant::now() >= deadline)
+                {
+                    continue;
+                }
+                if session.has_exited() {
+                    session.wait_for_readers().await;
+                    let snapshot = session.snapshot(max_output);
+                    ctx.sessions.remove(&session.session_id);
+                    return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
+                }
+            }
             let snapshot = session.snapshot(max_output);
             spawn_timeout_monitor(session.clone(), deadline);
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
@@ -486,35 +512,79 @@ fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -
         .get("details")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let termination_reason = match code {
+        "TIMEOUT" => "timeout",
+        "COMMAND_REJECTED" => "command_rejected",
+        _ => "spawn_failed",
+    };
+    let status = if code == "TIMEOUT" {
+        "exited"
+    } else {
+        termination_reason
+    };
+    let suggestion = details
+        .get("suggestion")
+        .and_then(Value::as_str)
+        .unwrap_or(match code {
+            "TIMEOUT" => "读取保留输出，调整 timeout_ms 后重试",
+            "COMMAND_REJECTED" => "检查命令白名单、路径和 Workspace 执行策略",
+            _ => "检查命令路径、权限和运行时环境后重试",
+        });
     let mut result = details.get("session").cloned().unwrap_or_else(|| {
         json!({
-            "status": "spawn_failed",
-            "termination_reason": "spawn_failed",
+            "status": status,
+            "termination_reason": termination_reason,
             "recoverable": error_value["retryable"].as_bool().unwrap_or(false),
+            "suggestion": suggestion,
             "exit_code": Value::Null,
             "stdout": "",
             "stderr": "",
             "stdout_truncated": false,
-            "stderr_truncated": false
+            "stderr_truncated": false,
+            "duration_ms": 0,
+            "elapsed_ms": 0,
+            "warnings": []
         })
     });
     if let Some(object) = result.as_object_mut() {
+        let elapsed_ms = object
+            .get("elapsed_ms")
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        object.entry("status").or_insert_with(|| json!(status));
+        object
+            .entry("termination_reason")
+            .or_insert_with(|| json!(termination_reason));
+        object
+            .entry("recoverable")
+            .or_insert_with(|| error_value["retryable"].clone());
+        object
+            .entry("suggestion")
+            .or_insert_with(|| json!(suggestion));
+        object.entry("exit_code").or_insert(Value::Null);
+        object.entry("stdout").or_insert_with(|| json!(""));
+        object.entry("stderr").or_insert_with(|| json!(""));
+        object
+            .entry("stdout_truncated")
+            .or_insert_with(|| Value::Bool(false));
+        object
+            .entry("stderr_truncated")
+            .or_insert_with(|| Value::Bool(false));
+        object
+            .entry("elapsed_ms")
+            .or_insert_with(|| elapsed_ms.clone());
+        object.entry("duration_ms").or_insert(elapsed_ms);
+        object.entry("warnings").or_insert_with(|| json!([]));
         object.insert("command".into(), json!(command));
         object.insert("resolved_cwd".into(), json!(cwd.display().to_string()));
         object.insert("execution_mode".into(), json!("direct"));
         object.insert("filesystem_scope".into(), json!("workspace"));
         object.insert("sandbox_enforced".into(), Value::Bool(false));
         object.insert("execution_boundary".into(), json!("policy_only"));
-        object.insert("child_process".into(), Value::Bool(true));
+        object.insert("child_process".into(), Value::Bool(code == "TIMEOUT"));
         object.insert("transport_ok".into(), Value::Bool(true));
         object.insert("command_ok".into(), Value::Bool(false));
         object.insert("error".into(), error_value);
-        if code == "TIMEOUT" {
-            object.insert("termination_reason".into(), json!("timeout"));
-        } else {
-            object.insert("status".into(), json!("spawn_failed"));
-            object.insert("termination_reason".into(), json!("spawn_failed"));
-        }
     }
     Some(result)
 }
@@ -670,13 +740,30 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn assert_failure_result(error: WorkspaceError, expected_code: &str) {
-        let result = execution_failure_result(&error, "missing-command", Path::new("C:/workspace"))
-            .expect("应转换为统一执行结果");
+    fn assert_failure_result(
+        error: WorkspaceError,
+        expected_code: &str,
+        expected_status: &str,
+        expected_reason: &str,
+    ) {
+        let result = tool_ok(
+            execution_failure_result(&error, "missing-command", Path::new("C:/workspace"))
+                .expect("应转换为统一执行结果"),
+        );
+        jsonschema::validator_for(&crate::tools::registry::output_schema("exec_command"))
+            .expect("exec output schema")
+            .validate(&result)
+            .expect("failure result must satisfy exec output schema");
         assert_eq!(result["transport_ok"], true);
         assert_eq!(result["command_ok"], false);
-        assert_eq!(result["status"], "spawn_failed");
+        assert_eq!(result["status"], expected_status);
+        assert_eq!(result["termination_reason"], expected_reason);
+        assert_eq!(result["child_process"], false);
         assert_eq!(result["error"]["code"], expected_code);
+        assert!(result["suggestion"].is_string());
+        assert!(result["duration_ms"].is_u64());
+        assert!(result["elapsed_ms"].is_u64());
+        assert!(result["warnings"].is_array());
     }
 
     #[test]
@@ -689,6 +776,8 @@ mod tests {
                 retryable: false,
             },
             "COMMAND_REJECTED",
+            "command_rejected",
+            "command_rejected",
         );
     }
 
@@ -703,6 +792,8 @@ mod tests {
                 details: json!({"recoverable": true}),
             },
             "COMMAND_SPAWN_FAILED",
+            "spawn_failed",
+            "spawn_failed",
         );
     }
 

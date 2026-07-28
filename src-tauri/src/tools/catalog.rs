@@ -6,9 +6,11 @@ use sha2::{Digest, Sha256};
 use crate::tools::context::ToolContext;
 use crate::tools::workspace::WorkspaceError;
 
-const MAX_EFFECTIVE_TOOLS: usize = 1_024;
-const MAX_EFFECTIVE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CHATGPT_CATALOG_TOOLS: usize = 128;
+pub const MAX_CHATGPT_CATALOG_BYTES: usize = 512 * 1024;
+pub const MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS: usize = 96 * 1024;
 const MAX_EFFECTIVE_TOOL_BYTES: usize = 128 * 1024;
+const ESTIMATED_BYTES_PER_TOKEN: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct EffectiveCatalog {
@@ -17,6 +19,20 @@ pub struct EffectiveCatalog {
     pub local_count: usize,
     pub proxy_count: usize,
     pub total_bytes: usize,
+    pub estimated_tokens: usize,
+}
+
+impl EffectiveCatalog {
+    pub fn metrics_value(&self) -> Value {
+        json!({
+            "local_tool_count": self.local_count,
+            "proxy_tool_count": self.proxy_count,
+            "tool_count": self.tools.len(),
+            "catalog_bytes": self.total_bytes,
+            "estimated_tokens": self.estimated_tokens,
+            "budget": catalog_budget_value()
+        })
+    }
 }
 
 pub fn build_effective_catalog(ctx: &ToolContext) -> Result<EffectiveCatalog, WorkspaceError> {
@@ -43,17 +59,6 @@ pub fn build_effective_catalog_from_parts(
     let local_count = tools.len();
     let proxy_count = proxy_tools.len();
     tools.extend(proxy_tools);
-
-    if tools.len() > MAX_EFFECTIVE_TOOLS {
-        return Err(catalog_error(
-            "EFFECTIVE_CATALOG_TOO_LARGE",
-            format!(
-                "Effective MCP catalog contains {} tools; maximum is {MAX_EFFECTIVE_TOOLS}",
-                tools.len()
-            ),
-            json!({"tool_count": tools.len(), "maximum": MAX_EFFECTIVE_TOOLS}),
-        ));
-    }
 
     let mut names = HashSet::with_capacity(tools.len());
     let mut total_bytes = 0usize;
@@ -87,16 +92,14 @@ pub fn build_effective_catalog_from_parts(
         }
         total_bytes = total_bytes.saturating_add(bytes.len());
     }
-    if total_bytes > MAX_EFFECTIVE_CATALOG_BYTES {
-        return Err(catalog_error(
-            "EFFECTIVE_CATALOG_BYTES_EXCEEDED",
-            "Effective MCP catalog exceeds the byte budget",
-            json!({
-                "bytes": total_bytes,
-                "maximum": MAX_EFFECTIVE_CATALOG_BYTES
-            }),
-        ));
-    }
+    let estimated_tokens = estimate_catalog_tokens(total_bytes);
+    enforce_chatgpt_catalog_budget(
+        local_count,
+        proxy_count,
+        tools.len(),
+        total_bytes,
+        estimated_tokens,
+    )?;
 
     tools.sort_by(|left, right| {
         left.get("name")
@@ -110,6 +113,56 @@ pub fn build_effective_catalog_from_parts(
         local_count,
         proxy_count,
         total_bytes,
+        estimated_tokens,
+    })
+}
+
+pub fn estimate_catalog_tokens(total_bytes: usize) -> usize {
+    total_bytes.div_ceil(ESTIMATED_BYTES_PER_TOKEN)
+}
+
+fn enforce_chatgpt_catalog_budget(
+    local_count: usize,
+    proxy_count: usize,
+    tool_count: usize,
+    total_bytes: usize,
+    estimated_tokens: usize,
+) -> Result<(), WorkspaceError> {
+    let exceeded = tool_count > MAX_CHATGPT_CATALOG_TOOLS
+        || total_bytes > MAX_CHATGPT_CATALOG_BYTES
+        || estimated_tokens > MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS;
+    if !exceeded {
+        return Ok(());
+    }
+
+    Err(catalog_error(
+        "EFFECTIVE_CATALOG_CHATGPT_BUDGET_EXCEEDED",
+        format!(
+            "Anchor MCP tool catalog exceeds the ChatGPT compatibility budget: {tool_count} tools, {total_bytes} bytes, approximately {estimated_tokens} tokens"
+        ),
+        json!({
+            "reason": "chatgpt_catalog_budget_exceeded",
+            "local_tool_count": local_count,
+            "proxy_tool_count": proxy_count,
+            "tool_count": tool_count,
+            "catalog_bytes": total_bytes,
+            "estimated_tokens": estimated_tokens,
+            "budget": catalog_budget_value(),
+            "suggestions": [
+                "Set includeTools, excludeTools, or maxTools on downstream MCP servers",
+                "Use the core or read-only Anchor tool profile",
+                "Restart Anchor and refresh or recreate the ChatGPT app after reducing the catalog"
+            ]
+        }),
+    ))
+}
+
+fn catalog_budget_value() -> Value {
+    json!({
+        "max_tools": MAX_CHATGPT_CATALOG_TOOLS,
+        "max_catalog_bytes": MAX_CHATGPT_CATALOG_BYTES,
+        "max_estimated_tokens": MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS,
+        "estimated_bytes_per_token": ESTIMATED_BYTES_PER_TOKEN
     })
 }
 
@@ -248,7 +301,10 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    use super::{build_effective_catalog_from_parts, snapshot_document};
+    use super::{
+        build_effective_catalog_from_parts, snapshot_document, MAX_CHATGPT_CATALOG_BYTES,
+        MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS, MAX_CHATGPT_CATALOG_TOOLS,
+    };
 
     fn proxy_tool(name: &str) -> serde_json::Value {
         json!({
@@ -273,6 +329,71 @@ mod tests {
                 "openWorldHint": true
             }
         })
+    }
+
+    fn browser_tools(count: usize) -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|index| proxy_tool(&format!("browser__action_{index:02}")))
+            .collect()
+    }
+
+    #[test]
+    fn advanced_plus_browser_catalog_stays_within_chatgpt_budget() {
+        let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(48))
+            .expect("advanced plus browser catalog");
+
+        assert_eq!(catalog.local_count, 39);
+        assert_eq!(catalog.proxy_count, 48);
+        assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
+        assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
+        assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
+    }
+
+    #[test]
+    fn core_plus_browser_catalog_stays_within_chatgpt_budget() {
+        let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
+            .expect("core plus browser catalog");
+
+        assert_eq!(catalog.local_count, 26);
+        assert_eq!(catalog.proxy_count, 48);
+        assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
+        assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
+        assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
+    }
+
+    #[test]
+    fn restricted_browser_catalog_stays_within_chatgpt_budget() {
+        let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
+            .expect("restricted browser catalog");
+
+        assert_eq!(catalog.local_count, 26);
+        assert_eq!(catalog.proxy_count, 8);
+        assert_eq!(catalog.tools.len(), 34);
+        assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
+        assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
+    }
+
+    #[test]
+    fn over_budget_catalog_returns_actionable_diagnostics() {
+        let error = build_effective_catalog_from_parts("advanced", true, browser_tools(100))
+            .expect_err("catalog should exceed the tool-count budget");
+        let diagnostic = error.to_error_value();
+
+        assert_eq!(
+            diagnostic["code"],
+            "EFFECTIVE_CATALOG_CHATGPT_BUDGET_EXCEEDED"
+        );
+        assert_eq!(
+            diagnostic["details"]["reason"],
+            "chatgpt_catalog_budget_exceeded"
+        );
+        assert_eq!(diagnostic["details"]["local_tool_count"], 39);
+        assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
+        assert!(diagnostic["details"]["suggestions"]
+            .as_array()
+            .is_some_and(|suggestions| suggestions.iter().any(|suggestion| suggestion
+                .as_str()
+                .is_some_and(|text| text.contains("includeTools")))));
     }
 
     #[test]

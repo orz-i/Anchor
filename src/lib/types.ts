@@ -176,7 +176,7 @@ export interface RuntimeRecovery {
 export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {
   return {
     public_url: "",
-    tunnel_type: "frp",
+    tunnel_type: "cloudflare",
     frp_server: "",
     frp_subdomain: "",
     cloudflare_mode: "quick",

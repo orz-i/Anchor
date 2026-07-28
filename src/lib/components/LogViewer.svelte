@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { readWorkspaceLogs, type LogChunk, type LogService } from "$lib/api/logs";
+
+  const AUTO_REFRESH_INTERVAL_MS = 3_000;
 
   interface Props {
     workspaceId: string;
@@ -14,27 +15,64 @@
   let chunks = $state<LogChunk[]>([]);
   let busy = $state(false);
   let error = $state("");
+  let autoRefreshEnabled = $state(true);
+  let requestGeneration = 0;
 
   const heading = $derived(title ?? (service === "mcp" ? "MCP 日志" : "Actions 日志"));
 
-  async function refresh() {
-    if (busy || !workspaceId) return;
+  async function refresh(
+    targetWorkspaceId = workspaceId,
+    targetService = service,
+    force = false,
+  ) {
+    if ((!force && busy) || !targetWorkspaceId) return;
+    const generation = ++requestGeneration;
     busy = true;
     error = "";
     try {
-      chunks = await readWorkspaceLogs(workspaceId, service);
+      const nextChunks = await readWorkspaceLogs(targetWorkspaceId, targetService);
+      if (generation === requestGeneration) {
+        chunks = nextChunks;
+      }
     } catch (err) {
-      error = String(err);
-      chunks = [];
+      if (generation === requestGeneration) {
+        error = String(err);
+        chunks = [];
+      }
     } finally {
-      busy = false;
+      if (generation === requestGeneration) {
+        busy = false;
+      }
     }
   }
 
-  onMount(() => {
-    if (autoRefresh) {
-      void refresh();
+  function toggleAutoRefresh(event: Event) {
+    autoRefreshEnabled = (event.currentTarget as HTMLInputElement).checked;
+    if (autoRefreshEnabled) {
+      void refresh(workspaceId, service, true);
     }
+  }
+
+  $effect(() => {
+    autoRefreshEnabled = autoRefresh;
+  });
+
+  $effect(() => {
+    const targetWorkspaceId = workspaceId;
+    const targetService = service;
+    queueMicrotask(() => {
+      void refresh(targetWorkspaceId, targetService, true);
+    });
+  });
+
+  $effect(() => {
+    if (!autoRefreshEnabled) return;
+
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, AUTO_REFRESH_INTERVAL_MS);
+
+    return () => window.clearInterval(timer);
   });
 </script>
 
@@ -44,14 +82,25 @@
       <h3 class="font-semibold">{heading}</h3>
       <p class="mt-1 text-sm text-[var(--color-text-muted)]">最近 8KB 尾部输出</p>
     </div>
-    <button
-      type="button"
-      class="tx-btn-ghost shrink-0 disabled:opacity-50"
-      disabled={busy}
-      onclick={refresh}
-    >
-      {busy ? "刷新中…" : "刷新"}
-    </button>
+    <div class="flex shrink-0 items-center gap-3">
+      <label class="inline-flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+        <input
+          type="checkbox"
+          class="h-4 w-4"
+          checked={autoRefreshEnabled}
+          onchange={toggleAutoRefresh}
+        />
+        <span>自动刷新（3 秒）</span>
+      </label>
+      <button
+        type="button"
+        class="tx-btn-ghost shrink-0 disabled:opacity-50"
+        disabled={busy}
+        onclick={() => refresh()}
+      >
+        {busy ? "刷新中…" : "刷新"}
+      </button>
+    </div>
   </div>
 
   {#if error}

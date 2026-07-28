@@ -6,12 +6,16 @@ use serde_json::Value;
 use crate::tools::dispatch::call_tool_prevalidated_with_session_cancellation;
 use crate::tools::workspace::tool_err;
 use crate::tools::{
-    build_effective_catalog, wrap_mcp_tool_result, CancellationToken, SharedToolContext,
-    ToolContext, Workspace,
+    build_effective_catalog, wrap_mcp_tool_result, CancellationToken, EffectiveCatalog,
+    SharedToolContext, ToolContext, Workspace,
 };
 use crate::workspace::AuthConfig;
 
 pub type SharedState = SharedToolContext;
+
+const TOOLS_LIST_PAGE_MAX_TOOLS: usize = 64;
+const TOOLS_LIST_PAGE_MAX_BYTES: usize = 192 * 1024;
+const TOOLS_LIST_CURSOR_PREFIX: &str = "anchor-v1";
 
 #[cfg(test)]
 pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
@@ -25,6 +29,109 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
         crate::mcp::protocol::CURRENT_PROTOCOL_VERSION
     };
     handle_request_with_protocol(state, body, protocol_version).await
+}
+
+fn tools_list_result(catalog: &EffectiveCatalog, params: &Value) -> Result<Value, Value> {
+    let start = tools_list_cursor_offset(params, &catalog.digest, catalog.tools.len())?;
+    let mut end = start;
+    let mut page_bytes = 0usize;
+    while end < catalog.tools.len() && end.saturating_sub(start) < TOOLS_LIST_PAGE_MAX_TOOLS {
+        let tool_bytes = serde_json::to_vec(&catalog.tools[end])
+            .map_err(|error| {
+                serde_json::json!({
+                    "code": -32603,
+                    "message": "Failed to serialize MCP tool catalog page",
+                    "data": {
+                        "reason": "catalog_page_serialization_failed",
+                        "detail": error.to_string()
+                    }
+                })
+            })?
+            .len();
+        if end > start && page_bytes.saturating_add(tool_bytes) > TOOLS_LIST_PAGE_MAX_BYTES {
+            break;
+        }
+        page_bytes = page_bytes.saturating_add(tool_bytes);
+        end += 1;
+    }
+
+    let mut result = serde_json::json!({
+        "tools": catalog.tools[start..end].to_vec(),
+        "_meta": {
+            "anchor/catalog": catalog.metrics_value(),
+            "anchor/page": {
+                "start": start,
+                "end": end,
+                "page_tool_count": end.saturating_sub(start),
+                "page_bytes": page_bytes,
+                "max_page_tools": TOOLS_LIST_PAGE_MAX_TOOLS,
+                "max_page_bytes": TOOLS_LIST_PAGE_MAX_BYTES
+            }
+        }
+    });
+    if end < catalog.tools.len() {
+        result["nextCursor"] = Value::String(format!(
+            "{TOOLS_LIST_CURSOR_PREFIX}:{}:{end}",
+            catalog.digest
+        ));
+    }
+    Ok(result)
+}
+
+fn tools_list_cursor_offset(
+    params: &Value,
+    expected_digest: &str,
+    tool_count: usize,
+) -> Result<usize, Value> {
+    let Some(cursor) = params.get("cursor") else {
+        return Ok(0);
+    };
+    let Some(cursor) = cursor.as_str().filter(|cursor| !cursor.is_empty()) else {
+        return Err(invalid_tools_cursor("cursor must be a non-empty string"));
+    };
+    let mut parts = cursor.split(':');
+    let prefix = parts.next();
+    let digest = parts.next();
+    let offset = parts.next();
+    if prefix != Some(TOOLS_LIST_CURSOR_PREFIX)
+        || digest != Some(expected_digest)
+        || parts.next().is_some()
+    {
+        return Err(invalid_tools_cursor(
+            "cursor is invalid or belongs to a different tool catalog",
+        ));
+    }
+    let offset = offset
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|offset| *offset <= tool_count)
+        .ok_or_else(|| invalid_tools_cursor("cursor offset is invalid"))?;
+    Ok(offset)
+}
+
+fn invalid_tools_cursor(detail: &str) -> Value {
+    serde_json::json!({
+        "code": -32602,
+        "message": "Invalid tools/list cursor",
+        "data": {
+            "reason": "invalid_tools_list_cursor",
+            "detail": detail
+        }
+    })
+}
+
+fn effective_catalog_error(error: crate::tools::workspace::WorkspaceError) -> Value {
+    let data = error.to_error_value();
+    let budget_exceeded = data.get("code").and_then(Value::as_str)
+        == Some("EFFECTIVE_CATALOG_CHATGPT_BUDGET_EXCEEDED");
+    serde_json::json!({
+        "code": if budget_exceeded { -32004 } else { -32603 },
+        "message": if budget_exceeded {
+            "Anchor MCP tool catalog exceeds the ChatGPT compatibility budget. Reduce downstream tools with includeTools, excludeTools, or maxTools, then restart Anchor and refresh or recreate the ChatGPT app."
+        } else {
+            "Failed to build effective MCP tool catalog"
+        },
+        "data": data
+    })
 }
 
 #[cfg(test)]
@@ -97,12 +204,8 @@ pub async fn handle_request_with_protocol_session_and_cancellation(
                 });
             }
             match build_effective_catalog(state.as_ref()) {
-                Ok(catalog) => Ok(serde_json::json!({ "tools": catalog.tools })),
-                Err(error) => Err(serde_json::json!({
-                    "code": -32603,
-                    "message": "Failed to build effective MCP tool catalog",
-                    "data": error.to_error_value()
-                })),
+                Ok(catalog) => tools_list_result(&catalog, &params),
+                Err(error) => Err(effective_catalog_error(error)),
             }
         }
         "tools/call" => handle_tools_call(state, &params, cancellation, session_id).await,
@@ -288,9 +391,12 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::tools::ToolContext;
+    use crate::tools::{build_effective_catalog_from_parts, ToolContext};
 
-    use super::{handle_request, initialize_result, tool_arguments};
+    use super::{
+        effective_catalog_error, handle_request, initialize_result, tool_arguments,
+        tools_list_result,
+    };
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -300,6 +406,87 @@ mod tests {
                 .expect("tool context"),
         );
         (workspace, harness, state)
+    }
+
+    fn browser_proxy_tools(count: usize) -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|index| {
+                json!({
+                    "name": format!("browser__action_{index:02}"),
+                    "title": format!("Browser action {index}"),
+                    "description": "Representative browser MCP action",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": true
+                    },
+                    "annotations": {
+                        "readOnlyHint": false,
+                        "destructiveHint": true,
+                        "idempotentHint": false,
+                        "openWorldHint": true
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tools_list_paginates_a_budget_compliant_catalog() {
+        let catalog = build_effective_catalog_from_parts("core", true, browser_proxy_tools(48))
+            .expect("budget-compliant catalog");
+        let first = tools_list_result(&catalog, &json!({})).expect("first page");
+        let first_tools = first["tools"].as_array().expect("first tools");
+        assert_eq!(first_tools.len(), 64);
+        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 26);
+        assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 48);
+        assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0));
+        let cursor = first["nextCursor"].as_str().expect("next cursor");
+
+        let second = tools_list_result(&catalog, &json!({"cursor": cursor})).expect("second page");
+        let second_tools = second["tools"].as_array().expect("second tools");
+        assert_eq!(first_tools.len() + second_tools.len(), catalog.tools.len());
+        assert!(second.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn tools_list_rejects_a_cursor_from_another_catalog() {
+        let catalog = build_effective_catalog_from_parts("core", true, browser_proxy_tools(48))
+            .expect("catalog");
+        let error = tools_list_result(
+            &catalog,
+            &json!({
+                "cursor": "anchor-v1:wrong-digest:64"
+            }),
+        )
+        .expect_err("invalid cursor");
+
+        assert_eq!(error["code"], -32602);
+        assert_eq!(error["data"]["reason"], "invalid_tools_list_cursor");
+    }
+
+    #[test]
+    fn tools_list_maps_over_budget_catalog_to_actionable_server_error() {
+        let error = build_effective_catalog_from_parts("advanced", true, browser_proxy_tools(100))
+            .expect_err("over-budget catalog");
+        let response = effective_catalog_error(error);
+
+        assert_eq!(response["code"], -32004);
+        assert!(response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("includeTools")));
+        assert_eq!(
+            response["data"]["details"]["reason"],
+            "chatgpt_catalog_budget_exceeded"
+        );
     }
 
     #[test]

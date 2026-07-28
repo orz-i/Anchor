@@ -375,6 +375,58 @@ fn search_text_filters_by_glob() {
 }
 
 #[test]
+fn search_text_truncates_multibyte_preview_on_a_utf8_boundary() {
+    let fx = tiny_js_fixture();
+    fs::write(
+        fx.root.join("src/multibyte.txt"),
+        format!("marker {}\n", "连接正常".repeat(40)),
+    )
+    .expect("write multibyte fixture");
+    let result = invoke(
+        &ctx_for(&fx.root),
+        "search_text",
+        json!({
+            "query": "marker",
+            "path": "src/multibyte.txt",
+            "max_preview_bytes": 64
+        }),
+    );
+    let payload = assert_ok(&result);
+    let preview = payload["matches"][0]["preview"]
+        .as_str()
+        .expect("preview string");
+
+    assert!(preview.ends_with("..."));
+    assert!(preview.is_char_boundary(preview.len()));
+    assert!(preview.len() <= 67);
+}
+
+#[test]
+fn blocking_exec_timeout_preserves_the_declared_output_contract() {
+    let fx = tiny_js_fixture();
+    let result = invoke(
+        &ctx_for(&fx.root),
+        "exec_command",
+        json!({
+            "cmd": format!("{TEST_PYTHON} -c \"import time; time.sleep(2)\""),
+            "timeout_ms": 100,
+            "yield_time_ms": 1_000
+        }),
+    );
+    let payload = assert_ok(&result);
+
+    assert_eq!(payload["termination_reason"], "timeout");
+    assert_eq!(payload["child_process"], true);
+    assert_eq!(payload["transport_ok"], true);
+    assert_eq!(payload["command_ok"], false);
+    assert_eq!(payload["error"]["code"], "TIMEOUT");
+    assert!(payload["suggestion"].is_string());
+    assert!(payload["duration_ms"].is_u64());
+    assert_eq!(payload["duration_ms"], payload["elapsed_ms"]);
+    assert!(payload["warnings"].is_array());
+}
+
+#[test]
 fn grep_reuses_search_text_schema_and_behavior() {
     let schema = anchor_lib::tools::registry::input_schema("grep");
     assert_eq!(
