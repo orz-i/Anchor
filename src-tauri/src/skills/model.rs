@@ -181,7 +181,6 @@ pub(super) struct TextPage {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawSkillFrontmatter {
     name: String,
     description: String,
@@ -193,6 +192,8 @@ struct RawSkillFrontmatter {
     metadata: BTreeMap<String, serde_yaml::Value>,
     #[serde(rename = "allowed-tools", default)]
     allowed_tools: String,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug)]
@@ -255,7 +256,11 @@ pub fn parse_skill_markdown(
         }
     }
 
-    let metadata = serde_json::to_value(parsed.metadata)
+    let mut metadata = parsed.metadata;
+    for (key, value) in parsed.extensions {
+        metadata.entry(key).or_insert(value);
+    }
+    let metadata = serde_json::to_value(metadata)
         .map_err(|error| format!("SKILL.md metadata 无法序列化：{error}"))?;
     let instructions = instructions.trim_start().to_string();
     let instruction_lines = instructions.lines().count();
@@ -450,13 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_frontmatter_and_accepts_structured_metadata() {
-        let unknown = parse_skill_markdown(
-            "---\nname: example\ndescription: Test.\ncustom-field: true\n---\nBody",
+    fn accepts_extension_frontmatter_and_structured_metadata() {
+        let extended = parse_skill_markdown(
+            "---\nname: example\ndescription: Test.\nrisk: medium\ncategory: architecture\nuser-invocable: true\nmetadata:\n  risk: explicit\n---\nBody",
             "example",
         )
-        .expect_err("unknown field");
-        assert!(unknown.contains("unknown field"));
+        .expect("extension fields");
+        assert_eq!(extended.metadata["risk"], "explicit");
+        assert_eq!(extended.metadata["category"], "architecture");
+        assert_eq!(extended.metadata["user-invocable"], true);
 
         let metadata = parse_skill_markdown(
             "---\nname: example\ndescription: Test.\nmetadata:\n  nested:\n    value: true\n  priority: 5\n  tags: [one, two]\n---\nBody",

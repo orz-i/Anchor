@@ -715,6 +715,27 @@ mod tests {
     }
 
     #[test]
+    fn discovers_skills_with_extension_frontmatter_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("skills/extended");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: extended\ndescription: Extended frontmatter.\nrisk: low\ncategory: development\nuser-invocable: true\n---\nUse it.\n",
+        )
+        .expect("skill");
+
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        let listed = catalog.list(None, 100);
+
+        assert_eq!(listed.skills.len(), 1, "{:?}", listed.warnings);
+        assert!(listed.warnings.is_empty(), "{:?}", listed.warnings);
+        assert_eq!(listed.skills[0].metadata["risk"], "low");
+        assert_eq!(listed.skills[0].metadata["category"], "development");
+        assert_eq!(listed.skills[0].metadata["user-invocable"], true);
+    }
+
+    #[test]
     fn first_configured_root_wins_duplicate_names() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(&temp.path().join("one"), "shared", "First skill.");
@@ -773,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_installed_skill_uses_strict_frontmatter() {
+    fn repository_installed_skill_uses_supported_frontmatter() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let Some(workspace) = manifest.parent() else {
             return;

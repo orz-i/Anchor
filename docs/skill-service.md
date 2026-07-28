@@ -39,6 +39,11 @@ metadata:
 Read the changed files and report concrete findings with file references.
 ```
 
+除 `name`、`description`、`license`、`compatibility`、`metadata` 和
+`allowed-tools` 外，Anchor 也兼容 `risk`、`category`、`user-invocable`
+等生态扩展字段。扩展字段会作为只读元数据返回；若与 `metadata` 中的同名键冲突，
+显式 `metadata` 值优先。扩展字段不会授予工具权限、启用脚本执行或绕过现有策略。
+
 名称规则：
 
 - 1–64 个字符；
