@@ -1,6 +1,8 @@
 use crate::data::DataStore;
 use crate::error::AppResult;
 
+const OAUTH_REFRESH_REPLAY_SCOPE: &str = "oauth_refresh_replay";
+
 pub struct SecretStore;
 
 impl SecretStore {
@@ -8,6 +10,45 @@ impl SecretStore {
     pub fn remove_workspace_secrets(profile_id: &str) -> AppResult<()> {
         DataStore::update_file(|data| {
             data.workspace_secrets.remove(profile_id);
+            Ok(())
+        })
+    }
+
+    pub fn consume_refresh_token(
+        replay_key: &str,
+        jti: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> AppResult<bool> {
+        DataStore::update_file(|data| {
+            let items = data
+                .app_secrets
+                .entry(OAUTH_REFRESH_REPLAY_SCOPE.into())
+                .or_default();
+            let mut used = items
+                .get(replay_key)
+                .and_then(|raw| serde_json::from_str::<std::collections::HashMap<String, u64>>(raw).ok())
+                .unwrap_or_default();
+            used.retain(|_, expiry| *expiry >= now);
+            if jti.is_empty() || used.contains_key(jti) {
+                return Ok(false);
+            }
+            used.insert(jti.to_string(), expires_at);
+            items.insert(replay_key.to_string(), serde_json::to_string(&used)?);
+            Ok(true)
+        })
+    }
+
+    pub fn clear_refresh_replay_state(workspace_id: &str) -> AppResult<()> {
+        DataStore::update_file(|data| {
+            let Some(items) = data.app_secrets.get_mut(OAUTH_REFRESH_REPLAY_SCOPE) else {
+                return Ok(());
+            };
+            let prefix = format!("{workspace_id}:");
+            items.retain(|key, _| !key.starts_with(&prefix));
+            if items.is_empty() {
+                data.app_secrets.remove(OAUTH_REFRESH_REPLAY_SCOPE);
+            }
             Ok(())
         })
     }
@@ -51,7 +92,6 @@ impl SecretStore {
         })
     }
 
-    #[cfg(test)]
     pub fn set_app(scope: &str, item_id: &str, value: &str) -> AppResult<()> {
         DataStore::update_file(|data| {
             data.app_secrets
@@ -93,5 +133,15 @@ mod tests {
         let loaded = SecretStore::get(&id, "oauth_client_secret").expect("get");
         assert_eq!(loaded.as_deref(), Some("roundtrip-secret"));
         let _ = SecretStore::remove_workspace_secrets(&id);
+    }
+
+    #[test]
+    fn refresh_token_consumption_persists_across_calls() {
+        let workspace_id = uuid::Uuid::new_v4().simple().to_string();
+        let replay_key = format!("{workspace_id}:mcp");
+        assert!(SecretStore::consume_refresh_token(&replay_key, "jti-1", 200, 100).unwrap());
+        assert!(!SecretStore::consume_refresh_token(&replay_key, "jti-1", 200, 100).unwrap());
+        assert!(SecretStore::consume_refresh_token(&replay_key, "jti-2", 300, 201).unwrap());
+        SecretStore::clear_refresh_replay_state(&workspace_id).unwrap();
     }
 }

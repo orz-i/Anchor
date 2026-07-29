@@ -104,6 +104,7 @@ pub fn spawn_listener(
                 oauth_password.unwrap_or_default(),
                 oauth_token_secret.unwrap_or_default(),
             )
+            .with_refresh_replay_key(format!("{workspace_id}:actions"))
             .with_redirect_uris(&oauth_redirect_uris)?
             .with_redirect_host_patterns(&oauth_redirect_hosts)?,
         ))

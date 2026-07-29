@@ -183,6 +183,7 @@ pub fn spawn_listener(
                 password,
                 token_secret,
             )
+            .with_refresh_replay_key(format!("{workspace_id}:mcp"))
             .with_redirect_uris(&auth.oauth_redirect_uris)?
             .with_redirect_host_patterns(&auth.oauth_redirect_hosts)?,
         ))

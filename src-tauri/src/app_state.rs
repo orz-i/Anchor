@@ -51,5 +51,6 @@ impl Default for AppState {
 }
 
 pub fn teardown_workspace(store: &mut DataStore, profile_id: &str) -> AppResult<()> {
-    store.remove_workspace_secrets(profile_id)
+    store.remove_workspace_secrets(profile_id)?;
+    crate::secret::SecretStore::clear_refresh_replay_state(profile_id)
 }

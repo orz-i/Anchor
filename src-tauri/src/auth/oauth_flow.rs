@@ -14,6 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::bearer::constant_time_eq_str;
+use crate::secret::SecretStore;
 
 pub const OAUTH_CODE_TTL_SECONDS: u64 = 300;
 pub const OAUTH_TOKEN_TTL_SECONDS: i64 = 60 * 60;
@@ -33,6 +34,7 @@ pub struct OAuthRuntime {
     redirect_host_patterns: Arc<RwLock<Vec<String>>>,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
     used_refresh_tokens: Arc<Mutex<HashMap<String, u64>>>,
+    refresh_replay_key: Option<String>,
 }
 
 #[cfg(feature = "cli")]
@@ -273,7 +275,13 @@ impl OAuthRuntime {
             redirect_host_patterns: Arc::new(RwLock::new(Vec::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             used_refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+            refresh_replay_key: None,
         }
+    }
+
+    pub fn with_refresh_replay_key(mut self, replay_key: String) -> Self {
+        self.refresh_replay_key = (!replay_key.trim().is_empty()).then_some(replay_key);
+        self
     }
 
     pub fn with_redirect_uris(mut self, raw: &str) -> Result<Self, String> {
@@ -302,6 +310,29 @@ impl OAuthRuntime {
             .write()
             .expect("oauth redirect host pattern lock") = redirect_host_patterns;
         Ok(())
+    }
+
+    fn consume_refresh_token_jti(
+        &self,
+        jti: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<bool, String> {
+        if let Some(replay_key) = self.refresh_replay_key.as_deref() {
+            return SecretStore::consume_refresh_token(replay_key, jti, expires_at, now)
+                .map_err(|error| format!("Failed to persist refresh token replay state: {error}"));
+        }
+
+        let mut used = self
+            .used_refresh_tokens
+            .lock()
+            .expect("oauth refresh token lock");
+        used.retain(|_, expiry| *expiry >= now);
+        if jti.is_empty() || used.contains_key(jti) {
+            return Ok(false);
+        }
+        used.insert(jti.to_string(), expires_at);
+        Ok(true)
     }
 
     pub fn redirect_uri_allowed(&self, redirect_uri: &str) -> bool {
@@ -781,19 +812,16 @@ fn refresh_access_token(
     };
 
     let now = unix_now();
-    let mut used = oauth
-        .used_refresh_tokens
-        .lock()
-        .expect("oauth refresh token lock");
-    used.retain(|_, expires_at| *expires_at >= now);
-    if claims.jti.is_empty() || used.contains_key(&claims.jti) {
-        return token_error(
-            "invalid_grant",
-            "refresh token was already used; re-authorization is required",
-        );
+    match oauth.consume_refresh_token_jti(&claims.jti, claims.exp.max(0) as u64, now) {
+        Ok(true) => {}
+        Ok(false) => {
+            return token_error(
+                "invalid_grant",
+                "refresh token was already used; re-authorization is required",
+            )
+        }
+        Err(message) => return token_error("server_error", &message),
     }
-    used.insert(claims.jti, claims.exp.max(0) as u64);
-    drop(used);
 
     token_success(tokens)
 }
