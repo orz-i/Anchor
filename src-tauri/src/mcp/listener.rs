@@ -115,9 +115,11 @@ pub fn spawn_listener(
     runtime: RuntimeConfig,
 ) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
     let proxy_specs = parse_mcp_proxy_config(&runtime.mcp_config, &workspace_path)?;
+    let allow_external_reads =
+        !runtime.strict_workspace_reads && runtime.permission_mode == "dangerous";
     let workspace = Workspace::new(workspace_path)
         .map_err(|e| e.message())?
-        .with_strict_read_boundary(runtime.strict_workspace_reads);
+        .with_strict_read_boundary(!allow_external_reads);
     let policy = PolicySettings::from_runtime(&runtime);
     let mcp = new_state(
         workspace,

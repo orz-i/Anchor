@@ -180,7 +180,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "read_file",
         "Read file",
-        "Read a UTF-8 text file slice inside the configured workspace.",
+        "Read a UTF-8 text file slice strictly inside the configured workspace.",
         true,
         false,
         false,
@@ -308,7 +308,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "view_image",
         "View image",
-        "Return a workspace image as MCP image content.",
+        "Return an image strictly inside the configured workspace as MCP image content.",
         true,
         false,
         false,

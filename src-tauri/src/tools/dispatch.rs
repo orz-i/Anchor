@@ -569,6 +569,8 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
         "workspace_exec_available": workspace_exec_available,
+        "workspace_read_boundary": if ctx.workspace.strict_read_boundary() { "strict" } else { "operator_override" },
+        "external_reads_allowed": !ctx.workspace.strict_read_boundary(),
         "workspace_exec_sandbox_enforced": false,
         "workspace_exec_boundary": "policy_only",
         "workspace_link_guard": {

@@ -176,7 +176,7 @@ impl Workspace {
         }
         Ok(Self {
             root,
-            allow_external_reads: true,
+            allow_external_reads: false,
         })
     }
 
@@ -276,8 +276,8 @@ impl Workspace {
         Ok(())
     }
 
-    /// 解析只读路径。显式的绝对路径和 `..` 路径允许指向 Workspace 外部，
-    /// 但不会被任何写入工具复用。
+    /// Resolve a read-only path. Workspace reads are strict by default; an
+    /// explicit opt-out is reserved for operator-enabled dangerous mode.
     pub fn resolve_read_path(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
         let raw = if raw_path.is_empty() { "." } else { raw_path };
         self.validate_read_text(raw)?;
@@ -634,13 +634,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_read_boundary_still_allows_explicit_external_paths() {
+    fn explicit_operator_override_can_allow_external_read_paths() {
         let root = tempfile::tempdir().expect("workspace");
         let external = tempfile::NamedTempFile::new().expect("external file");
-        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let workspace = Workspace::new(root.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(false);
         assert!(workspace
             .resolve_read_path(&external.path().display().to_string())
             .is_ok());
+    }
+
+    #[test]
+    fn workspace_reads_are_strict_by_default() {
+        let root = tempfile::tempdir().expect("workspace");
+        let external = tempfile::NamedTempFile::new().expect("external file");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let error = workspace
+            .resolve_read_path(&external.path().display().to_string())
+            .expect_err("default workspace must reject external reads");
+        assert_eq!(error.to_error_value()["code"], "PATH_OUTSIDE_WORKSPACE");
     }
 
     #[test]

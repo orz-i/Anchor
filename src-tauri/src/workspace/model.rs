@@ -77,9 +77,9 @@ pub struct RuntimeConfig {
     /// Newline-separated Skill roots. Relative paths resolve from the workspace root.
     #[serde(default = "default_skill_roots")]
     pub skill_roots: String,
-    /// Runtime-enforced read boundary. Gateway mode overrides this to true so
-    /// one logical MCP server cannot explicitly read another workspace path.
-    #[serde(default)]
+    /// Runtime-enforced read boundary. It is strict by default; only an
+    /// operator-enabled dangerous profile may explicitly opt out.
+    #[serde(default = "default_strict_workspace_reads")]
     pub strict_workspace_reads: bool,
 }
 
@@ -238,6 +238,10 @@ fn default_skill_service_enabled() -> bool {
     true
 }
 
+fn default_strict_workspace_reads() -> bool {
+    true
+}
+
 fn default_skill_roots() -> String {
     ".agents/skills\n.codex/skills\nskills".to_string()
 }
@@ -286,7 +290,7 @@ impl Default for RuntimeConfig {
             workspace_script_extensions: default_workspace_script_extensions(),
             skill_service_enabled: default_skill_service_enabled(),
             skill_roots: default_skill_roots(),
-            strict_workspace_reads: false,
+            strict_workspace_reads: default_strict_workspace_reads(),
         }
     }
 }
