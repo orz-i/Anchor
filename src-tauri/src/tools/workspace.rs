@@ -23,6 +23,8 @@ pub const DEFAULT_EXCLUDED_NAMES: &[&str] = &[
     "__pycache__",
 ];
 
+const MAX_CHILD_PROCESS_BOUNDARY_ENTRIES: usize = 250_000;
+
 #[derive(Debug, Clone)]
 pub struct ResolvedPath {
     pub display: String,
@@ -227,51 +229,95 @@ impl Workspace {
         self.resolve_existing_at(&self.root, raw_path)
     }
 
-    /// Child processes are policy-limited rather than OS-sandboxed. A top-level
-    /// symlink or Windows junction that resolves outside the workspace would let
-    /// an interpreter reach another workspace through an otherwise relative path.
-    /// Reject process execution until the unsafe link is removed.
+    /// Child processes are policy-limited rather than OS-sandboxed. Recursively
+    /// reject symlinks or Windows junctions that resolve outside the workspace so
+    /// an interpreter cannot escape through an otherwise relative path.
     pub fn ensure_child_process_boundary(&self) -> WorkspaceResult<()> {
-        let entries = fs::read_dir(&self.root).map_err(|error| WorkspaceError::ToolDetails {
-            code: "WORKSPACE_SCAN_FAILED",
-            message: format!("Failed to inspect workspace boundary: {error}"),
-            category: "runtime",
-            retryable: true,
-            details: json!({
-                "stage": "workspace_boundary_scan",
-                "retryable": true
-            }),
-        })?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_link_like(&path) {
-                continue;
-            }
-            let resolved = match path.canonicalize() {
-                Ok(resolved) => resolved,
-                Err(_) => continue,
-            };
-            if resolved.starts_with(&self.root) {
-                continue;
-            }
-            let link_name = entry.file_name().to_string_lossy().into_owned();
-            return Err(WorkspaceError::ToolDetails {
-                code: "WORKSPACE_LINK_ESCAPE",
+        let mut pending = vec![self.root.clone()];
+        let mut scanned = 0usize;
+        while let Some(directory) = pending.pop() {
+            let entries = fs::read_dir(&directory).map_err(|error| WorkspaceError::ToolDetails {
+                code: "WORKSPACE_SCAN_FAILED",
                 message: format!(
-                    "Workspace contains an external directory link: {link_name}. Remove the symlink/junction before running child processes."
+                    "Failed to inspect workspace boundary at {}: {error}",
+                    relative_display(&self.root, &directory)
                 ),
-                category: "security",
-                retryable: false,
+                category: "runtime",
+                retryable: true,
                 details: json!({
                     "stage": "workspace_boundary_scan",
-                    "reason": "external_workspace_link",
-                    "link_path": link_name,
-                    "sandbox_enforced": false,
-                    "recoverable": true,
-                    "suggestion": "Remove the workspace-local symlink/junction; do not delete its target directory"
+                    "path": relative_display(&self.root, &directory),
+                    "retryable": true
                 }),
-            });
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| WorkspaceError::ToolDetails {
+                    code: "WORKSPACE_SCAN_FAILED",
+                    message: format!("Failed to inspect workspace entry: {error}"),
+                    category: "runtime",
+                    retryable: true,
+                    details: json!({"stage": "workspace_boundary_scan", "retryable": true}),
+                })?;
+                scanned = scanned.saturating_add(1);
+                if scanned > MAX_CHILD_PROCESS_BOUNDARY_ENTRIES {
+                    return Err(WorkspaceError::ToolDetails {
+                        code: "WORKSPACE_SCAN_LIMIT_EXCEEDED",
+                        message: "Workspace boundary scan exceeded its safety limit".into(),
+                        category: "security",
+                        retryable: false,
+                        details: json!({
+                            "stage": "workspace_boundary_scan",
+                            "maximum_entries": MAX_CHILD_PROCESS_BOUNDARY_ENTRIES,
+                            "sandbox_enforced": false,
+                            "recoverable": true,
+                            "suggestion": "Reduce generated dependency trees or use an OS-sandboxed execution backend"
+                        }),
+                    });
+                }
+
+                let path = entry.path();
+                if is_link_like(&path) {
+                    let link_path = relative_display(&self.root, &path);
+                    let resolved = path.canonicalize().map_err(|error| WorkspaceError::ToolDetails {
+                        code: "WORKSPACE_LINK_UNRESOLVED",
+                        message: format!(
+                            "Workspace contains an unresolved symlink/junction at {link_path}: {error}"
+                        ),
+                        category: "security",
+                        retryable: false,
+                        details: json!({
+                            "stage": "workspace_boundary_scan",
+                            "reason": "unresolved_workspace_link",
+                            "link_path": link_path,
+                            "sandbox_enforced": false,
+                            "recoverable": true,
+                            "suggestion": "Remove or repair the workspace-local symlink/junction"
+                        }),
+                    })?;
+                    if !resolved.starts_with(&self.root) {
+                        return Err(WorkspaceError::ToolDetails {
+                            code: "WORKSPACE_LINK_ESCAPE",
+                            message: format!(
+                                "Workspace contains an external directory link: {link_path}. Remove the symlink/junction before running child processes."
+                            ),
+                            category: "security",
+                            retryable: false,
+                            details: json!({
+                                "stage": "workspace_boundary_scan",
+                                "reason": "external_workspace_link",
+                                "link_path": link_path,
+                                "sandbox_enforced": false,
+                                "recoverable": true,
+                                "suggestion": "Remove the workspace-local symlink/junction; do not delete its target directory"
+                            }),
+                        });
+                    }
+                    continue;
+                }
+                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                    pending.push(path);
+                }
+            }
         }
         Ok(())
     }
@@ -631,6 +677,28 @@ mod tests {
             .resolve_read_path(&external.path().display().to_string())
             .expect_err("external read must be rejected");
         assert_eq!(error.to_error_value()["code"], "PATH_OUTSIDE_WORKSPACE");
+    }
+
+    #[test]
+    fn child_process_boundary_rejects_nested_external_links() {
+        let root = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external");
+        let nested = root.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let link = nested.join("escape");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(external.path(), &link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(external.path(), &link).is_err() {
+            return;
+        }
+
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let error = workspace
+            .ensure_child_process_boundary()
+            .expect_err("nested external link must block child processes");
+        assert_eq!(error.to_error_value()["code"], "WORKSPACE_LINK_ESCAPE");
+        assert_eq!(error.to_error_value()["details"]["link_path"], "nested/escape");
     }
 
     #[test]

@@ -575,14 +575,16 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         "workspace_exec_boundary": "policy_only",
         "workspace_link_guard": {
             "safe": workspace_exec_available,
-            "scope": "top_level_reparse_points",
+            "scope": "recursive_reparse_points",
+            "maximum_entries": 250000,
             "message": boundary_error.as_ref().map(WorkspaceError::message).unwrap_or_default()
         },
         "system_command_allowlist": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "workspace_local_entries": {
             "enabled": ctx.policy.workspace_local_entries,
             "script_extensions": ctx.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
-            "resolution": "workdir_first"
+            "resolution": "workdir_first",
+            "allowlist_required": true
         },
         // Backward-compatible alias for older MCP clients.
         "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),

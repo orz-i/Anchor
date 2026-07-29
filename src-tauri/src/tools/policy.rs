@@ -299,9 +299,10 @@ pub fn validate_command_for_workspace(
             .workspace_script_extensions
             .iter()
             .any(|extension| base_name.to_ascii_lowercase().ends_with(extension));
-    if !(policy.allowed_commands.contains(stem)
-        || (policy.workspace_local_entries && workspace_entry_candidate))
-    {
+    let workspace_entry_allowed = policy.workspace_local_entries
+        && workspace_entry_candidate
+        && policy.allowed_commands.contains(stem);
+    if !(policy.allowed_commands.contains(stem) || workspace_entry_allowed) {
         return Err(PolicyError(format!("Command is not allowlisted: {stem}")));
     }
 
@@ -537,12 +538,19 @@ mod tests {
     }
 
     #[test]
-    fn trusted_mode_accepts_any_configured_workspace_script_extension() {
-        let policy = PolicySettings {
+    fn trusted_mode_requires_workspace_script_name_to_be_allowlisted() {
+        let mut policy = PolicySettings {
             workspace_local_entries: true,
             workspace_script_extensions: parse_workspace_script_extensions(".cmd,.launcher"),
             ..PolicySettings::default()
         };
+        assert!(validate_command(
+            &serde_json::json!({ "cmd": "anything.launcher" }),
+            &policy
+        )
+        .is_err());
+        policy.allowed_commands.insert("anything.launcher".into());
+        policy.allowed_commands.insert("another-name".into());
         assert!(
             validate_command(&serde_json::json!({ "cmd": "anything.launcher" }), &policy).is_ok()
         );
@@ -558,9 +566,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("workspace");
         std::fs::write(dir.path().join("project-entry"), "#!/bin/sh\necho ok\n").expect("entry");
         let workspace = Workspace::new(dir.path().to_path_buf()).expect("workspace");
+        let mut policy = PolicySettings::default();
+        policy.allowed_commands.insert("project-entry".into());
         assert!(validate_command_for_workspace(
             &serde_json::json!({ "cmd": "project-entry", "workdir": "." }),
-            &PolicySettings::default(),
+            &policy,
             Some(&workspace),
         )
         .is_ok());
