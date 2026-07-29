@@ -49,8 +49,55 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
-fn advances_expected_state(name: &str) -> bool {
-    matches!(name, "exec_command" | "apply_patch")
+fn advances_expected_state(name: &str, output: &Value) -> bool {
+    match name {
+        "apply_patch" | "history_session_checkpoint" => true,
+        "exec_command" => command_output_is_terminal(output),
+        _ => false,
+    }
+}
+
+fn command_output_is_terminal(output: &Value) -> bool {
+    output.get("status").and_then(Value::as_str) != Some("running")
+        && output.get("termination_reason").and_then(Value::as_str) != Some("running")
+}
+
+fn record_verification_from_output(
+    ctx: &ToolContext,
+    task_id: &str,
+    kind: &str,
+    command: &str,
+    output: &mut Value,
+) {
+    let exit_code = output
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let passed = output.get("command_ok").and_then(Value::as_bool) == Some(true);
+    let duration_ms = output.get("duration_ms").and_then(Value::as_u64);
+    if let Ok(verification) = ctx.harness.record_verification(
+        task_id,
+        kind,
+        command,
+        exit_code,
+        passed,
+        duration_ms,
+        None,
+    ) {
+        if let Some(object) = output.as_object_mut() {
+            object.insert(
+                "verification".into(),
+                json!({
+                    "verification_id": verification.id,
+                    "kind": verification.kind,
+                    "status": verification.status,
+                    "exit_code": verification.exit_code,
+                    "command": verification.command,
+                    "duration_ms": verification.duration_ms
+                }),
+            );
+        }
+    }
 }
 
 fn skill_script_permission_error(
@@ -195,6 +242,14 @@ fn call_tool_impl(
     }
 
     let active_task = ctx.harness.current_task().ok().flatten();
+    let retained_session = if matches!(name, "write_stdin" | "kill_session") {
+        effective_args
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|session_id| ctx.sessions.get(session_id).ok())
+    } else {
+        None
+    };
     let task_id = if requires_write_baseline(name, &effective_args) {
         if let Some(task) = active_task.as_ref() {
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
@@ -307,11 +362,56 @@ fn call_tool_impl(
             operation_input(args),
             json!({"ok": succeeded, "tool": name}),
         );
-        if succeeded && advances_expected_state(name) {
+        if succeeded && advances_expected_state(name, &output) {
             let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
             let _ = ctx
                 .harness
                 .refresh_expected_state_for_operation(task_id, operation_id);
+        }
+        if name == "exec_command" && command_output_is_terminal(&output) {
+            if let (Some(kind), Some(command)) = (
+                effective_args
+                    .get("verification_kind")
+                    .and_then(Value::as_str),
+                effective_args.get("cmd").and_then(Value::as_str),
+            ) {
+                record_verification_from_output(ctx, task_id, kind, command, &mut output);
+            }
+        } else if name == "exec_command" && effective_args.get("verification_kind").is_some() {
+            if let Some(object) = output.as_object_mut() {
+                object.insert("verification_pending".into(), Value::Bool(true));
+            }
+        }
+    }
+    if let Some(session) = retained_session {
+        if command_output_is_terminal(&output) && session.mark_harness_finalized() {
+            if let Some(metadata) = session.harness_metadata() {
+                let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
+                let _ = ctx
+                    .harness
+                    .refresh_expected_state_for_operation(&metadata.task_id, operation_id);
+                if let Some(kind) = metadata.verification_kind.as_deref() {
+                    record_verification_from_output(
+                        ctx,
+                        &metadata.task_id,
+                        kind,
+                        &metadata.command,
+                        &mut output,
+                    );
+                }
+                let _ = ctx.harness.record_event(
+                    &metadata.task_id,
+                    "command_session_finalized",
+                    Some(name),
+                    json!({"session_id": effective_args.get("session_id")}),
+                    json!({
+                        "ok": output.get("ok"),
+                        "command": metadata.command,
+                        "termination_reason": output.get("termination_reason"),
+                        "exit_code": output.get("exit_code")
+                    }),
+                );
+            }
         }
     }
     if let Some(operation) = operation {
@@ -556,6 +656,7 @@ fn server_info_for_session(
         "tools": tools,
         "tool_count": tools.len(),
         "catalog_digest": catalog.digest,
+        "catalog_version": crate::tools::registry::CATALOG_VERSION,
         "catalog_bytes": catalog.total_bytes,
         "catalog_estimated_tokens": catalog.estimated_tokens,
         "local_tool_count": catalog.local_count,
@@ -671,20 +772,14 @@ mod tests {
     fn cancelled_file_scan_stops_before_work() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
-        let ctx = ToolContext::for_test(
-            workspace.path().to_path_buf(),
-            harness.path().to_path_buf(),
-        )
-        .expect("context");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
-        let result = call_tool_with_cancellation(
-            &ctx,
-            "list_files",
-            &json!({"path": "."}),
-            &cancellation,
-        );
+        let result =
+            call_tool_with_cancellation(&ctx, "list_files", &json!({"path": "."}), &cancellation);
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["error"]["code"], "REQUEST_CANCELLED");

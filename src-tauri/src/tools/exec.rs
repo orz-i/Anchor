@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::tools::context::ToolContext;
-use crate::tools::session::ExecSession;
+use crate::tools::session::{ExecSession, SessionHarnessMetadata};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::CancellationToken;
 
@@ -99,6 +99,11 @@ pub fn exec_command_with_cancellation(
         .min(30_000);
     let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
     let stdin_text = args.get("stdin").and_then(Value::as_str).unwrap_or("");
+    let verification_kind = args
+        .get("verification_kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     ctx.workspace.ensure_child_process_boundary()?;
 
@@ -112,6 +117,7 @@ pub fn exec_command_with_cancellation(
             max_output,
             tty,
             stdin_text,
+            verification_kind,
             cancellation,
         )
         .await
@@ -266,6 +272,7 @@ async fn run_command(
     max_output: usize,
     tty: bool,
     stdin_text: &str,
+    verification_kind: Option<&str>,
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
     if cancellation.is_cancelled() {
@@ -300,7 +307,21 @@ async fn run_command(
         }),
     })?;
 
-    let session = match ctx.sessions.insert(ExecSession::new_with_mode(child, tty)) {
+    let harness_metadata =
+        ctx.harness
+            .current_task()
+            .ok()
+            .flatten()
+            .map(|task| SessionHarnessMetadata {
+                task_id: task.id,
+                command: cmd.to_string(),
+                verification_kind: verification_kind.map(str::to_string),
+            });
+    let session = match ctx.sessions.insert(ExecSession::new_with_harness_metadata(
+        child,
+        tty,
+        harness_metadata,
+    )) {
         Ok(session) => session,
         Err(rejected) => {
             rejected.mark_termination_reason("session_limit");
@@ -444,6 +465,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         16_384,
         false,
         "",
+        None,
         &CancellationToken::default(),
     ));
 

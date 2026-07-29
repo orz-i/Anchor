@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+pub const CATALOG_VERSION: u32 = 3;
+
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "harness_status",
@@ -550,6 +552,8 @@ fn history_bootstrap_output_properties() -> Value {
             "session_key": { "type": "string", "minLength": 1 },
             "session_key_source": { "type": "string", "minLength": 1 },
             "host_session_key_mismatch": { "type": "boolean" },
+            "host_session_key_mismatch_level": { "type": "string", "enum": ["none", "debug"] },
+            "target_preserved": { "type": "boolean", "const": true },
             "history_numbers": { "type": "array", "maxItems": 256, "items": { "type": "integer", "minimum": 1 } },
             "history_numbers_total": { "type": "integer", "minimum": 0 },
             "history_numbers_truncated": { "type": "boolean" },
@@ -606,6 +610,19 @@ fn history_bootstrap_output_properties() -> Value {
             "assistant_instructions": { "type": "string", "minLength": 1 },
             "required_next_actions": { "type": "array", "items": { "type": "string" } },
             "checkpoint_policy": { "type": "object" },
+            "persistence": {
+                "type": "object",
+                "properties": {
+                    "storage": { "type": "string", "const": "workspace_file" },
+                    "path": { "type": "string", "minLength": 1 },
+                    "git_tracked": { "type": "boolean" },
+                    "git_ignored": { "type": "boolean" },
+                    "git_dirty_after_write": { "type": "boolean" },
+                    "reason": { "type": "string", "minLength": 1 }
+                },
+                "required": ["storage", "path", "git_tracked", "git_ignored", "git_dirty_after_write", "reason"],
+                "additionalProperties": false
+            },
             "warnings": warnings_property()
         }),
     ])
@@ -680,6 +697,7 @@ pub fn output_schema(name: &str) -> Value {
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "tool_count": { "type": "integer", "minimum": 0 },
                 "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "catalog_version": { "type": "integer", "minimum": 1 },
                 "catalog_bytes": { "type": "integer", "minimum": 0 },
                 "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
                 "local_tool_count": { "type": "integer", "minimum": 0 },
@@ -717,6 +735,7 @@ pub fn output_schema(name: &str) -> Value {
                 "tools",
                 "tool_count",
                 "catalog_digest",
+                "catalog_version",
                 "catalog_bytes",
                 "catalog_estimated_tokens",
                 "local_tool_count",
@@ -872,6 +891,8 @@ pub fn output_schema(name: &str) -> Value {
                 "child_process": { "type": "boolean" },
                 "transport_ok": { "type": "boolean" },
                 "command_ok": { "type": ["boolean", "null"] },
+                "verification_pending": { "type": "boolean" },
+                "verification": { "type": "object", "additionalProperties": true },
                 "warnings": warnings_property()
             }),
             &[
@@ -972,6 +993,8 @@ pub fn output_schema(name: &str) -> Value {
                 "session_key",
                 "session_key_source",
                 "host_session_key_mismatch",
+                "host_session_key_mismatch_level",
+                "target_preserved",
                 "history_numbers",
                 "history_numbers_total",
                 "history_numbers_truncated",
@@ -1007,6 +1030,7 @@ pub fn output_schema(name: &str) -> Value {
                 "assistant_instructions",
                 "required_next_actions",
                 "checkpoint_policy",
+                "persistence",
                 "warnings",
             ],
         ),
@@ -1017,6 +1041,8 @@ pub fn output_schema(name: &str) -> Value {
                 "session_key": { "type": "string", "minLength": 1 },
                 "expected_path": { "type": "string", "minLength": 1 },
                 "host_session_key_mismatch": { "type": "boolean" },
+                "host_session_key_mismatch_level": { "type": "string", "enum": ["none", "debug"] },
+                "target_preserved": { "type": "boolean", "const": true },
                 "turn_id": { "type": "string", "minLength": 1 },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
                 "previous_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
@@ -1028,6 +1054,11 @@ pub fn output_schema(name: &str) -> Value {
                 "updated": { "type": "boolean" },
                 "duplicate_ignored": { "type": "boolean" },
                 "content_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "storage": { "type": "string", "const": "workspace_file" },
+                "git_tracked": { "type": "boolean" },
+                "git_ignored": { "type": "boolean" },
+                "git_dirty_after_write": { "type": "boolean" },
+                "persistence_reason": { "type": "string", "minLength": 1 },
                 "warnings": warnings_property()
             }),
             &[
@@ -1036,6 +1067,8 @@ pub fn output_schema(name: &str) -> Value {
                 "session_key",
                 "expected_path",
                 "host_session_key_mismatch",
+                "host_session_key_mismatch_level",
+                "target_preserved",
                 "turn_id",
                 "session_status",
                 "previous_status",
@@ -1047,6 +1080,11 @@ pub fn output_schema(name: &str) -> Value {
                 "updated",
                 "duplicate_ignored",
                 "content_hash",
+                "storage",
+                "git_tracked",
+                "git_ignored",
+                "git_dirty_after_write",
+                "persistence_reason",
                 "warnings",
             ],
         ),
@@ -1100,6 +1138,150 @@ pub fn output_schema(name: &str) -> Value {
                 "index_status",
                 "repaired",
                 "warnings",
+            ],
+        ),
+        "harness_status" => success_output_schema(
+            json!({
+                "schema_version": { "type": "integer", "minimum": 1 },
+                "workspace_id": { "type": "string", "minLength": 1 },
+                "task_id": { "type": ["string", "null"] },
+                "task_state": { "type": ["string", "null"] },
+                "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
+                "next_stage_started": { "type": "boolean", "const": false },
+                "writable": { "type": "boolean" },
+                "baseline_matches": { "type": ["boolean", "null"] },
+                "branch": { "type": ["string", "null"] },
+                "head": { "type": ["string", "null"] },
+                "worktree_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "expected_branch": { "type": ["string", "null"] },
+                "expected_head": { "type": ["string", "null"] },
+                "expected_fingerprint": { "type": ["string", "null"] },
+                "capabilities": { "type": "object" },
+                "next_actions": { "type": "array", "items": { "type": "string" } },
+                "reason": { "type": "string" },
+                "recoverable": { "type": "boolean" }
+            }),
+            &[
+                "schema_version",
+                "workspace_id",
+                "session_status",
+                "next_stage_started",
+                "writable",
+                "worktree_fingerprint",
+                "capabilities",
+                "next_actions",
+                "reason",
+                "recoverable",
+            ],
+        ),
+        "stage_commit" => success_output_schema(
+            json!({
+                "workflow_id": { "type": "string", "minLength": 1 },
+                "idempotency_key": { "type": "string", "minLength": 1 },
+                "workflow_status": { "type": "string", "minLength": 1 },
+                "complete": { "type": "boolean" },
+                "retryable": { "type": "boolean" },
+                "task_id": { "type": "string", "minLength": 1 },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "checks": { "type": "array", "items": { "type": "object" } },
+                "verification_ids": { "type": "array", "items": { "type": "string" } },
+                "commit_sha": { "type": ["string", "null"] },
+                "committed_files": { "type": "array", "items": { "type": "string" } },
+                "working_tree_files": { "type": "array", "items": { "type": "string" } },
+                "runtime_artifacts": { "type": "array", "items": { "type": "string" } },
+                "ignored_files": { "type": "array", "items": { "type": "string" } },
+                "baseline_refreshed": { "type": "boolean" },
+                "checkpoint_hash": { "type": ["string", "null"] },
+                "checkpoint_count": nullable_integer_property(),
+                "error": { "type": ["object", "null"] }
+            }),
+            &[
+                "workflow_id",
+                "idempotency_key",
+                "workflow_status",
+                "complete",
+                "retryable",
+                "task_id",
+                "paths",
+                "checks",
+                "verification_ids",
+                "committed_files",
+                "working_tree_files",
+                "runtime_artifacts",
+                "ignored_files",
+                "baseline_refreshed",
+            ],
+        ),
+        "finish_task" => json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "task_status": { "type": "string", "enum": ["verifying", "completed", "completed_unverified"] },
+                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "unverified"] },
+                "closed": { "type": "boolean" },
+                "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
+                "next_stage_started": { "type": "boolean", "const": false },
+                "reason": { "type": "string" },
+                "next_actions": { "type": "array", "items": { "type": "string" } },
+                "task": { "type": "object" },
+                "verification": { "type": "array", "items": { "type": "object" } },
+                "change_summary": { "type": "object" },
+                "truncated": { "type": "boolean" },
+                "details_tool": { "type": "object" },
+                "max_response_bytes": { "type": "integer", "minimum": 1 },
+                "response_bytes": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["ok", "task_status", "verification_status", "closed", "session_status", "next_stage_started", "task"],
+            "allOf": [
+                {
+                    "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+                    "then": {
+                        "properties": { "closed": { "const": true } },
+                        "required": ["change_summary", "truncated", "details_tool", "max_response_bytes", "response_bytes"]
+                    }
+                },
+                {
+                    "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+                    "then": {
+                        "properties": { "task_status": { "const": "verifying" }, "closed": { "const": false } },
+                        "required": ["reason", "next_actions", "verification"]
+                    }
+                }
+            ],
+            "additionalProperties": true
+        }),
+        "change_summary" => success_output_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1 },
+                "objective": { "type": "string" },
+                "commit_sha": { "type": ["string", "null"] },
+                "committed_files": { "type": "array", "items": { "type": "string" } },
+                "working_tree_files": { "type": "array", "items": { "type": "string" } },
+                "runtime_artifacts": { "type": "array", "items": { "type": "string" } },
+                "ignored_files": { "type": "array", "items": { "type": "string" } },
+                "verification": { "type": "array", "items": { "type": "object" } },
+                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified"] },
+                "evidence": { "type": "array", "items": { "type": "object" } },
+                "counts": { "type": "object" },
+                "baseline": { "type": "object" },
+                "truncated": { "type": "boolean" },
+                "next_cursor": { "type": ["object", "null"] },
+                "section": { "type": "string" }
+            }),
+            &[
+                "task_id",
+                "objective",
+                "committed_files",
+                "working_tree_files",
+                "runtime_artifacts",
+                "ignored_files",
+                "verification",
+                "verification_status",
+                "evidence",
+                "counts",
+                "baseline",
+                "truncated",
+                "next_cursor",
             ],
         ),
         "view_image" => success_output_schema(
@@ -1370,7 +1552,13 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "task_id": { "type": "string", "minLength": 1 },
                 "summary": { "type": "string" },
-                "allow_unverified": { "type": "boolean", "default": false }
+                "allow_unverified": { "type": "boolean", "default": false },
+                "session_status": {
+                    "type": "string",
+                    "enum": ["active", "paused", "completed"],
+                    "default": "paused",
+                    "description": "Persisted overall Harness session state after the task closes."
+                }
             },
             "required": ["task_id"],
             "additionalProperties": false
@@ -1395,7 +1583,16 @@ pub fn input_schema(name: &str) -> Value {
         }),
         "change_summary" => json!({
             "type": "object",
-            "properties": { "task_id": { "type": "string" }, "change_id": { "type": "string" } },
+            "properties": {
+                "task_id": { "type": "string" },
+                "change_id": { "type": "string" },
+                "section": {
+                    "type": "string",
+                    "enum": ["committed_files", "working_tree_files", "runtime_artifacts", "ignored_files", "verification", "evidence"]
+                },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 64 }
+            },
             "additionalProperties": false
         }),
         "read_file" => json!({
@@ -1479,6 +1676,12 @@ pub fn input_schema(name: &str) -> Value {
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
                 "stdin": { "type": "string", "default": "" },
+                "verification_kind": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "Optional verification category such as lint, test, build, check, or diff_check. Terminal results are persisted as Harness verification evidence when a task is active."
+                },
                 "filesystem_scope": { "type": "string", "enum": ["workspace"], "default": "workspace" },
                 "reason": { "type": "string", "default": "" }
             },

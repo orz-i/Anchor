@@ -77,6 +77,9 @@ fn history_successes_match_published_output_schemas() {
         }),
     );
     assert_ok(&bootstrap);
+    assert_eq!(bootstrap["target_preserved"], true);
+    assert_eq!(bootstrap["host_session_key_mismatch_level"], "none");
+    assert_eq!(bootstrap["persistence"]["storage"], "workspace_file");
     assert_matches_output_schema("history_session_bootstrap", &bootstrap);
 
     let current_path = bootstrap["current_path"]
@@ -94,6 +97,12 @@ fn history_successes_match_published_output_schemas() {
         }),
     );
     assert_ok(&checkpoint);
+    assert_eq!(checkpoint["target_preserved"], true);
+    assert_eq!(checkpoint["storage"], "workspace_file");
+    assert!(checkpoint["git_tracked"].is_boolean());
+    assert!(checkpoint["git_ignored"].is_boolean());
+    assert!(checkpoint["git_dirty_after_write"].is_boolean());
+    assert!(checkpoint["persistence_reason"].is_string());
     assert_matches_output_schema("history_session_checkpoint", &checkpoint);
 
     let validate = invoke(

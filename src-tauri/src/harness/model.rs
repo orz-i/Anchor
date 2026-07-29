@@ -3,13 +3,22 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityStatus {
     pub status: String,
     pub reason: String,
     pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessSessionStatus {
+    Active,
+    #[default]
+    Paused,
+    Completed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +45,19 @@ pub struct StageCommitReceipt {
     pub paths: Vec<String>,
     #[serde(default)]
     pub checks: Vec<Value>,
+    #[serde(default)]
+    pub verification_ids: Vec<String>,
     pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub committed_files: Vec<String>,
+    #[serde(default)]
+    pub working_tree_files: Vec<String>,
+    #[serde(default)]
+    pub runtime_artifacts: Vec<String>,
+    #[serde(default)]
+    pub ignored_files: Vec<String>,
+    #[serde(default)]
+    pub baseline_refreshed: bool,
     pub checkpoint_hash: Option<String>,
     pub checkpoint_count: Option<u64>,
     pub error: Option<Value>,
@@ -60,6 +81,8 @@ pub struct HarnessStatus {
     pub task_id: Option<String>,
     pub task_state: Option<TaskStatus>,
     pub task_updated_at: Option<String>,
+    pub session_status: HarnessSessionStatus,
+    pub next_stage_started: bool,
     pub writable: bool,
     pub reason: String,
     pub recoverable: bool,
@@ -197,11 +220,20 @@ pub struct VerificationRecord {
     pub id: String,
     pub task_id: String,
     pub command: String,
-    pub category: String,
+    #[serde(alias = "category")]
+    pub kind: String,
+    #[serde(default = "default_verification_status")]
+    pub status: String,
     pub exit_code: Option<i32>,
     pub passed: bool,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
     pub change_id: Option<String>,
     pub created_at: String,
+}
+
+fn default_verification_status() -> String {
+    "unknown".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +244,15 @@ pub struct ChangeSet {
     pub reason: ReasonRecord,
     #[serde(default)]
     pub files: Vec<FileChangeRecord>,
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub committed_files: Vec<String>,
+    #[serde(default)]
+    pub working_tree_files: Vec<String>,
+    #[serde(default)]
+    pub runtime_artifacts: Vec<String>,
+    #[serde(default)]
+    pub ignored_files: Vec<String>,
     #[serde(default)]
     pub command_ids: Vec<String>,
     #[serde(default)]
@@ -248,6 +289,8 @@ pub struct ProjectState {
 pub struct WorkspaceHarnessState {
     pub schema_version: u32,
     pub active_task_id: Option<String>,
+    #[serde(default)]
+    pub session_status: HarnessSessionStatus,
     #[serde(default)]
     pub recent_task_ids: Vec<String>,
     pub updated_at: String,

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::model::{
-    HarnessEvent, OperationRecord, StageCommitReceipt, TaskSession, WorkspaceHarnessState,
+    ChangeSet, HarnessEvent, OperationRecord, StageCommitReceipt, TaskSession, VerificationRecord,
+    WorkspaceHarnessState,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,16 @@ impl HarnessStore {
         self.workspace_dir(workspace_id).join("operations.jsonl")
     }
 
+    fn verifications_dir(&self, workspace_id: &str, task_id: &str) -> PathBuf {
+        self.workspace_dir(workspace_id)
+            .join("verifications")
+            .join(task_id)
+    }
+
+    fn changes_dir(&self, workspace_id: &str) -> PathBuf {
+        self.workspace_dir(workspace_id).join("changes")
+    }
+
     fn stage_commit_path(&self, workspace_id: &str, idempotency_key: &str) -> PathBuf {
         let digest = format!("{:x}", Sha256::digest(idempotency_key.as_bytes()));
         self.workspace_dir(workspace_id)
@@ -106,6 +117,76 @@ impl HarnessStore {
         let dir = self.workspace_dir(workspace_id);
         fs::create_dir_all(&dir).map_err(io_error)?;
         atomic_write_json(&dir.join("state.json"), state)
+    }
+
+    pub fn load_workspace_state(
+        &self,
+        workspace_id: &str,
+    ) -> HarnessResult<Option<WorkspaceHarnessState>> {
+        let path = self.workspace_dir(workspace_id).join("state.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
+    }
+
+    pub fn save_verification(
+        &self,
+        workspace_id: &str,
+        verification: &VerificationRecord,
+    ) -> HarnessResult<()> {
+        let dir = self.verifications_dir(workspace_id, &verification.task_id);
+        fs::create_dir_all(&dir).map_err(io_error)?;
+        atomic_write_json(&dir.join(format!("{}.json", verification.id)), verification)
+    }
+
+    pub fn list_verifications(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> HarnessResult<Vec<VerificationRecord>> {
+        let dir = self.verifications_dir(workspace_id, task_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for entry in fs::read_dir(dir).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(record) = read_json(&path) {
+                records.push(record);
+            }
+        }
+        records.sort_by(|left: &VerificationRecord, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(records)
+    }
+
+    pub fn save_change_set(&self, workspace_id: &str, change: &ChangeSet) -> HarnessResult<()> {
+        let dir = self.changes_dir(workspace_id);
+        fs::create_dir_all(&dir).map_err(io_error)?;
+        let digest = format!("{:x}", Sha256::digest(change.id.as_bytes()));
+        atomic_write_json(&dir.join(format!("{digest}.json")), change)
+    }
+
+    pub fn load_change_set(
+        &self,
+        workspace_id: &str,
+        change_id: &str,
+    ) -> HarnessResult<Option<ChangeSet>> {
+        let digest = format!("{:x}", Sha256::digest(change_id.as_bytes()));
+        let path = self
+            .changes_dir(workspace_id)
+            .join(format!("{digest}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
     }
 
     pub fn append_event_for_workspace(

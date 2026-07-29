@@ -3,6 +3,7 @@ mod model;
 mod storage;
 
 use std::fs;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -46,11 +47,6 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     }
 
     let mut warnings = Vec::<String>::new();
-    if host_session_key_mismatch {
-        warnings.push(
-            "宿主会话标识与显式 session_key 不一致，已使用显式 session_key 保持会话连续。".into(),
-        );
-    }
     match storage::read_index(&history_dir) {
         Ok(Some(_)) => {}
         Ok(None) => warnings.push("历史索引缺失，已根据 Markdown 重建。".into()),
@@ -244,6 +240,8 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "session_key": session_key.clone(),
         "session_key_source": source,
         "host_session_key_mismatch": host_session_key_mismatch,
+        "host_session_key_mismatch_level": if host_session_key_mismatch { "debug" } else { "none" },
+        "target_preserved": true,
         "history_numbers": history_numbers,
         "history_count": prior.len(),
         "latest_completed_number": latest_completed.map(|document| document.number),
@@ -286,6 +284,7 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "applies_after_bootstrap": true,
             "automatic_background_persistence": false
         },
+        "persistence": persistence_details(ctx, &current_path),
         "warnings": warnings
     });
     let object = payload
@@ -484,19 +483,19 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     if redacted {
         warnings.push("检测到疑似敏感信息，归档内容已脱敏。");
     }
-    if host_session_key_mismatch {
-        warnings.push("宿主会话标识已变化；本次仍使用 bootstrap 返回的稳定目标，未切换历史文件。");
-    }
     let content_bytes = final_content.len() as u64;
     if content_bytes > storage::MAX_HISTORY_FILE_BYTES * 3 / 4 {
         warnings.push("当前历史会话文件已超过容量上限的 75%，建议减少后续 checkpoint 内容或切换新的显式 session_key。");
     }
+    let persistence = persistence_details(ctx, &document.path);
     Ok(tool_ok(json!({
         "session_number": document.number,
         "path": document.path,
         "session_key": session_key,
         "expected_path": expected_path,
         "host_session_key_mismatch": host_session_key_mismatch,
+        "host_session_key_mismatch_level": if host_session_key_mismatch { "debug" } else { "none" },
+        "target_preserved": true,
         "turn_id": record.turn_id,
         "session_status": session_status,
         "previous_status": previous_status,
@@ -508,8 +507,57 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "updated": updated,
         "duplicate_ignored": duplicate_ignored,
         "content_hash": storage::sha256(final_content.as_bytes()),
+        "storage": persistence["storage"],
+        "git_tracked": persistence["git_tracked"],
+        "git_ignored": persistence["git_ignored"],
+        "git_dirty_after_write": persistence["git_dirty_after_write"],
+        "persistence_reason": persistence["reason"],
         "warnings": warnings
     })))
+}
+
+fn persistence_details(ctx: &ToolContext, relative_path: &str) -> Value {
+    let root = ctx.workspace.root();
+    let git_tracked = git_path_command(root, &["ls-files", "--error-unmatch", "--", relative_path])
+        .is_some_and(|output| output.status.success());
+    let git_ignored = git_path_command(root, &["check-ignore", "-q", "--", relative_path])
+        .is_some_and(|output| output.status.success());
+    let git_dirty_after_write = git_path_command(
+        root,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            relative_path,
+        ],
+    )
+    .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
+    let reason = if git_tracked && git_dirty_after_write {
+        "checkpoint updated a Git-tracked workspace file"
+    } else if git_tracked {
+        "checkpoint target is Git-tracked and its content is unchanged relative to the index"
+    } else if git_ignored {
+        "checkpoint is stored as an ignored workspace metadata file outside business Git changes"
+    } else if git_dirty_after_write {
+        "checkpoint is stored as an untracked workspace file"
+    } else {
+        "checkpoint is stored in the workspace; Git status did not report a pending change"
+    };
+    json!({
+        "storage": "workspace_file",
+        "path": relative_path,
+        "git_tracked": git_tracked,
+        "git_ignored": git_ignored,
+        "git_dirty_after_write": git_dirty_after_write,
+        "reason": reason
+    })
+}
+
+fn git_path_command(root: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
+    let mut command = Command::new("git");
+    crate::platform::hide_std_console(&mut command);
+    command.arg("-C").arg(root).args(args).output().ok()
 }
 
 pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {

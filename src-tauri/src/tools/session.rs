@@ -181,6 +181,15 @@ pub struct ExecSession {
     last_access: Mutex<Instant>,
     termination_reason: Mutex<Option<String>>,
     reader_tasks: AsyncMutex<Vec<crate::async_runtime::JoinHandle<()>>>,
+    harness_metadata: Option<SessionHarnessMetadata>,
+    harness_finalized: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionHarnessMetadata {
+    pub task_id: String,
+    pub command: String,
+    pub verification_kind: Option<String>,
 }
 
 impl ExecSession {
@@ -188,7 +197,15 @@ impl ExecSession {
         Self::new_with_mode(child, false)
     }
 
-    pub fn new_with_mode(mut child: Child, interactive: bool) -> Self {
+    pub fn new_with_mode(child: Child, interactive: bool) -> Self {
+        Self::new_with_harness_metadata(child, interactive, None)
+    }
+
+    pub fn new_with_harness_metadata(
+        mut child: Child,
+        interactive: bool,
+        harness_metadata: Option<SessionHarnessMetadata>,
+    ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
@@ -206,7 +223,19 @@ impl ExecSession {
             last_access: Mutex::new(Instant::now()),
             termination_reason: Mutex::new(None),
             reader_tasks: AsyncMutex::new(Vec::new()),
+            harness_metadata,
+            harness_finalized: AtomicBool::new(false),
         }
+    }
+
+    pub fn harness_metadata(&self) -> Option<SessionHarnessMetadata> {
+        self.harness_metadata.clone()
+    }
+
+    pub fn mark_harness_finalized(&self) -> bool {
+        self.harness_finalized
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub async fn spawn_readers(self: &Arc<Self>) {

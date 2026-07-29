@@ -1,7 +1,8 @@
 use std::fs;
+use std::process::Command;
 
 use anchor_lib::tools::{call_tool, ToolContext};
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[test]
 fn 无任务时仍可执行_dry_run_预检() {
@@ -27,6 +28,181 @@ fn 无任务时仍可执行_dry_run_预检() {
         fs::read_to_string(temp.path().join("workspace/README.md")).unwrap(),
         "初始内容\n"
     );
+}
+
+#[test]
+fn finish_task_rejects_uncommitted_business_changes() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "anchor-tests@example.invalid"]);
+    git(&["config", "user.name", "Anchor Tests"]);
+    fs::write(workspace.join("main.txt"), "before\n").expect("写入文件");
+    git(&["add", "main.txt"]);
+    git(&["commit", "-m", "initial"]);
+
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(&ctx, "start_task", &json!({"objective": "提交前不得关闭"}));
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+    let patched = call_tool(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Update File: main.txt\n@@\n-before\n+after\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(patched["ok"], true);
+    let verified = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"print('verified')\"",
+            "verification_kind": "test",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(verified["command_ok"], true);
+
+    let finished = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
+    assert_eq!(finished["ok"], false);
+    assert_eq!(finished["task_status"], "verifying");
+    assert_eq!(finished["closed"], false);
+    assert_eq!(finished["working_tree_files"], json!(["main.txt"]));
+    assert!(finished["reason"].as_str().unwrap().contains("未提交"));
+}
+
+#[test]
+fn successful_verification_retry_supersedes_previous_failure() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(&ctx, "start_task", &json!({"objective": "验证重试"}));
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+    let command =
+        "python -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('ok.flag').exists() else 1)\"";
+
+    let failed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": command, "verification_kind": "test", "yield_time_ms": 30000}),
+    );
+    assert_eq!(failed["command_ok"], false);
+    fs::write(workspace.join("ok.flag"), "ready\n").expect("写入验证标记");
+    let task = ctx.harness.current_task().unwrap().unwrap();
+    ctx.harness
+        .refresh_expected_state_for_operation(&task.id, Some("test-fixture"))
+        .expect("refresh fixture change");
+    let passed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": command, "verification_kind": "test", "yield_time_ms": 30000}),
+    );
+    assert_eq!(passed["command_ok"], true);
+
+    let finished = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
+    assert_eq!(finished["ok"], true);
+    assert_eq!(finished["verification_status"], "verified");
+    assert_eq!(finished["task_status"], "completed");
+}
+
+#[test]
+fn retained_git_commit_refreshes_expected_head_after_session_exit() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "anchor-tests@example.invalid"]);
+    git(&["config", "user.name", "Anchor Tests"]);
+    fs::write(workspace.join("main.txt"), "before\n").expect("写入文件");
+    git(&["add", "main.txt"]);
+    git(&["commit", "-m", "initial"]);
+
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "异步提交后继续任务"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+    let patched = call_tool(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Update File: main.txt\n@@\n-before\n+after\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(patched["ok"], true);
+
+    let command = "python -c \"import subprocess,time; time.sleep(0.25); subprocess.check_call(['git','add','main.txt']); subprocess.check_call(['git','commit','-m','async commit'])\"";
+    let launched = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": command,
+            "yield_time_ms": 1,
+            "timeout_ms": 10000
+        }),
+    );
+    assert_eq!(launched["ok"], true);
+    assert_eq!(launched["status"], "running");
+    let session_id = launched["session_id"].as_str().expect("session ID");
+
+    let completed = call_tool(
+        &ctx,
+        "write_stdin",
+        &json!({"session_id": session_id, "chars": "", "yield_time_ms": 2000}),
+    );
+    assert_eq!(completed["ok"], true);
+    assert_eq!(completed["status"], "exited");
+    assert_eq!(completed["exit_code"], 0);
+
+    let current_head = Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git head");
+    let current_head = String::from_utf8_lossy(&current_head.stdout)
+        .trim()
+        .to_string();
+    let status = call_tool(&ctx, "harness_status", &json!({}));
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["task_id"], task_id);
+    assert_eq!(status["baseline_matches"], true);
+    assert_eq!(status["expected_head"], current_head);
+    assert_eq!(status["head"], current_head);
 }
 
 #[test]
@@ -197,7 +373,114 @@ fn harness_tools_support_task_lifecycle() {
         &json!({"task_id": task_id, "allow_unverified": true}),
     );
     assert_eq!(finished["ok"], true);
+    assert_eq!(finished["task_status"], "completed_unverified");
+    assert_eq!(finished["verification_status"], "unverified");
+    assert_eq!(finished["closed"], true);
+    assert_eq!(finished["session_status"], "paused");
+    assert_eq!(finished["next_stage_started"], false);
     assert_eq!(finished["task"]["status"], "completed_unverified");
+    assert!(finished["task"]["baseline"]["file_count"].is_u64());
+    assert!(finished["task"]["baseline"].get("entries").is_none());
+    assert!(finished["response_bytes"].as_u64().unwrap() <= 32 * 1024);
+    let serialized_bytes = serde_json::to_vec(&finished).unwrap().len();
+    assert!(serialized_bytes <= 32 * 1024);
+    assert_eq!(finished["response_bytes"], serialized_bytes);
+}
+
+#[test]
+fn finish_task_requires_structured_verification_and_then_closes_atomically() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "验证后原子关闭任务"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+
+    let blocked = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["task_status"], "verifying");
+    assert_eq!(blocked["verification_status"], "missing");
+    assert_eq!(blocked["closed"], false);
+    assert_eq!(blocked["session_status"], "active");
+    assert!(blocked["reason"].is_string());
+
+    let verified = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"print('lint-ok')\"",
+            "verification_kind": "lint",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(verified["ok"], true);
+    assert_eq!(verified["command_ok"], true);
+    assert_eq!(verified["verification"]["kind"], "lint");
+    assert_eq!(verified["verification"]["status"], "passed");
+
+    let finished = call_tool(
+        &ctx,
+        "finish_task",
+        &json!({"task_id": task_id, "session_status": "paused"}),
+    );
+    assert_eq!(finished["ok"], true);
+    assert_eq!(finished["task_status"], "completed");
+    assert_eq!(finished["verification_status"], "verified");
+    assert_eq!(finished["closed"], true);
+    assert_eq!(finished["session_status"], "paused");
+    assert_eq!(finished["next_stage_started"], false);
+    assert_eq!(
+        finished["change_summary"]["verification"][0]["kind"],
+        "lint"
+    );
+    assert_eq!(
+        finished["change_summary"]["verification"][0]["status"],
+        "passed"
+    );
+    assert!(finished["response_bytes"].as_u64().unwrap() <= 32 * 1024);
+    let serialized_bytes = serde_json::to_vec(&finished).unwrap().len();
+    assert!(serialized_bytes <= 32 * 1024);
+    assert_eq!(finished["response_bytes"], serialized_bytes);
+
+    let status = call_tool(&ctx, "harness_status", &json!({}));
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["task_id"], Value::Null);
+    assert_eq!(status["session_status"], "paused");
+    assert_eq!(status["next_stage_started"], false);
+}
+
+#[test]
+fn finish_task_hard_limits_extreme_response_size() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let oversized_objective = "超大任务说明".repeat(20_000);
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": oversized_objective}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+
+    let finished = call_tool(
+        &ctx,
+        "finish_task",
+        &json!({"task_id": task_id, "allow_unverified": true}),
+    );
+    assert_eq!(finished["ok"], true);
+    assert_eq!(finished["truncated"], true);
+    assert!(finished["response_bytes"].as_u64().unwrap() <= 32 * 1024);
+    let serialized_bytes = serde_json::to_vec(&finished).unwrap().len();
+    assert!(serialized_bytes <= 32 * 1024);
+    assert_eq!(finished["response_bytes"], serialized_bytes);
+    assert_eq!(finished["details_tool"]["name"], "change_summary");
 }
 
 #[test]

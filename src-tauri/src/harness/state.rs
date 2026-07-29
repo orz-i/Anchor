@@ -10,9 +10,10 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::model::{
-    BaselineEntry, CapabilityStatus, ExpectedWorkspaceState, FileChangeRecord, HarnessEvent,
-    HarnessStatus, OperationRecord, ProjectBaseline, ProjectFileState, ProjectState,
-    StageCommitReceipt, TaskSession, TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
+    BaselineEntry, CapabilityStatus, ChangeSet, ExpectedWorkspaceState, FileChangeRecord,
+    HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord, ProjectBaseline,
+    ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt, TaskSession, TaskStatus,
+    VerificationRecord, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 
@@ -79,13 +80,180 @@ impl Harness {
             updated_at: now,
         };
         self.store.save_task(&task)?;
-        self.save_workspace_state(Some(&task.id), &task.updated_at)?;
+        self.save_workspace_state(
+            Some(&task.id),
+            HarnessSessionStatus::Active,
+            &task.updated_at,
+        )?;
         self.record_event(
             &task.id,
             "task_started",
             None,
             json!({}),
             json!({"ok": true}),
+        )?;
+        Ok(task)
+    }
+
+    pub fn mark_verifying(&self, task_id: &str) -> HarnessResult<TaskSession> {
+        let mut task = self.task(task_id)?;
+        if !task.status.is_writable() {
+            return Err(HarnessError::new(
+                "TASK_NOT_WRITABLE",
+                "当前任务已经关闭，不能进入验证状态",
+            ));
+        }
+        if task.status != TaskStatus::Verifying {
+            task.status = TaskStatus::Verifying;
+            task.updated_at = timestamp();
+            self.store.save_task(&task)?;
+            self.save_workspace_state(
+                Some(&task.id),
+                HarnessSessionStatus::Active,
+                &task.updated_at,
+            )?;
+            self.record_event(
+                task_id,
+                "task_verification_required",
+                Some("finish_task"),
+                json!({}),
+                json!({"ok": false, "task_status": "verifying"}),
+            )?;
+        }
+        Ok(task)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_verification(
+        &self,
+        task_id: &str,
+        kind: &str,
+        command: &str,
+        exit_code: Option<i32>,
+        passed: bool,
+        duration_ms: Option<u64>,
+        change_id: Option<&str>,
+    ) -> HarnessResult<VerificationRecord> {
+        let mut task = self.task(task_id)?;
+        let verification = VerificationRecord {
+            id: Uuid::new_v4().simple().to_string(),
+            task_id: task_id.to_string(),
+            command: command.to_string(),
+            kind: kind.trim().to_string(),
+            status: if passed { "passed" } else { "failed" }.into(),
+            exit_code,
+            passed,
+            duration_ms,
+            change_id: change_id.map(str::to_string),
+            created_at: timestamp(),
+        };
+        self.store
+            .save_verification(&self.workspace_id, &verification)?;
+        task.latest_verification_id = Some(verification.id.clone());
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        self.record_event(
+            task_id,
+            "verification_recorded",
+            Some("exec_command"),
+            json!({
+                "verification_id": verification.id,
+                "kind": verification.kind,
+                "command": verification.command
+            }),
+            json!({
+                "ok": passed,
+                "status": verification.status,
+                "exit_code": verification.exit_code,
+                "duration_ms": verification.duration_ms
+            }),
+        )?;
+        Ok(verification)
+    }
+
+    pub fn list_verifications(&self, task_id: &str) -> HarnessResult<Vec<VerificationRecord>> {
+        self.store.list_verifications(&self.workspace_id, task_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_change_set(
+        &self,
+        task_id: &str,
+        change_id: &str,
+        committed_files: Vec<String>,
+        working_tree_files: Vec<String>,
+        runtime_artifacts: Vec<String>,
+        ignored_files: Vec<String>,
+        verification_ids: Vec<String>,
+    ) -> HarnessResult<ChangeSet> {
+        let task = self.task(task_id)?;
+        let files = committed_files
+            .iter()
+            .map(|path| FileChangeRecord {
+                path: path.clone(),
+                status: "committed".into(),
+                before_sha256: None,
+                after_sha256: None,
+            })
+            .collect();
+        let change = ChangeSet {
+            id: change_id.to_string(),
+            task_id: task_id.to_string(),
+            objective: task.objective.clone(),
+            reason: ReasonRecord {
+                text: task.objective,
+                source: "task_objective".into(),
+            },
+            files,
+            commit_sha: Some(change_id.to_string()),
+            committed_files,
+            working_tree_files,
+            runtime_artifacts,
+            ignored_files,
+            command_ids: Vec::new(),
+            verification_ids,
+            risks: Vec::new(),
+            created_at: timestamp(),
+        };
+        self.store.save_change_set(&self.workspace_id, &change)?;
+        Ok(change)
+    }
+
+    pub fn load_change_set(&self, change_id: &str) -> HarnessResult<Option<ChangeSet>> {
+        self.store.load_change_set(&self.workspace_id, change_id)
+    }
+
+    pub fn complete_task(
+        &self,
+        task_id: &str,
+        verified: bool,
+        session_status: HarnessSessionStatus,
+    ) -> HarnessResult<TaskSession> {
+        let mut task = self.task(task_id)?;
+        if !task.status.is_writable() {
+            return Err(HarnessError::new(
+                "TASK_NOT_WRITABLE",
+                "当前任务已经关闭，不能重复完成",
+            ));
+        }
+        task.status = if verified {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::CompletedUnverified
+        };
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        self.save_workspace_state(None, session_status, &task.updated_at)?;
+        self.record_event(
+            task_id,
+            "task_completed",
+            Some("finish_task"),
+            json!({
+                "verification_status": if verified { "verified" } else { "unverified" },
+                "session_status": session_status,
+                "next_stage_started": false
+            }),
+            json!({"ok": true, "closed": true}),
         )?;
         Ok(task)
     }
@@ -113,9 +281,18 @@ impl Harness {
         task.status = next;
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
-        if !task.status.is_writable() {
-            self.save_workspace_state(None, &task.updated_at)?;
-        }
+        let (active_task_id, session_status) = match task.status {
+            TaskStatus::Active | TaskStatus::Verifying => {
+                (Some(task.id.as_str()), HarnessSessionStatus::Active)
+            }
+            TaskStatus::Paused | TaskStatus::Failed => {
+                (Some(task.id.as_str()), HarnessSessionStatus::Paused)
+            }
+            TaskStatus::Completed | TaskStatus::CompletedUnverified | TaskStatus::RolledBack => {
+                (None, HarnessSessionStatus::Paused)
+            }
+        };
+        self.save_workspace_state(active_task_id, session_status, &task.updated_at)?;
         self.record_event(
             task_id,
             "task_status_changed",
@@ -222,10 +399,7 @@ impl Harness {
         }
         let operation_id = Uuid::new_v4().simple().to_string();
         task.expected_fingerprint = current.worktree_fingerprint.clone();
-        task.expected_state = Some(expected_state_from_baseline(
-            &current,
-            Some(&operation_id),
-        ));
+        task.expected_state = Some(expected_state_from_baseline(&current, Some(&operation_id)));
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
         self.record_event(
@@ -333,19 +507,12 @@ impl Harness {
             .load_stage_commit_receipt(&self.workspace_id, idempotency_key)
     }
 
-    pub fn save_stage_commit_receipt(
-        &self,
-        receipt: &StageCommitReceipt,
-    ) -> HarnessResult<()> {
+    pub fn save_stage_commit_receipt(&self, receipt: &StageCommitReceipt) -> HarnessResult<()> {
         self.store
             .save_stage_commit_receipt(&self.workspace_id, receipt)
     }
 
-    pub fn set_latest_change(
-        &self,
-        task_id: &str,
-        change_id: &str,
-    ) -> HarnessResult<TaskSession> {
+    pub fn set_latest_change(&self, task_id: &str, change_id: &str) -> HarnessResult<TaskSession> {
         let mut task = self.task(task_id)?;
         task.latest_change_id = Some(change_id.to_string());
         task.updated_at = timestamp();
@@ -399,6 +566,7 @@ impl Harness {
                 }
             })
             .collect::<Vec<_>>();
+        let clean = files.iter().all(|file| file.status == "unchanged");
         let truncated = files.len() > max_files.max(1);
         let files = files.into_iter().take(max_files.max(1)).collect::<Vec<_>>();
         let active_task_id = task.as_ref().map(|t| t.id.clone());
@@ -412,7 +580,7 @@ impl Harness {
             workspace_id: self.workspace_id.clone(),
             branch: current.branch,
             head: current.head,
-            clean: files.iter().all(|f| f.status == "unchanged"),
+            clean,
             files,
             total_files,
             truncated,
@@ -425,6 +593,17 @@ impl Harness {
     pub fn status(&self) -> HarnessResult<HarnessStatus> {
         let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
+        let workspace_state = self.store.load_workspace_state(&self.workspace_id)?;
+        let session_status = workspace_state
+            .as_ref()
+            .map(|state| state.session_status)
+            .unwrap_or_else(|| {
+                if task.is_some() {
+                    HarnessSessionStatus::Active
+                } else {
+                    HarnessSessionStatus::Paused
+                }
+            });
         let expected = task.as_ref().map(expected_state);
         let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
@@ -546,6 +725,8 @@ impl Harness {
             task_id,
             task_state,
             task_updated_at,
+            session_status,
+            next_stage_started: false,
             writable,
             reason,
             recoverable: true,
@@ -566,6 +747,7 @@ impl Harness {
     fn save_workspace_state(
         &self,
         active_task_id: Option<&str>,
+        session_status: HarnessSessionStatus,
         updated_at: &str,
     ) -> HarnessResult<()> {
         self.store.save_workspace_state(
@@ -573,6 +755,7 @@ impl Harness {
             &WorkspaceHarnessState {
                 schema_version: SCHEMA_VERSION,
                 active_task_id: active_task_id.map(str::to_string),
+                session_status,
                 recent_task_ids: self
                     .store
                     .list_tasks(&self.workspace_id)?
@@ -628,13 +811,15 @@ fn git_file_paths(root: &Path) -> Option<Vec<PathBuf>> {
 }
 
 fn expected_state(task: &TaskSession) -> ExpectedWorkspaceState {
-    task.expected_state.clone().unwrap_or_else(|| ExpectedWorkspaceState {
-        branch: task.baseline.branch.clone(),
-        head: task.baseline.head.clone(),
-        worktree_fingerprint: task.expected_fingerprint.clone(),
-        accepted_at: task.updated_at.clone(),
-        accepted_by_operation_id: None,
-    })
+    task.expected_state
+        .clone()
+        .unwrap_or_else(|| ExpectedWorkspaceState {
+            branch: task.baseline.branch.clone(),
+            head: task.baseline.head.clone(),
+            worktree_fingerprint: task.expected_fingerprint.clone(),
+            accepted_at: task.updated_at.clone(),
+            accepted_by_operation_id: None,
+        })
 }
 
 fn expected_state_from_baseline(
@@ -765,7 +950,10 @@ mod tests {
 
     fn initialize_git(root: &Path) {
         git(root, &["init"]);
-        git(root, &["config", "user.email", "anchor-tests@example.invalid"]);
+        git(
+            root,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
         git(root, &["config", "user.name", "Anchor Tests"]);
     }
 
@@ -811,8 +999,11 @@ mod tests {
     fn git_baseline_ignores_history_metadata() {
         let workspace = tempdir().expect("workspace");
         initialize_git(workspace.path());
-        fs::write(workspace.path().join(".gitignore"), "docs/history-session/\n")
-            .expect("gitignore");
+        fs::write(
+            workspace.path().join(".gitignore"),
+            "docs/history-session/\n",
+        )
+        .expect("gitignore");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
         git(workspace.path(), &["add", ".gitignore", "main.rs"]);
         git(workspace.path(), &["commit", "-m", "initial"]);
@@ -846,8 +1037,11 @@ mod tests {
         let started = harness.start_task("commit test").expect("start");
         let initial_head = started.baseline.head.clone();
 
-        fs::write(workspace.path().join("main.rs"), "fn main() { println!(\"ok\"); }\n")
-            .expect("change");
+        fs::write(
+            workspace.path().join("main.rs"),
+            "fn main() { println!(\"ok\"); }\n",
+        )
+        .expect("change");
         git(workspace.path(), &["add", "main.rs"]);
         git(workspace.path(), &["commit", "-m", "change"]);
         assert!(harness.check_baseline(&started.id).is_err());
@@ -858,7 +1052,10 @@ mod tests {
         harness.check_baseline(&started.id).expect("baseline valid");
         assert_eq!(refreshed.baseline.head, initial_head);
         assert_ne!(
-            refreshed.expected_state.as_ref().and_then(|state| state.head.clone()),
+            refreshed
+                .expected_state
+                .as_ref()
+                .and_then(|state| state.head.clone()),
             initial_head
         );
         assert_eq!(

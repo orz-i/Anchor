@@ -269,8 +269,7 @@ fn execute_new_workflow(
 
     let now = timestamp();
     let mut receipt = StageCommitReceipt {
-        workflow_id: existing_workflow_id
-            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+        workflow_id: existing_workflow_id.unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
         idempotency_key: idempotency_key.to_string(),
         task_id: task_id.to_string(),
         status: StageCommitStatus::Started,
@@ -278,7 +277,13 @@ fn execute_new_workflow(
         expected_fingerprint: expected_fingerprint.to_string(),
         paths: paths.clone(),
         checks: Vec::new(),
+        verification_ids: Vec::new(),
         commit_sha: None,
+        committed_files: Vec::new(),
+        working_tree_files: Vec::new(),
+        runtime_artifacts: Vec::new(),
+        ignored_files: Vec::new(),
+        baseline_refreshed: false,
         checkpoint_hash: None,
         checkpoint_count: None,
         error: None,
@@ -301,8 +306,35 @@ fn execute_new_workflow(
     );
 
     for command in checks {
-        let result = run_required_check(ctx, &command, check_timeout_ms, cancellation)?;
+        let mut result = run_required_check(ctx, &command, check_timeout_ms, cancellation)?;
         let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
+        let verification = ctx
+            .harness
+            .record_verification(
+                task_id,
+                verification_kind(&command),
+                &command,
+                result
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok()),
+                passed,
+                result.get("duration_ms").and_then(Value::as_u64),
+                None,
+            )
+            .map_err(harness_error)?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "verification_id".into(),
+                Value::String(verification.id.clone()),
+            );
+            object.insert("verification_kind".into(), Value::String(verification.kind));
+            object.insert(
+                "verification_status".into(),
+                Value::String(verification.status),
+            );
+        }
+        receipt.verification_ids.push(verification.id);
         receipt.checks.push(result.clone());
         receipt.updated_at = timestamp();
         if !passed {
@@ -424,6 +456,19 @@ fn execute_new_workflow(
         cancellation,
     )?;
     receipt.commit_sha = Some(commit_sha.clone());
+    receipt.committed_files = git_paths(
+        ctx,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            &commit_sha,
+        ],
+        None,
+        cancellation,
+    )?;
     receipt.status = StageCommitStatus::Committed;
     receipt.updated_at = timestamp();
     save_receipt(ctx, &receipt)?;
@@ -445,6 +490,7 @@ fn execute_new_workflow(
     }
 
     let post_commit_changes = changed_paths(ctx, cancellation)?;
+    receipt.working_tree_files = post_commit_changes.clone();
     if !post_commit_changes.is_empty() {
         receipt.status = StageCommitStatus::CommittedRecoveryRequired;
         receipt.error = Some(json!({
@@ -460,9 +506,22 @@ fn execute_new_workflow(
     ctx.harness
         .refresh_expected_state_for_operation(task_id, Some(&receipt.workflow_id))
         .map_err(harness_error)?;
+    receipt.baseline_refreshed = true;
     let _ = ctx
         .harness
         .set_latest_change(task_id, &commit_sha)
+        .map_err(harness_error)?;
+    let _ = ctx
+        .harness
+        .save_change_set(
+            task_id,
+            &commit_sha,
+            receipt.committed_files.clone(),
+            receipt.working_tree_files.clone(),
+            receipt.runtime_artifacts.clone(),
+            receipt.ignored_files.clone(),
+            receipt.verification_ids.clone(),
+        )
         .map_err(harness_error)?;
     let _ = ctx.harness.record_event(
         task_id,
@@ -602,6 +661,23 @@ fn run_required_check(
     }))
 }
 
+fn verification_kind(command: &str) -> &str {
+    let normalized = command.to_ascii_lowercase();
+    if normalized.contains("diff --check") {
+        "diff_check"
+    } else if normalized.contains("lint") || normalized.contains("clippy") {
+        "lint"
+    } else if normalized.contains("test") {
+        "test"
+    } else if normalized.contains("check") {
+        "check"
+    } else if normalized.contains("build") {
+        "build"
+    } else {
+        "command"
+    }
+}
+
 fn ensure_repository_root(
     ctx: &ToolContext,
     cancellation: &CancellationToken,
@@ -674,13 +750,7 @@ fn git_paths(
     index: Option<&Path>,
     cancellation: &CancellationToken,
 ) -> Result<Vec<String>, WorkspaceError> {
-    let output = run_git(
-        ctx,
-        args,
-        index,
-        Duration::from_secs(30),
-        cancellation,
-    )?;
+    let output = run_git(ctx, args, index, Duration::from_secs(30), cancellation)?;
     if output.exit_code != Some(0) {
         return Err(stage_error(
             "STAGE_COMMIT_GIT_FAILED",
@@ -888,7 +958,9 @@ fn parse_paths(args: &Value) -> Result<Vec<String>, WorkspaceError> {
                     Component::ParentDir | Component::RootDir | Component::Prefix(_)
                 )
             })
-            || path.components().any(|component| component.as_os_str() == ".git")
+            || path
+                .components()
+                .any(|component| component.as_os_str() == ".git")
         {
             return Err(stage_error(
                 "STAGE_COMMIT_PATH_REJECTED",
@@ -946,9 +1018,9 @@ fn ensure_changes_are_selected(
     let outside = changed
         .iter()
         .filter(|path| {
-            !selected.iter().any(|selected| {
-                *path == selected || path.starts_with(&format!("{selected}/"))
-            })
+            !selected
+                .iter()
+                .any(|selected| *path == selected || path.starts_with(&format!("{selected}/")))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -999,7 +1071,7 @@ fn receipt_response(
     complete: bool,
     retryable: bool,
 ) -> Result<Value, WorkspaceError> {
-    Ok(json!({
+    let mut response = json!({
         "workflow_id": receipt.workflow_id,
         "idempotency_key": receipt.idempotency_key,
         "workflow_status": receipt.status,
@@ -1008,11 +1080,20 @@ fn receipt_response(
         "task_id": receipt.task_id,
         "paths": receipt.paths,
         "checks": receipt.checks,
+        "verification_ids": receipt.verification_ids,
         "commit_sha": receipt.commit_sha,
+        "committed_files": receipt.committed_files,
+        "working_tree_files": receipt.working_tree_files,
+        "runtime_artifacts": receipt.runtime_artifacts,
+        "ignored_files": receipt.ignored_files,
+        "baseline_refreshed": receipt.baseline_refreshed,
         "checkpoint_hash": receipt.checkpoint_hash,
         "checkpoint_count": receipt.checkpoint_count,
-        "error": receipt.error
-    }))
+    });
+    if let (Some(object), Some(error)) = (response.as_object_mut(), receipt.error.clone()) {
+        object.insert("error".into(), error);
+    }
+    Ok(response)
 }
 
 fn process_details(output: &ProcessOutput) -> Value {
@@ -1024,21 +1105,11 @@ fn process_details(output: &ProcessOutput) -> Value {
 }
 
 fn harness_error(error: super::store::HarnessError) -> WorkspaceError {
-    stage_error(
-        error.code(),
-        error.to_string(),
-        false,
-        json!({}),
-    )
+    stage_error(error.code(), error.to_string(), false, json!({}))
 }
 
 fn invalid_argument(message: impl Into<String>) -> WorkspaceError {
-    stage_error(
-        "INVALID_ARGUMENT",
-        message.into(),
-        false,
-        json!({}),
-    )
+    stage_error("INVALID_ARGUMENT", message.into(), false, json!({}))
 }
 
 fn stage_error(
@@ -1094,10 +1165,7 @@ mod tests {
             workspace.path(),
             &["config", "user.email", "anchor-tests@example.invalid"],
         );
-        git(
-            workspace.path(),
-            &["config", "user.name", "Anchor Tests"],
-        );
+        git(workspace.path(), &["config", "user.name", "Anchor Tests"]);
         fs::write(
             workspace.path().join(".gitignore"),
             "docs/history-session/\n",
@@ -1106,11 +1174,9 @@ mod tests {
         fs::write(workspace.path().join("main.txt"), "before\n").expect("file");
         git(workspace.path(), &["add", ".gitignore", "main.txt"]);
         git(workspace.path(), &["commit", "-m", "initial"]);
-        let ctx = ToolContext::for_test(
-            workspace.path().to_path_buf(),
-            harness.path().to_path_buf(),
-        )
-        .expect("context");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
         Some((workspace, harness, ctx))
     }
 
@@ -1135,8 +1201,7 @@ mod tests {
             return;
         };
         let initial_head = git(workspace.path(), &["rev-parse", "HEAD"]);
-        let (task_id, expected_head, expected_fingerprint) =
-            prepare_change(&ctx, workspace.path());
+        let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
         let command = "python -c \"import sys; sys.exit(3)\"";
 
         let error = run(
@@ -1171,8 +1236,7 @@ mod tests {
             return;
         };
         let initial_head = git(workspace.path(), &["rev-parse", "HEAD"]);
-        let (task_id, expected_head, expected_fingerprint) =
-            prepare_change(&ctx, workspace.path());
+        let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
 
         let error = run(
             &ctx,
@@ -1189,7 +1253,10 @@ mod tests {
         )
         .expect_err("dirty real index must fail");
 
-        assert_eq!(error.to_error_value()["code"], "STAGE_COMMIT_INDEX_NOT_CLEAN");
+        assert_eq!(
+            error.to_error_value()["code"],
+            "STAGE_COMMIT_INDEX_NOT_CLEAN"
+        );
         assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), initial_head);
     }
 
@@ -1198,14 +1265,8 @@ mod tests {
         let Some((workspace, _harness, ctx)) = fixture() else {
             return;
         };
-        let (task_id, expected_head, expected_fingerprint) =
-            prepare_change(&ctx, workspace.path());
-        let initial_baseline_head = ctx
-            .harness
-            .task(&task_id)
-            .expect("task")
-            .baseline
-            .head;
+        let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
+        let initial_baseline_head = ctx.harness.task(&task_id).expect("task").baseline.head;
         let command = "python -c \"print('ok')\"";
         let arguments = json!({
             "task_id": task_id,
@@ -1219,14 +1280,32 @@ mod tests {
 
         let first = run(&ctx, &arguments, &CancellationToken::default()).expect("commit");
         assert_eq!(first["complete"], true);
-        let commit_sha = first["commit_sha"].as_str().expect("commit sha").to_string();
+        assert_eq!(first["committed_files"], json!(["main.txt"]));
+        assert_eq!(first["working_tree_files"], json!([]));
+        assert_eq!(first["runtime_artifacts"], json!([]));
+        assert_eq!(first["baseline_refreshed"], true);
+        assert_eq!(first["verification_ids"].as_array().unwrap().len(), 1);
+        let commit_sha = first["commit_sha"]
+            .as_str()
+            .expect("commit sha")
+            .to_string();
         assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), commit_sha);
         assert!(git(workspace.path(), &["status", "--porcelain"]).is_empty());
-        ctx.harness.check_baseline(&task_id).expect("baseline valid");
+        ctx.harness
+            .check_baseline(&task_id)
+            .expect("baseline valid");
         assert_eq!(
             ctx.harness.task(&task_id).expect("task").baseline.head,
             initial_baseline_head
         );
+        let change = ctx
+            .harness
+            .load_change_set(&commit_sha)
+            .expect("load change set")
+            .expect("persisted change set");
+        assert_eq!(change.committed_files, vec!["main.txt"]);
+        assert_eq!(change.working_tree_files, Vec::<String>::new());
+        assert_eq!(change.verification_ids.len(), 1);
 
         let second = run(&ctx, &arguments, &CancellationToken::default()).expect("idempotent");
         assert_eq!(second["commit_sha"], first["commit_sha"]);
@@ -1250,8 +1329,7 @@ mod tests {
             .as_str()
             .expect("current path")
             .to_string();
-        let (task_id, expected_head, expected_fingerprint) =
-            prepare_change(&ctx, workspace.path());
+        let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
         let base = json!({
             "task_id": task_id,
             "expected_head": expected_head,
@@ -1272,13 +1350,12 @@ mod tests {
             .expect("commit with pending checkpoint");
         assert_eq!(first["complete"], false);
         assert_eq!(first["retryable"], true);
-        assert_eq!(
-            first["workflow_status"],
-            "committed_checkpoint_pending"
-        );
+        assert_eq!(first["workflow_status"], "committed_checkpoint_pending");
         let commit_sha = first["commit_sha"].as_str().expect("commit").to_string();
         assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
-        ctx.harness.check_baseline(&task_id).expect("baseline valid");
+        ctx.harness
+            .check_baseline(&task_id)
+            .expect("baseline valid");
 
         let mut retry_args = base;
         retry_args["history_checkpoint"] = json!({
@@ -1287,8 +1364,8 @@ mod tests {
             "user_intent": "checkpoint retry test",
             "findings": ["commit already exists; checkpoint resumed"]
         });
-        let retry = run(&ctx, &retry_args, &CancellationToken::default())
-            .expect("checkpoint resumed");
+        let retry =
+            run(&ctx, &retry_args, &CancellationToken::default()).expect("checkpoint resumed");
         assert_eq!(retry["complete"], true);
         assert_eq!(retry["commit_sha"], commit_sha);
         assert!(retry["checkpoint_hash"].as_str().is_some());

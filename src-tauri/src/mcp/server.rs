@@ -592,6 +592,15 @@ mod tests {
         assert_eq!(structured["session_key_source"], "explicit_session_key");
         assert_eq!(structured["session_key"], "explicit-session");
         assert_eq!(structured["host_session_key_mismatch"], true);
+        assert_eq!(structured["host_session_key_mismatch_level"], "debug");
+        assert_eq!(structured["target_preserved"], true);
+        assert!(!structured["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|value| value.contains("宿主会话"))));
         let content = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
             .expect("read history file");
         assert!(content.contains("**Session key:** explicit-session"));
