@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -384,14 +384,52 @@ impl Default for McpProxyRegistry {
 
 struct McpProxyClient {
     request_timeout: Duration,
-    connection: Mutex<ProxyConnection>,
+    writer: Mutex<ChildStdin>,
+    child: Mutex<Option<Child>>,
+    pending: StdMutex<HashMap<u64, oneshot::Sender<Result<Value, ProxyClientError>>>>,
+    next_id: AtomicU64,
+    closed: AtomicBool,
+    close_reason: StdMutex<Option<String>>,
+    workspace_id: String,
+    server_name: String,
 }
 
-struct ProxyConnection {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
+#[derive(Debug, Clone)]
+enum ProxyClientError {
+    Cancelled,
+    Timeout { method: String, seconds: u64 },
+    Transport(String),
+    Remote(String),
+    Protocol(String),
+}
+
+impl ProxyClientError {
+    fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    fn invalidates_connection(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+
+    fn retryable(&self) -> bool {
+        matches!(self, Self::Timeout { .. } | Self::Transport(_))
+    }
+}
+
+impl std::fmt::Display for ProxyClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("request cancelled"),
+            Self::Timeout { method, seconds } => write!(
+                formatter,
+                "request `{method}` timed out after {seconds} seconds"
+            ),
+            Self::Transport(message) | Self::Remote(message) | Self::Protocol(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
 }
 
 impl McpProxyRegistry {
@@ -588,16 +626,19 @@ impl McpProxyRegistry {
                 cancellation,
             )
             .await;
-        if let Err(message) = &result {
-            let cancelled = message == "request cancelled";
-            server.invalidate_client(&client).await;
-            if !cancelled {
+        if let Err(error) = &result {
+            let cancelled = error.is_cancelled();
+            let connection_lost = error.invalidates_connection();
+            if connection_lost {
+                server.invalidate_client(&client).await;
                 server.clone().schedule_reconnect();
             }
             let log_message = if cancelled {
-                format!("[mcp-proxy:{server_name}] request cancelled; next call will reconnect")
+                format!("[mcp-proxy:{server_name}] request cancelled without closing the downstream connection")
+            } else if connection_lost {
+                format!("[mcp-proxy:{server_name}] connection lost; reconnect scheduled: {error}")
             } else {
-                format!("[mcp-proxy:{server_name}] connection lost; reconnect scheduled: {message}")
+                format!("[mcp-proxy:{server_name}] request failed without reconnect: {error}")
             };
             append_profile_log(&server.workspace_id, "stderr.log", &log_message);
         }
@@ -620,19 +661,26 @@ impl McpProxyRegistry {
                     false,
                 )
             }),
-            Err(message) => {
-                let cancelled = message == "request cancelled";
+            Err(error) => {
+                let cancelled = error.is_cancelled();
+                let connection_lost = error.invalidates_connection();
                 proxy_call_error_result(
                     &server_name,
                     public_name,
                     if cancelled {
                         "proxy_call_cancelled"
+                    } else if matches!(&error, ProxyClientError::Timeout { .. }) {
+                        "proxy_call_timeout"
+                    } else if matches!(&error, ProxyClientError::Remote(_)) {
+                        "proxy_downstream_error"
+                    } else if matches!(&error, ProxyClientError::Protocol(_)) {
+                        "proxy_protocol_error"
                     } else {
                         "proxy_call_failed"
                     },
-                    message,
-                    !cancelled,
-                    !cancelled,
+                    error.to_string(),
+                    error.retryable(),
+                    connection_lost,
                 )
             }
         }))
@@ -662,7 +710,10 @@ impl ProxyServer {
     async fn ensure_client(&self) -> Result<Arc<McpProxyClient>, String> {
         let mut client = self.client.lock().await;
         if let Some(current) = client.as_ref() {
-            return Ok(current.clone());
+            if !current.is_closed() {
+                return Ok(current.clone());
+            }
+            *client = None;
         }
         let (connected, catalog) =
             McpProxyClient::connect(self.spec.clone(), &self.workspace_id).await?;
@@ -685,11 +736,15 @@ impl ProxyServer {
 
     async fn invalidate_client(&self, failed: &Arc<McpProxyClient>) {
         let mut client = self.client.lock().await;
-        if client
+        let removed = client
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, failed))
-        {
+            .is_some_and(|current| Arc::ptr_eq(current, failed));
+        if removed {
             *client = None;
+        }
+        drop(client);
+        if removed {
+            failed.terminate().await;
         }
     }
 
@@ -867,13 +922,16 @@ impl McpProxyClient {
 
         let client = Arc::new(Self {
             request_timeout: spec.request_timeout,
-            connection: Mutex::new(ProxyConnection {
-                child,
-                stdin,
-                stdout: BufReader::new(stdout),
-                next_id: 1,
-            }),
+            writer: Mutex::new(stdin),
+            child: Mutex::new(Some(child)),
+            pending: StdMutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            close_reason: StdMutex::new(None),
+            workspace_id: workspace_id.to_string(),
+            server_name: spec.name.clone(),
         });
+        Self::spawn_reader(&client, stdout);
 
         client
             .request(
@@ -887,15 +945,197 @@ impl McpProxyClient {
                     }
                 }),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         client
             .notify("notifications/initialized", json!({}))
-            .await?;
-        let tools = client.list_tools().await?;
+            .await
+            .map_err(|error| error.to_string())?;
+        let tools = client
+            .list_tools()
+            .await
+            .map_err(|error| error.to_string())?;
         Ok((client, tools))
     }
 
-    async fn list_tools(&self) -> Result<Vec<Value>, String> {
+    fn spawn_reader(client: &Arc<Self>, stdout: ChildStdout) {
+        let client = Arc::downgrade(client);
+        tokio::spawn(async move {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                let bytes = match stdout.read_line(&mut line).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        if let Some(client) = client.upgrade() {
+                            client.mark_closed(format!(
+                                "failed to read downstream response: {error}"
+                            ));
+                        }
+                        return;
+                    }
+                };
+                if bytes == 0 {
+                    if let Some(client) = client.upgrade() {
+                        client.mark_closed("downstream MCP closed stdout".into());
+                    }
+                    return;
+                }
+                let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let Some(client) = client.upgrade() else {
+                    return;
+                };
+                if let Err(error) = client.handle_incoming_message(message).await {
+                    client.mark_closed(error.to_string());
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn handle_incoming_message(&self, message: Value) -> Result<(), ProxyClientError> {
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            if let Some(server_request_id) = message.get("id").cloned() {
+                self.send_message(&json!({
+                    "jsonrpc": "2.0",
+                    "id": server_request_id,
+                    "error": {
+                        "code": -32601,
+                        "message": "Downstream server requests are not supported by this proxy"
+                    }
+                }))
+                .await?;
+            } else if method == "notifications/tools/list_changed" {
+                append_profile_log(
+                    &self.workspace_id,
+                    "stderr.log",
+                    &format!(
+                        "[mcp-proxy:{}] downstream tools/list changed; restart the MCP listener to renegotiate the public catalog",
+                        self.server_name
+                    ),
+                );
+            }
+            return Ok(());
+        }
+
+        let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            return Ok(());
+        };
+        let sender = self
+            .pending
+            .lock()
+            .expect("mcp proxy pending request lock")
+            .remove(&id);
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let result = if let Some(error) = message.get("error") {
+            Err(ProxyClientError::Remote(error.to_string()))
+        } else {
+            message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| {
+                    ProxyClientError::Protocol(
+                        "downstream response is missing result".to_string(),
+                    )
+                })
+        };
+        let _ = sender.send(result);
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn closed_error(&self) -> ProxyClientError {
+        ProxyClientError::Transport(
+            self.close_reason
+                .lock()
+                .expect("mcp proxy close reason lock")
+                .clone()
+                .unwrap_or_else(|| "downstream MCP connection is closed".into()),
+        )
+    }
+
+    fn mark_closed(&self, reason: String) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self
+            .close_reason
+            .lock()
+            .expect("mcp proxy close reason lock") = Some(reason.clone());
+        let pending = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .expect("mcp proxy pending request lock"),
+        );
+        for (_, sender) in pending {
+            let _ = sender.send(Err(ProxyClientError::Transport(reason.clone())));
+        }
+    }
+
+    async fn terminate(&self) {
+        self.mark_closed("downstream MCP connection terminated".into());
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    fn remove_pending(&self, id: u64) {
+        self.pending
+            .lock()
+            .expect("mcp proxy pending request lock")
+            .remove(&id);
+    }
+
+    async fn send_message(&self, message: &Value) -> Result<(), ProxyClientError> {
+        if self.is_closed() {
+            return Err(self.closed_error());
+        }
+        let encoded = serde_json::to_vec(message).map_err(|error| {
+            ProxyClientError::Protocol(format!(
+                "failed to encode downstream message: {error}"
+            ))
+        })?;
+        let result = async {
+            let mut writer = self.writer.lock().await;
+            writer.write_all(&encoded).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await
+        }
+        .await;
+        if let Err(error) = result {
+            let message = format!("failed to write downstream message: {error}");
+            self.mark_closed(message.clone());
+            return Err(ProxyClientError::Transport(message));
+        }
+        Ok(())
+    }
+
+    async fn send_cancel_notification(&self, id: u64, reason: &str) {
+        if self.is_closed() {
+            return;
+        }
+        let _ = self
+            .send_message(&json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {
+                    "requestId": id,
+                    "reason": reason
+                }
+            }))
+            .await;
+    }
+
+    async fn list_tools(&self) -> Result<Vec<Value>, ProxyClientError> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
 
@@ -918,10 +1158,12 @@ impl McpProxyClient {
             }
         }
 
-        Err("downstream MCP returned too many tools/list pages".to_string())
+        Err(ProxyClientError::Protocol(
+            "downstream MCP returned too many tools/list pages".to_string(),
+        ))
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, ProxyClientError> {
         self.request_with_cancellation(method, params, &CancellationToken::default())
             .await
     }
@@ -931,158 +1173,66 @@ impl McpProxyClient {
         method: &str,
         params: Value,
         cancellation: &CancellationToken,
-    ) -> Result<Value, String> {
-        let result = timeout(self.request_timeout, async {
-            let mut connection = tokio::select! {
-                _ = cancellation.cancelled() => return Err("request cancelled".to_string()),
-                connection = self.connection.lock() => connection,
-            };
-            let id = connection.next_id;
-            connection.next_id += 1;
-            let request = json!({
+    ) -> Result<Value, ProxyClientError> {
+        if self.is_closed() {
+            return Err(self.closed_error());
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("mcp proxy pending request lock")
+            .insert(id, sender);
+        if let Err(error) = self
+            .send_message(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "method": method,
                 "params": params
-            });
-            let cancelled = {
-                let response = request_over_stdio(&mut connection, id, &request);
-                tokio::pin!(response);
-                tokio::select! {
-                    result = &mut response => return result,
-                    _ = cancellation.cancelled() => true,
-                }
-            };
-            if cancelled {
-                let _ = connection.child.kill().await;
-                let _ = connection.child.wait().await;
-                Err("request cancelled".to_string())
-            } else {
-                unreachable!()
-            }
-        })
-        .await;
+            }))
+            .await
+        {
+            self.remove_pending(id);
+            return Err(error);
+        }
 
-        match result {
-            Ok(result) => result,
-            Err(_) => {
-                if let Ok(mut connection) = self.connection.try_lock() {
-                    let _ = connection.child.kill().await;
-                    let _ = connection.child.wait().await;
+        let response = timeout(self.request_timeout, receiver);
+        tokio::pin!(response);
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                self.remove_pending(id);
+                self.send_cancel_notification(id, "cancelled by upstream request").await;
+                Err(ProxyClientError::Cancelled)
+            }
+            response = &mut response => match response {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(self.closed_error()),
+                Err(_) => {
+                    self.remove_pending(id);
+                    self.send_cancel_notification(id, "downstream request timed out").await;
+                    Err(ProxyClientError::Timeout {
+                        method: method.to_string(),
+                        seconds: self.request_timeout.as_secs(),
+                    })
                 }
-                Err(format!(
-                    "request `{method}` timed out after {} seconds including queue wait",
-                    self.request_timeout.as_secs()
-                ))
             }
         }
     }
 
-    async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        timeout(self.request_timeout, async {
-            let mut connection = self.connection.lock().await;
-            let notification = json!({
+    async fn notify(&self, method: &str, params: Value) -> Result<(), ProxyClientError> {
+        timeout(
+            self.request_timeout,
+            self.send_message(&json!({
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params
-            });
-            let encoded = serde_json::to_vec(&notification)
-                .map_err(|error| format!("failed to encode downstream notification: {error}"))?;
-            connection
-                .stdin
-                .write_all(&encoded)
-                .await
-                .map_err(|error| format!("failed to write downstream notification: {error}"))?;
-            connection
-                .stdin
-                .write_all(b"\n")
-                .await
-                .map_err(|error| format!("failed to terminate downstream notification: {error}"))?;
-            connection
-                .stdin
-                .flush()
-                .await
-                .map_err(|error| format!("failed to flush downstream notification: {error}"))
-        })
+            })),
+        )
         .await
-        .map_err(|_| format!("notification `{method}` timed out including queue wait"))?
-    }
-}
-
-async fn request_over_stdio(
-    connection: &mut ProxyConnection,
-    id: u64,
-    request: &Value,
-) -> Result<Value, String> {
-    let encoded = serde_json::to_vec(request)
-        .map_err(|error| format!("failed to encode downstream request: {error}"))?;
-    connection
-        .stdin
-        .write_all(&encoded)
-        .await
-        .map_err(|error| format!("failed to write downstream request: {error}"))?;
-    connection
-        .stdin
-        .write_all(b"\n")
-        .await
-        .map_err(|error| format!("failed to terminate downstream request: {error}"))?;
-    connection
-        .stdin
-        .flush()
-        .await
-        .map_err(|error| format!("failed to flush downstream request: {error}"))?;
-
-    loop {
-        let mut line = String::new();
-        let bytes = connection
-            .stdout
-            .read_line(&mut line)
-            .await
-            .map_err(|error| format!("failed to read downstream response: {error}"))?;
-        if bytes == 0 {
-            return Err("downstream MCP closed stdout".to_string());
-        }
-        let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        if message.get("method").and_then(Value::as_str).is_some() {
-            if let Some(server_request_id) = message.get("id").cloned() {
-                let rejection = json!({
-                    "jsonrpc": "2.0",
-                    "id": server_request_id,
-                    "error": {
-                        "code": -32601,
-                        "message": "Downstream server requests are not supported by this proxy"
-                    }
-                });
-                let encoded = serde_json::to_vec(&rejection)
-                    .map_err(|error| format!("failed to encode downstream rejection: {error}"))?;
-                connection
-                    .stdin
-                    .write_all(&encoded)
-                    .await
-                    .map_err(|error| format!("failed to reject downstream request: {error}"))?;
-                connection.stdin.write_all(b"\n").await.map_err(|error| {
-                    format!("failed to terminate downstream rejection: {error}")
-                })?;
-                connection
-                    .stdin
-                    .flush()
-                    .await
-                    .map_err(|error| format!("failed to flush downstream rejection: {error}"))?;
-            }
-            continue;
-        }
-        if message.get("id").and_then(Value::as_u64) != Some(id) {
-            continue;
-        }
-        if let Some(error) = message.get("error") {
-            return Err(error.to_string());
-        }
-        return message
-            .get("result")
-            .cloned()
-            .ok_or_else(|| "downstream response is missing result".to_string());
+        .map_err(|_| ProxyClientError::Timeout {
+            method: method.to_string(),
+            seconds: self.request_timeout.as_secs(),
+        })?
     }
 }
 
@@ -1238,7 +1388,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
 
@@ -1644,6 +1794,210 @@ for raw in sys.stdin:
         assert_eq!(
             error["structuredContent"]["error"]["details"]["reconnect_scheduled"],
             false
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_proxy_multiplexes_concurrent_tool_calls() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("concurrent_mcp.py");
+        fs::write(
+            &script,
+            r#"import json
+import sys
+import threading
+import time
+
+output_lock = threading.Lock()
+
+def emit(message):
+    with output_lock:
+        print(json.dumps(message), flush=True)
+
+def handle(message):
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "concurrent", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "wait", "description": "Wait", "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        time.sleep(0.6)
+        result = {"content": [{"type": "text", "text": "done"}]}
+    else:
+        result = {}
+    emit({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    if message.get("method") == "tools/call":
+        threading.Thread(target=handle, args=(message,), daemon=True).start()
+    else:
+        handle(message)
+"#,
+        )
+        .expect("write fixture");
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![McpProxyServerSpec {
+                    name: "concurrent".into(),
+                    command: python.display().to_string(),
+                    args: vec![script.display().to_string()],
+                    env: BTreeMap::new(),
+                    cwd: temp.path().to_path_buf(),
+                    tool_prefix: "concurrent".into(),
+                    include_tools: None,
+                    exclude_tools: BTreeSet::new(),
+                    max_tools: None,
+                    request_timeout: Duration::from_secs(5),
+                }],
+                "proxy-concurrency-test",
+            )
+            .await;
+
+        let started = Instant::now();
+        let first_args = json!({});
+        let second_args = json!({});
+        let (first, second) = tokio::join!(
+            registry.call_tool("concurrent__wait", &first_args),
+            registry.call_tool("concurrent__wait", &second_args)
+        );
+        assert_eq!(
+            first
+                .expect("known first route")
+                .expect("first result")["structuredContent"]["ok"],
+            true
+        );
+        assert_eq!(
+            second
+                .expect("known second route")
+                .expect("second result")["structuredContent"]["ok"],
+            true
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_050),
+            "concurrent calls were serialized: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_keeps_stdio_connection_available_for_followup() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("cancellable_mcp.py");
+        let starts = temp.path().join("starts.txt");
+        fs::write(
+            &script,
+            r#"import json
+import sys
+import threading
+import time
+
+starts = sys.argv[1]
+with open(starts, "a", encoding="utf-8") as marker:
+    marker.write("start\n")
+
+output_lock = threading.Lock()
+
+def emit(message):
+    with output_lock:
+        print(json.dumps(message), flush=True)
+
+def handle(message):
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "cancellable", "version": "1"}}
+    elif method == "tools/list":
+        tool = {"description": "Tool", "inputSchema": {"type": "object", "properties": {}}}
+        result = {"tools": [{"name": "slow", **tool}, {"name": "fast", **tool}]}
+    elif method == "tools/call":
+        name = message.get("params", {}).get("name")
+        if name == "slow":
+            time.sleep(5)
+        result = {"content": [{"type": "text", "text": name or "done"}]}
+    else:
+        result = {}
+    emit({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    if message.get("method") == "tools/call":
+        threading.Thread(target=handle, args=(message,), daemon=True).start()
+    else:
+        handle(message)
+"#,
+        )
+        .expect("write fixture");
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![McpProxyServerSpec {
+                    name: "cancellable".into(),
+                    command: python.display().to_string(),
+                    args: vec![script.display().to_string(), starts.display().to_string()],
+                    env: BTreeMap::new(),
+                    cwd: temp.path().to_path_buf(),
+                    tool_prefix: "cancellable".into(),
+                    include_tools: None,
+                    exclude_tools: BTreeSet::new(),
+                    max_tools: None,
+                    request_timeout: Duration::from_secs(10),
+                }],
+                "proxy-cancel-followup-test",
+            )
+            .await;
+
+        let cancellation = CancellationToken::default();
+        let worker_registry = registry.clone();
+        let worker_cancellation = cancellation.clone();
+        let slow = tokio::spawn(async move {
+            worker_registry
+                .call_tool_with_cancellation(
+                    "cancellable__slow",
+                    &json!({}),
+                    &worker_cancellation,
+                )
+                .await
+                .expect("known route")
+                .expect("cancelled result")
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        let cancelled = slow.await.expect("cancel worker");
+        assert_eq!(
+            cancelled["structuredContent"]["error"]["details"]["reason"],
+            "proxy_call_cancelled"
+        );
+
+        let started = Instant::now();
+        let fast = registry
+            .call_tool("cancellable__fast", &json!({}))
+            .await
+            .expect("known followup route")
+            .expect("followup result");
+        assert_eq!(fast["structuredContent"]["ok"], true);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            fs::read_to_string(&starts)
+                .expect("start marker")
+                .lines()
+                .count(),
+            1,
+            "cancellation restarted the downstream process"
         );
     }
 
