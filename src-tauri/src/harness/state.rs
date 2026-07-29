@@ -10,9 +10,9 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::model::{
-    BaselineEntry, CapabilityStatus, FileChangeRecord, HarnessEvent, HarnessStatus,
-    OperationRecord, ProjectBaseline, ProjectFileState, ProjectState, TaskSession, TaskStatus,
-    WorkspaceHarnessState, SCHEMA_VERSION,
+    BaselineEntry, CapabilityStatus, ExpectedWorkspaceState, FileChangeRecord, HarnessEvent,
+    HarnessStatus, OperationRecord, ProjectBaseline, ProjectFileState, ProjectState, TaskSession,
+    TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 
@@ -69,6 +69,7 @@ impl Harness {
             objective: objective.trim().to_string(),
             status: TaskStatus::Active,
             expected_fingerprint: baseline.worktree_fingerprint.clone(),
+            expected_state: Some(expected_state_from_baseline(&baseline, None)),
             baseline,
             completed_steps: Vec::new(),
             pending_steps: Vec::new(),
@@ -156,13 +157,14 @@ impl Harness {
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
         let task = self.task(task_id)?;
         let current = capture_baseline(&self.workspace_root);
-        if current.branch != task.baseline.branch || current.head != task.baseline.head {
+        let expected = expected_state(&task);
+        if current.branch != expected.branch || current.head != expected.head {
             return Err(HarnessError::new(
                 "BASELINE_STALE",
                 "Git 分支或 HEAD 已发生变化",
             ));
         }
-        if current.worktree_fingerprint != task.expected_fingerprint {
+        if current.worktree_fingerprint != expected.worktree_fingerprint {
             return Err(HarnessError::new(
                 "FILE_CHANGED_EXTERNALLY",
                 "工作区存在 Harness 未记录的外部文件变化",
@@ -172,10 +174,77 @@ impl Harness {
     }
 
     pub fn refresh_expected_state(&self, task_id: &str) -> HarnessResult<TaskSession> {
+        self.refresh_expected_state_for_operation(task_id, None)
+    }
+
+    pub fn refresh_expected_state_for_operation(
+        &self,
+        task_id: &str,
+        operation_id: Option<&str>,
+    ) -> HarnessResult<TaskSession> {
         let mut task = self.task(task_id)?;
-        task.expected_fingerprint = capture_baseline(&self.workspace_root).worktree_fingerprint;
+        let current = capture_baseline(&self.workspace_root);
+        task.expected_fingerprint = current.worktree_fingerprint.clone();
+        task.expected_state = Some(expected_state_from_baseline(&current, operation_id));
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
+        Ok(task)
+    }
+
+    pub fn refresh_baseline(
+        &self,
+        task_id: &str,
+        observed_head: Option<&str>,
+        observed_fingerprint: &str,
+        reason: &str,
+    ) -> HarnessResult<TaskSession> {
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "refresh_baseline 必须提供接受当前状态的原因",
+            ));
+        }
+        let mut task = self.task(task_id)?;
+        if !task.status.is_writable() {
+            return Err(HarnessError::new(
+                "TASK_NOT_WRITABLE",
+                "当前任务状态不允许刷新基线",
+            ));
+        }
+        let current = capture_baseline(&self.workspace_root);
+        if current.head.as_deref() != observed_head
+            || current.worktree_fingerprint != observed_fingerprint
+        {
+            return Err(HarnessError::new(
+                "BASELINE_REFRESH_CAS_FAILED",
+                "工作区状态已再次变化；请重新读取 harness_status/project_state 后重试",
+            ));
+        }
+        let operation_id = Uuid::new_v4().simple().to_string();
+        task.expected_fingerprint = current.worktree_fingerprint.clone();
+        task.expected_state = Some(expected_state_from_baseline(
+            &current,
+            Some(&operation_id),
+        ));
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        self.record_event(
+            task_id,
+            "baseline_refreshed",
+            Some("refresh_baseline"),
+            json!({
+                "observed_head": observed_head,
+                "observed_fingerprint": observed_fingerprint,
+                "reason": reason
+            }),
+            json!({
+                "ok": true,
+                "branch": current.branch,
+                "head": current.head,
+                "worktree_fingerprint": current.worktree_fingerprint,
+                "operation_id": operation_id
+            }),
+        )?;
         Ok(task)
     }
 
@@ -328,12 +397,14 @@ impl Harness {
     pub fn status(&self) -> HarnessResult<HarnessStatus> {
         let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
+        let expected = task.as_ref().map(expected_state);
         let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
-                    let matches = task.baseline.branch == current.branch
-                        && task.baseline.head == current.head
-                        && task.expected_fingerprint == current.worktree_fingerprint;
+                    let expected = expected_state(task);
+                    let matches = expected.branch == current.branch
+                        && expected.head == current.head
+                        && expected.worktree_fingerprint == current.worktree_fingerprint;
                     let reason = if matches {
                         "任务可继续执行"
                     } else {
@@ -450,8 +521,14 @@ impl Harness {
             writable,
             reason,
             recoverable: true,
-            branch: current.branch,
-            head: current.head,
+            branch: current.branch.clone(),
+            head: current.head.clone(),
+            worktree_fingerprint: current.worktree_fingerprint.clone(),
+            expected_branch: expected.as_ref().and_then(|state| state.branch.clone()),
+            expected_head: expected.as_ref().and_then(|state| state.head.clone()),
+            expected_fingerprint: expected
+                .as_ref()
+                .map(|state| state.worktree_fingerprint.clone()),
             baseline_matches,
             capabilities,
             next_actions,
@@ -481,21 +558,91 @@ impl Harness {
     }
 }
 
-pub fn capture_baseline(root: &Path) -> ProjectBaseline {
-    let mut entries = Vec::new();
-    for item in WalkDir::new(root)
+fn baseline_paths(root: &Path) -> Vec<PathBuf> {
+    if let Some(paths) = git_file_paths(root) {
+        return paths;
+    }
+    WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-    {
-        let path = item.path();
-        if path == root || should_skip(path, root) || !item.file_type().is_file() {
+        .filter(|item| {
+            let path = item.path();
+            path != root && !should_skip(path, root) && item.file_type().is_file()
+        })
+        .map(|item| item.into_path())
+        .collect()
+}
+
+fn git_file_paths(root: &Path) -> Option<Vec<PathBuf>> {
+    let mut command = Command::new("git");
+    crate::platform::hide_std_console(&mut command);
+    let output = command
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| std::str::from_utf8(value).ok())
+        .map(|relative| root.join(relative))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+fn expected_state(task: &TaskSession) -> ExpectedWorkspaceState {
+    task.expected_state.clone().unwrap_or_else(|| ExpectedWorkspaceState {
+        branch: task.baseline.branch.clone(),
+        head: task.baseline.head.clone(),
+        worktree_fingerprint: task.expected_fingerprint.clone(),
+        accepted_at: task.updated_at.clone(),
+        accepted_by_operation_id: None,
+    })
+}
+
+fn expected_state_from_baseline(
+    baseline: &ProjectBaseline,
+    operation_id: Option<&str>,
+) -> ExpectedWorkspaceState {
+    ExpectedWorkspaceState {
+        branch: baseline.branch.clone(),
+        head: baseline.head.clone(),
+        worktree_fingerprint: baseline.worktree_fingerprint.clone(),
+        accepted_at: timestamp(),
+        accepted_by_operation_id: operation_id.map(str::to_string),
+    }
+}
+
+pub fn capture_baseline(root: &Path) -> ProjectBaseline {
+    let mut entries = Vec::new();
+    for path in baseline_paths(root) {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
-        let Ok(bytes) = fs::read(path) else { continue };
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(root) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&canonical) else {
+            continue;
+        };
         let rel = path
             .strip_prefix(root)
-            .unwrap_or(path)
+            .unwrap_or(path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
         let mut hasher = Sha256::new();
@@ -573,6 +720,27 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialize_git(root: &Path) {
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "anchor-tests@example.invalid"]);
+        git(root, &["config", "user.name", "Anchor Tests"]);
+    }
+
     #[test]
     fn status_keeps_read_available_without_task() {
         let workspace = tempdir().expect("workspace");
@@ -609,5 +777,94 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn git_baseline_ignores_history_metadata() {
+        let workspace = tempdir().expect("workspace");
+        initialize_git(workspace.path());
+        fs::write(workspace.path().join(".gitignore"), "docs/history-session/\n")
+            .expect("gitignore");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        git(workspace.path(), &["add", ".gitignore", "main.rs"]);
+        git(workspace.path(), &["commit", "-m", "initial"]);
+
+        let before = capture_baseline(workspace.path());
+        let history = workspace.path().join("docs/history-session");
+        fs::create_dir_all(&history).expect("history dir");
+        fs::write(history.join("1.md"), "checkpoint\n").expect("history");
+        let after = capture_baseline(workspace.path());
+
+        assert_eq!(before.worktree_fingerprint, after.worktree_fingerprint);
+        assert!(!after
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with("docs/history-session/")));
+    }
+
+    #[test]
+    fn controlled_commit_advances_expected_head_without_replacing_baseline() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        initialize_git(workspace.path());
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        git(workspace.path(), &["add", "main.rs"]);
+        git(workspace.path(), &["commit", "-m", "initial"]);
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let started = harness.start_task("commit test").expect("start");
+        let initial_head = started.baseline.head.clone();
+
+        fs::write(workspace.path().join("main.rs"), "fn main() { println!(\"ok\"); }\n")
+            .expect("change");
+        git(workspace.path(), &["add", "main.rs"]);
+        git(workspace.path(), &["commit", "-m", "change"]);
+        assert!(harness.check_baseline(&started.id).is_err());
+
+        let refreshed = harness
+            .refresh_expected_state_for_operation(&started.id, Some("commit-operation"))
+            .expect("refresh");
+        harness.check_baseline(&started.id).expect("baseline valid");
+        assert_eq!(refreshed.baseline.head, initial_head);
+        assert_ne!(
+            refreshed.expected_state.as_ref().and_then(|state| state.head.clone()),
+            initial_head
+        );
+        assert_eq!(
+            refreshed
+                .expected_state
+                .as_ref()
+                .and_then(|state| state.accepted_by_operation_id.as_deref()),
+            Some("commit-operation")
+        );
+    }
+
+    #[test]
+    fn refresh_baseline_rejects_stale_observation() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "one\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("refresh test").expect("start");
+        fs::write(workspace.path().join("main.rs"), "two\n").expect("first change");
+        let observed = capture_baseline(workspace.path());
+        fs::write(workspace.path().join("main.rs"), "three\n").expect("second change");
+
+        let error = harness
+            .refresh_baseline(
+                &task.id,
+                observed.head.as_deref(),
+                &observed.worktree_fingerprint,
+                "accept known external change",
+            )
+            .expect_err("stale observation must fail");
+        assert_eq!(error.code(), "BASELINE_REFRESH_CAS_FAILED");
     }
 }

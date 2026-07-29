@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "e4f829c597c6a4a6e19b53d09442e8f28ed30ff1fbb0fd747a8a91f2b4718ac3",
+    "digest": "da3118a6ed48319e75efa956eca2baa12717b0ef47e95469a7b6b83105fd4759",
     "names": [
       "apply_patch",
       "change_summary",
@@ -31,6 +31,7 @@
       "read_file",
       "read_output",
       "read_skill_resource",
+      "refresh_baseline",
       "resume_task",
       "search_text",
       "server_info",
@@ -41,7 +42,7 @@
       "view_image",
       "write_stdin"
     ],
-    "tool_count": 38
+    "tool_count": 39
   },
   "core": {
     "digest": "2cef6aabdb79f9b0920b597298d1e59d911bae64ba0929ea46cb78dc3e843535",

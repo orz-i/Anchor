@@ -11,6 +11,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "operation_log",
     "project_state",
     "start_task",
+    "refresh_baseline",
     "update_task",
     "pause_task",
     "resume_task",
@@ -26,6 +27,7 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
         "operation_log" => operation_log(ctx, args),
         "project_state" => project_state(ctx, args),
         "start_task" => start_task(ctx, args),
+        "refresh_baseline" => refresh_baseline(ctx, args),
         "update_task" => update_task(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
         "resume_task" => transition(ctx, args, TaskStatus::Active),
@@ -36,6 +38,29 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     Ok(tool_ok(value))
+}
+
+fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let observed_head = args.get("observed_head").and_then(Value::as_str);
+    let observed_fingerprint = args
+        .get("observed_fingerprint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "observed_fingerprint 是必填项"))?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
+    let task = ctx
+        .harness
+        .refresh_baseline(task_id, observed_head, observed_fingerprint, reason)
+        .map_err(map_error)?;
+    Ok(json!({
+        "task": task,
+        "harness": ctx.harness.status().map_err(map_error)?
+    }))
 }
 
 fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {

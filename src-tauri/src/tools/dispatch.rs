@@ -49,6 +49,10 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn advances_expected_state(name: &str) -> bool {
+    matches!(name, "exec_command" | "apply_patch")
+}
+
 fn skill_script_permission_error(
     ctx: &ToolContext,
     name: &str,
@@ -190,9 +194,9 @@ fn call_tool_impl(
         };
     }
 
+    let active_task = ctx.harness.current_task().ok().flatten();
     let task_id = if requires_write_baseline(name, &effective_args) {
-        let task = ctx.harness.current_task().ok().flatten();
-        if let Some(task) = task {
+        if let Some(task) = active_task.as_ref() {
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
                 return attach_harness_status(
                     ctx,
@@ -207,7 +211,7 @@ fn call_tool_impl(
                 operation_input(args),
                 json!({"ok": true, "tracking": "task"}),
             );
-            Some(task.id)
+            Some(task.id.clone())
         } else {
             None
         }
@@ -219,7 +223,7 @@ fn call_tool_impl(
         ctx.harness
             .record_operation(
                 None,
-                task_id.as_deref(),
+                active_task.as_ref().map(|task| task.id.as_str()),
                 name,
                 "started",
                 json!({"arguments_present": !args.is_null()}),
@@ -303,15 +307,18 @@ fn call_tool_impl(
             operation_input(args),
             json!({"ok": succeeded, "tool": name}),
         );
-        if succeeded {
-            let _ = ctx.harness.refresh_expected_state(task_id);
+        if succeeded && advances_expected_state(name) {
+            let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
+            let _ = ctx
+                .harness
+                .refresh_expected_state_for_operation(task_id, operation_id);
         }
     }
     if let Some(operation) = operation {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
         let _ = ctx.harness.record_operation(
             Some(&operation.id),
-            task_id.as_deref(),
+            active_task.as_ref().map(|task| task.id.as_str()),
             name,
             if succeeded { "completed" } else { "failed" },
             operation_input(args),
@@ -439,7 +446,7 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
 
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
-        "exec_command" => true,
+        "exec_command" | "history_session_checkpoint" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -456,7 +463,12 @@ fn should_log_operation(name: &str) -> bool {
     standalone_operation(name)
         || matches!(
             name,
-            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame"
+            "git_status"
+                | "git_diff"
+                | "git_log"
+                | "git_show"
+                | "git_blame"
+                | "history_session_checkpoint"
         )
 }
 

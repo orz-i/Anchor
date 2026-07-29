@@ -3,13 +3,22 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityStatus {
     pub status: String,
     pub reason: String,
     pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedWorkspaceState {
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub worktree_fingerprint: String,
+    pub accepted_at: String,
+    pub accepted_by_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +33,10 @@ pub struct HarnessStatus {
     pub recoverable: bool,
     pub branch: Option<String>,
     pub head: Option<String>,
+    pub worktree_fingerprint: String,
+    pub expected_branch: Option<String>,
+    pub expected_head: Option<String>,
+    pub expected_fingerprint: Option<String>,
     pub baseline_matches: Option<bool>,
     pub capabilities: HashMap<String, CapabilityStatus>,
     pub next_actions: Vec<String>,
@@ -89,6 +102,9 @@ pub struct TaskSession {
     pub objective: String,
     pub status: TaskStatus,
     pub baseline: ProjectBaseline,
+    #[serde(default)]
+    pub expected_state: Option<ExpectedWorkspaceState>,
+    // Kept for backward-compatible reads of schema v1 task files.
     pub expected_fingerprint: String,
     #[serde(default)]
     pub completed_steps: Vec<String>,

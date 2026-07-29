@@ -90,6 +90,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "refresh_baseline",
+        "Refresh Harness baseline",
+        "Accept an explicitly observed workspace HEAD and fingerprint as the active task's new expected state without changing the immutable task-start baseline.",
+        false,
+        false,
+        false,
+    ),
+    (
         "update_task",
         "Update task",
         "Update task steps and durable progress.",
@@ -389,6 +397,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "git_blame",
     "project_state",
     "start_task",
+    "refresh_baseline",
     "update_task",
     "pause_task",
     "resume_task",
@@ -409,6 +418,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "kill_session",
     "set_default_cwd",
     "start_task",
+    "refresh_baseline",
     "update_task",
     "pause_task",
     "resume_task",
@@ -1274,6 +1284,17 @@ pub fn input_schema(name: &str) -> Value {
                 "objective": { "type": "string", "minLength": 1 }
             },
             "required": ["objective"],
+            "additionalProperties": false
+        }),
+        "refresh_baseline" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "observed_head": { "type": "string", "minLength": 1 },
+                "observed_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+            },
+            "required": ["task_id", "observed_fingerprint", "reason"],
             "additionalProperties": false
         }),
         "update_task" => json!({
