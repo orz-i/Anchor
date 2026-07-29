@@ -6,9 +6,28 @@ use regex::Regex;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
+use crate::tools::CancellationToken;
 use crate::tools::workspace::{relative_display, tool_ok, Workspace, WorkspaceError};
 
-pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), WorkspaceError> {
+    if cancellation.is_cancelled() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "REQUEST_CANCELLED",
+            message: "Tool request was cancelled".into(),
+            category: "runtime",
+            retryable: true,
+            details: json!({"reason": "client_cancelled", "retryable": true}),
+        });
+    }
+    Ok(())
+}
+
+pub fn read_file(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    ensure_not_cancelled(cancellation)?;
     let path = args
         .get("path")
         .and_then(Value::as_str)
@@ -34,6 +53,7 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
     let end_line = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
 
     let data = fs::read(&resolved.path).map_err(|_| WorkspaceError::not_found("File not found"))?;
+    ensure_not_cancelled(cancellation)?;
     if data.iter().take(4096).any(|b| *b == 0) {
         return Err(WorkspaceError::Tool {
             code: "BINARY_FILE",
@@ -81,7 +101,12 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
     })))
 }
 
-pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn list_dir(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    ensure_not_cancelled(cancellation)?;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = ws.resolve_read_path(path)?;
     if !resolved.path.is_dir() {
@@ -120,7 +145,8 @@ pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         max_entries,
         &mut entries,
         &mut truncated,
-    );
+        cancellation,
+    )?;
     entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(tool_ok(json!({
         "path": resolved.display,
@@ -130,7 +156,12 @@ pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     })))
 }
 
-pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn list_files(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    ensure_not_cancelled(cancellation)?;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = ws.resolve_read_path(path)?;
     if !resolved.path.is_dir() {
@@ -158,6 +189,7 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .into_iter()
         .filter_map(Result::ok)
     {
+        ensure_not_cancelled(cancellation)?;
         let p = entry.path();
         if p == resolved.path {
             continue;
@@ -202,7 +234,12 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
-pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn search_text(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    ensure_not_cancelled(cancellation)?;
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -230,21 +267,26 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .unwrap_or(0) as usize;
     let matcher = build_matcher(query, use_regex, case_sensitive)?;
 
-    let file_paths: Vec<PathBuf> = if resolved.path.is_file() {
-        vec![resolved.path.clone()]
+    let mut file_paths = Vec::<PathBuf>::new();
+    if resolved.path.is_file() {
+        file_paths.push(resolved.path.clone());
     } else {
-        WalkDir::new(&resolved.path)
+        for entry in WalkDir::new(&resolved.path)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.path().to_path_buf())
-            .collect()
-    };
+        {
+            ensure_not_cancelled(cancellation)?;
+            if entry.file_type().is_file() {
+                file_paths.push(entry.path().to_path_buf());
+            }
+        }
+    }
 
     let mut matches = Vec::new();
     let mut total = 0usize;
     for p in file_paths {
+        ensure_not_cancelled(cancellation)?;
         if !ws.is_safe_read_path(&p) {
             continue;
         }
@@ -261,6 +303,9 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         };
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
         for (idx, line) in lines.iter().enumerate() {
+            if idx % 256 == 0 {
+                ensure_not_cancelled(cancellation)?;
+            }
             if !matcher.is_match(line) {
                 continue;
             }
@@ -357,14 +402,17 @@ fn collect_dir_entries(
     max_entries: usize,
     entries: &mut Vec<Value>,
     truncated: &mut bool,
-) {
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceError> {
+    ensure_not_cancelled(cancellation)?;
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     for item in read_dir.flatten() {
+        ensure_not_cancelled(cancellation)?;
         if *truncated {
-            return;
+            return Ok(());
         }
         let p = item.path();
         if ws.is_ignored_path(&p, include_hidden, include_ignored) {
@@ -398,7 +446,7 @@ fn collect_dir_entries(
         }));
         if entries.len() >= max_entries {
             *truncated = true;
-            return;
+            return Ok(());
         }
         if recursive && depth < max_depth && entry_type == "directory" && !p.is_symlink() {
             collect_dir_entries(
@@ -413,9 +461,11 @@ fn collect_dir_entries(
                 max_entries,
                 entries,
                 truncated,
-            );
+                cancellation,
+            )?;
         }
     }
+    Ok(())
 }
 
 fn truncate_bytes(text: &str, max_bytes: usize) -> (String, bool, Option<&'static str>) {

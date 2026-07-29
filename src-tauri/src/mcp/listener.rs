@@ -10,8 +10,8 @@ use crate::auth::{
 };
 use crate::mcp::protocol::{
     negotiate_protocol_version, protocol_version_supported, requested_protocol_version,
-    validate_client_message, ClientMessage, InFlightRequests, RateLimiter, RequestReservation,
-    SessionStore,
+    validate_client_message, ClientMessage, InFlightRequests, InFlightReservation,
+    KeyedRateLimiter, RateLimiter, RequestReservation, SessionStore,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{
@@ -34,6 +34,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Semaphore};
 
 pub type ShutdownSender = oneshot::Sender<()>;
@@ -41,8 +42,11 @@ pub type ShutdownSender = oneshot::Sender<()>;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MCP_MAX_BODY_BYTES: usize = 1_048_576;
 const MCP_MAX_CONCURRENT_REQUESTS: usize = 16;
+const MCP_MAX_CONCURRENT_REQUESTS_PER_SESSION: usize = 4;
 const MCP_MAX_REQUESTS_PER_MINUTE: usize = 240;
+const MCP_MAX_REQUESTS_PER_IDENTITY_PER_MINUTE: usize = 120;
 const OAUTH_MAX_REQUESTS_PER_MINUTE: usize = 30;
+const OAUTH_MAX_REQUESTS_PER_CLIENT_PER_MINUTE: usize = 12;
 
 #[derive(Clone)]
 struct ListenerState {
@@ -58,7 +62,9 @@ struct ListenerState {
     proxy_specs: Vec<McpProxyServerSpec>,
     sessions: SessionStore,
     mcp_rate_limiter: RateLimiter,
+    mcp_identity_rate_limiter: KeyedRateLimiter,
     oauth_rate_limiter: RateLimiter,
+    oauth_identity_rate_limiter: KeyedRateLimiter,
     concurrency: Arc<Semaphore>,
     in_flight: InFlightRequests,
     activity: McpActivityTracker,
@@ -99,6 +105,34 @@ fn accepts_streamable_http(headers: &HeaderMap) -> bool {
     accepted.iter().any(|item| item == "*/*")
         || (accepted.iter().any(|item| item == "application/json")
             && accepted.iter().any(|item| item == "text/event-stream"))
+}
+
+fn bounded_identity(prefix: &str, value: &[u8]) -> String {
+    let digest = format!("{:x}", Sha256::digest(value));
+    format!("{prefix}:{}", &digest[..16])
+}
+
+fn mcp_request_identity(headers: &HeaderMap) -> String {
+    if let Some(session_id) = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return bounded_identity("session", session_id.as_bytes());
+    }
+    if let Some(authorization) = headers.get("authorization") {
+        return bounded_identity("authorization", authorization.as_bytes());
+    }
+    "anonymous".into()
+}
+
+fn oauth_client_identity(client_id: &str) -> String {
+    let value = client_id.trim();
+    if value.is_empty() {
+        "anonymous-oauth-client".into()
+    } else {
+        bounded_identity("oauth-client", value.as_bytes())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -207,8 +241,18 @@ pub fn spawn_listener(
         proxy_specs,
         sessions: SessionStore::default(),
         mcp_rate_limiter: RateLimiter::new(MCP_MAX_REQUESTS_PER_MINUTE, Duration::from_secs(60)),
+        mcp_identity_rate_limiter: KeyedRateLimiter::new(
+            MCP_MAX_REQUESTS_PER_IDENTITY_PER_MINUTE,
+            1024,
+            Duration::from_secs(60),
+        ),
         oauth_rate_limiter: RateLimiter::new(
             OAUTH_MAX_REQUESTS_PER_MINUTE,
+            Duration::from_secs(60),
+        ),
+        oauth_identity_rate_limiter: KeyedRateLimiter::new(
+            OAUTH_MAX_REQUESTS_PER_CLIENT_PER_MINUTE,
+            1024,
             Duration::from_secs(60),
         ),
         concurrency: Arc::new(Semaphore::new(MCP_MAX_CONCURRENT_REQUESTS)),
@@ -371,6 +415,15 @@ async fn mcp_post(
     }
     if let Some(response) = require_mcp_auth(&state, &headers) {
         return response;
+    }
+    if !state
+        .mcp_identity_rate_limiter
+        .allow(&mcp_request_identity(&headers))
+    {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "MCP request identity rate limit exceeded",
+        );
     }
     let _permit = match state.concurrency.clone().try_acquire_owned() {
         Ok(permit) => permit,
@@ -557,12 +610,45 @@ async fn mcp_post(
     }
     cleanup_retired_sessions(&state);
 
-    let Some(cancellation) = state.in_flight.insert(session_id, &request_id) else {
-        return jsonrpc_error_response(
-            StatusCode::OK,
-            request_id,
-            json!({ "code": -32600, "message": "Duplicate in-flight request id" }),
-        );
+    let cancellation = match state.in_flight.insert_with_session_limit(
+        session_id,
+        &request_id,
+        MCP_MAX_CONCURRENT_REQUESTS_PER_SESSION,
+    ) {
+        InFlightReservation::Inserted(cancellation) => cancellation,
+        InFlightReservation::Duplicate => {
+            return jsonrpc_error_response(
+                StatusCode::OK,
+                request_id,
+                json!({
+                    "code": -32600,
+                    "message": "Duplicate in-flight request id",
+                    "data": {"reason": "duplicate_in_flight_request_id"}
+                }),
+            )
+        }
+        InFlightReservation::SessionLimit => {
+            return jsonrpc_error_response(
+                StatusCode::OK,
+                request_id,
+                json!({
+                    "code": -32002,
+                    "message": "MCP session concurrency limit exceeded",
+                    "data": {
+                        "reason": "session_concurrency_limit",
+                        "maximum_in_flight": MCP_MAX_CONCURRENT_REQUESTS_PER_SESSION,
+                        "retryable": true
+                    }
+                }),
+            )
+        }
+        InFlightReservation::InvalidRequestId => {
+            return jsonrpc_error_response(
+                StatusCode::OK,
+                request_id,
+                json!({"code": -32600, "message": "Invalid request id"}),
+            )
+        }
     };
     let response = execute_mcp_request(
         &state,
@@ -874,6 +960,15 @@ async fn oauth_authorize_get(
             "OAuth request rate limit exceeded",
         );
     }
+    if !state
+        .oauth_identity_rate_limiter
+        .allow(&oauth_client_identity(&params.client_id))
+    {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth client rate limit exceeded",
+        );
+    }
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
@@ -915,6 +1010,15 @@ async fn oauth_authorize_post(
         return http_error(
             StatusCode::TOO_MANY_REQUESTS,
             "OAuth request rate limit exceeded",
+        );
+    }
+    if !state
+        .oauth_identity_rate_limiter
+        .allow(&oauth_client_identity(&form.client_id))
+    {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth client rate limit exceeded",
         );
     }
     let Some(oauth) = state.oauth.as_ref() else {
@@ -960,6 +1064,15 @@ async fn oauth_token_post(
         return http_error(
             StatusCode::TOO_MANY_REQUESTS,
             "OAuth request rate limit exceeded",
+        );
+    }
+    if !state
+        .oauth_identity_rate_limiter
+        .allow(&oauth_client_identity(&form.client_id))
+    {
+        return http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OAuth client rate limit exceeded",
         );
     }
     let Some(oauth) = state.oauth.as_ref() else {
@@ -1021,7 +1134,7 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::sync::Semaphore;
 
-    use crate::mcp::protocol::{InFlightRequests, RateLimiter, SessionStore};
+    use crate::mcp::protocol::{InFlightRequests, KeyedRateLimiter, RateLimiter, SessionStore};
     use crate::mcp::server::new_state;
     use crate::mcp::McpActivityTracker;
     use crate::runtime::{register_public_url, update_public_url};
@@ -1099,7 +1212,17 @@ mod tests {
                 proxy_specs: Vec::new(),
                 sessions: SessionStore::default(),
                 mcp_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+                mcp_identity_rate_limiter: KeyedRateLimiter::new(
+                    100,
+                    32,
+                    Duration::from_secs(60),
+                ),
                 oauth_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+                oauth_identity_rate_limiter: KeyedRateLimiter::new(
+                    100,
+                    32,
+                    Duration::from_secs(60),
+                ),
                 concurrency: Arc::new(Semaphore::new(4)),
                 in_flight: InFlightRequests::default(),
                 activity: McpActivityTracker::default(),

@@ -17,21 +17,96 @@ pub enum ClientMessage {
     Response,
 }
 
+#[derive(Clone)]
+pub struct KeyedRateLimiter {
+    inner: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    max_requests: usize,
+    max_keys: usize,
+    window: Duration,
+}
+
+impl KeyedRateLimiter {
+    pub fn new(max_requests: usize, max_keys: usize, window: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            max_requests: max_requests.max(1),
+            max_keys: max_keys.max(1),
+            window,
+        }
+    }
+
+    pub fn allow(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.inner.lock().expect("MCP keyed rate limiter lock");
+        buckets.retain(|_, requests| {
+            while requests
+                .front()
+                .is_some_and(|created| now.duration_since(*created) >= self.window)
+            {
+                requests.pop_front();
+            }
+            !requests.is_empty()
+        });
+
+        if !buckets.contains_key(key) && buckets.len() >= self.max_keys {
+            let oldest = buckets
+                .iter()
+                .min_by_key(|(_, requests)| requests.back().copied())
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                buckets.remove(&oldest);
+            }
+        }
+
+        let requests = buckets.entry(key.to_string()).or_default();
+        if requests.len() >= self.max_requests {
+            return false;
+        }
+        requests.push_back(now);
+        true
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct InFlightRequests {
     inner: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
+pub enum InFlightReservation {
+    Inserted(CancellationToken),
+    Duplicate,
+    SessionLimit,
+    InvalidRequestId,
+}
+
 impl InFlightRequests {
     pub fn insert(&self, session_id: &str, request_id: &Value) -> Option<CancellationToken> {
-        let key = request_key(session_id, request_id)?;
+        match self.insert_with_session_limit(session_id, request_id, usize::MAX) {
+            InFlightReservation::Inserted(token) => Some(token),
+            _ => None,
+        }
+    }
+
+    pub fn insert_with_session_limit(
+        &self,
+        session_id: &str,
+        request_id: &Value,
+        max_in_flight: usize,
+    ) -> InFlightReservation {
+        let Some(key) = request_key(session_id, request_id) else {
+            return InFlightReservation::InvalidRequestId;
+        };
         let mut requests = self.inner.lock().expect("MCP in-flight request lock");
         if requests.contains_key(&key) {
-            return None;
+            return InFlightReservation::Duplicate;
+        }
+        let prefix = format!("{session_id}:");
+        if requests.keys().filter(|key| key.starts_with(&prefix)).count() >= max_in_flight.max(1) {
+            return InFlightReservation::SessionLimit;
         }
         let token = CancellationToken::default();
         requests.insert(key, token.clone());
-        Some(token)
+        InFlightReservation::Inserted(token)
     }
 
     pub fn cancel(&self, session_id: &str, request_id: &Value) -> bool {
@@ -577,6 +652,14 @@ mod tests {
     }
 
     #[test]
+    fn keyed_rate_limiter_keeps_client_budgets_independent() {
+        let limiter = KeyedRateLimiter::new(1, 4, Duration::from_secs(60));
+        assert!(limiter.allow("client-a"));
+        assert!(!limiter.allow("client-a"));
+        assert!(limiter.allow("client-b"));
+    }
+
+    #[test]
     fn in_flight_registry_cancels_matching_request() {
         let requests = InFlightRequests::default();
         let id = json!(7);
@@ -586,6 +669,27 @@ mod tests {
         assert!(token.is_cancelled());
         requests.remove("session", &id);
         assert!(!requests.cancel("session", &id));
+    }
+
+    #[test]
+    fn in_flight_registry_enforces_per_session_limit() {
+        let requests = InFlightRequests::default();
+        assert!(matches!(
+            requests.insert_with_session_limit("session", &json!(1), 2),
+            InFlightReservation::Inserted(_)
+        ));
+        assert!(matches!(
+            requests.insert_with_session_limit("session", &json!(2), 2),
+            InFlightReservation::Inserted(_)
+        ));
+        assert!(matches!(
+            requests.insert_with_session_limit("session", &json!(3), 2),
+            InFlightReservation::SessionLimit
+        ));
+        assert!(matches!(
+            requests.insert_with_session_limit("other", &json!(1), 2),
+            InFlightReservation::Inserted(_)
+        ));
     }
 
     #[test]

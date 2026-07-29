@@ -291,6 +291,7 @@ pub fn validate_command_for_workspace(
         .strip_suffix(".exe")
         .or_else(|| base_name.strip_suffix(".cmd"))
         .or_else(|| base_name.strip_suffix(".bat"))
+        .or_else(|| base_name.strip_suffix(".ps1"))
         .unwrap_or(base_name);
 
     let workspace_entry_candidate = workspace_local_entry_exists(workspace, arguments, executable)
@@ -444,14 +445,38 @@ fn interpreter_mutation_pattern() -> &'static regex::Regex {
 
 fn command_contains_external_path(command: &str) -> bool {
     let normalized = command.replace('\\', "/");
+    let posix_absolute = POSIX_ABSOLUTE_PATH_PATTERN
+        .get_or_init(|| {
+            regex::Regex::new(r#"(?i)(^|["'\s])(/[^\s"']*)"#).expect("valid regex")
+        })
+        .captures_iter(&normalized)
+        .filter_map(|captures| captures.get(2).map(|value| value.as_str()))
+        .any(|value| !is_windows_command_switch(value));
     normalized.contains("../")
         || normalized.contains("..\\")
-        || POSIX_ABSOLUTE_PATH_PATTERN
-            .get_or_init(|| regex::Regex::new(r#"(?i)(^|["'\s])/[^"]"#).expect("valid regex"))
-            .is_match(&normalized)
+        || posix_absolute
         || WINDOWS_ABSOLUTE_PATH_PATTERN
             .get_or_init(|| regex::Regex::new(r"(?i)\b[A-Z]:/").expect("valid regex"))
             .is_match(&normalized)
+}
+
+fn is_windows_command_switch(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "/a"
+            | "/c"
+            | "/d"
+            | "/e:off"
+            | "/e:on"
+            | "/f:off"
+            | "/f:on"
+            | "/k"
+            | "/q"
+            | "/s"
+            | "/u"
+            | "/v:off"
+            | "/v:on"
+    )
 }
 
 fn command_targets_protected_repository_asset(command: &str) -> bool {
@@ -520,6 +545,12 @@ mod tests {
         .is_err());
         assert!(validate_command_for_workspace(
             &json!({"cmd": "cat local.txt"}),
+            &policy,
+            Some(&workspace),
+        )
+        .is_ok());
+        assert!(validate_command_for_workspace(
+            &json!({"cmd": "cmd /c echo local"}),
             &policy,
             Some(&workspace),
         )

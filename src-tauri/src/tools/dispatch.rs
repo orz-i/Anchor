@@ -243,10 +243,12 @@ fn call_tool_impl(
         "exec_health_check" => exec::exec_health_check(ctx),
         "get_default_cwd" => get_default_cwd_for_session(ctx, session_id),
         "set_default_cwd" => set_default_cwd_for_session(ctx, session_id, &effective_args),
-        "read_file" => file::read_file(ws, &effective_args),
-        "list_dir" => file::list_dir(ws, &effective_args),
-        "list_files" => file::list_files(ws, &effective_args),
-        "search_text" | "grep_text" | "grep" => file::search_text(ws, &effective_args),
+        "read_file" => file::read_file(ws, &effective_args, cancellation),
+        "list_dir" => file::list_dir(ws, &effective_args, cancellation),
+        "list_files" => file::list_files(ws, &effective_args, cancellation),
+        "search_text" | "grep_text" | "grep" => {
+            file::search_text(ws, &effective_args, cancellation)
+        }
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
         "exec_command" => exec::exec_command_with_cancellation(ctx, &effective_args, cancellation),
@@ -634,9 +636,10 @@ fn set_default_cwd_for_session(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tempfile::tempdir;
 
-    use super::preserve_completed_result;
-    use crate::tools::CancellationToken;
+    use super::{call_tool_with_cancellation, preserve_completed_result};
+    use crate::tools::{CancellationToken, ToolContext};
 
     #[test]
     fn late_cancellation_preserves_a_committed_success_result() {
@@ -649,5 +652,28 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["cancellation_after_completion"], true);
         assert_eq!(result["affected_files"], json!(["probe.txt"]));
+    }
+
+    #[test]
+    fn cancelled_file_scan_stops_before_work() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness.path().to_path_buf(),
+        )
+        .expect("context");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = call_tool_with_cancellation(
+            &ctx,
+            "list_files",
+            &json!({"path": "."}),
+            &cancellation,
+        );
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "REQUEST_CANCELLED");
     }
 }

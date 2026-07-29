@@ -967,9 +967,10 @@ mod tests {
             "print('workflow-ok')\n",
         )
         .expect("python module");
-        let ctx =
+        let mut ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
+        ctx.policy.allowed_commands.insert("any-name".into());
 
         for command in [
             "any-name.cmd",
@@ -1008,8 +1009,9 @@ mod tests {
         let workspace = parent.path().join("Life Brain 中文");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let harness = tempdir().expect("harness");
-        let ctx = ToolContext::for_test(workspace.clone(), harness.path().to_path_buf())
+        let mut ctx = ToolContext::for_test(workspace.clone(), harness.path().to_path_buf())
             .expect("context");
+        ctx.policy.allowed_commands.insert("run & tooling".into());
 
         for extension in ["cmd", "bat"] {
             let script_name = format!("run & tooling.{extension}");
