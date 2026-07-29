@@ -663,7 +663,23 @@ pub fn output_schema(name: &str) -> Value {
                 "catalog_bytes": { "type": "integer", "minimum": 0 },
                 "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
                 "local_tool_count": { "type": "integer", "minimum": 0 },
-                "proxy_tool_count": { "type": "integer", "minimum": 0 }
+                "proxy_tool_count": { "type": "integer", "minimum": 0 },
+                "downstream_mcp": {
+                    "type": "object",
+                    "properties": {
+                        "configured": { "type": "boolean" },
+                        "server_count": { "type": "integer", "minimum": 0 },
+                        "servers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        }
+                    },
+                    "required": ["configured", "server_count", "servers"],
+                    "additionalProperties": false
+                }
             }),
             &[
                 "server",
@@ -685,6 +701,7 @@ pub fn output_schema(name: &str) -> Value {
                 "catalog_estimated_tokens",
                 "local_tool_count",
                 "proxy_tool_count",
+                "downstream_mcp",
             ],
         ),
         "read_file" => success_output_schema(

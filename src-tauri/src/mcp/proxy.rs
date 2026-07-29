@@ -5,12 +5,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -23,6 +27,12 @@ const MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER: usize = 4_096;
 const MAX_PROXY_TOOLS_PER_SERVER: usize = 256;
 const MAX_PROXY_TOOLS_TOTAL: usize = 512;
 const MAX_PROXY_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
+const DEFAULT_STDIO_MAX_CONCURRENT_REQUESTS: usize = 4;
+const DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS: usize = 16;
+const MAX_PROXY_CONCURRENT_REQUESTS: usize = 64;
+const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 #[derive(Debug, Clone)]
 struct SanitizedProxyTool {
@@ -60,6 +70,7 @@ struct SanitizedProxyCatalog {
 #[derive(Debug, Clone)]
 pub struct McpProxyServerSpec {
     pub name: String,
+    transport: McpProxyTransportSpec,
     command: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
@@ -68,7 +79,26 @@ pub struct McpProxyServerSpec {
     include_tools: Option<BTreeSet<String>>,
     exclude_tools: BTreeSet<String>,
     max_tools: Option<usize>,
+    max_concurrent_requests: usize,
     request_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+enum McpProxyTransportSpec {
+    Stdio,
+    StreamableHttp {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl McpProxyTransportSpec {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::StreamableHttp { .. } => "streamable-http",
+        }
+    }
 }
 
 fn validate_schema_document(schema: &Value, label: &str) -> Result<(), String> {
@@ -321,13 +351,21 @@ struct ProxyServer {
     workspace_id: String,
     catalog_digest: String,
     client: Mutex<Option<Arc<McpProxyClient>>>,
+    concurrency: Semaphore,
     reconnect_scheduled: AtomicBool,
+    calls: AtomicU64,
+    failures: AtomicU64,
+    cancellations: AtomicU64,
+    timeouts: AtomicU64,
+    queue_timeouts: AtomicU64,
+    last_error: StdMutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawMcpServerConfig {
     #[serde(rename = "type", default)]
     transport_type: String,
+    #[serde(default)]
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -335,6 +373,10 @@ struct RawMcpServerConfig {
     env: BTreeMap<String, String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     #[serde(default)]
     disabled: bool,
     #[serde(rename = "toolPrefix", default)]
@@ -345,6 +387,8 @@ struct RawMcpServerConfig {
     exclude_tools: Vec<String>,
     #[serde(rename = "maxTools", default)]
     max_tools: Option<usize>,
+    #[serde(rename = "maxConcurrentRequests", default)]
+    max_concurrent_requests: Option<usize>,
     #[serde(rename = "requestTimeoutSeconds", default)]
     request_timeout_seconds: Option<u64>,
 }
@@ -383,6 +427,15 @@ impl Default for McpProxyRegistry {
 }
 
 struct McpProxyClient {
+    transport: ProxyClientTransport,
+}
+
+enum ProxyClientTransport {
+    Stdio(Arc<StdioMcpProxyClient>),
+    StreamableHttp(Arc<HttpMcpProxyClient>),
+}
+
+struct StdioMcpProxyClient {
     request_timeout: Duration,
     writer: Mutex<ChildStdin>,
     child: Mutex<Option<Child>>,
@@ -390,6 +443,19 @@ struct McpProxyClient {
     next_id: AtomicU64,
     closed: AtomicBool,
     close_reason: StdMutex<Option<String>>,
+    workspace_id: String,
+    server_name: String,
+}
+
+struct HttpMcpProxyClient {
+    request_timeout: Duration,
+    endpoint: reqwest::Url,
+    client: reqwest::Client,
+    configured_headers: HeaderMap,
+    session_id: StdMutex<Option<String>>,
+    protocol_version: StdMutex<String>,
+    next_id: AtomicU64,
+    closed: AtomicBool,
     workspace_id: String,
     server_name: String,
 }
@@ -455,6 +521,26 @@ impl McpProxyRegistry {
             .expect("mcp proxy registry read")
             .tools
             .clone()
+    }
+
+    pub fn status(&self) -> Value {
+        let state = self.state.read().expect("mcp proxy registry read");
+        let mut servers = BTreeMap::<String, (Arc<ProxyServer>, usize)>::new();
+        for route in state.routes.values() {
+            let entry = servers
+                .entry(route.server_name.clone())
+                .or_insert_with(|| (route.server.clone(), 0));
+            entry.1 += 1;
+        }
+        let servers = servers
+            .into_values()
+            .map(|(server, tool_count)| server.status(tool_count))
+            .collect::<Vec<_>>();
+        json!({
+            "configured": self.configured.load(Ordering::Acquire),
+            "server_count": servers.len(),
+            "servers": servers
+        })
     }
 
     pub async fn configure(&self, specs: Vec<McpProxyServerSpec>, workspace_id: &str) {
@@ -602,9 +688,57 @@ impl McpProxyRegistry {
                 false,
             )));
         }
+        let permit = timeout(
+            server.spec.request_timeout,
+            server.concurrency.acquire(),
+        );
+        tokio::pin!(permit);
+        let _permit = tokio::select! {
+            _ = cancellation.cancelled() => {
+                server.record_queue_cancelled();
+                return Some(Ok(proxy_call_error_result(
+                    &server_name,
+                    public_name,
+                    "proxy_call_cancelled",
+                    "request cancelled while waiting for downstream capacity".into(),
+                    false,
+                    false,
+                )));
+            }
+            permit = &mut permit => match permit {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    server.record_failure_message("downstream concurrency queue is closed");
+                    return Some(Ok(proxy_call_error_result(
+                        &server_name,
+                        public_name,
+                        "proxy_queue_closed",
+                        "downstream concurrency queue is closed".into(),
+                        true,
+                        false,
+                    )));
+                }
+                Err(_) => {
+                    server.record_queue_timeout();
+                    return Some(Ok(proxy_call_error_result(
+                        &server_name,
+                        public_name,
+                        "proxy_queue_timeout",
+                        format!(
+                            "waited {} seconds for downstream capacity",
+                            server.spec.request_timeout.as_secs()
+                        ),
+                        true,
+                        false,
+                    )));
+                }
+            }
+        };
+        server.record_call_started();
         let client = match server.ensure_client().await {
             Ok(client) => client,
             Err(message) => {
+                server.record_failure_message(&message);
                 server.clone().schedule_reconnect();
                 return Some(Ok(proxy_call_error_result(
                     &server_name,
@@ -627,6 +761,7 @@ impl McpProxyRegistry {
             )
             .await;
         if let Err(error) = &result {
+            server.record_client_error(error);
             let cancelled = error.is_cancelled();
             let connection_lost = error.invalidates_connection();
             if connection_lost {
@@ -652,6 +787,7 @@ impl McpProxyRegistry {
                 route.synthesized_output_schema,
             )
             .unwrap_or_else(|message| {
+                server.record_failure_message(&message);
                 proxy_call_error_result(
                     &server_name,
                     public_name,
@@ -695,13 +831,21 @@ impl ProxyServer {
         let (client, catalog) = McpProxyClient::connect(spec.clone(), &workspace_id).await?;
         let catalog = sanitize_proxy_catalog(&spec, catalog)?;
         let catalog_digest = proxy_catalog_digest(&catalog.tools)?;
+        let max_concurrent_requests = spec.max_concurrent_requests;
         Ok((
             Arc::new(Self {
                 spec,
                 workspace_id,
                 catalog_digest,
                 client: Mutex::new(Some(client)),
+                concurrency: Semaphore::new(max_concurrent_requests),
                 reconnect_scheduled: AtomicBool::new(false),
+                calls: AtomicU64::new(0),
+                failures: AtomicU64::new(0),
+                cancellations: AtomicU64::new(0),
+                timeouts: AtomicU64::new(0),
+                queue_timeouts: AtomicU64::new(0),
+                last_error: StdMutex::new(None),
             }),
             catalog,
         ))
@@ -746,6 +890,73 @@ impl ProxyServer {
         if removed {
             failed.terminate().await;
         }
+    }
+
+    fn record_queue_cancelled(&self) {
+        self.cancellations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_queue_timeout(&self) {
+        self.timeouts.fetch_add(1, Ordering::Relaxed);
+        self.queue_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.record_failure_message("downstream concurrency queue timed out");
+    }
+
+    fn record_call_started(&self) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_client_error(&self, error: &ProxyClientError) {
+        if error.is_cancelled() {
+            self.cancellations.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if matches!(error, ProxyClientError::Timeout { .. }) {
+            self.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_failure_message(&error.to_string());
+    }
+
+    fn record_failure_message(&self, message: &str) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_error
+            .lock()
+            .expect("mcp proxy last error lock") = Some(truncate_log_detail(message, 1_024));
+    }
+
+    fn status(&self, tool_count: usize) -> Value {
+        let (connected, state_busy) = match self.client.try_lock() {
+            Ok(client) => (
+                client
+                    .as_ref()
+                    .is_some_and(|client| !client.is_closed()),
+                false,
+            ),
+            Err(_) => (true, true),
+        };
+        let available_slots = self.concurrency.available_permits();
+        json!({
+            "name": self.spec.name,
+            "transport": self.spec.transport.label(),
+            "connected": connected,
+            "state_busy": state_busy,
+            "reconnect_scheduled": self.reconnect_scheduled.load(Ordering::Acquire),
+            "tool_count": tool_count,
+            "max_concurrent_requests": self.spec.max_concurrent_requests,
+            "in_flight_requests": self.spec.max_concurrent_requests.saturating_sub(available_slots),
+            "available_slots": available_slots,
+            "calls": self.calls.load(Ordering::Relaxed),
+            "failures": self.failures.load(Ordering::Relaxed),
+            "cancellations": self.cancellations.load(Ordering::Relaxed),
+            "timeouts": self.timeouts.load(Ordering::Relaxed),
+            "queue_timeouts": self.queue_timeouts.load(Ordering::Relaxed),
+            "last_error": self
+                .last_error
+                .lock()
+                .expect("mcp proxy last error lock")
+                .clone()
+        })
     }
 
     fn schedule_reconnect(self: Arc<Self>) {
@@ -874,6 +1085,621 @@ fn normalize_proxy_tool_result(
 }
 
 impl McpProxyClient {
+    async fn connect(
+        spec: McpProxyServerSpec,
+        workspace_id: &str,
+    ) -> Result<(Arc<Self>, Vec<Value>), String> {
+        match spec.transport.clone() {
+            McpProxyTransportSpec::Stdio => {
+                let (client, tools) =
+                    StdioMcpProxyClient::connect(spec, workspace_id).await?;
+                Ok((
+                    Arc::new(Self {
+                        transport: ProxyClientTransport::Stdio(client),
+                    }),
+                    tools,
+                ))
+            }
+            McpProxyTransportSpec::StreamableHttp { url, headers } => {
+                let (client, tools) = HttpMcpProxyClient::connect(
+                    &spec,
+                    workspace_id,
+                    &url,
+                    &headers,
+                )
+                .await?;
+                Ok((
+                    Arc::new(Self {
+                        transport: ProxyClientTransport::StreamableHttp(client),
+                    }),
+                    tools,
+                ))
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match &self.transport {
+            ProxyClientTransport::Stdio(client) => client.is_closed(),
+            ProxyClientTransport::StreamableHttp(client) => client.is_closed(),
+        }
+    }
+
+    async fn terminate(&self) {
+        match &self.transport {
+            ProxyClientTransport::Stdio(client) => client.terminate().await,
+            ProxyClientTransport::StreamableHttp(client) => client.terminate().await,
+        }
+    }
+
+    async fn request_with_cancellation(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ProxyClientError> {
+        match &self.transport {
+            ProxyClientTransport::Stdio(client) => {
+                client
+                    .request_with_cancellation(method, params, cancellation)
+                    .await
+            }
+            ProxyClientTransport::StreamableHttp(client) => {
+                client
+                    .request_with_cancellation(method, params, cancellation)
+                    .await
+            }
+        }
+    }
+}
+
+impl HttpMcpProxyClient {
+    async fn connect(
+        spec: &McpProxyServerSpec,
+        workspace_id: &str,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+    ) -> Result<(Arc<Self>, Vec<Value>), String> {
+        let endpoint = reqwest::Url::parse(url)
+            .map_err(|error| format!("invalid Streamable HTTP endpoint: {error}"))?;
+        let mut configured_headers = HeaderMap::new();
+        for (name, value) in headers {
+            configured_headers.insert(
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|error| format!("invalid downstream header `{name}`: {error}"))?,
+                HeaderValue::from_str(value)
+                    .map_err(|error| format!("invalid downstream header `{name}`: {error}"))?,
+            );
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(spec.request_timeout.min(Duration::from_secs(30)))
+            .build()
+            .map_err(|error| format!("failed to build Streamable HTTP client: {error}"))?;
+        let client = Arc::new(Self {
+            request_timeout: spec.request_timeout,
+            endpoint,
+            client,
+            configured_headers,
+            session_id: StdMutex::new(None),
+            protocol_version: StdMutex::new(
+                crate::mcp::protocol::CURRENT_PROTOCOL_VERSION.to_string(),
+            ),
+            next_id: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            workspace_id: workspace_id.to_string(),
+            server_name: spec.name.clone(),
+        });
+
+        let initialized = client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "anchor-proxy",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        client.update_protocol_version(&initialized)?;
+        client
+            .notify("notifications/initialized", json!({}))
+            .await
+            .map_err(|error| error.to_string())?;
+        let tools = client
+            .list_tools()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((client, tools))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn update_protocol_version(&self, initialized: &Value) -> Result<(), String> {
+        let version = initialized
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                "downstream initialize result is missing protocolVersion".to_string()
+            })?;
+        *self
+            .protocol_version
+            .lock()
+            .expect("mcp HTTP protocol version lock") = version.to_string();
+        Ok(())
+    }
+
+    async fn terminate(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session_id = self
+            .session_id
+            .lock()
+            .expect("mcp HTTP session lock")
+            .clone();
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let Ok(headers) = self.request_headers(Some(&session_id), true) else {
+            return;
+        };
+        let _ = timeout(
+            Duration::from_secs(5),
+            self.client
+                .delete(self.endpoint.clone())
+                .headers(headers)
+                .send(),
+        )
+        .await;
+    }
+
+    async fn list_tools(&self) -> Result<Vec<Value>, ProxyClientError> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_LIST_PAGES {
+            let params = cursor
+                .as_ref()
+                .map(|value| json!({ "cursor": value }))
+                .unwrap_or_else(|| json!({}));
+            let result = self.request("tools/list", params).await?;
+            if let Some(page) = result.get("tools").and_then(Value::as_array) {
+                tools.extend(page.iter().cloned());
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .filter(|value| !value.is_empty());
+            if cursor.is_none() {
+                return Ok(tools);
+            }
+        }
+        Err(ProxyClientError::Protocol(
+            "downstream MCP returned too many tools/list pages".into(),
+        ))
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value, ProxyClientError> {
+        self.request_with_cancellation(method, params, &CancellationToken::default())
+            .await
+    }
+
+    async fn request_with_cancellation(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, ProxyClientError> {
+        if self.is_closed() {
+            return Err(ProxyClientError::Transport(
+                "downstream Streamable HTTP session is closed".into(),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        let response = timeout(
+            self.request_timeout,
+            self.post_message(&request, Some(id), method != "initialize"),
+        );
+        tokio::pin!(response);
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                self.send_cancel_notification(id, "cancelled by upstream request").await;
+                Err(ProxyClientError::Cancelled)
+            }
+            response = &mut response => match response {
+                Ok(result) => result?.ok_or_else(|| {
+                    ProxyClientError::Protocol(
+                        "downstream HTTP request completed without a JSON-RPC result".into(),
+                    )
+                }),
+                Err(_) => {
+                    self.send_cancel_notification(id, "downstream request timed out").await;
+                    Err(ProxyClientError::Timeout {
+                        method: method.to_string(),
+                        seconds: self.request_timeout.as_secs(),
+                    })
+                }
+            }
+        }
+    }
+
+    async fn notify(&self, method: &str, params: Value) -> Result<(), ProxyClientError> {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        });
+        timeout(
+            self.request_timeout,
+            self.post_message(&notification, None, true),
+        )
+        .await
+        .map_err(|_| ProxyClientError::Timeout {
+            method: method.to_string(),
+            seconds: self.request_timeout.as_secs(),
+        })??;
+        Ok(())
+    }
+
+    async fn send_cancel_notification(&self, id: u64, reason: &str) {
+        if self.is_closed() {
+            return;
+        }
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": id,
+                "reason": reason
+            }
+        });
+        let _ = timeout(
+            Duration::from_secs(5),
+            self.post_message(&notification, None, true),
+        )
+        .await;
+    }
+
+    async fn post_message(
+        &self,
+        message: &Value,
+        expected_id: Option<u64>,
+        include_session: bool,
+    ) -> Result<Option<Value>, ProxyClientError> {
+        let session_id = include_session
+            .then(|| {
+                self.session_id
+                    .lock()
+                    .expect("mcp HTTP session lock")
+                    .clone()
+            })
+            .flatten();
+        let headers = self.request_headers(session_id.as_deref(), include_session)?;
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .headers(headers)
+            .json(message)
+            .send()
+            .await
+            .map_err(|error| {
+                ProxyClientError::Transport(format!(
+                    "downstream Streamable HTTP request failed: {error}"
+                ))
+            })?;
+        self.capture_session_header(response.headers())?;
+        let status = response.status();
+        if status == reqwest::StatusCode::ACCEPTED {
+            return if expected_id.is_none() {
+                Ok(None)
+            } else {
+                Err(ProxyClientError::Protocol(
+                    "downstream returned HTTP 202 for a JSON-RPC request".into(),
+                ))
+            };
+        }
+        if !status.is_success() {
+            let body = collect_http_body(response).await?;
+            let detail = String::from_utf8_lossy(&body);
+            return Err(ProxyClientError::Remote(format!(
+                "downstream Streamable HTTP returned {status}: {}",
+                truncate_log_detail(&detail, 4_096)
+            )));
+        }
+        let Some(expected_id) = expected_id else {
+            return Ok(None);
+        };
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if content_type.starts_with("text/event-stream") {
+            return self.read_sse_result(response, expected_id).await.map(Some);
+        }
+        let body = collect_http_body(response).await?;
+        let message = serde_json::from_slice::<Value>(&body).map_err(|error| {
+            ProxyClientError::Protocol(format!(
+                "downstream HTTP response is not valid JSON: {error}"
+            ))
+        })?;
+        match_http_rpc_message(message, expected_id)?.ok_or_else(|| {
+            ProxyClientError::Protocol(
+                "downstream HTTP response did not contain the expected request id".into(),
+            )
+        }).map(Some)
+    }
+
+    fn request_headers(
+        &self,
+        session_id: Option<&str>,
+        include_protocol: bool,
+    ) -> Result<HeaderMap, ProxyClientError> {
+        let mut headers = self.configured_headers.clone();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if include_protocol {
+            let protocol = self
+                .protocol_version
+                .lock()
+                .expect("mcp HTTP protocol version lock")
+                .clone();
+            headers.insert(
+                HeaderName::from_static(MCP_PROTOCOL_VERSION_HEADER),
+                HeaderValue::from_str(&protocol).map_err(|error| {
+                    ProxyClientError::Protocol(format!(
+                        "invalid negotiated MCP protocol version header: {error}"
+                    ))
+                })?,
+            );
+        }
+        if let Some(session_id) = session_id {
+            headers.insert(
+                HeaderName::from_static(MCP_SESSION_ID_HEADER),
+                HeaderValue::from_str(session_id).map_err(|error| {
+                    ProxyClientError::Protocol(format!(
+                        "invalid downstream MCP session id: {error}"
+                    ))
+                })?,
+            );
+        }
+        Ok(headers)
+    }
+
+    fn capture_session_header(&self, headers: &HeaderMap) -> Result<(), ProxyClientError> {
+        let Some(session_id) = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        if session_id.len() > 1_024 {
+            return Err(ProxyClientError::Protocol(
+                "downstream MCP session id is too long".into(),
+            ));
+        }
+        let mut current = self
+            .session_id
+            .lock()
+            .expect("mcp HTTP session lock");
+        if current
+            .as_ref()
+            .is_some_and(|current| current != session_id)
+        {
+            return Err(ProxyClientError::Protocol(
+                "downstream MCP changed session id unexpectedly".into(),
+            ));
+        }
+        if current.is_none() {
+            *current = Some(session_id.to_string());
+            append_profile_log(
+                &self.workspace_id,
+                "stdout.log",
+                &format!(
+                    "[mcp-proxy:{}] Streamable HTTP session established",
+                    self.server_name
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    async fn read_sse_result(
+        &self,
+        response: reqwest::Response,
+        expected_id: u64,
+    ) -> Result<Value, ProxyClientError> {
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut received = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                ProxyClientError::Transport(format!(
+                    "failed to read downstream SSE response: {error}"
+                ))
+            })?;
+            received = received.saturating_add(chunk.len());
+            if received > MAX_HTTP_RESPONSE_BYTES {
+                return Err(ProxyClientError::Protocol(format!(
+                    "downstream SSE response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+                )));
+            }
+            buffer.extend_from_slice(&chunk);
+            while let Some(event) = take_sse_event(&mut buffer) {
+                let Some(message) = parse_sse_message(&event)? else {
+                    continue;
+                };
+                if let Some(result) = match_http_rpc_message(message, expected_id)? {
+                    return Ok(result);
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            if let Some(message) = parse_sse_message(&buffer)? {
+                if let Some(result) = match_http_rpc_message(message, expected_id)? {
+                    return Ok(result);
+                }
+            }
+        }
+        Err(ProxyClientError::Protocol(
+            "downstream SSE stream ended before the expected response".into(),
+        ))
+    }
+}
+
+impl Drop for HttpMcpProxyClient {
+    fn drop(&mut self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session_id = self
+            .session_id
+            .lock()
+            .expect("mcp HTTP session lock")
+            .clone();
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let Ok(headers) = self.request_headers(Some(&session_id), true) else {
+            return;
+        };
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        crate::async_runtime::spawn(async move {
+            let _ = timeout(
+                Duration::from_secs(5),
+                client.delete(endpoint).headers(headers).send(),
+            )
+            .await;
+        });
+    }
+}
+
+async fn collect_http_body(response: reqwest::Response) -> Result<Vec<u8>, ProxyClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HTTP_RESPONSE_BYTES as u64)
+    {
+        return Err(ProxyClientError::Protocol(format!(
+            "downstream HTTP response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+        )));
+    }
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ProxyClientError::Transport(format!(
+                "failed to read downstream HTTP response: {error}"
+            ))
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
+            return Err(ProxyClientError::Protocol(format!(
+                "downstream HTTP response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n");
+    let (index, delimiter) = match (lf, crlf) {
+        (Some(left), Some(right)) if left <= right => (left, 2),
+        (Some(_), Some(right)) => (right, 4),
+        (Some(index), None) => (index, 2),
+        (None, Some(index)) => (index, 4),
+        (None, None) => return None,
+    };
+    let event = buffer[..index].to_vec();
+    buffer.drain(..index + delimiter);
+    Some(event)
+}
+
+fn parse_sse_message(event: &[u8]) -> Result<Option<Value>, ProxyClientError> {
+    let text = std::str::from_utf8(event).map_err(|error| {
+        ProxyClientError::Protocol(format!("downstream SSE event is not UTF-8: {error}"))
+    })?;
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| line.strip_prefix(' ').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|error| {
+            ProxyClientError::Protocol(format!(
+                "downstream SSE data is not valid JSON: {error}"
+            ))
+        })
+}
+
+fn match_http_rpc_message(
+    message: Value,
+    expected_id: u64,
+) -> Result<Option<Value>, ProxyClientError> {
+    if message.get("method").and_then(Value::as_str).is_some() {
+        if message.get("id").is_some() {
+            return Err(ProxyClientError::Protocol(
+                "downstream HTTP server requests are not supported by this proxy".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if message.get("id").and_then(Value::as_u64) != Some(expected_id) {
+        return Ok(None);
+    }
+    if let Some(error) = message.get("error") {
+        return Err(ProxyClientError::Remote(error.to_string()));
+    }
+    message
+        .get("result")
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| {
+            ProxyClientError::Protocol("downstream response is missing result".into())
+        })
+}
+
+fn truncate_log_detail(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_string();
+    }
+    let mut end = maximum;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
+impl StdioMcpProxyClient {
     async fn connect(
         spec: McpProxyServerSpec,
         workspace_id: &str,
@@ -1258,36 +2084,106 @@ pub fn parse_mcp_proxy_config(
         if config.disabled {
             continue;
         }
-        if !config.transport_type.is_empty() && config.transport_type != "stdio" {
-            return Err(format!(
-                "MCP server `{name}` uses unsupported transport `{}`; only stdio is supported",
-                config.transport_type
-            ));
-        }
-        if config.command.trim().is_empty() {
-            return Err(format!("MCP server `{name}` is missing command"));
-        }
-
         let workspace_display = workspace_path.display().to_string();
-        let command = expand_workspace_placeholders(&config.command, &workspace_display);
+        let transport_name = config.transport_type.trim().to_ascii_lowercase();
+        let has_url = config
+            .url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        let transport = match transport_name.as_str() {
+            "" if has_url => {
+                let url = config.url.as_deref().unwrap_or_default();
+                McpProxyTransportSpec::StreamableHttp {
+                    url: validate_proxy_http_url(
+                        &name,
+                        &expand_proxy_placeholders(url, &workspace_display)?,
+                    )?,
+                    headers: validate_proxy_http_headers(
+                        &name,
+                        config
+                            .headers
+                            .iter()
+                            .map(|(key, value)| {
+                                Ok((
+                                    key.clone(),
+                                    expand_proxy_placeholders(value, &workspace_display)?,
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, String>>()?,
+                    )?,
+                }
+            }
+            "" | "stdio" => {
+                if config.command.trim().is_empty() {
+                    return Err(format!("MCP server `{name}` is missing command"));
+                }
+                if has_url {
+                    return Err(format!(
+                        "MCP server `{name}` cannot configure both stdio command and url"
+                    ));
+                }
+                McpProxyTransportSpec::Stdio
+            }
+            "streamable-http" | "http" => {
+                if !config.command.trim().is_empty() {
+                    return Err(format!(
+                        "MCP server `{name}` cannot configure both Streamable HTTP url and command"
+                    ));
+                }
+                let url = config
+                    .url
+                    .as_deref()
+                    .filter(|url| !url.trim().is_empty())
+                    .ok_or_else(|| format!("MCP server `{name}` is missing url"))?;
+                McpProxyTransportSpec::StreamableHttp {
+                    url: validate_proxy_http_url(
+                        &name,
+                        &expand_proxy_placeholders(url, &workspace_display)?,
+                    )?,
+                    headers: validate_proxy_http_headers(
+                        &name,
+                        config
+                            .headers
+                            .iter()
+                            .map(|(key, value)| {
+                                Ok((
+                                    key.clone(),
+                                    expand_proxy_placeholders(value, &workspace_display)?,
+                                ))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, String>>()?,
+                    )?,
+                }
+            }
+            "sse" => {
+                return Err(format!(
+                    "MCP server `{name}` uses legacy SSE transport; configure a Streamable HTTP endpoint instead"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "MCP server `{name}` uses unsupported transport `{other}`"
+                ));
+            }
+        };
+
+        let command = expand_proxy_placeholders(&config.command, &workspace_display)?;
         let args = config
             .args
             .into_iter()
-            .map(|arg| expand_workspace_placeholders(&arg, &workspace_display))
-            .collect();
+            .map(|arg| expand_proxy_placeholders(&arg, &workspace_display))
+            .collect::<Result<Vec<_>, _>>()?;
         let env = config
             .env
             .into_iter()
             .map(|(key, value)| {
-                (
-                    key,
-                    expand_workspace_placeholders(&value, &workspace_display),
-                )
+                Ok((key, expand_proxy_placeholders(&value, &workspace_display)?))
             })
-            .collect();
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
         let cwd = config
             .cwd
-            .map(|cwd| expand_workspace_placeholders(&cwd, &workspace_display))
+            .map(|cwd| expand_proxy_placeholders(&cwd, &workspace_display))
+            .transpose()?
             .map(PathBuf::from)
             .map(|cwd| {
                 if cwd.is_absolute() {
@@ -1313,9 +2209,24 @@ pub fn parse_mcp_proxy_config(
                 "MCP server `{name}` maxTools must be at most {MAX_PROXY_TOOLS_PER_SERVER}"
             ));
         }
+        let default_concurrency = match &transport {
+            McpProxyTransportSpec::Stdio => DEFAULT_STDIO_MAX_CONCURRENT_REQUESTS,
+            McpProxyTransportSpec::StreamableHttp { .. } => {
+                DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS
+            }
+        };
+        let max_concurrent_requests = config
+            .max_concurrent_requests
+            .unwrap_or(default_concurrency);
+        if !(1..=MAX_PROXY_CONCURRENT_REQUESTS).contains(&max_concurrent_requests) {
+            return Err(format!(
+                "MCP server `{name}` maxConcurrentRequests must be between 1 and {MAX_PROXY_CONCURRENT_REQUESTS}"
+            ));
+        }
 
         specs.push(McpProxyServerSpec {
             name,
+            transport,
             command,
             args,
             env,
@@ -1324,6 +2235,7 @@ pub fn parse_mcp_proxy_config(
             include_tools,
             exclude_tools,
             max_tools: config.max_tools,
+            max_concurrent_requests,
             request_timeout: Duration::from_secs(
                 config
                     .request_timeout_seconds
@@ -1333,6 +2245,65 @@ pub fn parse_mcp_proxy_config(
         });
     }
     Ok(specs)
+}
+
+fn validate_proxy_http_url(server_name: &str, raw: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|error| format!("MCP server `{server_name}` has an invalid url: {error}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "MCP server `{server_name}` url cannot contain user information"
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(format!(
+            "MCP server `{server_name}` url cannot contain a fragment"
+        ));
+    }
+    let loopback_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if url.scheme() != "https" && !loopback_http {
+        return Err(format!(
+            "MCP server `{server_name}` Streamable HTTP url must use HTTPS or loopback HTTP"
+        ));
+    }
+    Ok(url.to_string())
+}
+
+fn validate_proxy_http_headers(
+    server_name: &str,
+    headers: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    const MANAGED_HEADERS: &[&str] = &[
+        "accept",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "transfer-encoding",
+    ];
+    for (name, value) in &headers {
+        let normalized = name.trim().to_ascii_lowercase();
+        if MANAGED_HEADERS.contains(&normalized.as_str()) {
+            return Err(format!(
+                "MCP server `{server_name}` header `{name}` is managed by Anchor"
+            ));
+        }
+        reqwest::header::HeaderName::from_bytes(name.trim().as_bytes()).map_err(|error| {
+            format!("MCP server `{server_name}` has invalid header name `{name}`: {error}")
+        })?;
+        reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+            format!("MCP server `{server_name}` has invalid header `{name}` value: {error}")
+        })?;
+    }
+    Ok(headers)
 }
 
 fn parse_configured_tool_names(
@@ -1364,6 +2335,40 @@ fn expand_workspace_placeholders(value: &str, workspace_path: &str) -> String {
         .replace("${workspace}", workspace_path)
 }
 
+fn expand_proxy_placeholders(value: &str, workspace_path: &str) -> Result<String, String> {
+    let expanded = expand_workspace_placeholders(value, workspace_path);
+    let mut output = String::with_capacity(expanded.len());
+    let mut remaining = expanded.as_str();
+    while let Some(start) = remaining.find("${env:") {
+        output.push_str(&remaining[..start]);
+        let placeholder = &remaining[start + 6..];
+        let end = placeholder.find('}').ok_or_else(|| {
+            "downstream MCP configuration contains an unterminated ${env:...} placeholder"
+                .to_string()
+        })?;
+        let name = &placeholder[..end];
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!(
+                "downstream MCP configuration contains invalid environment variable name `{name}`"
+            ));
+        }
+        let resolved = std::env::var(name).map_err(|_| {
+            format!(
+                "downstream MCP configuration requires missing environment variable `{name}`"
+            )
+        })?;
+        output.push_str(&resolved);
+        remaining = &placeholder[end + 1..];
+    }
+    output.push_str(remaining);
+    Ok(output)
+}
+
 fn sanitize_tool_segment(value: &str) -> String {
     let normalized: String = value
         .chars()
@@ -1388,20 +2393,30 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{HeaderMap as AxumHeaderMap, HeaderValue as AxumHeaderValue, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use axum::{Json, Router};
     use serde_json::json;
 
     use crate::tools::CancellationToken;
 
     use super::{
-        normalize_proxy_tool_result, parse_mcp_proxy_config, proxy_catalog_digest,
-        sanitize_proxy_catalog, McpProxyRegistry, McpProxyServerSpec,
+        expand_proxy_placeholders, normalize_proxy_tool_result, parse_mcp_proxy_config,
+        proxy_catalog_digest, sanitize_proxy_catalog, McpProxyRegistry, McpProxyServerSpec,
+        McpProxyTransportSpec,
     };
 
     fn test_spec() -> McpProxyServerSpec {
         McpProxyServerSpec {
             name: "test".into(),
+            transport: McpProxyTransportSpec::Stdio,
             command: "noop".into(),
             args: Vec::new(),
             env: BTreeMap::new(),
@@ -1410,6 +2425,7 @@ mod tests {
             include_tools: None,
             exclude_tools: BTreeSet::new(),
             max_tools: None,
+            max_concurrent_requests: 4,
             request_timeout: Duration::from_secs(5),
         }
     }
@@ -1424,6 +2440,170 @@ mod tests {
                 "additionalProperties": false
             }
         })
+    }
+
+    #[derive(Clone, Default)]
+    struct HttpProxyFixtureState {
+        authorization_seen: Arc<AtomicBool>,
+        session_seen: Arc<AtomicBool>,
+        protocol_seen: Arc<AtomicBool>,
+        cancellations: Arc<AtomicUsize>,
+        deletes: Arc<AtomicUsize>,
+    }
+
+    fn fixture_json_response(id: u64, result: serde_json::Value) -> Response {
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }))
+        .into_response()
+    }
+
+    fn fixture_headers_valid(
+        state: &HttpProxyFixtureState,
+        headers: &AxumHeaderMap,
+        require_session: bool,
+    ) -> bool {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer fixture-token")
+        {
+            state.authorization_seen.store(true, Ordering::Release);
+        } else {
+            return false;
+        }
+        if !require_session {
+            return true;
+        }
+        if headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            == Some("fixture-session")
+        {
+            state.session_seen.store(true, Ordering::Release);
+        } else {
+            return false;
+        }
+        if headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            == Some(crate::mcp::protocol::CURRENT_PROTOCOL_VERSION)
+        {
+            state.protocol_seen.store(true, Ordering::Release);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    async fn http_proxy_fixture_post(
+        State(state): State<HttpProxyFixtureState>,
+        headers: AxumHeaderMap,
+        Json(message): Json<serde_json::Value>,
+    ) -> Response {
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !fixture_headers_valid(&state, &headers, method != "initialize") {
+            return (StatusCode::BAD_REQUEST, "missing managed MCP headers").into_response();
+        }
+        if message.get("id").is_none() {
+            if method == "notifications/cancelled" {
+                state.cancellations.fetch_add(1, Ordering::AcqRel);
+            }
+            return StatusCode::ACCEPTED.into_response();
+        }
+        let id = message["id"].as_u64().unwrap_or_default();
+        match method {
+            "initialize" => {
+                let mut response = fixture_json_response(
+                    id,
+                    json!({
+                        "protocolVersion": crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "serverInfo": {"name": "http-fixture", "version": "1"}
+                    }),
+                );
+                response.headers_mut().insert(
+                    "mcp-session-id",
+                    AxumHeaderValue::from_static("fixture-session"),
+                );
+                response
+            }
+            "tools/list" => fixture_json_response(
+                id,
+                json!({
+                    "tools": [
+                        {"name": "json", "description": "JSON", "inputSchema": {"type": "object", "properties": {}}},
+                        {"name": "sse", "description": "SSE", "inputSchema": {"type": "object", "properties": {}}},
+                        {"name": "slow", "description": "Slow", "inputSchema": {"type": "object", "properties": {}}}
+                    ]
+                }),
+            ),
+            "tools/call" => {
+                let tool = message["params"]["name"].as_str().unwrap_or_default();
+                if tool == "slow" {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                let result = json!({
+                    "content": [{"type": "text", "text": tool}],
+                });
+                if tool == "sse" {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(format!(
+                            "event: message\r\ndata: {payload}\r\n\r\n"
+                        )))
+                        .expect("SSE response")
+                } else {
+                    fixture_json_response(id, result)
+                }
+            }
+            _ => fixture_json_response(id, json!({})),
+        }
+    }
+
+    async fn http_proxy_fixture_delete(
+        State(state): State<HttpProxyFixtureState>,
+        headers: AxumHeaderMap,
+    ) -> Response {
+        if !fixture_headers_valid(&state, &headers, true) {
+            return (StatusCode::BAD_REQUEST, "missing managed MCP headers").into_response();
+        }
+        state.deletes.fetch_add(1, Ordering::AcqRel);
+        StatusCode::NO_CONTENT.into_response()
+    }
+
+    async fn spawn_http_proxy_fixture(
+    ) -> (
+        String,
+        HttpProxyFixtureState,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = HttpProxyFixtureState::default();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(http_proxy_fixture_post).delete(http_proxy_fixture_delete),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("HTTP fixture server");
+        });
+        (format!("http://{address}/mcp"), state, server)
     }
 
     #[test]
@@ -1655,7 +2835,8 @@ mod tests {
                         "command": "browser-mcp",
                         "includeTools": ["navigate", "click", "screenshot"],
                         "excludeTools": ["screenshot"],
-                        "maxTools": 2
+                        "maxTools": 2,
+                        "maxConcurrentRequests": 3
                     }
                 }
             }"#,
@@ -1665,11 +2846,60 @@ mod tests {
 
         let spec = &specs[0];
         assert_eq!(spec.max_tools, Some(2));
+        assert_eq!(spec.max_concurrent_requests, 3);
         assert!(spec
             .include_tools
             .as_ref()
             .is_some_and(|tools| tools.contains("navigate") && tools.contains("click")));
         assert!(spec.exclude_tools.contains("screenshot"));
+    }
+
+    #[test]
+    fn parses_streamable_http_servers_and_authorization_headers() {
+        let specs = parse_mcp_proxy_config(
+            r#"{
+                "mcpServers": {
+                    "remote": {
+                        "type": "streamable-http",
+                        "url": "https://mcp.example.com/api",
+                        "headers": {
+                            "Authorization": "Bearer secret",
+                            "X-Workspace": "${workspaceFolder}"
+                        }
+                    }
+                }
+            }"#,
+            Path::new("/tmp/example"),
+        )
+        .expect("parse Streamable HTTP config");
+
+        assert_eq!(specs.len(), 1);
+        match &specs[0].transport {
+            McpProxyTransportSpec::StreamableHttp { url, headers } => {
+                assert_eq!(url, "https://mcp.example.com/api");
+                assert_eq!(headers["Authorization"], "Bearer secret");
+                assert_eq!(headers["X-Workspace"], "/tmp/example");
+            }
+            McpProxyTransportSpec::Stdio => panic!("expected Streamable HTTP transport"),
+        }
+    }
+
+    #[test]
+    fn expands_environment_placeholders_without_persisting_secret_values() {
+        if let Ok(path) = std::env::var("PATH") {
+            assert_eq!(
+                expand_proxy_placeholders("Bearer ${env:PATH}", "/tmp/example")
+                    .expect("expand existing environment variable"),
+                format!("Bearer {path}")
+            );
+        }
+        let error = expand_proxy_placeholders(
+            "Bearer ${env:ANCHOR_PROXY_TEST_VARIABLE_THAT_MUST_NOT_EXIST}",
+            "/tmp/example",
+        )
+        .expect_err("missing environment variable");
+        assert!(error.contains("ANCHOR_PROXY_TEST_VARIABLE_THAT_MUST_NOT_EXIST"));
+        assert!(!error.contains("Bearer"));
     }
 
     #[test]
@@ -1687,17 +2917,37 @@ mod tests {
         )
         .expect_err("excessive maxTools");
         assert!(excessive.contains("maxTools must be at most 256"));
+
+        let invalid_concurrency = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"browser":{"command":"browser-mcp","maxConcurrentRequests":0}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("invalid maxConcurrentRequests");
+        assert!(invalid_concurrency.contains("must be between 1 and 64"));
     }
 
     #[test]
-    fn rejects_non_stdio_transports() {
-        let error = parse_mcp_proxy_config(
+    fn rejects_legacy_sse_and_insecure_remote_http_transports() {
+        let legacy = parse_mcp_proxy_config(
             r#"{"mcpServers":{"remote":{"type":"sse","command":"noop"}}}"#,
             Path::new("/tmp/example"),
         )
-        .expect_err("reject unsupported transport");
+        .expect_err("reject legacy SSE transport");
+        assert!(legacy.contains("legacy SSE transport"));
 
-        assert!(error.contains("only stdio is supported"));
+        let insecure = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"remote":{"type":"streamable-http","url":"http://example.com/mcp"}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("reject insecure remote HTTP");
+        assert!(insecure.contains("must use HTTPS or loopback HTTP"));
+
+        let managed_header = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"remote":{"url":"https://example.com/mcp","headers":{"MCP-Session-Id":"forged"}}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("reject managed headers");
+        assert!(managed_header.contains("is managed by Anchor"));
     }
 
     #[tokio::test]
@@ -1715,6 +2965,112 @@ mod tests {
             configured.configure(Vec::new(), "readiness-test").await;
         });
         assert!(registry.wait_until_configured(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_proxy_supports_sessions_json_sse_cancellation_and_delete() {
+        let (url, state, server) = spawn_http_proxy_fixture().await;
+        let config = json!({
+            "mcpServers": {
+                "remote": {
+                    "type": "streamable-http",
+                    "url": url,
+                    "headers": {
+                        "Authorization": "Bearer fixture-token"
+                    },
+                    "requestTimeoutSeconds": 10
+                }
+            }
+        })
+        .to_string();
+        let specs = parse_mcp_proxy_config(&config, Path::new("/tmp/example"))
+            .expect("parse HTTP fixture config");
+        let registry = McpProxyRegistry::default();
+        registry.configure(specs, "proxy-http-test").await;
+
+        let names = registry
+            .list_tools()
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            ["remote__json", "remote__slow", "remote__sse"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        let json_result = registry
+            .call_tool("remote__json", &json!({}))
+            .await
+            .expect("known JSON route")
+            .expect("JSON result");
+        assert_eq!(json_result["structuredContent"]["ok"], true);
+
+        let sse_result = registry
+            .call_tool("remote__sse", &json!({}))
+            .await
+            .expect("known SSE route")
+            .expect("SSE result");
+        assert_eq!(sse_result["structuredContent"]["ok"], true);
+        assert!(sse_result["content"]
+            .as_array()
+            .is_some_and(|content| content.iter().any(|item| item["text"] == "sse")));
+
+        let cancellation = CancellationToken::default();
+        let worker_registry = registry.clone();
+        let worker_cancellation = cancellation.clone();
+        let slow = tokio::spawn(async move {
+            worker_registry
+                .call_tool_with_cancellation(
+                    "remote__slow",
+                    &json!({}),
+                    &worker_cancellation,
+                )
+                .await
+                .expect("known slow route")
+                .expect("cancelled HTTP result")
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        let cancelled = slow.await.expect("cancelled worker");
+        assert_eq!(
+            cancelled["structuredContent"]["error"]["details"]["reason"],
+            "proxy_call_cancelled"
+        );
+        for _ in 0..20 {
+            if state.cancellations.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(state.cancellations.load(Ordering::Acquire), 1);
+        assert!(state.authorization_seen.load(Ordering::Acquire));
+        assert!(state.session_seen.load(Ordering::Acquire));
+        assert!(state.protocol_seen.load(Ordering::Acquire));
+
+        let status = registry.status();
+        assert_eq!(status["configured"], true);
+        assert_eq!(status["server_count"], 1);
+        assert_eq!(status["servers"][0]["name"], "remote");
+        assert_eq!(status["servers"][0]["transport"], "streamable-http");
+        assert_eq!(status["servers"][0]["tool_count"], 3);
+        assert_eq!(status["servers"][0]["calls"], 3);
+        assert_eq!(status["servers"][0]["cancellations"], 1);
+        let encoded_status = status.to_string();
+        assert!(!encoded_status.contains("fixture-token"));
+        assert!(!encoded_status.contains("/mcp"));
+
+        drop(registry);
+        for _ in 0..40 {
+            if state.deletes.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(state.deletes.load(Ordering::Acquire), 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -1755,6 +3111,7 @@ for raw in sys.stdin:
             .configure(
                 vec![McpProxyServerSpec {
                     name: "slow".into(),
+                    transport: McpProxyTransportSpec::Stdio,
                     command: python.display().to_string(),
                     args: vec![script.display().to_string()],
                     env: BTreeMap::new(),
@@ -1763,6 +3120,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-cancellation-test",
@@ -1848,6 +3206,7 @@ for raw in sys.stdin:
             .configure(
                 vec![McpProxyServerSpec {
                     name: "concurrent".into(),
+                    transport: McpProxyTransportSpec::Stdio,
                     command: python.display().to_string(),
                     args: vec![script.display().to_string()],
                     env: BTreeMap::new(),
@@ -1856,6 +3215,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-concurrency-test",
@@ -1947,6 +3307,7 @@ for raw in sys.stdin:
             .configure(
                 vec![McpProxyServerSpec {
                     name: "cancellable".into(),
+                    transport: McpProxyTransportSpec::Stdio,
                     command: python.display().to_string(),
                     args: vec![script.display().to_string(), starts.display().to_string()],
                     env: BTreeMap::new(),
@@ -1955,6 +3316,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(10),
                 }],
                 "proxy-cancel-followup-test",
@@ -2043,6 +3405,7 @@ for raw in sys.stdin:
             .configure(
                 vec![McpProxyServerSpec {
                     name: "unstable".into(),
+                    transport: McpProxyTransportSpec::Stdio,
                     command: python.display().to_string(),
                     args: vec![script.display().to_string(), marker.display().to_string()],
                     env: BTreeMap::new(),
@@ -2051,6 +3414,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-reconnect-test",
@@ -2130,6 +3494,7 @@ for raw in sys.stdin:
             .configure(
                 vec![McpProxyServerSpec {
                     name: "drift".into(),
+                    transport: McpProxyTransportSpec::Stdio,
                     command: python.display().to_string(),
                     args: vec![script.display().to_string(), marker.display().to_string()],
                     env: BTreeMap::new(),
@@ -2138,6 +3503,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
                 }],
                 "proxy-catalog-drift-test",

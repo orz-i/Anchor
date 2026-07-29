@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "b041fb0ed0061d5aa8c77b23544d6444033668e84e724c102abad3ddf80ca01c",
+    "digest": "e4f829c597c6a4a6e19b53d09442e8f28ed30ff1fbb0fd747a8a91f2b4718ac3",
     "names": [
       "apply_patch",
       "change_summary",
@@ -44,7 +44,7 @@
     "tool_count": 38
   },
   "core": {
-    "digest": "3fec17ba710bca5ba205e1f1d2ddec2b08ace1de01ff1b05aa2d5610ea8e0d2f",
+    "digest": "2cef6aabdb79f9b0920b597298d1e59d911bae64ba0929ea46cb78dc3e843535",
     "names": [
       "apply_patch",
       "check_exec_environment",
@@ -75,7 +75,7 @@
     "tool_count": 25
   },
   "read-only": {
-    "digest": "82bbef0db0d813f3787f36f8ae14a6404b67987f2de580312a98ec3ebe66907a",
+    "digest": "bf207404e07e6f0068c7ccf8c871f34399663e3c6b68a544be87bf45ad8d46bf",
     "names": [
       "check_exec_environment",
       "get_default_cwd",

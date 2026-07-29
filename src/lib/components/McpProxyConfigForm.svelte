@@ -11,6 +11,14 @@
       "command": "codegraph",
       "args": ["serve", "--mcp", "--path", "\${workspaceFolder}"]
     },
+    "remote": {
+      "type": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer \${env:REMOTE_MCP_TOKEN}"
+      },
+      "maxConcurrentRequests": 16
+    },
     "browser": {
       "command": "node",
       "args": [
@@ -86,11 +94,14 @@
   </label>
 
   <p class="text-xs leading-5 text-[var(--color-text-muted)]">
-    当前支持 stdio MCP。启动 MCP 服务时会拉起这些进程，并将工具以
+    当前支持 stdio 与 Streamable HTTP MCP。stdio 会在启动 MCP 服务时拉起本地进程；
+    Streamable HTTP 支持 JSON/SSE 响应、MCP 会话和自定义认证头。工具会以
     <code class="font-mono">服务器名__工具名</code> 合并到公网 MCP；
     <code class="font-mono">{"${workspaceFolder}"}</code> 会替换为当前工作区路径。
+    敏感头建议引用 <code class="font-mono">{"${env:VARIABLE}"}</code>，避免将令牌直接写入配置文件。
     可用 <code class="font-mono">includeTools</code>、<code class="font-mono">excludeTools</code>
-    和 <code class="font-mono">maxTools</code> 控制下游工具数量；工具名使用下游 MCP
+    和 <code class="font-mono">maxTools</code> 控制下游工具数量；
+    <code class="font-mono">maxConcurrentRequests</code> 用于限制单个下游的并发压力。工具名使用下游 MCP
     原始名称，不包含服务器前缀。
   </p>
 

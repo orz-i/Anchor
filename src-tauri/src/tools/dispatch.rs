@@ -547,7 +547,8 @@ fn server_info_for_session(
         "catalog_bytes": catalog.total_bytes,
         "catalog_estimated_tokens": catalog.estimated_tokens,
         "local_tool_count": catalog.local_count,
-        "proxy_tool_count": catalog.proxy_count
+        "proxy_tool_count": catalog.proxy_count,
+        "downstream_mcp": ctx.mcp_proxies.status()
     })))
 }
 
