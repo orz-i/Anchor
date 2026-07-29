@@ -222,16 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn core_openapi_exposes_grep_text_as_read_only() {
+    fn core_openapi_exposes_search_text_as_read_only() {
         let tools = crate::tools::list_tools_for_profile("core");
         let schema = build_openapi(&tools, "https://actions.example.com", "none");
-        let operation = &schema["paths"]["/actions/grep_text"]["post"];
+        let operation = &schema["paths"]["/actions/search_text"]["post"];
 
-        assert_eq!(operation["operationId"], "anchor_grep_text");
+        assert_eq!(operation["operationId"], "anchor_search_text");
         assert_eq!(operation["x-openai-isConsequential"], false);
         assert_eq!(
             operation["requestBody"]["content"]["application/json"]["schema"],
-            crate::tools::registry::input_schema("grep_text")
+            crate::tools::registry::input_schema("search_text")
         );
+        assert!(schema["paths"].get("/actions/grep_text").is_none());
     }
 }

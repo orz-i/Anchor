@@ -45,15 +45,12 @@ fn unknown_tool_is_validation_error() {
 }
 
 #[test]
-fn read_file_explicit_parent_path_is_read_only() {
+fn read_file_explicit_parent_path_is_rejected() {
     let fx = malicious_fixture();
     let ctx = ctx_for(&fx.root);
     let out = invoke(&ctx, "read_file", json!({"path": "../outside-secret.txt"}));
-    let result = assert_ok(&out);
-    assert!(result["content"]
-        .as_str()
-        .unwrap_or("")
-        .contains("TOP_SECRET"));
+    let result = assert_err(&out);
+    assert_eq!(result["error"]["code"], "PATH_OUTSIDE_WORKSPACE");
 }
 
 #[test]
@@ -167,11 +164,12 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 26);
+    assert_eq!(names.len(), 25);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
-    assert!(names.contains("grep_text"));
+    assert!(names.contains("search_text"));
+    assert!(!names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));

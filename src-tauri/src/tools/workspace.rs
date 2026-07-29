@@ -32,6 +32,21 @@ pub struct ResolvedPath {
     pub existed: bool,
 }
 
+#[cfg(windows)]
+fn windows_hidden_attribute(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    path.symlink_metadata()
+        .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn windows_hidden_attribute(_path: &Path) -> bool {
+    false
+}
+
 fn is_link_like(path: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
@@ -494,33 +509,37 @@ impl Workspace {
         include_hidden: bool,
         include_ignored: bool,
     ) -> bool {
+        (!include_hidden && self.is_hidden_path(path))
+            || (!include_ignored && self.is_default_ignored_path(path))
+    }
+
+    pub fn is_hidden_path(&self, path: &Path) -> bool {
         let Ok(scan_path) = path.strip_prefix(&self.root) else {
             // Workspace 外的读取路径不套用 Workspace 内部的隐藏/构建目录过滤，
             // 否则 Windows 临时目录等路径会被误判为隐藏目录而无法读取。
             return false;
         };
-        let parts: Vec<String> = scan_path
+        let hidden_by_name = scan_path
             .components()
             .filter_map(|part| match part {
                 Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
                 _ => None,
             })
-            .collect();
-        if !include_hidden {
-            for part in &parts {
-                if part.starts_with('.') && part != "." {
-                    return true;
-                }
-            }
-        }
-        if !include_ignored {
-            for part in &parts {
-                if DEFAULT_EXCLUDED_NAMES.contains(&part.as_str()) {
-                    return true;
-                }
-            }
-        }
-        false
+            .any(|part| part.starts_with('.') && part != ".");
+        hidden_by_name || windows_hidden_attribute(path)
+    }
+
+    pub fn is_default_ignored_path(&self, path: &Path) -> bool {
+        let Ok(scan_path) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        scan_path
+            .components()
+            .filter_map(|part| match part {
+                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .any(|part| DEFAULT_EXCLUDED_NAMES.contains(&part.as_str()))
     }
 
     pub fn is_safe_existing_path(&self, path: &Path) -> bool {

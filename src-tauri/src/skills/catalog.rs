@@ -16,7 +16,7 @@ const DEFAULT_SKILL_ROOTS: &str = ".agents/skills\n.codex/skills\nskills";
 const MAX_SKILLS: usize = 200;
 pub(super) const MAX_SKILL_MD_BYTES: u64 = 131_072;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillSettings {
     pub enabled: bool,
     pub roots: Vec<String>,
@@ -181,7 +181,7 @@ impl SkillCatalog {
 
     pub fn list(&self, query: Option<&str>, max_results: usize) -> SkillListResult {
         let settings = self.settings();
-        let snapshot = self.snapshot();
+        let snapshot = self.refresh_snapshot();
         if !settings.enabled {
             return SkillListResult {
                 enabled: false,
@@ -191,7 +191,7 @@ impl SkillCatalog {
                 truncated: false,
                 script_execution_enabled: false,
                 script_execution_policy: "disabled".into(),
-                snapshot_mode: "listener-fixed".into(),
+                snapshot_mode: "live-refresh".into(),
                 catalog_digest: snapshot.digest.clone(),
             };
         }
@@ -221,7 +221,7 @@ impl SkillCatalog {
             truncated,
             script_execution_enabled: false,
             script_execution_policy: "operator-dangerous-mode".into(),
-            snapshot_mode: "listener-fixed".into(),
+            snapshot_mode: "live-refresh".into(),
             catalog_digest: snapshot.digest.clone(),
         }
     }
@@ -272,7 +272,7 @@ impl SkillCatalog {
 
     pub fn index_json(&self) -> Result<String, String> {
         let settings = self.settings();
-        let snapshot = self.snapshot();
+        let snapshot = self.refresh_snapshot();
         let skills = if settings.enabled {
             snapshot
                 .records
@@ -293,7 +293,7 @@ impl SkillCatalog {
         serde_json::to_string_pretty(&serde_json::json!({
             "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
             "catalogDigest": snapshot.digest,
-            "snapshotMode": "listener-fixed",
+            "snapshotMode": "live-refresh",
             "skills": skills
         }))
         .map_err(|error| format!("Skill index 序列化失败：{error}"))
@@ -330,7 +330,10 @@ impl SkillCatalog {
         if !self.is_enabled() {
             return None;
         }
-        let snapshot = self.snapshot();
+        // Script execution keeps the configured snapshot as the approval
+        // boundary. A modified script must become stale until the operator
+        // explicitly reconfigures/restarts the catalog.
+        let snapshot = self.snapshot.read().expect("skill snapshot read").clone();
         let normalized_command = normalize_command_path(command);
         let canonical_workdir = workdir
             .canonicalize()
@@ -395,15 +398,21 @@ impl SkillCatalog {
         if !self.is_enabled() {
             return Err("当前 workspace/profile 未启用 Skill 服务".into());
         }
-        self.snapshot()
+        self.refresh_snapshot()
             .records
             .get(name.trim())
             .cloned()
             .ok_or_else(|| format!("找不到 Skill：{}", name.trim()))
     }
 
-    fn snapshot(&self) -> Arc<SkillSnapshot> {
-        self.snapshot.read().expect("skill snapshot read").clone()
+    fn refresh_snapshot(&self) -> Arc<SkillSnapshot> {
+        let settings = self.settings.read().expect("skill settings read");
+        let refreshed = Arc::new(scan_workspace(&self.workspace_root, &settings));
+        let mut snapshot = self.snapshot.write().expect("skill snapshot write");
+        if snapshot.digest != refreshed.digest {
+            *snapshot = refreshed;
+        }
+        snapshot.clone()
     }
 }
 
@@ -768,16 +777,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_does_not_change_until_reconfigured() {
+    fn snapshot_refreshes_when_skill_files_change() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         write_skill(&skills, "one", "One.");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
         assert_eq!(catalog.list(None, 100).skills.len(), 1);
         write_skill(&skills, "two", "Two.");
-        assert_eq!(catalog.list(None, 100).skills.len(), 1);
-        catalog.configure(SkillSettings::default());
-        assert_eq!(catalog.list(None, 100).skills.len(), 2);
+        let listed = catalog.list(None, 100);
+        assert_eq!(listed.snapshot_mode, "live-refresh");
+        assert_eq!(listed.skills.len(), 2);
     }
 
     #[test]
@@ -788,7 +797,6 @@ mod tests {
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
         let before = catalog.list(None, 100).skills[0].digest.clone();
         fs::write(skills.join("digest/references/DETAILS.md"), "changed").expect("change");
-        catalog.configure(SkillSettings::default());
         let after = catalog.list(None, 100).skills[0].digest.clone();
         assert_ne!(before, after);
     }

@@ -22,6 +22,58 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), Workspac
     Ok(())
 }
 
+fn decode_text(data: Vec<u8>) -> Result<(String, &'static str), WorkspaceError> {
+    if let Some(payload) = data.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(payload.to_vec())
+            .map(|text| (text, "utf-8"))
+            .map_err(|_| unsupported_encoding());
+    }
+    if let Some(payload) = data.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(payload, true).map(|text| (text, "utf-16le"));
+    }
+    if let Some(payload) = data.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(payload, false).map(|text| (text, "utf-16be"));
+    }
+    if data.iter().take(4096).any(|byte| *byte == 0) {
+        return Err(WorkspaceError::Tool {
+            code: "BINARY_FILE",
+            message: "Binary file read blocked for text tool.".into(),
+            category: "validation",
+            retryable: false,
+        });
+    }
+    String::from_utf8(data)
+        .map(|text| (text, "utf-8"))
+        .map_err(|_| unsupported_encoding())
+}
+
+fn decode_utf16(data: &[u8], little_endian: bool) -> Result<String, WorkspaceError> {
+    if !data.len().is_multiple_of(2) {
+        return Err(unsupported_encoding());
+    }
+    let units = data
+        .chunks_exact(2)
+        .map(|chunk| {
+            let pair = [chunk[0], chunk[1]];
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| unsupported_encoding())
+}
+
+fn unsupported_encoding() -> WorkspaceError {
+    WorkspaceError::Tool {
+        code: "UNSUPPORTED_ENCODING",
+        message: "File must be UTF-8 or BOM-marked UTF-16 text.".into(),
+        category: "validation",
+        retryable: false,
+    }
+}
+
 pub fn read_file(
     ws: &Workspace,
     args: &Value,
@@ -54,20 +106,7 @@ pub fn read_file(
 
     let data = fs::read(&resolved.path).map_err(|_| WorkspaceError::not_found("File not found"))?;
     ensure_not_cancelled(cancellation)?;
-    if data.iter().take(4096).any(|b| *b == 0) {
-        return Err(WorkspaceError::Tool {
-            code: "BINARY_FILE",
-            message: "Binary file read blocked for text tool.".into(),
-            category: "validation",
-            retryable: false,
-        });
-    }
-    let text = String::from_utf8(data).map_err(|_| WorkspaceError::Tool {
-        code: "UNSUPPORTED_ENCODING",
-        message: "File is not valid utf-8.".into(),
-        category: "validation",
-        retryable: false,
-    })?;
+    let (text, encoding) = decode_text(data)?;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total_lines = lines.len();
     let end = end_line.unwrap_or(total_lines).min(total_lines);
@@ -89,7 +128,7 @@ pub fn read_file(
     Ok(tool_ok(json!({
         "path": resolved.display,
         "content": content,
-        "encoding": "utf-8",
+        "encoding": encoding,
         "start_line": start_line,
         "end_line": actual_end,
         "total_lines": total_lines,
@@ -297,8 +336,8 @@ pub fn search_text(
         if !passes_glob_filters(&rel, &include_globs, &exclude_globs) {
             continue;
         }
-        let content = match fs::read_to_string(&p) {
-            Ok(s) if !s.contains('\0') => s,
+        let content = match fs::read(&p).ok().and_then(|data| decode_text(data).ok()) {
+            Some((text, _)) if !text.contains('\0') => text,
             _ => continue,
         };
         let lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -435,14 +474,16 @@ fn collect_dir_entries(
             "other"
         };
         let meta = item.metadata().ok();
+        let is_hidden = ws.is_hidden_path(&p);
+        let is_ignored = ws.is_default_ignored_path(&p);
         entries.push(json!({
             "name": name,
             "path": rel.replace('\\', "/"),
             "type": entry_type,
             "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
             "modified": meta.and_then(|m| format_mtime(m.modified().ok())),
-            "is_hidden": name.starts_with('.'),
-            "is_ignored": false
+            "is_hidden": is_hidden,
+            "is_ignored": is_ignored
         }));
         if entries.len() >= max_entries {
             *truncated = true;
@@ -550,4 +591,67 @@ fn format_mtime(st: Option<SystemTime>) -> Option<String> {
             .unwrap_or_default();
         format!("{}.{:03}Z", d.as_secs(), d.subsec_millis())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn reads_and_searches_bom_marked_utf16_text() {
+        let root = tempdir().expect("workspace");
+        let text = "第一行\n包含 needle 的第二行\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(root.path().join("utf16.txt"), bytes).expect("utf16 file");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+
+        let read = read_file(
+            &workspace,
+            &json!({"path": "utf16.txt"}),
+            &cancellation,
+        )
+        .expect("read");
+        assert_eq!(read["encoding"], "utf-16le");
+        assert_eq!(read["content"], text);
+
+        let searched = search_text(
+            &workspace,
+            &json!({"path": ".", "query": "needle"}),
+            &cancellation,
+        )
+        .expect("search");
+        assert_eq!(searched["total_matches"], 1);
+        assert_eq!(searched["matches"][0]["path"], "utf16.txt");
+    }
+
+    #[test]
+    fn list_dir_reports_hidden_and_default_ignored_entries() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join(".hidden"), "hidden").expect("hidden");
+        std::fs::create_dir_all(root.path().join("node_modules")).expect("ignored");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+
+        let listed = list_dir(
+            &workspace,
+            &json!({"path": ".", "include_hidden": true, "include_ignored": true}),
+            &CancellationToken::default(),
+        )
+        .expect("list");
+        let entries = listed["entries"].as_array().expect("entries");
+        let hidden = entries
+            .iter()
+            .find(|entry| entry["name"] == ".hidden")
+            .expect("hidden entry");
+        let ignored = entries
+            .iter()
+            .find(|entry| entry["name"] == "node_modules")
+            .expect("ignored entry");
+        assert_eq!(hidden["is_hidden"], true);
+        assert_eq!(ignored["is_ignored"], true);
+    }
 }

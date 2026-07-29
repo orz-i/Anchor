@@ -80,6 +80,7 @@ pub enum InFlightReservation {
 }
 
 impl InFlightRequests {
+    #[cfg(test)]
     pub fn insert(&self, session_id: &str, request_id: &Value) -> Option<CancellationToken> {
         match self.insert_with_session_limit(session_id, request_id, usize::MAX) {
             InFlightReservation::Inserted(token) => Some(token),

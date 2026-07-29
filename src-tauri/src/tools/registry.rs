@@ -180,7 +180,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "read_file",
         "Read file",
-        "Read a UTF-8 text file slice strictly inside the configured workspace.",
+        "Read a UTF-8 or BOM-marked UTF-16 text file slice strictly inside the configured workspace.",
         true,
         false,
         false,
@@ -204,15 +204,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "search_text",
         "Search text",
-        "Search UTF-8 workspace files for text or regex matches.",
-        true,
-        false,
-        false,
-    ),
-    (
-        "grep_text",
-        "Grep workspace text",
-        "Search workspace text with grep-style regex, glob, context, and bounded results.",
+        "Search UTF-8 or BOM-marked UTF-16 workspace files for text or regex matches.",
         true,
         false,
         false,
@@ -331,7 +323,6 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_dir",
     "list_files",
     "search_text",
-    "grep_text",
     "apply_patch",
     "exec_command",
     "write_stdin",
@@ -356,7 +347,6 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "list_dir",
     "list_files",
     "search_text",
-    "grep_text",
     "read_output",
     "git_status",
     "git_diff",
@@ -701,7 +691,7 @@ pub fn output_schema(name: &str) -> Value {
             json!({
                 "path": { "type": "string" },
                 "content": { "type": "string" },
-                "encoding": { "type": "string", "const": "utf-8" },
+                "encoding": { "type": "string", "enum": ["utf-8", "utf-16le", "utf-16be"] },
                 "start_line": { "type": "integer", "minimum": 1 },
                 "end_line": { "type": "integer", "minimum": 0 },
                 "total_lines": { "type": "integer", "minimum": 0 },
@@ -1106,7 +1096,7 @@ pub fn output_schema(name: &str) -> Value {
 
 pub fn canonical_tool_name(name: &str) -> &str {
     match name {
-        "grep" => "grep_text",
+        "grep" | "grep_text" => "search_text",
         _ => name,
     }
 }
@@ -1529,7 +1519,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, normalize_tool_profile, output_schema};
 
     #[test]
-    fn core_catalog_exposes_26_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_25_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -1537,7 +1527,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 25);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -1545,7 +1535,8 @@ mod tests {
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"history_session_validate"));
-        assert!(names.contains(&"grep_text"));
+        assert!(names.contains(&"search_text"));
+        assert!(!names.contains(&"grep_text"));
         assert!(!names.contains(&"grep"));
         assert!(!names.contains(&"request_permissions"));
 

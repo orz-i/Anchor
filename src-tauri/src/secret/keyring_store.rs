@@ -92,6 +92,7 @@ impl SecretStore {
         })
     }
 
+    #[cfg(test)]
     pub fn set_app(scope: &str, item_id: &str, value: &str) -> AppResult<()> {
         DataStore::update_file(|data| {
             data.app_secrets

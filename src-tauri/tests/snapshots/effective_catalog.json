@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "1e295f9e918d61c96ab536b256486c31f808f2a3164158fb2ef5f4a82f1112f2",
+    "digest": "b041fb0ed0061d5aa8c77b23544d6444033668e84e724c102abad3ddf80ca01c",
     "names": [
       "apply_patch",
       "change_summary",
@@ -14,7 +14,6 @@
       "git_log",
       "git_show",
       "git_status",
-      "grep_text",
       "harness_status",
       "history_session_bootstrap",
       "history_session_checkpoint",
@@ -42,10 +41,10 @@
       "view_image",
       "write_stdin"
     ],
-    "tool_count": 39
+    "tool_count": 38
   },
   "core": {
-    "digest": "ddb774fa68ce0c5f34ddb037e8e53795a75c1022fceab522141dd861b4ce3277",
+    "digest": "3fec17ba710bca5ba205e1f1d2ddec2b08ace1de01ff1b05aa2d5610ea8e0d2f",
     "names": [
       "apply_patch",
       "check_exec_environment",
@@ -56,7 +55,6 @@
       "git_log",
       "git_show",
       "git_status",
-      "grep_text",
       "history_session_bootstrap",
       "history_session_checkpoint",
       "history_session_validate",
@@ -74,10 +72,10 @@
       "view_image",
       "write_stdin"
     ],
-    "tool_count": 26
+    "tool_count": 25
   },
   "read-only": {
-    "digest": "b0e21ab41a5c5e05d89569ed772d2f589953c0f6f92c0131831d63863702758d",
+    "digest": "82bbef0db0d813f3787f36f8ae14a6404b67987f2de580312a98ec3ebe66907a",
     "names": [
       "check_exec_environment",
       "get_default_cwd",
@@ -86,7 +84,6 @@
       "git_log",
       "git_show",
       "git_status",
-      "grep_text",
       "list_dir",
       "list_files",
       "list_skills",
@@ -98,6 +95,6 @@
       "server_info",
       "view_image"
     ],
-    "tool_count": 18
+    "tool_count": 17
   }
 }
