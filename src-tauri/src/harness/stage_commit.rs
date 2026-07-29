@@ -1,0 +1,1297 @@
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fs2::FileExt;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use super::model::{StageCommitReceipt, StageCommitStatus};
+use crate::tools::context::ToolContext;
+use crate::tools::policy::validate_tool_arguments_for_workspace;
+use crate::tools::session;
+use crate::tools::workspace::WorkspaceError;
+use crate::tools::{exec, history, CancellationToken};
+
+const DEFAULT_CHECK_TIMEOUT_MS: u64 = 600_000;
+const MAX_STAGE_PATHS: usize = 256;
+const MAX_REQUIRED_CHECKS: usize = 16;
+const MAX_PROCESS_OUTPUT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct ProcessOutput {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn ensure_real_index_clean(
+    ctx: &ToolContext,
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceError> {
+    let real_index = run_git(
+        ctx,
+        &["diff", "--cached", "--quiet"],
+        None,
+        Duration::from_secs(10),
+        cancellation,
+    )?;
+    if real_index.exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(stage_error(
+        "STAGE_COMMIT_INDEX_NOT_CLEAN",
+        "stage_commit requires the real Git index to remain clean so it can safely commit through a temporary index and realign the index afterward.",
+        false,
+        process_details(&real_index),
+    ))
+}
+
+fn acquire_stage_commit_lock(ctx: &ToolContext) -> Result<StageCommitLock, WorkspaceError> {
+    let path = ctx
+        .harness
+        .store_root()
+        .join("workspaces")
+        .join(ctx.harness.workspace_id())
+        .join("stage-commit.lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            stage_error(
+                "STAGE_COMMIT_LOCK_FAILED",
+                error.to_string(),
+                true,
+                json!({}),
+            )
+        })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| {
+            stage_error(
+                "STAGE_COMMIT_LOCK_FAILED",
+                error.to_string(),
+                true,
+                json!({}),
+            )
+        })?;
+    file.try_lock_exclusive().map_err(|_| {
+        stage_error(
+            "STAGE_COMMIT_BUSY",
+            "Another stage_commit workflow is already active for this workspace.",
+            true,
+            json!({}),
+        )
+    })?;
+    Ok(StageCommitLock { file })
+}
+
+impl Drop for StageCommitLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+struct TempIndex {
+    path: PathBuf,
+}
+
+struct StageCommitLock {
+    file: File,
+}
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(PathBuf::from(format!("{}.lock", self.path.display())));
+    }
+}
+
+pub fn run(
+    ctx: &ToolContext,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    let task_id = required_string(args, "task_id")?;
+    let expected_head = required_string(args, "expected_head")?;
+    let expected_fingerprint = required_string(args, "expected_fingerprint")?;
+    let message = required_string(args, "message")?;
+    let idempotency_key = required_string(args, "idempotency_key")?;
+    let paths = parse_paths(args)?;
+    let checks = parse_checks(args)?;
+    let check_timeout_ms = args
+        .get("check_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_CHECK_TIMEOUT_MS)
+        .clamp(1_000, 600_000);
+    let checkpoint = args.get("history_checkpoint").cloned();
+    let _workflow_lock = acquire_stage_commit_lock(ctx)?;
+
+    if let Some(mut existing) = ctx
+        .harness
+        .load_stage_commit_receipt(idempotency_key)
+        .map_err(harness_error)?
+    {
+        return match existing.status {
+            StageCommitStatus::Completed => receipt_response(&existing, true, false),
+            StageCommitStatus::CommittedCheckpointPending | StageCommitStatus::Committed => {
+                resume_checkpoint(ctx, &mut existing, checkpoint.as_ref())
+            }
+            StageCommitStatus::CommittedRecoveryRequired => {
+                receipt_response(&existing, false, false)
+            }
+            StageCommitStatus::Started | StageCommitStatus::ChecksPassed => {
+                let current = super::state::capture_baseline(ctx.workspace.root());
+                if current.head.as_deref() != Some(expected_head)
+                    || current.worktree_fingerprint != expected_fingerprint
+                {
+                    Err(stage_error(
+                        "STAGE_COMMIT_INCOMPLETE",
+                        "A previous stage_commit attempt did not complete and the workspace has changed.",
+                        false,
+                        json!({
+                            "workflow_id": existing.workflow_id,
+                            "status": existing.status,
+                            "current_head": current.head,
+                            "current_fingerprint": current.worktree_fingerprint
+                        }),
+                    ))
+                } else {
+                    execute_new_workflow(
+                        ctx,
+                        args,
+                        cancellation,
+                        task_id,
+                        expected_head,
+                        expected_fingerprint,
+                        message,
+                        idempotency_key,
+                        paths,
+                        checks,
+                        check_timeout_ms,
+                        checkpoint.as_ref(),
+                        Some(existing.workflow_id),
+                    )
+                }
+            }
+            StageCommitStatus::Failed => Err(stage_error(
+                "STAGE_COMMIT_PREVIOUSLY_FAILED",
+                "This idempotency key belongs to a failed workflow. Use a new key after resolving the failure.",
+                false,
+                json!({
+                    "workflow_id": existing.workflow_id,
+                    "error": existing.error
+                }),
+            )),
+        };
+    }
+
+    execute_new_workflow(
+        ctx,
+        args,
+        cancellation,
+        task_id,
+        expected_head,
+        expected_fingerprint,
+        message,
+        idempotency_key,
+        paths,
+        checks,
+        check_timeout_ms,
+        checkpoint.as_ref(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_new_workflow(
+    ctx: &ToolContext,
+    original_args: &Value,
+    cancellation: &CancellationToken,
+    task_id: &str,
+    expected_head: &str,
+    expected_fingerprint: &str,
+    message: &str,
+    idempotency_key: &str,
+    paths: Vec<String>,
+    checks: Vec<String>,
+    check_timeout_ms: u64,
+    checkpoint: Option<&Value>,
+    existing_workflow_id: Option<String>,
+) -> Result<Value, WorkspaceError> {
+    let task = ctx.harness.task(task_id).map_err(harness_error)?;
+    if !task.status.is_writable() {
+        return Err(stage_error(
+            "TASK_NOT_WRITABLE",
+            "The task is not in a writable state.",
+            false,
+            json!({"task_id": task_id, "status": task.status}),
+        ));
+    }
+    ensure_real_index_clean(ctx, cancellation)?;
+    ctx.harness.check_baseline(task_id).map_err(harness_error)?;
+    ensure_repository_root(ctx, cancellation)?;
+
+    let before = super::state::capture_baseline(ctx.workspace.root());
+    if before.head.as_deref() != Some(expected_head)
+        || before.worktree_fingerprint != expected_fingerprint
+    {
+        return Err(stage_error(
+            "STAGE_COMMIT_CAS_FAILED",
+            "The observed HEAD or workspace fingerprint no longer matches.",
+            true,
+            json!({
+                "expected_head": expected_head,
+                "current_head": before.head,
+                "expected_fingerprint": expected_fingerprint,
+                "current_fingerprint": before.worktree_fingerprint
+            }),
+        ));
+    }
+
+    let changed_before = changed_paths(ctx, cancellation)?;
+    ensure_changes_are_selected(&changed_before, &paths)?;
+    if changed_before.is_empty() {
+        return Err(stage_error(
+            "STAGE_COMMIT_EMPTY",
+            "No Git changes are available to commit.",
+            false,
+            json!({"paths": paths}),
+        ));
+    }
+
+    let now = timestamp();
+    let mut receipt = StageCommitReceipt {
+        workflow_id: existing_workflow_id
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+        idempotency_key: idempotency_key.to_string(),
+        task_id: task_id.to_string(),
+        status: StageCommitStatus::Started,
+        expected_head: expected_head.to_string(),
+        expected_fingerprint: expected_fingerprint.to_string(),
+        paths: paths.clone(),
+        checks: Vec::new(),
+        commit_sha: None,
+        checkpoint_hash: None,
+        checkpoint_count: None,
+        error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    save_receipt(ctx, &receipt)?;
+    let _ = ctx.harness.record_operation(
+        Some(&receipt.workflow_id),
+        Some(task_id),
+        "stage_commit",
+        "started",
+        json!({
+            "reason": original_args.get("reason"),
+            "paths": paths,
+            "required_checks": checks,
+            "message": message
+        }),
+        json!({"ok": true}),
+    );
+
+    for command in checks {
+        let result = run_required_check(ctx, &command, check_timeout_ms, cancellation)?;
+        let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
+        receipt.checks.push(result.clone());
+        receipt.updated_at = timestamp();
+        if !passed {
+            receipt.status = StageCommitStatus::Failed;
+            receipt.error = Some(json!({
+                "code": "STAGE_COMMIT_CHECK_FAILED",
+                "command": command,
+                "result": result
+            }));
+            save_receipt(ctx, &receipt)?;
+            finish_operation(ctx, &receipt, false);
+            return Err(stage_error(
+                "STAGE_COMMIT_CHECK_FAILED",
+                "A required check failed; no files were staged and HEAD was not changed.",
+                false,
+                json!({
+                    "workflow_id": receipt.workflow_id,
+                    "checks": receipt.checks
+                }),
+            ));
+        }
+        save_receipt(ctx, &receipt)?;
+    }
+
+    let after_checks = super::state::capture_baseline(ctx.workspace.root());
+    if after_checks.head.as_deref() != Some(expected_head)
+        || after_checks.worktree_fingerprint != expected_fingerprint
+    {
+        receipt.status = StageCommitStatus::Failed;
+        receipt.error = Some(json!({
+            "code": "STAGE_COMMIT_CHECK_MODIFIED_WORKSPACE",
+            "current_head": after_checks.head,
+            "current_fingerprint": after_checks.worktree_fingerprint
+        }));
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, &receipt)?;
+        finish_operation(ctx, &receipt, false);
+        return Err(stage_error(
+            "STAGE_COMMIT_CHECK_MODIFIED_WORKSPACE",
+            "A required check modified the workspace or HEAD; inspect the changes before committing.",
+            false,
+            receipt.error.clone().unwrap_or_else(|| json!({})),
+        ));
+    }
+    ensure_real_index_clean(ctx, cancellation)?;
+    receipt.status = StageCommitStatus::ChecksPassed;
+    receipt.updated_at = timestamp();
+    save_receipt(ctx, &receipt)?;
+
+    let temp_index = create_temp_index(ctx)?;
+    git_expect_success(
+        ctx,
+        &["read-tree", expected_head],
+        Some(&temp_index.path),
+        Duration::from_secs(30),
+        cancellation,
+        "STAGE_COMMIT_INDEX_FAILED",
+    )?;
+    let mut add_args = vec!["add".to_string(), "-A".to_string(), "--".to_string()];
+    add_args.extend(paths.iter().cloned());
+    git_expect_success_owned(
+        ctx,
+        &add_args,
+        Some(&temp_index.path),
+        Duration::from_secs(60),
+        cancellation,
+        "STAGE_COMMIT_STAGE_FAILED",
+    )?;
+
+    let staged = git_paths(
+        ctx,
+        &["diff", "--cached", "--name-only", "-z"],
+        Some(&temp_index.path),
+        cancellation,
+    )?;
+    ensure_changes_are_selected(&staged, &paths)?;
+    if staged.is_empty() {
+        receipt.status = StageCommitStatus::Failed;
+        receipt.error = Some(json!({"code": "STAGE_COMMIT_EMPTY"}));
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, &receipt)?;
+        finish_operation(ctx, &receipt, false);
+        return Err(stage_error(
+            "STAGE_COMMIT_EMPTY",
+            "The selected paths produced an empty staged diff.",
+            false,
+            json!({"paths": paths}),
+        ));
+    }
+
+    let pre_commit = super::state::capture_baseline(ctx.workspace.root());
+    if pre_commit.head.as_deref() != Some(expected_head)
+        || pre_commit.worktree_fingerprint != expected_fingerprint
+    {
+        return Err(stage_error(
+            "STAGE_COMMIT_CAS_FAILED",
+            "The workspace changed after checks and before commit.",
+            true,
+            json!({
+                "current_head": pre_commit.head,
+                "current_fingerprint": pre_commit.worktree_fingerprint
+            }),
+        ));
+    }
+
+    git_expect_success(
+        ctx,
+        &["commit", "--no-gpg-sign", "-m", message],
+        Some(&temp_index.path),
+        Duration::from_millis(check_timeout_ms),
+        cancellation,
+        "STAGE_COMMIT_GIT_FAILED",
+    )?;
+    let commit_sha = git_text(
+        ctx,
+        &["rev-parse", "HEAD"],
+        None,
+        Duration::from_secs(10),
+        cancellation,
+    )?;
+    receipt.commit_sha = Some(commit_sha.clone());
+    receipt.status = StageCommitStatus::Committed;
+    receipt.updated_at = timestamp();
+    save_receipt(ctx, &receipt)?;
+
+    if let Err(error) = git_expect_success(
+        ctx,
+        &["reset", "--mixed", "--quiet", "HEAD"],
+        None,
+        Duration::from_secs(30),
+        cancellation,
+        "STAGE_COMMIT_INDEX_REALIGN_FAILED",
+    ) {
+        receipt.status = StageCommitStatus::CommittedRecoveryRequired;
+        receipt.error = Some(error.to_error_value());
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, &receipt)?;
+        finish_operation(ctx, &receipt, false);
+        return receipt_response(&receipt, false, false);
+    }
+
+    let post_commit_changes = changed_paths(ctx, cancellation)?;
+    if !post_commit_changes.is_empty() {
+        receipt.status = StageCommitStatus::CommittedRecoveryRequired;
+        receipt.error = Some(json!({
+            "code": "STAGE_COMMIT_POST_COMMIT_DRIFT",
+            "changed_paths": post_commit_changes
+        }));
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, &receipt)?;
+        finish_operation(ctx, &receipt, false);
+        return receipt_response(&receipt, false, false);
+    }
+
+    ctx.harness
+        .refresh_expected_state_for_operation(task_id, Some(&receipt.workflow_id))
+        .map_err(harness_error)?;
+    let _ = ctx
+        .harness
+        .set_latest_change(task_id, &commit_sha)
+        .map_err(harness_error)?;
+    let _ = ctx.harness.record_event(
+        task_id,
+        "stage_commit_committed",
+        Some("stage_commit"),
+        json!({"paths": staged, "message": message}),
+        json!({
+            "ok": true,
+            "workflow_id": receipt.workflow_id,
+            "commit_sha": commit_sha,
+            "checks": receipt.checks
+        }),
+    );
+
+    if checkpoint.is_some() {
+        return resume_checkpoint(ctx, &mut receipt, checkpoint);
+    }
+    receipt.status = StageCommitStatus::Completed;
+    receipt.updated_at = timestamp();
+    save_receipt(ctx, &receipt)?;
+    finish_operation(ctx, &receipt, true);
+    receipt_response(&receipt, true, false)
+}
+
+fn resume_checkpoint(
+    ctx: &ToolContext,
+    receipt: &mut StageCommitReceipt,
+    checkpoint: Option<&Value>,
+) -> Result<Value, WorkspaceError> {
+    let Some(checkpoint) = checkpoint else {
+        receipt.status = StageCommitStatus::CommittedCheckpointPending;
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, receipt)?;
+        finish_operation(ctx, receipt, false);
+        return receipt_response(receipt, false, true);
+    };
+    match history::checkpoint(ctx, checkpoint) {
+        Ok(result) => {
+            receipt.checkpoint_hash = result
+                .get("content_hash")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            receipt.checkpoint_count = result.get("checkpoint_count").and_then(Value::as_u64);
+            receipt.status = StageCommitStatus::Completed;
+            receipt.error = None;
+            receipt.updated_at = timestamp();
+            save_receipt(ctx, receipt)?;
+            finish_operation(ctx, receipt, true);
+            receipt_response(receipt, true, false)
+        }
+        Err(error) => {
+            receipt.status = StageCommitStatus::CommittedCheckpointPending;
+            receipt.error = Some(error.to_error_value());
+            receipt.updated_at = timestamp();
+            save_receipt(ctx, receipt)?;
+            finish_operation(ctx, receipt, false);
+            receipt_response(receipt, false, true)
+        }
+    }
+}
+
+fn run_required_check(
+    ctx: &ToolContext,
+    command: &str,
+    timeout_ms: u64,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    let arguments = json!({
+        "cmd": command,
+        "timeout_ms": timeout_ms,
+        "yield_time_ms": 30_000,
+        "max_output_bytes": 65_536,
+        "filesystem_scope": "workspace",
+        "reason": "stage_commit required check"
+    });
+    validate_tool_arguments_for_workspace(
+        "exec_command",
+        &arguments,
+        &ctx.policy,
+        Some(&ctx.workspace),
+    )
+    .map_err(|error| {
+        stage_error(
+            "STAGE_COMMIT_CHECK_REJECTED",
+            error.to_string(),
+            false,
+            json!({"command": command}),
+        )
+    })?;
+    let mut result = exec::exec_command_with_cancellation(ctx, &arguments, cancellation)?;
+    while result.get("status").and_then(Value::as_str) == Some("running") {
+        let session_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                stage_error(
+                    "STAGE_COMMIT_CHECK_SESSION_INVALID",
+                    "A running check did not return a session_id.",
+                    false,
+                    json!({"command": command}),
+                )
+            })?
+            .to_string();
+        if cancellation.is_cancelled() {
+            let _ = session::kill_session(
+                &ctx.sessions,
+                &json!({"session_id": session_id, "signal": "TERM", "wait_ms": 5_000}),
+            );
+            return Err(stage_error(
+                "REQUEST_CANCELLED",
+                "stage_commit was cancelled while running a required check.",
+                true,
+                json!({"command": command}),
+            ));
+        }
+        result = session::write_stdin(
+            &ctx.sessions,
+            &json!({
+                "session_id": session_id,
+                "chars": "",
+                "yield_time_ms": 30_000,
+                "max_output_bytes": 65_536
+            }),
+        )?;
+    }
+    Ok(json!({
+        "command": command,
+        "command_ok": result.get("command_ok").cloned().unwrap_or(Value::Null),
+        "exit_code": result.get("exit_code").cloned().unwrap_or(Value::Null),
+        "termination_reason": result.get("termination_reason").cloned().unwrap_or(Value::Null),
+        "duration_ms": result.get("duration_ms").cloned().unwrap_or(Value::Null),
+        "stdout": result.get("stdout").cloned().unwrap_or(Value::String(String::new())),
+        "stderr": result.get("stderr").cloned().unwrap_or(Value::String(String::new())),
+        "stdout_truncated": result.get("stdout_truncated").cloned().unwrap_or(Value::Bool(false)),
+        "stderr_truncated": result.get("stderr_truncated").cloned().unwrap_or(Value::Bool(false)),
+        "output_refs": result.get("output_refs").cloned().unwrap_or_else(|| json!({}))
+    }))
+}
+
+fn ensure_repository_root(
+    ctx: &ToolContext,
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceError> {
+    let top = git_text(
+        ctx,
+        &["rev-parse", "--show-toplevel"],
+        None,
+        Duration::from_secs(10),
+        cancellation,
+    )?;
+    let top = PathBuf::from(top).canonicalize().map_err(|error| {
+        stage_error(
+            "STAGE_COMMIT_REPOSITORY_INVALID",
+            error.to_string(),
+            false,
+            json!({}),
+        )
+    })?;
+    if top != ctx.workspace.root() {
+        return Err(stage_error(
+            "STAGE_COMMIT_REPOSITORY_SCOPE",
+            "stage_commit requires the configured workspace to be the Git repository root.",
+            false,
+            json!({"repository_root": top.display().to_string()}),
+        ));
+    }
+    Ok(())
+}
+
+fn create_temp_index(ctx: &ToolContext) -> Result<TempIndex, WorkspaceError> {
+    let dir = ctx.harness.store_root().join("tmp");
+    fs::create_dir_all(&dir).map_err(|error| {
+        stage_error(
+            "STAGE_COMMIT_INDEX_FAILED",
+            error.to_string(),
+            true,
+            json!({}),
+        )
+    })?;
+    Ok(TempIndex {
+        path: dir.join(format!("stage-{}.index", Uuid::new_v4().simple())),
+    })
+}
+
+fn changed_paths(
+    ctx: &ToolContext,
+    cancellation: &CancellationToken,
+) -> Result<Vec<String>, WorkspaceError> {
+    let mut paths = git_paths(
+        ctx,
+        &["diff", "HEAD", "--name-only", "-z"],
+        None,
+        cancellation,
+    )?;
+    paths.extend(git_paths(
+        ctx,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        None,
+        cancellation,
+    )?);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn git_paths(
+    ctx: &ToolContext,
+    args: &[&str],
+    index: Option<&Path>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<String>, WorkspaceError> {
+    let output = run_git(
+        ctx,
+        args,
+        index,
+        Duration::from_secs(30),
+        cancellation,
+    )?;
+    if output.exit_code != Some(0) {
+        return Err(stage_error(
+            "STAGE_COMMIT_GIT_FAILED",
+            "Git failed while inspecting changed paths.",
+            true,
+            process_details(&output),
+        ));
+    }
+    Ok(output
+        .stdout
+        .as_bytes()
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .map(|path| path.replace('\\', "/"))
+        .collect())
+}
+
+fn git_text(
+    ctx: &ToolContext,
+    args: &[&str],
+    index: Option<&Path>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<String, WorkspaceError> {
+    let output = run_git(ctx, args, index, timeout, cancellation)?;
+    if output.exit_code != Some(0) {
+        return Err(stage_error(
+            "STAGE_COMMIT_GIT_FAILED",
+            "Git command failed.",
+            true,
+            process_details(&output),
+        ));
+    }
+    Ok(output.stdout.trim().to_string())
+}
+
+fn git_expect_success(
+    ctx: &ToolContext,
+    args: &[&str],
+    index: Option<&Path>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    code: &'static str,
+) -> Result<(), WorkspaceError> {
+    let output = run_git(ctx, args, index, timeout, cancellation)?;
+    if output.exit_code == Some(0) {
+        return Ok(());
+    }
+    Err(stage_error(
+        code,
+        "Git command failed during stage_commit.",
+        false,
+        process_details(&output),
+    ))
+}
+
+fn git_expect_success_owned(
+    ctx: &ToolContext,
+    args: &[String],
+    index: Option<&Path>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    code: &'static str,
+) -> Result<(), WorkspaceError> {
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git_expect_success(ctx, &borrowed, index, timeout, cancellation, code)
+}
+
+fn run_git(
+    ctx: &ToolContext,
+    args: &[&str],
+    index: Option<&Path>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, WorkspaceError> {
+    let mut command = Command::new("git");
+    crate::platform::hide_std_console(&mut command);
+    command
+        .arg("-C")
+        .arg(ctx.workspace.root())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    run_process(command, timeout, cancellation)
+}
+
+fn run_process(
+    mut command: Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, WorkspaceError> {
+    let mut child = command.spawn().map_err(|error| {
+        stage_error(
+            "STAGE_COMMIT_PROCESS_FAILED",
+            error.to_string(),
+            true,
+            json!({}),
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        stage_error(
+            "STAGE_COMMIT_PROCESS_FAILED",
+            "Process stdout is unavailable.",
+            true,
+            json!({}),
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        stage_error(
+            "STAGE_COMMIT_PROCESS_FAILED",
+            "Process stderr is unavailable.",
+            true,
+            json!({}),
+        )
+    })?;
+    let stdout_reader = thread::spawn(move || read_bounded(stdout));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr));
+    let started = Instant::now();
+    let exit_status = loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(stage_error(
+                "REQUEST_CANCELLED",
+                "stage_commit process was cancelled.",
+                true,
+                json!({}),
+            ));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(stage_error(
+                "STAGE_COMMIT_PROCESS_TIMEOUT",
+                "stage_commit process timed out.",
+                true,
+                json!({"timeout_ms": timeout.as_millis()}),
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(stage_error(
+                    "STAGE_COMMIT_PROCESS_FAILED",
+                    error.to_string(),
+                    true,
+                    json!({}),
+                ));
+            }
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(ProcessOutput {
+        exit_code: exit_status.code(),
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded(mut reader: impl Read) -> String {
+    let mut retained = Vec::new();
+    let mut buffer = [0u8; 8192];
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_PROCESS_OUTPUT_BYTES.saturating_sub(retained.len());
+        if remaining > 0 {
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+    }
+    String::from_utf8_lossy(&retained).into_owned()
+}
+
+fn parse_paths(args: &Value) -> Result<Vec<String>, WorkspaceError> {
+    let values = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_argument("paths must be a non-empty array"))?;
+    if values.is_empty() || values.len() > MAX_STAGE_PATHS {
+        return Err(invalid_argument(format!(
+            "paths must contain between 1 and {MAX_STAGE_PATHS} entries"
+        )));
+    }
+    let mut paths = BTreeSet::new();
+    for value in values {
+        let raw = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid_argument("paths contains an invalid entry"))?;
+        let path = Path::new(raw);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+            || path.components().any(|component| component.as_os_str() == ".git")
+        {
+            return Err(stage_error(
+                "STAGE_COMMIT_PATH_REJECTED",
+                "stage_commit paths must be relative workspace paths and cannot target .git.",
+                false,
+                json!({"path": raw}),
+            ));
+        }
+        let normalized = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => value.to_str(),
+                Component::CurDir => None,
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if normalized.is_empty() {
+            return Err(invalid_argument("paths cannot contain the workspace root"));
+        }
+        paths.insert(normalized);
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn parse_checks(args: &Value) -> Result<Vec<String>, WorkspaceError> {
+    let Some(values) = args.get("required_checks") else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| invalid_argument("required_checks must be an array"))?;
+    if values.len() > MAX_REQUIRED_CHECKS {
+        return Err(invalid_argument(format!(
+            "required_checks supports at most {MAX_REQUIRED_CHECKS} commands"
+        )));
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| invalid_argument("required_checks contains an invalid command"))
+        })
+        .collect()
+}
+
+fn ensure_changes_are_selected(
+    changed: &[String],
+    selected: &[String],
+) -> Result<(), WorkspaceError> {
+    let outside = changed
+        .iter()
+        .filter(|path| {
+            !selected.iter().any(|selected| {
+                *path == selected || path.starts_with(&format!("{selected}/"))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    Err(stage_error(
+        "STAGE_COMMIT_SCOPE_MISMATCH",
+        "Workspace changes exist outside the selected stage_commit paths.",
+        false,
+        json!({"outside_paths": outside, "selected_paths": selected}),
+    ))
+}
+
+fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, WorkspaceError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_argument(format!("{key} is required")))
+}
+
+fn save_receipt(ctx: &ToolContext, receipt: &StageCommitReceipt) -> Result<(), WorkspaceError> {
+    ctx.harness
+        .save_stage_commit_receipt(receipt)
+        .map_err(harness_error)
+}
+
+fn finish_operation(ctx: &ToolContext, receipt: &StageCommitReceipt, complete: bool) {
+    let _ = ctx.harness.record_operation(
+        Some(&receipt.workflow_id),
+        Some(&receipt.task_id),
+        "stage_commit",
+        if complete { "completed" } else { "incomplete" },
+        json!({"idempotency_key": receipt.idempotency_key}),
+        json!({
+            "ok": complete,
+            "status": receipt.status,
+            "commit_sha": receipt.commit_sha,
+            "checkpoint_hash": receipt.checkpoint_hash,
+            "error": receipt.error
+        }),
+    );
+}
+
+fn receipt_response(
+    receipt: &StageCommitReceipt,
+    complete: bool,
+    retryable: bool,
+) -> Result<Value, WorkspaceError> {
+    Ok(json!({
+        "workflow_id": receipt.workflow_id,
+        "idempotency_key": receipt.idempotency_key,
+        "workflow_status": receipt.status,
+        "complete": complete,
+        "retryable": retryable,
+        "task_id": receipt.task_id,
+        "paths": receipt.paths,
+        "checks": receipt.checks,
+        "commit_sha": receipt.commit_sha,
+        "checkpoint_hash": receipt.checkpoint_hash,
+        "checkpoint_count": receipt.checkpoint_count,
+        "error": receipt.error
+    }))
+}
+
+fn process_details(output: &ProcessOutput) -> Value {
+    json!({
+        "exit_code": output.exit_code,
+        "stdout": output.stdout,
+        "stderr": output.stderr
+    })
+}
+
+fn harness_error(error: super::store::HarnessError) -> WorkspaceError {
+    stage_error(
+        error.code(),
+        error.to_string(),
+        false,
+        json!({}),
+    )
+}
+
+fn invalid_argument(message: impl Into<String>) -> WorkspaceError {
+    stage_error(
+        "INVALID_ARGUMENT",
+        message.into(),
+        false,
+        json!({}),
+    )
+}
+
+fn stage_error(
+    code: &'static str,
+    message: impl Into<String>,
+    retryable: bool,
+    details: Value,
+) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code,
+        message: message.into(),
+        category: "runtime",
+        retryable,
+        details,
+    }
+}
+
+fn timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolContext;
+    use tempfile::tempdir;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn fixture() -> Option<(tempfile::TempDir, tempfile::TempDir, ToolContext)> {
+        which::which("python").ok()?;
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        git(workspace.path(), &["init"]);
+        git(
+            workspace.path(),
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(
+            workspace.path(),
+            &["config", "user.name", "Anchor Tests"],
+        );
+        fs::write(
+            workspace.path().join(".gitignore"),
+            "docs/history-session/\n",
+        )
+        .expect("gitignore");
+        fs::write(workspace.path().join("main.txt"), "before\n").expect("file");
+        git(workspace.path(), &["add", ".gitignore", "main.txt"]);
+        git(workspace.path(), &["commit", "-m", "initial"]);
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness.path().to_path_buf(),
+        )
+        .expect("context");
+        Some((workspace, harness, ctx))
+    }
+
+    fn prepare_change(ctx: &ToolContext, path: &Path) -> (String, String, String) {
+        let task = ctx.harness.start_task("stage commit test").expect("task");
+        fs::write(path.join("main.txt"), "after\n").expect("change");
+        let refreshed = ctx
+            .harness
+            .refresh_expected_state_for_operation(&task.id, Some("test-change"))
+            .expect("refresh");
+        let expected = refreshed.expected_state.expect("expected state");
+        (
+            task.id,
+            expected.head.expect("head"),
+            expected.worktree_fingerprint,
+        )
+    }
+
+    #[test]
+    fn failed_check_leaves_head_and_index_unchanged() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let initial_head = git(workspace.path(), &["rev-parse", "HEAD"]);
+        let (task_id, expected_head, expected_fingerprint) =
+            prepare_change(&ctx, workspace.path());
+        let command = "python -c \"import sys; sys.exit(3)\"";
+
+        let error = run(
+            &ctx,
+            &json!({
+                "task_id": task_id,
+                "expected_head": expected_head,
+                "expected_fingerprint": expected_fingerprint,
+                "paths": ["main.txt"],
+                "message": "must not commit",
+                "required_checks": [command],
+                "idempotency_key": "failed-check"
+            }),
+            &CancellationToken::default(),
+        )
+        .expect_err("check failure");
+
+        assert_eq!(error.to_error_value()["code"], "STAGE_COMMIT_CHECK_FAILED");
+        assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), initial_head);
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(workspace.path())
+            .args(["diff", "--cached", "--quiet"])
+            .status()
+            .expect("git diff");
+        assert!(staged.success(), "real Git index must remain unchanged");
+    }
+
+    #[test]
+    fn check_that_mutates_real_index_is_rejected_before_commit() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let initial_head = git(workspace.path(), &["rev-parse", "HEAD"]);
+        let (task_id, expected_head, expected_fingerprint) =
+            prepare_change(&ctx, workspace.path());
+
+        let error = run(
+            &ctx,
+            &json!({
+                "task_id": task_id,
+                "expected_head": expected_head,
+                "expected_fingerprint": expected_fingerprint,
+                "paths": ["main.txt"],
+                "message": "must not commit staged side effect",
+                "required_checks": ["git add main.txt"],
+                "idempotency_key": "index-mutating-check"
+            }),
+            &CancellationToken::default(),
+        )
+        .expect_err("dirty real index must fail");
+
+        assert_eq!(error.to_error_value()["code"], "STAGE_COMMIT_INDEX_NOT_CLEAN");
+        assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), initial_head);
+    }
+
+    #[test]
+    fn successful_stage_commit_is_idempotent_and_preserves_initial_baseline() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let (task_id, expected_head, expected_fingerprint) =
+            prepare_change(&ctx, workspace.path());
+        let initial_baseline_head = ctx
+            .harness
+            .task(&task_id)
+            .expect("task")
+            .baseline
+            .head;
+        let command = "python -c \"print('ok')\"";
+        let arguments = json!({
+            "task_id": task_id,
+            "expected_head": expected_head,
+            "expected_fingerprint": expected_fingerprint,
+            "paths": ["main.txt"],
+            "message": "commit selected stage",
+            "required_checks": [command],
+            "idempotency_key": "successful-stage"
+        });
+
+        let first = run(&ctx, &arguments, &CancellationToken::default()).expect("commit");
+        assert_eq!(first["complete"], true);
+        let commit_sha = first["commit_sha"].as_str().expect("commit sha").to_string();
+        assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), commit_sha);
+        assert!(git(workspace.path(), &["status", "--porcelain"]).is_empty());
+        ctx.harness.check_baseline(&task_id).expect("baseline valid");
+        assert_eq!(
+            ctx.harness.task(&task_id).expect("task").baseline.head,
+            initial_baseline_head
+        );
+
+        let second = run(&ctx, &arguments, &CancellationToken::default()).expect("idempotent");
+        assert_eq!(second["commit_sha"], first["commit_sha"]);
+        assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
+    }
+
+    #[test]
+    fn checkpoint_failure_resumes_without_repeating_commit() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let bootstrap = history::bootstrap(
+            &ctx,
+            &json!({
+                "session_key": "stage-commit-checkpoint-test",
+                "create_if_missing": true
+            }),
+        )
+        .expect("bootstrap");
+        let current_path = bootstrap["current_path"]
+            .as_str()
+            .expect("current path")
+            .to_string();
+        let (task_id, expected_head, expected_fingerprint) =
+            prepare_change(&ctx, workspace.path());
+        let base = json!({
+            "task_id": task_id,
+            "expected_head": expected_head,
+            "expected_fingerprint": expected_fingerprint,
+            "paths": ["main.txt"],
+            "message": "commit before checkpoint retry",
+            "required_checks": ["python -c \"print('ok')\""],
+            "idempotency_key": "checkpoint-retry"
+        });
+        let mut first_args = base.clone();
+        first_args["history_checkpoint"] = json!({
+            "session_key": "stage-commit-checkpoint-test",
+            "expected_path": "docs/history-session/not-the-current-session.md",
+            "user_intent": "checkpoint retry test"
+        });
+
+        let first = run(&ctx, &first_args, &CancellationToken::default())
+            .expect("commit with pending checkpoint");
+        assert_eq!(first["complete"], false);
+        assert_eq!(first["retryable"], true);
+        assert_eq!(
+            first["workflow_status"],
+            "committed_checkpoint_pending"
+        );
+        let commit_sha = first["commit_sha"].as_str().expect("commit").to_string();
+        assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
+        ctx.harness.check_baseline(&task_id).expect("baseline valid");
+
+        let mut retry_args = base;
+        retry_args["history_checkpoint"] = json!({
+            "session_key": "stage-commit-checkpoint-test",
+            "expected_path": current_path,
+            "user_intent": "checkpoint retry test",
+            "findings": ["commit already exists; checkpoint resumed"]
+        });
+        let retry = run(&ctx, &retry_args, &CancellationToken::default())
+            .expect("checkpoint resumed");
+        assert_eq!(retry["complete"], true);
+        assert_eq!(retry["commit_sha"], commit_sha);
+        assert!(retry["checkpoint_hash"].as_str().is_some());
+        assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
+    }
+}

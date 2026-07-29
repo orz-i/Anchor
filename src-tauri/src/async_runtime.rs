@@ -38,7 +38,8 @@ where
 
 pub fn block_on<F>(future: F) -> F::Output
 where
-    F: Future,
+    F: Future + Send,
+    F::Output: Send,
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
@@ -46,10 +47,31 @@ where
                 tokio::task::block_in_place(|| handle.block_on(future))
             }
             tokio::runtime::RuntimeFlavor::CurrentThread => {
-                panic!("cannot synchronously block inside a current-thread Tokio runtime")
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| fallback_runtime().block_on(future))
+                        .join()
+                        .expect("fallback async runtime worker panicked")
+                })
             }
             _ => panic!("unsupported Tokio runtime flavor"),
         },
         Err(_) => fallback_runtime().block_on(future),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn block_on_from_current_thread_spawn_blocking_uses_fallback_runtime() {
+        let value = tokio::task::spawn_blocking(|| {
+            super::block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                7
+            })
+        })
+        .await
+        .expect("blocking worker");
+        assert_eq!(value, 7);
     }
 }

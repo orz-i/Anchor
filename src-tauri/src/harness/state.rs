@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 
 use super::model::{
     BaselineEntry, CapabilityStatus, ExpectedWorkspaceState, FileChangeRecord, HarnessEvent,
-    HarnessStatus, OperationRecord, ProjectBaseline, ProjectFileState, ProjectState, TaskSession,
-    TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
+    HarnessStatus, OperationRecord, ProjectBaseline, ProjectFileState, ProjectState,
+    StageCommitReceipt, TaskSession, TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 
@@ -323,6 +323,34 @@ impl Harness {
     ) -> HarnessResult<Vec<OperationRecord>> {
         self.store
             .list_operations(&self.workspace_id, offset, limit)
+    }
+
+    pub fn load_stage_commit_receipt(
+        &self,
+        idempotency_key: &str,
+    ) -> HarnessResult<Option<StageCommitReceipt>> {
+        self.store
+            .load_stage_commit_receipt(&self.workspace_id, idempotency_key)
+    }
+
+    pub fn save_stage_commit_receipt(
+        &self,
+        receipt: &StageCommitReceipt,
+    ) -> HarnessResult<()> {
+        self.store
+            .save_stage_commit_receipt(&self.workspace_id, receipt)
+    }
+
+    pub fn set_latest_change(
+        &self,
+        task_id: &str,
+        change_id: &str,
+    ) -> HarnessResult<TaskSession> {
+        let mut task = self.task(task_id)?;
+        task.latest_change_id = Some(change_id.to_string());
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        Ok(task)
     }
 
     pub fn project_state(&self, max_files: usize) -> HarnessResult<ProjectState> {

@@ -2,7 +2,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use super::model::{HarnessEvent, OperationRecord, TaskSession, WorkspaceHarnessState};
+use sha2::{Digest, Sha256};
+
+use super::model::{
+    HarnessEvent, OperationRecord, StageCommitReceipt, TaskSession, WorkspaceHarnessState,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -56,6 +60,13 @@ impl HarnessStore {
 
     fn operations_path(&self, workspace_id: &str) -> PathBuf {
         self.workspace_dir(workspace_id).join("operations.jsonl")
+    }
+
+    fn stage_commit_path(&self, workspace_id: &str, idempotency_key: &str) -> PathBuf {
+        let digest = format!("{:x}", Sha256::digest(idempotency_key.as_bytes()));
+        self.workspace_dir(workspace_id)
+            .join("stage-commits")
+            .join(format!("{digest}.json"))
     }
 
     pub fn save_task(&self, task: &TaskSession) -> HarnessResult<()> {
@@ -152,6 +163,28 @@ impl HarnessStore {
             }
         }
         Ok(operations)
+    }
+
+    pub fn save_stage_commit_receipt(
+        &self,
+        workspace_id: &str,
+        receipt: &StageCommitReceipt,
+    ) -> HarnessResult<()> {
+        let path = self.stage_commit_path(workspace_id, &receipt.idempotency_key);
+        fs::create_dir_all(path.parent().expect("stage commit parent")).map_err(io_error)?;
+        atomic_write_json(&path, receipt)
+    }
+
+    pub fn load_stage_commit_receipt(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> HarnessResult<Option<StageCommitReceipt>> {
+        let path = self.stage_commit_path(workspace_id, idempotency_key);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(&path).map(Some)
     }
 
     pub fn list_events(

@@ -98,6 +98,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "stage_commit",
+        "Validate and commit a stage",
+        "Run required checks, stage only selected paths through a temporary Git index, create one commit, advance the Harness expected state, and optionally persist a history checkpoint with resumable evidence.",
+        false,
+        true,
+        false,
+    ),
+    (
         "update_task",
         "Update task",
         "Update task steps and durable progress.",
@@ -398,6 +406,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "project_state",
     "start_task",
     "refresh_baseline",
+    "stage_commit",
     "update_task",
     "pause_task",
     "resume_task",
@@ -419,6 +428,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "set_default_cwd",
     "start_task",
     "refresh_baseline",
+    "stage_commit",
     "update_task",
     "pause_task",
     "resume_task",
@@ -1185,6 +1195,48 @@ pub fn input_schema(name: &str) -> Value {
                 "query": { "type": "string", "description": "Optional case-insensitive name/description filter" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 }
             },
+            "additionalProperties": false
+        }),
+        "stage_commit" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "expected_head": { "type": "string", "minLength": 40, "maxLength": 64 },
+                "expected_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1 }
+                },
+                "message": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                "required_checks": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "default": [],
+                    "items": { "type": "string", "minLength": 1, "maxLength": 4000 }
+                },
+                "check_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "default": 600000 },
+                "history_checkpoint": {
+                    "type": "object",
+                    "required": ["session_key", "expected_path"],
+                    "properties": {
+                        "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 }
+                    },
+                    "additionalProperties": true
+                },
+                "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "reason": { "type": "string", "maxLength": 2000, "default": "" }
+            },
+            "required": [
+                "task_id",
+                "expected_head",
+                "expected_fingerprint",
+                "paths",
+                "message",
+                "idempotency_key"
+            ],
             "additionalProperties": false
         }),
         "load_skill" => json!({

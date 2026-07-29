@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 use crate::tools::workspace::{tool_ok, WorkspaceError};
-use crate::tools::ToolContext;
+use crate::tools::{CancellationToken, ToolContext};
 
 use super::model::TaskStatus;
 use super::store::HarnessError;
@@ -12,6 +12,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "project_state",
     "start_task",
     "refresh_baseline",
+    "stage_commit",
     "update_task",
     "pause_task",
     "resume_task",
@@ -21,13 +22,19 @@ pub const TOOL_NAMES: &[&str] = &[
     "change_summary",
 ];
 
-pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn call(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
     let value = match name {
         "harness_status" => harness_status(ctx),
         "operation_log" => operation_log(ctx, args),
         "project_state" => project_state(ctx, args),
         "start_task" => start_task(ctx, args),
         "refresh_baseline" => refresh_baseline(ctx, args),
+        "stage_commit" => super::stage_commit::run(ctx, args, cancellation),
         "update_task" => update_task(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
         "resume_task" => transition(ctx, args, TaskStatus::Active),

@@ -13,6 +13,38 @@ pub struct CapabilityStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageCommitStatus {
+    Started,
+    ChecksPassed,
+    Committed,
+    CommittedRecoveryRequired,
+    CommittedCheckpointPending,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageCommitReceipt {
+    pub workflow_id: String,
+    pub idempotency_key: String,
+    pub task_id: String,
+    pub status: StageCommitStatus,
+    pub expected_head: String,
+    pub expected_fingerprint: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<Value>,
+    pub commit_sha: Option<String>,
+    pub checkpoint_hash: Option<String>,
+    pub checkpoint_count: Option<u64>,
+    pub error: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpectedWorkspaceState {
     pub branch: Option<String>,
     pub head: Option<String>,

@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "da3118a6ed48319e75efa956eca2baa12717b0ef47e95469a7b6b83105fd4759",
+    "digest": "857a7b90bf511f9e9cb0e9b43a1d0bf5ff4297d17a3388b64318d28ec873c2e3",
     "names": [
       "apply_patch",
       "change_summary",
@@ -36,13 +36,14 @@
       "search_text",
       "server_info",
       "set_default_cwd",
+      "stage_commit",
       "start_task",
       "task_context",
       "update_task",
       "view_image",
       "write_stdin"
     ],
-    "tool_count": 39
+    "tool_count": 40
   },
   "core": {
     "digest": "2cef6aabdb79f9b0920b597298d1e59d911bae64ba0929ea46cb78dc3e843535",

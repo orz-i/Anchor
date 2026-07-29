@@ -1,4 +1,5 @@
 pub mod model;
+mod stage_commit;
 pub mod state;
 pub mod store;
 pub mod tools;

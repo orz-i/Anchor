@@ -188,7 +188,7 @@ fn call_tool_impl(
     }
 
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
-        return match crate::harness::tools::call(ctx, name, args) {
+        return match crate::harness::tools::call(ctx, name, args, cancellation) {
             Ok(value) => value,
             Err(error) => attach_harness_status(ctx, tool_err(error), false),
         };
