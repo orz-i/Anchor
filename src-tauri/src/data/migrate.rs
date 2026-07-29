@@ -4,17 +4,27 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 use crate::platform::platform;
 use crate::settings::AppSettings;
 
 use super::model::{AppData, LegacyProfilesOnlyFile, SecretsData};
+use super::secret_protection;
 
 const LEGACY_PROFILES_FILE: &str = "profiles.json";
 const LEGACY_SETTINGS_FILE: &str = "app_settings.json";
+const SECRETS_ENVELOPE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecretsEnvelope {
+    version: u32,
+    protection: String,
+    payload: String,
+}
 const LEGACY_BRAND_DATA_FILES: &[&str] = &[
     "data/profiles.json",
     "data/profiles.json.bak",
@@ -54,7 +64,11 @@ fn migrate_or_load_secrets_at(
     let had_inline_secrets = !legacy.is_empty();
 
     if has_primary_or_backup(secrets_path) {
-        load_with_backup::<SecretsData>(secrets_path)?.apply_to(data);
+        let (loaded, protected) = load_secrets_with_backup(secrets_path)?;
+        loaded.apply_to(data);
+        if !protected {
+            write_secrets_data(secrets_path, &SecretsData::from_app_data(data))?;
+        }
     } else if had_inline_secrets {
         write_secrets_data(secrets_path, &legacy)?;
     }
@@ -185,6 +199,12 @@ mod tests {
                 .map(String::as_str),
             Some("workspace-secret")
         );
+        let protected_file = fs::read_to_string(&secrets_path).expect("protected secrets read");
+        let envelope: SecretsEnvelope =
+            serde_json::from_str(&protected_file).expect("protected envelope");
+        assert_eq!(envelope.version, SECRETS_ENVELOPE_VERSION);
+        assert!(!protected_file.contains("shared-secret"));
+        assert!(!protected_file.contains("workspace-secret"));
         let sanitized: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(&profile_path).expect("sanitized profile read"),
         )
@@ -375,7 +395,68 @@ fn write_data(path: &Path, data: &AppData) -> AppResult<()> {
 }
 
 fn write_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> {
-    write_json(path, data)
+    let plaintext = serde_json::to_vec(data)?;
+    let (protection, protected) = secret_protection::protect(&plaintext)
+        .map_err(crate::error::AppError::Message)?;
+    let envelope = SecretsEnvelope {
+        version: SECRETS_ENVELOPE_VERSION,
+        protection: protection.into(),
+        payload: BASE64_STANDARD.encode(protected),
+    };
+    write_json(path, &envelope)
+}
+
+fn load_secrets_with_backup(path: &Path) -> AppResult<(SecretsData, bool)> {
+    match read_secrets_file(path) {
+        Ok(data) => Ok(data),
+        Err(primary_error) => {
+            let backup = backup_path(path);
+            if !backup.exists() {
+                return Err(primary_error);
+            }
+            let recovered = read_secrets_file(&backup).map_err(|backup_error| {
+                crate::error::AppError::Message(format!(
+                    "凭据文件损坏且备份无法读取：主文件错误：{primary_error}；备份错误：{backup_error}"
+                ))
+            })?;
+            write_secrets_data(path, &recovered.0)?;
+            eprintln!(
+                "凭据文件 {} 损坏，已从 {} 恢复",
+                path.display(),
+                backup.display()
+            );
+            Ok((recovered.0, true))
+        }
+    }
+}
+
+fn read_secrets_file(path: &Path) -> AppResult<(SecretsData, bool)> {
+    let raw = fs::read_to_string(path)?;
+    if let Ok(envelope) = serde_json::from_str::<SecretsEnvelope>(&raw) {
+        if envelope.version != SECRETS_ENVELOPE_VERSION {
+            return Err(crate::error::AppError::Message(format!(
+                "不支持的凭据文件版本：{}",
+                envelope.version
+            )));
+        }
+        let protected = BASE64_STANDARD.decode(envelope.payload).map_err(|error| {
+            crate::error::AppError::Message(format!("凭据载荷 Base64 无效：{error}"))
+        })?;
+        let plaintext = secret_protection::unprotect(&envelope.protection, &protected)
+            .map_err(crate::error::AppError::Message)?;
+        let data = serde_json::from_slice::<SecretsData>(&plaintext).map_err(|error| {
+            crate::error::AppError::Message(format!("无法解析解密后的凭据文件：{error}"))
+        })?;
+        return Ok((data, true));
+    }
+
+    let legacy = serde_json::from_str::<SecretsData>(&raw).map_err(|error| {
+        crate::error::AppError::Message(format!(
+            "无法解析凭据文件 {}：{error}",
+            path.display()
+        ))
+    })?;
+    Ok((legacy, false))
 }
 
 fn write_json<T>(path: &Path, data: &T) -> AppResult<()>
@@ -428,7 +509,7 @@ fn read_data(path: &Path) -> AppResult<AppData> {
 
 #[cfg(test)]
 fn read_secrets_data(path: &Path) -> AppResult<SecretsData> {
-    read_json(path)
+    read_secrets_file(path).map(|value| value.0)
 }
 
 fn read_json<T>(path: &Path) -> AppResult<T>
