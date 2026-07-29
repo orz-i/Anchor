@@ -118,7 +118,7 @@
     frp_subdomain: profile?.tunnel.frp_subdomain ?? "",
     frp_profile_id: profile?.tunnel.frp_profile_id ?? "",
     frp_server_port: profile?.tunnel.frp_server_port ?? 7000,
-    cloudflare_mode: profile?.tunnel.cloudflare_mode ?? "quick",
+    cloudflare_mode: profile?.tunnel.cloudflare_mode ?? "named",
     use_proxy: profile?.tunnel.use_proxy ?? true,
   });
 
@@ -129,7 +129,7 @@
     frp_subdomain: actions?.frp_subdomain ?? "",
     frp_profile_id: actions?.frp_profile_id ?? "",
     frp_server_port: actions?.frp_server_port ?? 7000,
-    cloudflare_mode: actions?.cloudflare_mode ?? "quick",
+    cloudflare_mode: actions?.cloudflare_mode ?? "named",
     use_proxy: actions?.use_proxy ?? true,
   });
 

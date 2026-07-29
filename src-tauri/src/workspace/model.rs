@@ -179,6 +179,10 @@ fn default_cloudflare_mode() -> String {
     "quick".to_string()
 }
 
+fn default_new_cloudflare_mode() -> String {
+    "named".to_string()
+}
+
 fn default_use_proxy() -> bool {
     true
 }
@@ -259,7 +263,7 @@ impl Default for TunnelConfig {
             frp_subdomain: String::new(),
             frp_profile_id: String::new(),
             frp_server_port: default_frp_server_port(),
-            cloudflare_mode: default_cloudflare_mode(),
+            cloudflare_mode: default_new_cloudflare_mode(),
             use_proxy: default_use_proxy(),
         }
     }
@@ -304,7 +308,7 @@ impl Default for ActionsConfig {
             frp_subdomain: String::new(),
             frp_profile_id: String::new(),
             frp_server_port: default_frp_server_port(),
-            cloudflare_mode: default_cloudflare_mode(),
+            cloudflare_mode: default_new_cloudflare_mode(),
             cloudflare_token: String::new(),
             use_proxy: default_use_proxy(),
             local_port: default_actions_port(),
@@ -473,13 +477,13 @@ mod tests {
     use super::{ActionsConfig, RuntimeConfig, TunnelConfig, WorkspaceProfile};
 
     #[test]
-    fn workspace_defaults_to_cloudflare_quick_tunnels() {
+    fn workspace_defaults_to_stable_cloudflare_named_tunnels() {
         let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
 
         assert_eq!(profile.tunnel.tunnel_type, "cloudflare");
-        assert_eq!(profile.tunnel.cloudflare_mode, "quick");
+        assert_eq!(profile.tunnel.cloudflare_mode, "named");
         assert_eq!(profile.actions.tunnel_type, "cloudflare");
-        assert_eq!(profile.actions.cloudflare_mode, "quick");
+        assert_eq!(profile.actions.cloudflare_mode, "named");
     }
 
     #[test]

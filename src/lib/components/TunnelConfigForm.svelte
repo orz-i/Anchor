@@ -37,7 +37,7 @@
     frp_subdomain: "",
     frp_profile_id: "",
     frp_server_port: 7000,
-    cloudflare_mode: "quick",
+    cloudflare_mode: "named",
     use_proxy: true,
   });
   let saving = $state(false);
@@ -281,6 +281,16 @@
         <option value="named">Named Tunnel</option>
       </select>
     </label>
+
+    {#if draft.cloudflare_mode === "quick"}
+      <p class="text-xs text-[var(--color-warning)]">
+        Quick Tunnel 仅适合临时测试；服务重启后公网地址可能变化，ChatGPT 中保存的连接不会自动迁移。
+      </p>
+    {:else}
+      <p class="text-xs text-[var(--color-text-muted)]">
+        Named Tunnel 使用固定公网地址，适合长期连接。需要 Tunnel Token 和已配置的公网 URL。
+      </p>
+    {/if}
 
     {#if showCloudflareToken}
       <SecretTokenField

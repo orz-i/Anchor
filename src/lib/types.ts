@@ -179,7 +179,7 @@ export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {
     tunnel_type: "cloudflare",
     frp_server: "",
     frp_subdomain: "",
-    cloudflare_mode: "quick",
+    cloudflare_mode: "named",
     local_port: DEFAULT_ACTIONS_PORT,
     permission_mode: "trusted",
     auth_type: "api_key",
