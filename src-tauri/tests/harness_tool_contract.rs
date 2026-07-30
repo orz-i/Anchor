@@ -43,6 +43,55 @@ fn begin_work_session_binds_history_and_task_idempotently() {
 }
 
 #[test]
+fn observation_token_accepts_exact_current_baseline_and_rejects_stale_tokens() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("main.txt"), "one\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
+        .expect("创建上下文");
+    let started = call_tool(&ctx, "start_task", &json!({"objective": "接受当前基线"}));
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    fs::write(workspace.join("main.txt"), "two\n").expect("外部修改");
+
+    let status = call_tool(&ctx, "harness_status", &json!({}));
+    assert_eq!(status["baseline_matches"], false);
+    let token = status["observation_token"]
+        .as_str()
+        .expect("observation token")
+        .to_string();
+    let accepted = call_tool(
+        &ctx,
+        "accept_current_baseline",
+        &json!({
+            "task_id": task_id,
+            "observation_token": token,
+            "reason": "接受已审阅的外部修改"
+        }),
+    );
+    assert_eq!(accepted["ok"], true);
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(accepted["harness"]["baseline_matches"], true);
+
+    let stale_token = accepted["harness"]["observation_token"]
+        .as_str()
+        .expect("new observation token")
+        .to_string();
+    fs::write(workspace.join("main.txt"), "three\n").expect("再次修改");
+    let stale = call_tool(
+        &ctx,
+        "accept_current_baseline",
+        &json!({
+            "task_id": task_id,
+            "observation_token": stale_token,
+            "reason": "不应接受过期观察"
+        }),
+    );
+    assert_eq!(stale["ok"], false);
+    assert_eq!(stale["error"]["code"], "BASELINE_OBSERVATION_STALE");
+}
+
+#[test]
 fn expected_failure_disposition_allows_audited_task_completion() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

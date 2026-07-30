@@ -18,6 +18,10 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let diagnostic_mode = args
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("exact");
     let file_patches = parse_unified_diff(patch)?;
     if file_patches.is_empty() {
         return Err(patch_failed("No files were modified."));
@@ -76,7 +80,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             continue;
         }
 
-        let updated = apply_hunks(&original, &fp.hunks)?;
+        let updated = apply_hunks(&resolved.display, &original, &fp.hunks, diagnostic_mode)?;
         let op = if resolved.existed { "update" } else { "add" };
         staged.insert(resolved.display.clone(), Some(updated));
         affected.push(json!({ "path": resolved.display, "operation": op }));
@@ -119,6 +123,80 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         "would_delete": files_deleted,
         "warnings": []
     })))
+}
+
+fn hunk_context_mismatch(
+    file: &str,
+    hunk_index: usize,
+    lines: &[String],
+    expected: &[String],
+    diagnostic_mode: &str,
+) -> WorkspaceError {
+    let (nearest_index, nearest_context, matched_lines) = nearest_hunk_context(lines, expected);
+    let denominator = expected.len().max(1) as f64;
+    let confidence = matched_lines as f64 / denominator;
+    WorkspaceError::ToolDetails {
+        code: "PATCH_FAILED",
+        message: format!(
+            "Patch hunk {} did not match {} near line {}.",
+            hunk_index + 1,
+            file,
+            nearest_index + 1
+        ),
+        category: "validation",
+        retryable: true,
+        details: json!({
+            "file": file,
+            "hunk_index": hunk_index,
+            "failure_code": "HUNK_CONTEXT_MISMATCH",
+            "expected_context": expected.iter().take(24).collect::<Vec<_>>(),
+            "nearest_context": nearest_context,
+            "line_hint": nearest_index + 1,
+            "encoding": "utf-8",
+            "match_confidence": confidence,
+            "mode": diagnostic_mode,
+            "file_line_count": lines.len(),
+            "suggested_patch": {
+                "action": "regenerate_from_current_file",
+                "read_tool": "read_file",
+                "arguments": {
+                    "path": file,
+                    "start_line": nearest_index.saturating_sub(3) + 1,
+                    "end_line": (nearest_index + expected.len() + 3).min(lines.len()).max(1)
+                }
+            },
+            "suggestion": "读取 line_hint 附近的当前文件内容，基于 nearest_context 重新生成 patch；不要盲目重复同一 hunk。"
+        }),
+    }
+}
+
+fn nearest_hunk_context(
+    lines: &[String],
+    expected: &[String],
+) -> (usize, Vec<String>, usize) {
+    if lines.is_empty() || expected.is_empty() {
+        return (0, Vec::new(), 0);
+    }
+    let window = expected.len().min(lines.len());
+    let mut best_index = 0usize;
+    let mut best_score = 0usize;
+    for index in 0..=lines.len().saturating_sub(window) {
+        let score = lines[index..index + window]
+            .iter()
+            .zip(expected.iter())
+            .filter(|(actual, expected)| actual == expected)
+            .count();
+        if score > best_score {
+            best_index = index;
+            best_score = score;
+        }
+    }
+    let end = (best_index + expected.len()).min(lines.len());
+    (
+        best_index,
+        lines[best_index..end].iter().take(24).cloned().collect(),
+        best_score,
+    )
 }
 
 pub fn patch_check(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -327,7 +405,12 @@ fn parse_diff_path(raw: &str) -> String {
     path.replace('\\', "/")
 }
 
-fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError> {
+fn apply_hunks(
+    file: &str,
+    original: &str,
+    hunks: &[Hunk],
+    diagnostic_mode: &str,
+) -> Result<String, WorkspaceError> {
     let line_ending = if original.contains("\r\n") {
         "\r\n"
     } else {
@@ -344,7 +427,7 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError>
     };
     let mut offset: i64 = 0;
 
-    for hunk in hunks {
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
         let search_at = 0usize;
         let hunk_old: Vec<String> = hunk
             .lines
@@ -355,8 +438,15 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError>
             })
             .collect();
 
-        let pos = find_hunk_position(&lines, &hunk_old, search_at)
-            .ok_or_else(|| patch_failed("Hunk context did not match file content."))?;
+        let pos = find_hunk_position(&lines, &hunk_old, search_at).ok_or_else(|| {
+            hunk_context_mismatch(
+                file,
+                hunk_index,
+                &lines,
+                &hunk_old,
+                diagnostic_mode,
+            )
+        })?;
 
         let mut idx = pos;
         for hl in &hunk.lines {
@@ -620,7 +710,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            apply_hunks(input, &[hunk]).expect("patch"),
+            apply_hunks("main.txt", input, &[hunk], "exact").expect("patch"),
             "one\r\ninsert-a\r\ninsert-b\r\ntwo\r\n"
         );
     }

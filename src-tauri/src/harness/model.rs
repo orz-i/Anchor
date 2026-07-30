@@ -92,6 +92,7 @@ pub struct HarnessStatus {
     pub expected_branch: Option<String>,
     pub expected_head: Option<String>,
     pub expected_fingerprint: Option<String>,
+    pub observation_token: Option<String>,
     pub baseline_matches: Option<bool>,
     pub capabilities: HashMap<String, CapabilityStatus>,
     pub next_actions: Vec<String>,

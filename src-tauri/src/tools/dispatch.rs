@@ -20,13 +20,22 @@ fn policy_tool_err(err: PolicyError) -> Value {
         "POLICY_REJECTED"
     };
     let message = protected.or(dangerous).unwrap_or(&err.0).to_string();
+    let alternatives = policy_alternatives(&message);
+    let recoverable = !alternatives.is_empty();
     let (reason, suggestion) = if dangerous.is_some() {
         (
             "dangerous_mode_required",
             "模型参数不能作为用户批准凭证；请由操作者在受信任控制面将权限模式切换为 dangerous 后重试",
         )
     } else if message.contains("allowlisted") {
-        ("command_rejected", "改用允许的命令，或调整工作区命令白名单")
+        (
+            "command_rejected",
+            if recoverable {
+                "使用返回的安全替代工具或命令重试"
+            } else {
+                "改用允许的命令，或由操作者调整工作区命令白名单"
+            },
+        )
     } else if message.contains("Shell chaining") {
         (
             "shell_syntax_rejected",
@@ -39,14 +48,48 @@ fn policy_tool_err(err: PolicyError) -> Value {
         code,
         message,
         category: "policy",
-        retryable: false,
+        retryable: recoverable,
         details: json!({
             "stage": "policy",
             "reason": reason,
-            "recoverable": false,
-            "suggestion": suggestion
+            "recoverable": recoverable,
+            "suggestion": suggestion,
+            "alternatives": alternatives
         }),
     })
+}
+
+fn policy_alternatives(message: &str) -> Vec<Value> {
+    let executable = message
+        .strip_prefix("Command is not allowlisted: ")
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match executable.as_str() {
+        "rg" | "ripgrep" => vec![
+            json!({
+                "type": "tool",
+                "name": "search_text",
+                "reason": "使用 Anchor 的受控文本搜索，不需要额外命令白名单"
+            }),
+            json!({
+                "type": "command",
+                "command": "grep",
+                "reason": "grep 位于默认诊断命令白名单；调用者需根据原参数重新构造安全参数"
+            }),
+        ],
+        "corepack" => vec![json!({
+            "type": "command",
+            "command": "pnpm",
+            "reason": "pnpm 已在默认白名单中；仅当原命令形如 corepack pnpm ... 时可移除 wrapper"
+        })],
+        "findstr" => vec![json!({
+            "type": "tool",
+            "name": "search_text",
+            "reason": "使用跨平台工作区文本搜索"
+        })],
+        _ => Vec::new(),
+    }
 }
 
 fn advances_expected_state(name: &str, output: &Value) -> bool {

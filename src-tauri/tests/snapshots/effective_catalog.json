@@ -1,7 +1,8 @@
 {
   "advanced": {
-    "digest": "86fc1cd1412a173edb262232c28c2b19a21f07c5252ecb355a4caba700ab06f8",
+    "digest": "b2ee2347bd10c11505da744cc2dc63633f8e54376b3c76f5e5901b14650469b8",
     "names": [
+      "accept_current_baseline",
       "apply_patch",
       "begin_work_session",
       "change_summary",
@@ -47,7 +48,7 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 44
+    "tool_count": 45
   },
   "core": {
     "digest": "b42310b5b2d0a960a4ca6271ba59cdff4a317b39be73af27fd14ac69a3534a08",

@@ -25,6 +25,25 @@ pub struct Harness {
     store: HarnessStore,
 }
 
+fn baseline_observation_token(
+    workspace_id: &str,
+    task_id: &str,
+    baseline: &ProjectBaseline,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"anchor-baseline-observation-v1\0");
+    hasher.update(workspace_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(task_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(baseline.branch.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(baseline.head.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(baseline.worktree_fingerprint.as_bytes());
+    format!("anchor-observation-v1:{:x}", hasher.finalize())
+}
+
 impl Harness {
     pub fn new(workspace_root: PathBuf, harness_root: PathBuf) -> HarnessResult<Self> {
         let workspace_root = workspace_root
@@ -71,6 +90,28 @@ impl Harness {
             json!({"ok": true}),
         )?;
         Ok(task)
+    }
+
+    pub fn accept_current_baseline(
+        &self,
+        task_id: &str,
+        observation_token: &str,
+        reason: &str,
+    ) -> HarnessResult<TaskSession> {
+        let current = capture_baseline(&self.workspace_root);
+        let expected_token = baseline_observation_token(&self.workspace_id, task_id, &current);
+        if observation_token != expected_token {
+            return Err(HarnessError::new(
+                "BASELINE_OBSERVATION_STALE",
+                "工作区状态已变化或 observation_token 不属于当前任务；请重新读取 harness_status",
+            ));
+        }
+        self.refresh_baseline(
+            task_id,
+            current.head.as_deref(),
+            &current.worktree_fingerprint,
+            reason,
+        )
     }
 
     pub fn default_root() -> HarnessResult<PathBuf> {
@@ -845,6 +886,7 @@ impl Harness {
         } else if baseline_matches == Some(false) {
             next_actions.push("project_state".into());
             next_actions.push("git_diff".into());
+            next_actions.push("accept_current_baseline".into());
             next_actions.push("refresh_baseline".into());
         } else if !writable {
             next_actions.push("resume_task".into());
@@ -871,6 +913,9 @@ impl Harness {
             expected_fingerprint: expected
                 .as_ref()
                 .map(|state| state.worktree_fingerprint.clone()),
+            observation_token: task
+                .as_ref()
+                .map(|task| baseline_observation_token(&self.workspace_id, &task.id, &current)),
             baseline_matches,
             capabilities,
             next_actions,

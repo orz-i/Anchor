@@ -26,6 +26,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "project_state",
     "start_task",
     "refresh_baseline",
+    "accept_current_baseline",
     "stage_commit",
     "update_task",
     "pause_task",
@@ -51,6 +52,7 @@ pub fn call(
         "project_state" => project_state(ctx, args),
         "start_task" => start_task(ctx, args),
         "refresh_baseline" => refresh_baseline(ctx, args),
+        "accept_current_baseline" => accept_current_baseline(ctx, args),
         "stage_commit" => super::stage_commit::run(ctx, args, cancellation),
         "update_task" => update_task(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
@@ -62,6 +64,29 @@ pub fn call(
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     Ok(tool_ok(value))
+}
+
+fn accept_current_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let observation_token = args
+        .get("observation_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "observation_token 是必填项"))?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
+    let task = ctx
+        .harness
+        .accept_current_baseline(task_id, observation_token, reason)
+        .map_err(map_error)?;
+    Ok(json!({
+        "task": task_view(&task),
+        "harness": ctx.harness.status().map_err(map_error)?,
+        "accepted": true
+    }))
 }
 
 fn update_verification_disposition(
@@ -1243,7 +1268,10 @@ fn tool_error(code: &'static str, message: impl Into<String>) -> WorkspaceError 
         category: "permission",
         retryable: matches!(
             code,
-            "TASK_ALREADY_ACTIVE" | "FILE_CHANGED_EXTERNALLY" | "BASELINE_STALE"
+            "TASK_ALREADY_ACTIVE"
+                | "FILE_CHANGED_EXTERNALLY"
+                | "BASELINE_STALE"
+                | "BASELINE_OBSERVATION_STALE"
         ),
     }
 }

@@ -25,6 +25,47 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn patch_check_reports_hunk_and_nearest_context_diagnostics() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(
+        &ctx,
+        "patch_check",
+        json!({
+            "mode": "fuzzy",
+            "patch": "--- a/src/math.js\n+++ b/src/math.js\n@@\n-function missing() { return 1; }\n+function missing() { return 2; }\n"
+        }),
+    );
+    let error = assert_err(&out);
+    assert_eq!(error["error"]["code"], "PATCH_FAILED");
+    let details = &error["error"]["details"];
+    assert_eq!(details["file"], "src/math.js");
+    assert_eq!(details["hunk_index"], 0);
+    assert_eq!(details["failure_code"], "HUNK_CONTEXT_MISMATCH");
+    assert_eq!(details["mode"], "fuzzy");
+    assert!(details["line_hint"].as_u64().is_some());
+    assert!(details["nearest_context"].is_array());
+    assert_eq!(details["suggested_patch"]["read_tool"], "read_file");
+}
+
+#[test]
+fn policy_rejection_returns_safe_structured_alternatives() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "exec_command", json!({"cmd": "rg hello"}));
+    let error = assert_err(&out);
+    assert_eq!(error["error"]["code"], "POLICY_REJECTED");
+    assert_eq!(error["error"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["recoverable"], true);
+    let alternatives = error["error"]["details"]["alternatives"]
+        .as_array()
+        .expect("alternatives");
+    assert!(alternatives
+        .iter()
+        .any(|alternative| alternative["name"] == "search_text"));
+}
+
+#[test]
 fn read_file_happy_path() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

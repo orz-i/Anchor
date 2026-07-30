@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 6;
+pub const CATALOG_VERSION: u32 = 7;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -8,6 +8,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Harness status",
         "Return durable task, workspace, capability, and recovery status.",
         true,
+        false,
+        false,
+    ),
+    (
+        "accept_current_baseline",
+        "Accept current baseline",
+        "Accept the currently observed workspace HEAD and fingerprint using a task-bound observation token.",
+        false,
         false,
         false,
     ),
@@ -416,6 +424,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "begin_work_session",
     "close_work_session",
     "update_verification_disposition",
+    "accept_current_baseline",
     "server_info",
     "list_skills",
     "load_skill",
@@ -463,6 +472,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "begin_work_session",
     "close_work_session",
     "update_verification_disposition",
+    "accept_current_baseline",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -788,6 +798,14 @@ pub fn output_schema(name: &str) -> Value {
                 "command_cost_policy",
                 "downstream_mcp",
             ],
+        ),
+        "accept_current_baseline" => success_output_schema(
+            json!({
+                "accepted": { "type": "boolean", "const": true },
+                "task": { "type": "object" },
+                "harness": { "type": "object" }
+            }),
+            &["accepted", "task", "harness"],
         ),
         "read_file" => success_output_schema(
             json!({
@@ -1227,6 +1245,7 @@ pub fn output_schema(name: &str) -> Value {
                 "expected_branch": { "type": ["string", "null"] },
                 "expected_head": { "type": ["string", "null"] },
                 "expected_fingerprint": { "type": ["string", "null"] },
+                "observation_token": { "type": ["string", "null"] },
                 "capabilities": { "type": "object" },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
                 "reason": { "type": "string" },
@@ -1504,6 +1523,16 @@ pub fn input_schema(name: &str) -> Value {
                 "query": { "type": "string", "description": "Optional case-insensitive name/description filter" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 }
             },
+            "additionalProperties": false
+        }),
+        "accept_current_baseline" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "observation_token": { "type": "string", "minLength": 32 },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+            },
+            "required": ["task_id", "observation_token", "reason"],
             "additionalProperties": false
         }),
         "stage_commit" => json!({
@@ -1836,7 +1865,8 @@ pub fn input_schema(name: &str) -> Value {
         "patch_check" => json!({
             "type": "object",
             "properties": {
-                "patch": { "type": "string", "minLength": 1 }
+                "patch": { "type": "string", "minLength": 1 },
+                "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" }
             },
             "required": ["patch"],
             "additionalProperties": false
