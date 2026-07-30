@@ -2031,7 +2031,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, normalize_tool_profile, output_schema};
 
     #[test]
-    fn core_catalog_exposes_25_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_28_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2039,7 +2039,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 28);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -2047,6 +2047,9 @@ mod tests {
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"history_session_validate"));
+        assert!(names.contains(&"begin_work_session"));
+        assert!(names.contains(&"close_work_session"));
+        assert!(names.contains(&"wait_command"));
         assert!(names.contains(&"search_text"));
         assert!(!names.contains(&"grep_text"));
         assert!(!names.contains(&"grep"));

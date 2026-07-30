@@ -153,7 +153,7 @@ mod tests {
         .is_err());
         assert!(validate_tool_input(
             "exec_command",
-            &json!({"cmd": "cargo check", "timeout_ms": 600001})
+            &json!({"cmd": "cargo check", "timeout_ms": 3600001})
         )
         .is_err());
     }
