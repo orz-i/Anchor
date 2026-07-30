@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "b967bc9386df452d34e8e29133244258ae2d9766b6c6ee3d5a8be5fd52ac3907",
+    "digest": "d87e366ccbad7ef9d9f1e2973334b2b81fcec033c5f31a97aaba4df405dec3d7",
     "names": [
       "apply_patch",
       "change_summary",
@@ -41,12 +41,13 @@
       "task_context",
       "update_task",
       "view_image",
+      "wait_command",
       "write_stdin"
     ],
-    "tool_count": 40
+    "tool_count": 41
   },
   "core": {
-    "digest": "ebf62a97695c3ccc8423fe7a9300becc105c9ad2dc071866a49cd00ef6dd22ce",
+    "digest": "8e01c3369e919c95b4e06f3eda15306048bbf99b29d5f830d7f4f165be5d4796",
     "names": [
       "apply_patch",
       "check_exec_environment",
@@ -72,12 +73,13 @@
       "server_info",
       "set_default_cwd",
       "view_image",
+      "wait_command",
       "write_stdin"
     ],
-    "tool_count": 25
+    "tool_count": 26
   },
   "read-only": {
-    "digest": "1715e2a31b0686b620f132b6cdb2ed01d76be484aa5468701baa56415d0e5b89",
+    "digest": "b9fcfa3c316ae62f0dce604881d02bc3f1cab043bf6b34544b60b8fef7145233",
     "names": [
       "check_exec_environment",
       "get_default_cwd",
@@ -95,8 +97,9 @@
       "read_skill_resource",
       "search_text",
       "server_info",
-      "view_image"
+      "view_image",
+      "wait_command"
     ],
-    "tool_count": 17
+    "tool_count": 18
   }
 }

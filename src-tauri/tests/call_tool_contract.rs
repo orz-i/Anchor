@@ -164,7 +164,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 25);
+    assert_eq!(names.len(), 26);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
@@ -173,6 +173,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
+    assert!(names.contains("wait_command"));
     assert!(!names.contains("harness_status"));
     assert!(!names.contains("start_task"));
 }
@@ -244,6 +245,48 @@ fn direct_exec_uses_the_same_result_contract() {
     assert_eq!(payload["duration_ms"], payload["elapsed_ms"]);
     assert_eq!(payload["transport_ok"], true);
     assert_eq!(payload["command_ok"], true);
+    assert_eq!(payload["cost_policy"]["cost_class"], "free");
+}
+
+#[test]
+fn wait_command_returns_terminal_state_and_incremental_output() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": format!(
+                "{TEST_PYTHON} -c \"import time; print('started', flush=True); time.sleep(0.1); print('finished', flush=True)\""
+            ),
+            "filesystem_scope": "workspace",
+            "timeout_ms": 5_000,
+            "yield_time_ms": 0
+        }),
+    );
+    let payload = assert_ok(&result);
+    let session_id = payload["session_id"].as_str().expect("session id");
+
+    let waited = invoke(
+        &ctx,
+        "wait_command",
+        json!({
+            "session_id": session_id,
+            "timeout_ms": 2_000,
+            "stdout_offset": 0,
+            "stderr_offset": 0,
+            "return_incremental_output": true
+        }),
+    );
+    let waited = assert_ok(&waited);
+    assert_eq!(waited["state"], "completed");
+    assert_eq!(waited["exit_code"], 0);
+    assert_eq!(waited["command_ok"], true);
+    assert!(waited["started_at"].as_str().is_some_and(|value| value.ends_with('Z')));
+    assert!(waited["last_output_at"].as_str().is_some_and(|value| value.ends_with('Z')));
+    let stdout = waited["stdout"]["content"].as_str().expect("stdout");
+    assert!(stdout.contains("started"));
+    assert!(stdout.contains("finished"));
 }
 
 #[test]

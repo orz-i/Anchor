@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
@@ -19,6 +20,129 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
     max_sessions: usize,
     terminal_retention: Duration,
+}
+
+pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkspaceError::invalid_argument("session_id is required"))?;
+    let session = store.get(session_id)?;
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .min(60_000);
+    let stdout_offset = args
+        .get("stdout_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let stderr_offset = args
+        .get("stderr_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(65_536)
+        .clamp(1, 1_048_576) as usize;
+    let return_incremental = args
+        .get("return_incremental_output")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let stop_patterns = args
+        .get("stop_on_patterns")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .take(16)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let matched_pattern = crate::async_runtime::block_on(async {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            session.refresh_status().await;
+            let stdout = session.retained_stream_bytes("stdout").0;
+            let stderr = session.retained_stream_bytes("stderr").0;
+            if let Some(pattern) = stop_patterns.iter().find(|pattern| {
+                String::from_utf8_lossy(&stdout).contains(pattern.as_str())
+                    || String::from_utf8_lossy(&stderr).contains(pattern.as_str())
+            }) {
+                break Some(pattern.clone());
+            }
+            if session.has_exited() || Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    if session.has_exited() {
+        crate::async_runtime::block_on(session.wait_for_readers());
+    }
+    let snapshot = session.snapshot(limit);
+    let termination_reason = snapshot
+        .get("termination_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    let exit_code = snapshot.get("exit_code").and_then(Value::as_i64);
+    let state = match termination_reason {
+        "running" => "running",
+        "exited" if exit_code == Some(0) => "completed",
+        "exited" => "failed",
+        "cancelled" | "killed" => "cancelled",
+        _ => "failed",
+    };
+    let stdout = incremental_stream(&session, "stdout", stdout_offset, limit, return_incremental);
+    let stderr = incremental_stream(&session, "stderr", stderr_offset, limit, return_incremental);
+
+    Ok(tool_ok(json!({
+        "session_id": session_id,
+        "state": state,
+        "status": snapshot["status"],
+        "termination_reason": termination_reason,
+        "exit_code": snapshot["exit_code"],
+        "command_ok": snapshot["command_ok"],
+        "started_at": snapshot["started_at"],
+        "elapsed_ms": snapshot["elapsed_ms"],
+        "last_output_at": snapshot["last_output_at"],
+        "stdin_open": snapshot["stdin_open"],
+        "stdout": stdout,
+        "stderr": stderr,
+        "stop_pattern_matched": matched_pattern,
+        "wait_timeout_ms": timeout_ms,
+        "warnings": []
+    })))
+}
+
+fn incremental_stream(
+    session: &ExecSession,
+    stream: &str,
+    offset: usize,
+    limit: usize,
+    include_content: bool,
+) -> Value {
+    let (data, total_stream_bytes) = session.retained_stream_bytes(stream);
+    let page = page_retained_output(&data, total_stream_bytes, offset, limit);
+    json!({
+        "output_ref": format!("session:{}:{stream}", session.session_id),
+        "offset": page.effective_offset,
+        "requested_offset": offset,
+        "retained_start_offset": page.retained_start_offset,
+        "content": if include_content { String::from_utf8_lossy(page.content).into_owned() } else { String::new() },
+        "next_offset": page.next_offset.unwrap_or(total_stream_bytes as u64),
+        "total_stream_bytes": total_stream_bytes,
+        "truncated": page.evicted_before_offset || page.next_offset.is_some()
+    })
+}
+
+fn timestamp() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl Default for SessionStore {
@@ -176,6 +300,8 @@ pub struct ExecSession {
     stdout: Mutex<StreamBuffer>,
     stderr: Mutex<StreamBuffer>,
     pub started_at: Instant,
+    started_at_iso: String,
+    last_output_at: Mutex<String>,
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
     last_access: Mutex<Instant>,
@@ -209,6 +335,7 @@ impl ExecSession {
         let session_id = Uuid::new_v4().to_string();
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
+        let started_at_iso = timestamp();
         Self {
             session_id,
             child: AsyncMutex::new(child),
@@ -218,6 +345,8 @@ impl ExecSession {
             stdout: Mutex::new(StreamBuffer::default()),
             stderr: Mutex::new(StreamBuffer::default()),
             started_at: Instant::now(),
+            started_at_iso: started_at_iso.clone(),
+            last_output_at: Mutex::new(started_at_iso),
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
             last_access: Mutex::new(Instant::now()),
@@ -291,6 +420,7 @@ impl ExecSession {
                             .expect("stderr lock")
                             .append(chunk, SESSION_BUFFER_BYTES);
                     }
+                    *self.last_output_at.lock().expect("last output lock") = timestamp();
                 }
                 Err(_) => break,
             }
@@ -409,6 +539,8 @@ impl ExecSession {
             "stdout_truncated": stdout.truncated,
             "stderr_truncated": stderr.truncated,
             "elapsed_ms": self.started_at.elapsed().as_millis(),
+            "started_at": self.started_at_iso,
+            "last_output_at": self.last_output_at.lock().expect("last output lock").clone(),
             "output_refs": {
                 "stdout": format!("session:{}:stdout", self.session_id),
                 "stderr": format!("session:{}:stderr", self.session_id)

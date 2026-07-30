@@ -96,6 +96,9 @@ export interface RuntimeConfig {
   skill_service_enabled?: boolean;
   skill_roots?: string;
   strict_workspace_reads?: boolean;
+  external_paid_commands_enabled?: boolean;
+  external_paid_max_runs_per_day?: number;
+  external_paid_max_duration_seconds?: number;
 }
 
 export interface ActionsConfig {

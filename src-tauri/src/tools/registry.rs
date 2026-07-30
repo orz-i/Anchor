@@ -1,12 +1,20 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 3;
+pub const CATALOG_VERSION: u32 = 4;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "harness_status",
         "Harness status",
         "Return durable task, workspace, capability, and recovery status.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "wait_command",
+        "Wait for command",
+        "Wait for a retained command session and return explicit terminal state plus incremental stdout/stderr.",
         true,
         false,
         false,
@@ -344,6 +352,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "apply_patch",
     "exec_command",
     "write_stdin",
+    "wait_command",
     "kill_session",
     "read_output",
     "git_status",
@@ -366,6 +375,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "read_output",
+    "wait_command",
     "git_status",
     "git_diff",
     "git_log",
@@ -398,6 +408,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "patch_check",
     "exec_command",
     "write_stdin",
+    "wait_command",
     "kill_session",
     "read_output",
     "git_status",
@@ -454,6 +465,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "grep_text",
     "grep",
     "read_output",
+    "wait_command",
     "git_status",
     "git_diff",
     "git_log",
@@ -702,6 +714,7 @@ pub fn output_schema(name: &str) -> Value {
                 "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
                 "local_tool_count": { "type": "integer", "minimum": 0 },
                 "proxy_tool_count": { "type": "integer", "minimum": 0 },
+                "command_cost_policy": { "type": "object" },
                 "downstream_mcp": {
                     "type": "object",
                     "properties": {
@@ -740,6 +753,7 @@ pub fn output_schema(name: &str) -> Value {
                 "catalog_estimated_tokens",
                 "local_tool_count",
                 "proxy_tool_count",
+                "command_cost_policy",
                 "downstream_mcp",
             ],
         ),
@@ -893,6 +907,7 @@ pub fn output_schema(name: &str) -> Value {
                 "command_ok": { "type": ["boolean", "null"] },
                 "verification_pending": { "type": "boolean" },
                 "verification": { "type": "object", "additionalProperties": true },
+                "cost_policy": { "type": "object", "additionalProperties": true },
                 "warnings": warnings_property()
             }),
             &[
@@ -920,6 +935,30 @@ pub fn output_schema(name: &str) -> Value {
             ],
         ),
         "write_stdin" => session_snapshot_output_schema(),
+        "wait_command" => success_output_schema(
+            json!({
+                "session_id": { "type": "string", "minLength": 1 },
+                "state": { "type": "string", "enum": ["running", "completed", "failed", "cancelled"] },
+                "status": { "type": "string", "minLength": 1 },
+                "termination_reason": { "type": "string", "minLength": 1 },
+                "exit_code": nullable_integer_property(),
+                "command_ok": { "type": ["boolean", "null"] },
+                "started_at": { "type": "string", "minLength": 1 },
+                "elapsed_ms": { "type": "integer", "minimum": 0 },
+                "last_output_at": { "type": "string", "minLength": 1 },
+                "stdin_open": { "type": "boolean" },
+                "stdout": { "type": "object" },
+                "stderr": { "type": "object" },
+                "stop_pattern_matched": { "type": ["string", "null"] },
+                "wait_timeout_ms": { "type": "integer", "minimum": 0 },
+                "warnings": warnings_property()
+            }),
+            &[
+                "session_id", "state", "status", "termination_reason", "exit_code",
+                "command_ok", "started_at", "elapsed_ms", "last_output_at", "stdin_open",
+                "stdout", "stderr", "wait_timeout_ms", "warnings"
+            ],
+        ),
         "kill_session" => {
             let schema = session_snapshot_output_schema();
             append_output_condition(
@@ -1671,7 +1710,7 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "cmd": { "type": "string", "minLength": 1 },
                 "workdir": { "type": "string", "default": "." },
-                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 30000 },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 30000 },
                 "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
@@ -1695,6 +1734,20 @@ pub fn input_schema(name: &str) -> Value {
                 "chars": { "type": "string", "default": "" },
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "max_output_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536 }
+            },
+            "required": ["session_id"],
+            "additionalProperties": false
+        }),
+        "wait_command" => json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "minLength": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 30000 },
+                "stdout_offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "stderr_offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536 },
+                "return_incremental_output": { "type": "boolean", "default": true },
+                "stop_on_patterns": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1 } }
             },
             "required": ["session_id"],
             "additionalProperties": false

@@ -63,6 +63,9 @@ pub struct PolicySettings {
     pub workspace_script_extensions: HashSet<String>,
     pub max_patch_bytes: usize,
     pub permission_mode: String,
+    pub external_paid_commands_enabled: bool,
+    pub external_paid_max_runs_per_day: u32,
+    pub external_paid_max_duration_seconds: u64,
 }
 
 impl Default for PolicySettings {
@@ -73,6 +76,9 @@ impl Default for PolicySettings {
             workspace_script_extensions: default_workspace_script_extension_set(),
             max_patch_bytes: 200_000,
             permission_mode: "trusted".into(),
+            external_paid_commands_enabled: false,
+            external_paid_max_runs_per_day: 1,
+            external_paid_max_duration_seconds: 1800,
         }
     }
 }
@@ -87,6 +93,11 @@ impl PolicySettings {
             ),
             max_patch_bytes: 200_000,
             permission_mode: runtime.permission_mode.clone(),
+            external_paid_commands_enabled: runtime.external_paid_commands_enabled,
+            external_paid_max_runs_per_day: runtime.external_paid_max_runs_per_day.max(1),
+            external_paid_max_duration_seconds: runtime
+                .external_paid_max_duration_seconds
+                .clamp(1, 3600),
         }
     }
 
@@ -97,6 +108,9 @@ impl PolicySettings {
             workspace_script_extensions: default_workspace_script_extension_set(),
             max_patch_bytes: actions.max_patch_bytes as usize,
             permission_mode: actions.permission_mode.clone(),
+            external_paid_commands_enabled: false,
+            external_paid_max_runs_per_day: 1,
+            external_paid_max_duration_seconds: 1800,
         }
     }
 
@@ -314,8 +328,8 @@ pub fn validate_command_for_workspace(
     }
 
     if let Some(timeout_ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
-        if timeout_ms > 600_000 {
-            return Err(PolicyError("Command timeout exceeds 10 minutes".into()));
+        if timeout_ms > 3_600_000 {
+            return Err(PolicyError("Command timeout exceeds 60 minutes".into()));
         }
     }
 

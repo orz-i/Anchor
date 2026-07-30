@@ -571,6 +571,9 @@
         allowed_commands: draft.allowedCommands,
         workspace_local_entries: draft.workspaceLocalEntries,
         workspace_script_extensions: draft.workspaceScriptExtensions,
+        external_paid_commands_enabled: draft.externalPaidCommandsEnabled,
+        external_paid_max_runs_per_day: draft.externalPaidMaxRunsPerDay,
+        external_paid_max_duration_seconds: draft.externalPaidMaxDurationSeconds,
       },
     };
     await updateWorkspace(next);
@@ -883,6 +886,9 @@
                 allowedCommands={profile.runtime.allowed_commands ?? ""}
                 workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
                 workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}
+                externalPaidCommandsEnabled={profile.runtime.external_paid_commands_enabled ?? false}
+                externalPaidMaxRunsPerDay={profile.runtime.external_paid_max_runs_per_day ?? 1}
+                externalPaidMaxDurationSeconds={profile.runtime.external_paid_max_duration_seconds ?? 1800}
                 onSave={saveMcpPolicy}
               />
             </div>

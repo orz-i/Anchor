@@ -242,7 +242,7 @@ fn call_tool_impl(
     }
 
     let active_task = ctx.harness.current_task().ok().flatten();
-    let retained_session = if matches!(name, "write_stdin" | "kill_session") {
+    let retained_session = if matches!(name, "write_stdin" | "kill_session" | "wait_command") {
         effective_args
             .get("session_id")
             .and_then(Value::as_str)
@@ -313,6 +313,7 @@ fn call_tool_impl(
         "exec_command" => exec::exec_command_with_cancellation(ctx, &effective_args, cancellation),
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
+        "wait_command" => session::wait_command(&ctx.sessions, &effective_args),
         "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
         "git_status" => git::git_status(ws, &effective_args),
         "git_diff" => git::git_diff(ws, &effective_args),
@@ -661,6 +662,20 @@ fn server_info_for_session(
         "catalog_estimated_tokens": catalog.estimated_tokens,
         "local_tool_count": catalog.local_count,
         "proxy_tool_count": catalog.proxy_count,
+        "command_cost_policy": {
+            "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
+            "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
+            "external_paid_max_duration_seconds": ctx.policy.external_paid_max_duration_seconds,
+            "workspace_policy_path": ".anchor/command-policy.yml",
+            "approval_source": "trusted_runtime_config"
+        },
+        "command_cost_policy": {
+            "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
+            "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
+            "external_paid_max_duration_seconds": ctx.policy.external_paid_max_duration_seconds,
+            "workspace_policy_path": ".anchor/command-policy.yml",
+            "approval_source": "trusted_runtime_config"
+        },
         "downstream_mcp": ctx.mcp_proxies.status()
     })))
 }

@@ -1,5 +1,6 @@
 mod cancellation;
 pub mod catalog;
+pub mod command_cost;
 pub mod context;
 pub mod dispatch;
 pub mod exec;

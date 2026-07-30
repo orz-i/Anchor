@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::harness::Harness;
+use crate::tools::command_cost::CommandCostGuard;
 use crate::tools::policy::PolicySettings;
 use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
@@ -20,6 +21,7 @@ pub struct ToolContext {
     default_cwd: Mutex<PathBuf>,
     session_default_cwds: Mutex<HashMap<String, PathBuf>>,
     pub sessions: SessionStore,
+    pub command_cost: CommandCostGuard,
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -67,6 +69,7 @@ impl ToolContext {
         harness_root: PathBuf,
     ) -> Self {
         let root = workspace.root().to_path_buf();
+        let command_cost = CommandCostGuard::new(&harness_root, &root);
         Self {
             workspace,
             auth,
@@ -79,6 +82,7 @@ impl ToolContext {
             default_cwd: Mutex::new(root),
             session_default_cwds: Mutex::new(HashMap::new()),
             sessions: SessionStore::new(),
+            command_cost,
         }
     }
 

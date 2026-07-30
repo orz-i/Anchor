@@ -81,6 +81,13 @@ pub struct RuntimeConfig {
     /// operator-enabled dangerous profile may explicitly opt out.
     #[serde(default = "default_strict_workspace_reads")]
     pub strict_workspace_reads: bool,
+    /// Trusted-control-plane approval for commands classified as external_paid.
+    #[serde(default)]
+    pub external_paid_commands_enabled: bool,
+    #[serde(default = "default_external_paid_max_runs_per_day")]
+    pub external_paid_max_runs_per_day: u32,
+    #[serde(default = "default_external_paid_max_duration_seconds")]
+    pub external_paid_max_duration_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +253,14 @@ fn default_strict_workspace_reads() -> bool {
     true
 }
 
+fn default_external_paid_max_runs_per_day() -> u32 {
+    1
+}
+
+fn default_external_paid_max_duration_seconds() -> u64 {
+    1800
+}
+
 fn default_skill_roots() -> String {
     ".agents/skills\n.codex/skills\nskills".to_string()
 }
@@ -295,6 +310,9 @@ impl Default for RuntimeConfig {
             skill_service_enabled: default_skill_service_enabled(),
             skill_roots: default_skill_roots(),
             strict_workspace_reads: default_strict_workspace_reads(),
+            external_paid_commands_enabled: false,
+            external_paid_max_runs_per_day: default_external_paid_max_runs_per_day(),
+            external_paid_max_duration_seconds: default_external_paid_max_duration_seconds(),
         }
     }
 }

@@ -63,6 +63,17 @@ pub fn exec_command_with_cancellation(
         .unwrap_or("workspace")
         .to_string();
     validate_child_process_scope(ctx, args)?;
+    let requested_timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
+    let cost_decision = ctx.command_cost.evaluate(
+        ctx.workspace.root(),
+        cmd,
+        requested_timeout_ms,
+        &ctx.policy,
+    )?;
+    let timeout_ms = cost_decision.effective_timeout_ms();
     if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
         if cancellation.is_cancelled() {
             return Err(cancelled_error(None));
@@ -81,13 +92,10 @@ pub fn exec_command_with_cancellation(
             object.insert("child_process".into(), Value::Bool(false));
             object.insert("transport_ok".into(), Value::Bool(true));
             object.insert("command_ok".into(), Value::Bool(true));
+            object.insert("cost_policy".into(), cost_decision.to_value());
         }
         return Ok(tool_ok(result));
     }
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(30_000);
     let max_output = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -133,11 +141,17 @@ pub fn exec_command_with_cancellation(
                     Value::String("policy_only".into()),
                 );
                 object.insert("child_process".into(), Value::Bool(true));
+                object.insert("cost_policy".into(), cost_decision.to_value());
             }
             Ok(tool_ok(out))
         }
         Err(error) => match execution_failure_result(&error, cmd, &workdir.path) {
-            Some(result) => Ok(tool_ok(result)),
+            Some(mut result) => {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("cost_policy".into(), cost_decision.to_value());
+                }
+                Ok(tool_ok(result))
+            }
             None => Err(error),
         },
     }
