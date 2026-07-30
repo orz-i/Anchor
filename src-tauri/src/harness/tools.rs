@@ -481,7 +481,7 @@ fn collapse_operations(operations: Vec<OperationRecord>) -> Vec<Value> {
     order
         .into_iter()
         .filter_map(|id| grouped.remove(&id))
-        .filter_map(|records| collapse_operation(records))
+        .filter_map(collapse_operation)
         .collect()
 }
 
