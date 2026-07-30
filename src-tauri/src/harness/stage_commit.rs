@@ -294,6 +294,7 @@ fn execute_new_workflow(
     let _ = ctx.harness.record_operation(
         Some(&receipt.workflow_id),
         Some(task_id),
+        None,
         "stage_commit",
         "started",
         json!({
@@ -1053,6 +1054,7 @@ fn finish_operation(ctx: &ToolContext, receipt: &StageCommitReceipt, complete: b
     let _ = ctx.harness.record_operation(
         Some(&receipt.workflow_id),
         Some(&receipt.task_id),
+        None,
         "stage_commit",
         if complete { "completed" } else { "incomplete" },
         json!({"idempotency_key": receipt.idempotency_key}),

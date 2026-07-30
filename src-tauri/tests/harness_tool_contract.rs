@@ -5,6 +5,154 @@ use anchor_lib::tools::{call_tool, ToolContext};
 use serde_json::{json, Value};
 
 #[test]
+fn begin_work_session_binds_history_and_task_idempotently() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "initial\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
+        .expect("创建上下文");
+    let arguments = json!({
+        "objective": "统一工作会话测试",
+        "session_key": "work-session-contract",
+        "workspace_root": workspace.to_string_lossy()
+    });
+
+    let first = call_tool(&ctx, "begin_work_session", &arguments);
+    assert_eq!(first["ok"], true);
+    assert_eq!(first["work_session"]["status"], "active");
+    assert_eq!(first["work_session"]["task_created"], true);
+    assert_eq!(
+        first["work_session"]["history_session_key"],
+        "work-session-contract"
+    );
+    let task_id = first["work_session"]["task_id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let history_path = first["work_session"]["history_session_path"]
+        .as_str()
+        .expect("history path");
+    assert!(workspace.join(history_path).exists());
+    assert_eq!(first["task"]["history_session_key"], "work-session-contract");
+
+    let second = call_tool(&ctx, "begin_work_session", &arguments);
+    assert_eq!(second["ok"], true);
+    assert_eq!(second["work_session"]["task_created"], false);
+    assert_eq!(second["work_session"]["task_id"], task_id);
+}
+
+#[test]
+fn close_work_session_closes_task_and_checkpoints_bound_history() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
+        .expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "关闭统一工作会话",
+            "session_key": "close-work-session-contract",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+    );
+    let task_id = started["work_session"]["task_id"]
+        .as_str()
+        .expect("task id");
+    let expected_path = started["work_session"]["history_session_path"]
+        .as_str()
+        .expect("history path")
+        .to_string();
+
+    let closed = call_tool(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "allow_unverified": true,
+            "session_status": "paused",
+            "summary": "合约测试关闭",
+            "checkpoint": {
+                "findings": ["close_work_session contract passed"],
+                "runtime_state": ["test_fixture=true"]
+            }
+        }),
+    );
+    assert_eq!(closed["ok"], true);
+    assert_eq!(closed["work_session"]["closed"], true);
+    assert_eq!(closed["work_session"]["status"], "paused");
+    assert_eq!(closed["work_session"]["task_status"], "completed_unverified");
+    assert_eq!(closed["checkpoint"]["session_key"], "close-work-session-contract");
+    assert_eq!(closed["checkpoint"]["path"], expected_path);
+
+    let retried = call_tool(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "allow_unverified": true,
+            "session_status": "paused",
+            "summary": "合约测试关闭"
+        }),
+    );
+    assert_eq!(retried["ok"], true);
+    assert_eq!(retried["finish"]["idempotent_retry"], true);
+}
+
+#[test]
+fn operation_log_filters_and_collapses_bound_work_session_operations() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
+        .expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "作用域操作日志",
+            "session_key": "operation-scope-contract",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+    );
+    let task_id = started["work_session"]["task_id"]
+        .as_str()
+        .expect("task id");
+    let executed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": "python --version", "yield_time_ms": 30000}),
+    );
+    assert_eq!(executed["command_ok"], true);
+
+    let log = call_tool(
+        &ctx,
+        "operation_log",
+        &json!({
+            "task_id": task_id,
+            "history_session_key": "operation-scope-contract",
+            "tool": "exec_command",
+            "collapse": true,
+            "limit": 20
+        }),
+    );
+    assert_eq!(log["ok"], true);
+    assert_eq!(log["total_matches"], 1);
+    assert_eq!(log["operations"].as_array().unwrap().len(), 1);
+    let operation = &log["operations"][0];
+    assert_eq!(operation["task_id"], task_id);
+    assert_eq!(operation["history_session_key"], "operation-scope-contract");
+    assert_eq!(operation["tool"], "exec_command");
+    assert_eq!(operation["status"], "completed");
+    assert!(operation["started_at_iso"]
+        .as_str()
+        .is_some_and(|value| value.ends_with('Z')));
+    assert_eq!(log["summary"]["returned_operations"], 1);
+}
+
+#[test]
 fn 无任务时仍可执行_dry_run_预检() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

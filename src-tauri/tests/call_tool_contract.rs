@@ -164,7 +164,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 26);
+    assert_eq!(names.len(), 28);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
@@ -174,6 +174,8 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
     assert!(names.contains("wait_command"));
+    assert!(names.contains("begin_work_session"));
+    assert!(names.contains("close_work_session"));
     assert!(!names.contains("harness_status"));
     assert!(!names.contains("start_task"));
 }

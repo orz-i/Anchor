@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::Command;
 
@@ -8,7 +8,8 @@ use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::{CancellationToken, ToolContext};
 
 use super::model::{
-    HarnessEvent, HarnessSessionStatus, TaskSession, TaskStatus, VerificationRecord,
+    HarnessEvent, HarnessSessionStatus, OperationRecord, TaskSession, TaskStatus,
+    VerificationRecord,
 };
 use super::store::HarnessError;
 
@@ -19,6 +20,8 @@ const DEFAULT_EVENT_LIMIT: usize = 20;
 pub const TOOL_NAMES: &[&str] = &[
     "harness_status",
     "operation_log",
+    "begin_work_session",
+    "close_work_session",
     "project_state",
     "start_task",
     "refresh_baseline",
@@ -41,6 +44,8 @@ pub fn call(
     let value = match name {
         "harness_status" => harness_status(ctx),
         "operation_log" => operation_log(ctx, args),
+        "begin_work_session" => begin_work_session(ctx, args),
+        "close_work_session" => close_work_session(ctx, args),
         "project_state" => project_state(ctx, args),
         "start_task" => start_task(ctx, args),
         "refresh_baseline" => refresh_baseline(ctx, args),
@@ -55,6 +60,153 @@ pub fn call(
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     Ok(tool_ok(value))
+}
+
+fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let objective = args
+        .get("objective")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
+    let history = crate::tools::history::bootstrap(ctx, args)?;
+    let session_key = history
+        .get("session_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| tool_error("HISTORY_SESSION_INVALID", "History Session 缺少 session_key"))?;
+    let current_path = history
+        .get("current_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| tool_error("HISTORY_SESSION_INVALID", "History Session 缺少 current_path"))?;
+
+    let (task, task_created) = match ctx.harness.current_task().map_err(map_error)? {
+        Some(task) => {
+            if task.objective != objective {
+                return Err(tool_error(
+                    "WORK_SESSION_CONFLICT",
+                    format!("工作区已有活动任务 {}，目标与本次工作会话不同", task.id),
+                ));
+            }
+            (task, false)
+        }
+        None => (ctx.harness.start_task(objective).map_err(map_error)?, true),
+    };
+    let task = ctx
+        .harness
+        .bind_history_session(&task.id, session_key, current_path)
+        .map_err(map_error)?;
+    let harness = ctx.harness.status().map_err(map_error)?;
+    Ok(json!({
+        "work_session": {
+            "status": "active",
+            "history_session_key": session_key,
+            "history_session_path": current_path,
+            "task_id": task.id,
+            "task_created": task_created,
+            "baseline": baseline_view(&task),
+            "expected_state": task.expected_state
+        },
+        "history": history,
+        "task": task_view(&task),
+        "harness": harness,
+        "reconnect_required": false
+    }))
+}
+
+fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let session_key = task_before
+        .history_session_key
+        .clone()
+        .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 History Session"))?;
+    let expected_path = task_before
+        .history_session_path
+        .clone()
+        .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 History Session 路径"))?;
+
+    let finish = if task_before.status.is_writable() {
+        finish_task(ctx, args)?
+    } else {
+        json!({
+            "ok": true,
+            "task_status": task_before.status,
+            "closed": true,
+            "session_status": args.get("session_status").and_then(Value::as_str).unwrap_or("paused"),
+            "next_stage_started": false,
+            "task": task_view(&task_before),
+            "idempotent_retry": true
+        })
+    };
+    if finish.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Ok(json!({
+            "ok": false,
+            "closed": false,
+            "phase": "finish_task",
+            "finish": finish,
+            "checkpoint": null,
+            "retryable": true
+        }));
+    }
+
+    let mut checkpoint = args
+        .get("checkpoint")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    checkpoint["session_key"] = Value::String(session_key.clone());
+    checkpoint["expected_path"] = Value::String(expected_path.clone());
+    checkpoint["turn_id"] = Value::String(format!("close-work-session-{task_id}"));
+    if checkpoint.get("user_intent").is_none() {
+        checkpoint["user_intent"] = Value::String(task_before.objective.clone());
+    }
+    if checkpoint.get("notes").is_none() {
+        checkpoint["notes"] = Value::String(
+            args.get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Work session closed through close_work_session.")
+                .to_string(),
+        );
+    }
+    checkpoint["session_status"] = Value::String(
+        args.get("session_status")
+            .and_then(Value::as_str)
+            .unwrap_or("paused")
+            .to_string(),
+    );
+    let checkpoint = crate::tools::history::checkpoint(ctx, &checkpoint).map_err(|error| {
+        WorkspaceError::ToolDetails {
+            code: "WORK_SESSION_CHECKPOINT_PENDING",
+            message: error.message(),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "phase": "history_checkpoint",
+                "task_closed": true,
+                "task_id": task_id,
+                "session_key": session_key,
+                "expected_path": expected_path,
+                "suggestion": "使用相同 task_id 重新调用 close_work_session；已关闭任务不会重复完成。",
+                "cause": error.to_error_value()
+            }),
+        }
+    })?;
+    let task = ctx.harness.task(task_id).map_err(map_error)?;
+    Ok(json!({
+        "work_session": {
+            "status": args.get("session_status").and_then(Value::as_str).unwrap_or("paused"),
+            "history_session_key": session_key,
+            "history_session_path": expected_path,
+            "task_id": task_id,
+            "task_status": task.status,
+            "closed": true,
+            "next_stage_started": false
+        },
+        "finish": finish,
+        "checkpoint": checkpoint,
+        "task": task_view(&task),
+        "harness": ctx.harness.status().map_err(map_error)?
+    }))
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
@@ -110,14 +262,239 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let operations = ctx
-        .harness
-        .list_operations(offset, limit)
-        .map_err(map_error)?;
+    let collapse = args
+        .get("collapse")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let task_filter = optional_text(args, "task_id");
+    let history_filter = optional_text(args, "history_session_key");
+    let mcp_filter = optional_text(args, "mcp_session_id");
+    let tool_filter = optional_text(args, "tool");
+    let status_filter = optional_text(args, "status");
+    let failures_only = args
+        .get("failures_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let started_after = optional_text(args, "started_after")
+        .map(parse_time_filter)
+        .transpose()?;
+    let started_before = optional_text(args, "started_before")
+        .map(parse_time_filter)
+        .transpose()?;
+    let raw = ctx.harness.all_operations(20_000).map_err(map_error)?;
+    let mut operations = if collapse {
+        collapse_operations(raw)
+    } else {
+        raw.into_iter().map(operation_value).collect()
+    };
+    operations.retain(|operation| {
+        matches_optional(operation, "task_id", task_filter.as_deref())
+            && matches_optional(
+                operation,
+                "history_session_key",
+                history_filter.as_deref(),
+            )
+            && matches_optional(operation, "mcp_session_id", mcp_filter.as_deref())
+            && matches_optional(operation, "tool", tool_filter.as_deref())
+            && matches_optional(operation, "status", status_filter.as_deref())
+            && (!failures_only
+                || operation.get("status").and_then(Value::as_str) == Some("failed"))
+            && within_time_range(operation, started_after, started_before)
+    });
+    operations.sort_by(|left, right| {
+        operation_timestamp(left)
+            .cmp(&operation_timestamp(right))
+            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+    });
+    let total_matches = operations.len();
+    let page = operations
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let summary = operation_summary(&page, total_matches);
     Ok(json!({
-        "operations": operations,
-        "next_cursor": offset + operations.len()
+        "operations": page,
+        "summary": summary,
+        "total_matches": total_matches,
+        "next_cursor": if offset + page.len() < total_matches { Some(offset + page.len()) } else { None },
+        "filters": {
+            "task_id": task_filter,
+            "history_session_key": history_filter,
+            "mcp_session_id": mcp_filter,
+            "tool": tool_filter,
+            "status": status_filter,
+            "failures_only": failures_only,
+            "started_after": args.get("started_after"),
+            "started_before": args.get("started_before"),
+            "collapse": collapse
+        }
     }))
+}
+
+fn optional_text(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_time_filter(value: String) -> Result<i64, WorkspaceError> {
+    if let Ok(epoch) = value.parse::<i64>() {
+        return Ok(epoch);
+    }
+    chrono::DateTime::parse_from_rfc3339(&value)
+        .map(|time| time.timestamp_millis())
+        .map_err(|_| {
+            tool_error(
+                "INVALID_ARGUMENT",
+                "started_after/started_before 必须是 epoch 毫秒或 RFC3339 时间",
+            )
+        })
+}
+
+fn operation_timestamp(operation: &Value) -> i64 {
+    operation
+        .get("started_at")
+        .or_else(|| operation.get("created_at"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn within_time_range(operation: &Value, after: Option<i64>, before: Option<i64>) -> bool {
+    let timestamp = operation_timestamp(operation);
+    after.is_none_or(|value| timestamp >= value)
+        && before.is_none_or(|value| timestamp <= value)
+}
+
+fn matches_optional(operation: &Value, key: &str, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| operation.get(key).and_then(Value::as_str) == Some(expected))
+}
+
+fn operation_value(operation: OperationRecord) -> Value {
+    let created_at_iso = operation_iso(&operation);
+    json!({
+        "id": operation.id,
+        "workspace_id": operation.workspace_id,
+        "task_id": operation.task_id,
+        "history_session_key": operation.history_session_key,
+        "mcp_session_id": operation.mcp_session_id,
+        "tool": operation.tool,
+        "status": operation.kind,
+        "input_summary": operation.input_summary,
+        "result_summary": operation.result_summary,
+        "reason": operation.reason,
+        "affected_files": operation.affected_files,
+        "created_at": operation.created_at,
+        "created_at_iso": created_at_iso
+    })
+}
+
+fn collapse_operations(operations: Vec<OperationRecord>) -> Vec<Value> {
+    let mut order = Vec::<String>::new();
+    let mut grouped = HashMap::<String, Vec<OperationRecord>>::new();
+    for operation in operations {
+        if !grouped.contains_key(&operation.id) {
+            order.push(operation.id.clone());
+        }
+        grouped.entry(operation.id.clone()).or_default().push(operation);
+    }
+    order
+        .into_iter()
+        .filter_map(|id| grouped.remove(&id))
+        .filter_map(|records| collapse_operation(records))
+        .collect()
+}
+
+fn collapse_operation(records: Vec<OperationRecord>) -> Option<Value> {
+    let started = records.first()?;
+    let final_record = records
+        .iter()
+        .rev()
+        .find(|record| record.kind != "started")
+        .unwrap_or(started);
+    let status = if final_record.kind == "started" {
+        "running"
+    } else {
+        final_record.kind.as_str()
+    };
+    let affected_files = records
+        .iter()
+        .rev()
+        .find(|record| !record.affected_files.is_empty())
+        .map(|record| record.affected_files.clone())
+        .unwrap_or_default();
+    let started_at_iso = operation_iso(started);
+    let completed_at_iso = operation_iso(final_record);
+    Some(json!({
+        "id": started.id,
+        "workspace_id": started.workspace_id,
+        "task_id": final_record.task_id.as_ref().or(started.task_id.as_ref()),
+        "history_session_key": final_record.history_session_key.as_ref().or(started.history_session_key.as_ref()),
+        "mcp_session_id": final_record.mcp_session_id.as_ref().or(started.mcp_session_id.as_ref()),
+        "tool": final_record.tool,
+        "status": status,
+        "input_summary": final_record.input_summary,
+        "result_summary": final_record.result_summary,
+        "reason": final_record.reason.as_ref().or(started.reason.as_ref()),
+        "affected_files": affected_files,
+        "started_at": started.created_at,
+        "started_at_iso": started_at_iso,
+        "completed_at": if status == "running" { Value::Null } else { Value::String(final_record.created_at.clone()) },
+        "completed_at_iso": if status == "running" { Value::Null } else { Value::String(completed_at_iso) },
+        "event_count": records.len()
+    }))
+}
+
+fn operation_iso(operation: &OperationRecord) -> String {
+    if !operation.created_at_iso.is_empty() {
+        return operation.created_at_iso.clone();
+    }
+    operation
+        .created_at
+        .parse::<i64>()
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+fn operation_summary(operations: &[Value], total_matches: usize) -> Value {
+    let mut tool_counts = BTreeMap::<String, usize>::new();
+    let mut affected_files = Vec::<String>::new();
+    let mut failed = 0usize;
+    let mut running = 0usize;
+    for operation in operations {
+        if let Some(tool) = operation.get("tool").and_then(Value::as_str) {
+            *tool_counts.entry(tool.to_string()).or_default() += 1;
+        }
+        match operation.get("status").and_then(Value::as_str) {
+            Some("failed") => failed += 1,
+            Some("running") | Some("started") => running += 1,
+            _ => {}
+        }
+        if let Some(files) = operation.get("affected_files").and_then(Value::as_array) {
+            affected_files.extend(files.iter().filter_map(|file| {
+                file.get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }));
+        }
+    }
+    affected_files.sort();
+    affected_files.dedup();
+    json!({
+        "total_matches": total_matches,
+        "returned_operations": operations.len(),
+        "failed_operations": failed,
+        "running_operations": running,
+        "tool_counts": tool_counts,
+        "affected_files": affected_files,
+        "command_duration_ms": null,
+        "command_duration_note": "历史 OperationRecord 尚未持久化统一 duration_ms；命令耗时可从 Task verification 或命令 session 读取。"
+    })
 }
 
 fn project_state(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -459,6 +836,8 @@ fn task_view(task: &TaskSession) -> Value {
         "pending_steps": bounded_strings(&task.pending_steps, 64, 1_000),
         "latest_change_id": task.latest_change_id,
         "latest_verification_id": task.latest_verification_id,
+        "history_session_key": task.history_session_key,
+        "history_session_path": task.history_session_path,
         "created_at": task.created_at,
         "updated_at": task.updated_at
     })

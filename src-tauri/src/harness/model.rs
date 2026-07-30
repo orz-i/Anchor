@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityStatus {
@@ -167,6 +167,10 @@ pub struct TaskSession {
     pub pending_steps: Vec<String>,
     pub latest_change_id: Option<String>,
     pub latest_verification_id: Option<String>,
+    #[serde(default)]
+    pub history_session_key: Option<String>,
+    #[serde(default)]
+    pub history_session_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -205,6 +209,10 @@ pub struct OperationRecord {
     pub id: String,
     pub workspace_id: String,
     pub task_id: Option<String>,
+    #[serde(default)]
+    pub history_session_key: Option<String>,
+    #[serde(default)]
+    pub mcp_session_id: Option<String>,
     pub tool: String,
     pub kind: String,
     pub input_summary: Value,
@@ -213,6 +221,8 @@ pub struct OperationRecord {
     #[serde(default)]
     pub affected_files: Vec<FileChangeRecord>,
     pub created_at: String,
+    #[serde(default)]
+    pub created_at_iso: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

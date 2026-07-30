@@ -1,10 +1,12 @@
 {
   "advanced": {
-    "digest": "d87e366ccbad7ef9d9f1e2973334b2b81fcec033c5f31a97aaba4df405dec3d7",
+    "digest": "c37c9b2227efeeb8d68b080a21c9f31bc1d472524972b3ee8d5f29648bbc3db9",
     "names": [
       "apply_patch",
+      "begin_work_session",
       "change_summary",
       "check_exec_environment",
+      "close_work_session",
       "exec_command",
       "exec_health_check",
       "finish_task",
@@ -44,13 +46,15 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 41
+    "tool_count": 43
   },
   "core": {
-    "digest": "8e01c3369e919c95b4e06f3eda15306048bbf99b29d5f830d7f4f165be5d4796",
+    "digest": "b42310b5b2d0a960a4ca6271ba59cdff4a317b39be73af27fd14ac69a3534a08",
     "names": [
       "apply_patch",
+      "begin_work_session",
       "check_exec_environment",
+      "close_work_session",
       "exec_command",
       "get_default_cwd",
       "git_blame",
@@ -76,7 +80,7 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 26
+    "tool_count": 28
   },
   "read-only": {
     "digest": "b9fcfa3c316ae62f0dce604881d02bc3f1cab043bf6b34544b60b8fef7145233",

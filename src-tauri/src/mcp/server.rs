@@ -351,7 +351,7 @@ fn raw_tool_arguments(params: &Value) -> Value {
 
 fn tool_arguments(name: &str, params: &Value) -> Value {
     let mut args = raw_tool_arguments(params);
-    if name.starts_with("history_session_") {
+    if name.starts_with("history_session_") || name == "begin_work_session" {
         if let Some(session_key) = params
             .get("_meta")
             .and_then(|meta| meta.get("openai/session"))
@@ -444,7 +444,7 @@ mod tests {
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
         assert_eq!(first_tools.len(), 64);
-        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 25);
+        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 28);
         assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 48);
         assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
             .as_u64()
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_session_metadata_is_injected_only_for_history_tools() {
+    fn chatgpt_session_metadata_is_injected_for_history_and_work_session_tools() {
         let params = json!({
             "arguments": {"session_key": "explicit"},
             "_meta": {"openai/session": "chatgpt-conversation"}
@@ -559,6 +559,13 @@ mod tests {
         let history = tool_arguments("history_session_bootstrap", &params);
         assert_eq!(history["session_key"], "explicit");
         assert_eq!(history["_host_session_key"], "chatgpt-conversation");
+
+        let work_session = tool_arguments("begin_work_session", &params);
+        assert_eq!(work_session["session_key"], "explicit");
+        assert_eq!(
+            work_session["_host_session_key"],
+            "chatgpt-conversation"
+        );
 
         let existing = tool_arguments("read_file", &params);
         assert_eq!(existing["session_key"], "explicit");

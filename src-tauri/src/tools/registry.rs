@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 4;
+pub const CATALOG_VERSION: u32 = 5;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -8,6 +8,22 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Harness status",
         "Return durable task, workspace, capability, and recovery status.",
         true,
+        false,
+        false,
+    ),
+    (
+        "begin_work_session",
+        "Begin work session",
+        "Create or resume a History Session, create a Harness Task, capture its baseline, and bind both lifecycles.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "close_work_session",
+        "Close work session",
+        "Validate and close the bound Harness Task, then persist the matching History Session checkpoint as a recoverable workflow.",
+        false,
         false,
         false,
     ),
@@ -336,6 +352,8 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
 /// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
 pub const CORE_TOOLS: &[&str] = &[
     "server_info",
+    "begin_work_session",
+    "close_work_session",
     "list_skills",
     "load_skill",
     "read_skill_resource",
@@ -387,6 +405,8 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 pub const ALLOWED_TOOLS: &[&str] = &[
     "harness_status",
     "operation_log",
+    "begin_work_session",
+    "close_work_session",
     "server_info",
     "list_skills",
     "load_skill",
@@ -431,6 +451,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 ];
 
 pub const MUTATING_TOOLS: &[&str] = &[
+    "begin_work_session",
+    "close_work_session",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -1213,6 +1235,53 @@ pub fn output_schema(name: &str) -> Value {
                 "recoverable",
             ],
         ),
+        "operation_log" => success_output_schema(
+            json!({
+                "operations": { "type": "array", "items": { "type": "object" } },
+                "summary": { "type": "object" },
+                "total_matches": { "type": "integer", "minimum": 0 },
+                "next_cursor": nullable_integer_property(),
+                "filters": { "type": "object" }
+            }),
+            &["operations", "summary", "total_matches", "next_cursor", "filters"],
+        ),
+        "begin_work_session" => success_output_schema(
+            json!({
+                "work_session": { "type": "object" },
+                "history": { "type": "object" },
+                "task": { "type": "object" },
+                "harness": { "type": "object" },
+                "reconnect_required": { "type": "boolean", "const": false }
+            }),
+            &["work_session", "history", "task", "harness", "reconnect_required"],
+        ),
+        "close_work_session" => json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "closed": { "type": "boolean" },
+                "phase": { "type": "string" },
+                "retryable": { "type": "boolean" },
+                "work_session": { "type": "object" },
+                "finish": { "type": "object" },
+                "checkpoint": { "type": ["object", "null"] },
+                "task": { "type": "object" },
+                "harness": { "type": "object" },
+                "error": error_output_schema()
+            },
+            "required": ["ok"],
+            "allOf": [
+                {
+                    "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+                    "then": { "required": ["work_session", "finish", "checkpoint", "task", "harness"] }
+                },
+                {
+                    "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+                    "then": { "required": ["closed", "phase", "finish", "checkpoint", "retryable"] }
+                }
+            ],
+            "additionalProperties": true
+        }),
         "stage_commit" => success_output_schema(
             json!({
                 "workflow_id": { "type": "string", "minLength": 1 },
@@ -1540,8 +1609,42 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+                "task_id": { "type": "string", "minLength": 1 },
+                "history_session_key": { "type": "string", "minLength": 1 },
+                "mcp_session_id": { "type": "string", "minLength": 1 },
+                "started_after": { "type": "string", "minLength": 1, "description": "Epoch milliseconds or RFC3339" },
+                "started_before": { "type": "string", "minLength": 1, "description": "Epoch milliseconds or RFC3339" },
+                "tool": { "type": "string", "minLength": 1 },
+                "status": { "type": "string", "enum": ["started", "running", "completed", "failed", "incomplete"] },
+                "failures_only": { "type": "boolean", "default": false },
+                "collapse": { "type": "boolean", "default": true }
             },
+            "additionalProperties": false
+        }),
+        "begin_work_session" => json!({
+            "type": "object",
+            "properties": {
+                "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
+                "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "title": { "type": "string", "maxLength": 200 },
+                "create_if_missing": { "type": "boolean", "default": true },
+                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "workspace_root": { "type": "string", "minLength": 1 }
+            },
+            "required": ["objective"],
+            "additionalProperties": false
+        }),
+        "close_work_session" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "summary": { "type": "string", "maxLength": 8000 },
+                "allow_unverified": { "type": "boolean", "default": false },
+                "session_status": { "type": "string", "enum": ["active", "paused", "completed"], "default": "paused" },
+                "checkpoint": { "type": "object", "additionalProperties": true }
+            },
+            "required": ["task_id"],
             "additionalProperties": false
         }),
         "project_state" => json!({

@@ -279,6 +279,7 @@ fn call_tool_impl(
             .record_operation(
                 None,
                 active_task.as_ref().map(|task| task.id.as_str()),
+                session_id,
                 name,
                 "started",
                 json!({"arguments_present": !args.is_null()}),
@@ -420,6 +421,7 @@ fn call_tool_impl(
         let _ = ctx.harness.record_operation(
             Some(&operation.id),
             active_task.as_ref().map(|task| task.id.as_str()),
+            session_id,
             name,
             if succeeded { "completed" } else { "failed" },
             operation_input(args),

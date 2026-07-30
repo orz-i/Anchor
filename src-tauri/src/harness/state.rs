@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::Utc;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -35,6 +36,41 @@ impl Harness {
             workspace_id,
             store: HarnessStore::new(harness_root)?,
         })
+    }
+
+    pub fn all_operations(&self, limit: usize) -> HarnessResult<Vec<OperationRecord>> {
+        self.store
+            .list_operations(&self.workspace_id, 0, limit.clamp(1, 20_000))
+    }
+
+    pub fn bind_history_session(
+        &self,
+        task_id: &str,
+        session_key: &str,
+        path: &str,
+    ) -> HarnessResult<TaskSession> {
+        let mut task = self.task(task_id)?;
+        if let Some(existing) = task.history_session_key.as_deref() {
+            if existing != session_key || task.history_session_path.as_deref() != Some(path) {
+                return Err(HarnessError::new(
+                    "WORK_SESSION_CONFLICT",
+                    "当前任务已绑定到另一个 History Session",
+                ));
+            }
+            return Ok(task);
+        }
+        task.history_session_key = Some(session_key.to_string());
+        task.history_session_path = Some(path.to_string());
+        task.updated_at = timestamp();
+        self.store.save_task(&task)?;
+        self.record_event(
+            task_id,
+            "history_session_bound",
+            Some("begin_work_session"),
+            json!({"session_key": session_key, "path": path}),
+            json!({"ok": true}),
+        )?;
+        Ok(task)
     }
 
     pub fn default_root() -> HarnessResult<PathBuf> {
@@ -76,6 +112,8 @@ impl Harness {
             pending_steps: Vec::new(),
             latest_change_id: None,
             latest_verification_id: None,
+            history_session_key: None,
+            history_session_path: None,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -462,6 +500,7 @@ impl Harness {
         &self,
         operation_id: Option<&str>,
         task_id: Option<&str>,
+        mcp_session_id: Option<&str>,
         tool: &str,
         kind: &str,
         input_summary: serde_json::Value,
@@ -471,19 +510,49 @@ impl Harness {
             .get("reason")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let history_session_key = task_id
+            .and_then(|task_id| self.task(task_id).ok())
+            .and_then(|task| task.history_session_key);
+        let affected_files = result_summary
+            .get("affected_files")
+            .and_then(serde_json::Value::as_array)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| {
+                        let path = file.get("path")?.as_str()?.to_string();
+                        let status = file
+                            .get("operation")
+                            .or_else(|| file.get("status"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("changed")
+                            .to_string();
+                        Some(FileChangeRecord {
+                            path,
+                            status,
+                            before_sha256: None,
+                            after_sha256: None,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let operation = OperationRecord {
             id: operation_id
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
             workspace_id: self.workspace_id.clone(),
             task_id: task_id.map(str::to_string),
+            history_session_key,
+            mcp_session_id: mcp_session_id.map(str::to_string),
             tool: tool.to_string(),
             kind: kind.to_string(),
             input_summary,
             result_summary,
             reason,
-            affected_files: Vec::new(),
+            affected_files,
             created_at: timestamp(),
+            created_at_iso: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
         self.store
             .append_operation(&self.workspace_id, &operation)?;
