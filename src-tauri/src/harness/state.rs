@@ -14,7 +14,7 @@ use super::model::{
     BaselineEntry, CapabilityStatus, ChangeSet, ExpectedWorkspaceState, FileChangeRecord,
     HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord, ProjectBaseline,
     ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt, TaskSession, TaskStatus,
-    VerificationRecord, WorkspaceHarnessState, SCHEMA_VERSION,
+    VerificationDispositionRecord, VerificationRecord, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 
@@ -183,6 +183,7 @@ impl Harness {
             passed,
             duration_ms,
             change_id: change_id.map(str::to_string),
+            dispositions: Vec::new(),
             created_at: timestamp(),
         };
         self.store
@@ -211,6 +212,69 @@ impl Harness {
 
     pub fn list_verifications(&self, task_id: &str) -> HarnessResult<Vec<VerificationRecord>> {
         self.store.list_verifications(&self.workspace_id, task_id)
+    }
+
+    pub fn update_verification_disposition(
+        &self,
+        task_id: &str,
+        verification_id: &str,
+        disposition: &str,
+        reason: &str,
+        source: &str,
+    ) -> HarnessResult<VerificationRecord> {
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "verification disposition 必须提供理由",
+            ));
+        }
+        let allowed = [
+            "active_failure",
+            "expected_failure",
+            "diagnostic_only",
+            "superseded",
+            "waived",
+            "passed",
+        ];
+        if !allowed.contains(&disposition) {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "不支持的 verification disposition",
+            ));
+        }
+        let mut verification = self
+            .list_verifications(task_id)?
+            .into_iter()
+            .find(|record| record.id == verification_id)
+            .ok_or_else(|| {
+                HarnessError::new(
+                    "VERIFICATION_NOT_FOUND",
+                    format!("Verification not found: {verification_id}"),
+                )
+            })?;
+        let entry = VerificationDispositionRecord {
+            id: Uuid::new_v4().simple().to_string(),
+            disposition: disposition.to_string(),
+            reason: reason.trim().to_string(),
+            source: source.trim().to_string(),
+            created_at: timestamp(),
+        };
+        verification.dispositions.push(entry.clone());
+        self.store
+            .save_verification(&self.workspace_id, &verification)?;
+        self.record_event(
+            task_id,
+            "verification_disposition_updated",
+            Some("update_verification_disposition"),
+            json!({
+                "verification_id": verification_id,
+                "disposition": disposition,
+                "reason": reason,
+                "source": source
+            }),
+            json!({"ok": true, "disposition_id": entry.id}),
+        )?;
+        Ok(verification)
     }
 
     #[allow(clippy::too_many_arguments)]

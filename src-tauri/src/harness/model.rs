@@ -239,6 +239,17 @@ pub struct VerificationRecord {
     #[serde(default)]
     pub duration_ms: Option<u64>,
     pub change_id: Option<String>,
+    #[serde(default)]
+    pub dispositions: Vec<VerificationDispositionRecord>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationDispositionRecord {
+    pub id: String,
+    pub disposition: String,
+    pub reason: String,
+    pub source: String,
     pub created_at: String,
 }
 

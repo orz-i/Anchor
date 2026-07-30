@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "c37c9b2227efeeb8d68b080a21c9f31bc1d472524972b3ee8d5f29648bbc3db9",
+    "digest": "86fc1cd1412a173edb262232c28c2b19a21f07c5252ecb355a4caba700ab06f8",
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -42,11 +42,12 @@
       "start_task",
       "task_context",
       "update_task",
+      "update_verification_disposition",
       "view_image",
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 43
+    "tool_count": 44
   },
   "core": {
     "digest": "b42310b5b2d0a960a4ca6271ba59cdff4a317b39be73af27fd14ac69a3534a08",

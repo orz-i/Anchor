@@ -22,6 +22,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "operation_log",
     "begin_work_session",
     "close_work_session",
+    "update_verification_disposition",
     "project_state",
     "start_task",
     "refresh_baseline",
@@ -46,6 +47,7 @@ pub fn call(
         "operation_log" => operation_log(ctx, args),
         "begin_work_session" => begin_work_session(ctx, args),
         "close_work_session" => close_work_session(ctx, args),
+        "update_verification_disposition" => update_verification_disposition(ctx, args),
         "project_state" => project_state(ctx, args),
         "start_task" => start_task(ctx, args),
         "refresh_baseline" => refresh_baseline(ctx, args),
@@ -60,6 +62,56 @@ pub fn call(
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     Ok(tool_ok(value))
+}
+
+fn update_verification_disposition(
+    ctx: &ToolContext,
+    args: &Value,
+) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let verification_id = args
+        .get("verification_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "verification_id 是必填项"))?;
+    let disposition = args
+        .get("disposition")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "disposition 是必填项"))?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
+    if disposition == "waived" && !ctx.policy.skip_permission_gates() {
+        return Err(tool_error(
+            "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
+            "waived 会接受未通过的验证债务，必须由操作者在受信任控制面启用 dangerous 模式",
+        ));
+    }
+    let source = if disposition == "waived" {
+        "dangerous_operator_waiver"
+    } else {
+        "audited_disposition"
+    };
+    let verification = ctx
+        .harness
+        .update_verification_disposition(
+            task_id,
+            verification_id,
+            disposition,
+            reason,
+            source,
+        )
+        .map_err(map_error)?;
+    let records = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    Ok(json!({
+        "verification": verification_view(&verification),
+        "verification_status": verification_status(&records),
+        "effective_disposition": effective_disposition(&verification),
+        "task_id": task_id
+    }))
 }
 
 fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -574,7 +626,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "verification": verification_views(&verifications)
         }));
     }
-    if !allow_unverified && verification_status != "verified" {
+    if !allow_unverified && !verification_status_is_accepted(verification_status) {
         let task = ctx.harness.mark_verifying(task_id).map_err(map_error)?;
         let reason = if verification_status == "missing" {
             "任务缺少结构化验证证据；请使用 exec_command.verification_kind 或 stage_commit.required_checks 运行验证。"
@@ -595,7 +647,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         }));
     }
     let session_status = parse_session_status(args)?;
-    let verified = verification_status == "verified";
+    let verified = verification_status_is_accepted(verification_status);
     let change_summary = change_summary(
         ctx,
         &json!({
@@ -610,7 +662,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     let mut response = json!({
         "ok": true,
         "task_status": if verified { "completed" } else { "completed_unverified" },
-        "verification_status": if verified { "verified" } else { "unverified" },
+        "verification_status": if verified { verification_status } else { "unverified" },
         "closed": true,
         "session_status": session_status,
         "next_stage_started": false,
@@ -847,11 +899,25 @@ fn verification_status(records: &[VerificationRecord]) -> &'static str {
     let effective = effective_verifications(records);
     if effective.is_empty() {
         "missing"
-    } else if effective.iter().all(|record| record.passed) {
-        "verified"
-    } else {
+    } else if effective
+        .iter()
+        .any(|record| effective_disposition(record) == "active_failure")
+    {
         "failed"
+    } else if effective.iter().any(|record| {
+        matches!(
+            effective_disposition(record),
+            "expected_failure" | "waived"
+        )
+    }) {
+        "verified_with_exceptions"
+    } else {
+        "verified"
     }
+}
+
+fn verification_status_is_accepted(status: &str) -> bool {
+    matches!(status, "verified" | "verified_with_exceptions")
 }
 
 fn effective_verifications(records: &[VerificationRecord]) -> Vec<&VerificationRecord> {
@@ -859,26 +925,47 @@ fn effective_verifications(records: &[VerificationRecord]) -> Vec<&VerificationR
     for record in records {
         latest.insert((record.kind.as_str(), record.command.as_str()), record);
     }
-    latest.into_values().collect()
+    latest
+        .into_values()
+        .filter(|record| {
+            !matches!(
+                effective_disposition(record),
+                "diagnostic_only" | "superseded"
+            )
+        })
+        .collect()
 }
 
 fn verification_views(records: &[VerificationRecord]) -> Vec<Value> {
-    records
-        .iter()
-        .map(|record| {
-            json!({
-                "verification_id": record.id,
-                "kind": record.kind,
-                "status": record.status,
-                "passed": record.passed,
-                "exit_code": record.exit_code,
-                "command": bounded_text(&record.command, 4_000),
-                "duration_ms": record.duration_ms,
-                "change_id": record.change_id,
-                "created_at": record.created_at
-            })
+    records.iter().map(verification_view).collect()
+}
+
+fn verification_view(record: &VerificationRecord) -> Value {
+    json!({
+        "verification_id": record.id,
+        "kind": record.kind,
+        "status": record.status,
+        "passed": record.passed,
+        "effective_disposition": effective_disposition(record),
+        "disposition_history": record.dispositions,
+        "exit_code": record.exit_code,
+        "command": bounded_text(&record.command, 4_000),
+        "duration_ms": record.duration_ms,
+        "change_id": record.change_id,
+        "created_at": record.created_at
+    })
+}
+
+fn effective_disposition(record: &VerificationRecord) -> &str {
+    record
+        .dispositions
+        .last()
+        .map(|entry| entry.disposition.as_str())
+        .unwrap_or(if record.passed {
+            "passed"
+        } else {
+            "active_failure"
         })
-        .collect()
 }
 
 fn compact_event(event: &HarnessEvent) -> Value {

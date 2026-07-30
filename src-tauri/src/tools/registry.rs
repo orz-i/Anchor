@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 5;
+pub const CATALOG_VERSION: u32 = 6;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -8,6 +8,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Harness status",
         "Return durable task, workspace, capability, and recovery status.",
         true,
+        false,
+        false,
+    ),
+    (
+        "update_verification_disposition",
+        "Update verification disposition",
+        "Append an audited disposition to immutable verification evidence, such as expected_failure, diagnostic_only, superseded, or waived.",
+        false,
         false,
         false,
     ),
@@ -407,6 +415,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "operation_log",
     "begin_work_session",
     "close_work_session",
+    "update_verification_disposition",
     "server_info",
     "list_skills",
     "load_skill",
@@ -453,6 +462,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 pub const MUTATING_TOOLS: &[&str] = &[
     "begin_work_session",
     "close_work_session",
+    "update_verification_disposition",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -1282,6 +1292,15 @@ pub fn output_schema(name: &str) -> Value {
             ],
             "additionalProperties": true
         }),
+        "update_verification_disposition" => success_output_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1 },
+                "verification": { "type": "object" },
+                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "verified_with_exceptions"] },
+                "effective_disposition": { "type": "string", "enum": ["active_failure", "expected_failure", "diagnostic_only", "superseded", "waived", "passed"] }
+            }),
+            &["task_id", "verification", "verification_status", "effective_disposition"],
+        ),
         "stage_commit" => success_output_schema(
             json!({
                 "workflow_id": { "type": "string", "minLength": 1 },
@@ -1325,7 +1344,7 @@ pub fn output_schema(name: &str) -> Value {
             "properties": {
                 "ok": { "type": "boolean" },
                 "task_status": { "type": "string", "enum": ["verifying", "completed", "completed_unverified"] },
-                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "unverified"] },
+                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "verified_with_exceptions", "unverified"] },
                 "closed": { "type": "boolean" },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
                 "next_stage_started": { "type": "boolean", "const": false },
@@ -1368,7 +1387,7 @@ pub fn output_schema(name: &str) -> Value {
                 "runtime_artifacts": { "type": "array", "items": { "type": "string" } },
                 "ignored_files": { "type": "array", "items": { "type": "string" } },
                 "verification": { "type": "array", "items": { "type": "object" } },
-                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified"] },
+                "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "verified_with_exceptions"] },
                 "evidence": { "type": "array", "items": { "type": "object" } },
                 "counts": { "type": "object" },
                 "baseline": { "type": "object" },
@@ -1645,6 +1664,20 @@ pub fn input_schema(name: &str) -> Value {
                 "checkpoint": { "type": "object", "additionalProperties": true }
             },
             "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        "update_verification_disposition" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "verification_id": { "type": "string", "minLength": 1 },
+                "disposition": {
+                    "type": "string",
+                    "enum": ["active_failure", "expected_failure", "diagnostic_only", "superseded", "waived", "passed"]
+                },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+            },
+            "required": ["task_id", "verification_id", "disposition", "reason"],
             "additionalProperties": false
         }),
         "project_state" => json!({

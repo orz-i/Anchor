@@ -43,6 +43,60 @@ fn begin_work_session_binds_history_and_task_idempotently() {
 }
 
 #[test]
+fn expected_failure_disposition_allows_audited_task_completion() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness"))
+        .expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "归档已接受的预期失败"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let failed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"import sys; sys.exit(1)\"",
+            "verification_kind": "expected-debt",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(failed["command_ok"], false);
+    let verification_id = failed["verification"]["verification_id"]
+        .as_str()
+        .expect("verification id");
+
+    let disposition = call_tool(
+        &ctx,
+        "update_verification_disposition",
+        &json!({
+            "task_id": task_id,
+            "verification_id": verification_id,
+            "disposition": "expected_failure",
+            "reason": "该失败用于记录已接受的兼容性债务"
+        }),
+    );
+    assert_eq!(disposition["ok"], true);
+    assert_eq!(disposition["effective_disposition"], "expected_failure");
+    assert_eq!(
+        disposition["verification_status"],
+        "verified_with_exceptions"
+    );
+
+    let finished = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
+    assert_eq!(finished["ok"], true);
+    assert_eq!(finished["task_status"], "completed");
+    assert_eq!(
+        finished["verification_status"],
+        "verified_with_exceptions"
+    );
+    assert_eq!(finished["closed"], true);
+}
+
+#[test]
 fn close_work_session_closes_task_and_checkpoints_bound_history() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
