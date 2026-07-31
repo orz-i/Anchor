@@ -411,7 +411,7 @@ async fn handle_tools_call(
     }
 
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
-    if !known.iter().any(|n| *n == name) {
+    if !known.contains(&name) {
         let catalog_changed = state
             .published_catalog()
             .zip(build_effective_catalog(state.as_ref()).ok())
