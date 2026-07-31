@@ -22,6 +22,10 @@ fn server_info_returns_workspace_and_tools() {
     assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     assert!(payload["tools"].is_array());
     assert!(payload["tool_count"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(payload["catalog_published"], false);
+    assert_eq!(payload["catalog_changed"], false);
+    assert_eq!(payload["reconnect_required"], false);
+    assert_eq!(payload["running_catalog_digest"], payload["current_catalog_digest"]);
 }
 
 #[test]

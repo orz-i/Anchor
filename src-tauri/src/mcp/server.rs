@@ -55,6 +55,27 @@ fn tools_list_result(catalog: &EffectiveCatalog, params: &Value) -> Result<Value
         end += 1;
     }
 
+    #[tokio::test]
+    async fn unpublished_new_tool_requires_reconnect() {
+        let (_workspace, _harness, state) = test_state();
+        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
+        let _ = state.publish_catalog(core);
+
+        let error = handle_tools_call(
+            &state,
+            &json!({
+                "name": "stage_commit_status",
+                "arguments": {"task_id": "task", "idempotency_key": "key"}
+            }),
+            &CancellationToken::default(),
+            Some("session"),
+        )
+        .await
+        .expect_err("tool was not published");
+        assert_eq!(error["data"]["reason"], "catalog_changed");
+        assert_eq!(error["data"]["reconnect_required"], true);
+    }
+
     let mut result = serde_json::json!({
         "tools": catalog.tools[start..end].to_vec(),
         "_meta": {
@@ -204,7 +225,21 @@ pub async fn handle_request_with_protocol_session_and_cancellation(
                 });
             }
             match build_effective_catalog(state.as_ref()) {
-                Ok(catalog) => tools_list_result(&catalog, &params),
+                Ok(current) => {
+                    let (catalog, changed) = state.publish_catalog(current);
+                    match tools_list_result(&catalog, &params) {
+                        Ok(mut result) => {
+                            if changed {
+                                result["_meta"]["anchor/catalog"]["catalog_changed"] =
+                                    Value::Bool(true);
+                                result["_meta"]["anchor/catalog"]["reconnect_required"] =
+                                    Value::Bool(true);
+                            }
+                            Ok(result)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 Err(error) => Err(effective_catalog_error(error)),
             }
         }
@@ -261,6 +296,19 @@ async fn handle_tools_call(
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let raw_args = raw_tool_arguments(params);
+    let canonical_name = crate::tools::registry::canonical_tool_name(name);
+
+    if state.is_published_tool(canonical_name) == Some(false) {
+        return Err(serde_json::json!({
+            "code": -32005,
+            "message": format!("Tool {name} was not published for this MCP connection"),
+            "data": {
+                "reason": "catalog_changed",
+                "catalog_changed": true,
+                "reconnect_required": true
+            }
+        }));
+    }
 
     if crate::skills::is_skill_tool(name) && !state.skills.is_enabled() {
         return Err(serde_json::json!({
@@ -293,7 +341,6 @@ async fn handle_tools_call(
         return result;
     }
 
-    let canonical_name = crate::tools::registry::canonical_tool_name(name);
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
     if !known.iter().any(|n| n == &canonical_name) {
         return Err(serde_json::json!({
@@ -391,11 +438,11 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::tools::{build_effective_catalog_from_parts, ToolContext};
+    use crate::tools::{build_effective_catalog_from_parts, CancellationToken, ToolContext};
 
     use super::{
-        effective_catalog_error, handle_request, initialize_result, tool_arguments,
-        tools_list_result,
+        effective_catalog_error, handle_request, handle_tools_call, initialize_result,
+        tool_arguments, tools_list_result,
     };
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {

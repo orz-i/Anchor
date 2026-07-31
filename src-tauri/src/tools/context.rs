@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::harness::Harness;
 use crate::tools::command_cost::CommandCostGuard;
+use crate::tools::catalog::EffectiveCatalog;
 use crate::tools::policy::PolicySettings;
 use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
@@ -22,6 +23,38 @@ pub struct ToolContext {
     session_default_cwds: Mutex<HashMap<String, PathBuf>>,
     pub sessions: SessionStore,
     pub command_cost: CommandCostGuard,
+    published_catalog: Mutex<Option<EffectiveCatalog>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::catalog::build_effective_catalog_from_parts;
+
+    #[test]
+    fn published_catalog_remains_stable_and_requires_reconnect_on_drift() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness = tempfile::tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness.path().to_path_buf(),
+        )
+        .expect("context");
+        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
+        let advanced =
+            build_effective_catalog_from_parts("advanced", true, Vec::new()).expect("advanced");
+
+        let (published, changed) = ctx.publish_catalog(core.clone());
+        assert!(!changed);
+        assert_eq!(published.digest, core.digest);
+
+        let (still_published, changed) = ctx.publish_catalog(advanced.clone());
+        assert!(changed);
+        assert_eq!(still_published.digest, core.digest);
+        assert_ne!(still_published.digest, advanced.digest);
+        assert_eq!(ctx.is_published_tool("stage_commit_status"), Some(false));
+        assert_eq!(ctx.is_published_tool("read_file"), Some(true));
+    }
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -83,6 +116,7 @@ impl ToolContext {
             session_default_cwds: Mutex::new(HashMap::new()),
             sessions: SessionStore::new(),
             command_cost,
+            published_catalog: Mutex::new(None),
         }
     }
 
@@ -158,5 +192,35 @@ impl ToolContext {
             .lock()
             .expect("session cwd lock")
             .remove(session_id);
+    }
+
+    pub fn publish_catalog(&self, current: EffectiveCatalog) -> (EffectiveCatalog, bool) {
+        let mut published = self
+            .published_catalog
+            .lock()
+            .expect("published catalog lock");
+        if let Some(snapshot) = published.as_ref() {
+            let changed = snapshot.digest != current.digest;
+            return (snapshot.clone(), changed);
+        }
+        *published = Some(current.clone());
+        (current, false)
+    }
+
+    pub fn published_catalog(&self) -> Option<EffectiveCatalog> {
+        self.published_catalog
+            .lock()
+            .expect("published catalog lock")
+            .clone()
+    }
+
+    pub fn is_published_tool(&self, name: &str) -> Option<bool> {
+        self.published_catalog().map(|catalog| {
+            catalog.tools.iter().any(|tool| {
+                tool.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|published| published == name)
+            })
+        })
     }
 }

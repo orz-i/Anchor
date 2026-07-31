@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 7;
+pub const CATALOG_VERSION: u32 = 8;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -770,12 +770,23 @@ pub fn output_schema(name: &str) -> Value {
                 "endpoint_path": { "type": "string", "const": "/mcp" },
                 "tools": { "type": "array", "items": { "type": "string" } },
                 "tool_count": { "type": "integer", "minimum": 0 },
+                "current_tools": { "type": "array", "items": { "type": "string" } },
+                "current_tool_count": { "type": "integer", "minimum": 0 },
                 "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "running_catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "current_catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "catalog_published": { "type": "boolean" },
+                "catalog_changed": { "type": "boolean" },
+                "reconnect_required": { "type": "boolean" },
                 "catalog_version": { "type": "integer", "minimum": 1 },
                 "catalog_bytes": { "type": "integer", "minimum": 0 },
                 "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
                 "local_tool_count": { "type": "integer", "minimum": 0 },
                 "proxy_tool_count": { "type": "integer", "minimum": 0 },
+                "current_catalog_bytes": { "type": "integer", "minimum": 0 },
+                "current_catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
+                "current_local_tool_count": { "type": "integer", "minimum": 0 },
+                "current_proxy_tool_count": { "type": "integer", "minimum": 0 },
                 "command_cost_policy": { "type": "object" },
                 "downstream_mcp": {
                     "type": "object",
@@ -809,12 +820,23 @@ pub fn output_schema(name: &str) -> Value {
                 "endpoint_path",
                 "tools",
                 "tool_count",
+                "current_tools",
+                "current_tool_count",
                 "catalog_digest",
+                "running_catalog_digest",
+                "current_catalog_digest",
+                "catalog_published",
+                "catalog_changed",
+                "reconnect_required",
                 "catalog_version",
                 "catalog_bytes",
                 "catalog_estimated_tokens",
                 "local_tool_count",
                 "proxy_tool_count",
+                "current_catalog_bytes",
+                "current_catalog_estimated_tokens",
+                "current_local_tool_count",
+                "current_proxy_tool_count",
                 "command_cost_policy",
                 "downstream_mcp",
             ],

@@ -680,8 +680,16 @@ fn server_info_for_session(
     ctx: &ToolContext,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
-    let catalog = crate::tools::catalog::build_effective_catalog(ctx)?;
-    let tools = catalog
+    let current_catalog = crate::tools::catalog::build_effective_catalog(ctx)?;
+    let published_catalog = ctx.published_catalog();
+    let running_catalog = published_catalog.as_ref().unwrap_or(&current_catalog);
+    let catalog_changed = running_catalog.digest != current_catalog.digest;
+    let tools = running_catalog
+        .tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let current_tools = current_catalog
         .tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
@@ -701,19 +709,23 @@ fn server_info_for_session(
         "endpoint_path": "/mcp",
         "tools": tools,
         "tool_count": tools.len(),
-        "catalog_digest": catalog.digest,
+        "current_tools": current_tools,
+        "current_tool_count": current_tools.len(),
+        "catalog_digest": running_catalog.digest,
+        "running_catalog_digest": running_catalog.digest,
+        "current_catalog_digest": current_catalog.digest,
+        "catalog_published": published_catalog.is_some(),
+        "catalog_changed": catalog_changed,
+        "reconnect_required": catalog_changed,
         "catalog_version": crate::tools::registry::CATALOG_VERSION,
-        "catalog_bytes": catalog.total_bytes,
-        "catalog_estimated_tokens": catalog.estimated_tokens,
-        "local_tool_count": catalog.local_count,
-        "proxy_tool_count": catalog.proxy_count,
-        "command_cost_policy": {
-            "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
-            "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
-            "external_paid_max_duration_seconds": ctx.policy.external_paid_max_duration_seconds,
-            "workspace_policy_path": ".anchor/command-policy.yml",
-            "approval_source": "trusted_runtime_config"
-        },
+        "catalog_bytes": running_catalog.total_bytes,
+        "catalog_estimated_tokens": running_catalog.estimated_tokens,
+        "local_tool_count": running_catalog.local_count,
+        "proxy_tool_count": running_catalog.proxy_count,
+        "current_catalog_bytes": current_catalog.total_bytes,
+        "current_catalog_estimated_tokens": current_catalog.estimated_tokens,
+        "current_local_tool_count": current_catalog.local_count,
+        "current_proxy_tool_count": current_catalog.proxy_count,
         "command_cost_policy": {
             "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
             "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
