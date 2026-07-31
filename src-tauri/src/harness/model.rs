@@ -235,10 +235,7 @@ pub struct TaskSession {
     pub objective: String,
     pub status: TaskStatus,
     pub baseline: ProjectBaseline,
-    #[serde(default)]
-    pub expected_state: Option<ExpectedWorkspaceState>,
-    // Kept for backward-compatible reads of schema v1 task files.
-    pub expected_fingerprint: String,
+    pub expected_state: ExpectedWorkspaceState,
     #[serde(default)]
     pub completed_steps: Vec<String>,
     #[serde(default)]
@@ -308,7 +305,6 @@ pub struct VerificationRecord {
     pub id: String,
     pub task_id: String,
     pub command: String,
-    #[serde(alias = "category")]
     pub kind: String,
     #[serde(default = "default_verification_status")]
     pub status: String,

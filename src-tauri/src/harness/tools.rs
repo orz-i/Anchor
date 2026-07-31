@@ -1042,8 +1042,8 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .or_else(|| requested_change_id.map(str::to_string))
         .or_else(|| {
             task.expected_state
-                .as_ref()
-                .and_then(|expected| expected.head.clone())
+                .head
+                .clone()
                 .filter(|head| task.baseline.head.as_ref() != Some(head))
         });
     let mut committed_file_set = BTreeSet::new();
@@ -1084,8 +1084,8 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .and_then(|change| change.commit_sha.clone());
     let end_head = task
         .expected_state
-        .as_ref()
-        .and_then(|expected| expected.head.clone())
+        .head
+        .clone()
         .or_else(|| last_commit.clone());
     let net_changed_files = match (task.baseline.head.as_deref(), end_head.as_deref()) {
         (Some(start), Some(end)) if start != end => {

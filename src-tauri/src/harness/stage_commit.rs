@@ -1648,7 +1648,7 @@ mod tests {
             .harness
             .refresh_expected_state_for_operation(&task.id, Some("test-change"))
             .expect("refresh");
-        let expected = refreshed.expected_state.expect("expected state");
+        let expected = refreshed.expected_state;
         (
             task.id,
             expected.head.expect("head"),

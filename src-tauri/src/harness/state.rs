@@ -190,8 +190,7 @@ impl Harness {
                     workspace_id: self.workspace_id.clone(),
                     objective: objective.trim().to_string(),
                     status: TaskStatus::Active,
-                    expected_fingerprint: baseline.worktree_fingerprint.clone(),
-                    expected_state: Some(expected_state_from_baseline(&baseline, None)),
+                    expected_state: expected_state_from_baseline(&baseline, None),
                     baseline,
                     completed_steps: Vec::new(),
                     pending_steps: Vec::new(),
@@ -641,8 +640,7 @@ impl Harness {
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;
-                task.expected_fingerprint = current.worktree_fingerprint.clone();
-                task.expected_state = Some(expected_state_from_baseline(&current, operation_id));
+                task.expected_state = expected_state_from_baseline(&current, operation_id);
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
                 Ok(task)
@@ -681,9 +679,8 @@ impl Harness {
                         "当前任务状态不允许刷新基线",
                     ));
                 }
-                task.expected_fingerprint = current.worktree_fingerprint.clone();
                 task.expected_state =
-                    Some(expected_state_from_baseline(&current, Some(&operation_id)));
+                    expected_state_from_baseline(&current, Some(&operation_id));
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
                 transaction.append_event(&harness_event(
@@ -1179,15 +1176,7 @@ fn git_file_paths(root: &Path) -> Option<Vec<PathBuf>> {
 }
 
 fn expected_state(task: &TaskSession) -> ExpectedWorkspaceState {
-    task.expected_state
-        .clone()
-        .unwrap_or_else(|| ExpectedWorkspaceState {
-            branch: task.baseline.branch.clone(),
-            head: task.baseline.head.clone(),
-            worktree_fingerprint: task.expected_fingerprint.clone(),
-            accepted_at: task.updated_at.clone(),
-            accepted_by_operation_id: None,
-        })
+    task.expected_state.clone()
 }
 
 fn expected_state_from_baseline(
@@ -1440,17 +1429,14 @@ mod tests {
         harness.check_baseline(&started.id).expect("baseline valid");
         assert_eq!(refreshed.baseline.head, initial_head);
         assert_ne!(
-            refreshed
-                .expected_state
-                .as_ref()
-                .and_then(|state| state.head.clone()),
+            refreshed.expected_state.head,
             initial_head
         );
         assert_eq!(
             refreshed
                 .expected_state
-                .as_ref()
-                .and_then(|state| state.accepted_by_operation_id.as_deref()),
+                .accepted_by_operation_id
+                .as_deref(),
             Some("commit-operation")
         );
     }
