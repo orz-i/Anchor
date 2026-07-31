@@ -10,13 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 use crate::platform::platform;
-use crate::settings::AppSettings;
 
-use super::model::{AppData, LegacyProfilesOnlyFile, SecretsData};
+use super::model::{AppData, SecretsData};
 use super::secret_protection;
 
-const LEGACY_PROFILES_FILE: &str = "profiles.json";
-const LEGACY_SETTINGS_FILE: &str = "app_settings.json";
 const SECRETS_ENVELOPE_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,31 +34,11 @@ fn has_primary_or_backup(path: &Path) -> bool {
     path.exists() || backup_path(path).exists()
 }
 
-fn migrate_or_load_secrets(profile_path: &Path, data: &mut AppData) -> AppResult<()> {
+fn load_secrets(data: &mut AppData) -> AppResult<()> {
     let secrets_path = secrets_file_path()?;
-    migrate_or_load_secrets_at(profile_path, &secrets_path, data)
-}
-
-fn migrate_or_load_secrets_at(
-    profile_path: &Path,
-    secrets_path: &Path,
-    data: &mut AppData,
-) -> AppResult<()> {
-    let legacy = SecretsData::from_app_data(data);
-    let had_inline_secrets = !legacy.is_empty();
-
-    if has_primary_or_backup(secrets_path) {
-        let (loaded, protected) = load_secrets_with_backup(secrets_path)?;
+    if has_primary_or_backup(&secrets_path) {
+        let loaded = load_secrets_with_backup(&secrets_path)?;
         loaded.apply_to(data);
-        if !protected {
-            write_secrets_data(secrets_path, &SecretsData::from_app_data(data))?;
-        }
-    } else if had_inline_secrets {
-        write_secrets_data(secrets_path, &legacy)?;
-    }
-
-    if had_inline_secrets {
-        write_data(profile_path, data)?;
     }
     Ok(())
 }
@@ -154,83 +131,35 @@ mod tests {
     }
 
     #[test]
-    fn migrates_inline_secrets_to_separate_file() {
+    fn rejects_unprotected_plaintext_secrets() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let profile_path = temp.path().join("profiles.json");
         let secrets_path = temp.path().join("secrets.json");
         fs::write(
-            &profile_path,
+            &secrets_path,
             serde_json::to_string_pretty(&serde_json::json!({
-                "shared_secrets": {"token": "shared-secret"},
-                "workspace_secrets": {"workspace": {"password": "workspace-secret"}},
-                "app_secrets": {},
-                "profiles": []
+                "shared_secrets": {"token": "plaintext"},
+                "workspace_secrets": {},
+                "app_secrets": {}
             }))
-            .expect("legacy json"),
+            .expect("plaintext json"),
         )
-        .expect("legacy write");
-        let mut data = read_data(&profile_path).expect("legacy read");
+        .expect("plaintext write");
 
-        migrate_or_load_secrets_at(&profile_path, &secrets_path, &mut data).expect("migrate");
+        let error = read_secrets_file(&secrets_path).expect_err("plaintext secrets must fail");
 
-        let secrets = read_secrets_data(&secrets_path).expect("secrets read");
-        assert_eq!(
-            secrets.shared_secrets.get("token").map(String::as_str),
-            Some("shared-secret")
-        );
-        assert_eq!(
-            secrets
-                .workspace_secrets
-                .get("workspace")
-                .and_then(|items| items.get("password"))
-                .map(String::as_str),
-            Some("workspace-secret")
-        );
-        let protected_file = fs::read_to_string(&secrets_path).expect("protected secrets read");
-        let envelope: SecretsEnvelope =
-            serde_json::from_str(&protected_file).expect("protected envelope");
-        assert_eq!(envelope.version, SECRETS_ENVELOPE_VERSION);
-        assert!(!protected_file.contains("shared-secret"));
-        assert!(!protected_file.contains("workspace-secret"));
-        let sanitized: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&profile_path).expect("sanitized profile read"),
-        )
-        .expect("sanitized profile json");
-        assert!(sanitized.get("shared_secrets").is_none());
-        assert!(sanitized.get("workspace_secrets").is_none());
-        assert!(sanitized.get("app_secrets").is_none());
+        assert!(error.to_string().contains("受保护的凭据封装"));
     }
 
 }
 
-pub fn load_or_migrate() -> AppResult<AppData> {
+pub fn load() -> AppResult<AppData> {
     let path = data_file_path()?;
     if has_primary_or_backup(&path) {
         let mut data = load_with_backup(&path)?;
-        migrate_or_load_secrets(&path, &mut data)?;
+        load_secrets(&mut data)?;
         return Ok(data);
     }
-
-    let app_root = platform().app_config_dir()?;
-    let mut data = AppData::default();
-
-    let legacy_profiles = app_root.join(LEGACY_PROFILES_FILE);
-    if legacy_profiles.exists() {
-        let raw = fs::read_to_string(&legacy_profiles)?;
-        if let Ok(file) = serde_json::from_str::<LegacyProfilesOnlyFile>(&raw) {
-            data.profiles = file.profiles;
-        }
-    }
-
-    let legacy_settings = app_root.join(LEGACY_SETTINGS_FILE);
-    if legacy_settings.exists() {
-        let raw = fs::read_to_string(&legacy_settings)?;
-        if let Ok(settings) = serde_json::from_str::<AppSettings>(&raw) {
-            merge_settings(&mut data, settings);
-        }
-    }
-
-    Ok(data)
+    Ok(AppData::default())
 }
 
 pub fn save(data: &AppData) -> AppResult<()> {
@@ -256,7 +185,7 @@ fn write_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> {
     write_json(path, &envelope)
 }
 
-fn load_secrets_with_backup(path: &Path) -> AppResult<(SecretsData, bool)> {
+fn load_secrets_with_backup(path: &Path) -> AppResult<SecretsData> {
     match read_secrets_file(path) {
         Ok(data) => Ok(data),
         Err(primary_error) => {
@@ -269,44 +198,39 @@ fn load_secrets_with_backup(path: &Path) -> AppResult<(SecretsData, bool)> {
                     "凭据文件损坏且备份无法读取：主文件错误：{primary_error}；备份错误：{backup_error}"
                 ))
             })?;
-            write_secrets_data(path, &recovered.0)?;
+            write_secrets_data(path, &recovered)?;
             eprintln!(
                 "凭据文件 {} 损坏，已从 {} 恢复",
                 path.display(),
                 backup.display()
             );
-            Ok((recovered.0, true))
+            Ok(recovered)
         }
     }
 }
 
-fn read_secrets_file(path: &Path) -> AppResult<(SecretsData, bool)> {
+fn read_secrets_file(path: &Path) -> AppResult<SecretsData> {
     let raw = fs::read_to_string(path)?;
-    if let Ok(envelope) = serde_json::from_str::<SecretsEnvelope>(&raw) {
-        if envelope.version != SECRETS_ENVELOPE_VERSION {
-            return Err(crate::error::AppError::Message(format!(
-                "不支持的凭据文件版本：{}",
-                envelope.version
-            )));
-        }
-        let protected = BASE64_STANDARD.decode(envelope.payload).map_err(|error| {
-            crate::error::AppError::Message(format!("凭据载荷 Base64 无效：{error}"))
-        })?;
-        let plaintext = secret_protection::unprotect(&envelope.protection, &protected)
-            .map_err(crate::error::AppError::Message)?;
-        let data = serde_json::from_slice::<SecretsData>(&plaintext).map_err(|error| {
-            crate::error::AppError::Message(format!("无法解析解密后的凭据文件：{error}"))
-        })?;
-        return Ok((data, true));
-    }
-
-    let legacy = serde_json::from_str::<SecretsData>(&raw).map_err(|error| {
+    let envelope = serde_json::from_str::<SecretsEnvelope>(&raw).map_err(|error| {
         crate::error::AppError::Message(format!(
-            "无法解析凭据文件 {}：{error}",
+            "凭据文件 {} 不是受保护的凭据封装：{error}",
             path.display()
         ))
     })?;
-    Ok((legacy, false))
+    if envelope.version != SECRETS_ENVELOPE_VERSION {
+        return Err(crate::error::AppError::Message(format!(
+            "不支持的凭据文件版本：{}",
+            envelope.version
+        )));
+    }
+    let protected = BASE64_STANDARD.decode(envelope.payload).map_err(|error| {
+        crate::error::AppError::Message(format!("凭据载荷 Base64 无效：{error}"))
+    })?;
+    let plaintext = secret_protection::unprotect(&envelope.protection, &protected)
+        .map_err(crate::error::AppError::Message)?;
+    serde_json::from_slice::<SecretsData>(&plaintext).map_err(|error| {
+        crate::error::AppError::Message(format!("无法解析解密后的凭据文件：{error}"))
+    })
 }
 
 fn write_json<T>(path: &Path, data: &T) -> AppResult<()>
@@ -355,11 +279,6 @@ where
 #[cfg(test)]
 fn read_data(path: &Path) -> AppResult<AppData> {
     read_json(path)
-}
-
-#[cfg(test)]
-fn read_secrets_data(path: &Path) -> AppResult<SecretsData> {
-    read_secrets_file(path).map(|value| value.0)
 }
 
 fn read_json<T>(path: &Path) -> AppResult<T>
@@ -462,31 +381,4 @@ fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
-}
-
-pub fn maybe_backup_legacy_files(path: &Path) -> AppResult<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let app_root = platform().app_config_dir()?;
-    for name in [LEGACY_PROFILES_FILE, LEGACY_SETTINGS_FILE] {
-        let legacy = app_root.join(name);
-        if legacy.exists() {
-            let backup = app_root.join(format!("{name}.bak"));
-            if !backup.exists() {
-                let _ = fs::rename(&legacy, &backup);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn merge_settings(data: &mut AppData, settings: AppSettings) {
-    data.frp_profiles = settings.frp_profiles;
-    data.last_workspace_id = settings.last_workspace_id;
-    data.download = settings.download;
-    data.proxy = settings.proxy;
-    data.shared_secrets = settings.shared_secrets;
-    data.workspace_secrets = settings.workspace_secrets;
-    data.app_secrets = settings.app_secrets;
 }

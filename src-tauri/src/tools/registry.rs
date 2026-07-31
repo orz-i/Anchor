@@ -1610,12 +1610,9 @@ pub fn canonical_tool_name(name: &str) -> &str {
 
 pub fn normalize_tool_profile(profile: &str) -> &'static str {
     match profile {
-        "advanced" | "full" => "advanced",
+        "advanced" => "advanced",
         "core" => "core",
         "read-only" => "read-only",
-        // Legacy compatibility profile used to expose mutating tools with false
-        // read-only annotations. Preserve the stored value as a safe alias.
-        "compat-readonly-all" => "read-only",
         _ => "core",
     }
 }
@@ -2260,12 +2257,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_aliases_map_to_canonical_profiles() {
+    fn only_current_profile_names_are_accepted() {
         assert_eq!(normalize_tool_profile("core"), "core");
         assert_eq!(normalize_tool_profile("advanced"), "advanced");
-        assert_eq!(normalize_tool_profile("full"), "advanced");
         assert_eq!(normalize_tool_profile("read-only"), "read-only");
-        assert_eq!(normalize_tool_profile("compat-readonly-all"), "read-only");
+        assert_eq!(normalize_tool_profile("unknown"), "core");
     }
 
     #[test]
@@ -2294,16 +2290,4 @@ mod tests {
         assert!(names.contains(&"read_file"));
     }
 
-    #[test]
-    fn legacy_compat_profile_is_a_truthful_read_only_alias() {
-        let read_only = list_tools_for_profile("read-only");
-        let compat = list_tools_for_profile("compat-readonly-all");
-        assert_eq!(compat, read_only);
-        assert!(compat.iter().all(|tool| {
-            tool["annotations"]["readOnlyHint"] == true
-                && tool["annotations"]["destructiveHint"] == false
-        }));
-        assert!(!compat.iter().any(|tool| tool["name"] == "apply_patch"));
-        assert!(!compat.iter().any(|tool| tool["name"] == "exec_command"));
-    }
 }

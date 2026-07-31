@@ -18,11 +18,11 @@ pub struct AppData {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub mcp_gateway: McpGatewayConfig,
-    #[serde(default, skip_serializing)]
+    #[serde(skip)]
     pub shared_secrets: HashMap<String, String>,
-    #[serde(default, skip_serializing)]
+    #[serde(skip)]
     pub workspace_secrets: HashMap<String, HashMap<String, String>>,
-    #[serde(default, skip_serializing)]
+    #[serde(skip)]
     pub app_secrets: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
     pub profiles: Vec<WorkspaceProfile>,
@@ -52,18 +52,6 @@ impl SecretsData {
         data.workspace_secrets = self.workspace_secrets;
         data.app_secrets = self.app_secrets;
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.shared_secrets.is_empty()
-            && self.workspace_secrets.is_empty()
-            && self.app_secrets.is_empty()
-    }
-}
-
-/// Legacy `{ "profiles": [...] }` file at the app root.
-#[derive(Debug, Deserialize)]
-pub struct LegacyProfilesOnlyFile {
-    pub profiles: Vec<WorkspaceProfile>,
 }
 
 #[cfg(test)]
@@ -87,22 +75,17 @@ mod tests {
     }
 
     #[test]
-    fn app_data_still_reads_legacy_inline_secrets() {
+    fn app_data_ignores_inline_secret_fields() {
         let data: AppData = serde_json::from_value(serde_json::json!({
-            "shared_secrets": {"token": "legacy"},
-            "workspace_secrets": {"workspace": {"password": "legacy"}},
+            "shared_secrets": {"token": "ignored"},
+            "workspace_secrets": {"workspace": {"password": "ignored"}},
             "app_secrets": {},
             "profiles": []
         }))
-        .expect("read legacy data");
+        .expect("read current data");
 
-        assert_eq!(data.shared_secrets.get("token").map(String::as_str), Some("legacy"));
-        assert_eq!(
-            data.workspace_secrets
-                .get("workspace")
-                .and_then(|items| items.get("password"))
-                .map(String::as_str),
-            Some("legacy")
-        );
+        assert!(data.shared_secrets.is_empty());
+        assert!(data.workspace_secrets.is_empty());
+        assert!(data.app_secrets.is_empty());
     }
 }

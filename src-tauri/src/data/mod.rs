@@ -1,6 +1,6 @@
-mod migrate;
 mod model;
 mod secret_protection;
+mod storage;
 mod store;
 
 pub use model::AppData;

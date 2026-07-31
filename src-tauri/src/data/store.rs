@@ -7,31 +7,14 @@ use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
 use crate::workspace::WorkspaceProfile;
 
-use super::migrate::{data_file_path, load_or_migrate, maybe_backup_legacy_files, save};
 use super::model::AppData;
+use super::storage::{data_file_path, load, save};
 
 static DATA_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 struct DataFileGuard {
     _process_guard: MutexGuard<'static, ()>,
     lock_file: File,
-}
-
-fn migrate_gateway_url_state(data: &mut AppData) -> bool {
-    data.mcp_gateway.migrate_legacy_url_state()
-}
-
-fn migrate_tool_profiles(data: &mut AppData) -> bool {
-    let mut changed = false;
-    for profile in &mut data.profiles {
-        let canonical =
-            crate::tools::registry::normalize_tool_profile(&profile.runtime.tool_profile);
-        if profile.runtime.tool_profile != canonical {
-            profile.runtime.tool_profile = canonical.to_string();
-            changed = true;
-        }
-    }
-    changed
 }
 
 fn normalize_workspace_profile(mut profile: WorkspaceProfile) -> WorkspaceProfile {
@@ -87,33 +70,23 @@ impl DataStore {
         let _guard = lock_data_file()?;
         let path = data_file_path()?;
         let existed_before = path.exists();
-        let mut data = load_or_migrate()?;
-        let gateway_migrated = migrate_gateway_url_state(&mut data);
-        let tool_profiles_migrated = migrate_tool_profiles(&mut data);
+        let data = load()?;
         let store = Self { data };
-        if !existed_before || gateway_migrated || tool_profiles_migrated {
-            store.persist_unlocked()?;
-        }
         if !existed_before {
-            maybe_backup_legacy_files(&path)?;
+            store.persist_unlocked()?;
         }
         Ok(store)
     }
 
     pub fn read_file<R>(f: impl FnOnce(&AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
-        let mut data = load_or_migrate()?;
-        if migrate_gateway_url_state(&mut data) | migrate_tool_profiles(&mut data) {
-            save(&data)?;
-        }
+        let data = load()?;
         f(&data)
     }
 
     pub fn update_file<R>(f: impl FnOnce(&mut AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
-        let mut data = load_or_migrate()?;
-        migrate_gateway_url_state(&mut data);
-        migrate_tool_profiles(&mut data);
+        let mut data = load()?;
         let result = f(&mut data)?;
         save(&data)?;
         Ok(result)
@@ -369,37 +342,4 @@ mod tests {
         assert!(!secrets.contains_key("oauth_client_secret"));
     }
 
-    #[test]
-    fn legacy_tool_profiles_are_migrated_to_canonical_values() {
-        let mut data = AppData::default();
-        data.profiles.push(WorkspaceProfile {
-            id: "full-profile".into(),
-            name: "full".into(),
-            path: ".".into(),
-            tunnel: Default::default(),
-            auth: Default::default(),
-            runtime: crate::workspace::RuntimeConfig {
-                tool_profile: "full".into(),
-                ..Default::default()
-            },
-            actions: Default::default(),
-        });
-        data.profiles.push(WorkspaceProfile {
-            id: "compat-profile".into(),
-            name: "compat".into(),
-            path: ".".into(),
-            tunnel: Default::default(),
-            auth: Default::default(),
-            runtime: crate::workspace::RuntimeConfig {
-                tool_profile: "compat-readonly-all".into(),
-                ..Default::default()
-            },
-            actions: Default::default(),
-        });
-
-        assert!(migrate_tool_profiles(&mut data));
-        assert_eq!(data.profiles[0].runtime.tool_profile, "advanced");
-        assert_eq!(data.profiles[1].runtime.tool_profile, "read-only");
-        assert!(!migrate_tool_profiles(&mut data));
-    }
 }

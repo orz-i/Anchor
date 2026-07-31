@@ -47,8 +47,6 @@
   let saving = $state(false);
 
   function canonicalProfile(value: string) {
-    if (value === "full") return "advanced";
-    if (value === "compat-readonly-all") return "read-only";
     if (value === "advanced" || value === "read-only") return value;
     return "core";
   }

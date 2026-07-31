@@ -16,10 +16,6 @@ pub struct FrpProfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpGatewayConfig {
-    /// URL state schema. Version 0 is the phase-one legacy format where
-    /// `public_url` mixed configured and runtime-observed values.
-    #[serde(default)]
-    pub url_model_version: u8,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_mcp_gateway_port")]
@@ -45,7 +41,6 @@ pub struct McpGatewayConfig {
 impl Default for McpGatewayConfig {
     fn default() -> Self {
         Self {
-            url_model_version: 2,
             enabled: false,
             local_port: default_mcp_gateway_port(),
             owner_workspace_id: String::new(),
@@ -62,27 +57,6 @@ impl McpGatewayConfig {
         self.observed_public_url.clear();
         self.observed_owner_workspace_id.clear();
         self.observed_tunnel_signature.clear();
-    }
-
-    pub fn migrate_legacy_url_state(&mut self) -> bool {
-        let mut changed = false;
-        if self.url_model_version == 0 {
-            if self.observed_public_url.trim().is_empty() && !self.public_url.trim().is_empty() {
-                self.observed_public_url = self.public_url.trim().trim_end_matches('/').to_string();
-                self.public_url.clear();
-            }
-            changed = true;
-        }
-        if self.url_model_version < 2 {
-            if !self.observed_public_url.trim().is_empty()
-                && self.observed_owner_workspace_id.trim().is_empty()
-            {
-                self.observed_owner_workspace_id = self.owner_workspace_id.clone();
-            }
-            self.url_model_version = 2;
-            changed = true;
-        }
-        changed
     }
 
     pub fn effective_public_url(&self) -> String {
@@ -268,14 +242,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_legacy_snake_case_server_port_compatible() {
+    fn accepts_persisted_snake_case_server_port() {
         let profile: FrpProfile = serde_json::from_value(serde_json::json!({
             "id": "p1",
             "name": "公司 FRP",
             "server": "frp.example.com",
             "server_port": 7005
         }))
-        .expect("legacy FRP profile should deserialize");
+        .expect("persisted FRP profile should deserialize");
 
         assert_eq!(profile.server_port, 7005);
     }
@@ -283,7 +257,6 @@ mod tests {
     #[test]
     fn gateway_defaults_to_disabled_reserved_port() {
         let gateway = McpGatewayConfig::default();
-        assert_eq!(gateway.url_model_version, 2);
         assert!(!gateway.enabled);
         assert_eq!(gateway.local_port, 28765);
         assert!(gateway.owner_workspace_id.is_empty());
@@ -292,20 +265,4 @@ mod tests {
         assert!(gateway.observed_tunnel_signature.is_empty());
     }
 
-    #[test]
-    fn legacy_gateway_url_is_migrated_to_observed_state() {
-        let mut gateway: McpGatewayConfig = serde_json::from_value(serde_json::json!({
-            "enabled": true,
-            "localPort": 28765,
-            "ownerWorkspaceId": "owner",
-            "publicUrl": "https://legacy.example.com"
-        }))
-        .expect("legacy gateway config");
-        assert_eq!(gateway.url_model_version, 0);
-        assert!(gateway.migrate_legacy_url_state());
-        assert!(gateway.public_url.is_empty());
-        assert_eq!(gateway.observed_public_url, "https://legacy.example.com");
-        assert_eq!(gateway.observed_owner_workspace_id, "owner");
-        assert_eq!(gateway.url_model_version, 2);
-    }
 }

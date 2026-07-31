@@ -83,7 +83,6 @@ pub async fn set_mcp_gateway(
     state: State<'_, AppState>,
     mut config: McpGatewayConfig,
 ) -> AppResult<McpGatewayStatus> {
-    config.url_model_version = 2;
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
     let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
@@ -171,7 +170,6 @@ fn persist_gateway_observation(
         .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
     let signature = gateway::tunnel_identity_signature(config, owner)?;
     let mut candidate = config.clone();
-    candidate.url_model_version = 2;
     candidate.observed_public_url = normalized.to_string();
     candidate.observed_owner_workspace_id = config.owner_workspace_id.clone();
     candidate.observed_tunnel_signature = signature.clone();
@@ -187,7 +185,6 @@ fn persist_gateway_observation(
         {
             return Ok(());
         }
-        settings.mcp_gateway.url_model_version = 2;
         settings.mcp_gateway.observed_public_url = normalized.to_string();
         settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
         settings.mcp_gateway.observed_tunnel_signature = signature;

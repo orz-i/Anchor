@@ -106,7 +106,6 @@ fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResu
     if let Some(public_url) = options.public_url {
         config.public_url = public_url.trim().trim_end_matches('/').to_string();
     }
-    config.url_model_version = 2;
     if previous.identity_changed(&config) {
         config.clear_observation();
     } else {
@@ -342,7 +341,6 @@ fn persist_cli_gateway_observation(
         .find(|profile| profile.id == config.owner_workspace_id)
         .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
     let signature = gateway::tunnel_identity_signature(config, owner)?;
-    config.url_model_version = 2;
     config.observed_public_url = normalized.to_string();
     config.observed_owner_workspace_id = config.owner_workspace_id.clone();
     config.observed_tunnel_signature = signature.clone();
@@ -358,7 +356,6 @@ fn persist_cli_gateway_observation(
     {
         return Ok(());
     }
-    settings.mcp_gateway.url_model_version = 2;
     settings.mcp_gateway.observed_public_url = normalized.to_string();
     settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
     settings.mcp_gateway.observed_tunnel_signature = signature;

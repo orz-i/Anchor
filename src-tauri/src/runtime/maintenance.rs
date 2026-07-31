@@ -269,7 +269,6 @@ fn persist_gateway_observation(
         })?;
     let signature = gateway::tunnel_identity_signature(config, owner)?;
     let mut candidate = config.clone();
-    candidate.url_model_version = 2;
     candidate.observed_public_url = normalized.to_string();
     candidate.observed_owner_workspace_id = config.owner_workspace_id.clone();
     candidate.observed_tunnel_signature = signature.clone();
@@ -285,7 +284,6 @@ fn persist_gateway_observation(
         {
             return Ok(());
         }
-        settings.mcp_gateway.url_model_version = 2;
         settings.mcp_gateway.observed_public_url = normalized.to_string();
         settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
         settings.mcp_gateway.observed_tunnel_signature = signature;
