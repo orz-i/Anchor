@@ -343,6 +343,21 @@ async fn handle_tools_call(
 
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
     if !known.iter().any(|n| n == &canonical_name) {
+        let catalog_changed = state
+            .published_catalog()
+            .zip(build_effective_catalog(state.as_ref()).ok())
+            .is_some_and(|(published, current)| published.digest != current.digest);
+        if catalog_changed {
+            return Err(serde_json::json!({
+                "code": -32005,
+                "message": format!("Tool {name} is no longer available in the current catalog"),
+                "data": {
+                    "reason": "catalog_changed",
+                    "catalog_changed": true,
+                    "reconnect_required": true
+                }
+            }));
+        }
         return Err(serde_json::json!({
             "code": -32602,
             "message": format!("Unknown tool: {name}"),

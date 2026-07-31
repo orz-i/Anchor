@@ -185,8 +185,8 @@ pub fn snapshot_document() -> Result<Value, WorkspaceError> {
         snapshots.insert(
             profile.to_string(),
             json!({
+                "catalog_version": crate::tools::registry::CATALOG_VERSION,
                 "tool_count": catalog.tools.len(),
-                "digest": catalog.digest,
                 "names": catalog.tools.iter().filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>()
             }),
         );

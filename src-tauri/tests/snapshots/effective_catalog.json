@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "digest": "b2ee2347bd10c11505da744cc2dc63633f8e54376b3c76f5e5901b14650469b8",
+    "catalog_version": 8,
     "names": [
       "accept_current_baseline",
       "apply_patch",
@@ -40,18 +40,20 @@
       "server_info",
       "set_default_cwd",
       "stage_commit",
+      "stage_commit_status",
       "start_task",
       "task_context",
       "update_task",
       "update_verification_disposition",
       "view_image",
       "wait_command",
+      "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 45
+    "tool_count": 47
   },
   "core": {
-    "digest": "b42310b5b2d0a960a4ca6271ba59cdff4a317b39be73af27fd14ac69a3534a08",
+    "catalog_version": 8,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -85,7 +87,7 @@
     "tool_count": 28
   },
   "read-only": {
-    "digest": "b9fcfa3c316ae62f0dce604881d02bc3f1cab043bf6b34544b60b8fef7145233",
+    "catalog_version": 8,
     "names": [
       "check_exec_environment",
       "get_default_cwd",
