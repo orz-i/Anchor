@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 8;
+pub const CATALOG_VERSION: u32 = 9;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -719,6 +719,8 @@ fn session_snapshot_output_schema() -> Value {
             "stderr": { "type": "string" },
             "stdout_truncated": { "type": "boolean" },
             "stderr_truncated": { "type": "boolean" },
+            "stdout_complete": { "type": "boolean" },
+            "stderr_complete": { "type": "boolean" },
             "elapsed_ms": { "type": "integer", "minimum": 0 },
             "output_refs": {
                 "type": "object",
@@ -746,6 +748,8 @@ fn session_snapshot_output_schema() -> Value {
             "stderr",
             "stdout_truncated",
             "stderr_truncated",
+            "stdout_complete",
+            "stderr_complete",
             "elapsed_ms",
             "output_refs",
         ],
@@ -756,58 +760,60 @@ pub fn output_schema(name: &str) -> Value {
     match canonical_tool_name(name) {
         "server_info" => success_output_schema(
             merge_schema_properties(vec![
-            json!({
-                "server": { "type": "string", "const": crate::brand::SERVER_NAME },
-                "title": { "type": "string", "minLength": 1 },
-                "version": { "type": "string", "minLength": 1 },
-                "protocol_version": { "type": "string", "minLength": 1 },
-                "workspace": { "type": "string", "minLength": 1 },
-                "permission_mode": { "type": "string", "minLength": 1 },
-                "default_cwd": { "type": "string", "minLength": 1 },
-                "network_allowed": { "type": "boolean" },
-                "tool_profile": { "type": "string", "enum": ["core", "read-only", "advanced"] },
-                "auth_enabled": { "type": "boolean" },
-                "auth_type": { "type": "string", "minLength": 1 },
-                "endpoint_path": { "type": "string", "const": "/mcp" },
-                "tools": { "type": "array", "items": { "type": "string" } },
-                "tool_count": { "type": "integer", "minimum": 0 },
-                "current_tools": { "type": "array", "items": { "type": "string" } },
-                "current_tool_count": { "type": "integer", "minimum": 0 },
-                "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
-                "running_catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
-                "current_catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
-                "catalog_published": { "type": "boolean" },
-                "catalog_changed": { "type": "boolean" },
-                "reconnect_required": { "type": "boolean" },
-                "catalog_version": { "type": "integer", "minimum": 1 },
-                "catalog_bytes": { "type": "integer", "minimum": 0 },
-                "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
-                "local_tool_count": { "type": "integer", "minimum": 0 },
-                "proxy_tool_count": { "type": "integer", "minimum": 0 },
-                "current_catalog_bytes": { "type": "integer", "minimum": 0 },
-                "current_catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
-                "current_local_tool_count": { "type": "integer", "minimum": 0 },
-                "current_proxy_tool_count": { "type": "integer", "minimum": 0 }
-            }),
-            json!({
-                "command_cost_policy": { "type": "object" },
-                "downstream_mcp": {
-                    "type": "object",
-                    "properties": {
-                        "configured": { "type": "boolean" },
-                        "server_count": { "type": "integer", "minimum": 0 },
-                        "servers": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": true
+                json!({
+                    "server": { "type": "string", "const": crate::brand::SERVER_NAME },
+                    "title": { "type": "string", "minLength": 1 },
+                    "version": { "type": "string", "minLength": 1 },
+                    "protocol_version": { "type": "string", "minLength": 1 },
+                    "workspace": { "type": "string", "minLength": 1 },
+                    "permission_mode": { "type": "string", "minLength": 1 },
+                    "default_cwd": { "type": "string", "minLength": 1 },
+                    "network_allowed": { "type": "boolean" },
+                    "tool_profile": { "type": "string", "enum": ["core", "read-only", "advanced"] },
+                    "auth_enabled": { "type": "boolean" },
+                    "auth_type": { "type": "string", "minLength": 1 },
+                    "endpoint_path": { "type": "string", "const": "/mcp" },
+                    "tools": { "type": "array", "items": { "type": "string" } },
+                    "tool_count": { "type": "integer", "minimum": 0 },
+                    "tool_groups": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+                    "current_tools": { "type": "array", "items": { "type": "string" } },
+                    "current_tool_count": { "type": "integer", "minimum": 0 },
+                    "current_tool_groups": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+                    "catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                    "running_catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                    "current_catalog_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
+                    "catalog_published": { "type": "boolean" },
+                    "catalog_changed": { "type": "boolean" },
+                    "reconnect_required": { "type": "boolean" },
+                    "catalog_version": { "type": "integer", "minimum": 1 },
+                    "catalog_bytes": { "type": "integer", "minimum": 0 },
+                    "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
+                    "local_tool_count": { "type": "integer", "minimum": 0 },
+                    "proxy_tool_count": { "type": "integer", "minimum": 0 },
+                    "current_catalog_bytes": { "type": "integer", "minimum": 0 },
+                    "current_catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
+                    "current_local_tool_count": { "type": "integer", "minimum": 0 },
+                    "current_proxy_tool_count": { "type": "integer", "minimum": 0 }
+                }),
+                json!({
+                    "command_cost_policy": { "type": "object" },
+                    "downstream_mcp": {
+                        "type": "object",
+                        "properties": {
+                            "configured": { "type": "boolean" },
+                            "server_count": { "type": "integer", "minimum": 0 },
+                            "servers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": true
+                                }
                             }
-                        }
-                    },
-                    "required": ["configured", "server_count", "servers"],
-                    "additionalProperties": false
-                }
-            })
+                        },
+                        "required": ["configured", "server_count", "servers"],
+                        "additionalProperties": false
+                    }
+                }),
             ]),
             &[
                 "server",
@@ -824,8 +830,10 @@ pub fn output_schema(name: &str) -> Value {
                 "endpoint_path",
                 "tools",
                 "tool_count",
+                "tool_groups",
                 "current_tools",
                 "current_tool_count",
+                "current_tool_groups",
                 "catalog_digest",
                 "running_catalog_digest",
                 "current_catalog_digest",
@@ -923,10 +931,19 @@ pub fn output_schema(name: &str) -> Value {
                         "would_modify": { "type": "array", "items": { "type": "string" } },
                         "would_delete": { "type": "array", "items": { "type": "string" } },
                         "post_validation": { "type": "array", "items": { "type": "object" } },
+                        "hunk_matches": { "type": "array", "items": { "type": "object" } },
+                        "transaction": { "type": "object" },
                         "recovery": { "type": "string", "minLength": 1 },
                         "warnings": warnings_property()
                     }),
-                    &["dry_run", "clean", "summary", "affected_files", "post_validation", "warnings"],
+                    &[
+                        "dry_run",
+                        "clean",
+                        "summary",
+                        "affected_files",
+                        "post_validation",
+                        "warnings",
+                    ],
                 ),
                 json!({
                     "if": {
@@ -995,6 +1012,8 @@ pub fn output_schema(name: &str) -> Value {
                 "stderr": { "type": "string" },
                 "stdout_truncated": { "type": "boolean" },
                 "stderr_truncated": { "type": "boolean" },
+                "stdout_complete": { "type": "boolean" },
+                "stderr_complete": { "type": "boolean" },
                 "duration_ms": { "type": "integer", "minimum": 0 },
                 "elapsed_ms": { "type": "integer", "minimum": 0 },
                 "execution_mode": { "type": "string", "minLength": 1 },
@@ -1005,6 +1024,10 @@ pub fn output_schema(name: &str) -> Value {
                 "transport_ok": { "type": "boolean" },
                 "command_ok": { "type": ["boolean", "null"] },
                 "verification_pending": { "type": "boolean" },
+                "verification_id": { "type": "string", "minLength": 1 },
+                "verification_level": { "type": "string", "enum": ["diagnostic", "informational", "required", "blocking"] },
+                "supersedes": { "type": "array", "items": { "type": "string" } },
+                "affected_task_status": { "type": ["string", "null"] },
                 "verification": { "type": "object", "additionalProperties": true },
                 "cost_policy": { "type": "object", "additionalProperties": true },
                 "warnings": warnings_property()
@@ -1021,6 +1044,8 @@ pub fn output_schema(name: &str) -> Value {
                 "stderr",
                 "stdout_truncated",
                 "stderr_truncated",
+                "stdout_complete",
+                "stderr_complete",
                 "duration_ms",
                 "elapsed_ms",
                 "execution_mode",
@@ -1048,14 +1073,31 @@ pub fn output_schema(name: &str) -> Value {
                 "stdin_open": { "type": "boolean" },
                 "stdout": { "type": "object" },
                 "stderr": { "type": "object" },
+                "stdout_complete": { "type": "boolean" },
+                "stderr_complete": { "type": "boolean" },
+                "output_refs": { "type": "object" },
                 "stop_pattern_matched": { "type": ["string", "null"] },
                 "wait_timeout_ms": { "type": "integer", "minimum": 0 },
                 "warnings": warnings_property()
             }),
             &[
-                "session_id", "state", "status", "termination_reason", "exit_code",
-                "command_ok", "started_at", "elapsed_ms", "last_output_at", "stdin_open",
-                "stdout", "stderr", "wait_timeout_ms", "warnings"
+                "session_id",
+                "state",
+                "status",
+                "termination_reason",
+                "exit_code",
+                "command_ok",
+                "started_at",
+                "elapsed_ms",
+                "last_output_at",
+                "stdin_open",
+                "stdout",
+                "stderr",
+                "stdout_complete",
+                "stderr_complete",
+                "output_refs",
+                "wait_timeout_ms",
+                "warnings",
             ],
         ),
         "kill_session" => {
@@ -1118,7 +1160,13 @@ pub fn output_schema(name: &str) -> Value {
                 "ahead": { "type": "integer", "minimum": 0 },
                 "behind": { "type": "integer", "minimum": 0 },
                 "clean": { "type": "boolean" },
+                "raw_clean": { "type": "boolean" },
                 "entries": { "type": "array", "items": { "type": "object" } },
+                "metadata_only_entries": { "type": "array", "items": { "type": "object" } },
+                "metadata_only_count": { "type": "integer", "minimum": 0 },
+                "content_changed_count": { "type": "integer", "minimum": 0 },
+                "index_refresh_performed": { "type": "boolean" },
+                "index_refresh_failed_count": { "type": "integer", "minimum": 0 },
                 "truncated": { "type": "boolean" },
                 "warnings": warnings_property()
             }),
@@ -1321,7 +1369,13 @@ pub fn output_schema(name: &str) -> Value {
                 "next_cursor": nullable_integer_property(),
                 "filters": { "type": "object" }
             }),
-            &["operations", "summary", "total_matches", "next_cursor", "filters"],
+            &[
+                "operations",
+                "summary",
+                "total_matches",
+                "next_cursor",
+                "filters",
+            ],
         ),
         "begin_work_session" => success_output_schema(
             json!({
@@ -1331,7 +1385,13 @@ pub fn output_schema(name: &str) -> Value {
                 "harness": { "type": "object" },
                 "reconnect_required": { "type": "boolean", "const": false }
             }),
-            &["work_session", "history", "task", "harness", "reconnect_required"],
+            &[
+                "work_session",
+                "history",
+                "task",
+                "harness",
+                "reconnect_required",
+            ],
         ),
         "close_work_session" => json!({
             "type": "object",
@@ -1367,7 +1427,12 @@ pub fn output_schema(name: &str) -> Value {
                 "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "verified_with_exceptions"] },
                 "effective_disposition": { "type": "string", "enum": ["active_failure", "expected_failure", "diagnostic_only", "superseded", "waived", "passed"] }
             }),
-            &["task_id", "verification", "verification_status", "effective_disposition"],
+            &[
+                "task_id",
+                "verification",
+                "verification_status",
+                "effective_disposition",
+            ],
         ),
         "stage_commit" | "stage_commit_status" | "wait_stage_commit" => success_output_schema(
             json!({
@@ -1963,6 +2028,7 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "patch": { "type": "string", "minLength": 1 },
                 "dry_run": { "type": "boolean", "default": false },
+                "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" },
                 "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" },
                 "reason": { "type": "string", "default": "" }
             },
@@ -1994,6 +2060,17 @@ pub fn input_schema(name: &str) -> Value {
                     "minLength": 1,
                     "maxLength": 128,
                     "description": "Optional verification category such as lint, test, build, check, or diff_check. Terminal results are persisted as Harness verification evidence when a task is active."
+                },
+                "verification_level": {
+                    "type": "string",
+                    "enum": ["diagnostic", "informational", "required", "blocking"],
+                    "default": "blocking",
+                    "description": "Controls whether a failed verification blocks task completion. Diagnostic and informational failures are recorded as non-blocking evidence."
+                },
+                "supersede_previous_failures": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "When a verification passes, mark prior active failures with the same verification_kind as superseded."
                 },
                 "filesystem_scope": { "type": "string", "enum": ["workspace"], "default": "workspace" },
                 "reason": { "type": "string", "default": "" }
@@ -2053,7 +2130,9 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "path": { "type": "string", "default": "." },
                 "include_untracked": { "type": "boolean", "default": true },
-                "max_entries": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
+                "max_entries": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
+                "diagnose_metadata_only": { "type": "boolean", "default": true },
+                "refresh_index": { "type": "boolean", "default": false, "description": "Safely refresh index stat metadata only for paths whose filtered worktree blob already matches the index blob." }
             },
             "additionalProperties": false
         }),
