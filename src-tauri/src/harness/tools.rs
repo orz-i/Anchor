@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Command;
 
@@ -786,46 +786,97 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let selected_change_id = requested_change_id.or(task.latest_change_id.as_deref());
-    let change = selected_change_id
-        .and_then(|change_id| ctx.harness.load_change_set(change_id).ok().flatten());
-    let commit_sha = change
-        .as_ref()
+    let all_changes = ctx
+        .harness
+        .list_change_sets(&task.id)
+        .map_err(map_error)?;
+    let selected_changes = if let Some(change_id) = requested_change_id {
+        ctx.harness
+            .load_change_set(change_id)
+            .map_err(map_error)?
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        all_changes
+    };
+    let commits = selected_changes
+        .iter()
+        .map(|change| {
+            json!({
+                "change_id": change.id,
+                "commit_sha": change.commit_sha,
+                "created_at": change.created_at,
+                "committed_files": change.committed_files,
+                "verification_ids": change.verification_ids
+            })
+        })
+        .collect::<Vec<_>>();
+    let commit_sha = selected_changes
+        .last()
         .and_then(|change| change.commit_sha.clone())
-        .or_else(|| selected_change_id.map(str::to_string))
+        .or_else(|| requested_change_id.map(str::to_string))
         .or_else(|| {
             task.expected_state
                 .as_ref()
                 .and_then(|expected| expected.head.clone())
                 .filter(|head| task.baseline.head.as_ref() != Some(head))
         });
-    let committed_files = change
+    let mut committed_file_set = BTreeSet::new();
+    for change in &selected_changes {
+        committed_file_set.extend(change.committed_files.iter().cloned());
+    }
+    if committed_file_set.is_empty() {
+        if let Some(commit) = commit_sha.as_deref() {
+            committed_file_set.extend(git_paths(
+                ctx.workspace.root(),
+                &[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-z",
+                    commit,
+                ],
+            ));
+        }
+    }
+    let committed_files = committed_file_set.into_iter().collect::<Vec<_>>();
+    let files_by_commit = selected_changes
+        .iter()
+        .map(|change| {
+            json!({
+                "commit_sha": change.commit_sha,
+                "change_id": change.id,
+                "files": change.committed_files
+            })
+        })
+        .collect::<Vec<_>>();
+    let first_commit = selected_changes
+        .first()
+        .and_then(|change| change.commit_sha.clone());
+    let last_commit = selected_changes
+        .last()
+        .and_then(|change| change.commit_sha.clone());
+    let end_head = task
+        .expected_state
         .as_ref()
-        .map(|change| change.committed_files.clone())
-        .filter(|files| !files.is_empty())
-        .unwrap_or_else(|| {
-            commit_sha
-                .as_deref()
-                .map(|commit| {
-                    git_paths(
-                        ctx.workspace.root(),
-                        &[
-                            "diff-tree",
-                            "--no-commit-id",
-                            "--name-only",
-                            "-r",
-                            "-z",
-                            commit,
-                        ],
-                    )
-                })
-                .unwrap_or_default()
-        });
+        .and_then(|expected| expected.head.clone())
+        .or_else(|| last_commit.clone());
+    let net_changed_files = match (task.baseline.head.as_deref(), end_head.as_deref()) {
+        (Some(start), Some(end)) if start != end => {
+            let range = format!("{start}..{end}");
+            git_paths(
+                ctx.workspace.root(),
+                &["diff", "--name-only", "-z", range.as_str()],
+            )
+        }
+        _ => Vec::new(),
+    };
     let mut working_tree_files = git_working_tree_files(ctx.workspace.root());
     let mut runtime_artifacts = known_runtime_artifacts(ctx.workspace.root());
     let mut ignored_files = known_ignored_paths(ctx.workspace.root());
     working_tree_files.retain(|path| !is_runtime_artifact(path));
-    if let Some(change) = change.as_ref() {
+    for change in &selected_changes {
         runtime_artifacts.extend(change.runtime_artifacts.clone());
         ignored_files.extend(change.ignored_files.clone());
     }
@@ -848,7 +899,9 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .map(compact_event)
         .collect::<Vec<_>>();
     let counts = json!({
+        "commits": commits.len(),
         "committed_files": committed_files.len(),
+        "net_changed_files": net_changed_files.len(),
         "working_tree_files": working_tree_files.len(),
         "runtime_artifacts": runtime_artifacts.len(),
         "ignored_files": ignored_files.len(),
@@ -861,7 +914,13 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         "objective": bounded_objective,
         "why": {"text": bounded_objective, "source": "task_objective"},
         "commit_sha": commit_sha,
+        "commit_count": commits.len(),
+        "first_commit": first_commit,
+        "last_commit": last_commit,
+        "commits": commits,
+        "files_by_commit": files_by_commit,
         "committed_files": committed_files,
+        "net_changed_files": net_changed_files,
         "working_tree_files": working_tree_files,
         "runtime_artifacts": runtime_artifacts,
         "ignored_files": ignored_files,
@@ -869,7 +928,7 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         "verification": verification_views(&verifications),
         "verification_status": verification_status(&verifications),
         "risks": [],
-        "rollback_capability": if task.latest_change_id.is_some() { "git_commit" } else { "not_available" },
+        "rollback_capability": if selected_changes.is_empty() { "not_available" } else { "git_commit_range" },
         "baseline": baseline_view(&task),
         "counts": counts,
         "truncated": false,
@@ -1119,7 +1178,10 @@ fn paginate_summary_section(
     limit: usize,
 ) {
     let keys = [
+        "commits",
+        "files_by_commit",
         "committed_files",
+        "net_changed_files",
         "working_tree_files",
         "runtime_artifacts",
         "ignored_files",

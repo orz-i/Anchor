@@ -130,6 +130,35 @@ impl HarnessStore {
         read_json(&path).map(Some)
     }
 
+    pub fn list_change_sets(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> HarnessResult<Vec<ChangeSet>> {
+        let dir = self.changes_dir(workspace_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut changes = Vec::new();
+        for entry in fs::read_dir(dir).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(change) = read_json::<ChangeSet>(&path) {
+                if change.task_id == task_id {
+                    changes.push(change);
+                }
+            }
+        }
+        changes.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+        Ok(changes)
+    }
+
     pub fn save_verification(
         &self,
         workspace_id: &str,

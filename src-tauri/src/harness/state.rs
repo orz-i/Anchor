@@ -366,6 +366,10 @@ impl Harness {
         self.store.load_change_set(&self.workspace_id, change_id)
     }
 
+    pub fn list_change_sets(&self, task_id: &str) -> HarnessResult<Vec<ChangeSet>> {
+        self.store.list_change_sets(&self.workspace_id, task_id)
+    }
+
     pub fn complete_task(
         &self,
         task_id: &str,

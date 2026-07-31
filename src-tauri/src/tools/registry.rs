@@ -1431,7 +1431,13 @@ pub fn output_schema(name: &str) -> Value {
                 "task_id": { "type": "string", "minLength": 1 },
                 "objective": { "type": "string" },
                 "commit_sha": { "type": ["string", "null"] },
+                "commit_count": { "type": "integer", "minimum": 0 },
+                "first_commit": { "type": ["string", "null"] },
+                "last_commit": { "type": ["string", "null"] },
+                "commits": { "type": "array", "items": { "type": "object" } },
+                "files_by_commit": { "type": "array", "items": { "type": "object" } },
                 "committed_files": { "type": "array", "items": { "type": "string" } },
+                "net_changed_files": { "type": "array", "items": { "type": "string" } },
                 "working_tree_files": { "type": "array", "items": { "type": "string" } },
                 "runtime_artifacts": { "type": "array", "items": { "type": "string" } },
                 "ignored_files": { "type": "array", "items": { "type": "string" } },
@@ -1447,7 +1453,11 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "task_id",
                 "objective",
+                "commit_count",
+                "commits",
+                "files_by_commit",
                 "committed_files",
+                "net_changed_files",
                 "working_tree_files",
                 "runtime_artifacts",
                 "ignored_files",
@@ -1853,7 +1863,7 @@ pub fn input_schema(name: &str) -> Value {
                 "change_id": { "type": "string" },
                 "section": {
                     "type": "string",
-                    "enum": ["committed_files", "working_tree_files", "runtime_artifacts", "ignored_files", "verification", "evidence"]
+                    "enum": ["commits", "files_by_commit", "committed_files", "net_changed_files", "working_tree_files", "runtime_artifacts", "ignored_files", "verification", "evidence"]
                 },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 64 }

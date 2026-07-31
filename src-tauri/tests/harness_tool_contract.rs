@@ -374,6 +374,61 @@ fn successful_verification_retry_supersedes_previous_failure() {
 }
 
 #[test]
+fn change_summary_aggregates_every_task_commit_and_file() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "anchor-tests@example.invalid"]);
+    git(&["config", "user.name", "Anchor Tests"]);
+    fs::write(workspace.join("README.md"), "baseline\n").expect("baseline");
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "baseline"]);
+
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("context");
+    let task = ctx.harness.start_task("multi commit summary").expect("task");
+    ctx.harness
+        .save_change_set(
+            &task.id,
+            "1111111111111111111111111111111111111111",
+            vec!["a.rs".into(), "shared.rs".into()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("first change");
+    ctx.harness
+        .save_change_set(
+            &task.id,
+            "2222222222222222222222222222222222222222",
+            vec!["b.rs".into(), "shared.rs".into()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("second change");
+
+    let summary = call_tool(&ctx, "change_summary", &json!({"task_id": task.id}));
+    assert_eq!(summary["ok"], true);
+    assert_eq!(summary["commit_count"], 2);
+    assert_eq!(summary["first_commit"], "1111111111111111111111111111111111111111");
+    assert_eq!(summary["last_commit"], "2222222222222222222222222222222222222222");
+    assert_eq!(summary["committed_files"], json!(["a.rs", "b.rs", "shared.rs"]));
+    assert_eq!(summary["files_by_commit"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn retained_git_commit_refreshes_expected_head_after_session_exit() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
