@@ -7,7 +7,7 @@
 | 属性 | 值 |
 |------|-----|
 | 项目名称 | Anchor Rust |
-| 版本 | 0.0.0（重构中） |
+| 版本 | 0.1.23 |
 | 语言 | Rust + TypeScript |
 | 框架 | Tauri 2 + Svelte |
 | 类型 | 桌面客户端 + 内嵌 MCP 运行时 |
@@ -33,14 +33,12 @@
 ### [设计系统](./design-system.md)
 2026 开发者工具 UI 审美、色彩、字体、交互规范
 
-## 参考实现
+## 权威实现与契约
 
-旧版 Python 实现完整归档在 `old/` 目录：
-
-- `old/coding_tools_mcp/server.py` — legacy MCP 核心（~5400 行）
-- `old/apps/desktop-client/` — PySide6 桌面客户端
-- `old/docs/profile-v0.1.md` — MCP 协议契约
-- `old/tests/compliance/` — 71 项合规测试
+- `src-tauri/src/mcp/` — MCP Streamable HTTP、OAuth、Session 与代理聚合
+- `src-tauri/src/tools/` — 文件、Patch、Exec、Git、History 与 Skill 工具内核
+- `src-tauri/tests/` — 工具结果契约、安全边界、输出 Schema 与 Harness 集成测试
+- `docs/verification/` — 发布候选、协议、OAuth、远程连接与回归验证证据
 
 ## 快速开始
 
@@ -52,17 +50,18 @@
 ## 开发时查看对应文档
 
 ### 新功能开发
-- 先调用 `start_feature` MCP 工具
+- 使用 `begin_work_session` 或 `start_task` 建立基线
 - 规格文档：`docs/specs/<feature>/`
-- 通过 `check_spec` 后再写实现代码
+- 使用 `stage_commit` 完成检查、分段提交和验证证据绑定
 
 ### 理解 MCP 协议行为
-- `old/docs/profile-v0.1.md` — 协议规范
-- `old/docs/tools-and-schemas.md` — 工具 schema
+- `src-tauri/src/mcp/protocol.rs` — 协议版本与消息结构
+- `src-tauri/src/tools/registry.rs` — 工具目录、inputSchema 与 outputSchema
+- `src-tauri/tests/call_tool_contract.rs` — 工具行为契约
 
 ### 编写测试
 - [how-to-test.md](./project-context/how-to-test.md)
-- `old/tests/compliance/` — 行为参考
+- `src-tauri/tests/` — 当前回归基线
 
 ---
 *生成时间: 2026-07-10*

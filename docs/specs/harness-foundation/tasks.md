@@ -257,13 +257,13 @@
   - _需求：FR-5、FR-6、NFR-3、NFR-7_ · _设计：Event Log 与 Context Capsule_
 
 - [ ] 8.3 扩展 dogfood 场景覆盖上下文恢复和失败回滚
-  - 证据块：`old/docs/dogfood.md:1`、`old/tests/compliance/test_dogfood.py:1`
-  - 文件：`old/tests/compliance/test_dogfood.py`、`old/docs/dogfood.md`（合计预算 260 行）
+  - 证据块：`src-tauri/src/harness/tools_tests.rs`、`docs/verification/`
+  - 文件：Harness 集成测试与对应验证报告
   - 验收：新对话恢复任务、修改原因、测试失败、回滚和 Git/exec 闭环均有记录。
   - _需求：FR-12_ · _设计：分阶段交付_
 
 - [ ] 8.4 执行 Windows 真机与 ChatGPT Connector 发布验证
-  - 证据块：`README.md:1`、`old/docs/remote-mcp.md:1`
+  - 证据块：`README.md:1`、`docs/verification/`
   - 文件：`docs/specs/harness-foundation/verification.md`（≤300 行）
   - 验收：OAuth、Project State、任务恢复、修改、测试、审批、总结和进程清理全链路通过。
   - _需求：FR-12、NFR-10_ · _设计：风险评估_

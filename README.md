@@ -21,7 +21,7 @@
 
 Anchor 是一个 Rust + Tauri 2 桌面应用。选择项目目录并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存为项目内的历史会话。它更接近“AI 打开一个会记住开发进度的 IDE 工作区”；普通开发工具不要求先创建 Task，历史会话则负责在新对话中恢复上下文。
 
-从旧版本升级时，Anchor 会迁移 Workspace、密钥、软件缓存和受管 FRP 状态；详见 [Anchor 更名与升级迁移](docs/anchor-migration.md)。
+Anchor 只读取当前配置目录和当前配置格式，不再自动导入早期产品目录或兼容格式。升级前请先备份现有配置，并在 Anchor 中重新注册需要保留的工作区。
 
 ![Anchor 工作区总览](docs/images/workspace-overview.png)
 
@@ -321,8 +321,9 @@ Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`�
 | `src-tauri/src/mcp/` | MCP Streamable HTTP 服务 |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 网关 |
 | `src-tauri/src/tunnel/` | FRP / Cloudflare 隧道和进程管理 |
+| `src-tauri/tests/` | Rust 合约、安全、输出 Schema 与集成测试 |
 | `src/` | SvelteKit 桌面界面 |
-| `old/` | Python 参考实现和兼容性基线 |
+| `docs/` | 产品、协议、架构与验证文档 |
 
 ## 致谢
 感谢 [Linux.do](https://linux.do/) 社区对项目推广与反馈的支持。

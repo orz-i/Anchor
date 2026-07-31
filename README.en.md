@@ -21,7 +21,7 @@
 
 Anchor is a Rust + Tauri 2 desktop application. Select a project directory and start the service; an AI agent can then read files, edit code, run commands and tests, inspect Git, and preserve development progress inside the project through MCP. It behaves like an AI opening an IDE workspace that remembers where the last conversation stopped.
 
-When upgrading from the previous product name, Anchor migrates workspaces, secrets, software caches, and managed FRP state. See [Anchor rename and upgrade migration](docs/anchor-migration.md).
+Anchor reads only the current configuration directory and current configuration format. It no longer imports earlier product directories or compatibility formats automatically. Back up existing configuration and re-register any workspaces that must be retained.
 
 ![Anchor workspace overview](docs/images/workspace-overview.png)
 
@@ -313,8 +313,9 @@ See [Connection recovery, retries, and OAuth renewal](docs/reliability.md) for b
 | `src-tauri/src/mcp/` | MCP Streamable HTTP server |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI gateway |
 | `src-tauri/src/tunnel/` | FRP / Cloudflare tunnel and process management |
+| `src-tauri/tests/` | Rust contract, security, output-schema, and integration tests |
 | `src/` | SvelteKit desktop UI |
-| `old/` | Python reference implementation and compatibility baseline |
+| `docs/` | Product, protocol, architecture, and verification documentation |
 
 ## License
 

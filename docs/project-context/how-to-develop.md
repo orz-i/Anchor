@@ -119,9 +119,9 @@ enum RuntimeState {
 }
 ```
 
-## 参考旧版实现
+## 当前行为契约
 
-开发 MCP 工具时，以 `old/docs/profile-v0.1.md` 为行为契约，以 `old/tests/compliance/` 为验收标准。不要猜测工具行为，对照规范和测试。
+开发 MCP 工具时，以 `src-tauri/src/tools/registry.rs` 发布的 Schema、`src-tauri/src/mcp/protocol.rs` 的协议约束和 `src-tauri/tests/` 的合约/安全测试为准。修改目录或结果结构时，必须同步更新 snapshot 与 outputSchema 测试。
 
 ---
 *返回索引: [../project-context.md](../project-context.md)*

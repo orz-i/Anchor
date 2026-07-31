@@ -7,8 +7,8 @@
 | 属性 | 值 |
 |------|-----|
 | 项目名称 | Anchor Rust |
-| 版本 | 0.0.0 |
-| 语言 | Rust 1.77+ / TypeScript |
+| 版本 | 0.1.23 |
+| 语言 | Rust / TypeScript |
 | 框架 | Tauri 2 |
 
 ## 核心技术
@@ -21,8 +21,8 @@
 | 异步运行时 | tokio | 异步 I/O、进程监督 |
 | HTTP 服务 | axum | 内嵌 MCP Streamable HTTP |
 | MCP SDK | rmcp | MCP 协议实现 |
-| Git 操作 | git2 | git_status / git_diff 等工具 |
-| 密钥存储 | keyring | 系统钥匙串（Windows Credential Manager 等） |
+| Git 操作 | 系统 Git + 受控临时索引 | 状态、差异、提交与阶段工作流 |
+| 密钥存储 | 平台保护封装 | Windows 当前用户 DPAPI；Unix 私有权限文件 |
 | 序列化 | serde + serde_json | 配置持久化 |
 
 ## 开发工具
@@ -35,16 +35,7 @@
 | 代码检查 | clippy / rustfmt | Rust lint 与格式化 |
 | 前端检查 | eslint / prettier | TypeScript 检查 |
 
-## 参考实现技术栈（old/）
-
-| 类别 | 技术 | 说明 |
-|------|------|------|
-| MCP 核心 | Python 3.11+ | legacy archive `coding_tools_mcp/server.py` |
-| 桌面客户端 | PySide6 | `apps/desktop-client/` |
-| Actions 网关 | FastAPI + uvicorn | `coding_tools_actions/` |
-| 测试 | pytest + unittest | `tests/compliance/` |
-
-## 主要依赖（计划）
+## 主要依赖
 
 ### Rust (src-tauri/Cargo.toml)
 

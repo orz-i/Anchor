@@ -269,7 +269,7 @@ AppShell, WorkspaceCard, StatusOrb, ConnectionPanel, HealthPanel, ConfigPanel, L
 | 测试类型 | 覆盖范围 | 验证方式 |
 |----------|----------|----------|
 | Rust 单元测试 | 数据模型、状态机转换、路径校验 | cargo test |
-| MCP 合规测试 | P0 工具行为、协议契约 | tests/compliance/ 对照 old/ 基线 |
+| MCP 合规测试 | P0 工具行为、协议契约 | `src-tauri/tests/` 合约与安全套件 |
 | 安全测试 | 路径穿越、命令注入 | tests/compliance/security.rs |
 | 集成测试 | 启动→调用工具→停止 全流程 | cargo test --test integration |
 | 手动测试 | UI 交互、隧道连接、剪贴板 | 验收标准逐条核对 |
@@ -284,7 +284,7 @@ AppShell, WorkspaceCard, StatusOrb, ConnectionPanel, HealthPanel, ConfigPanel, L
 | Windows 进程管理差异 | 中 | 优先在 Windows 开发和测试；tokio::process 跨平台 |
 | 合规测试移植工作量大 | 中 | Phase 1 仅移植 P0 工具相关测试 |
 | Cloudflare 隧道 URL 解析 | 低 | 参考旧版 regex 逻辑，增加超时和重试 |
-| git2 与系统 git 行为差异 | 低 | 对照 old/ git 工具测试验证 |
+| Git 实现与系统 Git 行为差异 | 低 | 使用当前 Git 合约、真实仓库和阶段提交测试验证 |
 
 ---
 

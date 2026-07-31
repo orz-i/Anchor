@@ -2,12 +2,12 @@
 
 ## 功能概述
 
-用 Rust/Tauri 2 重构 Anchor 桌面客户端。目标是单二进制跨平台桌面应用，内嵌 MCP 核心（不再依赖外部 Python 子进程），提供 Workspace-first 管理界面、本地 HTTP `/mcp` 端点、FRP/Cloudflare 公网隧道、OAuth/Bearer/NoAuth 认证、健康检查与日志查看。参考 `old/` 目录中的 Python 实现，以 `old/docs/profile-v0.1.md` 和 `old/tests/compliance/` 为行为契约。
+用 Rust/Tauri 2 构建 Anchor 桌面客户端。目标是单二进制跨平台桌面应用，内嵌 MCP 核心，提供 Workspace-first 管理界面、本地 HTTP `/mcp` 端点、FRP/Cloudflare 公网隧道、OAuth/Bearer/NoAuth 认证、健康检查与日志查看。当前行为契约由 Rust 工具目录、MCP 协议模块和 `src-tauri/tests/` 共同定义。
 
 ## 历史经验与坑
 
-- **可复用经验**: 旧版 `old/docs/specs/mcp-desktop-client/` 已定义 Workspace-first 产品模型和 FRP/OAuth 需求，可直接继承 FR 定义
-- **必须规避的坑**: 旧版 PySide6 客户端通过 psutil 启发式猜 PID 管理外部 Python 进程，导致重启后状态不一致、Cloudflare 隧道靠 regex 扒日志超时。新版必须内嵌 MCP 核心并使用显式状态机
+- **可复用经验**: Workspace-first 产品模型、FRP/OAuth 配置和显式生命周期状态机必须由当前 Rust 数据模型与测试固定。
+- **必须规避的坑**: 不通过启发式 PID 推断管理外部进程；隧道地址、进程归属和恢复必须由受管状态与明确诊断驱动。
 
 ## 术语定义
 
@@ -89,7 +89,7 @@
 #### 验收标准（EARS）
 
 1. WHEN 客户端调用 `tools/list` THEN 系统 SHALL 返回 P0 工具列表（read_file, list_dir, list_files, search_text, apply_patch, exec_command, git_status, git_diff, server_info, get_default_cwd, set_default_cwd）
-2. WHEN 客户端调用任一 P0 工具 THEN 系统 SHALL 返回符合 `old/docs/profile-v0.1.md` 定义的结果 envelope
+2. WHEN 客户端调用任一 P0 工具 THEN 系统 SHALL 返回符合 `src-tauri/src/tools/registry.rs` 发布 outputSchema 的结果 envelope
 3. WHEN 路径包含 `..` 或越出 workspace THEN 系统 SHALL 拒绝并返回错误
 4. WHEN 移植的合规测试运行 THEN P0 工具相关测试 SHALL 全部 PASS
 
@@ -175,9 +175,9 @@
 
 ## 依赖关系
 
-- `old/docs/profile-v0.1.md` — MCP 工具行为契约
-- `old/tests/compliance/` — 合规测试基线
-- `old/apps/desktop-client/` — UI 交互和配置模型参考
+- `src-tauri/src/mcp/protocol.rs` — MCP 协议行为契约
+- `src-tauri/src/tools/registry.rs` — 工具目录与 Schema
+- `src-tauri/tests/` — 合规、安全和输出契约基线
 - 外部依赖：cloudflared CLI（Cloudflare 隧道）、FRP 服务端（FRP 模式）
 - Rust crate：tauri, tokio, axum, rmcp, git2, keyring, serde
 
