@@ -8,12 +8,12 @@
   let { state }: Props = $props();
 
   const colorClass: Record<RuntimeState, string> = {
-    running: "bg-[var(--color-success)]",
-    starting: "bg-[var(--color-warning)]",
-    recovering: "bg-[var(--color-warning)]",
-    stopping: "bg-[var(--color-warning)]",
-    stopped: "bg-[var(--color-text-muted)]",
-    error: "bg-[var(--color-error)]",
+    running: "bg-[var(--success)]",
+    starting: "bg-[var(--warning)]",
+    recovering: "bg-[var(--warning)]",
+    stopping: "bg-[var(--warning)]",
+    stopped: "bg-[var(--text-muted)]",
+    error: "bg-[var(--danger)]",
   };
 </script>
 

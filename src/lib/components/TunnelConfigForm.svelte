@@ -45,7 +45,7 @@
   let tokenField = $state<SecretTokenField | null>(null);
   let tokenPending = $state(false);
   let frpProfiles = $state<FrpProfileDto[]>([]);
-  let legacyFrpOpen = $state(false);
+  let manualFrpOpen = $state(false);
 
   const secretKey = $derived(
     service === "mcp"
@@ -78,7 +78,7 @@
   const showFrp = $derived(draft.type === "frp");
   const showCloudflare = $derived(draft.type === "cloudflare");
   const showCloudflareToken = $derived(showCloudflare && draft.cloudflare_mode === "named");
-  const showLegacyFrpToken = $derived(showFrp && !useGlobalProfile);
+  const showManualFrpToken = $derived(showFrp && !useGlobalProfile);
   const canTest = $derived(draft.type === "frp" || draft.type === "cloudflare");
 
   $effect(() => {
@@ -94,7 +94,7 @@
   });
 
   async function saveDraft(options?: SaveTunnelOptions) {
-    if (tokenField && (showLegacyFrpToken || showCloudflareToken)) {
+    if (tokenField && (showManualFrpToken || showCloudflareToken)) {
       await tokenField.saveIfDirty();
     }
     await onSave({ ...draft }, options);
@@ -152,9 +152,9 @@
   }}
 >
   <label class="grid gap-1">
-    <span class="text-xs text-[var(--color-text-muted)]">隧道类型</span>
+    <span class="text-xs text-[var(--text-muted)]">隧道类型</span>
     <select
-      class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+      class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
       bind:value={draft.type}
     >
       <option value="none">未配置</option>
@@ -164,15 +164,15 @@
   </label>
 
   {#if canTest}
-    <label class="flex items-start gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2.5">
+    <label class="flex items-start gap-2 rounded-md border border-[var(--border)] bg-[var(--card-bg)] px-3 py-2.5">
       <input
         type="checkbox"
         class="mt-0.5 h-4 w-4"
         bind:checked={draft.use_proxy}
       />
       <span class="grid gap-0.5">
-        <span class="text-xs font-medium text-[var(--color-text-secondary)]">使用网络代理</span>
-        <span class="text-[11px] text-[var(--color-text-muted)]">
+        <span class="text-xs font-medium text-[var(--text-secondary)]">使用网络代理</span>
+        <span class="text-[11px] text-[var(--text-muted)]">
           启用后通过「设置 → 通用」中的全局代理连接隧道；关闭则直连（适合海外或已全局翻墙的环境）。
         </span>
       </span>
@@ -181,12 +181,12 @@
 
   {#if showFrp}
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">FRP 配置</span>
+      <span class="text-xs text-[var(--text-muted)]">FRP 配置</span>
       <select
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+        class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
         bind:value={draft.frp_profile_id}
       >
-        <option value="">手动填写（旧版）</option>
+        <option value="">手动填写</option>
         {#each frpProfiles as profile (profile.id)}
           <option value={profile.id}>
             {profile.name} · {profile.server}:{profile.serverPort}
@@ -194,32 +194,32 @@
         {/each}
       </select>
       {#if frpProfiles.length === 0}
-        <p class="text-[11px] text-[var(--color-text-muted)]">
+        <p class="text-[11px] text-[var(--text-muted)]">
           请先在侧边栏「FRP 配置」中添加全局服务器配置。
         </p>
       {/if}
     </label>
 
     {#if useGlobalProfile && selectedProfile}
-      <div class="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-xs">
-        <p class="text-[var(--color-text-secondary)]">
+      <div class="rounded-md border border-[var(--border)] bg-[var(--card-bg)] px-3 py-2 text-xs">
+        <p class="text-[var(--text-secondary)]">
           服务器：{selectedProfile.server}:{selectedProfile.serverPort}
         </p>
-        <p class="mt-1 text-[var(--color-text-muted)]">
+        <p class="mt-1 text-[var(--text-muted)]">
           Token：{selectedProfile.hasToken ? "已配置" : "未配置"}
         </p>
       </div>
     {/if}
 
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">子域名</span>
+      <span class="text-xs text-[var(--text-muted)]">子域名</span>
       <input
         type="text"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+        class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
         placeholder="my-mcp"
         bind:value={draft.frp_subdomain}
       />
-      <p class="text-[11px] text-[var(--color-text-muted)]">
+      <p class="text-[11px] text-[var(--text-muted)]">
         每个工作区使用独立子域名；保存后若隧道已连接会自动重启 frpc。
       </p>
     </label>
@@ -227,38 +227,38 @@
     {#if !useGlobalProfile}
       <button
         type="button"
-        class="text-left text-xs text-[var(--color-accent)] hover:underline"
+        class="text-left text-xs text-[var(--primary)] hover:underline"
         onclick={() => {
-          legacyFrpOpen = !legacyFrpOpen;
+          manualFrpOpen = !manualFrpOpen;
         }}
       >
-        {legacyFrpOpen ? "收起" : "展开"}手动 FRP 配置
+        {manualFrpOpen ? "收起" : "展开"}手动 FRP 配置
       </button>
     {/if}
 
-    {#if !useGlobalProfile && legacyFrpOpen}
+    {#if !useGlobalProfile && manualFrpOpen}
       <label class="grid gap-1">
-        <span class="text-xs text-[var(--color-text-muted)]">FRP 服务器</span>
+        <span class="text-xs text-[var(--text-muted)]">FRP 服务器</span>
         <input
           type="text"
-          class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+          class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
           placeholder="example.com"
           bind:value={draft.frp_server}
         />
       </label>
 
       <label class="grid gap-1">
-        <span class="text-xs text-[var(--color-text-muted)]">FRP 服务器端口</span>
+        <span class="text-xs text-[var(--text-muted)]">FRP 服务器端口</span>
         <input
           type="number"
           min="1"
           max="65535"
-          class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+          class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
           bind:value={draft.frp_server_port}
         />
       </label>
 
-      {#if showLegacyFrpToken}
+      {#if showManualFrpToken}
         <SecretTokenField
           bind:this={tokenField}
           bind:hasPending={tokenPending}
@@ -272,9 +272,9 @@
 
   {#if showCloudflare}
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Cloudflare 模式</span>
+      <span class="text-xs text-[var(--text-muted)]">Cloudflare 模式</span>
       <select
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+        class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
         bind:value={draft.cloudflare_mode}
       >
         <option value="quick">Quick Tunnel</option>
@@ -283,11 +283,11 @@
     </label>
 
     {#if draft.cloudflare_mode === "quick"}
-      <p class="text-xs text-[var(--color-warning)]">
+      <p class="text-xs text-[var(--warning)]">
         Quick Tunnel 仅适合临时测试；服务重启后公网地址可能变化，ChatGPT 中保存的连接不会自动迁移。
       </p>
     {:else}
-      <p class="text-xs text-[var(--color-text-muted)]">
+      <p class="text-xs text-[var(--text-muted)]">
         Named Tunnel 使用固定公网地址，适合长期连接。需要 Tunnel Token 和已配置的公网 URL。
       </p>
     {/if}
@@ -303,15 +303,15 @@
   {/if}
 
   <label class="grid gap-1">
-    <span class="text-xs text-[var(--color-text-muted)]">
+    <span class="text-xs text-[var(--text-muted)]">
       公网 URL
       {#if service === "actions"}
-        <span class="text-[var(--color-text-muted)]">（OpenAPI 根地址）</span>
+        <span class="text-[var(--text-muted)]">（OpenAPI 根地址）</span>
       {/if}
     </span>
     <input
       type="url"
-      class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+      class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
       placeholder="https://..."
       bind:value={draft.public_url}
     />
@@ -330,7 +330,7 @@
     {/if}
     <button
       type="submit"
-      class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+      class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
       disabled={saving || testing || !dirty}
     >
       {saving ? "保存中…" : "保存配置"}

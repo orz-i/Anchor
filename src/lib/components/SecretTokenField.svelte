@@ -63,7 +63,7 @@
 </script>
 
 <label class="grid gap-1">
-  <span class="text-xs text-[var(--color-text-muted)]">{label}</span>
+  <span class="text-xs text-[var(--text-muted)]">{label}</span>
   <SecretInput
     bind:value={draft}
     {placeholder}

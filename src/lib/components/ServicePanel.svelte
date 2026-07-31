@@ -77,9 +77,9 @@
   }
 
   function activityColor(state: McpActivityState): string {
-    if (state === "suspected_stalled") return "var(--color-warning)";
-    if (state === "active" || state === "recent") return "var(--color-success)";
-    return "var(--color-text-muted)";
+    if (state === "suspected_stalled") return "var(--warning)";
+    if (state === "active" || state === "recent") return "var(--success)";
+    return "var(--text-muted)";
   }
 
   function durationLabel(milliseconds: number | null): string {
@@ -114,9 +114,9 @@
         <StatusOrb state={status} />
         <h3 class="text-[15px] font-semibold tracking-tight">{title}</h3>
       </div>
-      <p class="mt-1 text-sm text-[var(--color-text-muted)]">{subtitle}</p>
+      <p class="mt-1 text-sm text-[var(--text-muted)]">{subtitle}</p>
       {#if tunnelEnabled}
-        <p class="mt-1 text-xs text-[var(--color-text-muted)]">
+        <p class="mt-1 text-xs text-[var(--text-muted)]">
           {tunnelLabel} 隧道随服务自动连接，停止服务时一并断开
         </p>
       {/if}
@@ -126,7 +126,7 @@
         </p>
       {/if}
       {#if running && recovery.recoveredCount > 0}
-        <p class="mt-1 text-xs text-[var(--color-success)]">
+        <p class="mt-1 text-xs text-[var(--success)]">
           已自动恢复 {recovery.recoveredCount} 次
         </p>
       {/if}
@@ -198,17 +198,17 @@
             {activityLabel(activity.state)}
           </span>
         </div>
-        <p class="mt-1.5 text-sm text-[var(--color-text-secondary)]">{activity.message}</p>
-        <p class="mt-1 text-xs text-[var(--color-text-muted)]">
+        <p class="mt-1.5 text-sm text-[var(--text-secondary)]">{activity.message}</p>
+        <p class="mt-1 text-xs text-[var(--text-muted)]">
           在途 {activity.inFlightRequests} · 最久 {durationLabel(activity.oldestInFlightMs)} ·
           最近活动 {durationLabel(activity.lastActivityAgeMs)} 前
         </p>
         {#if activity.currentTool || activity.currentMethod}
-          <p class="tx-mono mt-1 truncate text-xs text-[var(--color-text-muted)]">
+          <p class="tx-mono mt-1 truncate text-xs text-[var(--text-muted)]">
             {activity.currentTool || activity.currentMethod}
           </p>
         {/if}
-        <p class="mt-1.5 text-xs text-[var(--color-text-muted)]">
+        <p class="mt-1.5 text-xs text-[var(--text-muted)]">
           仅统计 tools/call、resources/read、prompts/get；模型纯推理或 MCP 外等待无法识别。
         </p>
       </div>
@@ -230,7 +230,7 @@
             <CopyButton value={publicEndpoint} />
           {/if}
         </div>
-        <p class="tx-mono mt-1.5 truncate text-sm text-[var(--color-text-secondary)]">
+        <p class="tx-mono mt-1.5 truncate text-sm text-[var(--text-secondary)]">
           {publicEndpoint || "未配置隧道"}
         </p>
       </div>

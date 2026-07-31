@@ -102,7 +102,7 @@
 <article class="tx-card p-5">
   <div class="mb-4">
     <p class="tx-section-label">GPT 配置</p>
-    <p class="mt-1 text-xs text-[var(--color-text-muted)]">
+    <p class="mt-1 text-xs text-[var(--text-muted)]">
       {service === "mcp"
         ? "复制以下内容到 ChatGPT → 设置 → 连接器 / MCP"
         : "复制以下内容到 GPT 编辑器 → Actions"}
@@ -132,7 +132,7 @@
       {:else if auth.type === "bearer"}
         <CopyFieldRow label="Bearer Token" value={secrets.bearer_token ?? ""} {loading} />
       {:else}
-        <p class="text-xs text-[var(--color-text-muted)]">当前未启用认证，仅本机调试可用。</p>
+        <p class="text-xs text-[var(--text-muted)]">当前未启用认证，仅本机调试可用。</p>
       {/if}
     {:else}
       <CopyFieldRow
@@ -166,7 +166,7 @@
         <CopyFieldRow label="Token URL" value={actionsOAuthTokenUrl(profile, frpProfiles)} />
         <CopyFieldRow label="Scope" value={actions.oauth_scopes ?? ""} hint="空格分隔" />
       {:else}
-        <p class="text-xs text-[var(--color-text-muted)]">当前未启用认证，公网暴露请改用 API Key 或 OAuth。</p>
+        <p class="text-xs text-[var(--text-muted)]">当前未启用认证，公网暴露请改用 API Key 或 OAuth。</p>
       {/if}
     {/if}
   </div>

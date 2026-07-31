@@ -74,7 +74,7 @@
   <header class="page-header">
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">软件管理</h2>
-    <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
+    <p class="mt-2 max-w-2xl text-sm text-[var(--text-muted)]">
       在此安装或卸载 frpc 和 cloudflared 隧道客户端。安装的软件会放入应用缓存目录，可统一管理。
     </p>
   </header>
@@ -84,16 +84,16 @@
     <div class="tx-card p-4">
       <h3 class="text-sm font-semibold">状态</h3>
       {#if loading}
-        <p class="mt-4 text-sm text-[var(--color-text-muted)]">加载中…</p>
+        <p class="mt-4 text-sm text-[var(--text-muted)]">加载中…</p>
       {:else if software.length === 0}
-        <p class="mt-4 text-sm text-[var(--color-text-muted)]">暂无信息。</p>
+        <p class="mt-4 text-sm text-[var(--text-muted)]">暂无信息。</p>
       {:else}
         <ul class="mt-4 space-y-2">
           {#each software as s (s.kind)}
             <li class="tx-panel flex items-center justify-between gap-3 px-3 py-2">
               <div class="min-w-0">
                 <p class="text-sm font-medium">{s.name}</p>
-                <p class="font-mono text-xs text-[var(--color-text-muted)]">
+                <p class="font-mono text-xs text-[var(--text-muted)]">
                   {s.installed ? s.path : "未安装"}
                   · {s.managed ? "可管理" : "系统安装"}
                 </p>
@@ -110,12 +110,12 @@
                       {uninstalling === s.kind ? "卸载中…" : "卸载"}
                     </button>
                   {:else}
-                    <span class="text-xs text-[var(--color-text-muted)]">系统安装</span>
+                    <span class="text-xs text-[var(--text-muted)]">系统安装</span>
                   {/if}
                 {:else}
                   <button
                     type="button"
-                    class="text-xs text-[var(--color-accent)] hover:underline disabled:opacity-50"
+                    class="text-xs text-[var(--primary)] hover:underline disabled:opacity-50"
                     disabled={installing === s.kind}
                     onclick={() => install(s.kind)}
                   >
@@ -137,7 +137,7 @@
         onsubmit={(e) => { e.preventDefault(); void saveConfig(); }}
       >
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">GitHub 镜像</span>
+          <span class="text-xs text-[var(--text-muted)]">GitHub 镜像</span>
           <input
             type="text"
             class="tx-input tx-mono"
@@ -145,12 +145,12 @@
             bind:value={downloadConfig.githubMirror}
             oninput={() => (configChanged = true)}
           />
-          <span class="text-xs text-[var(--color-text-muted)]">留空则直连 GitHub，默认使用 gh-proxy.com 加速</span>
+          <span class="text-xs text-[var(--text-muted)]">留空则直连 GitHub，默认使用 gh-proxy.com 加速</span>
         </label>
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">代理模式</span>
+          <span class="text-xs text-[var(--text-muted)]">代理模式</span>
           <select
-            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+            class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
             bind:value={downloadConfig.proxyMode}
             onchange={() => (configChanged = true)}
           >
@@ -161,7 +161,7 @@
         </label>
         {#if downloadConfig.proxyMode === "manual"}
           <label class="grid gap-1">
-            <span class="text-xs text-[var(--color-text-muted)]">代理地址</span>
+            <span class="text-xs text-[var(--text-muted)]">代理地址</span>
             <input
               type="text"
               class="tx-input tx-mono"
@@ -174,7 +174,7 @@
         <div class="flex justify-end pt-1">
           <button
             type="submit"
-            class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
             disabled={!configChanged}
           >
             保存设置

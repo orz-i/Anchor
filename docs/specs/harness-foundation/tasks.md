@@ -38,10 +38,10 @@
   - 验收：每个测试拥有独立 workspace、Harness root 和可控 Git baseline。
   - _需求：FR-12_ · _设计：存储布局_
 
-- [ ] 1.3 增加 Harness schema 与状态迁移失败测试
-  - 证据块：`src-tauri/src/data/model.rs:10`、`src-tauri/src/data/migrate.rs:1`
+- [ ] 1.3 增加 Harness schema 不兼容与状态损坏测试
+  - 证据块：`src-tauri/src/harness/model.rs`、`src-tauri/src/harness/store.rs`
   - 文件：`src-tauri/tests/harness_state.rs`（预算 300 行）
-  - 验收：覆盖首次创建、旧版本升级、损坏尾事件和应用重启恢复。
+  - 验收：覆盖首次创建、不兼容 Schema 拒绝、损坏尾事件和应用重启恢复。
   - _需求：FR-3、FR-12_ · _设计：数据模型、存储布局_
 
 ### 阶段 1 检查点
@@ -69,7 +69,7 @@
 - [ ] 2.3 更新工作区默认工具和命令策略
   - 证据块：`src-tauri/src/workspace/model.rs:49`、`src-tauri/src/tools/policy.rs:12`
   - 文件：`src-tauri/src/workspace/model.rs`、`src-tauri/src/tools/policy.rs`（合计预算 100 行）
-  - 验收：新工作区默认 safe；Actions 默认命令包含受控 git；旧配置迁移保持原值。
+  - 验收：新工作区使用当前安全默认值；Actions 默认命令包含受控 git；缺失字段按当前默认值补齐。
   - _需求：FR-1、FR-8、FR-12_ · _设计：默认策略_
 
 ### 阶段 2 检查点
@@ -313,8 +313,8 @@
 | `src-tauri/src/commands/harness.rs` | 新建 | ≤420 | Tauri Harness commands |
 | `src-tauri/src/lib.rs` | 修改 | +40 | 注册模块和 commands |
 | `src-tauri/src/app_state.rs` | 修改 | +60 | 注入 HarnessStore |
-| `src-tauri/src/data/model.rs` | 修改 | +30 | 迁移元信息引用 |
-| `src-tauri/src/data/migrate.rs` | 修改 | +80 | Harness schema 迁移入口 |
+| `src-tauri/src/data/model.rs` | 修改 | +30 | 当前数据模型引用 |
+| `src-tauri/src/data/storage.rs` | 修改 | +80 | 当前存储与不兼容格式拒绝入口 |
 | `src-tauri/src/tools/context.rs` | 修改 | +50 | task/client/harness 上下文 |
 | `src-tauri/src/tools/dispatch.rs` | 修改 | +180 | Gate、事件和分发 |
 | `src-tauri/src/tools/registry.rs` | 修改 | ≤500 | 单一 ToolDefinition 注册表 |
@@ -326,7 +326,7 @@
 | `src-tauri/src/actions/listener.rs` | 修改 | +40 | 统一工具过滤 |
 | `src-tauri/src/actions/openapi.rs` | 修改 | +60 | 统一注册表生成 OpenAPI |
 | `src-tauri/src/commands/mod.rs` | 修改 | +10 | 导出 Harness commands |
-| `src-tauri/src/workspace/model.rs` | 修改 | +30 | safe 默认值与兼容迁移 |
+| `src-tauri/src/workspace/model.rs` | 修改 | +30 | 当前安全默认值与缺失字段处理 |
 | `src-tauri/src/platform/mod.rs` | 修改 | +20 | 进程树能力接口 |
 | `src-tauri/src/platform/windows/process.rs` | 修改 | +160 | Windows 进程树终止 |
 | `src/lib/api/harness.ts` | 新建 | ≤240 | Harness Tauri API |

@@ -97,7 +97,7 @@
   <header class="page-header">
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">共享密钥</h2>
-    <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
+    <p class="mt-2 max-w-2xl text-sm text-[var(--text-muted)]">
       在此统一管理所有共享密钥。各工作区可以选择使用共享密钥或自己的密钥，这样 GPT 只需配置一次
       Bearer/API Key，即可访问所有工作区。重新生成或修改密钥后，正在运行的对应服务将自动重启以生效。
     </p>
@@ -109,12 +109,12 @@
       <div class="tx-card p-4">
         <h3 class="text-sm font-semibold">MCP 认证密钥</h3>
         {#if loading}
-          <p class="mt-4 text-sm text-[var(--color-text-muted)]">加载中…</p>
+          <p class="mt-4 text-sm text-[var(--text-muted)]">加载中…</p>
         {:else}
           <div class="mt-4 grid gap-4">
             {#each MCP_KEYS as { key, label }}
               <div class="grid gap-1">
-                <span class="text-xs text-[var(--color-text-muted)]">{label}</span>
+                <span class="text-xs text-[var(--text-muted)]">{label}</span>
                 <SecretInput
                   bind:value={secrets[key]}
                   disabled={loading}
@@ -131,12 +131,12 @@
       <div class="tx-card p-4">
         <h3 class="text-sm font-semibold">Actions 认证密钥</h3>
         {#if loading}
-          <p class="mt-4 text-sm text-[var(--color-text-muted)]">加载中…</p>
+          <p class="mt-4 text-sm text-[var(--text-muted)]">加载中…</p>
         {:else}
           <div class="mt-4 grid gap-4">
             {#each ACTIONS_KEYS as { key, label }}
               <div class="grid gap-1">
-                <span class="text-xs text-[var(--color-text-muted)]">{label}</span>
+                <span class="text-xs text-[var(--text-muted)]">{label}</span>
                 <SecretInput
                   bind:value={secrets[key]}
                   disabled={loading}
@@ -153,7 +153,7 @@
     <div class="flex justify-end">
       <button
         type="button"
-        class="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+        class="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
         disabled={!dirty || saving}
         onclick={() => saveAll()}
       >

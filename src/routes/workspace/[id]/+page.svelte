@@ -805,7 +805,7 @@
         >
           <StatusOrb state={mcpStatus} />
           <span class="font-medium">MCP</span>
-          <span class="text-[var(--color-text-muted)]">{stateLabel(mcpStatus)}</span>
+          <span class="text-[var(--text-muted)]">{stateLabel(mcpStatus)}</span>
         </button>
         <button
           type="button"
@@ -815,7 +815,7 @@
         >
           <StatusOrb state={actionsStatus} />
           <span class="font-medium">Actions</span>
-          <span class="text-[var(--color-text-muted)]">{stateLabel(actionsStatus)}</span>
+          <span class="text-[var(--text-muted)]">{stateLabel(actionsStatus)}</span>
         </button>
       </div>
     </header>
@@ -1004,7 +1004,7 @@
       {/if}
     </div>
 
-    <footer class="border-t border-[var(--color-border)] px-8 py-4 text-xs text-[var(--color-text-muted)]">
+    <footer class="border-t border-[var(--border)] px-8 py-4 text-xs text-[var(--text-muted)]">
       MCP 默认端口 28766，Actions 默认 8787，可同时运行。
     </footer>
   </section>
@@ -1017,7 +1017,7 @@
           {backendConnection === "offline" ? "无法连接应用后台" : "正在连接工作区"}
         </h2>
       </div>
-      <p class="mt-3 text-sm leading-6 text-[var(--color-text-muted)]">
+      <p class="mt-3 text-sm leading-6 text-[var(--text-muted)]">
         {backendConnection === "offline"
           ? "后台暂时没有响应。应用会继续自动重试，也可以立即重新连接。"
           : "正在读取配置和运行状态，短暂断联会自动恢复。"}

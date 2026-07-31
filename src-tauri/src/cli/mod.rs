@@ -1622,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn show_output_removes_legacy_inline_tokens() {
+    fn show_output_removes_inline_tokens() {
         let mut profile = WorkspaceProfile::new("/srv/a".into(), Some("a".into()));
         profile.actions.cloudflare_token = "must-not-leak".into();
 

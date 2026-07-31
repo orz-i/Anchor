@@ -507,9 +507,9 @@ mod tests {
     #[test]
     fn missing_tunnel_type_defaults_to_cloudflare_quick() {
         let tunnel: TunnelConfig =
-            serde_json::from_value(serde_json::json!({})).expect("legacy tunnel config");
-        let actions: ActionsConfig =
-            serde_json::from_value(serde_json::json!({})).expect("legacy actions config");
+            serde_json::from_value(serde_json::json!({})).expect("tunnel config with missing fields");
+        let actions: ActionsConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("actions config with missing fields");
 
         assert_eq!(tunnel.tunnel_type, "cloudflare");
         assert_eq!(tunnel.cloudflare_mode, "quick");
@@ -527,9 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_runtime_config_enables_default_skill_roots() {
+    fn runtime_config_with_missing_fields_enables_default_skill_roots() {
         let runtime: RuntimeConfig =
-            serde_json::from_value(serde_json::json!({})).expect("legacy runtime config");
+            serde_json::from_value(serde_json::json!({}))
+                .expect("runtime config with missing fields");
 
         assert!(runtime.skill_service_enabled);
         assert_eq!(runtime.skill_roots, ".agents/skills\n.codex/skills\nskills");

@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mcp_get_200_is_reported_as_drift() {
+    fn obsolete_mcp_get_200_is_reported_as_drift() {
         let (ok, detail) = evaluate_mcp_get_response(200, None);
 
         assert!(!ok);

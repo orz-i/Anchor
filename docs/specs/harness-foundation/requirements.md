@@ -20,7 +20,7 @@ Anchor Desktop 需要从“可调用的本地工具集合”升级为面向 Chat
 
 - **可复用经验**：外部契约、持久化字段和 UI 展示字段必须使用稳定名称并建立覆盖测试，避免“代码已增加字段但映射或展示层未同步”。
 - **必须规避的坑**：不得将模型推断当作事实保存；不得依赖客户端主动遵守提示词；不得在失败时静默丢失附件式的变更证据；所有状态流转必须由服务端规则约束。
-- **直接同类经验**：暂无与 Coding Harness 状态、事务或 Change Intelligence 完全同类的历史资产，因此本规格以当前代码、旧版 MCP 合规契约和本轮用户反馈为主。
+- **直接同类经验**：暂无与 Coding Harness 状态、事务或 Change Intelligence 完全同类的历史资产，因此本规格以当前 Rust 代码、MCP 合约测试和本轮用户反馈为主。
 
 ---
 
@@ -254,8 +254,8 @@ Anchor Desktop 需要从“可调用的本地工具集合”升级为面向 Chat
 
 - 依赖现有 `ToolContext`、统一 `call_tool` 入口、Workspace 路径边界和 SessionStore。
 - 依赖现有 `git_status`、`git_diff`、`git_log` 与命令执行能力。
-- 依赖 AppData/DataStore 的版本化迁移能力和应用配置目录解析。
+- 依赖当前 AppData/DataStore 配置格式和应用配置目录解析。
 - 依赖 Tauri command 作为桌面 UI 的状态、审批和回滚接口。
 - 依赖 MCP `tools/list`、`tools/call` 和当前 OAuth/HTTP transport。
-- 依赖现有 Rust 集成测试、旧版 Python 合规契约和 ChatGPT Connector 真机环境。
+- 依赖现有 Rust 集成测试、MCP/Actions 合约测试和 ChatGPT Connector 真机环境。
 

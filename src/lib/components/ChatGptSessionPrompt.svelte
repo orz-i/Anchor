@@ -53,7 +53,7 @@
 </script>
 
 <section
-  class="rounded-[12px] border border-[var(--color-border)] bg-[var(--card-bg)] px-3 py-2.5 sm:px-4"
+  class="rounded-[12px] border border-[var(--border)] bg-[var(--card-bg)] px-3 py-2.5 sm:px-4"
   aria-labelledby="chatgpt-session-prompt-title"
 >
   <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
@@ -65,10 +65,10 @@
         <History size={16} />
       </span>
       <div class="min-w-0">
-        <h3 id="chatgpt-session-prompt-title" class="text-sm font-semibold text-[var(--color-text)]">
+        <h3 id="chatgpt-session-prompt-title" class="text-sm font-semibold text-[var(--text-main)]">
           ChatGPT 新会话启动提示词
         </h3>
-        <p class="mt-0.5 text-xs leading-5 text-[var(--color-text-muted)]">
+        <p class="mt-0.5 text-xs leading-5 text-[var(--text-muted)]">
           首次使用会初始化历史；后续新会话会自动恢复已有进度。
         </p>
       </div>
@@ -109,11 +109,11 @@
   </div>
 
   {#if expanded}
-    <div id="chatgpt-session-prompt-content" class="mt-3 border-t border-[var(--color-border)] pt-3">
+    <div id="chatgpt-session-prompt-content" class="mt-3 border-t border-[var(--border)] pt-3">
       <pre
-        class="tx-mono whitespace-pre-wrap break-words rounded-[10px] bg-[var(--surface-hover)] p-3 leading-5 text-[var(--color-text-secondary)]"
+        class="tx-mono whitespace-pre-wrap break-words rounded-[10px] bg-[var(--surface-hover)] p-3 leading-5 text-[var(--text-secondary)]"
       >{sessionPrompt}</pre>
-      <p class="mt-2 text-[11px] leading-5 text-[var(--color-text-muted)]">
+      <p class="mt-2 text-[11px] leading-5 text-[var(--text-muted)]">
         复制后粘贴到使用当前工作区 MCP 连接器的 ChatGPT 新会话。
       </p>
     </div>

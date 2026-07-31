@@ -31,7 +31,7 @@
   <div class="flex items-start justify-between gap-3">
     <div>
       <h3 class="font-semibold">健康检查</h3>
-      <p class="mt-1 text-sm text-[var(--color-text-muted)]">
+      <p class="mt-1 text-sm text-[var(--text-muted)]">
         MCP、Actions 本地/公网 endpoint 与 OAuth 元数据
       </p>
     </div>
@@ -46,7 +46,7 @@
   </div>
 
   {#if error}
-    <p class="mt-4 rounded-lg border border-[var(--color-error)]/30 bg-[var(--color-error)]/10 px-3 py-2 text-sm text-[var(--color-error)]">
+    <p class="mt-4 rounded-lg border border-[var(--danger)]/30 bg-[var(--danger)]/10 px-3 py-2 text-sm text-[var(--danger)]">
       {error}
     </p>
   {/if}
@@ -55,13 +55,13 @@
     <ul class="mt-4 grid gap-2">
       {#each items as item (item.label)}
         <li
-          class="flex items-start justify-between gap-3 rounded-lg bg-[var(--color-bg)] px-3 py-2"
+          class="flex items-start justify-between gap-3 rounded-lg bg-[var(--page-bg)] px-3 py-2"
         >
           <div class="min-w-0">
             <p class="text-sm font-medium">{item.label}</p>
-            <p class="mt-0.5 text-xs text-[var(--color-text-muted)]">{item.detail}</p>
+            <p class="mt-0.5 text-xs text-[var(--text-muted)]">{item.detail}</p>
             {#if !item.ok && item.hint}
-              <p class="mt-1 text-xs text-[var(--color-accent)]">{item.hint}</p>
+              <p class="mt-1 text-xs text-[var(--primary)]">{item.hint}</p>
             {/if}
           </div>
           <span
@@ -75,18 +75,18 @@
       {/each}
     </ul>
   {:else if !busy && !error}
-    <p class="mt-4 text-sm text-[var(--color-text-muted)]">尚未运行检查。</p>
+    <p class="mt-4 text-sm text-[var(--text-muted)]">尚未运行检查。</p>
   {/if}
 </section>
 
 <style>
   .health-ok {
-    background: color-mix(in oklch, var(--color-success) 15%, transparent);
-    color: var(--color-success);
+    background: color-mix(in oklch, var(--success) 15%, transparent);
+    color: var(--success);
   }
 
   .health-fail {
-    background: color-mix(in oklch, var(--color-error) 15%, transparent);
-    color: var(--color-error);
+    background: color-mix(in oklch, var(--danger) 15%, transparent);
+    color: var(--danger);
   }
 </style>

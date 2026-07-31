@@ -162,7 +162,7 @@
   <header class="page-header">
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">通用</h2>
-    <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
+    <p class="mt-2 max-w-2xl text-sm text-[var(--text-muted)]">
       配置全局网络代理。此代理将应用于 Cloudflare 隧道连接，不影响软件下载代理。
     </p>
   </header>
@@ -175,9 +175,9 @@
         onsubmit={(e) => { e.preventDefault(); void save(); }}
       >
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">代理模式</span>
+          <span class="text-xs text-[var(--text-muted)]">代理模式</span>
           <select
-            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+            class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
             bind:value={proxy.mode}
             onchange={handleChange}
           >
@@ -189,7 +189,7 @@
 
         {#if proxy.mode === "manual"}
           <label class="grid gap-1">
-            <span class="text-xs text-[var(--color-text-muted)]">代理地址</span>
+            <span class="text-xs text-[var(--text-muted)]">代理地址</span>
             <input
               type="text"
               class="tx-input tx-mono"
@@ -197,7 +197,7 @@
               bind:value={proxy.url}
               oninput={handleChange}
             />
-            <span class="text-xs text-[var(--color-text-muted)]">
+            <span class="text-xs text-[var(--text-muted)]">
               支持 HTTP/HTTPS/SOCKS 代理，如 http://127.0.0.1:7890
             </span>
           </label>
@@ -206,7 +206,7 @@
         <div class="flex justify-end pt-1">
           <button
             type="submit"
-            class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
             disabled={!changed || saving}
           >
             {saving ? "保存中…" : "保存设置"}
@@ -219,12 +219,12 @@
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 class="text-sm font-semibold">单一 MCP Gateway</h3>
-          <p class="mt-1 max-w-3xl text-xs leading-5 text-[var(--color-text-muted)]">
+          <p class="mt-1 max-w-3xl text-xs leading-5 text-[var(--text-muted)]">
             通过一个本地网关和一个公网隧道暴露多个工作区。每个工作区仍使用独立路径、OAuth resource、会话和工具上下文。
           </p>
         </div>
         {#if gatewayStatus}
-          <span class="rounded-full border border-[var(--color-border)] px-2.5 py-1 text-xs">
+          <span class="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs">
             {gatewayStatus.state === "running"
               ? `运行中 · ${gatewayStatus.routeCount} 条路由`
               : gatewayStatus.state === "error"
@@ -238,7 +238,7 @@
         class="mt-4 grid gap-4"
         onsubmit={(e) => { e.preventDefault(); void saveGateway(); }}
       >
-        <label class="flex items-start gap-2 rounded-md border border-[var(--color-border)] p-3">
+        <label class="flex items-start gap-2 rounded-md border border-[var(--border)] p-3">
           <input
             type="checkbox"
             class="mt-0.5"
@@ -247,7 +247,7 @@
           />
           <span>
             <span class="block text-sm font-medium">启用单一 Gateway</span>
-            <span class="mt-0.5 block text-xs text-[var(--color-text-muted)]">
+            <span class="mt-0.5 block text-xs text-[var(--text-muted)]">
               启用后，各工作区原有 MCP 隧道会停止，仅保留下面所选工作区的隧道配置作为 Gateway 出入口。
             </span>
           </span>
@@ -255,7 +255,7 @@
 
         <div class="grid gap-3 md:grid-cols-2">
           <label class="grid gap-1">
-            <span class="text-xs text-[var(--color-text-muted)]">Gateway 本地端口</span>
+            <span class="text-xs text-[var(--text-muted)]">Gateway 本地端口</span>
             <input
               type="number"
               min="1"
@@ -267,9 +267,9 @@
           </label>
 
           <label class="grid gap-1">
-            <span class="text-xs text-[var(--color-text-muted)]">隧道所有者工作区</span>
+            <span class="text-xs text-[var(--text-muted)]">隧道所有者工作区</span>
             <select
-              class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+              class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
               bind:value={gateway.ownerWorkspaceId}
               onchange={handleGatewayChange}
               disabled={!gateway.enabled}
@@ -283,7 +283,7 @@
         </div>
 
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">Gateway 公网基础地址</span>
+          <span class="text-xs text-[var(--text-muted)]">Gateway 公网基础地址</span>
           <input
             type="url"
             class="tx-input tx-mono"
@@ -291,25 +291,25 @@
             bind:value={gateway.publicUrl}
             oninput={handleGatewayChange}
           />
-          <span class="text-xs text-[var(--color-text-muted)]">
+          <span class="text-xs text-[var(--text-muted)]">
             不包含 <code>/w/&lt;workspace&gt;/mcp</code>。远程地址必须使用 HTTPS 且不能包含子路径。留空时由隧道运行结果决定。
           </span>
         </label>
 
         {#if gateway.observedPublicUrl}
           <div class="grid gap-1">
-            <span class="text-xs text-[var(--color-text-muted)]">当前观测到的公网地址</span>
+            <span class="text-xs text-[var(--text-muted)]">当前观测到的公网地址</span>
             <code class="break-all text-xs">{gateway.observedPublicUrl}</code>
           </div>
         {/if}
 
         {#if gateway.enabled}
-          <div class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg-subtle)] p-3">
+          <div class="rounded-md border border-[var(--border)] bg-[var(--primary-soft)] p-3">
             <p class="text-xs font-medium">ChatGPT 工作区连接地址</p>
             <div class="mt-2 grid max-h-48 gap-2 overflow-auto">
               {#each workspaces as workspace}
                 <div class="grid gap-0.5 text-xs">
-                  <span class="flex flex-wrap items-center gap-2 text-[var(--color-text-muted)]">
+                  <span class="flex flex-wrap items-center gap-2 text-[var(--text-muted)]">
                     <span>{workspace.name}</span>
                     <span>
                       {gatewayRouteActive(workspace.id)
@@ -333,7 +333,7 @@
         <div class="flex justify-end pt-1">
           <button
             type="submit"
-            class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
             disabled={!gatewayChanged || gatewaySaving}
           >
             {gatewaySaving ? "保存中…" : "保存 Gateway 设置"}

@@ -495,7 +495,7 @@ mod tests {
             &format!("---\nname: example\ndescription: Test.\n---\n{english}"),
             "example",
         )
-        .expect("more than the legacy character limit remains valid");
+        .expect("instructions above the former character limit remain valid");
         assert!(parsed.instruction_lines < RECOMMENDED_INSTRUCTION_LINES);
         assert!(parsed.estimated_tokens > RECOMMENDED_INSTRUCTION_TOKENS);
         assert!(parsed.oversized);

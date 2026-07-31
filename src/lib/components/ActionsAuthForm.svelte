@@ -285,14 +285,14 @@
     void save();
   }}
 >
-  <p class="text-xs text-[var(--color-text-muted)]">
+  <p class="text-xs text-[var(--text-muted)]">
     复制 OpenAPI、密钥等请用上方「GPT 配置」卡片；此处仅修改认证方式与密钥。
   </p>
 
   <label class="grid gap-1">
-    <span class="text-xs text-[var(--color-text-muted)]">认证方式</span>
+    <span class="text-xs text-[var(--text-muted)]">认证方式</span>
     <select
-      class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+      class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
       bind:value={draftAuthType}
     >
       {#each ACTIONS_AUTH_OPTIONS as option}
@@ -307,12 +307,12 @@
       class="h-4 w-4"
       bind:checked={draftUseShared}
     />
-    <span class="text-xs text-[var(--color-text-muted)]">使用全局共享密钥（在「设置 → 共享密钥」中管理）</span>
+    <span class="text-xs text-[var(--text-muted)]">使用全局共享密钥（在「设置 → 共享密钥」中管理）</span>
   </label>
 
   {#if showApiKey}
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">API Key（Bearer）</span>
+      <span class="text-xs text-[var(--text-muted)]">API Key（Bearer）</span>
       <SecretInput
         value={loadingKey ? "加载中…" : apiKey}
         readonly
@@ -322,7 +322,7 @@
         regenerating={regenerating}
       />
     </label>
-    <p class="text-xs text-[var(--color-text-muted)]">
+    <p class="text-xs text-[var(--text-muted)]">
       在 GPT Actions 认证里选 API Key → Bearer，Key 填这里的值。
     </p>
   {:else if showOAuth}
@@ -332,11 +332,11 @@
     </div>
 
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">OAuth Client ID（填到 GPT）</span>
+      <span class="text-xs text-[var(--text-muted)]">OAuth Client ID（填到 GPT）</span>
       <div class="flex gap-2">
         <input
           type="text"
-          class="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+          class="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
           bind:value={draftOauthClientId}
         />
         {#if draftOauthClientId}
@@ -347,35 +347,35 @@
     <div class="tx-alert" role="note">
       ChatGPT 官方 callback 会自动识别并登记，无需中途返回 GUI 填写 Callback URL。
     </div>
-    <details class="rounded-md border border-[var(--color-border)] px-3 py-2">
-      <summary class="cursor-pointer text-xs text-[var(--color-text-muted)]">
+    <details class="rounded-md border border-[var(--border)] px-3 py-2">
+      <summary class="cursor-pointer text-xs text-[var(--text-muted)]">
         高级：其他 OAuth 客户端 Callback 策略
       </summary>
       <div class="mt-3 grid gap-3">
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">附加精确 Callback URL（可选）</span>
+          <span class="text-xs text-[var(--text-muted)]">附加精确 Callback URL（可选）</span>
           <textarea
             rows="3"
-            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-xs"
             bind:value={draftOauthRedirectUris}
           ></textarea>
         </label>
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">附加 Callback 域名白名单（可选）</span>
+          <span class="text-xs text-[var(--text-muted)]">附加 Callback 域名白名单（可选）</span>
           <textarea
             rows="3"
-            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-xs"
             bind:value={draftOauthRedirectHosts}
             placeholder="oauth.example.com&#10;*.example.com"
           ></textarea>
-          <span class="text-xs text-[var(--color-text-muted)]">
+          <span class="text-xs text-[var(--text-muted)]">
             匹配域名会自动登记精确 callback，不显示确认项，也不重启服务。
           </span>
         </label>
       </div>
     </details>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">OAuth Client Secret（填到 GPT）</span>
+      <span class="text-xs text-[var(--text-muted)]">OAuth Client Secret（填到 GPT）</span>
       <SecretInput
         value={loadingOAuthSecret ? "加载中…" : oauthClientSecret}
         readonly
@@ -386,7 +386,7 @@
       />
     </label>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">OAuth Password（服务端校验）</span>
+      <span class="text-xs text-[var(--text-muted)]">OAuth Password（服务端校验）</span>
       <SecretInput
         value={loadingOAuthPassword ? "加载中…" : oauthPassword}
         readonly
@@ -397,7 +397,7 @@
       />
     </label>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">OAuth Token Secret（JWT 签名）</span>
+      <span class="text-xs text-[var(--text-muted)]">OAuth Token Secret（JWT 签名）</span>
       <SecretInput
         value={loadingOAuthTokenSecret ? "加载中…" : oauthTokenSecret}
         readonly
@@ -408,12 +408,12 @@
       />
     </label>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Authorization URL（填到 GPT）</span>
+      <span class="text-xs text-[var(--text-muted)]">Authorization URL（填到 GPT）</span>
       <div class="flex gap-2">
         <input
           type="text"
           readonly
-          class="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+          class="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-xs"
           value={oauthAuthorizeUrl}
         />
         {#if oauthAuthorizeUrl}
@@ -422,12 +422,12 @@
       </div>
     </label>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Token URL（填到 GPT）</span>
+      <span class="text-xs text-[var(--text-muted)]">Token URL（填到 GPT）</span>
       <div class="flex gap-2">
         <input
           type="text"
           readonly
-          class="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+          class="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-xs"
           value={oauthTokenUrl}
         />
         {#if oauthTokenUrl}
@@ -436,20 +436,20 @@
       </div>
     </label>
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Scope（填到 GPT，空格分隔）</span>
+      <span class="text-xs text-[var(--text-muted)]">Scope（填到 GPT，空格分隔）</span>
       <input
         type="text"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+        class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
         placeholder="例如：anchor"
         bind:value={draftOauthScopes}
       />
     </label>
-    <p class="text-xs text-[var(--color-text-muted)]">
+    <p class="text-xs text-[var(--text-muted)]">
       GPT 编辑器会生成 Callback URL（<code>https://chatgpt.com/aip/g-…/oauth/callback</code>），无需在本应用配置。Token
       交换方式选默认即可。
     </p>
   {:else}
-    <p class="text-xs text-[var(--color-text-muted)]">
+    <p class="text-xs text-[var(--text-muted)]">
       不校验请求认证；GPT 侧选 None。仅建议本机调试，公网暴露请用 API Key 或 OAuth。
     </p>
   {/if}
@@ -457,7 +457,7 @@
   <div class="flex justify-end pt-1">
     <button
       type="submit"
-      class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+      class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
       disabled={saving || !dirty}
     >
       {saving ? "保存中…" : "保存配置"}

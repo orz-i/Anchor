@@ -80,10 +80,10 @@
   <div class="flex items-start justify-between gap-3">
     <div>
       <h3 class="font-semibold">{heading}</h3>
-      <p class="mt-1 text-sm text-[var(--color-text-muted)]">最近 8KB 尾部输出</p>
+      <p class="mt-1 text-sm text-[var(--text-muted)]">最近 8KB 尾部输出</p>
     </div>
     <div class="flex shrink-0 items-center gap-3">
-      <label class="inline-flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+      <label class="inline-flex items-center gap-2 text-xs text-[var(--text-secondary)]">
         <input
           type="checkbox"
           class="h-4 w-4"
@@ -105,7 +105,7 @@
 
   {#if error}
     <p
-      class="mt-4 rounded-lg border border-[var(--color-error)]/30 bg-[var(--color-error)]/10 px-3 py-2 text-sm text-[var(--color-error)]"
+      class="mt-4 rounded-lg border border-[var(--danger)]/30 bg-[var(--danger)]/10 px-3 py-2 text-sm text-[var(--danger)]"
     >
       {error}
     </p>
@@ -114,8 +114,8 @@
   {#if chunks.length > 0}
     <div class="mt-4 grid gap-3">
       {#each chunks as chunk (chunk.name)}
-        <div class="overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]">
-          <p class="border-b border-[var(--color-border)] px-3 py-1.5 font-mono text-xs text-[var(--color-text-muted)]">
+        <div class="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--page-bg)]">
+          <p class="border-b border-[var(--border)] px-3 py-1.5 font-mono text-xs text-[var(--text-muted)]">
             {chunk.name}
           </p>
           <pre
@@ -125,6 +125,6 @@
       {/each}
     </div>
   {:else if !busy && !error}
-    <p class="mt-4 text-sm text-[var(--color-text-muted)]">当前还没有日志</p>
+    <p class="mt-4 text-sm text-[var(--text-muted)]">当前还没有日志</p>
   {/if}
 </section>

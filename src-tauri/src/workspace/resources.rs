@@ -96,7 +96,7 @@ fn next_free_port(preferred: u16, reserved: &std::collections::HashSet<u16>) -> 
 }
 
 /// Validate an update without blocking a repair because another, unchanged
-/// service already has a legacy duplicate resource.
+/// service already has an unchanged duplicate resource.
 pub fn validate_workspace_resources_update(
     profiles: &[WorkspaceProfile],
     current: &WorkspaceProfile,
@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_fixing_mcp_port_when_legacy_actions_conflict_is_unchanged() {
+    fn allows_fixing_mcp_port_when_actions_conflict_is_unchanged() {
         let owner = profile("owner", 28_765, 8_787);
         let current = profile("target", 28_766, 8_787);
         let mut candidate = current.clone();
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_update_is_not_blocked_by_legacy_duplicates() {
+    fn unrelated_update_is_not_blocked_by_existing_duplicates() {
         let first = profile("first", 28_766, 8_787);
         let second = profile("second", 28_766, 8_788);
         let candidate = profile("candidate", 28_769, 8_789);
@@ -479,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn start_is_blocked_when_target_participates_in_legacy_duplicate() {
+    fn start_is_blocked_when_target_participates_in_existing_duplicate() {
         let first = profile("first", 28_766, 8_787);
         let target = profile("target", 28_766, 8_788);
 

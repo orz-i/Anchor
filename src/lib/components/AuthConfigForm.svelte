@@ -209,14 +209,14 @@
     void save();
   }}
 >
-  <p class="text-xs text-[var(--color-text-muted)]">
+  <p class="text-xs text-[var(--text-muted)]">
     复制 Client ID / 密钥等请用上方「GPT 配置」卡片；此处可修改认证类型与重新生成密钥。
   </p>
 
   <label class="grid gap-1">
-    <span class="text-xs text-[var(--color-text-muted)]">认证类型</span>
+    <span class="text-xs text-[var(--text-muted)]">认证类型</span>
     <select
-      class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-sm"
+      class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
       bind:value={draft.type}
     >
       {#each AUTH_OPTIONS as option}
@@ -231,7 +231,7 @@
       class="h-4 w-4"
       bind:checked={draft.use_shared_secrets}
     />
-    <span class="text-xs text-[var(--color-text-muted)]">使用全局共享密钥（在「设置 → 共享密钥」中管理）</span>
+    <span class="text-xs text-[var(--text-muted)]">使用全局共享密钥（在「设置 → 共享密钥」中管理）</span>
   </label>
 
   {#if showOAuth}
@@ -241,10 +241,10 @@
     </div>
 
     <label class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">OAuth 客户端 ID</span>
+      <span class="text-xs text-[var(--text-muted)]">OAuth 客户端 ID</span>
       <input
         type="text"
-        class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-sm"
+        class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
         bind:value={draft.oauth_client_id}
         readonly={draft.use_shared_secrets}
       />
@@ -254,29 +254,29 @@
       ChatGPT 官方 callback 会自动识别并登记，无需复制 Callback URL，也无需配置域名白名单。
     </div>
 
-    <details class="rounded-md border border-[var(--color-border)] px-3 py-2">
-      <summary class="cursor-pointer text-xs text-[var(--color-text-muted)]">
+    <details class="rounded-md border border-[var(--border)] px-3 py-2">
+      <summary class="cursor-pointer text-xs text-[var(--text-muted)]">
         高级：其他 OAuth 客户端 Callback 策略
       </summary>
       <div class="mt-3 grid gap-3">
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">附加精确 Callback URL（可选）</span>
+          <span class="text-xs text-[var(--text-muted)]">附加精确 Callback URL（可选）</span>
           <textarea
             rows="3"
-            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-xs"
             bind:value={draft.oauth_redirect_uris}
           ></textarea>
         </label>
 
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">附加 Callback 域名白名单（可选）</span>
+          <span class="text-xs text-[var(--text-muted)]">附加 Callback 域名白名单（可选）</span>
           <textarea
             rows="3"
-            class="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 font-mono text-xs"
+            class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-xs"
             bind:value={draft.oauth_redirect_hosts}
             placeholder="oauth.example.com&#10;*.example.com"
           ></textarea>
-          <span class="text-xs text-[var(--color-text-muted)]">
+          <span class="text-xs text-[var(--text-muted)]">
             匹配域名会自动登记本次精确 callback，不显示确认项，也不重启 listener。
           </span>
         </label>
@@ -284,7 +284,7 @@
     </details>
 
     <div class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">OAuth 客户端密钥</span>
+      <span class="text-xs text-[var(--text-muted)]">OAuth 客户端密钥</span>
       <SecretInput
         value={secrets.oauth_client_secret ?? ""}
         placeholder="加载中…"
@@ -295,7 +295,7 @@
     </div>
 
     <div class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">授权口令</span>
+      <span class="text-xs text-[var(--text-muted)]">授权口令</span>
       <SecretInput
         value={secrets.oauth_password ?? ""}
         placeholder="ChatGPT 首次授权时输入这个口令"
@@ -308,7 +308,7 @@
 
   {#if showBearer}
     <div class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">Bearer Token</span>
+      <span class="text-xs text-[var(--text-muted)]">Bearer Token</span>
       <SecretInput
         value={secrets.bearer_token ?? ""}
         placeholder="加载中…"
@@ -322,7 +322,7 @@
   <div class="flex justify-end pt-1">
     <button
       type="submit"
-      class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+      class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
       disabled={saving || !dirty}
     >
       {saving ? "保存中…" : "保存配置"}

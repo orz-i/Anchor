@@ -86,16 +86,16 @@
   }}
 >
   <label class="grid gap-1.5">
-    <span class="text-xs text-[var(--color-text-muted)]">下游 MCP 配置（JSON）</span>
+    <span class="text-xs text-[var(--text-muted)]">下游 MCP 配置（JSON）</span>
     <textarea
-      class="min-h-72 resize-y rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2 font-mono text-xs leading-5"
+      class="min-h-72 resize-y rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-3 py-2 font-mono text-xs leading-5"
       placeholder={EXAMPLE_CONFIG}
       spellcheck="false"
       bind:value={draft}
     ></textarea>
   </label>
 
-  <p class="text-xs leading-5 text-[var(--color-text-muted)]">
+  <p class="text-xs leading-5 text-[var(--text-muted)]">
     当前支持 stdio 与 Streamable HTTP MCP。stdio 会在启动 MCP 服务时拉起本地进程；
     Streamable HTTP 支持 JSON/SSE 响应、MCP 会话和自定义认证头。工具会以
     <code class="font-mono">服务器名__工具名</code> 合并到公网 MCP；
@@ -112,14 +112,14 @@
   </p>
 
   {#if error}
-    <p class="text-xs text-[var(--color-danger)]">{error}</p>
+    <p class="text-xs text-[var(--danger)]">{error}</p>
   {/if}
 
   <div class="flex flex-wrap justify-between gap-2 pt-1">
     <div class="flex gap-2">
       <button
         type="button"
-        class="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm"
+        class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm"
         onclick={() => {
           draft = EXAMPLE_CONFIG;
           error = "";
@@ -129,7 +129,7 @@
       </button>
       <button
         type="button"
-        class="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-sm"
+        class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm"
         onclick={formatConfig}
       >
         格式化 JSON
@@ -137,7 +137,7 @@
     </div>
     <button
       type="submit"
-      class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+      class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
       disabled={saving || !dirty}
     >
       {saving ? "保存中…" : "保存 MCP 聚合配置"}

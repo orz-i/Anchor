@@ -150,7 +150,7 @@ sudo loginctl enable-linger "$USER"
 
 ## GUI 与 CLI 并用
 
-- 从旧版首次升级时，先停止仍在运行的旧 GUI，再执行一次新版 GUI 或 CLI 命令完成 `secrets.json` 迁移。旧进程不认识新的跨进程锁，不应与首次迁移并行。
+- Anchor 只读取当前配置目录和受保护的 `secrets.json` 封装；早期产品目录、明文凭据和旧配置布局不会自动导入。需要保留的工作区应在当前版本中重新注册。
 - 可以共用同一个配置目录和 workspace/profile。
 - 配置文件写入有跨进程锁和最近有效备份。
 - 不要同时用 GUI 和 CLI 启动同一个 workspace 的同一种服务；端口检查会阻止重复启动。

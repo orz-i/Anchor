@@ -12,10 +12,10 @@
   <div
     class="tx-card mb-6 flex h-16 w-16 items-center justify-center rounded-2xl border border-dashed"
   >
-    <FolderPlus size={28} class="text-[var(--color-text-muted)]" />
+    <FolderPlus size={28} class="text-[var(--text-muted)]" />
   </div>
   <h2 class="text-2xl font-bold tracking-tight">添加你的第一个工作区</h2>
-  <p class="mt-2 max-w-md text-sm text-[var(--color-text-muted)]">
+  <p class="mt-2 max-w-md text-sm text-[var(--text-muted)]">
     选择项目目录后，可分别启动 MCP 与 Actions 本地服务。
   </p>
   {#if onAdd}

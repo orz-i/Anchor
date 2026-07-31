@@ -21,8 +21,8 @@
       <CopyButton {value} />
     {/if}
   </div>
-  <p class="tx-mono mt-1.5 truncate text-sm text-[var(--color-text-secondary)]">{display}</p>
+  <p class="tx-mono mt-1.5 truncate text-sm text-[var(--text-secondary)]">{display}</p>
   {#if hint}
-    <p class="mt-1 text-[11px] text-[var(--color-text-muted)]">{hint}</p>
+    <p class="mt-1 text-[11px] text-[var(--text-muted)]">{hint}</p>
   {/if}
 </div>

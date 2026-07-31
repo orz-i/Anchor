@@ -87,7 +87,7 @@
   <header class="page-header">
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">FRP 配置</h2>
-    <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
+    <p class="mt-2 max-w-2xl text-sm text-[var(--text-muted)]">
       在此配置 FRP 服务器、端口与 Token。各工作区只需选择配置并填写自己的子域名；修改子域名后保存会自动更新
       frpc 配置并重启隧道。
     </p>
@@ -104,7 +104,7 @@
         }}
       >
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">名称</span>
+          <span class="text-xs text-[var(--text-muted)]">名称</span>
           <input
             type="text"
             class="tx-input"
@@ -113,7 +113,7 @@
           />
         </label>
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">服务器域名</span>
+          <span class="text-xs text-[var(--text-muted)]">服务器域名</span>
           <input
             type="text"
             class="tx-input tx-mono"
@@ -122,7 +122,7 @@
           />
         </label>
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">端口</span>
+          <span class="text-xs text-[var(--text-muted)]">端口</span>
           <input
             type="number"
             min="1"
@@ -132,7 +132,7 @@
           />
         </label>
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--color-text-muted)]">
+          <span class="text-xs text-[var(--text-muted)]">
             Token {editingId ? "（留空则保持不变）" : ""}
           </span>
           <SecretInput
@@ -144,7 +144,7 @@
         <div class="flex gap-2 pt-1">
           <button
             type="submit"
-            class="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
             disabled={saving}
           >
             {saving ? "保存中…" : editingId ? "更新" : "添加"}
@@ -165,9 +165,9 @@
     <div class="tx-card p-4">
       <h3 class="text-sm font-semibold">已保存的配置</h3>
       {#if loading}
-        <p class="mt-4 text-sm text-[var(--color-text-muted)]">加载中…</p>
+        <p class="mt-4 text-sm text-[var(--text-muted)]">加载中…</p>
       {:else if profiles.length === 0}
-        <p class="mt-4 text-sm text-[var(--color-text-muted)]">暂无 FRP 配置。</p>
+        <p class="mt-4 text-sm text-[var(--text-muted)]">暂无 FRP 配置。</p>
       {:else}
         <ul class="mt-4 space-y-2">
           {#each profiles as profile (profile.id)}
@@ -176,7 +176,7 @@
             >
               <div class="min-w-0">
                 <p class="truncate text-sm font-medium">{profile.name}</p>
-                <p class="truncate font-mono text-xs text-[var(--color-text-muted)]">
+                <p class="truncate font-mono text-xs text-[var(--text-muted)]">
                   {profile.server}:{profile.serverPort}
                   · Token {profile.hasToken ? "已配置" : "未配置"}
                 </p>
@@ -184,7 +184,7 @@
               <div class="flex shrink-0 gap-2">
                 <button
                   type="button"
-                  class="text-xs text-[var(--color-accent)] hover:underline"
+                  class="text-xs text-[var(--primary)] hover:underline"
                   onclick={() => editProfile(profile)}
                 >
                   编辑

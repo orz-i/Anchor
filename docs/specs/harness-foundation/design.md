@@ -543,7 +543,7 @@ src-tauri/tests/call_tool_contract.rs
 | 多客户端竞争写入 | 高 | 单写任务锁、client_id/lease、超时恢复 |
 | 事件日志泄露秘密 | 严重 | 字段级脱敏、敏感模式测试、禁止完整聊天和环境原值 |
 | Pending Action 被过期状态复用 | 高 | 申请时指纹、执行前重校验、短 TTL |
-| 工具注册迁移导致 ChatGPT schema 漂移 | 中 | 兼容旧名称、统一注册表、MCP/Actions 契约测试 |
+| 工具注册变更导致 ChatGPT schema 漂移 | 中 | 统一注册表、固定发布目录、版本/摘要诊断和重连提示 |
 | Windows 进程树无法完全终止 | 高 | Job Object/进程树实现、真机超时测试 |
 | 状态文件损坏 | 中 | 原子替换、schema_version、备份和恢复诊断 |
 | 功能范围过大导致长期分支 | 高 | 按 Foundation、Recovery、Delivery 三个可交付切片实现 |

@@ -75,7 +75,7 @@
   {#if onRegenerate}
     <button
       type="button"
-      class="shrink-0 rounded-md border border-[var(--color-border)] px-2.5 py-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] disabled:opacity-50"
+      class="shrink-0 rounded-md border border-[var(--border)] px-2.5 py-1 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-hover)] disabled:opacity-50"
       disabled={regenerating || disabled}
       onclick={() => onRegenerate?.()}
     >
