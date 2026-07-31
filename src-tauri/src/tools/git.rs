@@ -47,6 +47,7 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     let mut ahead = 0i64;
     let mut behind = 0i64;
     let mut entries = Vec::new();
+    let mut warnings = Vec::new();
     let lines: Vec<_> = completed.stdout.lines().collect();
     let total_lines = lines.len();
 
@@ -82,6 +83,16 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         }
     }
 
+    if !upstream.is_empty() {
+        match git_ahead_behind(&resolved.path, &upstream) {
+            Ok((computed_ahead, computed_behind)) => {
+                ahead = computed_ahead;
+                behind = computed_behind;
+            }
+            Err(message) => warnings.push(message),
+        }
+    }
+
     let head = git_rev_parse(&resolved.path, "HEAD").unwrap_or_default();
     Ok(tool_ok(json!({
         "is_repo": true,
@@ -93,15 +104,20 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "clean": entries.is_empty(),
         "entries": entries,
         "truncated": entries.len() >= max_entries && total_lines > max_entries + 1,
-        "warnings": []
+        "warnings": warnings
     })))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command as StdCommand;
     use std::time::{Duration, Instant};
 
-    use super::run_process_with_timeout;
+    use serde_json::json;
+
+    use super::{git_status, parse_branch_line, run_process_with_timeout};
+    use crate::tools::workspace::Workspace;
 
     #[test]
     fn git_process_helper_enforces_deadline() {
@@ -119,6 +135,59 @@ mod tests {
         .expect_err("timeout");
         assert_eq!(error.to_error_value()["code"], "GIT_TIMEOUT");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn branch_metadata_parses_bracketed_ahead_and_behind_counts() {
+        assert_eq!(
+            parse_branch_line("main...origin/main [ahead 6, behind 2]"),
+            ("main".into(), "origin/main".into(), 6, 2)
+        );
+    }
+
+    #[test]
+    fn git_status_reports_real_ahead_count_against_upstream() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        fs::create_dir_all(&repo).expect("repo dir");
+
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&repo, &["config", "user.email", "anchor-tests@example.invalid"]);
+        git(&repo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(repo.join("main.txt"), "initial\n").expect("initial file");
+        git(&repo, &["add", "main.txt"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        git(temp.path(), &["clone", "--bare", repo.to_str().unwrap(), remote.to_str().unwrap()]);
+        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&repo, &["fetch", "origin"]);
+        git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+
+        fs::write(repo.join("main.txt"), "ahead\n").expect("ahead file");
+        git(&repo, &["add", "main.txt"]);
+        git(&repo, &["commit", "-m", "ahead"]);
+
+        let workspace = Workspace::new(repo).expect("workspace");
+        let result = git_status(&workspace, &json!({})).expect("git status");
+        assert_eq!(result["ahead"], 1);
+        assert_eq!(result["behind"], 0);
+        assert_eq!(result["upstream"], "origin/main");
+    }
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let output = StdCommand::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -603,7 +672,7 @@ fn parse_branch_line(line: &str) -> (String, String, i64, i64) {
     let mut upstream = tracking.clone();
     if let Some(idx) = tracking.find(' ') {
         upstream = tracking[..idx].to_string();
-        let meta = &tracking[idx + 1..];
+        let meta = tracking[idx + 1..].trim_matches(['[', ']']);
         for token in meta.split(',') {
             let token = token.trim();
             if let Some(n) = token.strip_prefix("ahead ") {
@@ -614,6 +683,32 @@ fn parse_branch_line(line: &str) -> (String, String, i64, i64) {
         }
     }
     (branch, upstream, ahead, behind)
+}
+
+fn git_ahead_behind(cwd: &std::path::Path, upstream: &str) -> Result<(i64, i64), String> {
+    let range = format!("HEAD...{upstream}");
+    let completed = run_git(
+        cwd,
+        &["rev-list", "--left-right", "--count", range.as_str()],
+        Duration::from_secs(10),
+    )
+    .map_err(|error| error.message())?;
+    if !completed.success {
+        return Err(format!(
+            "failed to compute ahead/behind against {upstream}: {}",
+            completed.stderr.trim()
+        ));
+    }
+    let mut counts = completed.stdout.split_whitespace();
+    let ahead = counts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| format!("invalid ahead/behind output for {upstream}"))?;
+    let behind = counts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| format!("invalid ahead/behind output for {upstream}"))?;
+    Ok((ahead, behind))
 }
 
 fn parse_diff_files(diff: &str) -> Vec<Value> {
