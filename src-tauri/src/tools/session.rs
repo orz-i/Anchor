@@ -610,27 +610,20 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     let parts: Vec<&str> = output_ref.split(':').collect();
     if parts.len() != 3 || parts[0] != "session" {
         return Err(WorkspaceError::invalid_argument(
-            "output_ref must look like session:<id>:stdout, session:<id>:stderr, or session:<id>:full",
+            "output_ref must look like session:<id>:stdout or session:<id>:stderr",
         ));
     }
     let session_id = parts[1];
     let ref_stream = parts[2];
-    if ref_stream != "stdout" && ref_stream != "stderr" && ref_stream != "full" {
+    if ref_stream != "stdout" && ref_stream != "stderr" {
         return Err(WorkspaceError::invalid_argument(
-            "output_ref stream must be stdout, stderr, or full",
+            "output_ref stream must be stdout or stderr",
         ));
     }
     let session = store.get(session_id)?;
     crate::async_runtime::block_on(session.refresh_status());
 
-    let requested_stream = args.get("stream").and_then(Value::as_str).unwrap_or("");
-    let stream = if ref_stream == "stdout" || ref_stream == "stderr" {
-        ref_stream
-    } else if requested_stream == "stdout" || requested_stream == "stderr" {
-        requested_stream
-    } else {
-        "stdout"
-    };
+    let stream = ref_stream;
 
     let (data, total_stream_bytes) = session.retained_stream_bytes(stream);
     let requested_offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -646,12 +639,6 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
             "requested offset is no longer retained; response starts at retained_start_offset",
         );
     }
-    if ref_stream == "full" {
-        warnings.push(
-            "legacy full output_ref defaults to stdout; use output_refs for stable stream paging",
-        );
-    }
-
     Ok(tool_ok(json!({
         "output_ref": output_ref,
         "stream_output_ref": format!("session:{session_id}:{stream}"),

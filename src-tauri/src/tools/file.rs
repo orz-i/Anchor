@@ -541,22 +541,14 @@ fn list_files_patterns(args: &Value) -> Vec<String> {
     if !patterns.is_empty() {
         return patterns;
     }
-    if let Some(glob) = args.get("glob").and_then(Value::as_str) {
-        if !glob.is_empty() {
-            return vec![glob.to_string()];
-        }
-    }
     vec!["**/*".to_string()]
 }
 
 fn search_globs(args: &Value) -> (Vec<String>, Vec<String>) {
-    let mut include = string_list_arg(args, "include_globs");
-    if let Some(glob) = args.get("glob").and_then(Value::as_str) {
-        if !glob.is_empty() {
-            include.push(glob.to_string());
-        }
-    }
-    (include, string_list_arg(args, "exclude_globs"))
+    (
+        string_list_arg(args, "include_globs"),
+        string_list_arg(args, "exclude_globs"),
+    )
 }
 
 fn passes_glob_filters(rel: &str, include: &[String], exclude: &[String]) -> bool {

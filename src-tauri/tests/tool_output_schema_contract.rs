@@ -30,10 +30,6 @@ fn high_value_local_tool_successes_match_published_output_schemas() {
             json!({"query": "add", "path": "src", "max_results": 20}),
         ),
         (
-            "grep_text",
-            json!({"query": "add", "path": "src", "max_results": 20}),
-        ),
-        (
             "patch_check",
             json!({
                 "patch": "*** Begin Patch\n*** Add File: schema-probe.txt\n+probe\n*** End Patch\n"

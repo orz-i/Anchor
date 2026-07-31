@@ -428,7 +428,7 @@ fn call_tool_impl(
         "read_file" => file::read_file(ws, &effective_args, cancellation),
         "list_dir" => file::list_dir(ws, &effective_args, cancellation),
         "list_files" => file::list_files(ws, &effective_args, cancellation),
-        "search_text" | "grep_text" | "grep" => {
+        "search_text" => {
             file::search_text(ws, &effective_args, cancellation)
         }
         "patch_check" => patch::patch_check(ctx, &effective_args),
@@ -661,7 +661,7 @@ fn apply_default_cwd(
             let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
             effective["path"] = Value::String(prefix_relative_path(&base, path));
         }
-        "read_file" | "search_text" | "grep_text" | "grep" | "git_blame" | "view_image" => {
+        "read_file" | "search_text" | "git_blame" | "view_image" => {
             if let Some(path) = effective.get("path").and_then(Value::as_str) {
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
@@ -983,8 +983,6 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
             "allowlist_required": true
         },
         "development_environment": development_environment,
-        // Backward-compatible alias for older MCP clients.
-        "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "warnings": warnings
     })))
 }

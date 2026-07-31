@@ -311,9 +311,8 @@ async fn handle_tools_call(
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let raw_args = raw_tool_arguments(params);
-    let canonical_name = crate::tools::registry::canonical_tool_name(name);
 
-    if state.is_published_tool(canonical_name) == Some(false) {
+    if state.is_published_tool(name) == Some(false) {
         return Err(serde_json::json!({
             "code": -32005,
             "message": format!("Tool {name} was not published for this MCP connection"),
@@ -412,7 +411,7 @@ async fn handle_tools_call(
     }
 
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
-    if !known.iter().any(|n| n == &canonical_name) {
+    if !known.iter().any(|n| *n == name) {
         let catalog_changed = state
             .published_catalog()
             .zip(build_effective_catalog(state.as_ref()).ok())
@@ -436,18 +435,13 @@ async fn handle_tools_call(
     }
 
     if let Err(error) = crate::tools::schema::validate_tool_input(name, &raw_args) {
-        return Ok(wrap_mcp_tool_result(
-            canonical_name,
-            &raw_args,
-            tool_err(error),
-        ));
+        return Ok(wrap_mcp_tool_result(name, &raw_args, tool_err(error)));
     }
 
     let args = tool_arguments(name, params);
 
     let state = state.clone();
-    let canonical_name = canonical_name.to_string();
-    let call_name = canonical_name.clone();
+    let call_name = name.to_string();
     let call_args = args.clone();
     let cancellation = cancellation.clone();
     let session_id = session_id.map(str::to_string);
@@ -471,7 +465,7 @@ async fn handle_tools_call(
             }
         })
     })?;
-    Ok(wrap_mcp_tool_result(&canonical_name, &raw_args, structured))
+    Ok(wrap_mcp_tool_result(name, &raw_args, structured))
 }
 
 fn raw_tool_arguments(params: &Value) -> Value {
@@ -762,35 +756,6 @@ mod tests {
             .expect("read history file");
         assert!(content.contains("**Session key:** explicit-session"));
         assert!(!content.contains("**Session key:** chatgpt-session"));
-    }
-
-    #[tokio::test]
-    async fn legacy_grep_calls_are_mapped_to_the_public_search_text_tool() {
-        let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let harness = tempfile::tempdir().expect("harness tempdir");
-        fs::write(workspace.path().join("sample.txt"), "catalog needle")
-            .expect("write sample file");
-        let state = Arc::new(
-            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
-                .expect("tool context"),
-        );
-
-        let response = handle_request(
-            &state,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": "grep",
-                    "arguments": {"query": "needle", "path": "."}
-                }
-            }),
-        )
-        .await;
-
-        assert!(response.get("error").is_none());
-        assert_eq!(response["result"]["structuredContent"]["ok"], true);
     }
 
     #[tokio::test]

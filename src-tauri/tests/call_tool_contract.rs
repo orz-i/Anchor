@@ -121,7 +121,7 @@ fn check_exec_environment_reports_policy_metadata() {
     let out = invoke(&ctx, "check_exec_environment", json!({}));
     let payload = assert_ok(&out);
     assert_eq!(payload["permission_mode"], "trusted");
-    assert!(payload["allowed_commands"].is_array());
+    assert!(payload["system_command_allowlist"].is_array());
 }
 
 #[test]
@@ -218,7 +218,6 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("search_text"));
-    assert!(!names.contains("grep_text"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
@@ -433,13 +432,13 @@ fn killed_session_reports_command_failure_even_when_transport_succeeds() {
 }
 
 #[test]
-fn list_files_accepts_glob_alias() {
+fn list_files_filters_with_patterns() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let out = invoke(
         &ctx,
         "list_files",
-        json!({"glob": "**/*.js", "max_results": 10}),
+        json!({"patterns": ["**/*.js"], "max_results": 10}),
     );
     let payload = assert_ok(&out);
     let files = payload["files"].as_array().expect("files array");
@@ -456,7 +455,7 @@ fn search_text_filters_by_glob() {
     let hit = invoke(
         &ctx,
         "search_text",
-        json!({"query": "function add", "glob": "**/*.js", "max_results": 10}),
+        json!({"query": "function add", "include_globs": ["**/*.js"], "max_results": 10}),
     );
     let hit_payload = assert_ok(&hit);
     assert!(hit_payload["total_matches"].as_u64().unwrap_or(0) > 0);
@@ -464,7 +463,7 @@ fn search_text_filters_by_glob() {
     let miss = invoke(
         &ctx,
         "search_text",
-        json!({"query": "function add", "glob": "**/*.py"}),
+        json!({"query": "function add", "include_globs": ["**/*.py"]}),
     );
     let miss_payload = assert_ok(&miss);
     assert_eq!(miss_payload["total_matches"].as_u64().unwrap_or(1), 0);
@@ -520,35 +519,4 @@ fn blocking_exec_timeout_preserves_the_declared_output_contract() {
     assert!(payload["duration_ms"].is_u64());
     assert_eq!(payload["duration_ms"], payload["elapsed_ms"]);
     assert!(payload["warnings"].is_array());
-}
-
-#[test]
-fn grep_reuses_search_text_schema_and_behavior() {
-    let schema = anchor_lib::tools::registry::input_schema("grep");
-    assert_eq!(
-        schema,
-        anchor_lib::tools::registry::input_schema("search_text")
-    );
-
-    let fx = tiny_js_fixture();
-    let ctx = ctx_for(&fx.root);
-    assert_ok(&invoke(&ctx, "set_default_cwd", json!({"path": "src"})));
-    let output = invoke(
-        &ctx,
-        "grep",
-        json!({
-            "query": "function\\s+add",
-            "path": ".",
-            "glob": "**/*.js",
-            "regex": true,
-            "case_sensitive": true,
-            "max_results": 10
-        }),
-    );
-    let payload = assert_ok(&output);
-    let matches = payload["matches"].as_array().expect("matches array");
-    assert!(!matches.is_empty());
-    assert!(matches
-        .iter()
-        .all(|item| item["path"].as_str().unwrap_or("").starts_with("src/")));
 }

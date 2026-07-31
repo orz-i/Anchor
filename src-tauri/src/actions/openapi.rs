@@ -233,6 +233,5 @@ mod tests {
             operation["requestBody"]["content"]["application/json"]["schema"],
             crate::tools::registry::input_schema("search_text")
         );
-        assert!(schema["paths"].get("/actions/grep_text").is_none());
     }
 }

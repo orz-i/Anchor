@@ -456,8 +456,6 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "list_dir",
     "list_files",
     "search_text",
-    "grep_text",
-    "grep",
     "apply_patch",
     "patch_check",
     "exec_command",
@@ -524,8 +522,6 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "list_dir",
     "list_files",
     "search_text",
-    "grep_text",
-    "grep",
     "read_output",
     "wait_command",
     "git_status",
@@ -757,7 +753,7 @@ fn session_snapshot_output_schema() -> Value {
 }
 
 pub fn output_schema(name: &str) -> Value {
-    match canonical_tool_name(name) {
+    match name {
         "server_info" => success_output_schema(
             merge_schema_properties(vec![
                 json!({
@@ -889,7 +885,7 @@ pub fn output_schema(name: &str) -> Value {
                 "warnings",
             ],
         ),
-        "search_text" | "grep_text" => success_output_schema(
+        "search_text" => success_output_schema(
             json!({
                 "query": { "type": "string" },
                 "matches": {
@@ -1601,13 +1597,6 @@ pub fn output_schema(name: &str) -> Value {
     }
 }
 
-pub fn canonical_tool_name(name: &str) -> &str {
-    match name {
-        "grep" | "grep_text" => "search_text",
-        _ => name,
-    }
-}
-
 pub fn normalize_tool_profile(profile: &str) -> &'static str {
     match profile {
         "advanced" => "advanced",
@@ -1998,7 +1987,6 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "path": { "type": "string", "default": "." },
                 "patterns": { "type": "array", "items": { "type": "string" } },
-                "glob": { "type": "string", "description": "Alias for a single patterns entry" },
                 "exclude_patterns": { "type": "array", "items": { "type": "string" } },
                 "include_hidden": { "type": "boolean", "default": false },
                 "include_ignored": { "type": "boolean", "default": false },
@@ -2006,12 +1994,11 @@ pub fn input_schema(name: &str) -> Value {
             },
             "additionalProperties": false
         }),
-        "search_text" | "grep_text" | "grep" => json!({
+        "search_text" => json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "minLength": 1 },
                 "path": { "type": "string", "default": "." },
-                "glob": { "type": "string", "description": "Alias appended to include_globs" },
                 "include_globs": { "type": "array", "items": { "type": "string" } },
                 "exclude_globs": { "type": "array", "items": { "type": "string" } },
                 "regex": { "type": "boolean", "default": false },
@@ -2238,8 +2225,6 @@ mod tests {
         assert!(names.contains(&"close_work_session"));
         assert!(names.contains(&"wait_command"));
         assert!(names.contains(&"search_text"));
-        assert!(!names.contains(&"grep_text"));
-        assert!(!names.contains(&"grep"));
         assert!(!names.contains(&"request_permissions"));
 
         for name in names {

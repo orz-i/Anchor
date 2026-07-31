@@ -71,17 +71,13 @@ impl SkillSummary {
         let mut ambiguous = Vec::new();
 
         for declared in &self.allowed_tools {
-            let canonical = crate::tools::registry::canonical_tool_name(declared);
-            let exact = [declared.as_str(), canonical]
-                .into_iter()
-                .find(|candidate| available.contains(*candidate));
-            if let Some(exact) = exact {
-                resolved.push(exact.to_string());
+            if available.contains(declared) {
+                resolved.push(declared.clone());
                 resolutions.push(SkillToolResolution {
                     declared: declared.clone(),
                     status: "resolved".into(),
-                    resolved: Some(exact.to_string()),
-                    candidates: vec![exact.to_string()],
+                    resolved: Some(declared.clone()),
+                    candidates: vec![declared.clone()],
                 });
                 continue;
             }
