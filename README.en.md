@@ -225,7 +225,7 @@ The default `core` profile provides a stable, composable development tool set:
 
 | Category | Main tools |
 | --- | --- |
-| File reading | `read_file`, `list_dir`, `list_files`, `search_text`, `grep_text`, `view_image` |
+| File reading | `read_file`, `list_dir`, `list_files`, `search_text`, `view_image` |
 | File modification | `apply_patch` |
 | Command execution | `exec_command`, `write_stdin`, `read_output`, `kill_session` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |

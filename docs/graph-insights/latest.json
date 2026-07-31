@@ -1,37 +1,64 @@
 {
-  "updated_at": "2026-07-13",
+  "updated_at": "2026-08-01T00:14:27+08:00",
   "project": "anchor",
-  "analysis_status": "partial",
-  "gitnexus": {
-    "indexed": true,
-    "nodes": 5338,
-    "edges": 10793,
-    "flows": 300,
-    "rust_symbol_queries_reliable": false
-  },
+  "analysis_status": "verified",
+  "source_of_truth": [
+    "current Rust/Tauri/Svelte source",
+    "tool catalog snapshots",
+    "Rust contract and security tests",
+    "frontend and desktop production builds"
+  ],
   "architecture": {
     "frontend": "SvelteKit + Tauri invoke",
     "backend": "Rust + Tauri 2",
-    "state": ["AppState", "DataStore", "RuntimeSupervisor"],
-    "services": ["MCP Streamable HTTP", "ChatGPT Actions OpenAPI"],
+    "cli": "anchor",
+    "state": ["AppState", "DataStore", "RuntimeSupervisor", "HarnessStore"],
+    "services": ["MCP Streamable HTTP", "ChatGPT Actions OpenAPI", "MCP Gateway"],
     "tunnels": ["FRP", "Cloudflare"]
   },
-  "entrypoints": {
-    "tauri": "src-tauri/src/lib.rs",
-    "frontend_layout": "src/routes/+layout.svelte",
-    "workspace_page": "src/routes/workspace/[id]/+page.svelte",
-    "runtime_commands": "src-tauri/src/commands/runtime.rs"
+  "hard_cut": {
+    "brand_runtime_bridges_removed": true,
+    "legacy_config_paths_removed": true,
+    "legacy_config_formats_removed": true,
+    "legacy_python_archive_removed": true,
+    "legacy_mcp_api_aliases_removed": true,
+    "harness_schema": 5,
+    "harness_legacy_task_fallback_removed": true,
+    "legacy_css_token_aliases_removed": true
+  },
+  "configuration": {
+    "environment_override": "ANCHOR_CONFIG_DIR",
+    "profiles": "data/profiles.json",
+    "secrets": "data/secrets.json protected envelope",
+    "plaintext_secrets_accepted": false,
+    "legacy_directory_import": false
+  },
+  "catalog": {
+    "catalog_version_in_source": 10,
+    "core_tool_count": 28,
+    "public_text_search_tool": "search_text",
+    "server_side_search_aliases": []
   },
   "verification": {
-    "cargo_check": "passed_with_16_warnings",
-    "cargo_test_no_run": "passed",
-    "svelte_check": "passed",
-    "frontend_build": "passed"
+    "rust_library_tests": "321 passed, 1 ignored",
+    "rust_integration_contract_security_tests": "passed",
+    "clippy_all_targets_all_features_deny_warnings": "passed",
+    "cli_check": "passed",
+    "svelte_check": "0 errors, 0 warnings",
+    "frontend_build": "passed",
+    "desktop_build": "passed",
+    "artifacts": [
+      "src-tauri/target/release/anchor-desktop.exe",
+      "src-tauri/target/release/bundle/msi/Anchor_0.1.23_x64_en-US.msi",
+      "src-tauri/target/release/bundle/nsis/Anchor_0.1.23_x64-setup.exe"
+    ]
   },
-  "risks": [
-    "Secrets are currently serialized into data/profiles.json while documentation promises OS keyring storage.",
-    "Legacy settings/workspace/keyring compatibility APIs remain unused.",
-    "Architecture documentation is stale relative to the current Rust/Tauri implementation.",
-    "Runtime integration coverage is not yet demonstrated by the available checks."
+  "intentional_remaining_references": [
+    "README release links retain the current remote repository slug mybolide/coding-tools-mcp"
+  ],
+  "runtime_notes": [
+    "Old configuration is intentionally not migrated or bridged.",
+    "The running installed listener must be replaced and restarted before the new behavior is active.",
+    "No Git push or remote repository modification was performed."
   ]
 }

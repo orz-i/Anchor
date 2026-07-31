@@ -233,7 +233,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 | 类别 | 主要工具 |
 | --- | --- |
-| 文件读取 | `read_file`、`list_dir`、`list_files`、`search_text`、`grep_text`、`view_image` |
+| 文件读取 | `read_file`、`list_dir`、`list_files`、`search_text`、`view_image` |
 | 文件修改 | `apply_patch` |
 | 命令执行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |

@@ -1,90 +1,98 @@
 # 项目图谱洞察
 
-更新时间：2026-07-13
+更新时间：2026-08-01（UTC+8）
 
 ## 分析状态
 
-- GitNexus 索引已刷新：5,338 个节点、10,793 条边、300 条执行流。
-- 当前索引对本仓库 Rust 符号的查询仍不稳定，`start_runtime`、`RuntimeSupervisor`、`call_tool` 等目标未能可靠解析。
-- 以下结构结论以当前源码和项目文档为准，GitNexus 仅作为辅助索引。
+- 本次结论来自当前 Rust/Tauri/Svelte 源码、工具目录快照、全量测试、严格 Clippy、前端生产构建和正式桌面打包。
+- 未依赖历史 Python 参考实现；仓库中的 `old/` 归档已删除。
+- GitNexus 旧索引数据不再作为当前结构事实来源；需要代码关系时以当前源码和 Rust 合约测试为准。
 
 ## 项目定位
 
-这是一个 Rust + Tauri 2 + Svelte 的 Anchor 桌面客户端，以内嵌 HTTP 服务暴露 MCP 能力，并同时提供 ChatGPT Actions OpenAPI 网关。每个工作区可以独立运行 MCP 服务、Actions 服务和 FRP/Cloudflare 隧道。
+Anchor 是 Rust + Tauri 2 + SvelteKit 桌面应用，同时提供独立 `anchor` CLI。每个 WorkspaceProfile 可运行 MCP Streamable HTTP、ChatGPT Actions、OAuth/Bearer 认证和 FRP/Cloudflare 隧道；单一 Gateway 可按路径隔离多个工作区。
 
 ## 主执行链路
 
 ```text
-Svelte 页面
+SvelteKit 页面
   → src/lib/api/* 的 Tauri invoke
   → src-tauri/src/commands/*
   → AppState
-      ├─ DataStore：工作区、设置和密钥数据
-      └─ RuntimeSupervisor：MCP/Actions 生命周期
-            ├─ mcp::spawn_listener：/mcp
-            └─ actions::spawn_listener：/openapi.json、/actions/{tool}
-  → tunnel supervisor：FRP / Cloudflare 公网隧道
+      ├─ DataStore：当前 profiles / protected secrets
+      ├─ RuntimeSupervisor：MCP / Actions / tunnel 生命周期
+      └─ HarnessStore：Task / baseline / verification / journal / outbox
+  → tools registry / dispatcher
+      ├─ MCP Streamable HTTP
+      ├─ Actions OpenAPI
+      └─ downstream MCP proxy
 ```
 
 ## 核心模块
 
-### 应用入口与状态
+### 数据与配置
 
-- `src-tauri/src/lib.rs` 注册 Tauri 插件、`AppState` 和全部 IPC commands。
-- `src-tauri/src/app_state.rs` 以两个 `Mutex` 管理 `DataStore` 与 `RuntimeSupervisor`。
-- `src-tauri/src/commands/mod.rs` 聚合工作区、运行时、隧道、密钥、软件和设置命令。
+- `src-tauri/src/data/storage.rs` 只加载当前 `data/profiles.json` 和受保护的 `data/secrets.json`。
+- 配置根目录只接受当前平台的 `anchor` 目录或显式 `ANCHOR_CONFIG_DIR`。
+- 明文 secrets、内联 secrets、根目录 `profiles.json` / `app_settings.json`、旧品牌目录和旧 Python 桌面配置均不再导入。
+- 配置与凭据写入保留原子替换、备份恢复和平台保护；Windows 使用当前用户 DPAPI。
 
-### 数据与工作区
+### Workspace 与运行时
 
-- `src-tauri/src/data/store.rs` 负责统一数据文件的读取、迁移、保存及工作区 CRUD。
-- `src-tauri/src/data/model.rs` 的 `AppData` 聚合 FRP 配置、代理、下载配置、工作区和 secrets。
-- `src-tauri/src/workspace/` 定义工作区模型、旧版导入和兼容层。
+- `src-tauri/src/workspace/` 定义当前 WorkspaceProfile、资源冲突规则和默认配置，不再包含旧配置导入模块。
+- `src-tauri/src/runtime/supervisor.rs` 管理 MCP/Actions 的启动、停止、恢复、活动度和隧道联动。
+- Windows 单实例锁、macOS Bundle 归属和 Linux daemon 目录只识别 Anchor 当前标识。
 
-### 运行时
+### MCP、Actions 与工具目录
 
-- `src-tauri/src/runtime/supervisor.rs` 以 `(workspace_id, ServiceKind)` 管理 MCP/Actions 状态。
-- 生命周期为 `Stopped → Starting → Running/ Error → Stopping`。
-- `src-tauri/src/commands/runtime.rs` 负责端口占用检查、启动/停止、隧道联动及公网 URL 回写。
-- `src-tauri/src/runtime/port.rs` 和 `src-tauri/src/platform/windows/net.rs` 提供端口与进程检测。
+- `src-tauri/src/mcp/` 实现 MCP 2025-11-25、OAuth、Session、Gateway 和 downstream proxy。
+- `src-tauri/src/tools/registry.rs` 是 MCP、server_info 与 Actions OpenAPI 的统一工具目录事实源。
+- core 目录当前为 28 个工具；文本搜索只公开 `search_text`，不再保留 `grep` / `grep_text` 服务端别名。
+- `glob` 参数别名、`allowed_commands` 输出别名和 `session:<id>:full` 输出引用均已移除。
 
-### HTTP 服务
+### Harness 与 History
 
-- `src-tauri/src/mcp/listener.rs` 启动 MCP Streamable HTTP 服务，并接入 Bearer/OAuth/无认证。
-- `src-tauri/src/actions/listener.rs` 生成 OpenAPI 文档，暴露 Actions 执行端点和 OAuth 端点。
-- 两个 listener 都复用 `src-tauri/src/tools/` 的工具内核和策略配置。
-
-### 隧道
-
-- `src-tauri/src/tunnel/supervisor.rs` 统一管理隧道生命周期。
-- `src-tauri/src/tunnel/frp/` 负责 FRP 配置与客户端。
-- `src-tauri/src/tunnel/cloudflare.rs` 负责 cloudflared 进程和公网 URL 处理。
+- 源码使用 Harness Schema 5，默认存储根为系统数据目录 `anchor/harness-v5`。
+- Task 必须保存单一 `expected_state`；旧 `expected_fingerprint` 回退字段不再读取。
+- Baseline 使用内容寻址对象；operation/event journal 带 sequence 和 checksum；close_work_session 使用持久 outbox 恢复 History checkpoint。
+- 旧 Schema 4 或未标记 Harness Store 明确返回不兼容错误，不迁移、不桥接。
 
 ### 前端
 
-- `src/routes/+layout.svelte` 加载工作区、刷新 MCP/Actions 状态并承载全局导航和 Toast。
-- `src/routes/workspace/[id]/+page.svelte` 是核心工作区页面，管理两个服务、认证、策略、隧道、日志和健康检查。
-- `src/lib/api/` 封装 Tauri IPC；`src/lib/components/` 提供配置表单和状态面板；`src/lib/stores/` 管理前端共享状态。
+- `src/app.css` 只定义当前 canonical design tokens，例如 `--page-bg`、`--card-bg`、`--text-main`、`--primary`。
+- 组件不再通过 `--color-*` 别名访问设计系统。
+- Workspace 页面、设置页、健康检查、日志、OAuth、隧道和 Skill 表单已通过 Svelte 静态检查与生产构建。
 
-## 当前工作区观察
+## 本次硬切结果
 
-- 当前有 52 个已修改文件，另有若干新增文件，改动集中在 OAuth、运行时、隧道、数据存储及 UI。
-- Rust `cargo check` 通过，但有 16 个 unused/dead-code 警告，表明旧的 `settings::store`、`workspace::store` 和 `secret::keyring_store` 抽象尚未完全清理或接回。
-- 当前 `Cargo.toml` 已移除 `keyring` 依赖，但 `DataStore` 将 `shared_secrets`、`workspace_secrets` 和 `app_secrets` 写入 `data/profiles.json`。这与文档中“系统钥匙串存储密钥”的设计目标不一致，应在发布前明确这是临时迁移方案还是需要恢复 OS keyring。
-- `docs/project-context/architecture.md` 仍描述“尚无 Rust 源码或 Tauri 工程”，已经落后于实际仓库，需要后续同步。
+1. 删除旧 `coding-tools-mcp` CLI 二进制、旧 daemon 路径、旧 mutex 和旧 macOS App Bundle 识别。
+2. 删除旧品牌环境变量、配置目录扫描、目录复制和 Python 配置导入。
+3. 删除旧配置文件布局、内联/明文凭据迁移、Gateway URL 版本迁移和旧 Tool Profile 映射。
+4. 删除完整旧 Python/Coding Tools 归档，仅将仍需要的最小测试 fixture 移入 `src-tauri/tests/fixtures/`。
+5. 删除 MCP 工具名、参数、响应和输出引用兼容桥接。
+6. 完成 Harness Schema 5 Task 状态结构硬切。
+7. 删除前端 CSS Token 和失效文档兼容层。
+
+## 有意保留的兼容性
+
+- MCP 协议版本协商属于标准互操作能力，不是旧品牌桥接。
+- downstream MCP 缺少 outputSchema 时的安全结果规范化属于协议防护，不是旧配置迁移。
+- 对旧 SSE transport 的明确拒绝用于安全诊断，不表示继续支持该 transport。
+- README 中 `mybolide/coding-tools-mcp` 仅是当前远端仓库与 Release 地址；本轮按要求未改远端仓库。
 
 ## 验证结果
 
-- `rtk cargo check --manifest-path src-tauri/Cargo.toml`：通过，16 个警告。
-- `rtk cargo test --manifest-path src-tauri/Cargo.toml --no-run`：通过，测试目标可编译。
-- `rtk npm run check`：通过，0 错误、0 警告。
-- `rtk npm run build`：通过，SvelteKit/Vite 生产构建成功。
+- Rust 全量测试：库测试 321 passed、1 ignored；全部 integration、contract、security、History、Harness 和 outputSchema 目标通过。
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过。
+- 独立 CLI：`cargo check --no-default-features --features cli --bin anchor` 通过。
+- Svelte：0 errors、0 warnings；Vite/SvelteKit 生产构建通过。
+- Tauri 正式构建通过，生成 release EXE、MSI 和 NSIS 安装包。
 
-## 建议优先级
+## 当前边界
 
-1. 先决定 secrets 的最终存储边界：恢复系统钥匙串，或明确加密文件方案并补迁移/权限测试。
-2. 清理未使用的兼容层，避免 `DataStore` 与 `SecretStore` 两套 API 继续并存。
-3. 将 `docs/project-context/architecture.md`、`how-to-test.md` 与实际 Tauri 工程同步。
-4. 补充 MCP/Actions/tunnel 的运行时集成测试，尤其是端口冲突、停止等待、OAuth 回调和隧道自动启动失败场景。
+- 这是有意的硬切：旧目录、旧配置文件、明文凭据和旧工具别名不会自动恢复，需在当前 Anchor 中重新注册配置。
+- 当前正在运行的 Anchor listener 仍是安装前的旧二进制；新行为需要安装本次构建并重启后生效。
+- 未执行 Git push，也未修改远端仓库配置。
 
 ---
-*来源：当前源码、README、项目上下文文档、Git 状态与构建验证；GitNexus 索引作为辅助。*
+*来源：当前源码、工具目录、Git 提交、全量自动化验证与桌面打包结果。*
