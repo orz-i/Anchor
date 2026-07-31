@@ -26,7 +26,9 @@
       ],
       "includeTools": ["navigate", "click", "screenshot", "get_text"],
       "excludeTools": ["evaluate"],
-      "maxTools": 12
+      "maxTools": 12,
+      "requestTimeoutSeconds": 90,
+      "managementTools": true
     }
   }
 }`;
@@ -102,7 +104,11 @@
     可用 <code class="font-mono">includeTools</code>、<code class="font-mono">excludeTools</code>
     和 <code class="font-mono">maxTools</code> 控制下游工具数量；
     <code class="font-mono">maxConcurrentRequests</code> 用于限制单个下游的并发压力。工具名使用下游 MCP
-    原始名称，不包含服务器前缀。
+    原始名称，不包含服务器前缀。默认会额外发布
+    <code class="font-mono">服务器名__health_check</code>、
+    <code class="font-mono">服务器名__reconnect</code> 和
+    <code class="font-mono">服务器名__reset_session</code>；可通过
+    <code class="font-mono">managementTools: false</code> 关闭。
   </p>
 
   {#if error}

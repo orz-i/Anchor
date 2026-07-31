@@ -5,10 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
+use chrono::Utc;
 use futures_util::StreamExt;
-use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE,
-};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -42,6 +41,215 @@ struct SanitizedProxyTool {
     input_schema: Value,
     output_schema: Value,
     synthesized_output_schema: bool,
+}
+
+fn proxy_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn proxy_endpoint_origin(endpoint: &reqwest::Url) -> String {
+    let host = endpoint.host_str().unwrap_or("unknown-host");
+    match endpoint.port() {
+        Some(port) => format!("{}://{host}:{port}", endpoint.scheme()),
+        None => format!("{}://{host}", endpoint.scheme()),
+    }
+}
+
+fn proxy_failure_reason(public_name: &str, error: &ProxyClientError) -> String {
+    let detail = error.to_string().to_ascii_lowercase();
+    if matches!(error, ProxyClientError::Cancelled) {
+        return "proxy_call_cancelled".into();
+    }
+    if matches!(error, ProxyClientError::Timeout { .. }) {
+        if public_name.contains("navigate")
+            || public_name.contains("goto")
+            || public_name.contains("reload")
+            || detail.contains("page load")
+            || detail.contains("navigation")
+        {
+            return "page_load_timeout".into();
+        }
+        if public_name.contains("wait")
+            || public_name.contains("click")
+            || public_name.contains("fill")
+            || detail.contains("selector")
+            || detail.contains("locator")
+        {
+            return "element_wait_timeout".into();
+        }
+        return "tool_service_timeout".into();
+    }
+    if matches!(error, ProxyClientError::Transport(_))
+        && (detail.contains("devtools")
+            || detail.contains("cdp")
+            || detail.contains("target closed")
+            || detail.contains("browser disconnected"))
+    {
+        return "devtools_channel_disconnected".into();
+    }
+    if matches!(error, ProxyClientError::Transport(_)) {
+        return "proxy_transport_disconnected".into();
+    }
+    if matches!(error, ProxyClientError::Remote(_)) {
+        return "proxy_downstream_error".into();
+    }
+    if matches!(error, ProxyClientError::Protocol(_)) {
+        return "proxy_protocol_error".into();
+    }
+    "proxy_call_failed".into()
+}
+
+fn proxy_result_state_summary(result: &Value) -> Value {
+    let structured = result.get("structuredContent").unwrap_or(result);
+    let keys = [
+        "url",
+        "currentUrl",
+        "pageUrl",
+        "title",
+        "pageTitle",
+        "currentPage",
+        "activeElement",
+        "focusPath",
+        "openDialogs",
+        "openPopovers",
+        "openTooltips",
+        "dismissableLayerStack",
+        "dataState",
+        "visibility",
+        "boundingBox",
+        "inertAncestors",
+        "ariaHiddenAncestors",
+        "viewport",
+    ];
+    let mut summary = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = find_proxy_state_value(structured, key, 0) {
+            summary.insert(key.into(), bounded_proxy_state_value(value, 0));
+        }
+    }
+    let current_url = summary
+        .get("currentUrl")
+        .or_else(|| summary.get("pageUrl"))
+        .or_else(|| summary.get("url"))
+        .cloned();
+    let current_title = summary
+        .get("pageTitle")
+        .or_else(|| summary.get("title"))
+        .cloned();
+    if current_url.is_some() || current_title.is_some() {
+        summary.insert(
+            "current_page".into(),
+            json!({"url": current_url, "title": current_title}),
+        );
+    }
+    Value::Object(summary)
+}
+
+fn find_proxy_state_value<'a>(value: &'a Value, key: &str, depth: usize) -> Option<&'a Value> {
+    if depth > 3 {
+        return None;
+    }
+    match value {
+        Value::Object(object) => {
+            if let Some(value) = object.get(key) {
+                return Some(value);
+            }
+            object
+                .values()
+                .find_map(|value| find_proxy_state_value(value, key, depth + 1))
+        }
+        Value::Array(values) => values
+            .iter()
+            .take(20)
+            .find_map(|value| find_proxy_state_value(value, key, depth + 1)),
+        _ => None,
+    }
+}
+
+fn bounded_proxy_state_value(value: &Value, depth: usize) -> Value {
+    if depth >= 2 {
+        return match value {
+            Value::String(text) => Value::String(truncate_log_detail(text, 2_048)),
+            Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
+            Value::Array(values) => json!({"item_count": values.len(), "truncated": true}),
+            Value::Object(object) => json!({"field_count": object.len(), "truncated": true}),
+        };
+    }
+    match value {
+        Value::String(text) => Value::String(truncate_log_detail(text, 2_048)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(20)
+                .map(|value| bounded_proxy_state_value(value, depth + 1))
+                .collect(),
+        ),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .take(20)
+                .map(|(key, value)| (key.clone(), bounded_proxy_state_value(value, depth + 1)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn proxy_management_tools(
+    spec: &McpProxyServerSpec,
+) -> Vec<(String, ProxyRouteKind, Value, Value, Value)> {
+    if !spec.management_tools {
+        return Vec::new();
+    }
+    let input_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    });
+    let output_schema = json!({
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "status": {"type": "string"},
+            "server": {"type": "string"},
+            "connection": {"type": "object", "additionalProperties": true},
+            "error": {"type": ["object", "null"]}
+        },
+        "required": ["ok", "status", "server", "connection"],
+        "additionalProperties": true
+    });
+    [
+        ("health_check", ProxyRouteKind::HealthCheck, true),
+        ("reconnect", ProxyRouteKind::Reconnect, false),
+        ("reset_session", ProxyRouteKind::ResetSession, false),
+    ]
+    .into_iter()
+    .map(|(suffix, kind, read_only)| {
+        let public_name = format!("{}__{suffix}", spec.tool_prefix);
+        let title = format!("{} {suffix}", spec.name);
+        let definition = json!({
+            "name": public_name,
+            "title": title,
+            "description": format!("Manage or inspect the downstream MCP connection for {}.", spec.name),
+            "inputSchema": input_schema,
+            "outputSchema": output_schema,
+            "annotations": {
+                "title": title,
+                "readOnlyHint": read_only,
+                "destructiveHint": !read_only,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        });
+        (
+            public_name,
+            kind,
+            definition,
+            input_schema.clone(),
+            output_schema.clone(),
+        )
+    })
+    .collect()
 }
 
 fn fallback_proxy_output_schema() -> Value {
@@ -81,6 +289,7 @@ pub struct McpProxyServerSpec {
     max_tools: Option<usize>,
     max_concurrent_requests: usize,
     request_timeout: Duration,
+    management_tools: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +568,13 @@ struct ProxyServer {
     timeouts: AtomicU64,
     queue_timeouts: AtomicU64,
     last_error: StdMutex<Option<String>>,
+    last_error_code: StdMutex<Option<String>>,
+    last_error_at: StdMutex<Option<String>>,
+    last_success_at: StdMutex<Option<String>>,
+    last_success_tool: StdMutex<Option<String>>,
+    last_success_summary: StdMutex<Option<Value>>,
+    reconnect_attempts: AtomicU64,
+    last_reconnect_at: StdMutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -391,6 +607,16 @@ struct RawMcpServerConfig {
     max_concurrent_requests: Option<usize>,
     #[serde(rename = "requestTimeoutSeconds", default)]
     request_timeout_seconds: Option<u64>,
+    #[serde(rename = "managementTools", default)]
+    management_tools: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyRouteKind {
+    Downstream,
+    HealthCheck,
+    Reconnect,
+    ResetSession,
 }
 
 #[derive(Clone)]
@@ -401,6 +627,7 @@ struct ProxyRoute {
     input_schema: Value,
     output_schema: Value,
     synthesized_output_schema: bool,
+    kind: ProxyRouteKind,
 }
 
 #[derive(Default)]
@@ -475,7 +702,7 @@ impl ProxyClientError {
     }
 
     fn invalidates_connection(&self) -> bool {
-        matches!(self, Self::Transport(_))
+        matches!(self, Self::Timeout { .. } | Self::Transport(_))
     }
 
     fn retryable(&self) -> bool {
@@ -521,6 +748,14 @@ impl McpProxyRegistry {
             .expect("mcp proxy registry read")
             .tools
             .clone()
+    }
+
+    pub fn contains_tool(&self, public_name: &str) -> bool {
+        self.state
+            .read()
+            .expect("mcp proxy registry read")
+            .routes
+            .contains_key(public_name)
     }
 
     pub fn status(&self) -> Value {
@@ -594,9 +829,35 @@ impl McpProxyRegistry {
                                 input_schema: tool.input_schema,
                                 output_schema: tool.output_schema,
                                 synthesized_output_schema: tool.synthesized_output_schema,
+                                kind: ProxyRouteKind::Downstream,
                             },
                         );
                         state.tools.push(tool.definition);
+                        added += 1;
+                    }
+                    for (public_name, kind, definition, input_schema, output_schema) in
+                        proxy_management_tools(&server.spec)
+                    {
+                        if state.tools.len() >= MAX_PROXY_TOOLS_TOTAL {
+                            break;
+                        }
+                        if state.routes.contains_key(&public_name) {
+                            skipped_duplicates.push(public_name);
+                            continue;
+                        }
+                        state.routes.insert(
+                            public_name,
+                            ProxyRoute {
+                                server: server.clone(),
+                                server_name: server_name.clone(),
+                                downstream_name: String::new(),
+                                input_schema,
+                                output_schema,
+                                synthesized_output_schema: false,
+                                kind,
+                            },
+                        );
+                        state.tools.push(definition);
                         added += 1;
                     }
                     drop(state);
@@ -688,10 +949,13 @@ impl McpProxyRegistry {
                 false,
             )));
         }
-        let permit = timeout(
-            server.spec.request_timeout,
-            server.concurrency.acquire(),
-        );
+        if !matches!(route.kind, ProxyRouteKind::Downstream) {
+            let structured = server
+                .handle_management_call(route.kind, cancellation)
+                .await;
+            return Some(Ok(crate::tools::workspace::wrap_tool_result(structured)));
+        }
+        let permit = timeout(server.spec.request_timeout, server.concurrency.acquire());
         tokio::pin!(permit);
         let _permit = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -761,7 +1025,7 @@ impl McpProxyRegistry {
             )
             .await;
         if let Err(error) = &result {
-            server.record_client_error(error);
+            server.record_client_error(public_name, error);
             let cancelled = error.is_cancelled();
             let connection_lost = error.invalidates_connection();
             if connection_lost {
@@ -779,41 +1043,37 @@ impl McpProxyRegistry {
         }
 
         Some(Ok(match result {
-            Ok(result) => normalize_proxy_tool_result(
-                &server_name,
-                public_name,
-                result,
-                &route.output_schema,
-                route.synthesized_output_schema,
-            )
-            .unwrap_or_else(|message| {
-                server.record_failure_message(&message);
-                proxy_call_error_result(
+            Ok(result) => {
+                match normalize_proxy_tool_result(
                     &server_name,
                     public_name,
-                    "proxy_result_invalid",
-                    message,
-                    false,
-                    false,
-                )
-            }),
+                    result,
+                    &route.output_schema,
+                    route.synthesized_output_schema,
+                ) {
+                    Ok(normalized) => {
+                        server.record_success(public_name, Some(&normalized));
+                        normalized
+                    }
+                    Err(message) => {
+                        server.record_failure("proxy_result_invalid", &message);
+                        proxy_call_error_result(
+                            &server_name,
+                            public_name,
+                            "proxy_result_invalid",
+                            message,
+                            false,
+                            false,
+                        )
+                    }
+                }
+            }
             Err(error) => {
-                let cancelled = error.is_cancelled();
                 let connection_lost = error.invalidates_connection();
                 proxy_call_error_result(
                     &server_name,
                     public_name,
-                    if cancelled {
-                        "proxy_call_cancelled"
-                    } else if matches!(&error, ProxyClientError::Timeout { .. }) {
-                        "proxy_call_timeout"
-                    } else if matches!(&error, ProxyClientError::Remote(_)) {
-                        "proxy_downstream_error"
-                    } else if matches!(&error, ProxyClientError::Protocol(_)) {
-                        "proxy_protocol_error"
-                    } else {
-                        "proxy_call_failed"
-                    },
+                    &proxy_failure_reason(public_name, &error),
                     error.to_string(),
                     error.retryable(),
                     connection_lost,
@@ -846,6 +1106,13 @@ impl ProxyServer {
                 timeouts: AtomicU64::new(0),
                 queue_timeouts: AtomicU64::new(0),
                 last_error: StdMutex::new(None),
+                last_error_code: StdMutex::new(None),
+                last_error_at: StdMutex::new(None),
+                last_success_at: StdMutex::new(None),
+                last_success_tool: StdMutex::new(None),
+                last_success_summary: StdMutex::new(None),
+                reconnect_attempts: AtomicU64::new(0),
+                last_reconnect_at: StdMutex::new(None),
             }),
             catalog,
         ))
@@ -875,7 +1142,84 @@ impl ProxyServer {
             "stdout.log",
             &format!("[mcp-proxy:{}] reconnected", self.spec.name),
         );
+        *self
+            .last_reconnect_at
+            .lock()
+            .expect("mcp proxy reconnect time lock") = Some(proxy_timestamp());
         Ok(connected)
+    }
+
+    async fn handle_management_call(
+        &self,
+        kind: ProxyRouteKind,
+        cancellation: &CancellationToken,
+    ) -> Value {
+        let result = match kind {
+            ProxyRouteKind::HealthCheck => {
+                self.probe_connection(cancellation).await.map(|_| "healthy")
+            }
+            ProxyRouteKind::Reconnect => {
+                if self.probe_connection(cancellation).await.is_ok() {
+                    Ok("already_healthy")
+                } else {
+                    self.replace_connection().await.map(|_| "reconnected")
+                }
+            }
+            ProxyRouteKind::ResetSession => {
+                self.replace_connection().await.map(|_| "session_reset")
+            }
+            ProxyRouteKind::Downstream => Ok("healthy"),
+        };
+        match result {
+            Ok(status) => json!({
+                "ok": true,
+                "status": status,
+                "server": self.spec.name,
+                "connection": self.status(0),
+                "error": null
+            }),
+            Err(message) => json!({
+                "ok": false,
+                "status": "unhealthy",
+                "server": self.spec.name,
+                "connection": self.status(0),
+                "error": {
+                    "code": self.last_error_code.lock().expect("mcp proxy error code lock").clone().unwrap_or_else(|| "proxy_management_failed".into()),
+                    "message": message,
+                    "retryable": true
+                }
+            }),
+        }
+    }
+
+    async fn probe_connection(&self, cancellation: &CancellationToken) -> Result<(), String> {
+        let client = self.ensure_client().await?;
+        match client
+            .request_with_cancellation("ping", json!({}), cancellation)
+            .await
+        {
+            Ok(_) => {
+                self.record_success("ping", None);
+                Ok(())
+            }
+            Err(error) => {
+                let code = proxy_failure_reason("ping", &error);
+                self.record_failure(&code, &error.to_string());
+                if error.invalidates_connection() {
+                    self.invalidate_client(&client).await;
+                }
+                Err(error.to_string())
+            }
+        }
+    }
+
+    async fn replace_connection(&self) -> Result<(), String> {
+        self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+        let previous = self.client.lock().await.take();
+        if let Some(previous) = previous {
+            previous.terminate().await;
+        }
+        self.ensure_client().await.map(|_| ())
     }
 
     async fn invalidate_client(&self, failed: &Arc<McpProxyClient>) {
@@ -906,7 +1250,7 @@ impl ProxyServer {
         self.calls.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_client_error(&self, error: &ProxyClientError) {
+    fn record_client_error(&self, public_name: &str, error: &ProxyClientError) {
         if error.is_cancelled() {
             self.cancellations.fetch_add(1, Ordering::Relaxed);
             return;
@@ -914,33 +1258,73 @@ impl ProxyServer {
         if matches!(error, ProxyClientError::Timeout { .. }) {
             self.timeouts.fetch_add(1, Ordering::Relaxed);
         }
-        self.record_failure_message(&error.to_string());
+        self.record_failure(
+            &proxy_failure_reason(public_name, error),
+            &error.to_string(),
+        );
     }
 
     fn record_failure_message(&self, message: &str) {
+        self.record_failure("proxy_call_failed", message);
+    }
+
+    fn record_failure(&self, code: &str, message: &str) {
         self.failures.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.lock().expect("mcp proxy last error lock") =
+            Some(truncate_log_detail(message, 1_024));
         *self
-            .last_error
+            .last_error_code
             .lock()
-            .expect("mcp proxy last error lock") = Some(truncate_log_detail(message, 1_024));
+            .expect("mcp proxy error code lock") = Some(code.to_string());
+        *self
+            .last_error_at
+            .lock()
+            .expect("mcp proxy error time lock") = Some(proxy_timestamp());
+    }
+
+    fn record_success(&self, tool: &str, result: Option<&Value>) {
+        *self
+            .last_success_at
+            .lock()
+            .expect("mcp proxy success time lock") = Some(proxy_timestamp());
+        *self
+            .last_success_tool
+            .lock()
+            .expect("mcp proxy success tool lock") = Some(tool.to_string());
+        *self
+            .last_success_summary
+            .lock()
+            .expect("mcp proxy success summary lock") = result.map(proxy_result_state_summary);
     }
 
     fn status(&self, tool_count: usize) -> Value {
-        let (connected, state_busy) = match self.client.try_lock() {
-            Ok(client) => (
-                client
+        let (connected, state_busy, client_status) = match self.client.try_lock() {
+            Ok(client) => {
+                let connected = client.as_ref().is_some_and(|client| !client.is_closed());
+                let status = client
                     .as_ref()
-                    .is_some_and(|client| !client.is_closed()),
-                false,
-            ),
-            Err(_) => (true, true),
+                    .map(|client| client.status())
+                    .unwrap_or_else(|| json!({"state": "disconnected"}));
+                (connected, false, status)
+            }
+            Err(_) => (true, true, json!({"state": "busy"})),
         };
         let available_slots = self.concurrency.available_permits();
+        let last_success_summary = self
+            .last_success_summary
+            .lock()
+            .expect("mcp proxy success summary lock")
+            .clone();
+        let current_page = last_success_summary
+            .as_ref()
+            .and_then(|value| value.get("current_page"))
+            .cloned();
         json!({
             "name": self.spec.name,
             "transport": self.spec.transport.label(),
             "connected": connected,
             "state_busy": state_busy,
+            "client": client_status,
             "reconnect_scheduled": self.reconnect_scheduled.load(Ordering::Acquire),
             "tool_count": tool_count,
             "max_concurrent_requests": self.spec.max_concurrent_requests,
@@ -951,6 +1335,15 @@ impl ProxyServer {
             "cancellations": self.cancellations.load(Ordering::Relaxed),
             "timeouts": self.timeouts.load(Ordering::Relaxed),
             "queue_timeouts": self.queue_timeouts.load(Ordering::Relaxed),
+            "management_tools": self.spec.management_tools,
+            "reconnect_attempts": self.reconnect_attempts.load(Ordering::Relaxed),
+            "last_reconnect_at": self.last_reconnect_at.lock().expect("mcp proxy reconnect time lock").clone(),
+            "last_success_at": self.last_success_at.lock().expect("mcp proxy success time lock").clone(),
+            "last_success_tool": self.last_success_tool.lock().expect("mcp proxy success tool lock").clone(),
+            "last_success_summary": last_success_summary,
+            "current_page": current_page,
+            "last_error_code": self.last_error_code.lock().expect("mcp proxy error code lock").clone(),
+            "last_error_at": self.last_error_at.lock().expect("mcp proxy error time lock").clone(),
             "last_error": self
                 .last_error
                 .lock()
@@ -1040,7 +1433,10 @@ fn normalize_proxy_tool_result(
     }) {
         return Err("downstream tools/call content contains an invalid item".into());
     }
-    let is_error = object.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let is_error = object
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut structured = object.get("structuredContent").cloned();
     if structured.as_ref().is_some_and(|value| !value.is_object()) {
         return Err("downstream structuredContent must be an object".into());
@@ -1091,8 +1487,7 @@ impl McpProxyClient {
     ) -> Result<(Arc<Self>, Vec<Value>), String> {
         match spec.transport.clone() {
             McpProxyTransportSpec::Stdio => {
-                let (client, tools) =
-                    StdioMcpProxyClient::connect(spec, workspace_id).await?;
+                let (client, tools) = StdioMcpProxyClient::connect(spec, workspace_id).await?;
                 Ok((
                     Arc::new(Self {
                         transport: ProxyClientTransport::Stdio(client),
@@ -1101,13 +1496,8 @@ impl McpProxyClient {
                 ))
             }
             McpProxyTransportSpec::StreamableHttp { url, headers } => {
-                let (client, tools) = HttpMcpProxyClient::connect(
-                    &spec,
-                    workspace_id,
-                    &url,
-                    &headers,
-                )
-                .await?;
+                let (client, tools) =
+                    HttpMcpProxyClient::connect(&spec, workspace_id, &url, &headers).await?;
                 Ok((
                     Arc::new(Self {
                         transport: ProxyClientTransport::StreamableHttp(client),
@@ -1122,6 +1512,32 @@ impl McpProxyClient {
         match &self.transport {
             ProxyClientTransport::Stdio(client) => client.is_closed(),
             ProxyClientTransport::StreamableHttp(client) => client.is_closed(),
+        }
+    }
+
+    fn status(&self) -> Value {
+        match &self.transport {
+            ProxyClientTransport::Stdio(client) => {
+                let (process_id, process_state) = match client.child.try_lock() {
+                    Ok(child) => (child.as_ref().and_then(|child| child.id()), "available"),
+                    Err(_) => (None, "busy"),
+                };
+                json!({
+                    "transport": "stdio",
+                    "state": if client.is_closed() { "closed" } else { "connected" },
+                    "process_id": process_id,
+                    "process_state": process_state,
+                    "cdp_connection": "downstream_managed"
+                })
+            }
+            ProxyClientTransport::StreamableHttp(client) => json!({
+                "transport": "streamable-http",
+                "state": if client.is_closed() { "closed" } else { "connected" },
+                "endpoint_origin": proxy_endpoint_origin(&client.endpoint),
+                "mcp_session_id": client.session_id.lock().expect("mcp HTTP session lock").clone(),
+                "protocol_version": client.protocol_version.lock().expect("mcp HTTP protocol lock").clone(),
+                "cdp_connection": "downstream_managed"
+            }),
         }
     }
 
@@ -1226,9 +1642,7 @@ impl HttpMcpProxyClient {
             .get("protocolVersion")
             .and_then(Value::as_str)
             .filter(|version| !version.is_empty())
-            .ok_or_else(|| {
-                "downstream initialize result is missing protocolVersion".to_string()
-            })?;
+            .ok_or_else(|| "downstream initialize result is missing protocolVersion".to_string())?;
         *self
             .protocol_version
             .lock()
@@ -1438,11 +1852,13 @@ impl HttpMcpProxyClient {
                 "downstream HTTP response is not valid JSON: {error}"
             ))
         })?;
-        match_http_rpc_message(message, expected_id)?.ok_or_else(|| {
-            ProxyClientError::Protocol(
-                "downstream HTTP response did not contain the expected request id".into(),
-            )
-        }).map(Some)
+        match_http_rpc_message(message, expected_id)?
+            .ok_or_else(|| {
+                ProxyClientError::Protocol(
+                    "downstream HTTP response did not contain the expected request id".into(),
+                )
+            })
+            .map(Some)
     }
 
     fn request_headers(
@@ -1498,10 +1914,7 @@ impl HttpMcpProxyClient {
                 "downstream MCP session id is too long".into(),
             ));
         }
-        let mut current = self
-            .session_id
-            .lock()
-            .expect("mcp HTTP session lock");
+        let mut current = self.session_id.lock().expect("mcp HTTP session lock");
         if current
             .as_ref()
             .is_some_and(|current| current != session_id)
@@ -1608,9 +2021,7 @@ async fn collect_http_body(response: reqwest::Response) -> Result<Vec<u8>, Proxy
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            ProxyClientError::Transport(format!(
-                "failed to read downstream HTTP response: {error}"
-            ))
+            ProxyClientError::Transport(format!("failed to read downstream HTTP response: {error}"))
         })?;
         if body.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
             return Err(ProxyClientError::Protocol(format!(
@@ -1624,9 +2035,7 @@ async fn collect_http_body(response: reqwest::Response) -> Result<Vec<u8>, Proxy
 
 fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
     let (index, delimiter) = match (lf, crlf) {
         (Some(left), Some(right)) if left <= right => (left, 2),
         (Some(_), Some(right)) => (right, 4),
@@ -1652,13 +2061,9 @@ fn parse_sse_message(event: &[u8]) -> Result<Option<Value>, ProxyClientError> {
     if data.is_empty() || data == "[DONE]" {
         return Ok(None);
     }
-    serde_json::from_str(&data)
-        .map(Some)
-        .map_err(|error| {
-            ProxyClientError::Protocol(format!(
-                "downstream SSE data is not valid JSON: {error}"
-            ))
-        })
+    serde_json::from_str(&data).map(Some).map_err(|error| {
+        ProxyClientError::Protocol(format!("downstream SSE data is not valid JSON: {error}"))
+    })
 }
 
 fn match_http_rpc_message(
@@ -1683,9 +2088,7 @@ fn match_http_rpc_message(
         .get("result")
         .cloned()
         .map(Some)
-        .ok_or_else(|| {
-            ProxyClientError::Protocol("downstream response is missing result".into())
-        })
+        .ok_or_else(|| ProxyClientError::Protocol("downstream response is missing result".into()))
 }
 
 fn truncate_log_detail(value: &str, maximum: usize) -> String {
@@ -1860,14 +2263,9 @@ impl StdioMcpProxyClient {
         let result = if let Some(error) = message.get("error") {
             Err(ProxyClientError::Remote(error.to_string()))
         } else {
-            message
-                .get("result")
-                .cloned()
-                .ok_or_else(|| {
-                    ProxyClientError::Protocol(
-                        "downstream response is missing result".to_string(),
-                    )
-                })
+            message.get("result").cloned().ok_or_else(|| {
+                ProxyClientError::Protocol("downstream response is missing result".to_string())
+            })
         };
         let _ = sender.send(result);
         Ok(())
@@ -1895,12 +2293,8 @@ impl StdioMcpProxyClient {
             .close_reason
             .lock()
             .expect("mcp proxy close reason lock") = Some(reason.clone());
-        let pending = std::mem::take(
-            &mut *self
-                .pending
-                .lock()
-                .expect("mcp proxy pending request lock"),
-        );
+        let pending =
+            std::mem::take(&mut *self.pending.lock().expect("mcp proxy pending request lock"));
         for (_, sender) in pending {
             let _ = sender.send(Err(ProxyClientError::Transport(reason.clone())));
         }
@@ -1926,9 +2320,7 @@ impl StdioMcpProxyClient {
             return Err(self.closed_error());
         }
         let encoded = serde_json::to_vec(message).map_err(|error| {
-            ProxyClientError::Protocol(format!(
-                "failed to encode downstream message: {error}"
-            ))
+            ProxyClientError::Protocol(format!("failed to encode downstream message: {error}"))
         })?;
         let result = async {
             let mut writer = self.writer.lock().await;
@@ -2176,9 +2568,7 @@ pub fn parse_mcp_proxy_config(
         let env = config
             .env
             .into_iter()
-            .map(|(key, value)| {
-                Ok((key, expand_proxy_placeholders(&value, &workspace_display)?))
-            })
+            .map(|(key, value)| Ok((key, expand_proxy_placeholders(&value, &workspace_display)?)))
             .collect::<Result<BTreeMap<_, _>, String>>()?;
         let cwd = config
             .cwd
@@ -2211,9 +2601,7 @@ pub fn parse_mcp_proxy_config(
         }
         let default_concurrency = match &transport {
             McpProxyTransportSpec::Stdio => DEFAULT_STDIO_MAX_CONCURRENT_REQUESTS,
-            McpProxyTransportSpec::StreamableHttp { .. } => {
-                DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS
-            }
+            McpProxyTransportSpec::StreamableHttp { .. } => DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS,
         };
         let max_concurrent_requests = config
             .max_concurrent_requests
@@ -2242,6 +2630,7 @@ pub fn parse_mcp_proxy_config(
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECONDS)
                     .clamp(1, 600),
             ),
+            management_tools: config.management_tools.unwrap_or(true),
         });
     }
     Ok(specs)
@@ -2358,9 +2747,7 @@ fn expand_proxy_placeholders(value: &str, workspace_path: &str) -> Result<String
             ));
         }
         let resolved = std::env::var(name).map_err(|_| {
-            format!(
-                "downstream MCP configuration requires missing environment variable `{name}`"
-            )
+            format!("downstream MCP configuration requires missing environment variable `{name}`")
         })?;
         output.push_str(&resolved);
         remaining = &placeholder[end + 1..];
@@ -2409,8 +2796,9 @@ mod tests {
 
     use super::{
         expand_proxy_placeholders, normalize_proxy_tool_result, parse_mcp_proxy_config,
-        proxy_catalog_digest, sanitize_proxy_catalog, McpProxyRegistry, McpProxyServerSpec,
-        McpProxyTransportSpec,
+        proxy_catalog_digest, proxy_failure_reason, proxy_management_tools,
+        proxy_result_state_summary, sanitize_proxy_catalog, McpProxyRegistry, McpProxyServerSpec,
+        McpProxyTransportSpec, ProxyClientError,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -2427,6 +2815,7 @@ mod tests {
             max_tools: None,
             max_concurrent_requests: 4,
             request_timeout: Duration::from_secs(5),
+            management_tools: false,
         }
     }
 
@@ -2584,11 +2973,7 @@ mod tests {
     }
 
     async fn spawn_http_proxy_fixture(
-    ) -> (
-        String,
-        HttpProxyFixtureState,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> (String, HttpProxyFixtureState, tokio::task::JoinHandle<()>) {
         let state = HttpProxyFixtureState::default();
         let app = Router::new()
             .route(
@@ -2601,7 +2986,9 @@ mod tests {
             .expect("HTTP fixture listener");
         let address = listener.local_addr().expect("fixture address");
         let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("HTTP fixture server");
+            axum::serve(listener, app)
+                .await
+                .expect("HTTP fixture server");
         });
         (format!("http://{address}/mcp"), state, server)
     }
@@ -2698,6 +3085,65 @@ mod tests {
         assert_ne!(
             proxy_catalog_digest(&first.tools).unwrap(),
             proxy_catalog_digest(&second.tools).unwrap()
+        );
+    }
+
+    #[test]
+    fn browser_proxy_failures_are_classified_for_recovery() {
+        assert_eq!(
+            proxy_failure_reason(
+                "browser__navigate",
+                &ProxyClientError::Timeout {
+                    method: "tools/call".into(),
+                    seconds: 90,
+                },
+            ),
+            "page_load_timeout"
+        );
+        assert_eq!(
+            proxy_failure_reason(
+                "browser__wait_for",
+                &ProxyClientError::Timeout {
+                    method: "tools/call".into(),
+                    seconds: 30,
+                },
+            ),
+            "element_wait_timeout"
+        );
+        assert_eq!(
+            proxy_failure_reason(
+                "browser__click",
+                &ProxyClientError::Transport("CDP target closed".into()),
+            ),
+            "devtools_channel_disconnected"
+        );
+        assert!(ProxyClientError::Timeout {
+            method: "tools/call".into(),
+            seconds: 30,
+        }
+        .invalidates_connection());
+    }
+
+    #[test]
+    fn browser_state_summary_keeps_page_focus_and_layer_diagnostics_bounded() {
+        let summary = proxy_result_state_summary(&json!({
+            "structuredContent": {
+                "ok": true,
+                "page": {
+                    "url": "https://example.test/story",
+                    "title": "Story Home",
+                    "activeElement": {"role": "button", "name": "Tooltip trigger"},
+                    "openTooltips": [{"id": "tooltip-1"}],
+                    "dismissableLayerStack": ["tooltip", "sheet"]
+                }
+            }
+        }));
+        assert_eq!(summary["current_page"]["url"], "https://example.test/story");
+        assert_eq!(summary["current_page"]["title"], "Story Home");
+        assert_eq!(summary["activeElement"]["role"], "button");
+        assert_eq!(
+            summary["dismissableLayerStack"],
+            json!(["tooltip", "sheet"])
         );
     }
 
@@ -2824,6 +3270,7 @@ mod tests {
         assert_eq!(specs[0].name, "code graph");
         assert_eq!(specs[0].tool_prefix, "code_graph");
         assert_eq!(specs[0].args[2], "/tmp/example");
+        assert!(specs[0].management_tools);
     }
 
     #[test]
@@ -2852,6 +3299,32 @@ mod tests {
             .as_ref()
             .is_some_and(|tools| tools.contains("navigate") && tools.contains("click")));
         assert!(spec.exclude_tools.contains("screenshot"));
+    }
+
+    #[test]
+    fn management_tools_can_be_disabled_and_use_stable_prefixed_names() {
+        let specs = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"browser":{"command":"browser-mcp","managementTools":false}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect("parse management flag");
+        assert!(!specs[0].management_tools);
+        assert!(proxy_management_tools(&specs[0]).is_empty());
+
+        let mut enabled = specs[0].clone();
+        enabled.management_tools = true;
+        let names = proxy_management_tools(&enabled)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "browser__health_check",
+                "browser__reconnect",
+                "browser__reset_session"
+            ]
+        );
     }
 
     #[test]
@@ -2995,10 +3468,17 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             names,
-            ["remote__json", "remote__slow", "remote__sse"]
-                .into_iter()
-                .map(str::to_string)
-                .collect()
+            [
+                "remote__health_check",
+                "remote__json",
+                "remote__reconnect",
+                "remote__reset_session",
+                "remote__slow",
+                "remote__sse",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         );
 
         let json_result = registry
@@ -3023,11 +3503,7 @@ mod tests {
         let worker_cancellation = cancellation.clone();
         let slow = tokio::spawn(async move {
             worker_registry
-                .call_tool_with_cancellation(
-                    "remote__slow",
-                    &json!({}),
-                    &worker_cancellation,
-                )
+                .call_tool_with_cancellation("remote__slow", &json!({}), &worker_cancellation)
                 .await
                 .expect("known slow route")
                 .expect("cancelled HTTP result")
@@ -3055,7 +3531,7 @@ mod tests {
         assert_eq!(status["server_count"], 1);
         assert_eq!(status["servers"][0]["name"], "remote");
         assert_eq!(status["servers"][0]["transport"], "streamable-http");
-        assert_eq!(status["servers"][0]["tool_count"], 3);
+        assert_eq!(status["servers"][0]["tool_count"], 6);
         assert_eq!(status["servers"][0]["calls"], 3);
         assert_eq!(status["servers"][0]["cancellations"], 1);
         let encoded_status = status.to_string();
@@ -3122,6 +3598,7 @@ for raw in sys.stdin:
                     max_tools: None,
                     max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
+                    management_tools: false,
                 }],
                 "proxy-cancellation-test",
             )
@@ -3217,6 +3694,7 @@ for raw in sys.stdin:
                     max_tools: None,
                     max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(5),
+                    management_tools: false,
                 }],
                 "proxy-concurrency-test",
             )
@@ -3230,15 +3708,11 @@ for raw in sys.stdin:
             registry.call_tool("concurrent__wait", &second_args)
         );
         assert_eq!(
-            first
-                .expect("known first route")
-                .expect("first result")["structuredContent"]["ok"],
+            first.expect("known first route").expect("first result")["structuredContent"]["ok"],
             true
         );
         assert_eq!(
-            second
-                .expect("known second route")
-                .expect("second result")["structuredContent"]["ok"],
+            second.expect("known second route").expect("second result")["structuredContent"]["ok"],
             true
         );
         assert!(
@@ -3318,6 +3792,7 @@ for raw in sys.stdin:
                     max_tools: None,
                     max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(10),
+                    management_tools: false,
                 }],
                 "proxy-cancel-followup-test",
             )
@@ -3328,11 +3803,7 @@ for raw in sys.stdin:
         let worker_cancellation = cancellation.clone();
         let slow = tokio::spawn(async move {
             worker_registry
-                .call_tool_with_cancellation(
-                    "cancellable__slow",
-                    &json!({}),
-                    &worker_cancellation,
-                )
+                .call_tool_with_cancellation("cancellable__slow", &json!({}), &worker_cancellation)
                 .await
                 .expect("known route")
                 .expect("cancelled result")
@@ -3416,6 +3887,7 @@ for raw in sys.stdin:
                     max_tools: None,
                     max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
+                    management_tools: false,
                 }],
                 "proxy-reconnect-test",
             )
@@ -3505,6 +3977,7 @@ for raw in sys.stdin:
                     max_tools: None,
                     max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
+                    management_tools: false,
                 }],
                 "proxy-catalog-drift-test",
             )
