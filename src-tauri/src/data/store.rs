@@ -5,7 +5,6 @@ use fs2::FileExt;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
-use crate::workspace::legacy_import::import_legacy_profiles_if_empty;
 use crate::workspace::WorkspaceProfile;
 
 use super::migrate::{data_file_path, load_or_migrate, maybe_backup_legacy_files, save};
@@ -91,9 +90,8 @@ impl DataStore {
         let mut data = load_or_migrate()?;
         let gateway_migrated = migrate_gateway_url_state(&mut data);
         let tool_profiles_migrated = migrate_tool_profiles(&mut data);
-        let imported = import_legacy_profiles_if_empty(&mut data)?;
         let store = Self { data };
-        if !existed_before || imported > 0 || gateway_migrated || tool_profiles_migrated {
+        if !existed_before || gateway_migrated || tool_profiles_migrated {
             store.persist_unlocked()?;
         }
         if !existed_before {

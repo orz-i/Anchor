@@ -25,19 +25,6 @@ struct SecretsEnvelope {
     protection: String,
     payload: String,
 }
-const LEGACY_BRAND_DATA_FILES: &[&str] = &[
-    "data/profiles.json",
-    "data/profiles.json.bak",
-    "data/secrets.json",
-    "data/secrets.json.bak",
-    "profiles.json",
-    "profiles.json.bak",
-    "app_settings.json",
-    "app_settings.json.bak",
-];
-const LEGACY_BRAND_DATA_DIRS: &[&str] = &["bin", "frpc"];
-const MAX_LEGACY_BRAND_FILES: usize = 4_096;
-const MAX_LEGACY_BRAND_BYTES: u64 = 512 * 1024 * 1024;
 
 pub fn data_file_path() -> AppResult<PathBuf> {
     Ok(platform()
@@ -214,50 +201,9 @@ mod tests {
         assert!(sanitized.get("app_secrets").is_none());
     }
 
-    #[test]
-    fn imports_profiles_and_secrets_from_the_legacy_brand_directory() {
-        let source = tempfile::tempdir().expect("legacy config");
-        let target = tempfile::tempdir().expect("anchor config");
-        fs::create_dir_all(source.path().join("data")).expect("legacy data dir");
-        fs::write(
-            source.path().join("data/profiles.json"),
-            "{\"profiles\":[]}",
-        )
-        .expect("legacy profiles");
-        fs::write(
-            source.path().join("data/secrets.json"),
-            "{\"shared_secrets\":{},\"workspace_secrets\":{},\"app_secrets\":{}}",
-        )
-        .expect("legacy secrets");
-        fs::create_dir_all(source.path().join("bin/downloads")).expect("legacy bin dir");
-        fs::write(source.path().join("bin/cloudflared"), "binary").expect("legacy binary");
-        fs::write(source.path().join("bin/downloads/archive"), "archive").expect("legacy archive");
-        fs::create_dir_all(source.path().join("frpc/workspace")).expect("legacy frpc dir");
-        fs::write(
-            source.path().join("frpc/workspace/frpc.pid"),
-            "42\n/legacy/frpc\n",
-        )
-        .expect("legacy frpc state");
-
-        assert!(
-            migrate_legacy_brand_data_at(source.path(), target.path()).expect("brand migration")
-        );
-        assert_eq!(
-            fs::read_to_string(target.path().join("data/profiles.json"))
-                .expect("migrated profiles"),
-            "{\"profiles\":[]}"
-        );
-        assert!(target.path().join("data/secrets.json").is_file());
-        assert!(target.path().join("bin/cloudflared").is_file());
-        assert!(target.path().join("bin/downloads/archive").is_file());
-        assert!(target.path().join("frpc/workspace/frpc.pid").is_file());
-        assert!(!migrate_legacy_brand_data_at(source.path(), target.path())
-            .expect("idempotent migration"));
-    }
 }
 
 pub fn load_or_migrate() -> AppResult<AppData> {
-    migrate_legacy_brand_data()?;
     let path = data_file_path()?;
     if has_primary_or_backup(&path) {
         let mut data = load_with_backup(&path)?;
@@ -285,102 +231,6 @@ pub fn load_or_migrate() -> AppResult<AppData> {
     }
 
     Ok(data)
-}
-
-fn migrate_legacy_brand_data() -> AppResult<bool> {
-    let target_root = platform().app_config_dir()?;
-    let target_profiles = target_root.join("data").join("profiles.json");
-    let target_secrets = target_root.join("data").join("secrets.json");
-    if has_primary_or_backup(&target_profiles) || has_primary_or_backup(&target_secrets) {
-        return Ok(false);
-    }
-
-    for source_root in platform().legacy_app_config_dirs()? {
-        if migrate_legacy_brand_data_at(&source_root, &target_root)? {
-            eprintln!(
-                "Anchor imported configuration from legacy directory {}",
-                source_root.display()
-            );
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn migrate_legacy_brand_data_at(source_root: &Path, target_root: &Path) -> AppResult<bool> {
-    if !source_root.is_dir() || source_root == target_root {
-        return Ok(false);
-    }
-    let mut copied = false;
-    for relative in LEGACY_BRAND_DATA_FILES {
-        let source = source_root.join(relative);
-        let target = target_root.join(relative);
-        if !source.is_file() || target.exists() {
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(source, target)?;
-        copied = true;
-    }
-
-    let mut copied_files = 0_usize;
-    let mut copied_bytes = 0_u64;
-    for relative in LEGACY_BRAND_DATA_DIRS {
-        copied |= copy_legacy_brand_directory(
-            &source_root.join(relative),
-            &target_root.join(relative),
-            &mut copied_files,
-            &mut copied_bytes,
-        )?;
-    }
-    Ok(copied)
-}
-
-fn copy_legacy_brand_directory(
-    source: &Path,
-    target: &Path,
-    copied_files: &mut usize,
-    copied_bytes: &mut u64,
-) -> AppResult<bool> {
-    if !source.is_dir() {
-        return Ok(false);
-    }
-    let mut copied = false;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        if file_type.is_dir() {
-            copied |= copy_legacy_brand_directory(
-                &source_path,
-                &target_path,
-                copied_files,
-                copied_bytes,
-            )?;
-            continue;
-        }
-        if !file_type.is_file() || target_path.exists() {
-            continue;
-        }
-        let bytes = entry.metadata()?.len();
-        *copied_files += 1;
-        *copied_bytes = copied_bytes.saturating_add(bytes);
-        if *copied_files > MAX_LEGACY_BRAND_FILES || *copied_bytes > MAX_LEGACY_BRAND_BYTES {
-            return Err(crate::error::AppError::Message(
-                "旧版配置迁移超过文件数量或容量上限".into(),
-            ));
-        }
-        fs::create_dir_all(target)?;
-        fs::copy(source_path, target_path)?;
-        copied = true;
-    }
-    Ok(copied)
 }
 
 pub fn save(data: &AppData) -> AppResult<()> {

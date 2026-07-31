@@ -11,10 +11,6 @@ pub trait Platform: Send + Sync {
 
     fn app_config_dir(&self) -> AppResult<PathBuf>;
 
-    fn legacy_app_config_dirs(&self) -> AppResult<Vec<PathBuf>> {
-        Ok(Vec::new())
-    }
-
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>>;
 
     /// Best-effort reclaim of a TCP listener on the given port. Windows uses
@@ -45,16 +41,7 @@ pub trait Platform: Send + Sync {
 pub(crate) fn app_config_dir_override() -> Option<PathBuf> {
     std::env::var_os(crate::brand::CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os(crate::brand::LEGACY_CONFIG_DIR_ENV))
-        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-}
-
-pub(crate) fn has_app_config_dir_override() -> bool {
-    std::env::var_os(crate::brand::CONFIG_DIR_ENV)
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os(crate::brand::LEGACY_CONFIG_DIR_ENV))
-        .is_some()
 }
 
 #[cfg(target_os = "linux")]

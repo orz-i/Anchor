@@ -1,4 +1,3 @@
-pub mod legacy_import;
 mod model;
 pub mod resources;
 
