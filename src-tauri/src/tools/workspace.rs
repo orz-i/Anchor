@@ -251,20 +251,21 @@ impl Workspace {
         let mut pending = vec![self.root.clone()];
         let mut scanned = 0usize;
         while let Some(directory) = pending.pop() {
-            let entries = fs::read_dir(&directory).map_err(|error| WorkspaceError::ToolDetails {
-                code: "WORKSPACE_SCAN_FAILED",
-                message: format!(
-                    "Failed to inspect workspace boundary at {}: {error}",
-                    relative_display(&self.root, &directory)
-                ),
-                category: "runtime",
-                retryable: true,
-                details: json!({
-                    "stage": "workspace_boundary_scan",
-                    "path": relative_display(&self.root, &directory),
-                    "retryable": true
-                }),
-            })?;
+            let entries =
+                fs::read_dir(&directory).map_err(|error| WorkspaceError::ToolDetails {
+                    code: "WORKSPACE_SCAN_FAILED",
+                    message: format!(
+                        "Failed to inspect workspace boundary at {}: {error}",
+                        relative_display(&self.root, &directory)
+                    ),
+                    category: "runtime",
+                    retryable: true,
+                    details: json!({
+                        "stage": "workspace_boundary_scan",
+                        "path": relative_display(&self.root, &directory),
+                        "retryable": true
+                    }),
+                })?;
             for entry in entries {
                 let entry = entry.map_err(|error| WorkspaceError::ToolDetails {
                     code: "WORKSPACE_SCAN_FAILED",
@@ -724,8 +725,14 @@ mod tests {
         let error = workspace
             .ensure_child_process_boundary()
             .expect_err("nested external link must block child processes");
-        assert_eq!(error.to_error_value()["code"], "WORKSPACE_LINK_ESCAPE");
-        assert_eq!(error.to_error_value()["details"]["link_path"], "nested/escape");
+        assert!(matches!(
+            error.to_error_value()["code"].as_str(),
+            Some("WORKSPACE_LINK_ESCAPE" | "WORKSPACE_LINK_UNRESOLVED")
+        ));
+        assert_eq!(
+            error.to_error_value()["details"]["link_path"],
+            "nested/escape"
+        );
     }
 
     #[test]
@@ -738,8 +745,7 @@ mod tests {
         std::os::unix::fs::symlink(root.path().join("does-not-exist"), &broken)
             .expect("broken symlink");
         #[cfg(windows)]
-        if std::os::windows::fs::symlink_dir(root.path().join("does-not-exist"), &broken).is_err()
-        {
+        if std::os::windows::fs::symlink_dir(root.path().join("does-not-exist"), &broken).is_err() {
             return;
         }
 

@@ -18,14 +18,16 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let diagnostic_mode = args
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("exact");
+    let diagnostic_mode = args.get("mode").and_then(Value::as_str).unwrap_or("exact");
     let validation_mode = args
         .get("validation_mode")
         .and_then(Value::as_str)
         .unwrap_or("syntax");
+    if !matches!(diagnostic_mode, "exact" | "fuzzy") {
+        return Err(WorkspaceError::invalid_argument(
+            "mode must be exact or fuzzy",
+        ));
+    }
     let file_patches = parse_unified_diff(patch)?;
     if file_patches.is_empty() {
         return Err(patch_failed("No files were modified."));
@@ -53,6 +55,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
 
     let mut affected = Vec::new();
     let mut summaries = Vec::new();
+    let mut hunk_matches = Vec::new();
     let mut staged: HashMap<String, Option<String>> = HashMap::new();
 
     for fp in &file_patches {
@@ -84,7 +87,9 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             continue;
         }
 
-        let updated = apply_hunks(&resolved.display, &original, &fp.hunks, diagnostic_mode)?;
+        let (updated, matches) =
+            apply_hunks(&resolved.display, &original, &fp.hunks, diagnostic_mode)?;
+        hunk_matches.extend(matches);
         let op = if resolved.existed { "update" } else { "add" };
         staged.insert(resolved.display.clone(), Some(updated));
         affected.push(json!({ "path": resolved.display, "operation": op }));
@@ -113,6 +118,15 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             "files_modified": files_modified,
             "files_deleted": files_deleted,
             "post_validation": post_validation,
+            "hunk_matches": hunk_matches,
+            "transaction": {
+                "committed": true,
+                "atomic": true,
+                "created": files_created,
+                "modified": files_modified,
+                "deleted": files_deleted,
+                "renamed": []
+            },
             "recovery": "git",
             "warnings": []
         })));
@@ -128,6 +142,15 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         "would_modify": files_modified,
         "would_delete": files_deleted,
         "post_validation": post_validation,
+        "hunk_matches": hunk_matches,
+        "transaction": {
+            "committed": false,
+            "atomic": true,
+            "created": files_created,
+            "modified": files_modified,
+            "deleted": files_deleted,
+            "renamed": []
+        },
         "warnings": []
     })))
 }
@@ -160,11 +183,13 @@ fn validate_staged_post_images(
                 .map_err(|error| ("yaml", error.to_string())),
             "rs" | "ts" | "tsx" | "js" | "jsx" | "svelte" => {
                 validate_balanced_structure(content, extension == "rs")
-                    .map(|_| json!({
-                        "path": path,
-                        "validator": "balanced_structure",
-                        "status": "passed"
-                    }))
+                    .map(|_| {
+                        json!({
+                            "path": path,
+                            "validator": "balanced_structure",
+                            "status": "passed"
+                        })
+                    })
                     .map_err(|error| ("balanced_structure", error))
             }
             _ => {
@@ -194,7 +219,8 @@ fn validate_staged_post_images(
     {
         return Err(WorkspaceError::ToolDetails {
             code: "PATCH_POST_VALIDATION_FAILED",
-            message: "Patched file images failed syntax or structural validation before write.".into(),
+            message: "Patched file images failed syntax or structural validation before write."
+                .into(),
             category: "validation",
             retryable: true,
             details: json!({
@@ -278,7 +304,10 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
                     _ => '{',
                 };
                 let Some((opened, opened_at)) = stack.pop() else {
-                    return Err(format!("unexpected closing {ch} at character {}", index + 1));
+                    return Err(format!(
+                        "unexpected closing {ch} at character {}",
+                        index + 1
+                    ));
                 };
                 if opened != expected {
                     return Err(format!(
@@ -313,12 +342,13 @@ fn hunk_context_mismatch(
     lines: &[String],
     expected: &[String],
     diagnostic_mode: &str,
+    line_ending: &str,
 ) -> WorkspaceError {
     let (nearest_index, nearest_context, matched_lines) = nearest_hunk_context(lines, expected);
     let denominator = expected.len().max(1) as f64;
     let confidence = matched_lines as f64 / denominator;
     WorkspaceError::ToolDetails {
-        code: "PATCH_FAILED",
+        code: "PATCH_CONTEXT_MISMATCH",
         message: format!(
             "Patch hunk {} did not match {} near line {}.",
             hunk_index + 1,
@@ -329,14 +359,19 @@ fn hunk_context_mismatch(
         retryable: true,
         details: json!({
             "file": file,
-            "hunk_index": hunk_index,
-            "failure_code": "HUNK_CONTEXT_MISMATCH",
+            "hunk_index": hunk_index + 1,
+            "hunk_index_zero_based": hunk_index,
+            "failure_code": "PATCH_CONTEXT_MISMATCH",
             "expected_context": expected.iter().take(24).collect::<Vec<_>>(),
             "nearest_context": nearest_context,
+            "actual_context": nearest_context,
             "line_hint": nearest_index + 1,
+            "nearest_match_line": nearest_index + 1,
             "encoding": "utf-8",
+            "line_ending": line_ending,
             "match_confidence": confidence,
             "mode": diagnostic_mode,
+            "can_retry_fuzzy": diagnostic_mode == "exact" && confidence >= 0.5,
             "file_line_count": lines.len(),
             "suggested_patch": {
                 "action": "regenerate_from_current_file",
@@ -352,10 +387,7 @@ fn hunk_context_mismatch(
     }
 }
 
-fn nearest_hunk_context(
-    lines: &[String],
-    expected: &[String],
-) -> (usize, Vec<String>, usize) {
+fn nearest_hunk_context(lines: &[String], expected: &[String]) -> (usize, Vec<String>, usize) {
     if lines.is_empty() || expected.is_empty() {
         return (0, Vec::new(), 0);
     }
@@ -592,7 +624,7 @@ fn apply_hunks(
     original: &str,
     hunks: &[Hunk],
     diagnostic_mode: &str,
-) -> Result<String, WorkspaceError> {
+) -> Result<(String, Vec<Value>), WorkspaceError> {
     let line_ending = if original.contains("\r\n") {
         "\r\n"
     } else {
@@ -608,6 +640,7 @@ fn apply_hunks(
             .collect()
     };
     let mut offset: i64 = 0;
+    let mut matches = Vec::new();
 
     for (hunk_index, hunk) in hunks.iter().enumerate() {
         let search_at = 0usize;
@@ -620,15 +653,37 @@ fn apply_hunks(
             })
             .collect();
 
-        let pos = find_hunk_position(&lines, &hunk_old, search_at).ok_or_else(|| {
-            hunk_context_mismatch(
+        let exact = find_hunk_position(&lines, &hunk_old, search_at);
+        let (pos, match_mode, confidence) = if let Some(pos) = exact {
+            (pos, "exact", 1.0)
+        } else if diagnostic_mode == "fuzzy" {
+            find_fuzzy_hunk_position(&lines, &hunk_old, search_at).ok_or_else(|| {
+                hunk_context_mismatch(
+                    file,
+                    hunk_index,
+                    &lines,
+                    &hunk_old,
+                    diagnostic_mode,
+                    if line_ending == "\r\n" { "crlf" } else { "lf" },
+                )
+            })?
+        } else {
+            return Err(hunk_context_mismatch(
                 file,
                 hunk_index,
                 &lines,
                 &hunk_old,
                 diagnostic_mode,
-            )
-        })?;
+                if line_ending == "\r\n" { "crlf" } else { "lf" },
+            ));
+        };
+        matches.push(json!({
+            "file": file,
+            "hunk_index": hunk_index + 1,
+            "line": pos + 1,
+            "mode": match_mode,
+            "confidence": confidence
+        }));
 
         let mut idx = pos;
         for hl in &hunk.lines {
@@ -652,7 +707,41 @@ fn apply_hunks(
     if !output.is_empty() && (had_trailing_newline || original.is_empty()) {
         output.push_str(line_ending);
     }
-    Ok(output)
+    Ok((output, matches))
+}
+
+fn find_fuzzy_hunk_position(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+) -> Option<(usize, &'static str, f64)> {
+    if pattern.is_empty() {
+        return Some((start, "fuzzy", 1.0));
+    }
+    if start > lines.len() || pattern.len() > lines.len().saturating_sub(start) {
+        return None;
+    }
+    let minimum_matches = (pattern.len() * 4).div_ceil(5);
+    let mut best = None::<(usize, usize)>;
+    let mut best_count = 0usize;
+    for index in start..=lines.len().saturating_sub(pattern.len()) {
+        let score = lines[index..index + pattern.len()]
+            .iter()
+            .zip(pattern.iter())
+            .filter(|(actual, expected)| actual.trim() == expected.trim())
+            .count();
+        if score > best_count {
+            best = Some((index, score));
+            best_count = score;
+        } else if score == best_count && score > 0 {
+            best = None;
+        }
+    }
+    let (index, score) = best?;
+    if score < minimum_matches || (pattern.len() == 1 && score != 1) {
+        return None;
+    }
+    Some((index, "fuzzy", score as f64 / pattern.len() as f64))
 }
 
 fn find_hunk_position(lines: &[String], pattern: &[String], start: usize) -> Option<usize> {
@@ -881,6 +970,44 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_mode_accepts_a_unique_whitespace_only_context_drift() {
+        let input = "fn main() {\n    let value = 1;\n}\n";
+        let hunk = Hunk {
+            lines: vec![
+                HunkLine::Context("fn main() {".into()),
+                HunkLine::Remove("let value = 1;".into()),
+                HunkLine::Add("let value = 2;".into()),
+                HunkLine::Context("}".into()),
+            ],
+        };
+        let (updated, matches) =
+            apply_hunks("main.rs", input, &[hunk], "fuzzy").expect("fuzzy patch");
+        assert_eq!(updated, "fn main() {\nlet value = 2;\n}\n");
+        assert_eq!(matches[0]["mode"], "fuzzy");
+        assert_eq!(matches[0]["hunk_index"], 1);
+    }
+
+    #[test]
+    fn exact_context_mismatch_reports_retry_diagnostics() {
+        let input = "alpha\nactual\nomega\n";
+        let hunk = Hunk {
+            lines: vec![
+                HunkLine::Context("alpha".into()),
+                HunkLine::Remove("expected".into()),
+                HunkLine::Add("replacement".into()),
+                HunkLine::Context("omega".into()),
+            ],
+        };
+        let error = apply_hunks("main.txt", input, &[hunk], "exact").expect_err("exact mismatch");
+        let value = error.to_error_value();
+        assert_eq!(value["code"], "PATCH_CONTEXT_MISMATCH");
+        assert_eq!(value["details"]["file"], "main.txt");
+        assert_eq!(value["details"]["hunk_index"], 1);
+        assert_eq!(value["details"]["nearest_match_line"], 1);
+        assert_eq!(value["details"]["can_retry_fuzzy"], true);
+    }
+
+    #[test]
     fn preserves_crlf_when_inserting_multiple_lines() {
         let input = "one\r\ntwo\r\n";
         let hunk = Hunk {
@@ -892,7 +1019,9 @@ mod tests {
             ],
         };
         assert_eq!(
-            apply_hunks("main.txt", input, &[hunk], "exact").expect("patch"),
+            apply_hunks("main.txt", input, &[hunk], "exact")
+                .expect("patch")
+                .0,
             "one\r\ninsert-a\r\ninsert-b\r\ntwo\r\n"
         );
     }

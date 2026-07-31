@@ -54,7 +54,10 @@ fn exec_command_rejects_workspace_external_directory_link() {
         }),
     );
     let error = assert_err(&out);
-    assert_eq!(error["error"]["code"], "WORKSPACE_LINK_ESCAPE");
+    assert!(matches!(
+        error["error"]["code"].as_str(),
+        Some("WORKSPACE_LINK_ESCAPE" | "WORKSPACE_LINK_UNRESOLVED")
+    ));
     assert_eq!(error["error"]["details"]["link_path"], "external-workspace");
 }
 

@@ -25,7 +25,10 @@ fn server_info_returns_workspace_and_tools() {
     assert_eq!(payload["catalog_published"], false);
     assert_eq!(payload["catalog_changed"], false);
     assert_eq!(payload["reconnect_required"], false);
-    assert_eq!(payload["running_catalog_digest"], payload["current_catalog_digest"]);
+    assert_eq!(
+        payload["running_catalog_digest"],
+        payload["current_catalog_digest"]
+    );
 }
 
 #[test]
@@ -41,11 +44,12 @@ fn patch_check_reports_hunk_and_nearest_context_diagnostics() {
         }),
     );
     let error = assert_err(&out);
-    assert_eq!(error["error"]["code"], "PATCH_FAILED");
+    assert_eq!(error["error"]["code"], "PATCH_CONTEXT_MISMATCH");
     let details = &error["error"]["details"];
     assert_eq!(details["file"], "src/math.js");
-    assert_eq!(details["hunk_index"], 0);
-    assert_eq!(details["failure_code"], "HUNK_CONTEXT_MISMATCH");
+    assert_eq!(details["hunk_index"], 1);
+    assert_eq!(details["hunk_index_zero_based"], 0);
+    assert_eq!(details["failure_code"], "PATCH_CONTEXT_MISMATCH");
     assert_eq!(details["mode"], "fuzzy");
     assert!(details["line_hint"].as_u64().is_some());
     assert!(details["nearest_context"].is_array());
@@ -329,8 +333,12 @@ fn wait_command_returns_terminal_state_and_incremental_output() {
     assert_eq!(waited["state"], "completed");
     assert_eq!(waited["exit_code"], 0);
     assert_eq!(waited["command_ok"], true);
-    assert!(waited["started_at"].as_str().is_some_and(|value| value.ends_with('Z')));
-    assert!(waited["last_output_at"].as_str().is_some_and(|value| value.ends_with('Z')));
+    assert!(waited["started_at"]
+        .as_str()
+        .is_some_and(|value| value.ends_with('Z')));
+    assert!(waited["last_output_at"]
+        .as_str()
+        .is_some_and(|value| value.ends_with('Z')));
     let stdout = waited["stdout"]["content"].as_str().expect("stdout");
     assert!(stdout.contains("started"));
     assert!(stdout.contains("finished"));

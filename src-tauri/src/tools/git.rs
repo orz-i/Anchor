@@ -18,6 +18,14 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("include_untracked")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let diagnose_metadata_only = args
+        .get("diagnose_metadata_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let refresh_index = args
+        .get("refresh_index")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let root_check = run_git(
         &resolved.path,
@@ -47,6 +55,7 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     let mut ahead = 0i64;
     let mut behind = 0i64;
     let mut entries = Vec::new();
+    let mut metadata_only_entries = Vec::new();
     let mut warnings = Vec::new();
     let lines: Vec<_> = completed.stdout.lines().collect();
     let total_lines = lines.len();
@@ -77,6 +86,18 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         if let Some(orig) = original {
             entry["original_path"] = json!(orig);
         }
+        if diagnose_metadata_only
+            && index_status == " "
+            && worktree_status == "M"
+            && !path_text.starts_with('"')
+        {
+            if let Some(diagnostic) =
+                diagnose_metadata_only_change(&resolved.path, &path_text, refresh_index)
+            {
+                metadata_only_entries.push(diagnostic);
+                continue;
+            }
+        }
         entries.push(entry);
         if entries.len() >= max_entries {
             break;
@@ -94,6 +115,20 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     }
 
     let head = git_rev_parse(&resolved.path, "HEAD").unwrap_or_default();
+    let metadata_only_count = metadata_only_entries.len();
+    let index_refresh_performed = refresh_index
+        && metadata_only_count > 0
+        && metadata_only_entries
+            .iter()
+            .all(|entry| entry.get("index_refreshed").and_then(Value::as_bool) == Some(true));
+    let index_refresh_failed_count = if refresh_index {
+        metadata_only_entries
+            .iter()
+            .filter(|entry| entry.get("index_refreshed").and_then(Value::as_bool) != Some(true))
+            .count()
+    } else {
+        0
+    };
     Ok(tool_ok(json!({
         "is_repo": true,
         "branch": branch,
@@ -102,10 +137,85 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "ahead": ahead,
         "behind": behind,
         "clean": entries.is_empty(),
+        "raw_clean": entries.is_empty() && metadata_only_entries.is_empty(),
         "entries": entries,
+        "metadata_only_entries": metadata_only_entries,
+        "metadata_only_count": metadata_only_count,
+        "content_changed_count": entries.len(),
+        "index_refresh_performed": index_refresh_performed,
+        "index_refresh_failed_count": index_refresh_failed_count,
         "truncated": entries.len() >= max_entries && total_lines > max_entries + 1,
         "warnings": warnings
     })))
+}
+
+fn diagnose_metadata_only_change(
+    root: &std::path::Path,
+    path: &str,
+    refresh_index: bool,
+) -> Option<Value> {
+    let staged = run_git(
+        root,
+        &["ls-files", "--stage", "--", path],
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    if !staged.success {
+        return None;
+    }
+    let index_blob = staged
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .filter(|value| value.len() == 40)?;
+    let path_filter = format!("--path={path}");
+    let filtered = run_git(
+        root,
+        &["hash-object", path_filter.as_str(), "--", path],
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    if !filtered.success || filtered.stdout.trim() != index_blob {
+        return None;
+    }
+    let raw = run_git(
+        root,
+        &["hash-object", "--no-filters", "--", path],
+        Duration::from_secs(5),
+    )
+    .ok();
+    let raw_matches = raw
+        .as_ref()
+        .is_some_and(|value| value.success && value.stdout.trim() == index_blob);
+    let classification = if raw_matches {
+        "stat_cache_stale"
+    } else {
+        "line_ending_or_clean_filter_only"
+    };
+    let mut refreshed = false;
+    if refresh_index {
+        refreshed = run_git(
+            root,
+            &["update-index", "--refresh", "--", path],
+            Duration::from_secs(5),
+        )
+        .is_ok_and(|result| result.success);
+    }
+    Some(json!({
+        "path": path,
+        "classification": classification,
+        "content_changed": false,
+        "index_blob": index_blob,
+        "worktree_filtered_blob": filtered.stdout.trim(),
+        "worktree_raw_blob": raw.and_then(|value| value.success.then(|| value.stdout.trim().to_string())),
+        "safe_index_refresh": true,
+        "index_refreshed": refreshed,
+        "suggestion": if refreshed {
+            "Git index stat cache was refreshed safely because filtered content matched the index blob."
+        } else {
+            "Run git_status with refresh_index=true to refresh the index stat cache safely."
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -116,7 +226,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{git_status, parse_branch_line, run_process_with_timeout};
+    use super::{
+        diagnose_metadata_only_change, git_status, parse_branch_line, run_process_with_timeout,
+    };
     use crate::tools::workspace::Workspace;
 
     #[test]
@@ -153,14 +265,28 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo dir");
 
         git(&repo, &["init", "--initial-branch=main"]);
-        git(&repo, &["config", "user.email", "anchor-tests@example.invalid"]);
+        git(
+            &repo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
         git(&repo, &["config", "user.name", "Anchor Tests"]);
         fs::write(repo.join("main.txt"), "initial\n").expect("initial file");
         git(&repo, &["add", "main.txt"]);
         git(&repo, &["commit", "-m", "initial"]);
 
-        git(temp.path(), &["clone", "--bare", repo.to_str().unwrap(), remote.to_str().unwrap()]);
-        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                repo.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         git(&repo, &["fetch", "origin"]);
         git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
 
@@ -173,6 +299,28 @@ mod tests {
         assert_eq!(result["ahead"], 1);
         assert_eq!(result["behind"], 0);
         assert_eq!(result["upstream"], "origin/main");
+    }
+
+    #[test]
+    fn unchanged_content_is_classified_as_safe_metadata_only_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(
+            &repo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(&repo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(repo.join("main.txt"), "same\n").expect("file");
+        git(&repo, &["add", "main.txt"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let diagnostic = diagnose_metadata_only_change(&repo, "main.txt", false)
+            .expect("matching worktree and index blob");
+        assert_eq!(diagnostic["content_changed"], false);
+        assert_eq!(diagnostic["classification"], "stat_cache_stale");
+        assert_eq!(diagnostic["safe_index_refresh"], true);
     }
 
     fn git(cwd: &std::path::Path, args: &[&str]) {
