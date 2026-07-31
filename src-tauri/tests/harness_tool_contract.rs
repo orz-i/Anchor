@@ -371,6 +371,31 @@ fn successful_verification_retry_supersedes_previous_failure() {
     assert_eq!(finished["ok"], true);
     assert_eq!(finished["verification_status"], "verified");
     assert_eq!(finished["task_status"], "completed");
+    assert_eq!(finished["change_summary"]["verification"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        finished["change_summary"]["verification_summary"]["total_records"],
+        2
+    );
+    assert_eq!(
+        finished["change_summary"]["verification_summary"]["effective_records"],
+        1
+    );
+    assert_eq!(
+        finished["change_summary"]["verification_summary"]
+            ["historical_failures_collapsed"],
+        1
+    );
+
+    let expanded = call_tool(
+        &ctx,
+        "change_summary",
+        &json!({
+            "task_id": task_id,
+            "verification_history_mode": "all",
+            "section": "verification"
+        }),
+    );
+    assert_eq!(expanded["verification"].as_array().unwrap().len(), 2);
 }
 
 #[test]

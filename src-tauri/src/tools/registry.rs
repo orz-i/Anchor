@@ -1426,6 +1426,7 @@ pub fn output_schema(name: &str) -> Value {
                 "next_actions": { "type": "array", "items": { "type": "string" } },
                 "task": { "type": "object" },
                 "verification": { "type": "array", "items": { "type": "object" } },
+                "verification_summary": { "type": "object" },
                 "change_summary": { "type": "object" },
                 "truncated": { "type": "boolean" },
                 "details_tool": { "type": "object" },
@@ -1467,6 +1468,8 @@ pub fn output_schema(name: &str) -> Value {
                 "runtime_artifacts": { "type": "array", "items": { "type": "string" } },
                 "ignored_files": { "type": "array", "items": { "type": "string" } },
                 "verification": { "type": "array", "items": { "type": "object" } },
+                "verification_history_mode": { "type": "string", "enum": ["effective", "all"] },
+                "verification_summary": { "type": "object" },
                 "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "verified_with_exceptions"] },
                 "evidence": { "type": "array", "items": { "type": "object" } },
                 "counts": { "type": "object" },
@@ -1487,6 +1490,8 @@ pub fn output_schema(name: &str) -> Value {
                 "runtime_artifacts",
                 "ignored_files",
                 "verification",
+                "verification_history_mode",
+                "verification_summary",
                 "verification_status",
                 "evidence",
                 "counts",
@@ -1890,6 +1895,7 @@ pub fn input_schema(name: &str) -> Value {
                     "type": "string",
                     "enum": ["commits", "files_by_commit", "committed_files", "net_changed_files", "working_tree_files", "runtime_artifacts", "ignored_files", "verification", "evidence"]
                 },
+                "verification_history_mode": { "type": "string", "enum": ["effective", "all"], "default": "effective" },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 64 }
             },

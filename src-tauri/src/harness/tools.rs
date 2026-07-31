@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -652,7 +652,8 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "working_tree_files": working_tree_files,
             "next_actions": ["git_status", "stage_commit", "finish_task"],
             "task": task_view(&task),
-            "verification": verification_views(&verifications)
+            "verification": verification_views(&verifications, "effective"),
+            "verification_summary": verification_presentation_summary(&verifications)
         }));
     }
     if !allow_unverified && !verification_status_is_accepted(verification_status) {
@@ -672,7 +673,8 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "reason": reason,
             "next_actions": ["exec_command", "change_summary", "finish_task"],
             "task": task_view(&task),
-            "verification": verification_views(&verifications)
+            "verification": verification_views(&verifications, "effective"),
+            "verification_summary": verification_presentation_summary(&verifications)
         }));
     }
     let session_status = parse_session_status(args)?;
@@ -781,6 +783,10 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .clamp(1, 500) as usize;
     let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
     let section = args.get("section").and_then(Value::as_str);
+    let verification_history_mode = args
+        .get("verification_history_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("effective");
     let requested_change_id = args
         .get("change_id")
         .and_then(Value::as_str)
@@ -888,6 +894,8 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .harness
         .list_verifications(&task.id)
         .map_err(map_error)?;
+    let verification = verification_views(&verifications, verification_history_mode);
+    let verification_summary = verification_presentation_summary(&verifications);
     let events = ctx
         .harness
         .list_events(&task.id, 0, 100)
@@ -905,7 +913,8 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         "working_tree_files": working_tree_files.len(),
         "runtime_artifacts": runtime_artifacts.len(),
         "ignored_files": ignored_files.len(),
-        "verification": verifications.len(),
+        "verification": verification.len(),
+        "verification_total": verifications.len(),
         "evidence": events.len()
     });
     let bounded_objective = bounded_text(&task.objective, 4_000);
@@ -925,7 +934,9 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         "runtime_artifacts": runtime_artifacts,
         "ignored_files": ignored_files,
         "evidence": evidence,
-        "verification": verification_views(&verifications),
+        "verification": verification,
+        "verification_history_mode": verification_history_mode,
+        "verification_summary": verification_summary,
         "verification_status": verification_status(&verifications),
         "risks": [],
         "rollback_capability": if selected_changes.is_empty() { "not_available" } else { "git_commit_range" },
@@ -1024,8 +1035,52 @@ fn effective_verifications(records: &[VerificationRecord]) -> Vec<&VerificationR
         .collect()
 }
 
-fn verification_views(records: &[VerificationRecord]) -> Vec<Value> {
-    records.iter().map(verification_view).collect()
+fn verification_views(records: &[VerificationRecord], history_mode: &str) -> Vec<Value> {
+    if history_mode == "all" {
+        return records.iter().map(verification_view).collect();
+    }
+    effective_verifications(records)
+        .into_iter()
+        .map(verification_view)
+        .collect()
+}
+
+fn verification_presentation_summary(records: &[VerificationRecord]) -> Value {
+    let effective = effective_verifications(records);
+    let effective_ids = effective
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<HashSet<_>>();
+    let collapsed_records = records.len().saturating_sub(effective.len());
+    let historical_failures_collapsed = records
+        .iter()
+        .filter(|record| !record.passed && !effective_ids.contains(record.id.as_str()))
+        .count();
+    let active_failures = effective
+        .iter()
+        .filter(|record| effective_disposition(record) == "active_failure")
+        .count();
+    let exceptions = effective
+        .iter()
+        .filter(|record| matches!(effective_disposition(record), "expected_failure" | "waived"))
+        .count();
+    let passed = effective
+        .iter()
+        .filter(|record| effective_disposition(record) == "passed")
+        .count();
+    json!({
+        "total_records": records.len(),
+        "effective_records": effective.len(),
+        "collapsed_records": collapsed_records,
+        "historical_failures_collapsed": historical_failures_collapsed,
+        "active_failures": active_failures,
+        "exceptions": exceptions,
+        "passed": passed,
+        "expand_with": {
+            "tool": "change_summary",
+            "arguments": {"verification_history_mode": "all", "section": "verification"}
+        }
+    })
 }
 
 fn verification_view(record: &VerificationRecord) -> Value {
