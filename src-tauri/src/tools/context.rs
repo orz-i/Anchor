@@ -26,37 +26,6 @@ pub struct ToolContext {
     published_catalog: Mutex<Option<EffectiveCatalog>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::catalog::build_effective_catalog_from_parts;
-
-    #[test]
-    fn published_catalog_remains_stable_and_requires_reconnect_on_drift() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let harness = tempfile::tempdir().expect("harness");
-        let ctx = ToolContext::for_test(
-            workspace.path().to_path_buf(),
-            harness.path().to_path_buf(),
-        )
-        .expect("context");
-        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
-        let advanced =
-            build_effective_catalog_from_parts("advanced", true, Vec::new()).expect("advanced");
-
-        let (published, changed) = ctx.publish_catalog(core.clone());
-        assert!(!changed);
-        assert_eq!(published.digest, core.digest);
-
-        let (still_published, changed) = ctx.publish_catalog(advanced.clone());
-        assert!(changed);
-        assert_eq!(still_published.digest, core.digest);
-        assert_ne!(still_published.digest, advanced.digest);
-        assert_eq!(ctx.is_published_tool("stage_commit_status"), Some(false));
-        assert_eq!(ctx.is_published_tool("read_file"), Some(true));
-    }
-}
-
 pub type SharedToolContext = Arc<ToolContext>;
 
 impl ToolContext {
@@ -222,5 +191,36 @@ impl ToolContext {
                     .is_some_and(|published| published == name)
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::catalog::build_effective_catalog_from_parts;
+
+    #[test]
+    fn published_catalog_remains_stable_and_requires_reconnect_on_drift() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness = tempfile::tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness.path().to_path_buf(),
+        )
+        .expect("context");
+        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
+        let advanced =
+            build_effective_catalog_from_parts("advanced", true, Vec::new()).expect("advanced");
+
+        let (published, changed) = ctx.publish_catalog(core.clone());
+        assert!(!changed);
+        assert_eq!(published.digest, core.digest);
+
+        let (still_published, changed) = ctx.publish_catalog(advanced.clone());
+        assert!(changed);
+        assert_eq!(still_published.digest, core.digest);
+        assert_ne!(still_published.digest, advanced.digest);
+        assert_eq!(ctx.is_published_tool("stage_commit_status"), Some(false));
+        assert_eq!(ctx.is_published_tool("read_file"), Some(true));
     }
 }

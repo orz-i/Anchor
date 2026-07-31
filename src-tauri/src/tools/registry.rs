@@ -755,6 +755,7 @@ fn session_snapshot_output_schema() -> Value {
 pub fn output_schema(name: &str) -> Value {
     match canonical_tool_name(name) {
         "server_info" => success_output_schema(
+            merge_schema_properties(vec![
             json!({
                 "server": { "type": "string", "const": crate::brand::SERVER_NAME },
                 "title": { "type": "string", "minLength": 1 },
@@ -786,7 +787,9 @@ pub fn output_schema(name: &str) -> Value {
                 "current_catalog_bytes": { "type": "integer", "minimum": 0 },
                 "current_catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
                 "current_local_tool_count": { "type": "integer", "minimum": 0 },
-                "current_proxy_tool_count": { "type": "integer", "minimum": 0 },
+                "current_proxy_tool_count": { "type": "integer", "minimum": 0 }
+            }),
+            json!({
                 "command_cost_policy": { "type": "object" },
                 "downstream_mcp": {
                     "type": "object",
@@ -804,7 +807,8 @@ pub fn output_schema(name: &str) -> Value {
                     "required": ["configured", "server_count", "servers"],
                     "additionalProperties": false
                 }
-            }),
+            })
+            ]),
             &[
                 "server",
                 "title",

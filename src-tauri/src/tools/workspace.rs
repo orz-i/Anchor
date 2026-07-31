@@ -56,27 +56,6 @@ fn is_link_like(path: &Path) -> bool {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
-
-    #[test]
-    fn child_process_boundary_skips_generated_dependency_link_trees() {
-        let root = tempfile::tempdir().expect("workspace");
-        let dependencies = root.path().join("node_modules").join("package");
-        std::fs::create_dir_all(&dependencies).expect("dependencies");
-        let broken = dependencies.join("missing-target");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(root.path().join("does-not-exist"), &broken)
-            .expect("broken symlink");
-        #[cfg(windows)]
-        if std::os::windows::fs::symlink_dir(root.path().join("does-not-exist"), &broken).is_err()
-        {
-            return;
-        }
-
-        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
-        workspace
-            .ensure_child_process_boundary()
-            .expect("generated dependency internals are not part of the recursive boundary scan");
-    }
     #[cfg(not(windows))]
     {
         metadata.file_type().is_symlink()
@@ -747,6 +726,27 @@ mod tests {
             .expect_err("nested external link must block child processes");
         assert_eq!(error.to_error_value()["code"], "WORKSPACE_LINK_ESCAPE");
         assert_eq!(error.to_error_value()["details"]["link_path"], "nested/escape");
+    }
+
+    #[test]
+    fn child_process_boundary_skips_generated_dependency_link_trees() {
+        let root = tempfile::tempdir().expect("workspace");
+        let dependencies = root.path().join("node_modules").join("package");
+        std::fs::create_dir_all(&dependencies).expect("dependencies");
+        let broken = dependencies.join("missing-target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.path().join("does-not-exist"), &broken)
+            .expect("broken symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(root.path().join("does-not-exist"), &broken).is_err()
+        {
+            return;
+        }
+
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        workspace
+            .ensure_child_process_boundary()
+            .expect("generated dependency internals are not part of the recursive boundary scan");
     }
 
     #[test]

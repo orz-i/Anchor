@@ -55,27 +55,6 @@ fn tools_list_result(catalog: &EffectiveCatalog, params: &Value) -> Result<Value
         end += 1;
     }
 
-    #[tokio::test]
-    async fn unpublished_new_tool_requires_reconnect() {
-        let (_workspace, _harness, state) = test_state();
-        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
-        let _ = state.publish_catalog(core);
-
-        let error = handle_tools_call(
-            &state,
-            &json!({
-                "name": "stage_commit_status",
-                "arguments": {"task_id": "task", "idempotency_key": "key"}
-            }),
-            &CancellationToken::default(),
-            Some("session"),
-        )
-        .await
-        .expect_err("tool was not published");
-        assert_eq!(error["data"]["reason"], "catalog_changed");
-        assert_eq!(error["data"]["reconnect_required"], true);
-    }
-
     let mut result = serde_json::json!({
         "tools": catalog.tools[start..end].to_vec(),
         "_meta": {
@@ -468,6 +447,27 @@ mod tests {
                 .expect("tool context"),
         );
         (workspace, harness, state)
+    }
+
+    #[tokio::test]
+    async fn unpublished_new_tool_requires_reconnect() {
+        let (_workspace, _harness, state) = test_state();
+        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
+        let _ = state.publish_catalog(core);
+
+        let error = handle_tools_call(
+            &state,
+            &json!({
+                "name": "stage_commit_status",
+                "arguments": {"task_id": "task", "idempotency_key": "key"}
+            }),
+            &CancellationToken::default(),
+            Some("session"),
+        )
+        .await
+        .expect_err("tool was not published");
+        assert_eq!(error["data"]["reason"], "catalog_changed");
+        assert_eq!(error["data"]["reconnect_required"], true);
     }
 
     fn browser_proxy_tools(count: usize) -> Vec<serde_json::Value> {
