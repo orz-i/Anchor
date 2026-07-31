@@ -918,10 +918,11 @@ pub fn output_schema(name: &str) -> Value {
                         "would_create": { "type": "array", "items": { "type": "string" } },
                         "would_modify": { "type": "array", "items": { "type": "string" } },
                         "would_delete": { "type": "array", "items": { "type": "string" } },
+                        "post_validation": { "type": "array", "items": { "type": "object" } },
                         "recovery": { "type": "string", "minLength": 1 },
                         "warnings": warnings_property()
                     }),
-                    &["dry_run", "clean", "summary", "affected_files", "warnings"],
+                    &["dry_run", "clean", "summary", "affected_files", "post_validation", "warnings"],
                 ),
                 json!({
                     "if": {
@@ -961,6 +962,7 @@ pub fn output_schema(name: &str) -> Value {
                 "would_create": { "type": "array", "items": { "type": "string" } },
                 "would_modify": { "type": "array", "items": { "type": "string" } },
                 "would_delete": { "type": "array", "items": { "type": "string" } },
+                "post_validation": { "type": "array", "items": { "type": "object" } },
                 "warnings": warnings_property()
             }),
             &[
@@ -972,6 +974,7 @@ pub fn output_schema(name: &str) -> Value {
                 "would_create",
                 "would_modify",
                 "would_delete",
+                "post_validation",
                 "warnings",
             ],
         ),
@@ -1950,6 +1953,7 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "patch": { "type": "string", "minLength": 1 },
                 "dry_run": { "type": "boolean", "default": false },
+                "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" },
                 "reason": { "type": "string", "default": "" }
             },
             "required": ["patch"],
@@ -1959,7 +1963,8 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "patch": { "type": "string", "minLength": 1 },
-                "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" }
+                "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" },
+                "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" }
             },
             "required": ["patch"],
             "additionalProperties": false

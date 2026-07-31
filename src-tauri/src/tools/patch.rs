@@ -22,6 +22,10 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("exact");
+    let validation_mode = args
+        .get("validation_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("syntax");
     let file_patches = parse_unified_diff(patch)?;
     if file_patches.is_empty() {
         return Err(patch_failed("No files were modified."));
@@ -94,6 +98,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let files_created = affected_paths(&affected, "add");
     let files_modified = affected_paths(&affected, "update");
     let files_deleted = affected_paths(&affected, "delete");
+    let post_validation = validate_staged_post_images(&staged, validation_mode)?;
 
     if !dry_run {
         let _transaction_backups = commit_staged(ws, &staged)?;
@@ -107,6 +112,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             "files_created": files_created,
             "files_modified": files_modified,
             "files_deleted": files_deleted,
+            "post_validation": post_validation,
             "recovery": "git",
             "warnings": []
         })));
@@ -121,8 +127,184 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         "would_create": files_created,
         "would_modify": files_modified,
         "would_delete": files_deleted,
+        "post_validation": post_validation,
         "warnings": []
     })))
+}
+
+fn validate_staged_post_images(
+    staged: &HashMap<String, Option<String>>,
+    mode: &str,
+) -> Result<Vec<Value>, WorkspaceError> {
+    if mode == "none" {
+        return Ok(Vec::new());
+    }
+    let mut paths = staged.keys().cloned().collect::<Vec<_>>();
+    paths.sort();
+    let mut results = Vec::new();
+    for path in paths {
+        let Some(content) = staged.get(&path).and_then(Option::as_ref) else {
+            continue;
+        };
+        let extension = PathBuf::from(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let validation = match extension.as_str() {
+            "json" => serde_json::from_str::<Value>(content)
+                .map(|_| json!({"path": path, "validator": "json", "status": "passed"}))
+                .map_err(|error| ("json", error.to_string())),
+            "yaml" | "yml" => serde_yaml::from_str::<Value>(content)
+                .map(|_| json!({"path": path, "validator": "yaml", "status": "passed"}))
+                .map_err(|error| ("yaml", error.to_string())),
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "svelte" => {
+                validate_balanced_structure(content, extension == "rs")
+                    .map(|_| json!({
+                        "path": path,
+                        "validator": "balanced_structure",
+                        "status": "passed"
+                    }))
+                    .map_err(|error| ("balanced_structure", error))
+            }
+            _ => {
+                results.push(json!({
+                    "path": path,
+                    "validator": "not_applicable",
+                    "status": "skipped"
+                }));
+                continue;
+            }
+        };
+        match validation {
+            Ok(result) => results.push(result),
+            Err((validator, message)) => {
+                results.push(json!({
+                    "path": path,
+                    "validator": validator,
+                    "status": "failed",
+                    "message": message
+                }));
+            }
+        }
+    }
+    if results
+        .iter()
+        .any(|result| result.get("status").and_then(Value::as_str) == Some("failed"))
+    {
+        return Err(WorkspaceError::ToolDetails {
+            code: "PATCH_POST_VALIDATION_FAILED",
+            message: "Patched file images failed syntax or structural validation before write.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "validation_mode": mode,
+                "post_validation": results,
+                "workspace_modified": false,
+                "suggestion": "修正失败文件的 patch 后重新运行 patch_check；验证发生在事务写盘前。"
+            }),
+        });
+    }
+    Ok(results)
+}
+
+fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<(), String> {
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut stack = Vec::<(char, usize)>::new();
+    let mut quote = None::<char>;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        let next = chars.get(index + 1).copied();
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && next == Some('/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '/' && next == Some('/') {
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        if ch == '\''
+            && rust_lifetimes
+            && next.is_some_and(|value| value.is_ascii_alphabetic() || value == '_')
+            && chars.get(index + 2).copied() != Some('\'')
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => stack.push((ch, index)),
+            ')' | ']' | '}' => {
+                let expected = match ch {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                let Some((opened, opened_at)) = stack.pop() else {
+                    return Err(format!("unexpected closing {ch} at character {}", index + 1));
+                };
+                if opened != expected {
+                    return Err(format!(
+                        "closing {ch} at character {} does not match {opened} opened at character {}",
+                        index + 1,
+                        opened_at + 1
+                    ));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if let Some(active_quote) = quote {
+        return Err(format!("unterminated {active_quote} string"));
+    }
+    if block_comment {
+        return Err("unterminated block comment".into());
+    }
+    if let Some((opened, opened_at)) = stack.pop() {
+        return Err(format!(
+            "unclosed {opened} opened at character {}",
+            opened_at + 1
+        ));
+    }
+    Ok(())
 }
 
 fn hunk_context_mismatch(
@@ -747,5 +929,37 @@ mod tests {
             std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
             "old\n"
         );
+    }
+
+    #[test]
+    fn invalid_json_post_image_is_rejected_before_write() {
+        let (_workspace, _harness, context) = context_with_file();
+        std::fs::write(
+            context.workspace.root().join("config.json"),
+            "{\"ok\": true}\n",
+        )
+        .expect("config");
+        let error = apply_patch(
+            &context,
+            &json!({
+                "patch": "--- a/config.json\n+++ b/config.json\n@@\n-{\"ok\": true}\n+{\"ok\": true\n"
+            }),
+        )
+        .expect_err("invalid JSON must fail before write");
+        assert_eq!(
+            error.to_error_value()["code"],
+            "PATCH_POST_VALIDATION_FAILED"
+        );
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("config.json")).unwrap(),
+            "{\"ok\": true}\n"
+        );
+    }
+
+    #[test]
+    fn balanced_structure_handles_rust_lifetimes_and_detects_unclosed_blocks() {
+        validate_balanced_structure("fn borrow<'a>(value: &'a str) -> &'a str { value }", true)
+            .expect("Rust lifetime is not a quote");
+        assert!(validate_balanced_structure("export const broken = {", false).is_err());
     }
 }

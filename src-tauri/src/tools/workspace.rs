@@ -56,6 +56,27 @@ fn is_link_like(path: &Path) -> bool {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
+
+    #[test]
+    fn child_process_boundary_skips_generated_dependency_link_trees() {
+        let root = tempfile::tempdir().expect("workspace");
+        let dependencies = root.path().join("node_modules").join("package");
+        std::fs::create_dir_all(&dependencies).expect("dependencies");
+        let broken = dependencies.join("missing-target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.path().join("does-not-exist"), &broken)
+            .expect("broken symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(root.path().join("does-not-exist"), &broken).is_err()
+        {
+            return;
+        }
+
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        workspace
+            .ensure_child_process_boundary()
+            .expect("generated dependency internals are not part of the recursive boundary scan");
+    }
     #[cfg(not(windows))]
     {
         metadata.file_type().is_symlink()
@@ -329,7 +350,15 @@ impl Workspace {
                     }
                     continue;
                 }
-                if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                let generated_subtree = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| DEFAULT_EXCLUDED_NAMES.contains(&name));
+                if is_directory && generated_subtree {
+                    continue;
+                }
+                if is_directory {
                     pending.push(path);
                 }
             }
