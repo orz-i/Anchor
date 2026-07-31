@@ -132,6 +132,15 @@ pub fn run(
         .unwrap_or(DEFAULT_CHECK_TIMEOUT_MS)
         .clamp(1_000, 600_000);
     let checkpoint = args.get("history_checkpoint").cloned();
+    let deferred = args
+        .get("execution_mode")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "deferred");
+    let wait_timeout_ms = args
+        .get("wait_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(60_000);
     let _workflow_lock = acquire_stage_commit_lock(ctx)?;
 
     if let Some(mut existing) = ctx
@@ -147,6 +156,23 @@ pub fn run(
             StageCommitStatus::CommittedRecoveryRequired => {
                 receipt_response(&existing, false, false)
             }
+            StageCommitStatus::CheckRunning if deferred => advance_deferred_workflow(
+                ctx,
+                &mut existing,
+                cancellation,
+                wait_timeout_ms,
+                checkpoint.as_ref(),
+                false,
+            ),
+            StageCommitStatus::CheckRunning => receipt_response(&existing, false, true),
+            StageCommitStatus::Started if deferred => advance_deferred_workflow(
+                ctx,
+                &mut existing,
+                cancellation,
+                wait_timeout_ms,
+                checkpoint.as_ref(),
+                false,
+            ),
             StageCommitStatus::Started | StageCommitStatus::ChecksPassed => {
                 let current = super::state::capture_baseline(ctx.workspace.root());
                 if current.head.as_deref() != Some(expected_head)
@@ -177,7 +203,9 @@ pub fn run(
                         checks,
                         check_timeout_ms,
                         checkpoint.as_ref(),
-                        Some(existing.workflow_id),
+                        Some(existing),
+                        false,
+                        0,
                     )
                 }
             }
@@ -207,6 +235,8 @@ pub fn run(
         check_timeout_ms,
         checkpoint.as_ref(),
         None,
+        deferred,
+        wait_timeout_ms,
     )
 }
 
@@ -224,7 +254,9 @@ fn execute_new_workflow(
     checks: Vec<String>,
     check_timeout_ms: u64,
     checkpoint: Option<&Value>,
-    existing_workflow_id: Option<String>,
+    existing_receipt: Option<StageCommitReceipt>,
+    deferred: bool,
+    wait_timeout_ms: u64,
 ) -> Result<Value, WorkspaceError> {
     let task = ctx.harness.task(task_id).map_err(harness_error)?;
     if !task.status.is_writable() {
@@ -267,14 +299,26 @@ fn execute_new_workflow(
         ));
     }
 
+    let is_new_receipt = existing_receipt.is_none();
     let now = timestamp();
-    let mut receipt = StageCommitReceipt {
-        workflow_id: existing_workflow_id.unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+    let mut receipt = existing_receipt.unwrap_or_else(|| StageCommitReceipt {
+        workflow_id: Uuid::new_v4().simple().to_string(),
         idempotency_key: idempotency_key.to_string(),
         task_id: task_id.to_string(),
         status: StageCommitStatus::Started,
         expected_head: expected_head.to_string(),
         expected_fingerprint: expected_fingerprint.to_string(),
+        message: message.to_string(),
+        reason: original_args
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        required_checks: checks.clone(),
+        check_timeout_ms,
+        current_check_index: 0,
+        current_session_id: None,
+        history_checkpoint: checkpoint.cloned(),
         paths: paths.clone(),
         checks: Vec::new(),
         verification_ids: Vec::new(),
@@ -289,24 +333,48 @@ fn execute_new_workflow(
         error: None,
         created_at: now.clone(),
         updated_at: now,
-    };
+    });
+    if receipt.message.is_empty() {
+        receipt.message = message.to_string();
+    }
+    if receipt.required_checks.is_empty() {
+        receipt.required_checks = checks.clone();
+    }
+    if receipt.history_checkpoint.is_none() {
+        receipt.history_checkpoint = checkpoint.cloned();
+    }
+    receipt.check_timeout_ms = check_timeout_ms;
     save_receipt(ctx, &receipt)?;
-    let _ = ctx.harness.record_operation(
-        Some(&receipt.workflow_id),
-        Some(task_id),
-        None,
-        "stage_commit",
-        "started",
-        json!({
-            "reason": original_args.get("reason"),
-            "paths": paths,
-            "required_checks": checks,
-            "message": message
-        }),
-        json!({"ok": true}),
-    );
+    if is_new_receipt {
+        let _ = ctx.harness.record_operation(
+            Some(&receipt.workflow_id),
+            Some(task_id),
+            None,
+            "stage_commit",
+            "started",
+            json!({
+                "reason": original_args.get("reason"),
+                "paths": paths,
+                "required_checks": checks,
+                "message": message,
+                "execution_mode": if deferred { "deferred" } else { "blocking" }
+            }),
+            json!({"ok": true}),
+        );
+    }
 
-    for command in checks {
+    if deferred {
+        return advance_deferred_workflow(
+            ctx,
+            &mut receipt,
+            cancellation,
+            wait_timeout_ms,
+            checkpoint,
+            false,
+        );
+    }
+
+    for command in checks.into_iter().skip(receipt.checks.len()) {
         let mut result = run_required_check(ctx, &command, check_timeout_ms, cancellation)?;
         let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
         let verification = ctx
@@ -545,6 +613,374 @@ fn execute_new_workflow(
     save_receipt(ctx, &receipt)?;
     finish_operation(ctx, &receipt, true);
     receipt_response(&receipt, true, false)
+}
+
+pub fn status(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = required_string(args, "task_id")?;
+    let idempotency_key = required_string(args, "idempotency_key")?;
+    let receipt = ctx
+        .harness
+        .load_stage_commit_receipt(idempotency_key)
+        .map_err(harness_error)?
+        .ok_or_else(|| {
+            stage_error(
+                "STAGE_COMMIT_NOT_FOUND",
+                "No stage_commit workflow exists for this idempotency key.",
+                false,
+                json!({"idempotency_key": idempotency_key}),
+            )
+        })?;
+    ensure_receipt_task(&receipt, task_id)?;
+    receipt_response(
+        &receipt,
+        matches!(&receipt.status, StageCommitStatus::Completed),
+        stage_status_retryable(&receipt.status),
+    )
+}
+
+pub fn wait(
+    ctx: &ToolContext,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    let task_id = required_string(args, "task_id")?;
+    let idempotency_key = required_string(args, "idempotency_key")?;
+    let wait_timeout_ms = args
+        .get("wait_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .min(60_000);
+    let restart_lost_check = args
+        .get("restart_lost_check")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let checkpoint = args.get("history_checkpoint");
+    let _workflow_lock = acquire_stage_commit_lock(ctx)?;
+    let mut receipt = ctx
+        .harness
+        .load_stage_commit_receipt(idempotency_key)
+        .map_err(harness_error)?
+        .ok_or_else(|| {
+            stage_error(
+                "STAGE_COMMIT_NOT_FOUND",
+                "No stage_commit workflow exists for this idempotency key.",
+                false,
+                json!({"idempotency_key": idempotency_key}),
+            )
+        })?;
+    ensure_receipt_task(&receipt, task_id)?;
+    advance_deferred_workflow(
+        ctx,
+        &mut receipt,
+        cancellation,
+        wait_timeout_ms,
+        checkpoint,
+        restart_lost_check,
+    )
+}
+
+fn ensure_receipt_task(
+    receipt: &StageCommitReceipt,
+    task_id: &str,
+) -> Result<(), WorkspaceError> {
+    if receipt.task_id == task_id {
+        return Ok(());
+    }
+    Err(stage_error(
+        "STAGE_COMMIT_TASK_MISMATCH",
+        "The stage_commit workflow belongs to another task.",
+        false,
+        json!({
+            "expected_task_id": receipt.task_id,
+            "observed_task_id": task_id
+        }),
+    ))
+}
+
+fn advance_deferred_workflow(
+    ctx: &ToolContext,
+    receipt: &mut StageCommitReceipt,
+    cancellation: &CancellationToken,
+    wait_timeout_ms: u64,
+    checkpoint_override: Option<&Value>,
+    restart_lost_check: bool,
+) -> Result<Value, WorkspaceError> {
+    if let Some(checkpoint) = checkpoint_override {
+        receipt.history_checkpoint = Some(checkpoint.clone());
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, receipt)?;
+    }
+    let deadline = Instant::now() + Duration::from_millis(wait_timeout_ms);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(stage_error(
+                "REQUEST_CANCELLED",
+                "Waiting for stage_commit was cancelled; the durable workflow remains available.",
+                true,
+                json!({"workflow_id": receipt.workflow_id}),
+            ));
+        }
+        match receipt.status.clone() {
+            StageCommitStatus::Started => {
+                if receipt.current_check_index >= receipt.required_checks.len() {
+                    receipt.status = StageCommitStatus::ChecksPassed;
+                    receipt.updated_at = timestamp();
+                    save_receipt(ctx, receipt)?;
+                    continue;
+                }
+                start_deferred_check(ctx, receipt, cancellation)?;
+                if wait_timeout_ms == 0 {
+                    return receipt_response(receipt, false, true);
+                }
+            }
+            StageCommitStatus::CheckRunning => {
+                let Some(session_id) = receipt.current_session_id.clone() else {
+                    if restart_lost_check {
+                        receipt.status = StageCommitStatus::Started;
+                        receipt.error = None;
+                        receipt.updated_at = timestamp();
+                        save_receipt(ctx, receipt)?;
+                        continue;
+                    }
+                    receipt.error = Some(json!({
+                        "code": "STAGE_COMMIT_CHECK_SESSION_LOST",
+                        "message": "The retained check session is unavailable. Pass restart_lost_check=true to explicitly rerun this check."
+                    }));
+                    receipt.updated_at = timestamp();
+                    save_receipt(ctx, receipt)?;
+                    return receipt_response(receipt, false, true);
+                };
+                let remaining_ms = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(60_000) as u64;
+                if wait_timeout_ms == 0 || remaining_ms == 0 {
+                    return receipt_response(receipt, false, true);
+                }
+                let waited = match session::wait_command(
+                    &ctx.sessions,
+                    &json!({
+                        "session_id": session_id,
+                        "timeout_ms": remaining_ms,
+                        "return_incremental_output": false,
+                        "limit": 65_536
+                    }),
+                ) {
+                    Ok(value) => value,
+                    Err(error)
+                        if error.to_error_value()["code"] == "SESSION_NOT_FOUND" =>
+                    {
+                        receipt.current_session_id = None;
+                        receipt.error = Some(json!({
+                            "code": "STAGE_COMMIT_CHECK_SESSION_LOST",
+                            "message": "The retained check session was lost, usually because the service restarted. Pass restart_lost_check=true to explicitly rerun this check."
+                        }));
+                        receipt.updated_at = timestamp();
+                        save_receipt(ctx, receipt)?;
+                        if restart_lost_check {
+                            receipt.status = StageCommitStatus::Started;
+                            receipt.error = None;
+                            save_receipt(ctx, receipt)?;
+                            continue;
+                        }
+                        return receipt_response(receipt, false, true);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if waited.get("state").and_then(Value::as_str) == Some("running") {
+                    return receipt_response(receipt, false, true);
+                }
+                let result = session::write_stdin(
+                    &ctx.sessions,
+                    &json!({
+                        "session_id": session_id,
+                        "chars": "",
+                        "yield_time_ms": 0,
+                        "max_output_bytes": 65_536
+                    }),
+                )?;
+                persist_deferred_check_result(ctx, receipt, result)?;
+                if matches!(&receipt.status, StageCommitStatus::Failed) {
+                    return receipt_response(receipt, false, false);
+                }
+            }
+            StageCommitStatus::ChecksPassed => {
+                return commit_deferred_receipt(ctx, receipt, cancellation, checkpoint_override);
+            }
+            StageCommitStatus::Committed | StageCommitStatus::CommittedCheckpointPending => {
+                let checkpoint = checkpoint_override
+                    .cloned()
+                    .or_else(|| receipt.history_checkpoint.clone());
+                return resume_checkpoint(ctx, receipt, checkpoint.as_ref());
+            }
+            StageCommitStatus::Completed => return receipt_response(receipt, true, false),
+            StageCommitStatus::CommittedRecoveryRequired | StageCommitStatus::Failed => {
+                return receipt_response(receipt, false, stage_status_retryable(&receipt.status));
+            }
+        }
+        if wait_timeout_ms > 0 && Instant::now() >= deadline {
+            return receipt_response(receipt, false, true);
+        }
+    }
+}
+
+fn start_deferred_check(
+    ctx: &ToolContext,
+    receipt: &mut StageCommitReceipt,
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceError> {
+    let command = receipt
+        .required_checks
+        .get(receipt.current_check_index)
+        .cloned()
+        .ok_or_else(|| invalid_argument("current deferred check is out of range"))?;
+    let arguments = json!({
+        "cmd": command,
+        "timeout_ms": receipt.check_timeout_ms,
+        "yield_time_ms": 0,
+        "max_output_bytes": 65_536,
+        "filesystem_scope": "workspace",
+        "reason": "deferred stage_commit required check"
+    });
+    validate_tool_arguments_for_workspace(
+        "exec_command",
+        &arguments,
+        &ctx.policy,
+        Some(&ctx.workspace),
+    )
+    .map_err(|error| {
+        stage_error(
+            "STAGE_COMMIT_CHECK_REJECTED",
+            error.to_string(),
+            false,
+            json!({"command": command}),
+        )
+    })?;
+    let result = exec::exec_command_with_cancellation(ctx, &arguments, cancellation)?;
+    if result.get("status").and_then(Value::as_str) == Some("running") {
+        receipt.current_session_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        receipt.status = StageCommitStatus::CheckRunning;
+        receipt.error = None;
+        receipt.updated_at = timestamp();
+        save_receipt(ctx, receipt)?;
+        return Ok(());
+    }
+    persist_deferred_check_result(ctx, receipt, result)
+}
+
+fn persist_deferred_check_result(
+    ctx: &ToolContext,
+    receipt: &mut StageCommitReceipt,
+    mut result: Value,
+) -> Result<(), WorkspaceError> {
+    let command = receipt
+        .required_checks
+        .get(receipt.current_check_index)
+        .cloned()
+        .ok_or_else(|| invalid_argument("completed deferred check is out of range"))?;
+    let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
+    let verification = ctx
+        .harness
+        .record_verification(
+            &receipt.task_id,
+            verification_kind(&command),
+            &command,
+            result
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok()),
+            passed,
+            result
+                .get("duration_ms")
+                .or_else(|| result.get("elapsed_ms"))
+                .and_then(Value::as_u64),
+            None,
+        )
+        .map_err(harness_error)?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("command".into(), Value::String(command.clone()));
+        object.insert(
+            "verification_id".into(),
+            Value::String(verification.id.clone()),
+        );
+        object.insert("verification_kind".into(), Value::String(verification.kind));
+        object.insert(
+            "verification_status".into(),
+            Value::String(verification.status),
+        );
+    }
+    receipt.verification_ids.push(verification.id);
+    receipt.checks.push(result.clone());
+    receipt.current_check_index = receipt.current_check_index.saturating_add(1);
+    receipt.current_session_id = None;
+    receipt.updated_at = timestamp();
+    if passed {
+        receipt.status = StageCommitStatus::Started;
+        receipt.error = None;
+    } else {
+        receipt.status = StageCommitStatus::Failed;
+        receipt.error = Some(json!({
+            "code": "STAGE_COMMIT_CHECK_FAILED",
+            "command": command,
+            "result": result
+        }));
+        finish_operation(ctx, receipt, false);
+    }
+    save_receipt(ctx, receipt)
+}
+
+fn commit_deferred_receipt(
+    ctx: &ToolContext,
+    receipt: &StageCommitReceipt,
+    cancellation: &CancellationToken,
+    checkpoint_override: Option<&Value>,
+) -> Result<Value, WorkspaceError> {
+    let checkpoint = checkpoint_override
+        .cloned()
+        .or_else(|| receipt.history_checkpoint.clone());
+    let args = json!({
+        "task_id": receipt.task_id,
+        "expected_head": receipt.expected_head,
+        "expected_fingerprint": receipt.expected_fingerprint,
+        "message": receipt.message,
+        "idempotency_key": receipt.idempotency_key,
+        "paths": receipt.paths,
+        "required_checks": [],
+        "check_timeout_ms": receipt.check_timeout_ms,
+        "reason": receipt.reason,
+        "history_checkpoint": checkpoint.clone()
+    });
+    execute_new_workflow(
+        ctx,
+        &args,
+        cancellation,
+        &receipt.task_id,
+        &receipt.expected_head,
+        &receipt.expected_fingerprint,
+        &receipt.message,
+        &receipt.idempotency_key,
+        receipt.paths.clone(),
+        Vec::new(),
+        receipt.check_timeout_ms,
+        checkpoint.as_ref(),
+        Some(receipt.clone()),
+        false,
+        0,
+    )
+}
+
+fn stage_status_retryable(status: &StageCommitStatus) -> bool {
+    matches!(
+        status,
+        StageCommitStatus::Started
+            | StageCommitStatus::CheckRunning
+            | StageCommitStatus::ChecksPassed
+            | StageCommitStatus::Committed
+            | StageCommitStatus::CommittedCheckpointPending
+    )
 }
 
 fn resume_checkpoint(
@@ -1073,15 +1509,34 @@ fn receipt_response(
     complete: bool,
     retryable: bool,
 ) -> Result<Value, WorkspaceError> {
+    let state = match &receipt.status {
+        StageCommitStatus::Started
+        | StageCommitStatus::CheckRunning
+        | StageCommitStatus::ChecksPassed => "running",
+        StageCommitStatus::Committed | StageCommitStatus::CommittedCheckpointPending => {
+            "checkpoint_pending"
+        }
+        StageCommitStatus::Completed => "completed",
+        StageCommitStatus::CommittedRecoveryRequired | StageCommitStatus::Failed => "failed",
+    };
+    let current_check = receipt
+        .required_checks
+        .get(receipt.current_check_index)
+        .cloned();
     let mut response = json!({
         "workflow_id": receipt.workflow_id,
         "idempotency_key": receipt.idempotency_key,
         "workflow_status": receipt.status,
+        "state": state,
         "complete": complete,
         "retryable": retryable,
         "task_id": receipt.task_id,
         "paths": receipt.paths,
         "checks": receipt.checks,
+        "required_check_count": receipt.required_checks.len(),
+        "current_check_index": receipt.current_check_index,
+        "current_check": current_check,
+        "current_session_id": receipt.current_session_id,
         "verification_ids": receipt.verification_ids,
         "commit_sha": receipt.commit_sha,
         "committed_files": receipt.committed_files,
@@ -1091,6 +1546,11 @@ fn receipt_response(
         "baseline_refreshed": receipt.baseline_refreshed,
         "checkpoint_hash": receipt.checkpoint_hash,
         "checkpoint_count": receipt.checkpoint_count,
+        "next_actions": match state {
+            "running" => vec!["stage_commit_status", "wait_stage_commit"],
+            "checkpoint_pending" => vec!["wait_stage_commit"],
+            _ => Vec::<&str>::new(),
+        }
     });
     if let (Some(object), Some(error)) = (response.as_object_mut(), receipt.error.clone()) {
         object.insert("error".into(), error);
@@ -1311,6 +1771,67 @@ mod tests {
 
         let second = run(&ctx, &arguments, &CancellationToken::default()).expect("idempotent");
         assert_eq!(second["commit_sha"], first["commit_sha"]);
+        assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
+    }
+
+    #[test]
+    fn deferred_stage_commit_is_waitable_and_does_not_replay_completed_checks() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
+        let arguments = json!({
+            "task_id": task_id,
+            "expected_head": expected_head,
+            "expected_fingerprint": expected_fingerprint,
+            "paths": ["main.txt"],
+            "message": "deferred commit",
+            "required_checks": ["python -c \"import time; time.sleep(0.2); print('ok')\""],
+            "idempotency_key": "deferred-stage",
+            "execution_mode": "deferred",
+            "wait_timeout_ms": 0
+        });
+
+        let started = run(&ctx, &arguments, &CancellationToken::default()).expect("started");
+        assert_eq!(started["state"], "running");
+        assert_eq!(started["complete"], false);
+        assert_eq!(started["current_check_index"], 0);
+        assert!(started["current_session_id"].as_str().is_some());
+
+        let observed = status(
+            &ctx,
+            &json!({"task_id": task_id, "idempotency_key": "deferred-stage"}),
+        )
+        .expect("status");
+        assert_eq!(observed["state"], "running");
+
+        let completed = wait(
+            &ctx,
+            &json!({
+                "task_id": task_id,
+                "idempotency_key": "deferred-stage",
+                "wait_timeout_ms": 60_000
+            }),
+            &CancellationToken::default(),
+        )
+        .expect("completed");
+        assert_eq!(completed["state"], "completed");
+        assert_eq!(completed["complete"], true);
+        assert_eq!(completed["checks"].as_array().unwrap().len(), 1);
+        let commit_sha = completed["commit_sha"].clone();
+
+        let repeated = wait(
+            &ctx,
+            &json!({
+                "task_id": task_id,
+                "idempotency_key": "deferred-stage",
+                "wait_timeout_ms": 1
+            }),
+            &CancellationToken::default(),
+        )
+        .expect("idempotent wait");
+        assert_eq!(repeated["commit_sha"], commit_sha);
+        assert_eq!(repeated["checks"].as_array().unwrap().len(), 1);
         assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
     }
 

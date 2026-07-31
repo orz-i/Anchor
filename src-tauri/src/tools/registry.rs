@@ -142,9 +142,25 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "stage_commit",
         "Validate and commit a stage",
-        "Run required checks, stage only selected paths through a temporary Git index, create one commit, advance the Harness expected state, and optionally persist a history checkpoint with resumable evidence.",
+        "Run or start a durable staged-commit workflow. Deferred mode returns quickly and is advanced with wait_stage_commit without replaying completed checks.",
         false,
         true,
+        false,
+    ),
+    (
+        "stage_commit_status",
+        "Stage commit status",
+        "Read a durable stage_commit workflow without advancing or replaying it.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "wait_stage_commit",
+        "Wait for stage commit",
+        "Wait for and advance a deferred stage_commit workflow for up to sixty seconds.",
+        false,
+        false,
         false,
     ),
     (
@@ -458,6 +474,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "start_task",
     "refresh_baseline",
     "stage_commit",
+    "stage_commit_status",
+    "wait_stage_commit",
     "update_task",
     "pause_task",
     "resume_task",
@@ -484,6 +502,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "start_task",
     "refresh_baseline",
     "stage_commit",
+    "wait_stage_commit",
     "update_task",
     "pause_task",
     "resume_task",
@@ -493,6 +512,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
 pub const READ_ONLY_TOOLS: &[&str] = &[
     "harness_status",
     "operation_log",
+    "stage_commit_status",
     "server_info",
     "list_skills",
     "load_skill",
@@ -1320,16 +1340,21 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &["task_id", "verification", "verification_status", "effective_disposition"],
         ),
-        "stage_commit" => success_output_schema(
+        "stage_commit" | "stage_commit_status" | "wait_stage_commit" => success_output_schema(
             json!({
                 "workflow_id": { "type": "string", "minLength": 1 },
                 "idempotency_key": { "type": "string", "minLength": 1 },
                 "workflow_status": { "type": "string", "minLength": 1 },
+                "state": { "type": "string", "enum": ["running", "checkpoint_pending", "completed", "failed"] },
                 "complete": { "type": "boolean" },
                 "retryable": { "type": "boolean" },
                 "task_id": { "type": "string", "minLength": 1 },
                 "paths": { "type": "array", "items": { "type": "string" } },
                 "checks": { "type": "array", "items": { "type": "object" } },
+                "required_check_count": { "type": "integer", "minimum": 0 },
+                "current_check_index": { "type": "integer", "minimum": 0 },
+                "current_check": { "type": ["string", "null"] },
+                "current_session_id": { "type": ["string", "null"] },
                 "verification_ids": { "type": "array", "items": { "type": "string" } },
                 "commit_sha": { "type": ["string", "null"] },
                 "committed_files": { "type": "array", "items": { "type": "string" } },
@@ -1339,23 +1364,28 @@ pub fn output_schema(name: &str) -> Value {
                 "baseline_refreshed": { "type": "boolean" },
                 "checkpoint_hash": { "type": ["string", "null"] },
                 "checkpoint_count": nullable_integer_property(),
+                "next_actions": { "type": "array", "items": { "type": "string" } },
                 "error": { "type": ["object", "null"] }
             }),
             &[
                 "workflow_id",
                 "idempotency_key",
                 "workflow_status",
+                "state",
                 "complete",
                 "retryable",
                 "task_id",
                 "paths",
                 "checks",
+                "required_check_count",
+                "current_check_index",
                 "verification_ids",
                 "committed_files",
                 "working_tree_files",
                 "runtime_artifacts",
                 "ignored_files",
                 "baseline_refreshed",
+                "next_actions",
             ],
         ),
         "finish_task" => json!({
@@ -1525,6 +1555,35 @@ pub fn input_schema(name: &str) -> Value {
             },
             "additionalProperties": false
         }),
+        "stage_commit_status" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required": ["task_id", "idempotency_key"],
+            "additionalProperties": false
+        }),
+        "wait_stage_commit" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "wait_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 30000 },
+                "restart_lost_check": { "type": "boolean", "default": false },
+                "history_checkpoint": {
+                    "type": "object",
+                    "required": ["session_key", "expected_path"],
+                    "properties": {
+                        "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 }
+                    },
+                    "additionalProperties": true
+                }
+            },
+            "required": ["task_id", "idempotency_key"],
+            "additionalProperties": false
+        }),
         "accept_current_baseline" => json!({
             "type": "object",
             "properties": {
@@ -1555,6 +1614,8 @@ pub fn input_schema(name: &str) -> Value {
                     "items": { "type": "string", "minLength": 1, "maxLength": 4000 }
                 },
                 "check_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "default": 600000 },
+                "execution_mode": { "type": "string", "enum": ["blocking", "deferred"], "default": "blocking" },
+                "wait_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 0 },
                 "history_checkpoint": {
                     "type": "object",
                     "required": ["session_key", "expected_path"],

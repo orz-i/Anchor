@@ -25,6 +25,7 @@ pub enum HarnessSessionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum StageCommitStatus {
     Started,
+    CheckRunning,
     ChecksPassed,
     Committed,
     CommittedRecoveryRequired,
@@ -41,6 +42,20 @@ pub struct StageCommitReceipt {
     pub status: StageCommitStatus,
     pub expected_head: String,
     pub expected_fingerprint: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub required_checks: Vec<String>,
+    #[serde(default = "default_stage_check_timeout_ms")]
+    pub check_timeout_ms: u64,
+    #[serde(default)]
+    pub current_check_index: usize,
+    #[serde(default)]
+    pub current_session_id: Option<String>,
+    #[serde(default)]
+    pub history_checkpoint: Option<Value>,
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -63,6 +78,10 @@ pub struct StageCommitReceipt {
     pub error: Option<Value>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_stage_check_timeout_ms() -> u64 {
+    600_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
