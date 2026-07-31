@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 9,
+    "catalog_version": 10,
     "names": [
       "accept_current_baseline",
       "apply_patch",
@@ -53,7 +53,7 @@
     "tool_count": 47
   },
   "core": {
-    "catalog_version": 9,
+    "catalog_version": 10,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -87,7 +87,7 @@
     "tool_count": 28
   },
   "read-only": {
-    "catalog_version": 9,
+    "catalog_version": 10,
     "names": [
       "check_exec_environment",
       "get_default_cwd",

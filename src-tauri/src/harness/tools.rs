@@ -9,7 +9,7 @@ use crate::tools::{CancellationToken, ToolContext};
 
 use super::model::{
     HarnessEvent, HarnessSessionStatus, OperationRecord, TaskSession, TaskStatus,
-    VerificationRecord,
+    VerificationRecord, WorkSessionCloseOutbox, WorkSessionClosePhase, SCHEMA_VERSION,
 };
 use super::store::HarnessError;
 
@@ -45,6 +45,11 @@ pub fn call(
     args: &Value,
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
+    let recovered_outboxes = if name == "close_work_session" {
+        Vec::new()
+    } else {
+        recover_close_outboxes(ctx)?
+    };
     let value = match name {
         "harness_status" => harness_status(ctx),
         "operation_log" => operation_log(ctx, args),
@@ -67,6 +72,12 @@ pub fn call(
         "change_summary" => change_summary(ctx, args),
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
+    let mut value = value;
+    if !recovered_outboxes.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("outbox_recovery".into(), json!(recovered_outboxes));
+        }
+    }
     Ok(tool_ok(value))
 }
 
@@ -200,6 +211,9 @@ fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
 
 fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
+    if let Some(outbox) = ctx.harness.load_close_outbox(task_id).map_err(map_error)? {
+        return resume_close_outbox(ctx, outbox, true);
+    }
     let task_before = ctx.harness.task(task_id).map_err(map_error)?;
     let session_key = task_before
         .history_session_key
@@ -209,31 +223,7 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
         .history_session_path
         .clone()
         .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 History Session 路径"))?;
-
-    let finish = if task_before.status.is_writable() {
-        finish_task(ctx, args)?
-    } else {
-        json!({
-            "ok": true,
-            "task_status": task_before.status,
-            "closed": true,
-            "session_status": args.get("session_status").and_then(Value::as_str).unwrap_or("paused"),
-            "next_stage_started": false,
-            "task": task_view(&task_before),
-            "idempotent_retry": true
-        })
-    };
-    if finish.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Ok(json!({
-            "ok": false,
-            "closed": false,
-            "phase": "finish_task",
-            "finish": finish,
-            "checkpoint": null,
-            "retryable": true
-        }));
-    }
-
+    let session_status = parse_session_status(args)?;
     let mut checkpoint = args
         .get("checkpoint")
         .cloned()
@@ -253,45 +243,209 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
                 .to_string(),
         );
     }
-    checkpoint["session_status"] = Value::String(
-        args.get("session_status")
-            .and_then(Value::as_str)
-            .unwrap_or("paused")
-            .to_string(),
-    );
-    let checkpoint = crate::tools::history::checkpoint(ctx, &checkpoint).map_err(|error| {
-        WorkspaceError::ToolDetails {
-            code: "WORK_SESSION_CHECKPOINT_PENDING",
-            message: error.message(),
-            category: "runtime",
-            retryable: true,
-            details: json!({
-                "phase": "history_checkpoint",
-                "task_closed": true,
-                "task_id": task_id,
-                "session_key": session_key,
-                "expected_path": expected_path,
-                "suggestion": "使用相同 task_id 重新调用 close_work_session；已关闭任务不会重复完成。",
-                "cause": error.to_error_value()
-            }),
+    checkpoint["session_status"] =
+        Value::String(harness_session_status_text(session_status).to_string());
+    let mut finish_args = args.clone();
+    finish_args["task_id"] = Value::String(task_id.to_string());
+    let now = harness_timestamp();
+    let outbox = WorkSessionCloseOutbox {
+        schema_version: SCHEMA_VERSION,
+        task_id: task_id.to_string(),
+        history_session_key: session_key,
+        history_session_path: expected_path,
+        session_status,
+        finish_args,
+        checkpoint_args: checkpoint,
+        phase: WorkSessionClosePhase::Prepared,
+        attempts: 0,
+        last_error: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+    resume_close_outbox(ctx, outbox, true)
+}
+
+pub(crate) fn recover_close_outboxes(ctx: &ToolContext) -> Result<Vec<Value>, WorkspaceError> {
+    let outboxes = ctx.harness.list_close_outboxes().map_err(map_error)?;
+    let mut recovered = Vec::new();
+    for outbox in outboxes {
+        if outbox.phase == WorkSessionClosePhase::Completed {
+            continue;
         }
-    })?;
-    let task = ctx.harness.task(task_id).map_err(map_error)?;
-    Ok(json!({
-        "work_session": {
-            "status": args.get("session_status").and_then(Value::as_str).unwrap_or("paused"),
-            "history_session_key": session_key,
-            "history_session_path": expected_path,
-            "task_id": task_id,
+        match resume_close_outbox(ctx, outbox, false) {
+            Ok(result) => recovered.push(json!({
+                "ok": result.get("ok").cloned().unwrap_or(Value::Bool(false)),
+                "task_id": result.pointer("/work_session/task_id").cloned(),
+                "phase": result.pointer("/outbox/phase").cloned(),
+                "closed": result.pointer("/work_session/closed").cloned()
+            })),
+            Err(error) => recovered.push(json!({
+                "ok": false,
+                "error": error.to_error_value()
+            })),
+        }
+    }
+    Ok(recovered)
+}
+
+fn resume_close_outbox(
+    ctx: &ToolContext,
+    mut outbox: WorkSessionCloseOutbox,
+    propagate_checkpoint_error: bool,
+) -> Result<Value, WorkspaceError> {
+    outbox.attempts = outbox.attempts.saturating_add(1);
+    outbox.updated_at = harness_timestamp();
+    ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+
+    let mut finish = None;
+    let mut checkpoint = None;
+    if outbox.phase == WorkSessionClosePhase::Completed {
+        let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+        finish = Some(json!({
+            "ok": true,
             "task_status": task.status,
             "closed": true,
+            "session_status": harness_session_status_text(outbox.session_status),
+            "next_stage_started": false,
+            "task": task_view(&task),
+            "idempotent_retry": true
+        }));
+        checkpoint = Some(json!({
+            "ok": true,
+            "session_key": outbox.history_session_key,
+            "path": outbox.history_session_path,
+            "idempotent_retry": true,
+            "outbox_completed": true
+        }));
+    }
+    if outbox.phase == WorkSessionClosePhase::Prepared {
+        let task_before = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+        let result = if task_before.status.is_writable() {
+            finish_task(ctx, &outbox.finish_args)?
+        } else {
+            json!({
+                "ok": true,
+                "task_status": task_before.status,
+                "closed": true,
+                "session_status": harness_session_status_text(outbox.session_status),
+                "next_stage_started": false,
+                "task": task_view(&task_before),
+                "idempotent_retry": true
+            })
+        };
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            outbox.last_error = Some(json!({
+                "phase": "finish_task",
+                "result": result
+            }));
+            outbox.updated_at = harness_timestamp();
+            ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+            return Ok(json!({
+                "ok": false,
+                "closed": false,
+                "phase": "finish_task",
+                "finish": result,
+                "checkpoint": null,
+                "retryable": true,
+                "outbox": close_outbox_view(&outbox)
+            }));
+        }
+        finish = Some(result);
+        outbox.phase = WorkSessionClosePhase::TaskClosed;
+        outbox.last_error = None;
+        outbox.updated_at = harness_timestamp();
+        ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+    }
+
+    if matches!(
+        outbox.phase,
+        WorkSessionClosePhase::TaskClosed | WorkSessionClosePhase::CheckpointPending
+    ) {
+        match crate::tools::history::checkpoint(ctx, &outbox.checkpoint_args) {
+            Ok(result) => {
+                checkpoint = Some(result);
+                outbox.phase = WorkSessionClosePhase::Completed;
+                outbox.last_error = None;
+                outbox.updated_at = harness_timestamp();
+                ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+            }
+            Err(error) => {
+                outbox.phase = WorkSessionClosePhase::CheckpointPending;
+                outbox.last_error = Some(json!({
+                    "phase": "history_checkpoint",
+                    "cause": error.to_error_value()
+                }));
+                outbox.updated_at = harness_timestamp();
+                ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+                if propagate_checkpoint_error {
+                    return Err(WorkspaceError::ToolDetails {
+                        code: "WORK_SESSION_CHECKPOINT_PENDING",
+                        message: error.message(),
+                        category: "runtime",
+                        retryable: true,
+                        details: json!({
+                            "phase": "history_checkpoint",
+                            "task_closed": true,
+                            "task_id": outbox.task_id,
+                            "session_key": outbox.history_session_key,
+                            "expected_path": outbox.history_session_path,
+                            "outbox": close_outbox_view(&outbox),
+                            "suggestion": "Checkpoint intent is durable and will be retried automatically on the next Harness call.",
+                            "cause": error.to_error_value()
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+    let completed = outbox.phase == WorkSessionClosePhase::Completed;
+    Ok(json!({
+        "ok": completed,
+        "work_session": {
+            "status": harness_session_status_text(outbox.session_status),
+            "history_session_key": outbox.history_session_key,
+            "history_session_path": outbox.history_session_path,
+            "task_id": outbox.task_id,
+            "task_status": task.status,
+            "closed": completed,
             "next_stage_started": false
         },
         "finish": finish,
         "checkpoint": checkpoint,
+        "outbox": close_outbox_view(&outbox),
         "task": task_view(&task),
         "harness": ctx.harness.status().map_err(map_error)?
     }))
+}
+
+fn close_outbox_view(outbox: &WorkSessionCloseOutbox) -> Value {
+    json!({
+        "schema_version": outbox.schema_version,
+        "task_id": outbox.task_id,
+        "phase": outbox.phase,
+        "attempts": outbox.attempts,
+        "last_error": outbox.last_error,
+        "created_at": outbox.created_at,
+        "updated_at": outbox.updated_at
+    })
+}
+
+fn harness_session_status_text(status: HarnessSessionStatus) -> &'static str {
+    match status {
+        HarnessSessionStatus::Active => "active",
+        HarnessSessionStatus::Paused => "paused",
+        HarnessSessionStatus::Completed => "completed",
+    }
+}
+
+fn harness_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".into())
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
@@ -1032,8 +1186,9 @@ fn parse_session_status(args: &Value) -> Result<HarnessSessionStatus, WorkspaceE
 
 fn baseline_view(task: &TaskSession) -> Value {
     json!({
-        "file_count": task.baseline.entries.len(),
+        "file_count": task.baseline.file_count,
         "baseline_hash": task.baseline.worktree_fingerprint,
+        "baseline_object_id": task.baseline.object_id,
         "head": task.baseline.head,
         "branch": task.baseline.branch,
         "captured_at": task.baseline.captured_at

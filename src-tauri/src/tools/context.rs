@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::harness::Harness;
-use crate::tools::command_cost::CommandCostGuard;
 use crate::tools::catalog::EffectiveCatalog;
+use crate::tools::command_cost::CommandCostGuard;
 use crate::tools::policy::PolicySettings;
 use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
@@ -72,7 +72,7 @@ impl ToolContext {
     ) -> Self {
         let root = workspace.root().to_path_buf();
         let command_cost = CommandCostGuard::new(&harness_root, &root);
-        Self {
+        let context = Self {
             workspace,
             auth,
             policy,
@@ -86,7 +86,9 @@ impl ToolContext {
             sessions: SessionStore::new(),
             command_cost,
             published_catalog: Mutex::new(None),
-        }
+        };
+        let _ = crate::harness::tools::recover_close_outboxes(&context);
+        context
     }
 
     pub fn for_test(workspace_path: PathBuf, harness_root: PathBuf) -> Result<Self, String> {
@@ -203,11 +205,9 @@ mod tests {
     fn published_catalog_remains_stable_and_requires_reconnect_on_drift() {
         let workspace = tempfile::tempdir().expect("workspace");
         let harness = tempfile::tempdir().expect("harness");
-        let ctx = ToolContext::for_test(
-            workspace.path().to_path_buf(),
-            harness.path().to_path_buf(),
-        )
-        .expect("context");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
         let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
         let advanced =
             build_effective_catalog_from_parts("advanced", true, Vec::new()).expect("advanced");

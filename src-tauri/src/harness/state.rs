@@ -11,12 +11,13 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::model::{
-    BaselineEntry, CapabilityStatus, ChangeSet, ExpectedWorkspaceState, FileChangeRecord,
-    HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord, ProjectBaseline,
-    ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt, TaskSession, TaskStatus,
-    VerificationDispositionRecord, VerificationRecord, WorkspaceHarnessState, SCHEMA_VERSION,
+    BaselineEntry, BaselineObject, CapabilityStatus, ChangeSet, ExpectedWorkspaceState,
+    FileChangeRecord, HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord,
+    ProjectBaseline, ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt, TaskSession,
+    TaskStatus, VerificationDispositionRecord, VerificationRecord, WorkSessionCloseOutbox,
+    WorkspaceHarnessState, SCHEMA_VERSION,
 };
-use super::store::{HarnessError, HarnessResult, HarnessStore};
+use super::store::{baseline_object_id, HarnessError, HarnessResult, HarnessStore};
 
 #[derive(Debug, Clone)]
 pub struct Harness {
@@ -80,11 +81,14 @@ impl Harness {
         let workspace_root = workspace_root
             .canonicalize()
             .map_err(|e| HarnessError::new("WORKSPACE_UNAVAILABLE", e.to_string()))?;
-        let workspace_id = workspace_id(&workspace_root);
+        let store = HarnessStore::new(harness_root)?;
+        let workspace_id = store
+            .resolve_workspace_identity(&workspace_root)?
+            .workspace_id;
         Ok(Self {
             workspace_root,
             workspace_id,
-            store: HarnessStore::new(harness_root)?,
+            store,
         })
     }
 
@@ -99,28 +103,33 @@ impl Harness {
         session_key: &str,
         path: &str,
     ) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
-        if let Some(existing) = task.history_session_key.as_deref() {
-            if existing != session_key || task.history_session_path.as_deref() != Some(path) {
-                return Err(HarnessError::new(
-                    "WORK_SESSION_CONFLICT",
-                    "当前任务已绑定到另一个 History Session",
-                ));
-            }
-            return Ok(task);
-        }
-        task.history_session_key = Some(session_key.to_string());
-        task.history_session_path = Some(path.to_string());
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        self.record_event(
-            task_id,
-            "history_session_bound",
-            Some("begin_work_session"),
-            json!({"session_key": session_key, "path": path}),
-            json!({"ok": true}),
-        )?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if let Some(existing) = task.history_session_key.as_deref() {
+                    if existing != session_key || task.history_session_path.as_deref() != Some(path)
+                    {
+                        return Err(HarnessError::new(
+                            "WORK_SESSION_CONFLICT",
+                            "当前任务已绑定到另一个 History Session",
+                        ));
+                    }
+                    return Ok(task);
+                }
+                task.history_session_key = Some(session_key.to_string());
+                task.history_session_path = Some(path.to_string());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "history_session_bound",
+                    Some("begin_work_session"),
+                    json!({"session_key": session_key, "path": path}),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
     }
 
     pub fn accept_current_baseline(
@@ -149,7 +158,7 @@ impl Harness {
         let root = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| HarnessError::new("STORE_UNAVAILABLE", "无法确定应用数据目录"))?;
-        Ok(root.join("anchor").join("harness"))
+        Ok(root.join("anchor").join("harness-v5"))
     }
 
     pub fn workspace_id(&self) -> &str {
@@ -164,73 +173,84 @@ impl Harness {
         if objective.trim().is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
         }
-        if let Some(task) = self.current_task()? {
-            return Err(HarnessError::new(
-                "TASK_ALREADY_ACTIVE",
-                format!("工作区已有活动任务 {}", task.id),
-            ));
-        }
-        let baseline = capture_baseline(&self.workspace_root);
-        let now = timestamp();
-        let task = TaskSession {
-            id: Uuid::new_v4().simple().to_string(),
-            workspace_id: self.workspace_id.clone(),
-            objective: objective.trim().to_string(),
-            status: TaskStatus::Active,
-            expected_fingerprint: baseline.worktree_fingerprint.clone(),
-            expected_state: Some(expected_state_from_baseline(&baseline, None)),
-            baseline,
-            completed_steps: Vec::new(),
-            pending_steps: Vec::new(),
-            latest_change_id: None,
-            latest_verification_id: None,
-            history_session_key: None,
-            history_session_path: None,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        self.store.save_task(&task)?;
-        self.save_workspace_state(
-            Some(&task.id),
-            HarnessSessionStatus::Active,
-            &task.updated_at,
-        )?;
-        self.record_event(
-            &task.id,
-            "task_started",
-            None,
-            json!({}),
-            json!({"ok": true}),
-        )?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                if let Some(task) = self.current_task()? {
+                    return Err(HarnessError::new(
+                        "TASK_ALREADY_ACTIVE",
+                        format!("工作区已有活动任务 {}", task.id),
+                    ));
+                }
+                let captured = capture_baseline_snapshot(&self.workspace_root);
+                let baseline = captured.baseline;
+                let now = timestamp();
+                let task = TaskSession {
+                    schema_version: SCHEMA_VERSION,
+                    id: Uuid::new_v4().simple().to_string(),
+                    workspace_id: self.workspace_id.clone(),
+                    objective: objective.trim().to_string(),
+                    status: TaskStatus::Active,
+                    expected_fingerprint: baseline.worktree_fingerprint.clone(),
+                    expected_state: Some(expected_state_from_baseline(&baseline, None)),
+                    baseline,
+                    completed_steps: Vec::new(),
+                    pending_steps: Vec::new(),
+                    latest_change_id: None,
+                    latest_verification_id: None,
+                    history_session_key: None,
+                    history_session_path: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                transaction.save_baseline_object(&captured.object)?;
+                transaction.save_task(&task)?;
+                transaction.save_workspace_state(&self.workspace_state(
+                    Some(&task.id),
+                    HarnessSessionStatus::Active,
+                    &task.updated_at,
+                )?)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    &task.id,
+                    "task_started",
+                    None,
+                    json!({}),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
     }
 
     pub fn mark_verifying(&self, task_id: &str) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
-        if !task.status.is_writable() {
-            return Err(HarnessError::new(
-                "TASK_NOT_WRITABLE",
-                "当前任务已经关闭，不能进入验证状态",
-            ));
-        }
-        if task.status != TaskStatus::Verifying {
-            task.status = TaskStatus::Verifying;
-            task.updated_at = timestamp();
-            self.store.save_task(&task)?;
-            self.save_workspace_state(
-                Some(&task.id),
-                HarnessSessionStatus::Active,
-                &task.updated_at,
-            )?;
-            self.record_event(
-                task_id,
-                "task_verification_required",
-                Some("finish_task"),
-                json!({}),
-                json!({"ok": false, "task_status": "verifying"}),
-            )?;
-        }
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能进入验证状态",
+                    ));
+                }
+                if task.status != TaskStatus::Verifying {
+                    task.status = TaskStatus::Verifying;
+                    task.updated_at = timestamp();
+                    transaction.save_task(&task)?;
+                    transaction.save_workspace_state(&self.workspace_state(
+                        Some(&task.id),
+                        HarnessSessionStatus::Active,
+                        &task.updated_at,
+                    )?)?;
+                    transaction.append_event(&harness_event(
+                        &self.workspace_id,
+                        task_id,
+                        "task_verification_required",
+                        Some("finish_task"),
+                        json!({}),
+                        json!({"ok": false, "task_status": "verifying"}),
+                    ))?;
+                }
+                Ok(task)
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -246,95 +266,97 @@ impl Harness {
         level: &str,
         supersede_previous_failures: bool,
     ) -> HarnessResult<VerificationRecord> {
-        let mut task = self.task(task_id)?;
         let level = normalize_verification_level(level)?;
-        let verification_id = Uuid::new_v4().simple().to_string();
-        let mut supersedes = Vec::new();
-        if passed && supersede_previous_failures {
-            for mut previous in self.list_verifications(task_id)? {
-                if previous.kind != kind
-                    || previous.passed
-                    || verification_effective_disposition(&previous) != "active_failure"
-                {
-                    continue;
-                }
-                previous.dispositions.push(VerificationDispositionRecord {
-                    id: Uuid::new_v4().simple().to_string(),
-                    disposition: "superseded".into(),
-                    reason: format!(
-                        "Superseded by later successful verification {verification_id} for kind {kind}"
-                    ),
-                    source: "automatic_later_success".into(),
-                    created_at: timestamp(),
-                });
-                self.store
-                    .save_verification(&self.workspace_id, &previous)?;
-                supersedes.push(previous.id);
-            }
-        }
-        let mut verification = VerificationRecord {
-            id: verification_id,
-            task_id: task_id.to_string(),
-            command: command.to_string(),
-            kind: kind.trim().to_string(),
-            status: if passed { "passed" } else { "failed" }.into(),
-            level: level.to_string(),
-            exit_code,
-            passed,
-            duration_ms,
-            change_id: change_id.map(str::to_string),
-            dispositions: Vec::new(),
-            supersedes,
-            created_at: timestamp(),
-        };
-        if !passed {
-            let initial_disposition = match level {
-                "diagnostic" => Some((
-                    "diagnostic_only",
-                    "Diagnostic verification failures are recorded but do not block task completion",
-                )),
-                "informational" => Some((
-                    "expected_failure",
-                    "Informational verification failures are retained as non-blocking evidence",
-                )),
-                _ => None,
-            };
-            if let Some((disposition, reason)) = initial_disposition {
-                verification
-                    .dispositions
-                    .push(VerificationDispositionRecord {
-                        id: Uuid::new_v4().simple().to_string(),
-                        disposition: disposition.into(),
-                        reason: reason.into(),
-                        source: "verification_level".into(),
-                        created_at: timestamp(),
-                    });
-            }
-        }
         self.store
-            .save_verification(&self.workspace_id, &verification)?;
-        task.latest_verification_id = Some(verification.id.clone());
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        self.record_event(
-            task_id,
-            "verification_recorded",
-            Some("exec_command"),
-            json!({
-                "verification_id": verification.id,
-                "kind": verification.kind,
-                "command": verification.command,
-                "level": verification.level,
-                "supersedes": verification.supersedes
-            }),
-            json!({
-                "ok": passed,
-                "status": verification.status,
-                "exit_code": verification.exit_code,
-                "duration_ms": verification.duration_ms
-            }),
-        )?;
-        Ok(verification)
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                let verification_id = Uuid::new_v4().simple().to_string();
+                let mut supersedes = Vec::new();
+                if passed && supersede_previous_failures {
+                    for mut previous in self.list_verifications(task_id)? {
+                        if previous.kind != kind
+                            || previous.passed
+                            || verification_effective_disposition(&previous) != "active_failure"
+                        {
+                            continue;
+                        }
+                        previous.dispositions.push(VerificationDispositionRecord {
+                            id: Uuid::new_v4().simple().to_string(),
+                            disposition: "superseded".into(),
+                            reason: format!(
+                                "Superseded by later successful verification {verification_id} for kind {kind}"
+                            ),
+                            source: "automatic_later_success".into(),
+                            created_at: timestamp(),
+                        });
+                        transaction.save_verification(&previous)?;
+                        supersedes.push(previous.id);
+                    }
+                }
+                let mut verification = VerificationRecord {
+                    id: verification_id,
+                    task_id: task_id.to_string(),
+                    command: command.to_string(),
+                    kind: kind.trim().to_string(),
+                    status: if passed { "passed" } else { "failed" }.into(),
+                    level: level.to_string(),
+                    exit_code,
+                    passed,
+                    duration_ms,
+                    change_id: change_id.map(str::to_string),
+                    dispositions: Vec::new(),
+                    supersedes,
+                    created_at: timestamp(),
+                };
+                if !passed {
+                    let initial_disposition = match level {
+                        "diagnostic" => Some((
+                            "diagnostic_only",
+                            "Diagnostic verification failures are recorded but do not block task completion",
+                        )),
+                        "informational" => Some((
+                            "expected_failure",
+                            "Informational verification failures are retained as non-blocking evidence",
+                        )),
+                        _ => None,
+                    };
+                    if let Some((disposition, reason)) = initial_disposition {
+                        verification
+                            .dispositions
+                            .push(VerificationDispositionRecord {
+                                id: Uuid::new_v4().simple().to_string(),
+                                disposition: disposition.into(),
+                                reason: reason.into(),
+                                source: "verification_level".into(),
+                                created_at: timestamp(),
+                            });
+                    }
+                }
+                transaction.save_verification(&verification)?;
+                task.latest_verification_id = Some(verification.id.clone());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "verification_recorded",
+                    Some("exec_command"),
+                    json!({
+                        "verification_id": verification.id,
+                        "kind": verification.kind,
+                        "command": verification.command,
+                        "level": verification.level,
+                        "supersedes": verification.supersedes
+                    }),
+                    json!({
+                        "ok": passed,
+                        "status": verification.status,
+                        "exit_code": verification.exit_code,
+                        "duration_ms": verification.duration_ms
+                    }),
+                ))?;
+                Ok(verification)
+            })
     }
 
     pub fn list_verifications(&self, task_id: &str) -> HarnessResult<Vec<VerificationRecord>> {
@@ -369,39 +391,42 @@ impl Harness {
                 "不支持的 verification disposition",
             ));
         }
-        let mut verification = self
-            .list_verifications(task_id)?
-            .into_iter()
-            .find(|record| record.id == verification_id)
-            .ok_or_else(|| {
-                HarnessError::new(
-                    "VERIFICATION_NOT_FOUND",
-                    format!("Verification not found: {verification_id}"),
-                )
-            })?;
-        let entry = VerificationDispositionRecord {
-            id: Uuid::new_v4().simple().to_string(),
-            disposition: disposition.to_string(),
-            reason: reason.trim().to_string(),
-            source: source.trim().to_string(),
-            created_at: timestamp(),
-        };
-        verification.dispositions.push(entry.clone());
         self.store
-            .save_verification(&self.workspace_id, &verification)?;
-        self.record_event(
-            task_id,
-            "verification_disposition_updated",
-            Some("update_verification_disposition"),
-            json!({
-                "verification_id": verification_id,
-                "disposition": disposition,
-                "reason": reason,
-                "source": source
-            }),
-            json!({"ok": true, "disposition_id": entry.id}),
-        )?;
-        Ok(verification)
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut verification = self
+                    .list_verifications(task_id)?
+                    .into_iter()
+                    .find(|record| record.id == verification_id)
+                    .ok_or_else(|| {
+                        HarnessError::new(
+                            "VERIFICATION_NOT_FOUND",
+                            format!("Verification not found: {verification_id}"),
+                        )
+                    })?;
+                let entry = VerificationDispositionRecord {
+                    id: Uuid::new_v4().simple().to_string(),
+                    disposition: disposition.to_string(),
+                    reason: reason.trim().to_string(),
+                    source: source.trim().to_string(),
+                    created_at: timestamp(),
+                };
+                verification.dispositions.push(entry.clone());
+                transaction.save_verification(&verification)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "verification_disposition_updated",
+                    Some("update_verification_disposition"),
+                    json!({
+                        "verification_id": verification_id,
+                        "disposition": disposition,
+                        "reason": reason,
+                        "source": source
+                    }),
+                    json!({"ok": true, "disposition_id": entry.id}),
+                ))?;
+                Ok(verification)
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -462,33 +487,41 @@ impl Harness {
         verified: bool,
         session_status: HarnessSessionStatus,
     ) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
-        if !task.status.is_writable() {
-            return Err(HarnessError::new(
-                "TASK_NOT_WRITABLE",
-                "当前任务已经关闭，不能重复完成",
-            ));
-        }
-        task.status = if verified {
-            TaskStatus::Completed
-        } else {
-            TaskStatus::CompletedUnverified
-        };
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        self.save_workspace_state(None, session_status, &task.updated_at)?;
-        self.record_event(
-            task_id,
-            "task_completed",
-            Some("finish_task"),
-            json!({
-                "verification_status": if verified { "verified" } else { "unverified" },
-                "session_status": session_status,
-                "next_stage_started": false
-            }),
-            json!({"ok": true, "closed": true}),
-        )?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能重复完成",
+                    ));
+                }
+                task.status = if verified {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::CompletedUnverified
+                };
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.save_workspace_state(&self.workspace_state(
+                    None,
+                    session_status,
+                    &task.updated_at,
+                )?)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_completed",
+                    Some("finish_task"),
+                    json!({
+                        "verification_status": if verified { "verified" } else { "unverified" },
+                        "session_status": session_status,
+                        "next_stage_started": false
+                    }),
+                    json!({"ok": true, "closed": true}),
+                ))?;
+                Ok(task)
+            })
     }
 
     pub fn current_task(&self) -> HarnessResult<Option<TaskSession>> {
@@ -504,36 +537,44 @@ impl Harness {
     }
 
     pub fn transition(&self, task_id: &str, next: TaskStatus) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
-        if !task.status.can_transition_to(next) {
-            return Err(HarnessError::new(
-                "INVALID_TASK_TRANSITION",
-                format!("不允许从 {:?} 转换到 {:?}", task.status, next),
-            ));
-        }
-        task.status = next;
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        let (active_task_id, session_status) = match task.status {
-            TaskStatus::Active | TaskStatus::Verifying => {
-                (Some(task.id.as_str()), HarnessSessionStatus::Active)
-            }
-            TaskStatus::Paused | TaskStatus::Failed => {
-                (Some(task.id.as_str()), HarnessSessionStatus::Paused)
-            }
-            TaskStatus::Completed | TaskStatus::CompletedUnverified | TaskStatus::RolledBack => {
-                (None, HarnessSessionStatus::Paused)
-            }
-        };
-        self.save_workspace_state(active_task_id, session_status, &task.updated_at)?;
-        self.record_event(
-            task_id,
-            "task_status_changed",
-            None,
-            json!({"status": next}),
-            json!({"ok": true}),
-        )?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.can_transition_to(next) {
+                    return Err(HarnessError::new(
+                        "INVALID_TASK_TRANSITION",
+                        format!("不允许从 {:?} 转换到 {:?}", task.status, next),
+                    ));
+                }
+                task.status = next;
+                task.updated_at = timestamp();
+                let (active_task_id, session_status) = match task.status {
+                    TaskStatus::Active | TaskStatus::Verifying => {
+                        (Some(task.id.as_str()), HarnessSessionStatus::Active)
+                    }
+                    TaskStatus::Paused | TaskStatus::Failed => {
+                        (Some(task.id.as_str()), HarnessSessionStatus::Paused)
+                    }
+                    TaskStatus::Completed
+                    | TaskStatus::CompletedUnverified
+                    | TaskStatus::RolledBack => (None, HarnessSessionStatus::Paused),
+                };
+                transaction.save_task(&task)?;
+                transaction.save_workspace_state(&self.workspace_state(
+                    active_task_id,
+                    session_status,
+                    &task.updated_at,
+                )?)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_status_changed",
+                    None,
+                    json!({"status": next}),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
     }
 
     pub fn update_steps(
@@ -542,26 +583,30 @@ impl Harness {
         completed_steps: Option<Vec<String>>,
         pending_steps: Option<Vec<String>>,
     ) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
-        if let Some(steps) = completed_steps {
-            task.completed_steps = steps;
-        }
-        if let Some(steps) = pending_steps {
-            task.pending_steps = steps;
-        }
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        self.record_event(
-            task_id,
-            "task_updated",
-            None,
-            json!({
-                "completed_steps": task.completed_steps,
-                "pending_steps": task.pending_steps
-            }),
-            json!({"ok": true}),
-        )?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if let Some(steps) = completed_steps {
+                    task.completed_steps = steps;
+                }
+                if let Some(steps) = pending_steps {
+                    task.pending_steps = steps;
+                }
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_updated",
+                    None,
+                    json!({
+                        "completed_steps": task.completed_steps,
+                        "pending_steps": task.pending_steps
+                    }),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
     }
 
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
@@ -592,13 +637,16 @@ impl Harness {
         task_id: &str,
         operation_id: Option<&str>,
     ) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
         let current = capture_baseline(&self.workspace_root);
-        task.expected_fingerprint = current.worktree_fingerprint.clone();
-        task.expected_state = Some(expected_state_from_baseline(&current, operation_id));
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                task.expected_fingerprint = current.worktree_fingerprint.clone();
+                task.expected_state = Some(expected_state_from_baseline(&current, operation_id));
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                Ok(task)
+            })
     }
 
     pub fn refresh_baseline(
@@ -614,13 +662,6 @@ impl Harness {
                 "refresh_baseline 必须提供接受当前状态的原因",
             ));
         }
-        let mut task = self.task(task_id)?;
-        if !task.status.is_writable() {
-            return Err(HarnessError::new(
-                "TASK_NOT_WRITABLE",
-                "当前任务状态不允许刷新基线",
-            ));
-        }
         let current = capture_baseline(&self.workspace_root);
         if current.head.as_deref() != observed_head
             || current.worktree_fingerprint != observed_fingerprint
@@ -631,28 +672,40 @@ impl Harness {
             ));
         }
         let operation_id = Uuid::new_v4().simple().to_string();
-        task.expected_fingerprint = current.worktree_fingerprint.clone();
-        task.expected_state = Some(expected_state_from_baseline(&current, Some(&operation_id)));
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        self.record_event(
-            task_id,
-            "baseline_refreshed",
-            Some("refresh_baseline"),
-            json!({
-                "observed_head": observed_head,
-                "observed_fingerprint": observed_fingerprint,
-                "reason": reason
-            }),
-            json!({
-                "ok": true,
-                "branch": current.branch,
-                "head": current.head,
-                "worktree_fingerprint": current.worktree_fingerprint,
-                "operation_id": operation_id
-            }),
-        )?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务状态不允许刷新基线",
+                    ));
+                }
+                task.expected_fingerprint = current.worktree_fingerprint.clone();
+                task.expected_state =
+                    Some(expected_state_from_baseline(&current, Some(&operation_id)));
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "baseline_refreshed",
+                    Some("refresh_baseline"),
+                    json!({
+                        "observed_head": observed_head,
+                        "observed_fingerprint": observed_fingerprint,
+                        "reason": reason
+                    }),
+                    json!({
+                        "ok": true,
+                        "branch": current.branch,
+                        "head": current.head,
+                        "worktree_fingerprint": current.worktree_fingerprint,
+                        "operation_id": operation_id
+                    }),
+                ))?;
+                Ok(task)
+            })
     }
 
     pub fn record_event(
@@ -663,18 +716,14 @@ impl Harness {
         input_summary: serde_json::Value,
         result_summary: serde_json::Value,
     ) -> HarnessResult<HarnessEvent> {
-        let event = HarnessEvent {
-            id: Uuid::new_v4().simple().to_string(),
-            task_id: task_id.to_string(),
-            operation_id: Uuid::new_v4().simple().to_string(),
-            kind: kind.to_string(),
-            tool_name: tool_name.map(str::to_string),
-            input_summary: json!({"workspace_id": self.workspace_id, "payload": input_summary}),
+        let event = harness_event(
+            &self.workspace_id,
+            task_id,
+            kind,
+            tool_name,
+            input_summary,
             result_summary,
-            reason: None,
-            affected_files: Vec::<FileChangeRecord>::new(),
-            created_at: timestamp(),
-        };
+        );
         self.store
             .append_event_for_workspace(&self.workspace_id, &event)?;
         Ok(event)
@@ -776,31 +825,61 @@ impl Harness {
             .save_stage_commit_receipt(&self.workspace_id, receipt)
     }
 
+    pub fn save_close_outbox(&self, outbox: &WorkSessionCloseOutbox) -> HarnessResult<()> {
+        self.store.save_close_outbox(&self.workspace_id, outbox)
+    }
+
+    pub fn load_close_outbox(
+        &self,
+        task_id: &str,
+    ) -> HarnessResult<Option<WorkSessionCloseOutbox>> {
+        self.store.load_close_outbox(&self.workspace_id, task_id)
+    }
+
+    pub fn list_close_outboxes(&self) -> HarnessResult<Vec<WorkSessionCloseOutbox>> {
+        self.store.list_close_outboxes(&self.workspace_id)
+    }
+
+    pub fn delete_close_outbox(&self, task_id: &str) -> HarnessResult<()> {
+        self.store.delete_close_outbox(&self.workspace_id, task_id)
+    }
+
     pub fn set_latest_change(&self, task_id: &str, change_id: &str) -> HarnessResult<TaskSession> {
-        let mut task = self.task(task_id)?;
-        task.latest_change_id = Some(change_id.to_string());
-        task.updated_at = timestamp();
-        self.store.save_task(&task)?;
-        Ok(task)
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                task.latest_change_id = Some(change_id.to_string());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                Ok(task)
+            })
     }
 
     pub fn project_state(&self, max_files: usize) -> HarnessResult<ProjectState> {
-        let current = capture_baseline(&self.workspace_root);
+        let current = capture_baseline_snapshot(&self.workspace_root);
         let task = self.current_task()?;
-        let baseline_map = task
+        let baseline_object = task
             .as_ref()
-            .map(|t| {
-                t.baseline
+            .map(|task| {
+                self.store
+                    .load_baseline_object(&self.workspace_id, &task.baseline.object_id)
+            })
+            .transpose()?;
+        let baseline_map = baseline_object
+            .as_ref()
+            .map(|baseline| {
+                baseline
                     .entries
                     .iter()
-                    .map(|e| (e.path.clone(), e))
+                    .map(|entry| (entry.path.clone(), entry))
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
         let current_map: HashMap<_, _> = current
+            .object
             .entries
             .iter()
-            .map(|e| (e.path.clone(), e))
+            .map(|entry| (entry.path.clone(), entry))
             .collect();
         let mut paths: Vec<String> = baseline_map
             .keys()
@@ -842,8 +921,8 @@ impl Harness {
         Ok(ProjectState {
             schema_version: SCHEMA_VERSION,
             workspace_id: self.workspace_id.clone(),
-            branch: current.branch,
-            head: current.head,
+            branch: current.baseline.branch,
+            head: current.baseline.head,
             clean,
             files,
             total_files,
@@ -1009,31 +1088,51 @@ impl Harness {
             baseline_matches,
             capabilities,
             next_actions,
+            journal_health: self.store.journal_health(&self.workspace_id)?,
         })
     }
 
-    fn save_workspace_state(
+    fn workspace_state(
         &self,
         active_task_id: Option<&str>,
         session_status: HarnessSessionStatus,
         updated_at: &str,
-    ) -> HarnessResult<()> {
-        self.store.save_workspace_state(
-            &self.workspace_id,
-            &WorkspaceHarnessState {
-                schema_version: SCHEMA_VERSION,
-                active_task_id: active_task_id.map(str::to_string),
-                session_status,
-                recent_task_ids: self
-                    .store
-                    .list_tasks(&self.workspace_id)?
-                    .into_iter()
-                    .take(20)
-                    .map(|t| t.id)
-                    .collect(),
-                updated_at: updated_at.to_string(),
-            },
-        )
+    ) -> HarnessResult<WorkspaceHarnessState> {
+        Ok(WorkspaceHarnessState {
+            schema_version: SCHEMA_VERSION,
+            active_task_id: active_task_id.map(str::to_string),
+            session_status,
+            recent_task_ids: self
+                .store
+                .list_tasks(&self.workspace_id)?
+                .into_iter()
+                .take(20)
+                .map(|task| task.id)
+                .collect(),
+            updated_at: updated_at.to_string(),
+        })
+    }
+}
+
+fn harness_event(
+    workspace_id: &str,
+    task_id: &str,
+    kind: &str,
+    tool_name: Option<&str>,
+    input_summary: serde_json::Value,
+    result_summary: serde_json::Value,
+) -> HarnessEvent {
+    HarnessEvent {
+        id: Uuid::new_v4().simple().to_string(),
+        task_id: task_id.to_string(),
+        operation_id: Uuid::new_v4().simple().to_string(),
+        kind: kind.to_string(),
+        tool_name: tool_name.map(str::to_string),
+        input_summary: json!({"workspace_id": workspace_id, "payload": input_summary}),
+        result_summary,
+        reason: None,
+        affected_files: Vec::new(),
+        created_at: timestamp(),
     }
 }
 
@@ -1072,6 +1171,7 @@ fn git_file_paths(root: &Path) -> Option<Vec<PathBuf>> {
         .filter_map(|value| std::str::from_utf8(value).ok())
         .map(|relative| root.join(relative))
         .filter(|path| path.exists())
+        .filter(|path| !should_skip(path, root))
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
@@ -1103,7 +1203,16 @@ fn expected_state_from_baseline(
     }
 }
 
-pub fn capture_baseline(root: &Path) -> ProjectBaseline {
+struct CapturedBaseline {
+    baseline: ProjectBaseline,
+    object: BaselineObject,
+}
+
+pub(crate) fn capture_baseline(root: &Path) -> ProjectBaseline {
+    capture_baseline_snapshot(root).baseline
+}
+
+fn capture_baseline_snapshot(root: &Path) -> CapturedBaseline {
     let mut entries = Vec::new();
     for path in baseline_paths(root) {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -1143,12 +1252,23 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
         fingerprint.update(entry.sha256.as_bytes());
         fingerprint.update(entry.bytes.to_le_bytes());
     }
-    ProjectBaseline {
-        branch: git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        head: git_value(root, &["rev-parse", "HEAD"]),
-        worktree_fingerprint: format!("{:x}", fingerprint.finalize()),
-        entries,
-        captured_at: timestamp(),
+    let worktree_fingerprint = format!("{:x}", fingerprint.finalize());
+    let object_id = baseline_object_id(&entries).expect("baseline entries are serializable");
+    CapturedBaseline {
+        baseline: ProjectBaseline {
+            schema_version: SCHEMA_VERSION,
+            branch: git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            head: git_value(root, &["rev-parse", "HEAD"]),
+            worktree_fingerprint,
+            object_id: object_id.clone(),
+            file_count: entries.len(),
+            captured_at: timestamp(),
+        },
+        object: BaselineObject {
+            schema_version: SCHEMA_VERSION,
+            id: object_id,
+            entries,
+        },
     }
 }
 
@@ -1162,6 +1282,8 @@ fn should_skip(path: &Path, root: &Path) -> bool {
             matches!(
                 name,
                 ".git"
+                    | "workspace-id.json"
+                    | "workspace-id.lock"
                     | ".mcp-probe-kit"
                     | "node_modules"
                     | "target"
@@ -1181,12 +1303,6 @@ fn git_value(root: &Path, args: &[&str]) -> Option<String> {
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!value.is_empty()).then_some(value)
-}
-
-fn workspace_id(root: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(root.to_string_lossy().as_bytes());
-    format!("{:x}", hasher.finalize())[..32].to_string()
 }
 
 fn timestamp() -> String {
@@ -1280,10 +1396,14 @@ mod tests {
         let history = workspace.path().join("docs/history-session");
         fs::create_dir_all(&history).expect("history dir");
         fs::write(history.join("1.md"), "checkpoint\n").expect("history");
-        let after = capture_baseline(workspace.path());
+        let after = capture_baseline_snapshot(workspace.path());
 
-        assert_eq!(before.worktree_fingerprint, after.worktree_fingerprint);
+        assert_eq!(
+            before.worktree_fingerprint,
+            after.baseline.worktree_fingerprint
+        );
         assert!(!after
+            .object
             .entries
             .iter()
             .any(|entry| entry.path.starts_with("docs/history-session/")));
@@ -1359,6 +1479,120 @@ mod tests {
             )
             .expect_err("stale observation must fail");
         assert_eq!(error.code(), "BASELINE_REFRESH_CAS_FAILED");
+    }
+
+    #[test]
+    fn stable_workspace_id_survives_directory_move_and_records_aliases() {
+        let root = tempdir().expect("root");
+        let first = root.path().join("workspace-first");
+        let second = root.path().join("workspace-second");
+        let harness_root = root.path().join("harness-store");
+        fs::create_dir_all(&first).expect("workspace");
+        initialize_git(&first);
+        fs::write(first.join("main.rs"), "fn main() {}\n").expect("file");
+
+        let first_harness =
+            Harness::new(first.clone(), harness_root.clone()).expect("first harness");
+        let workspace_id = first_harness.workspace_id().to_string();
+        drop(first_harness);
+        fs::rename(&first, &second).expect("move workspace");
+
+        let second_harness =
+            Harness::new(second.clone(), harness_root.clone()).expect("second harness");
+        assert_eq!(second_harness.workspace_id(), workspace_id);
+        let identity_path = harness_root
+            .join("workspaces")
+            .join(&workspace_id)
+            .join("identity.json");
+        let identity: super::super::model::WorkspaceIdentity =
+            serde_json::from_slice(&fs::read(identity_path).expect("identity bytes"))
+                .expect("identity");
+        assert!(identity
+            .aliases
+            .iter()
+            .any(|path| path.ends_with("workspace-first")));
+        assert!(identity
+            .aliases
+            .iter()
+            .any(|path| path.ends_with("workspace-second")));
+    }
+
+    #[test]
+    fn task_references_content_addressed_baseline_without_inline_entries() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("baseline object").expect("start");
+        assert_eq!(task.baseline.file_count, 1);
+        assert_eq!(task.baseline.object_id.len(), 64);
+
+        let task_path = harness
+            .store_root()
+            .join("workspaces")
+            .join(harness.workspace_id())
+            .join("tasks")
+            .join(format!("{}.json", task.id));
+        let task_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(task_path).expect("task bytes")).expect("task json");
+        assert!(task_json["baseline"].get("entries").is_none());
+        assert_eq!(task_json["baseline"]["object_id"], task.baseline.object_id);
+        let baseline = harness
+            .store
+            .load_baseline_object(harness.workspace_id(), &task.baseline.object_id)
+            .expect("baseline object");
+        assert_eq!(baseline.entries.len(), task.baseline.file_count);
+    }
+
+    #[test]
+    fn concurrent_operation_appends_keep_sequences_and_checksums_valid() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let mut handles = Vec::new();
+        for index in 0..12 {
+            let harness = harness.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                harness
+                    .record_operation(
+                        None,
+                        None,
+                        None,
+                        "concurrency_probe",
+                        "completed",
+                        json!({"index": index}),
+                        json!({"ok": true}),
+                    )
+                    .expect("operation");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+        assert_eq!(
+            harness.list_operations(0, 100).expect("operations").len(),
+            12
+        );
+        let health = harness
+            .store
+            .journal_health(harness.workspace_id())
+            .expect("journal health");
+        assert_eq!(health.valid_records, 12);
+        assert_eq!(health.corrupt_lines, 0);
+        assert_eq!(health.checksum_failures, 0);
+        assert_eq!(health.sequence_anomalies, 0);
     }
 
     #[test]

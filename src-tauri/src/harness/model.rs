@@ -3,13 +3,60 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityStatus {
     pub status: String,
     pub reason: String,
     pub recoverable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceIdentity {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub primary_path: String,
+    pub aliases: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JournalHealth {
+    pub segment_count: usize,
+    pub retained_bytes: u64,
+    pub valid_records: usize,
+    pub corrupt_lines: usize,
+    pub checksum_failures: usize,
+    pub schema_mismatches: usize,
+    pub sequence_anomalies: usize,
+    pub rotations: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkSessionClosePhase {
+    Prepared,
+    TaskClosed,
+    CheckpointPending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkSessionCloseOutbox {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub history_session_key: String,
+    pub history_session_path: String,
+    pub session_status: HarnessSessionStatus,
+    pub finish_args: Value,
+    pub checkpoint_args: Value,
+    pub phase: WorkSessionClosePhase,
+    pub attempts: u32,
+    pub last_error: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -115,6 +162,7 @@ pub struct HarnessStatus {
     pub baseline_matches: Option<bool>,
     pub capabilities: HashMap<String, CapabilityStatus>,
     pub next_actions: Vec<String>,
+    pub journal_health: JournalHealth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +200,7 @@ impl TaskStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaselineEntry {
     pub path: String,
     pub exists: bool,
@@ -163,15 +211,25 @@ pub struct BaselineEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectBaseline {
+    pub schema_version: u32,
     pub branch: Option<String>,
     pub head: Option<String>,
     pub worktree_fingerprint: String,
-    pub entries: Vec<BaselineEntry>,
+    pub object_id: String,
+    pub file_count: usize,
     pub captured_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineObject {
+    pub schema_version: u32,
+    pub id: String,
+    pub entries: Vec<BaselineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSession {
+    pub schema_version: u32,
     pub id: String,
     pub workspace_id: String,
     pub objective: String,

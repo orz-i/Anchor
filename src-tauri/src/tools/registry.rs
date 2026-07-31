@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 9;
+pub const CATALOG_VERSION: u32 = 10;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -1344,6 +1344,7 @@ pub fn output_schema(name: &str) -> Value {
                 "expected_fingerprint": { "type": ["string", "null"] },
                 "observation_token": { "type": ["string", "null"] },
                 "capabilities": { "type": "object" },
+                "journal_health": { "type": "object" },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
                 "reason": { "type": "string" },
                 "recoverable": { "type": "boolean" }
@@ -1356,6 +1357,7 @@ pub fn output_schema(name: &str) -> Value {
                 "writable",
                 "worktree_fingerprint",
                 "capabilities",
+                "journal_health",
                 "next_actions",
                 "reason",
                 "recoverable",
@@ -1401,8 +1403,9 @@ pub fn output_schema(name: &str) -> Value {
                 "phase": { "type": "string" },
                 "retryable": { "type": "boolean" },
                 "work_session": { "type": "object" },
-                "finish": { "type": "object" },
+                "finish": { "type": ["object", "null"] },
                 "checkpoint": { "type": ["object", "null"] },
+                "outbox": { "type": "object" },
                 "task": { "type": "object" },
                 "harness": { "type": "object" },
                 "error": error_output_schema()
@@ -1411,7 +1414,7 @@ pub fn output_schema(name: &str) -> Value {
             "allOf": [
                 {
                     "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
-                    "then": { "required": ["work_session", "finish", "checkpoint", "task", "harness"] }
+                    "then": { "required": ["work_session", "finish", "checkpoint", "outbox", "task", "harness"] }
                 },
                 {
                     "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },

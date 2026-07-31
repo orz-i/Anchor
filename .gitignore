@@ -27,3 +27,5 @@ src-tauri/icons/icons/
 src-tauri/icons/logo-design.png
 
 docs/history-session/
+/.anchor/workspace-id.json
+/.anchor/workspace-id.lock
