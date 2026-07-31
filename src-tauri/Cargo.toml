@@ -21,11 +21,6 @@ name = "anchor"
 path = "src/bin/anchor.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "coding-tools-mcp"
-path = "src/bin/legacy_cli.rs"
-required-features = ["cli"]
-
 [lib]
 name = "anchor_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

@@ -12,25 +12,7 @@ pub fn is_own_process(pid: u32) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
-struct DesktopIdentity {
-    executable_name: &'static str,
-    bundle_name: &'static str,
-    bundle_id: &'static str,
-}
-
-#[cfg(any(target_os = "macos", test))]
-const DESKTOP_IDENTITIES: &[DesktopIdentity] = &[
-    DesktopIdentity {
-        executable_name: crate::brand::DESKTOP_EXECUTABLE_NAME,
-        bundle_name: "Anchor.app",
-        bundle_id: crate::brand::BUNDLE_ID,
-    },
-    DesktopIdentity {
-        executable_name: crate::brand::LEGACY_DESKTOP_EXECUTABLE_NAME,
-        bundle_name: "Coding Tools MCP.app",
-        bundle_id: crate::brand::LEGACY_BUNDLE_ID,
-    },
-];
+const DESKTOP_BUNDLE_NAME: &str = "Anchor.app";
 
 /// Reclaim a port only when it belongs to an older macOS instance of this app.
 ///
@@ -73,29 +55,32 @@ pub fn try_reclaim_previous_macos_app_port(port: u16) -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 fn is_managed_macos_desktop_executable(image: &Path) -> bool {
+    if image.file_name().and_then(|name| name.to_str())
+        != Some(crate::brand::DESKTOP_EXECUTABLE_NAME)
+    {
+        return false;
+    }
     let Some(bundle) = image
         .ancestors()
         .find(|ancestor| ancestor.extension().and_then(|ext| ext.to_str()) == Some("app"))
     else {
         return false;
     };
-    if !image.starts_with(bundle.join("Contents").join("MacOS")) {
+    if bundle.file_name().and_then(|name| name.to_str()) != Some(DESKTOP_BUNDLE_NAME)
+        || !image.starts_with(bundle.join("Contents").join("MacOS"))
+    {
         return false;
     }
 
     let Ok(info_plist) = std::fs::read_to_string(bundle.join("Contents").join("Info.plist")) else {
         return false;
     };
-    DESKTOP_IDENTITIES.iter().any(|identity| {
-        image.file_name().and_then(|name| name.to_str()) == Some(identity.executable_name)
-            && bundle.file_name().and_then(|name| name.to_str()) == Some(identity.bundle_name)
-            && regex::Regex::new(&format!(
-                r"(?s)<key>\s*CFBundleIdentifier\s*</key>\s*<string>\s*{}\s*</string>",
-                regex::escape(identity.bundle_id)
-            ))
-            .map(|regex| regex.is_match(&info_plist))
-            .unwrap_or(false)
-    })
+    regex::Regex::new(&format!(
+        r"(?s)<key>\s*CFBundleIdentifier\s*</key>\s*<string>\s*{}\s*</string>",
+        regex::escape(crate::brand::BUNDLE_ID)
+    ))
+    .map(|regex| regex.is_match(&info_plist))
+    .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -262,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_anchor_and_legacy_macos_bundles() {
+    fn recognizes_anchor_macos_bundle() {
         let temp = tempfile::tempdir().expect("tempdir");
         let anchor = write_bundle(
             temp.path(),
@@ -270,16 +255,8 @@ mod tests {
             crate::brand::DESKTOP_EXECUTABLE_NAME,
             crate::brand::BUNDLE_ID,
         );
-        let legacy_root = temp.path().join("legacy");
-        let legacy = write_bundle(
-            &legacy_root,
-            "Coding Tools MCP.app",
-            crate::brand::LEGACY_DESKTOP_EXECUTABLE_NAME,
-            crate::brand::LEGACY_BUNDLE_ID,
-        );
 
         assert!(is_managed_macos_desktop_executable(&anchor));
-        assert!(is_managed_macos_desktop_executable(&legacy));
     }
 
     #[test]

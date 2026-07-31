@@ -9,12 +9,5 @@ pub const DESKTOP_EXECUTABLE_NAME: &str = "anchor-desktop";
 pub const BUNDLE_ID: &str = "com.anchor.desktop";
 pub(crate) const APP_CONFIG_DIR_NAME: &str = "anchor";
 pub(crate) const CONFIG_DIR_ENV: &str = "ANCHOR_CONFIG_DIR";
-
-// Compatibility identifiers are intentionally retained for one-way migration
-// and safe ownership checks. They are not user-facing product names.
-#[cfg(any(target_os = "macos", test))]
-pub const LEGACY_DESKTOP_EXECUTABLE_NAME: &str = "coding-tools-mcp-desktop";
-#[cfg(any(target_os = "macos", test))]
-pub const LEGACY_BUNDLE_ID: &str = "com.codingtools.mcp.desktop";
 pub(crate) const LEGACY_APP_CONFIG_DIR_NAME: &str = "coding-tools-mcp-desktop";
 pub(crate) const LEGACY_CONFIG_DIR_ENV: &str = "CODING_TOOLS_MCP_CONFIG_DIR";

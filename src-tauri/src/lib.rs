@@ -53,33 +53,15 @@ fn acquire_single_instance() -> bool {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
 
-    // 同时占用 Anchor 与旧产品名的 mutex，防止升级期间两个版本同时管理同一组
-    // Workspace/FRP 进程。HANDLE 保持到进程退出，由 Windows 自动回收。
-    let Ok(anchor_handle) =
-        (unsafe { CreateMutexW(None, false, w!("Local\\Anchor-SingleInstance")) })
+    // HANDLE 保持到进程退出，由 Windows 自动回收。第二个实例必须在
+    // cleanup_managed_frpc_instances 之前退出，避免误清理第一个实例的进程。
+    let Ok(handle) = (unsafe { CreateMutexW(None, false, w!("Local\\Anchor-SingleInstance")) })
     else {
         eprintln!("创建应用单实例锁失败，为避免误清理其他实例的 frpc，本次启动已取消");
         return false;
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let _ = unsafe { CloseHandle(anchor_handle) };
-        return false;
-    }
-
-    let Ok(legacy_handle) = (unsafe {
-        CreateMutexW(
-            None,
-            false,
-            w!("Local\\CodingToolsMcpDesktop-SingleInstance"),
-        )
-    }) else {
-        let _ = unsafe { CloseHandle(anchor_handle) };
-        eprintln!("创建旧版本兼容单实例锁失败，本次启动已取消");
-        return false;
-    };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let _ = unsafe { CloseHandle(anchor_handle) };
-        let _ = unsafe { CloseHandle(legacy_handle) };
+        let _ = unsafe { CloseHandle(handle) };
         return false;
     }
     true
