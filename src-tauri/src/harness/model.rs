@@ -254,6 +254,8 @@ pub struct VerificationRecord {
     pub kind: String,
     #[serde(default = "default_verification_status")]
     pub status: String,
+    #[serde(default = "default_verification_level")]
+    pub level: String,
     pub exit_code: Option<i32>,
     pub passed: bool,
     #[serde(default)]
@@ -261,6 +263,8 @@ pub struct VerificationRecord {
     pub change_id: Option<String>,
     #[serde(default)]
     pub dispositions: Vec<VerificationDispositionRecord>,
+    #[serde(default)]
+    pub supersedes: Vec<String>,
     pub created_at: String,
 }
 
@@ -275,6 +279,10 @@ pub struct VerificationDispositionRecord {
 
 fn default_verification_status() -> String {
     "unknown".into()
+}
+
+fn default_verification_level() -> String {
+    "blocking".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

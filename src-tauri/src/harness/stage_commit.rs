@@ -390,6 +390,8 @@ fn execute_new_workflow(
                 passed,
                 result.get("duration_ms").and_then(Value::as_u64),
                 None,
+                "blocking",
+                true,
             )
             .map_err(harness_error)?;
         if let Some(object) = result.as_object_mut() {
@@ -679,10 +681,7 @@ pub fn wait(
     )
 }
 
-fn ensure_receipt_task(
-    receipt: &StageCommitReceipt,
-    task_id: &str,
-) -> Result<(), WorkspaceError> {
+fn ensure_receipt_task(receipt: &StageCommitReceipt, task_id: &str) -> Result<(), WorkspaceError> {
     if receipt.task_id == task_id {
         return Ok(());
     }
@@ -767,9 +766,7 @@ fn advance_deferred_workflow(
                     }),
                 ) {
                     Ok(value) => value,
-                    Err(error)
-                        if error.to_error_value()["code"] == "SESSION_NOT_FOUND" =>
-                    {
+                    Err(error) if error.to_error_value()["code"] == "SESSION_NOT_FOUND" => {
                         receipt.current_session_id = None;
                         receipt.error = Some(json!({
                             "code": "STAGE_COMMIT_CHECK_SESSION_LOST",
@@ -898,6 +895,8 @@ fn persist_deferred_check_result(
                 .or_else(|| result.get("elapsed_ms"))
                 .and_then(Value::as_u64),
             None,
+            "blocking",
+            true,
         )
         .map_err(harness_error)?;
     if let Some(object) = result.as_object_mut() {

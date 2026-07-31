@@ -31,6 +31,42 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
     handle_request_with_protocol(state, body, protocol_version).await
 }
 
+fn proxy_operation_summary(
+    name: &str,
+    session_id: Option<&str>,
+    result: &Result<Value, Value>,
+) -> Value {
+    match result {
+        Ok(value) => {
+            let structured = value.get("structuredContent").unwrap_or(&Value::Null);
+            let error = structured.get("error");
+            serde_json::json!({
+                "ok": structured.get("ok").and_then(Value::as_bool).unwrap_or_else(|| {
+                    value.get("isError").and_then(Value::as_bool) != Some(true)
+                }),
+                "tool": name,
+                "session_id": session_id,
+                "error_code": error.and_then(|value| value.get("code")),
+                "error_message": error.and_then(|value| value.get("message")),
+                "retryable": error.and_then(|value| value.get("retryable")),
+                "error_details": error.and_then(|value| value.get("details")),
+                "duration_ms": structured.get("duration_ms"),
+                "source": "mcp_proxy"
+            })
+        }
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "tool": name,
+            "session_id": session_id,
+            "error_code": error.get("code"),
+            "error_message": error.get("message"),
+            "error_details": error.get("data"),
+            "duration_ms": null,
+            "source": "mcp_proxy"
+        }),
+    }
+}
+
 fn tools_list_result(catalog: &EffectiveCatalog, params: &Value) -> Result<Value, Value> {
     let start = tools_list_cursor_offset(params, &catalog.digest, catalog.tools.len())?;
     let mut end = start;
@@ -312,12 +348,67 @@ async fn handle_tools_call(
         }));
     }
 
-    if let Some(result) = state
-        .mcp_proxies
-        .call_tool_with_cancellation(name, &raw_args, cancellation)
-        .await
-    {
-        return result;
+    if state.mcp_proxies.contains_tool(name) {
+        let active_task = state.harness.current_task().ok().flatten();
+        let operation = state
+            .harness
+            .record_operation(
+                None,
+                active_task.as_ref().map(|task| task.id.as_str()),
+                session_id,
+                name,
+                "started",
+                serde_json::json!({
+                    "arguments": raw_args,
+                    "source": "mcp_proxy",
+                    "session_id": session_id
+                }),
+                serde_json::json!({"ok": true}),
+            )
+            .ok();
+        if let Some(mut result) = state
+            .mcp_proxies
+            .call_tool_with_cancellation(name, &raw_args, cancellation)
+            .await
+        {
+            if let Some(operation) = operation {
+                if let Ok(value) = &mut result {
+                    if let Some(structured) = value
+                        .get_mut("structuredContent")
+                        .and_then(Value::as_object_mut)
+                    {
+                        structured
+                            .insert("operation_id".into(), Value::String(operation.id.clone()));
+                        structured.insert("trace_id".into(), Value::String(operation.id.clone()));
+                    }
+                }
+                let summary = proxy_operation_summary(name, session_id, &result);
+                let succeeded = summary.get("ok").and_then(Value::as_bool) == Some(true);
+                let _ = state.harness.record_operation(
+                    Some(&operation.id),
+                    active_task.as_ref().map(|task| task.id.as_str()),
+                    session_id,
+                    name,
+                    if succeeded { "completed" } else { "failed" },
+                    serde_json::json!({
+                        "arguments": raw_args,
+                        "source": "mcp_proxy",
+                        "session_id": session_id
+                    }),
+                    summary.clone(),
+                );
+                if let Some(task) = active_task.as_ref() {
+                    let _ = state.harness.record_event(
+                        &task.id,
+                        "proxy_operation_finished",
+                        Some(name),
+                        serde_json::json!({"session_id": session_id}),
+                        summary,
+                    );
+                }
+            }
+            return result;
+        }
     }
 
     let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
@@ -624,10 +715,7 @@ mod tests {
 
         let work_session = tool_arguments("begin_work_session", &params);
         assert_eq!(work_session["session_key"], "explicit");
-        assert_eq!(
-            work_session["_host_session_key"],
-            "chatgpt-conversation"
-        );
+        assert_eq!(work_session["_host_session_key"], "chatgpt-conversation");
 
         let existing = tool_arguments("read_file", &params);
         assert_eq!(existing["session_key"], "explicit");

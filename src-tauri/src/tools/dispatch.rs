@@ -110,6 +110,8 @@ fn record_verification_from_output(
     task_id: &str,
     kind: &str,
     command: &str,
+    level: &str,
+    supersede_previous_failures: bool,
     output: &mut Value,
 ) {
     let exit_code = output
@@ -126,17 +128,52 @@ fn record_verification_from_output(
         passed,
         duration_ms,
         None,
+        level,
+        supersede_previous_failures,
     ) {
+        let effective_disposition = verification
+            .dispositions
+            .last()
+            .map(|entry| entry.disposition.as_str())
+            .unwrap_or(if verification.passed {
+                "passed"
+            } else {
+                "active_failure"
+            });
         if let Some(object) = output.as_object_mut() {
+            object.insert(
+                "verification_id".into(),
+                Value::String(verification.id.clone()),
+            );
+            object.insert(
+                "verification_level".into(),
+                Value::String(verification.level.clone()),
+            );
+            object.insert(
+                "supersedes".into(),
+                serde_json::to_value(&verification.supersedes).unwrap_or_else(|_| json!([])),
+            );
+            object.insert(
+                "affected_task_status".into(),
+                ctx.harness
+                    .current_task()
+                    .ok()
+                    .flatten()
+                    .map(|task| serde_json::to_value(task.status).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null),
+            );
             object.insert(
                 "verification".into(),
                 json!({
                     "verification_id": verification.id,
                     "kind": verification.kind,
                     "status": verification.status,
+                    "level": verification.level,
+                    "effective_disposition": effective_disposition,
                     "exit_code": verification.exit_code,
                     "command": verification.command,
-                    "duration_ms": verification.duration_ms
+                    "duration_ms": verification.duration_ms,
+                    "supersedes": verification.supersedes
                 }),
             );
         }
@@ -278,10 +315,52 @@ fn call_tool_impl(
     }
 
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
-        return match crate::harness::tools::call(ctx, name, args, cancellation) {
+        let active_task = ctx.harness.current_task().ok().flatten();
+        let operation = if name == "operation_log" {
+            None
+        } else {
+            ctx.harness
+                .record_operation(
+                    None,
+                    active_task.as_ref().map(|task| task.id.as_str()),
+                    session_id,
+                    name,
+                    "started",
+                    operation_input(args),
+                    json!({"ok": true}),
+                )
+                .ok()
+        };
+        let mut output = match crate::harness::tools::call(ctx, name, args, cancellation) {
             Ok(value) => value,
             Err(error) => attach_harness_status(ctx, tool_err(error), false),
         };
+        if let Some(operation) = operation {
+            let result_task_id = output
+                .get("task")
+                .and_then(|task| task.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| active_task.as_ref().map(|task| task.id.clone()));
+            if let Some(object) = output.as_object_mut() {
+                object.insert("operation_id".into(), Value::String(operation.id.clone()));
+                object.insert("trace_id".into(), Value::String(operation.id.clone()));
+            }
+            if output.get("response_bytes").is_some() {
+                crate::harness::tools::update_response_bytes(&mut output);
+            }
+            let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
+            let _ = ctx.harness.record_operation(
+                Some(&operation.id),
+                result_task_id.as_deref(),
+                session_id,
+                name,
+                if succeeded { "completed" } else { "failed" },
+                operation_input(args),
+                operation_result_summary(name, &output),
+            );
+        }
+        return output;
     }
 
     let active_task = ctx.harness.current_task().ok().flatten();
@@ -393,6 +472,7 @@ fn call_tool_impl(
     if let Some(operation) = operation.as_ref() {
         if let Some(object) = output.as_object_mut() {
             object.insert("operation_id".into(), Value::String(operation.id.clone()));
+            object.insert("trace_id".into(), Value::String(operation.id.clone()));
         }
     }
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -405,7 +485,7 @@ fn call_tool_impl(
             "operation_finished",
             Some(name),
             operation_input(args),
-            json!({"ok": succeeded, "tool": name}),
+            operation_result_summary(name, &output),
         );
         if succeeded && advances_expected_state(name, &output) {
             let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
@@ -420,7 +500,23 @@ fn call_tool_impl(
                     .and_then(Value::as_str),
                 effective_args.get("cmd").and_then(Value::as_str),
             ) {
-                record_verification_from_output(ctx, task_id, kind, command, &mut output);
+                let level = effective_args
+                    .get("verification_level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("blocking");
+                let supersede = effective_args
+                    .get("supersede_previous_failures")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                record_verification_from_output(
+                    ctx,
+                    task_id,
+                    kind,
+                    command,
+                    level,
+                    supersede,
+                    &mut output,
+                );
             }
         } else if name == "exec_command" && effective_args.get("verification_kind").is_some() {
             if let Some(object) = output.as_object_mut() {
@@ -441,6 +537,8 @@ fn call_tool_impl(
                         &metadata.task_id,
                         kind,
                         &metadata.command,
+                        &metadata.verification_level,
+                        metadata.supersede_previous_failures,
                         &mut output,
                     );
                 }
@@ -468,14 +566,44 @@ fn call_tool_impl(
             name,
             if succeeded { "completed" } else { "failed" },
             operation_input(args),
-            json!({
-                "ok": succeeded,
-                "tool": name,
-                "affected_files": output.get("affected_files")
-            }),
+            operation_result_summary(name, &output),
+        );
+    } else if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        let _ = ctx.harness.record_operation(
+            None,
+            active_task.as_ref().map(|task| task.id.as_str()),
+            session_id,
+            name,
+            "failed",
+            operation_input(args),
+            operation_result_summary(name, &output),
         );
     }
     output
+}
+
+fn operation_result_summary(name: &str, output: &Value) -> Value {
+    let error = output.get("error");
+    json!({
+        "ok": output.get("ok").and_then(Value::as_bool) == Some(true),
+        "tool": name,
+        "session_id": output.get("session_id"),
+        "termination_reason": output.get("termination_reason"),
+        "exit_code": output.get("exit_code"),
+        "duration_ms": output.get("duration_ms").or_else(|| output.get("elapsed_ms")),
+        "error_code": error.and_then(|value| value.get("code")),
+        "error_message": error.and_then(|value| value.get("message")),
+        "retryable": error.and_then(|value| value.get("retryable")),
+        "error_details": error.and_then(|value| value.get("details")),
+        "verification_id": output.get("verification_id"),
+        "verification_level": output.get("verification_level"),
+        "disposition": output
+            .get("verification")
+            .and_then(|value| value.get("effective_disposition")),
+        "supersedes": output.get("supersedes"),
+        "affected_task_status": output.get("affected_task_status"),
+        "affected_files": output.get("affected_files")
+    })
 }
 
 fn preserve_completed_result(mut output: Value, cancellation: &CancellationToken) -> Value {
@@ -689,11 +817,13 @@ fn server_info_for_session(
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
+    let tool_groups = tool_group_manifest(&tools);
     let current_tools = current_catalog
         .tools
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
+    let current_tool_groups = tool_group_manifest(&current_tools);
     Ok(tool_ok(json!({
         "server": crate::brand::SERVER_NAME,
         "title": crate::brand::PRODUCT_NAME,
@@ -709,8 +839,10 @@ fn server_info_for_session(
         "endpoint_path": "/mcp",
         "tools": tools,
         "tool_count": tools.len(),
+        "tool_groups": tool_groups,
         "current_tools": current_tools,
         "current_tool_count": current_tools.len(),
+        "current_tool_groups": current_tool_groups,
         "catalog_digest": running_catalog.digest,
         "running_catalog_digest": running_catalog.digest,
         "current_catalog_digest": current_catalog.digest,
@@ -737,6 +869,81 @@ fn server_info_for_session(
     })))
 }
 
+fn tool_group_manifest(tools: &[&str]) -> Value {
+    let mut workspace = Vec::new();
+    let mut git = Vec::new();
+    let mut command = Vec::new();
+    let mut task = Vec::new();
+    let mut skills = Vec::new();
+    let mut browser_proxy = Vec::new();
+    let mut service = Vec::new();
+    for tool in tools {
+        let target = if tool.starts_with("git_") {
+            &mut git
+        } else if matches!(
+            *tool,
+            "exec_command"
+                | "exec_health_check"
+                | "wait_command"
+                | "write_stdin"
+                | "read_output"
+                | "kill_session"
+                | "check_exec_environment"
+        ) {
+            &mut command
+        } else if matches!(
+            *tool,
+            "harness_status"
+                | "project_state"
+                | "start_task"
+                | "update_task"
+                | "pause_task"
+                | "resume_task"
+                | "finish_task"
+                | "begin_work_session"
+                | "close_work_session"
+                | "task_context"
+                | "list_task_events"
+                | "change_summary"
+                | "stage_commit"
+                | "stage_commit_status"
+                | "wait_stage_commit"
+                | "update_verification_disposition"
+                | "accept_current_baseline"
+                | "refresh_baseline"
+                | "operation_log"
+                | "history_session_bootstrap"
+                | "history_session_checkpoint"
+                | "history_session_validate"
+        ) {
+            &mut task
+        } else if matches!(*tool, "list_skills" | "load_skill" | "read_skill_resource") {
+            &mut skills
+        } else if tool.contains("browser")
+            || tool.ends_with("__health_check")
+            || tool.ends_with("__reconnect")
+            || tool.ends_with("__reset_session")
+        {
+            &mut browser_proxy
+        } else if matches!(*tool, "server_info" | "get_default_cwd" | "set_default_cwd") {
+            &mut service
+        } else {
+            &mut workspace
+        };
+        target.push((*tool).to_string());
+    }
+    json!({
+        "core": tools,
+        "workspace": workspace,
+        "git": git,
+        "command": command,
+        "task": task,
+        "skills": skills,
+        "browser_proxy": browser_proxy,
+        "service": service
+    })
+}
+
 pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     let boundary_error = ctx.workspace.ensure_child_process_boundary().err();
     let workspace_exec_available = boundary_error.is_none();
@@ -744,6 +951,7 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
     if let Some(error) = &boundary_error {
         warnings.push(error.message());
     }
+    let development_environment = crate::tools::environment::diagnose(ctx.workspace.root());
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
@@ -774,6 +982,7 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
             "resolution": "workdir_first",
             "allowlist_required": true
         },
+        "development_environment": development_environment,
         // Backward-compatible alias for older MCP clients.
         "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "warnings": warnings

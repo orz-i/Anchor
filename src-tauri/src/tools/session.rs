@@ -100,6 +100,10 @@ pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     };
     let stdout = incremental_stream(&session, "stdout", stdout_offset, limit, return_incremental);
     let stderr = incremental_stream(&session, "stderr", stderr_offset, limit, return_incremental);
+    let output_refs = json!({
+        "stdout": format!("session:{session_id}:stdout"),
+        "stderr": format!("session:{session_id}:stderr")
+    });
 
     Ok(tool_ok(json!({
         "session_id": session_id,
@@ -114,6 +118,9 @@ pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         "stdin_open": snapshot["stdin_open"],
         "stdout": stdout,
         "stderr": stderr,
+        "stdout_complete": stdout.get("complete").and_then(Value::as_bool).unwrap_or(false),
+        "stderr_complete": stderr.get("complete").and_then(Value::as_bool).unwrap_or(false),
+        "output_refs": output_refs,
         "stop_pattern_matched": matched_pattern,
         "wait_timeout_ms": timeout_ms,
         "warnings": []
@@ -129,6 +136,8 @@ fn incremental_stream(
 ) -> Value {
     let (data, total_stream_bytes) = session.retained_stream_bytes(stream);
     let page = page_retained_output(&data, total_stream_bytes, offset, limit);
+    let complete =
+        session.has_exited() && !page.evicted_before_offset && page.next_offset.is_none();
     json!({
         "output_ref": format!("session:{}:{stream}", session.session_id),
         "offset": page.effective_offset,
@@ -137,7 +146,8 @@ fn incremental_stream(
         "content": if include_content { String::from_utf8_lossy(page.content).into_owned() } else { String::new() },
         "next_offset": page.next_offset.unwrap_or(total_stream_bytes as u64),
         "total_stream_bytes": total_stream_bytes,
-        "truncated": page.evicted_before_offset || page.next_offset.is_some()
+        "truncated": page.evicted_before_offset || page.next_offset.is_some(),
+        "complete": complete
     })
 }
 
@@ -316,6 +326,8 @@ pub struct SessionHarnessMetadata {
     pub task_id: String,
     pub command: String,
     pub verification_kind: Option<String>,
+    pub verification_level: String,
+    pub supersede_previous_failures: bool,
 }
 
 impl ExecSession {
@@ -538,6 +550,8 @@ impl ExecSession {
             "stderr": stderr.content,
             "stdout_truncated": stdout.truncated,
             "stderr_truncated": stderr.truncated,
+            "stdout_complete": self.has_exited() && !stdout.truncated,
+            "stderr_complete": self.has_exited() && !stderr.truncated,
             "elapsed_ms": self.started_at.elapsed().as_millis(),
             "started_at": self.started_at_iso,
             "last_output_at": self.last_output_at.lock().expect("last output lock").clone(),

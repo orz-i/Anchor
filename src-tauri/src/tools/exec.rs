@@ -67,12 +67,9 @@ pub fn exec_command_with_cancellation(
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(30_000);
-    let cost_decision = ctx.command_cost.evaluate(
-        ctx.workspace.root(),
-        cmd,
-        requested_timeout_ms,
-        &ctx.policy,
-    )?;
+    let cost_decision =
+        ctx.command_cost
+            .evaluate(ctx.workspace.root(), cmd, requested_timeout_ms, &ctx.policy)?;
     let timeout_ms = cost_decision.effective_timeout_ms();
     if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
         if cancellation.is_cancelled() {
@@ -112,6 +109,14 @@ pub fn exec_command_with_cancellation(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let verification_level = args
+        .get("verification_level")
+        .and_then(Value::as_str)
+        .unwrap_or("blocking");
+    let supersede_previous_failures = args
+        .get("supersede_previous_failures")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     ctx.workspace.ensure_child_process_boundary()?;
 
@@ -126,6 +131,8 @@ pub fn exec_command_with_cancellation(
             tty,
             stdin_text,
             verification_kind,
+            verification_level,
+            supersede_previous_failures,
             cancellation,
         )
         .await
@@ -224,6 +231,10 @@ fn run_native_diagnostic(
             "stderr": "",
             "stdout_truncated": false,
             "stderr_truncated": false,
+            "stdout_complete": true,
+            "stderr_complete": true,
+            "stdout_complete": true,
+            "stderr_complete": true,
             "duration_ms": 0,
             "elapsed_ms": 0,
             "execution_mode": "native_builtin",
@@ -287,6 +298,8 @@ async fn run_command(
     tty: bool,
     stdin_text: &str,
     verification_kind: Option<&str>,
+    verification_level: &str,
+    supersede_previous_failures: bool,
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
     if cancellation.is_cancelled() {
@@ -330,6 +343,8 @@ async fn run_command(
                 task_id: task.id,
                 command: cmd.to_string(),
                 verification_kind: verification_kind.map(str::to_string),
+                verification_level: verification_level.to_string(),
+                supersede_previous_failures,
             });
     let session = match ctx.sessions.insert(ExecSession::new_with_harness_metadata(
         child,
@@ -480,6 +495,8 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         false,
         "",
         None,
+        "blocking",
+        true,
         &CancellationToken::default(),
     ));
 
@@ -606,6 +623,12 @@ fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -
         object
             .entry("stderr_truncated")
             .or_insert_with(|| Value::Bool(false));
+        object
+            .entry("stdout_complete")
+            .or_insert_with(|| Value::Bool(true));
+        object
+            .entry("stderr_complete")
+            .or_insert_with(|| Value::Bool(true));
         object
             .entry("elapsed_ms")
             .or_insert_with(|| elapsed_ms.clone());

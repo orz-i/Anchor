@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod command_cost;
 pub mod context;
 pub mod dispatch;
+pub mod environment;
 pub mod exec;
 pub mod file;
 pub mod git;

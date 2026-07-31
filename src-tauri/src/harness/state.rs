@@ -25,6 +25,37 @@ pub struct Harness {
     store: HarnessStore,
 }
 
+fn normalize_verification_level(level: &str) -> HarnessResult<&str> {
+    let normalized = if level.trim().is_empty() {
+        "blocking"
+    } else {
+        level.trim()
+    };
+    if matches!(
+        normalized,
+        "diagnostic" | "informational" | "required" | "blocking"
+    ) {
+        Ok(normalized)
+    } else {
+        Err(HarnessError::new(
+            "INVALID_ARGUMENT",
+            "verification level must be diagnostic, informational, required, or blocking",
+        ))
+    }
+}
+
+fn verification_effective_disposition(record: &VerificationRecord) -> &str {
+    record
+        .dispositions
+        .last()
+        .map(|entry| entry.disposition.as_str())
+        .unwrap_or(if record.passed {
+            "passed"
+        } else {
+            "active_failure"
+        })
+}
+
 fn baseline_observation_token(
     workspace_id: &str,
     task_id: &str,
@@ -212,21 +243,74 @@ impl Harness {
         passed: bool,
         duration_ms: Option<u64>,
         change_id: Option<&str>,
+        level: &str,
+        supersede_previous_failures: bool,
     ) -> HarnessResult<VerificationRecord> {
         let mut task = self.task(task_id)?;
-        let verification = VerificationRecord {
-            id: Uuid::new_v4().simple().to_string(),
+        let level = normalize_verification_level(level)?;
+        let verification_id = Uuid::new_v4().simple().to_string();
+        let mut supersedes = Vec::new();
+        if passed && supersede_previous_failures {
+            for mut previous in self.list_verifications(task_id)? {
+                if previous.kind != kind
+                    || previous.passed
+                    || verification_effective_disposition(&previous) != "active_failure"
+                {
+                    continue;
+                }
+                previous.dispositions.push(VerificationDispositionRecord {
+                    id: Uuid::new_v4().simple().to_string(),
+                    disposition: "superseded".into(),
+                    reason: format!(
+                        "Superseded by later successful verification {verification_id} for kind {kind}"
+                    ),
+                    source: "automatic_later_success".into(),
+                    created_at: timestamp(),
+                });
+                self.store
+                    .save_verification(&self.workspace_id, &previous)?;
+                supersedes.push(previous.id);
+            }
+        }
+        let mut verification = VerificationRecord {
+            id: verification_id,
             task_id: task_id.to_string(),
             command: command.to_string(),
             kind: kind.trim().to_string(),
             status: if passed { "passed" } else { "failed" }.into(),
+            level: level.to_string(),
             exit_code,
             passed,
             duration_ms,
             change_id: change_id.map(str::to_string),
             dispositions: Vec::new(),
+            supersedes,
             created_at: timestamp(),
         };
+        if !passed {
+            let initial_disposition = match level {
+                "diagnostic" => Some((
+                    "diagnostic_only",
+                    "Diagnostic verification failures are recorded but do not block task completion",
+                )),
+                "informational" => Some((
+                    "expected_failure",
+                    "Informational verification failures are retained as non-blocking evidence",
+                )),
+                _ => None,
+            };
+            if let Some((disposition, reason)) = initial_disposition {
+                verification
+                    .dispositions
+                    .push(VerificationDispositionRecord {
+                        id: Uuid::new_v4().simple().to_string(),
+                        disposition: disposition.into(),
+                        reason: reason.into(),
+                        source: "verification_level".into(),
+                        created_at: timestamp(),
+                    });
+            }
+        }
         self.store
             .save_verification(&self.workspace_id, &verification)?;
         task.latest_verification_id = Some(verification.id.clone());
@@ -239,7 +323,9 @@ impl Harness {
             json!({
                 "verification_id": verification.id,
                 "kind": verification.kind,
-                "command": verification.command
+                "command": verification.command,
+                "level": verification.level,
+                "supersedes": verification.supersedes
             }),
             json!({
                 "ok": passed,
@@ -1273,5 +1359,81 @@ mod tests {
             )
             .expect_err("stale observation must fail");
         assert_eq!(error.code(), "BASELINE_REFRESH_CAS_FAILED");
+    }
+
+    #[test]
+    fn diagnostic_failure_is_non_blocking_and_later_success_supersedes_blocking_failure() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("verification levels").expect("start");
+
+        let diagnostic = harness
+            .record_verification(
+                &task.id,
+                "environment_probe",
+                "pnpm --version",
+                Some(1),
+                false,
+                Some(10),
+                None,
+                "diagnostic",
+                true,
+            )
+            .expect("diagnostic");
+        assert_eq!(diagnostic.level, "diagnostic");
+        assert_eq!(
+            diagnostic
+                .dispositions
+                .last()
+                .map(|entry| entry.disposition.as_str()),
+            Some("diagnostic_only")
+        );
+
+        let failed = harness
+            .record_verification(
+                &task.id,
+                "lint",
+                "make lint",
+                Some(1),
+                false,
+                Some(20),
+                None,
+                "blocking",
+                true,
+            )
+            .expect("failed lint");
+        let passed = harness
+            .record_verification(
+                &task.id,
+                "lint",
+                "make lint",
+                Some(0),
+                true,
+                Some(30),
+                None,
+                "blocking",
+                true,
+            )
+            .expect("passed lint");
+        assert_eq!(passed.supersedes, vec![failed.id.clone()]);
+
+        let records = harness.list_verifications(&task.id).expect("verifications");
+        let superseded = records
+            .iter()
+            .find(|record| record.id == failed.id)
+            .expect("failed record");
+        assert_eq!(
+            superseded
+                .dispositions
+                .last()
+                .map(|entry| entry.disposition.as_str()),
+            Some("superseded")
+        );
     }
 }

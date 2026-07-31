@@ -126,13 +126,7 @@ fn update_verification_disposition(
     };
     let verification = ctx
         .harness
-        .update_verification_disposition(
-            task_id,
-            verification_id,
-            disposition,
-            reason,
-            source,
-        )
+        .update_verification_disposition(task_id, verification_id, disposition, reason, source)
         .map_err(map_error)?;
     let records = ctx.harness.list_verifications(task_id).map_err(map_error)?;
     Ok(json!({
@@ -154,11 +148,21 @@ fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
     let session_key = history
         .get("session_key")
         .and_then(Value::as_str)
-        .ok_or_else(|| tool_error("HISTORY_SESSION_INVALID", "History Session 缺少 session_key"))?;
+        .ok_or_else(|| {
+            tool_error(
+                "HISTORY_SESSION_INVALID",
+                "History Session 缺少 session_key",
+            )
+        })?;
     let current_path = history
         .get("current_path")
         .and_then(Value::as_str)
-        .ok_or_else(|| tool_error("HISTORY_SESSION_INVALID", "History Session 缺少 current_path"))?;
+        .ok_or_else(|| {
+            tool_error(
+                "HISTORY_SESSION_INVALID",
+                "History Session 缺少 current_path",
+            )
+        })?;
 
     let (task, task_created) = match ctx.harness.current_task().map_err(map_error)? {
         Some(task) => {
@@ -370,16 +374,11 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     };
     operations.retain(|operation| {
         matches_optional(operation, "task_id", task_filter.as_deref())
-            && matches_optional(
-                operation,
-                "history_session_key",
-                history_filter.as_deref(),
-            )
+            && matches_optional(operation, "history_session_key", history_filter.as_deref())
             && matches_optional(operation, "mcp_session_id", mcp_filter.as_deref())
             && matches_optional(operation, "tool", tool_filter.as_deref())
             && matches_optional(operation, "status", status_filter.as_deref())
-            && (!failures_only
-                || operation.get("status").and_then(Value::as_str) == Some("failed"))
+            && (!failures_only || operation.get("status").and_then(Value::as_str) == Some("failed"))
             && within_time_range(operation, started_after, started_before)
     });
     operations.sort_by(|left, right| {
@@ -446,8 +445,7 @@ fn operation_timestamp(operation: &Value) -> i64 {
 
 fn within_time_range(operation: &Value, after: Option<i64>, before: Option<i64>) -> bool {
     let timestamp = operation_timestamp(operation);
-    after.is_none_or(|value| timestamp >= value)
-        && before.is_none_or(|value| timestamp <= value)
+    after.is_none_or(|value| timestamp >= value) && before.is_none_or(|value| timestamp <= value)
 }
 
 fn matches_optional(operation: &Value, key: &str, expected: Option<&str>) -> bool {
@@ -456,16 +454,40 @@ fn matches_optional(operation: &Value, key: &str, expected: Option<&str>) -> boo
 
 fn operation_value(operation: OperationRecord) -> Value {
     let created_at_iso = operation_iso(&operation);
+    let result = &operation.result_summary;
+    let session_id = result
+        .get("session_id")
+        .cloned()
+        .or_else(|| operation.mcp_session_id.clone().map(Value::String));
+    let error_code = result.get("error_code").cloned().unwrap_or(Value::Null);
+    let error_message = result.get("error_message").cloned().unwrap_or(Value::Null);
+    let duration_ms = result.get("duration_ms").cloned().unwrap_or(Value::Null);
+    let verification_id = result
+        .get("verification_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let disposition = result.get("disposition").cloned().unwrap_or(Value::Null);
+    let superseded_by = result.get("superseded_by").cloned().unwrap_or(Value::Null);
+    let supersedes = result.get("supersedes").cloned().unwrap_or(Value::Null);
     json!({
         "id": operation.id,
+        "trace_id": operation.id,
         "workspace_id": operation.workspace_id,
         "task_id": operation.task_id,
         "history_session_key": operation.history_session_key,
         "mcp_session_id": operation.mcp_session_id,
+        "session_id": session_id,
         "tool": operation.tool,
         "status": operation.kind,
         "input_summary": operation.input_summary,
         "result_summary": operation.result_summary,
+        "error_code": error_code,
+        "error_message": error_message,
+        "duration_ms": duration_ms,
+        "verification_id": verification_id,
+        "disposition": disposition,
+        "superseded_by": superseded_by,
+        "supersedes": supersedes,
         "reason": operation.reason,
         "affected_files": operation.affected_files,
         "created_at": operation.created_at,
@@ -480,7 +502,10 @@ fn collapse_operations(operations: Vec<OperationRecord>) -> Vec<Value> {
         if !grouped.contains_key(&operation.id) {
             order.push(operation.id.clone());
         }
-        grouped.entry(operation.id.clone()).or_default().push(operation);
+        grouped
+            .entry(operation.id.clone())
+            .or_default()
+            .push(operation);
     }
     order
         .into_iter()
@@ -509,16 +534,53 @@ fn collapse_operation(records: Vec<OperationRecord>) -> Option<Value> {
         .unwrap_or_default();
     let started_at_iso = operation_iso(started);
     let completed_at_iso = operation_iso(final_record);
+    let computed_duration_ms = if status == "running" {
+        None
+    } else {
+        final_record
+            .created_at
+            .parse::<i64>()
+            .ok()
+            .zip(started.created_at.parse::<i64>().ok())
+            .map(|(completed, started)| completed.saturating_sub(started).max(0) as u64)
+    };
+    let result = &final_record.result_summary;
+    let session_id = result
+        .get("session_id")
+        .cloned()
+        .or_else(|| final_record.mcp_session_id.clone().map(Value::String));
+    let error_code = result.get("error_code").cloned().unwrap_or(Value::Null);
+    let error_message = result.get("error_message").cloned().unwrap_or(Value::Null);
+    let duration_ms = result
+        .get("duration_ms")
+        .cloned()
+        .unwrap_or_else(|| computed_duration_ms.map(Value::from).unwrap_or(Value::Null));
+    let verification_id = result
+        .get("verification_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let disposition = result.get("disposition").cloned().unwrap_or(Value::Null);
+    let superseded_by = result.get("superseded_by").cloned().unwrap_or(Value::Null);
+    let supersedes = result.get("supersedes").cloned().unwrap_or(Value::Null);
     Some(json!({
         "id": started.id,
+        "trace_id": started.id,
         "workspace_id": started.workspace_id,
         "task_id": final_record.task_id.as_ref().or(started.task_id.as_ref()),
         "history_session_key": final_record.history_session_key.as_ref().or(started.history_session_key.as_ref()),
         "mcp_session_id": final_record.mcp_session_id.as_ref().or(started.mcp_session_id.as_ref()),
+        "session_id": session_id,
         "tool": final_record.tool,
         "status": status,
         "input_summary": final_record.input_summary,
         "result_summary": final_record.result_summary,
+        "error_code": error_code,
+        "error_message": error_message,
+        "duration_ms": duration_ms,
+        "verification_id": verification_id,
+        "disposition": disposition,
+        "superseded_by": superseded_by,
+        "supersedes": supersedes,
         "reason": final_record.reason.as_ref().or(started.reason.as_ref()),
         "affected_files": affected_files,
         "started_at": started.created_at,
@@ -547,6 +609,7 @@ fn operation_summary(operations: &[Value], total_matches: usize) -> Value {
     let mut affected_files = Vec::<String>::new();
     let mut failed = 0usize;
     let mut running = 0usize;
+    let mut duration_ms = 0u64;
     for operation in operations {
         if let Some(tool) = operation.get("tool").and_then(Value::as_str) {
             *tool_counts.entry(tool.to_string()).or_default() += 1;
@@ -556,12 +619,18 @@ fn operation_summary(operations: &[Value], total_matches: usize) -> Value {
             Some("running") | Some("started") => running += 1,
             _ => {}
         }
+        duration_ms = duration_ms.saturating_add(
+            operation
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        );
         if let Some(files) = operation.get("affected_files").and_then(Value::as_array) {
-            affected_files.extend(files.iter().filter_map(|file| {
-                file.get("path")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }));
+            affected_files.extend(
+                files.iter().filter_map(|file| {
+                    file.get("path").and_then(Value::as_str).map(str::to_string)
+                }),
+            );
         }
     }
     affected_files.sort();
@@ -573,8 +642,7 @@ fn operation_summary(operations: &[Value], total_matches: usize) -> Value {
         "running_operations": running,
         "tool_counts": tool_counts,
         "affected_files": affected_files,
-        "command_duration_ms": null,
-        "command_duration_note": "历史 OperationRecord 尚未持久化统一 duration_ms；命令耗时可从 Task verification 或命令 session 读取。"
+        "duration_ms": duration_ms
     })
 }
 
@@ -792,10 +860,7 @@ fn change_summary(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let all_changes = ctx
-        .harness
-        .list_change_sets(&task.id)
-        .map_err(map_error)?;
+    let all_changes = ctx.harness.list_change_sets(&task.id).map_err(map_error)?;
     let selected_changes = if let Some(change_id) = requested_change_id {
         ctx.harness
             .load_change_set(change_id)
@@ -1003,12 +1068,10 @@ fn verification_status(records: &[VerificationRecord]) -> &'static str {
         .any(|record| effective_disposition(record) == "active_failure")
     {
         "failed"
-    } else if effective.iter().any(|record| {
-        matches!(
-            effective_disposition(record),
-            "expected_failure" | "waived"
-        )
-    }) {
+    } else if effective
+        .iter()
+        .any(|record| matches!(effective_disposition(record), "expected_failure" | "waived"))
+    {
         "verified_with_exceptions"
     } else {
         "verified"
@@ -1088,6 +1151,7 @@ fn verification_view(record: &VerificationRecord) -> Value {
         "verification_id": record.id,
         "kind": record.kind,
         "status": record.status,
+        "level": record.level,
         "passed": record.passed,
         "effective_disposition": effective_disposition(record),
         "disposition_history": record.dispositions,
@@ -1095,6 +1159,7 @@ fn verification_view(record: &VerificationRecord) -> Value {
         "command": bounded_text(&record.command, 4_000),
         "duration_ms": record.duration_ms,
         "change_id": record.change_id,
+        "supersedes": record.supersedes,
         "created_at": record.created_at
     })
 }
@@ -1207,7 +1272,7 @@ fn bound_finish_response(response: &mut Value) {
     debug_assert_eq!(response_bytes, update_response_bytes(response));
 }
 
-fn update_response_bytes(response: &mut Value) -> usize {
+pub(crate) fn update_response_bytes(response: &mut Value) -> usize {
     let mut measured = 0usize;
     for _ in 0..4 {
         measured = serde_json::to_vec(response)
