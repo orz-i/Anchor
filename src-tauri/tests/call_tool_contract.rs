@@ -213,11 +213,16 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 28);
+    assert_eq!(names.len(), 33);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("search_text"));
+    assert!(names.contains("command_cost_explain"));
+    assert!(names.contains("git_stage"));
+    assert!(names.contains("git_commit"));
+    assert!(names.contains("git_restore"));
+    assert!(names.contains("update_verification_disposition"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));

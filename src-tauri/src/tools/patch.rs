@@ -155,6 +155,77 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     })))
 }
 
+fn validation_failure(
+    path: &str,
+    validator: &str,
+    message: String,
+    line: usize,
+    column: usize,
+    content: &str,
+) -> Value {
+    json!({
+        "path": path,
+        "validator": validator,
+        "status": "failed",
+        "failure_kind": "target_file_syntax",
+        "message": message,
+        "line": line.max(1),
+        "column": column.max(1),
+        "snippet": validation_snippet(content, line.max(1)),
+        "workspace_modified": false
+    })
+}
+
+fn balanced_error_position(content: &str, message: &str) -> (usize, usize) {
+    let character = message
+        .split_once("character ")
+        .and_then(|(_, value)| value.split_whitespace().next())
+        .and_then(|value| {
+            value
+                .trim_end_matches(|ch: char| !ch.is_ascii_digit())
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or_else(|| content.chars().count().saturating_add(1));
+    line_column_for_character(content, character.saturating_sub(1))
+}
+
+fn line_column_for_character(content: &str, character: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for (index, ch) in content.chars().enumerate() {
+        if index >= character {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+fn validation_snippet(content: &str, line: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start = line.saturating_sub(2);
+    let end = (line + 1).min(lines.len());
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, value)| {
+            let line_number = start + offset + 1;
+            let value = value.chars().take(240).collect::<String>();
+            format!("{line_number:>5} | {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn validate_staged_post_images(
     staged: &HashMap<String, Option<String>>,
     mode: &str,
@@ -177,10 +248,29 @@ fn validate_staged_post_images(
         let validation = match extension.as_str() {
             "json" => serde_json::from_str::<Value>(content)
                 .map(|_| json!({"path": path, "validator": "json", "status": "passed"}))
-                .map_err(|error| ("json", error.to_string())),
+                .map_err(|error| {
+                    validation_failure(
+                        &path,
+                        "json",
+                        error.to_string(),
+                        error.line(),
+                        error.column(),
+                        content,
+                    )
+                }),
             "yaml" | "yml" => serde_yaml::from_str::<Value>(content)
                 .map(|_| json!({"path": path, "validator": "yaml", "status": "passed"}))
-                .map_err(|error| ("yaml", error.to_string())),
+                .map_err(|error| {
+                    let location = error.location();
+                    validation_failure(
+                        &path,
+                        "yaml",
+                        error.to_string(),
+                        location.as_ref().map(|value| value.line()).unwrap_or(1),
+                        location.as_ref().map(|value| value.column()).unwrap_or(1),
+                        content,
+                    )
+                }),
             "rs" | "ts" | "tsx" | "js" | "jsx" | "svelte" => {
                 validate_balanced_structure(content, extension == "rs")
                     .map(|_| {
@@ -190,7 +280,17 @@ fn validate_staged_post_images(
                             "status": "passed"
                         })
                     })
-                    .map_err(|error| ("balanced_structure", error))
+                    .map_err(|error| {
+                        let (line, column) = balanced_error_position(content, &error);
+                        validation_failure(
+                            &path,
+                            "balanced_structure",
+                            error,
+                            line,
+                            column,
+                            content,
+                        )
+                    })
             }
             _ => {
                 results.push(json!({
@@ -203,14 +303,7 @@ fn validate_staged_post_images(
         };
         match validation {
             Ok(result) => results.push(result),
-            Err((validator, message)) => {
-                results.push(json!({
-                    "path": path,
-                    "validator": validator,
-                    "status": "failed",
-                    "message": message
-                }));
-            }
+            Err(diagnostic) => results.push(diagnostic),
         }
     }
     if results
@@ -225,6 +318,7 @@ fn validate_staged_post_images(
             retryable: true,
             details: json!({
                 "validation_mode": mode,
+                "failure_kind": "target_file_syntax",
                 "post_validation": results,
                 "workspace_modified": false,
                 "suggestion": "修正失败文件的 patch 后重新运行 patch_check；验证发生在事务写盘前。"
@@ -362,6 +456,8 @@ fn hunk_context_mismatch(
             "hunk_index": hunk_index + 1,
             "hunk_index_zero_based": hunk_index,
             "failure_code": "PATCH_CONTEXT_MISMATCH",
+            "failure_kind": "patch_context",
+            "validator": "patch_hunk_matcher",
             "expected_context": expected.iter().take(24).collect::<Vec<_>>(),
             "nearest_context": nearest_context,
             "actual_context": nearest_context,
@@ -1079,6 +1175,17 @@ mod tests {
             error.to_error_value()["code"],
             "PATCH_POST_VALIDATION_FAILED"
         );
+        let value = error.to_error_value();
+        let diagnostic = &value["details"]["post_validation"][0];
+        assert_eq!(diagnostic["path"], "config.json");
+        assert_eq!(diagnostic["validator"], "json");
+        assert_eq!(diagnostic["failure_kind"], "target_file_syntax");
+        assert!(diagnostic["line"].as_u64().unwrap_or_default() >= 1);
+        assert!(diagnostic["column"].as_u64().unwrap_or_default() >= 1);
+        assert!(diagnostic["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("1 |"));
         assert_eq!(
             std::fs::read_to_string(context.workspace.root().join("config.json")).unwrap(),
             "{\"ok\": true}\n"
@@ -1090,5 +1197,27 @@ mod tests {
         validate_balanced_structure("fn borrow<'a>(value: &'a str) -> &'a str { value }", true)
             .expect("Rust lifetime is not a quote");
         assert!(validate_balanced_structure("export const broken = {", false).is_err());
+    }
+
+    #[test]
+    fn balanced_structure_diagnostic_reports_location_and_snippet() {
+        let content = "const ok = true;\nconst broken = 'value;\n";
+        let message = validate_balanced_structure(content, false).expect_err("unclosed quote");
+        let (line, column) = balanced_error_position(content, &message);
+        let diagnostic = validation_failure(
+            "example.ts",
+            "balanced_structure",
+            message,
+            line,
+            column,
+            content,
+        );
+        assert_eq!(diagnostic["failure_kind"], "target_file_syntax");
+        assert!(diagnostic["line"].as_u64().unwrap_or_default() >= 2);
+        assert!(diagnostic["column"].as_u64().unwrap_or_default() >= 1);
+        assert!(diagnostic["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("const broken"));
     }
 }

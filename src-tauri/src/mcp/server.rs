@@ -606,7 +606,7 @@ mod tests {
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
         assert_eq!(first_tools.len(), 64);
-        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 28);
+        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 33);
         assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 48);
         assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
             .as_u64()

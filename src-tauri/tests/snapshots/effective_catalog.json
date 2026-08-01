@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 10,
+    "catalog_version": 12,
     "names": [
       "accept_current_baseline",
       "apply_patch",
@@ -8,14 +8,18 @@
       "change_summary",
       "check_exec_environment",
       "close_work_session",
+      "command_cost_explain",
       "exec_command",
       "exec_health_check",
       "finish_task",
       "get_default_cwd",
       "git_blame",
+      "git_commit",
       "git_diff",
       "git_log",
+      "git_restore",
       "git_show",
+      "git_stage",
       "git_status",
       "harness_status",
       "history_session_bootstrap",
@@ -50,21 +54,25 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 47
+    "tool_count": 51
   },
   "core": {
-    "catalog_version": 10,
+    "catalog_version": 12,
     "names": [
       "apply_patch",
       "begin_work_session",
       "check_exec_environment",
       "close_work_session",
+      "command_cost_explain",
       "exec_command",
       "get_default_cwd",
       "git_blame",
+      "git_commit",
       "git_diff",
       "git_log",
+      "git_restore",
       "git_show",
+      "git_stage",
       "git_status",
       "history_session_bootstrap",
       "history_session_checkpoint",
@@ -80,16 +88,18 @@
       "search_text",
       "server_info",
       "set_default_cwd",
+      "update_verification_disposition",
       "view_image",
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 28
+    "tool_count": 33
   },
   "read-only": {
-    "catalog_version": 10,
+    "catalog_version": 12,
     "names": [
       "check_exec_environment",
+      "command_cost_explain",
       "get_default_cwd",
       "git_blame",
       "git_diff",
@@ -108,6 +118,6 @@
       "view_image",
       "wait_command"
     ],
-    "tool_count": 18
+    "tool_count": 19
   }
 }

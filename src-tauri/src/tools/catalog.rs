@@ -342,7 +342,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(48))
             .expect("advanced plus browser catalog");
 
-        assert_eq!(catalog.local_count, 47);
+        assert_eq!(catalog.local_count, 51);
         assert_eq!(catalog.proxy_count, 48);
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
@@ -354,7 +354,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 28);
+        assert_eq!(catalog.local_count, 33);
         assert_eq!(catalog.proxy_count, 48);
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
@@ -366,9 +366,9 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 28);
+        assert_eq!(catalog.local_count, 33);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 36);
+        assert_eq!(catalog.tools.len(), 41);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
@@ -387,7 +387,7 @@ mod tests {
             diagnostic["details"]["reason"],
             "chatgpt_catalog_budget_exceeded"
         );
-        assert_eq!(diagnostic["details"]["local_tool_count"], 47);
+        assert_eq!(diagnostic["details"]["local_tool_count"], 51);
         assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
         assert!(diagnostic["details"]["suggestions"]
             .as_array()

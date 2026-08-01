@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 10;
+pub const CATALOG_VERSION: u32 = 12;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -308,6 +308,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         true,
     ),
     (
+        "command_cost_explain",
+        "Explain command cost",
+        "Classify a command without executing it or reserving cost budget, including the executable, declarations, and matched evidence.",
+        true,
+        false,
+        false,
+    ),
+    (
         "write_stdin",
         "Write stdin",
         "Write characters to a server-managed running command session.",
@@ -336,6 +344,30 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Git status",
         "Return git working tree status for the workspace.",
         true,
+        false,
+        false,
+    ),
+    (
+        "git_stage",
+        "Git stage",
+        "Stage explicit workspace-relative paths without invoking a shell.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "git_commit",
+        "Git commit",
+        "Commit the currently staged changes with an explicit message and return the exact committed files.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "git_restore",
+        "Git restore",
+        "Restore explicit workspace-relative paths in the worktree and/or staging area without invoking a shell.",
+        false,
         false,
         false,
     ),
@@ -386,6 +418,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "server_info",
     "begin_work_session",
     "close_work_session",
+    "update_verification_disposition",
     "list_skills",
     "load_skill",
     "read_skill_resource",
@@ -393,6 +426,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "history_session_checkpoint",
     "history_session_validate",
     "check_exec_environment",
+    "command_cost_explain",
     "get_default_cwd",
     "set_default_cwd",
     "read_file",
@@ -406,6 +440,9 @@ pub const CORE_TOOLS: &[&str] = &[
     "kill_session",
     "read_output",
     "git_status",
+    "git_stage",
+    "git_commit",
+    "git_restore",
     "git_diff",
     "git_log",
     "git_show",
@@ -419,6 +456,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "load_skill",
     "read_skill_resource",
     "check_exec_environment",
+    "command_cost_explain",
     "get_default_cwd",
     "read_file",
     "list_dir",
@@ -450,6 +488,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "history_session_validate",
     "check_exec_environment",
     "exec_health_check",
+    "command_cost_explain",
     "get_default_cwd",
     "set_default_cwd",
     "read_file",
@@ -464,6 +503,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "kill_session",
     "read_output",
     "git_status",
+    "git_stage",
+    "git_commit",
+    "git_restore",
     "git_diff",
     "git_log",
     "git_show",
@@ -494,6 +536,9 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "history_session_validate",
     "apply_patch",
     "exec_command",
+    "git_stage",
+    "git_commit",
+    "git_restore",
     "write_stdin",
     "kill_session",
     "set_default_cwd",
@@ -517,6 +562,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "read_skill_resource",
     "check_exec_environment",
     "exec_health_check",
+    "command_cost_explain",
     "get_default_cwd",
     "read_file",
     "list_dir",
@@ -718,6 +764,8 @@ fn session_snapshot_output_schema() -> Value {
             "stdout_complete": { "type": "boolean" },
             "stderr_complete": { "type": "boolean" },
             "elapsed_ms": { "type": "integer", "minimum": 0 },
+            "affected_files": { "type": "array", "items": { "type": "object" } },
+            "mutation_attributed": { "type": "boolean" },
             "output_refs": {
                 "type": "object",
                 "properties": {
@@ -995,6 +1043,22 @@ pub fn output_schema(name: &str) -> Value {
                 "warnings",
             ],
         ),
+        "command_cost_explain" => success_output_schema(
+            json!({
+                "command": { "type": "string", "minLength": 1 },
+                "classification": { "type": "object" },
+                "would_require_operator_approval": { "type": "boolean" },
+                "executed": { "type": "boolean", "const": false },
+                "run_budget_reserved": { "type": "boolean", "const": false }
+            }),
+            &[
+                "command",
+                "classification",
+                "would_require_operator_approval",
+                "executed",
+                "run_budget_reserved",
+            ],
+        ),
         "exec_command" => success_output_schema(
             json!({
                 "command": { "type": "string", "minLength": 1 },
@@ -1017,6 +1081,7 @@ pub fn output_schema(name: &str) -> Value {
                 "sandbox_enforced": { "type": "boolean" },
                 "execution_boundary": { "type": "string", "minLength": 1 },
                 "child_process": { "type": "boolean" },
+                "execution_started": { "type": "boolean" },
                 "transport_ok": { "type": "boolean" },
                 "command_ok": { "type": ["boolean", "null"] },
                 "verification_pending": { "type": "boolean" },
@@ -1026,6 +1091,10 @@ pub fn output_schema(name: &str) -> Value {
                 "affected_task_status": { "type": ["string", "null"] },
                 "verification": { "type": "object", "additionalProperties": true },
                 "cost_policy": { "type": "object", "additionalProperties": true },
+                "affected_files": { "type": "array", "items": { "type": "object" } },
+                "mutation_attributed": { "type": "boolean" },
+                "verification_skipped": { "type": "boolean" },
+                "verification_skip_reason": { "type": "string" },
                 "warnings": warnings_property()
             }),
             &[
@@ -1049,6 +1118,7 @@ pub fn output_schema(name: &str) -> Value {
                 "sandbox_enforced",
                 "execution_boundary",
                 "child_process",
+                "execution_started",
                 "transport_ok",
                 "command_ok",
                 "warnings",
@@ -1074,6 +1144,8 @@ pub fn output_schema(name: &str) -> Value {
                 "output_refs": { "type": "object" },
                 "stop_pattern_matched": { "type": ["string", "null"] },
                 "wait_timeout_ms": { "type": "integer", "minimum": 0 },
+                "affected_files": { "type": "array", "items": { "type": "object" } },
+                "mutation_attributed": { "type": "boolean" },
                 "warnings": warnings_property()
             }),
             &[
@@ -1144,6 +1216,54 @@ pub fn output_schema(name: &str) -> Value {
                 "total_retained_bytes",
                 "total_stream_bytes",
                 "truncated",
+                "warnings",
+            ],
+        ),
+        "git_stage" => success_output_schema(
+            json!({
+                "staged_paths": { "type": "array", "items": { "type": "string" } },
+                "staged_files": { "type": "array", "items": { "type": "string" } },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": { "type": "array", "items": { "type": "string" } }
+            }),
+            &[
+                "staged_paths",
+                "staged_files",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_commit" => success_output_schema(
+            json!({
+                "commit_sha": { "type": "string", "minLength": 1 },
+                "message": { "type": "string", "minLength": 1 },
+                "committed_files": { "type": "array", "items": { "type": "string" } },
+                "previously_staged_files": { "type": "array", "items": { "type": "string" } },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": { "type": "array", "items": { "type": "string" } }
+            }),
+            &[
+                "commit_sha",
+                "message",
+                "committed_files",
+                "previously_staged_files",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_restore" => success_output_schema(
+            json!({
+                "restored_paths": { "type": "array", "items": { "type": "string" } },
+                "staged": { "type": "boolean" },
+                "worktree": { "type": "boolean" },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": { "type": "array", "items": { "type": "string" } }
+            }),
+            &[
+                "restored_paths",
+                "staged",
+                "worktree",
+                "mutation_attributed",
                 "warnings",
             ],
         ),
@@ -1414,7 +1534,7 @@ pub fn output_schema(name: &str) -> Value {
                 },
                 {
                     "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
-                    "then": { "required": ["closed", "phase", "finish", "checkpoint", "retryable"] }
+                    "then": { "required": ["closed", "phase", "finish", "checkpoint", "retryable", "error"] }
                 }
             ],
             "additionalProperties": true
@@ -1492,6 +1612,9 @@ pub fn output_schema(name: &str) -> Value {
                 "next_stage_started": { "type": "boolean", "const": false },
                 "reason": { "type": "string" },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
+                "error": error_output_schema(),
+                "blocking_verifications": { "type": "array", "items": { "type": "object" } },
+                "working_tree_files": { "type": "array", "items": { "type": "string" } },
                 "task": { "type": "object" },
                 "verification": { "type": "array", "items": { "type": "object" } },
                 "verification_summary": { "type": "object" },
@@ -1514,7 +1637,7 @@ pub fn output_schema(name: &str) -> Value {
                     "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
                     "then": {
                         "properties": { "task_status": { "const": "verifying" }, "closed": { "const": false } },
-                        "required": ["reason", "next_actions", "verification"]
+                        "required": ["reason", "next_actions", "verification", "error"]
                     }
                 }
             ],
@@ -2034,6 +2157,17 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["patch"],
             "additionalProperties": false
         }),
+        "command_cost_explain" => json!({
+            "type": "object",
+            "properties": {
+                "cmd": { "type": "string", "minLength": 1 },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 30000 },
+                "cost_intent": { "type": "string", "enum": ["auto", "local_only", "external_paid"], "default": "auto" },
+                "network_mode": { "type": "string", "enum": ["auto", "disabled", "enabled"], "default": "auto" }
+            },
+            "required": ["cmd"],
+            "additionalProperties": false
+        }),
         "exec_command" => json!({
             "type": "object",
             "properties": {
@@ -2044,11 +2178,41 @@ pub fn input_schema(name: &str) -> Value {
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
                 "stdin": { "type": "string", "default": "" },
+                "cost_intent": {
+                    "type": "string",
+                    "enum": ["auto", "local_only", "external_paid"],
+                    "default": "auto",
+                    "description": "Declares whether this execution is local-only or intentionally uses an external paid service."
+                },
+                "network_mode": {
+                    "type": "string",
+                    "enum": ["auto", "disabled", "enabled"],
+                    "default": "auto",
+                    "description": "Declares whether the command is expected to use network access. Explicit paid evidence that conflicts with disabled/local-only declarations is rejected."
+                },
                 "verification_kind": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
                     "description": "Optional verification category such as lint, test, build, check, or diff_check. Terminal results are persisted as Harness verification evidence when a task is active."
+                },
+                "verification_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Stable caller-provided identity used to supersede earlier results for the same logical verification."
+                },
+                "test_file": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                    "description": "Optional test file identity for verification supersession and diagnostics."
+                },
+                "test_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": "Optional test name identity for verification supersession and diagnostics."
                 },
                 "verification_level": {
                     "type": "string",
@@ -2059,7 +2223,7 @@ pub fn input_schema(name: &str) -> Value {
                 "supersede_previous_failures": {
                     "type": "boolean",
                     "default": true,
-                    "description": "When a verification passes, mark prior active failures with the same verification_kind as superseded."
+                    "description": "When a verification passes, supersede active failures matching verification_key, test_file/test_name, or the same verification kind for legacy callers."
                 },
                 "filesystem_scope": { "type": "string", "enum": ["workspace"], "default": "workspace" },
                 "reason": { "type": "string", "default": "" }
@@ -2112,6 +2276,42 @@ pub fn input_schema(name: &str) -> Value {
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 }
             },
             "required": ["output_ref"],
+            "additionalProperties": false
+        }),
+        "git_stage" => json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1 }
+                }
+            },
+            "required": ["paths"],
+            "additionalProperties": false
+        }),
+        "git_commit" => json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string", "minLength": 1, "maxLength": 4000 }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+        }),
+        "git_restore" => json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": { "type": "string", "minLength": 1 }
+                },
+                "staged": { "type": "boolean", "default": false },
+                "worktree": { "type": "boolean", "default": true }
+            },
+            "required": ["paths"],
             "additionalProperties": false
         }),
         "git_status" => json!({
@@ -2207,7 +2407,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_28_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_33_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2215,7 +2415,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 33);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -2227,6 +2427,10 @@ mod tests {
         assert!(names.contains(&"close_work_session"));
         assert!(names.contains(&"wait_command"));
         assert!(names.contains(&"search_text"));
+        assert!(names.contains(&"command_cost_explain"));
+        assert!(names.contains(&"git_stage"));
+        assert!(names.contains(&"git_commit"));
+        assert!(names.contains(&"git_restore"));
         assert!(!names.contains(&"request_permissions"));
 
         for name in names {
@@ -2276,5 +2480,4 @@ mod tests {
         assert!(names.contains(&"get_default_cwd"));
         assert!(names.contains(&"read_file"));
     }
-
 }

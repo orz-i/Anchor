@@ -149,6 +149,178 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
+pub fn git_stage(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let paths = git_write_paths(ws, args)?;
+    let mut command = vec!["add".to_string(), "--".to_string()];
+    command.extend(paths.iter().cloned());
+    let completed = run_git_owned(ws.root(), &command, Duration::from_secs(30))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let staged_files = git_name_list(ws.root(), &["diff", "--cached", "--name-only"])?;
+    Ok(tool_ok(json!({
+        "staged_paths": paths,
+        "staged_files": staged_files,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(|| WorkspaceError::invalid_argument("message is required"))?;
+    if message.len() > 4000 || message.contains('\0') {
+        return Err(WorkspaceError::invalid_argument(
+            "commit message must be between 1 and 4000 bytes",
+        ));
+    }
+    let staged_files = git_name_list(ws.root(), &["diff", "--cached", "--name-only"])?;
+    if staged_files.is_empty() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_NOTHING_STAGED",
+            message: "No staged changes are available to commit.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "suggestion": "Call git_stage with explicit workspace-relative paths first."
+            }),
+        });
+    }
+    let command = vec![
+        "commit".to_string(),
+        "--no-gpg-sign".to_string(),
+        "--no-verify".to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ];
+    let completed = run_git_owned(ws.root(), &command, Duration::from_secs(120))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let commit_sha = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let committed_files = git_name_list(
+        ws.root(),
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    )?;
+    Ok(tool_ok(json!({
+        "commit_sha": commit_sha,
+        "message": message,
+        "committed_files": committed_files,
+        "previously_staged_files": staged_files,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let paths = git_write_paths(ws, args)?;
+    let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+    let worktree = args
+        .get("worktree")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !staged && !worktree {
+        return Err(WorkspaceError::invalid_argument(
+            "at least one of staged or worktree must be true",
+        ));
+    }
+    if staged {
+        let mut command = vec![
+            "restore".to_string(),
+            "--staged".to_string(),
+            "--".to_string(),
+        ];
+        command.extend(paths.iter().cloned());
+        let completed = run_git_owned(ws.root(), &command, Duration::from_secs(30))?;
+        if !completed.success {
+            return Err(git_error(&completed.stderr));
+        }
+    }
+    if worktree {
+        let mut command = vec![
+            "restore".to_string(),
+            "--worktree".to_string(),
+            "--".to_string(),
+        ];
+        command.extend(paths.iter().cloned());
+        let completed = run_git_owned(ws.root(), &command, Duration::from_secs(30))?;
+        if !completed.success {
+            return Err(git_error(&completed.stderr));
+        }
+    }
+    Ok(tool_ok(json!({
+        "restored_paths": paths,
+        "staged": staged,
+        "worktree": worktree,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+fn git_write_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, WorkspaceError> {
+    let values = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorkspaceError::invalid_argument("paths is required"))?;
+    if values.is_empty() || values.len() > 256 {
+        return Err(WorkspaceError::invalid_argument(
+            "paths must contain between 1 and 256 entries",
+        ));
+    }
+    let mut paths = Vec::with_capacity(values.len());
+    for value in values {
+        let path = value
+            .as_str()
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| WorkspaceError::invalid_argument("paths must contain strings"))?;
+        ws.reject_unsafe_text(path)?;
+        let resolved = ws.resolve_for_write(path)?;
+        if resolved.display == ".git" || resolved.display.starts_with(".git/") {
+            return Err(WorkspaceError::invalid_argument(
+                "Git internal paths cannot be modified through Git tools",
+            ));
+        }
+        paths.push(resolved.display);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn ensure_git_repo(ws: &Workspace) -> Result<(), WorkspaceError> {
+    if is_git_repo(ws.root()) {
+        Ok(())
+    } else {
+        Err(WorkspaceError::Tool {
+            code: "NOT_GIT_REPOSITORY",
+            message: "Workspace is not a Git repository.".into(),
+            category: "validation",
+            retryable: false,
+        })
+    }
+}
+
+fn git_name_list(root: &std::path::Path, args: &[&str]) -> Result<Vec<String>, WorkspaceError> {
+    let completed = run_git(root, args, Duration::from_secs(15))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(completed
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn diagnose_metadata_only_change(
     root: &std::path::Path,
     path: &str,
@@ -227,7 +399,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        diagnose_metadata_only_change, git_status, parse_branch_line, run_process_with_timeout,
+        diagnose_metadata_only_change, git_commit, git_restore, git_stage, git_status,
+        parse_branch_line, run_process_with_timeout,
     };
     use crate::tools::workspace::Workspace;
 
@@ -321,6 +494,48 @@ mod tests {
         assert_eq!(diagnostic["content_changed"], false);
         assert_eq!(diagnostic["classification"], "stat_cache_stale");
         assert_eq!(diagnostic["safe_index_refresh"], true);
+    }
+
+    #[test]
+    fn structured_git_write_tools_stage_commit_and_restore_explicit_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(
+            &repo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(&repo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(repo.join("main.txt"), "initial\n").expect("initial file");
+        git(&repo, &["add", "main.txt"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let workspace = Workspace::new(repo.clone()).expect("workspace");
+        fs::write(repo.join("main.txt"), "updated\n").expect("updated file");
+        let staged = git_stage(&workspace, &json!({"paths": ["main.txt"]})).expect("stage");
+        assert_eq!(staged["staged_files"], json!(["main.txt"]));
+        assert_eq!(staged["mutation_attributed"], true);
+
+        let committed = git_commit(&workspace, &json!({"message": "update main"})).expect("commit");
+        assert_eq!(committed["committed_files"], json!(["main.txt"]));
+        assert!(committed["commit_sha"]
+            .as_str()
+            .is_some_and(|value| value.len() >= 7));
+
+        fs::write(repo.join("main.txt"), "discard me\n").expect("dirty file");
+        let restored = git_restore(
+            &workspace,
+            &json!({"paths": ["main.txt"], "worktree": true, "staged": false}),
+        )
+        .expect("restore");
+        assert_eq!(restored["restored_paths"], json!(["main.txt"]));
+        assert_eq!(
+            fs::read_to_string(repo.join("main.txt"))
+                .expect("restored file")
+                .replace("\r\n", "\n"),
+            "updated\n"
+        );
     }
 
     fn git(cwd: &std::path::Path, args: &[&str]) {
@@ -725,6 +940,15 @@ fn run_git(
     let mut process_args = vec!["-C".to_string(), cwd.display().to_string()];
     process_args.extend(args.iter().map(|arg| (*arg).to_string()));
     run_process_with_timeout("git", cwd, &process_args, limit)
+}
+
+fn run_git_owned(
+    cwd: &std::path::Path,
+    args: &[String],
+    limit: Duration,
+) -> Result<GitOutput, WorkspaceError> {
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_git(cwd, &args, limit)
 }
 
 fn run_process_with_timeout(
