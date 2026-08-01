@@ -117,7 +117,7 @@
       <p class="mt-1 text-sm text-[var(--text-muted)]">{subtitle}</p>
       {#if tunnelEnabled}
         <p class="mt-1 text-xs text-[var(--text-muted)]">
-          {tunnelLabel} 隧道随服务自动连接，停止服务时一并断开
+          {tunnelLabel} 隧道独立保活；配置重载不会更换公网链接，手动停止服务时才断开
         </p>
       {/if}
       {#if running && activity}

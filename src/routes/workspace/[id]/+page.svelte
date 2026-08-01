@@ -42,7 +42,7 @@
   import { restartTunnel, stopTunnel } from "$lib/api/tunnel";
   import { runServiceToggle, notifyStartFailure } from "$lib/runtime/service";
   import { showToast } from "$lib/stores/toast";
-  import { promptServiceRestart } from "$lib/runtime/restart-hint";
+  import { reloadServiceAfterConfigSave } from "$lib/runtime/restart-hint";
   import { actionsRuntimeStates, mcpRuntimeStates, workspaces } from "$lib/stores/app";
   import {
     actionsConfig,
@@ -152,6 +152,21 @@
       default:
         return "已停止";
     }
+  }
+
+  async function reloadConfiguredService(service: RuntimeService): Promise<void> {
+    const id = workspaceId;
+    if (!id) return;
+    const isMcp = service === "mcp";
+    const running = (isMcp ? mcpStatus : actionsStatus) === "running";
+    const runtime = await reloadServiceAfterConfigSave(
+      running,
+      isMcp ? "MCP 服务" : "Actions 服务",
+      () => (isMcp ? restartRuntime(id) : restartActionsRuntime(id)),
+    );
+    if (!runtime || id !== workspaceId) return;
+    if (isMcp) applyMcpRuntime(runtime, id);
+    else applyActionsRuntime(runtime, id);
   }
 
   function canvsStateLabel(status: CanvsTaskStatus | null): string {
@@ -477,6 +492,7 @@
     await updateWorkspace(next);
     profile = next;
     mcpLocal = mcpLocalEndpoint(port);
+    await reloadConfiguredService("mcp");
     await load();
   }
 
@@ -491,6 +507,7 @@
     await updateWorkspace(next);
     profile = next;
     actionsLocal = actionsLocalEndpoint(port);
+    await reloadConfiguredService("actions");
     await load();
   }
 
@@ -559,7 +576,7 @@
       if (workspaceId !== targetWorkspaceId) return;
     }
     if (!options?.skipServicePrompt) {
-      await promptServiceRestart(mcpStatus === "running", "MCP 服务");
+      await reloadConfiguredService("mcp");
     }
   }
 
@@ -594,7 +611,7 @@
       if (workspaceId !== targetWorkspaceId) return;
     }
     if (!options?.skipServicePrompt) {
-      await promptServiceRestart(actionsStatus === "running", "Actions 服务");
+      await reloadConfiguredService("actions");
     }
   }
 
@@ -616,8 +633,8 @@
     };
     await updateWorkspace(next);
     profile = next;
+    await reloadConfiguredService("mcp");
     await load();
-    await promptServiceRestart(mcpStatus === "running", "MCP 服务");
   }
 
   async function saveSkillService(config: { enabled: boolean; roots: string }) {
@@ -632,8 +649,8 @@
     };
     await updateWorkspace(next);
     profile = next;
+    await reloadConfiguredService("mcp");
     await load();
-    await promptServiceRestart(mcpStatus === "running", "MCP 服务");
   }
 
   async function saveMcpProxyConfig(config: string) {
@@ -647,8 +664,8 @@
     };
     await updateWorkspace(next);
     profile = next;
+    await reloadConfiguredService("mcp");
     await load();
-    await promptServiceRestart(mcpStatus === "running", "MCP 服务");
   }
 
   async function saveActionsPolicy(draft: ActionsPolicyDraft) {
@@ -665,8 +682,8 @@
     };
     await updateWorkspace(next);
     profile = next;
+    await reloadConfiguredService("actions");
     await load();
-    await promptServiceRestart(actionsStatus === "running", "Actions 服务");
   }
 
   async function saveMcpAuth(
@@ -678,7 +695,7 @@
     await updateWorkspace(next);
     profile = next;
     if (mcpStatus === "running" && !options.callbackPolicyOnly) {
-      try { await restartRuntime(workspaceId); } catch { /* ignore */ }
+      await reloadConfiguredService("mcp");
     } else if (mcpStatus === "running" && options.callbackPolicyOnly) {
       showToast("OAuth Callback 信任策略已热更新，当前授权流程不会中断", { kind: "success" });
     }
@@ -705,7 +722,7 @@
     await updateWorkspace(next);
     profile = next;
     if (actionsStatus === "running" && !options.callbackPolicyOnly) {
-      try { await restartActionsRuntime(workspaceId); } catch { /* ignore */ }
+      await reloadConfiguredService("actions");
     } else if (actionsStatus === "running" && options.callbackPolicyOnly) {
       showToast("Actions OAuth Callback 信任策略已热更新，当前授权流程不会中断", { kind: "success" });
     }
@@ -719,6 +736,8 @@
     workspaces.update((items) =>
       items.map((item) => (item.id === next.id ? { ...item, name: next.name } : item)),
     );
+    await reloadConfiguredService("mcp");
+    await reloadConfiguredService("actions");
   }
 
   async function saveWorkspacePath(path: string) {
@@ -727,8 +746,9 @@
     await updateWorkspace(next);
     profile = next;
     showToast("工作区目录已更新", { kind: "success" });
-    await promptServiceRestart(mcpStatus === "running", "MCP 服务");
-    await promptServiceRestart(actionsStatus === "running", "Actions 服务");
+    await reloadConfiguredService("mcp");
+    await reloadConfiguredService("actions");
+    await load();
   }
 
   async function removeWorkspace() {

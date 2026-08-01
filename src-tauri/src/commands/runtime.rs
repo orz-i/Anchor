@@ -16,8 +16,8 @@ use crate::mcp::gateway::{self, McpGatewayStatus};
 use crate::platform::platform;
 
 use crate::tunnel::{
-    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime, sync_managed_runtime_routes,
-    TunnelServiceKind,
+    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime,
+    supervisor as tunnel_supervisor, sync_managed_runtime_routes, TunnelServiceKind,
 };
 
 use crate::settings::{AppSettings, McpGatewayConfig};
@@ -31,6 +31,152 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TunnelContinuitySnapshot {
+    running: bool,
+    public_url: String,
+    pid: Option<u32>,
+}
+
+impl TunnelContinuitySnapshot {
+    fn from_direct(status: crate::tunnel::TunnelStatus) -> Self {
+        Self {
+            running: status.state == "running",
+            public_url: normalize_public_url(&status.public_url),
+            pid: status.tunnel_pid,
+        }
+    }
+
+    fn from_gateway(status: McpGatewayStatus) -> Self {
+        Self {
+            running: status.state == "running",
+            public_url: normalize_public_url(&status.public_base_url),
+            pid: None,
+        }
+    }
+}
+
+fn normalize_public_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+fn tunnel_continuity_preserved(
+    before: &TunnelContinuitySnapshot,
+    after: &TunnelContinuitySnapshot,
+) -> bool {
+    if !before.running {
+        return true;
+    }
+    after.running
+        && before.public_url == after.public_url
+        && (before.pid.is_none() || before.pid == after.pid)
+}
+
+async fn tunnel_continuity_snapshot(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<TunnelContinuitySnapshot> {
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
+        return Ok(TunnelContinuitySnapshot::from_gateway(
+            gateway::status(&settings.mcp_gateway).await,
+        ));
+    }
+    let guard = tunnel_supervisor().lock().await;
+    Ok(TunnelContinuitySnapshot::from_direct(
+        guard.status(profile, kind, &settings),
+    ))
+}
+
+async fn restart_listener_preserving_tunnel(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: ServiceKind,
+) -> AppResult<RuntimeStatusDto> {
+    let tunnel_kind = match kind {
+        ServiceKind::Mcp => TunnelServiceKind::Mcp,
+        ServiceKind::Actions => TunnelServiceKind::Actions,
+    };
+    let before = tunnel_continuity_snapshot(state, profile, tunnel_kind).await?;
+    let status = state.with_runtime(|runtime| match kind {
+        ServiceKind::Mcp => runtime.restart_mcp(profile),
+        ServiceKind::Actions => runtime.restart_actions(profile),
+    })?;
+    let after = tunnel_continuity_snapshot(state, profile, tunnel_kind).await?;
+    let tunnel_preserved = tunnel_continuity_preserved(&before, &after);
+
+    if status.state != "running" {
+        let tunnel_detail = if tunnel_preserved {
+            "隧道仍按原公网地址保留"
+        } else {
+            "同时检测到隧道连续性异常"
+        };
+        let message = format!(
+            "{} listener 重载后状态为 {}：{}。{}，本地服务尚未恢复，请修正配置后再次重载。",
+            match kind {
+                ServiceKind::Mcp => "MCP",
+                ServiceKind::Actions => "Actions",
+            },
+            status.state,
+            status.local_message,
+            tunnel_detail,
+        );
+        crate::tunnel::append_profile_log(
+            &profile.id,
+            match kind {
+                ServiceKind::Mcp => "stderr.log",
+                ServiceKind::Actions => "actions-stderr.log",
+            },
+            &format!(
+                "[reload] listener_restarted=false tunnel_preserved={tunnel_preserved} {message}"
+            ),
+        );
+        return Err(AppError::Message(message));
+    }
+
+    if !tunnel_preserved {
+        let message = format!(
+            "{} listener 已重启，但隧道连续性校验失败：重载前 URL={} PID={:?}，重载后 URL={} PID={:?}。请保持当前服务运行并检查隧道日志；不要重新注册 ChatGPT 插件，除非公网地址确实发生变化。",
+            match kind {
+                ServiceKind::Mcp => "MCP",
+                ServiceKind::Actions => "Actions",
+            },
+            before.public_url,
+            before.pid,
+            after.public_url,
+            after.pid,
+        );
+        crate::tunnel::append_profile_log(
+            &profile.id,
+            match kind {
+                ServiceKind::Mcp => "stderr.log",
+                ServiceKind::Actions => "actions-stderr.log",
+            },
+            &format!("[reload] tunnel_preserved=false {message}"),
+        );
+        return Err(AppError::Message(message));
+    }
+
+    crate::tunnel::append_profile_log(
+        &profile.id,
+        match kind {
+            ServiceKind::Mcp => "stdout.log",
+            ServiceKind::Actions => "actions-stdout.log",
+        },
+        &format!(
+            "[reload] service={} listener_restarted=true tunnel_preserved=true public_url={} tunnel_pid={:?}",
+            match kind {
+                ServiceKind::Mcp => "mcp",
+                ServiceKind::Actions => "actions",
+            },
+            after.public_url,
+            after.pid,
+        ),
+    );
+    Ok(status)
 }
 
 async fn rollback_started_mcp_runtime(
@@ -455,23 +601,71 @@ pub fn get_actions_runtime_status(
 }
 
 #[tauri::command]
-
-pub fn restart_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+pub async fn restart_runtime(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(&state, &id, WorkspaceService::Mcp)?;
     let profile = profile_by_id(&state, &id)?;
-
-    state.with_runtime(|runtime| runtime.restart_mcp(&profile))
+    restart_listener_preserving_tunnel(&state, &profile, ServiceKind::Mcp).await
 }
 
 #[tauri::command]
-
-pub fn restart_actions_runtime(
+pub async fn restart_actions_runtime(
     state: State<'_, AppState>,
-
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(&state, &id, WorkspaceService::Actions)?;
     let profile = profile_by_id(&state, &id)?;
+    restart_listener_preserving_tunnel(&state, &profile, ServiceKind::Actions).await
+}
 
-    state.with_runtime(|runtime| runtime.restart_actions(&profile))
+#[cfg(test)]
+mod tests {
+    use super::{tunnel_continuity_preserved, TunnelContinuitySnapshot};
+
+    fn snapshot(running: bool, url: &str, pid: Option<u32>) -> TunnelContinuitySnapshot {
+        TunnelContinuitySnapshot {
+            running,
+            public_url: url.into(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn stopped_tunnel_does_not_block_listener_reload() {
+        assert!(tunnel_continuity_preserved(
+            &snapshot(false, "", None),
+            &snapshot(false, "", None),
+        ));
+    }
+
+    #[test]
+    fn running_tunnel_requires_same_url_and_process() {
+        let before = snapshot(true, "https://stable.example.com", Some(42));
+        assert!(tunnel_continuity_preserved(
+            &before,
+            &snapshot(true, "https://stable.example.com", Some(42)),
+        ));
+        assert!(!tunnel_continuity_preserved(
+            &before,
+            &snapshot(true, "https://changed.example.com", Some(42)),
+        ));
+        assert!(!tunnel_continuity_preserved(
+            &before,
+            &snapshot(true, "https://stable.example.com", Some(43)),
+        ));
+        assert!(!tunnel_continuity_preserved(
+            &before,
+            &snapshot(false, "https://stable.example.com", None),
+        ));
+    }
+
+    #[test]
+    fn gateway_continuity_uses_stable_public_url_without_pid() {
+        assert!(tunnel_continuity_preserved(
+            &snapshot(true, "https://gateway.example.com", None),
+            &snapshot(true, "https://gateway.example.com", None),
+        ));
+    }
 }

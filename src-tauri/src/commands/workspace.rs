@@ -6,6 +6,7 @@ use crate::app_state::{teardown_workspace, AppState};
 use crate::auth::{update_oauth_redirect_policy, validate_redirect_policy};
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
+use crate::runtime::ServiceKind;
 use crate::tunnel::append_profile_log;
 use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::workspace::resources::{
@@ -58,8 +59,63 @@ pub fn create_workspace(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::validate_live_port_change;
+    use crate::workspace::WorkspaceProfile;
+
+    #[test]
+    fn running_tunneled_service_rejects_live_port_change() {
+        let current = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        let mut next = current.clone();
+        next.runtime.local_port += 1;
+
+        let error = validate_live_port_change(&current, &next, true, false, false)
+            .expect_err("running tunnel must keep its local port");
+        assert!(error.to_string().contains("保持当前公网链接不变"));
+    }
+
+    #[test]
+    fn stopped_service_allows_port_change() {
+        let current = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        let mut next = current.clone();
+        next.runtime.local_port += 1;
+
+        validate_live_port_change(&current, &next, false, false, false)
+            .expect("stopped service may change port");
+    }
+
+    #[test]
+    fn running_service_without_tunnel_allows_port_change() {
+        let mut current = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        current.tunnel.tunnel_type = "none".into();
+        let mut next = current.clone();
+        next.runtime.local_port += 1;
+
+        validate_live_port_change(&current, &next, true, false, false)
+            .expect("listener-only port change is reloadable");
+    }
+
+    #[test]
+    fn gateway_managed_mcp_rejects_live_port_change() {
+        let mut current = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        current.tunnel.tunnel_type = "none".into();
+        let mut next = current.clone();
+        next.runtime.local_port += 1;
+
+        validate_live_port_change(&current, &next, true, false, true)
+            .expect_err("gateway route must keep its live target port");
+    }
+}
+
 #[tauri::command]
 pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -> AppResult<()> {
+    let (mcp_running, actions_running) = state.with_runtime(|runtime| {
+        Ok((
+            runtime.is_running(&profile.id, ServiceKind::Mcp),
+            runtime.is_running(&profile.id, ServiceKind::Actions),
+        ))
+    })?;
     let profile_id = profile.id.clone();
     let mcp_redirect_uris = profile.auth.oauth_redirect_uris.clone();
     let mcp_redirect_hosts = profile.auth.oauth_redirect_hosts.clone();
@@ -72,6 +128,13 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
             .get(&profile.id)
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
+        validate_live_port_change(
+            &current,
+            &profile,
+            mcp_running,
+            actions_running,
+            store.settings().mcp_gateway.enabled,
+        )?;
         validate_workspace_resources_update(store.list(), &current, &profile)?;
         let gateway = store.settings().mcp_gateway;
         crate::mcp::gateway::validate_workspace_ports(&gateway, &profile)?;
@@ -131,6 +194,36 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
                 "[oauth] event=callback_policy_saved service=actions runtime_hot_updated={hot_updated}"
             ),
         );
+    }
+    Ok(())
+}
+
+fn validate_live_port_change(
+    current: &WorkspaceProfile,
+    next: &WorkspaceProfile,
+    mcp_running: bool,
+    actions_running: bool,
+    gateway_enabled: bool,
+) -> AppResult<()> {
+    let mcp_tunnel_active =
+        gateway_enabled || matches!(current.tunnel.tunnel_type.as_str(), "cloudflare" | "frp");
+    if mcp_running && mcp_tunnel_active && current.runtime.local_port != next.runtime.local_port {
+        return Err(AppError::Message(format!(
+            "MCP 隧道正在使用本地端口 {}。为保持当前公网链接不变，运行期间不能改为端口 {}。请保留当前端口；如确需迁移端口，请先停止服务并重新配置隧道。",
+            current.runtime.local_port, next.runtime.local_port
+        )));
+    }
+
+    let actions_tunnel_active =
+        matches!(current.actions.tunnel_type.as_str(), "cloudflare" | "frp");
+    if actions_running
+        && actions_tunnel_active
+        && current.actions.local_port != next.actions.local_port
+    {
+        return Err(AppError::Message(format!(
+            "Actions 隧道正在使用本地端口 {}。为保持当前公网链接不变，运行期间不能改为端口 {}。请保留当前端口；如确需迁移端口，请先停止服务并重新配置隧道。",
+            current.actions.local_port, next.actions.local_port
+        )));
     }
     Ok(())
 }

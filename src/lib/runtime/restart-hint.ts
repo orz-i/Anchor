@@ -1,12 +1,15 @@
 import { message } from "@tauri-apps/plugin-dialog";
 
-export async function promptServiceRestart(
+export async function reloadServiceAfterConfigSave<T>(
   serviceRunning: boolean,
   serviceLabel: string,
-): Promise<void> {
-  if (!serviceRunning) return;
-  await message(`配置已保存。请停止并重新启动${serviceLabel}，更改才会生效。`, {
-    title: "需要重启服务",
+  reload: () => Promise<T>,
+): Promise<T | null> {
+  if (!serviceRunning) return null;
+  const result = await reload();
+  await message(`配置已生效，${serviceLabel} listener 已受控重载。现有隧道和公网链接保持不变。`, {
+    title: "配置已热重载",
     kind: "info",
   });
+  return result;
 }
