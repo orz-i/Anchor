@@ -64,7 +64,7 @@ pub struct PolicySettings {
     pub max_patch_bytes: usize,
     pub permission_mode: String,
     pub external_paid_commands_enabled: bool,
-    pub external_paid_max_runs_per_day: u32,
+    pub external_paid_max_runs_per_day: u64,
     pub external_paid_max_duration_seconds: u64,
 }
 

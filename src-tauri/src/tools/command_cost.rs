@@ -47,7 +47,7 @@ struct CommandPolicyRule {
     cost_class: CostClass,
     #[serde(default)]
     require_confirmation: bool,
-    max_runs: Option<u32>,
+    max_runs: Option<u64>,
     max_duration_seconds: Option<u64>,
     max_retries: Option<u32>,
     max_external_calls: Option<u64>,
@@ -57,7 +57,7 @@ struct CommandPolicyRule {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct CostState {
-    runs: BTreeMap<String, u32>,
+    runs: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +68,8 @@ pub struct CommandCostDecision {
     effective_timeout_ms: u64,
     confirmation_required: bool,
     operator_approved: bool,
-    max_runs_per_day: Option<u32>,
-    run_number: Option<u32>,
+    max_runs_per_day: Option<u64>,
+    run_number: Option<u64>,
     max_retries: Option<u32>,
     max_external_calls: Option<u64>,
     max_tokens: Option<u64>,
@@ -319,8 +319,8 @@ impl CommandCostGuard {
         &self,
         command: &str,
         rule_name: Option<&str>,
-        max_runs: u32,
-    ) -> Result<u32, WorkspaceError> {
+        max_runs: u64,
+    ) -> Result<u64, WorkspaceError> {
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let command_digest = digest(command.as_bytes());
         let key = format!("{date}:{}:{command_digest}", rule_name.unwrap_or("default"));
@@ -614,6 +614,33 @@ mod tests {
             error.to_error_value()["code"],
             "EXTERNAL_PAID_COMMAND_BUDGET_EXCEEDED"
         );
+    }
+
+    #[test]
+    fn operator_paid_run_limit_supports_values_above_u32() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let guard = CommandCostGuard::new(harness.path(), workspace.path());
+        let max_runs = u64::from(u32::MAX) + 1;
+        let policy = PolicySettings {
+            external_paid_commands_enabled: true,
+            external_paid_max_runs_per_day: max_runs,
+            ..PolicySettings::default()
+        };
+
+        let decision = guard
+            .evaluate(
+                workspace.path(),
+                "pnpm story-live REAL_MODEL=1",
+                30_000,
+                "auto",
+                "auto",
+                &policy,
+            )
+            .expect("large paid run limit");
+
+        assert_eq!(decision.to_value()["max_runs_per_day"], max_runs);
+        assert_eq!(decision.to_value()["run_number"], 1);
     }
 
     #[test]

@@ -5,6 +5,10 @@ Anchor classifies workspace commands as `free`, `local_expensive`, or
 operator enables them in the trusted GUI or CLI control plane. A model-supplied
 argument cannot grant this approval.
 
+The workspace-level daily run input has no additional UI maximum. Runtime and
+persisted counters use unsigned 64-bit integers, while project rules can still
+set a lower `max_runs` value for individual commands.
+
 The runtime setting also defines a maximum number of paid runs per day and a
 maximum duration for each paid run. Run reservations are persisted under the
 Anchor Harness data directory, so reconnecting the MCP client does not reset

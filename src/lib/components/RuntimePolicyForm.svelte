@@ -104,14 +104,14 @@
     <div class="grid grid-cols-2 gap-2">
       <label class="grid gap-1">
         <span class="text-xs text-[var(--text-muted)]">每日最大运行次数</span>
-        <input type="number" min="1" max="100" class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm" bind:value={draftExternalPaidRuns} />
+        <input type="number" min="1" step="1" class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm" bind:value={draftExternalPaidRuns} />
       </label>
       <label class="grid gap-1">
         <span class="text-xs text-[var(--text-muted)]">单次最长秒数</span>
         <input type="number" min="1" max="3600" class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm" bind:value={draftExternalPaidDuration} />
       </label>
     </div>
-    <p class="text-xs text-[var(--text-muted)]">此开关只能在受信任控制面保存。项目可在 .anchor/command-policy.yml 中进一步收紧命令匹配、次数和时长；模型参数不能启用该权限。</p>
+    <p class="text-xs text-[var(--text-muted)]">每日次数不设额外的界面上限，保存时按正整数处理。此开关只能在受信任控制面保存；项目可在 .anchor/command-policy.yml 中进一步收紧命令匹配、次数和时长，模型参数不能启用该权限。</p>
   </fieldset>
   <label class="grid gap-1">
     <span class="text-xs text-[var(--text-muted)]">系统命令（逗号分隔）</span>

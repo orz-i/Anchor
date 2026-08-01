@@ -64,7 +64,7 @@ pub struct RuntimeConfig {
     pub strict_workspace_reads: bool,
     /// Trusted-control-plane approval for commands classified as external_paid.
     pub external_paid_commands_enabled: bool,
-    pub external_paid_max_runs_per_day: u32,
+    pub external_paid_max_runs_per_day: u64,
     pub external_paid_max_duration_seconds: u64,
 }
 
@@ -207,7 +207,7 @@ fn default_strict_workspace_reads() -> bool {
     true
 }
 
-fn default_external_paid_max_runs_per_day() -> u32 {
+fn default_external_paid_max_runs_per_day() -> u64 {
     1
 }
 
@@ -460,5 +460,15 @@ mod tests {
     #[test]
     fn persisted_runtime_config_rejects_missing_fields() {
         assert!(serde_json::from_value::<RuntimeConfig>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn persisted_runtime_config_accepts_large_paid_run_limits() {
+        let mut value = serde_json::to_value(RuntimeConfig::default()).expect("runtime config");
+        value["external_paid_max_runs_per_day"] = serde_json::json!(5_000_000_000_u64);
+
+        let runtime: RuntimeConfig = serde_json::from_value(value).expect("large paid run limit");
+
+        assert_eq!(runtime.external_paid_max_runs_per_day, 5_000_000_000);
     }
 }
