@@ -47,7 +47,7 @@ fn windows_hidden_attribute(_path: &Path) -> bool {
     false
 }
 
-fn is_link_like(path: &Path) -> bool {
+pub(crate) fn is_link_like(path: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -307,7 +307,9 @@ impl Workspace {
                             "link_path": link_path,
                             "sandbox_enforced": false,
                             "recoverable": true,
-                            "suggestion": "Remove or repair the workspace-local symlink/junction"
+                            "suggestion": "Call remove_path for this exact workspace-local symlink/junction, or repair its target",
+                            "recovery_tool": "remove_path",
+                            "recovery_args": { "path": link_path }
                         }),
                     })?;
                     if !resolved.starts_with(&self.root) {
@@ -324,7 +326,9 @@ impl Workspace {
                                 "link_path": link_path,
                                 "sandbox_enforced": false,
                                 "recoverable": true,
-                                "suggestion": "Remove the workspace-local symlink/junction; do not delete its target directory"
+                                "suggestion": "Call remove_path for this exact workspace-local symlink/junction; its target directory will be preserved",
+                                "recovery_tool": "remove_path",
+                                "recovery_args": { "path": link_path }
                             }),
                         });
                     }
@@ -435,6 +439,33 @@ impl Workspace {
             display: raw_path.replace('\\', "/"),
             path: candidate,
             existed: false,
+        })
+    }
+
+    /// Resolve a mutation target lexically without following the final entry.
+    /// This is reserved for recovery operations that must be able to address a
+    /// broken symlink or Windows junction by its workspace-local path.
+    pub fn resolve_lexical_write_path(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
+        self.reject_unsafe_text(raw_path)?;
+        self.reject_protected_write_path(raw_path)?;
+        let pure = Path::new(raw_path);
+        if pure.file_name().is_none() || raw_path == "." || raw_path == ".." {
+            return Err(WorkspaceError::invalid_argument("Invalid write target"));
+        }
+        let candidate = self
+            .root
+            .join(raw_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let parent = candidate.parent().unwrap_or(&self.root);
+        let resolved_parent = parent
+            .canonicalize()
+            .map_err(|_| WorkspaceError::not_found("Parent directory not found"))?;
+        if !resolved_parent.starts_with(&self.root) {
+            return Err(WorkspaceError::path_outside_workspace());
+        }
+        Ok(ResolvedPath {
+            display: raw_path.replace('\\', "/"),
+            existed: fs::symlink_metadata(&candidate).is_ok(),
+            path: candidate,
         })
     }
 

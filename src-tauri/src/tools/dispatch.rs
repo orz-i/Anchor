@@ -6,7 +6,9 @@ use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::context::ToolContext;
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
 use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
-use crate::tools::{exec, file, git, history, image_tool, patch, session, CancellationToken};
+use crate::tools::{
+    exec, file, git, history, image_tool, patch, recovery, session, CancellationToken,
+};
 
 fn policy_tool_err(err: PolicyError) -> Value {
     let dangerous = err
@@ -99,7 +101,11 @@ fn advances_expected_state(name: &str, output: &Value) -> bool {
         | "history_session_checkpoint"
         | "git_stage"
         | "git_commit"
-        | "git_restore" => true,
+        | "git_restore"
+        | "git_reset"
+        | "git_revert"
+        | "git_clean"
+        | "remove_path" => true,
         "exec_command" => command_output_is_terminal(output),
         _ => false,
     }
@@ -421,7 +427,20 @@ fn call_tool_impl(
     } else {
         None
     };
-    let task_id = if requires_write_baseline(name, &effective_args) {
+    let task_id = if name == "remove_path" {
+        if let Some(task) = active_task.as_ref() {
+            let _ = ctx.harness.record_event(
+                &task.id,
+                "operation_started",
+                Some(name),
+                operation_input(args),
+                json!({"ok": true, "tracking": "recovery_without_baseline_gate"}),
+            );
+            Some(task.id.clone())
+        } else {
+            None
+        }
+    } else if requires_write_baseline(name, &effective_args) {
         if let Some(task) = active_task.as_ref() {
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
                 return attach_harness_status(
@@ -481,6 +500,7 @@ fn call_tool_impl(
         "search_text" => file::search_text(ws, &effective_args, cancellation),
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
+        "remove_path" => recovery::remove_path(ctx, &effective_args),
         "exec_command" => exec::exec_command_with_cancellation(ctx, &effective_args, cancellation),
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
@@ -490,6 +510,9 @@ fn call_tool_impl(
         "git_stage" => git::git_stage(ws, &effective_args),
         "git_commit" => git::git_commit(ws, &effective_args),
         "git_restore" => git::git_restore(ws, &effective_args),
+        "git_reset" => git::git_reset(ws, &effective_args, ctx.policy.skip_permission_gates()),
+        "git_revert" => git::git_revert(ws, &effective_args),
+        "git_clean" => git::git_clean(ws, &effective_args, ctx.policy.skip_permission_gates()),
         "git_diff" => git::git_diff(ws, &effective_args),
         "git_log" => git::git_log(ws, &effective_args),
         "git_show" => git::git_show(ws, &effective_args),
@@ -737,12 +760,12 @@ fn apply_default_cwd(
             let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
             effective["path"] = Value::String(prefix_relative_path(&base, path));
         }
-        "read_file" | "search_text" | "git_blame" | "view_image" => {
+        "read_file" | "search_text" | "git_blame" | "view_image" | "remove_path" => {
             if let Some(path) = effective.get("path").and_then(Value::as_str) {
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
         }
-        "git_diff" => {
+        "git_diff" | "git_stage" | "git_restore" | "git_clean" => {
             if let Some(path) = effective.get("path").and_then(Value::as_str) {
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
@@ -800,7 +823,10 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
         | "history_session_checkpoint"
         | "git_stage"
         | "git_commit"
-        | "git_restore" => true,
+        | "git_restore"
+        | "git_reset"
+        | "git_revert"
+        | "git_clean" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -812,7 +838,16 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
 fn standalone_operation(name: &str) -> bool {
     matches!(
         name,
-        "patch_check" | "apply_patch" | "exec_command" | "git_stage" | "git_commit" | "git_restore"
+        "patch_check"
+            | "apply_patch"
+            | "remove_path"
+            | "exec_command"
+            | "git_stage"
+            | "git_commit"
+            | "git_restore"
+            | "git_reset"
+            | "git_revert"
+            | "git_clean"
     )
 }
 

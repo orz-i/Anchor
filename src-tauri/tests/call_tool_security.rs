@@ -61,6 +61,40 @@ fn exec_command_rejects_workspace_external_directory_link() {
     assert_eq!(error["error"]["details"]["link_path"], "external-workspace");
 }
 
+#[test]
+fn remove_path_breaks_the_workspace_link_self_lock_without_touching_target() {
+    let fx = tiny_js_fixture();
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    fs::write(outside.path().join("keep.txt"), "keep\n").expect("outside file");
+    let link = fx.root.join("external-workspace");
+    if !create_directory_link(&link, outside.path()) {
+        eprintln!("skip directory link test: platform did not allow link creation");
+        return;
+    }
+    let ctx = ctx_for(&fx.root);
+
+    let blocked = invoke(&ctx, "exec_command", json!({"cmd": "git --version"}));
+    let blocked = assert_err(&blocked);
+    assert!(matches!(
+        blocked["error"]["code"].as_str(),
+        Some("WORKSPACE_LINK_ESCAPE" | "WORKSPACE_LINK_UNRESOLVED")
+    ));
+    assert_eq!(blocked["error"]["details"]["recovery_tool"], "remove_path");
+
+    let removed = invoke(&ctx, "remove_path", json!({"path": "external-workspace"}));
+    let removed = assert_ok(&removed);
+    assert_eq!(removed["link_like"], true);
+    assert_eq!(removed["target_preserved"], true);
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert_eq!(
+        fs::read_to_string(outside.path().join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+
+    let recovered = invoke(&ctx, "exec_command", json!({"cmd": "git --version"}));
+    assert_eq!(recovered["command_ok"], true);
+}
+
 fn create_directory_link(link: &Path, target: &Path) -> bool {
     #[cfg(unix)]
     {

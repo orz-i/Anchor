@@ -11,6 +11,7 @@ pub mod history;
 mod image_tool;
 pub mod patch;
 pub mod policy;
+pub mod recovery;
 pub mod registry;
 pub(crate) mod schema;
 pub mod session;

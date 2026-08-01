@@ -264,6 +264,208 @@ pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     })))
 }
 
+pub fn git_reset(
+    ws: &Workspace,
+    args: &Value,
+    dangerous_mode: bool,
+) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let revision = validate_git_ref(
+        args.get("revision")
+            .and_then(Value::as_str)
+            .unwrap_or("HEAD"),
+    )?;
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("mixed");
+    if !matches!(mode, "soft" | "mixed" | "hard") {
+        return Err(WorkspaceError::invalid_argument(
+            "mode must be soft, mixed, or hard",
+        ));
+    }
+    if mode == "hard" && !dangerous_mode {
+        return Err(WorkspaceError::ToolDetails {
+            code: "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
+            message: "git_reset mode=hard requires operator-enabled dangerous mode.".into(),
+            category: "permission",
+            retryable: false,
+            details: json!({
+                "mode": mode,
+                "revision": revision,
+                "recoverable": true,
+                "suggestion": "Use mode=soft or mode=mixed, or enable dangerous mode in the trusted control plane."
+            }),
+        });
+    }
+    let verify = format!("{revision}^{{commit}}");
+    let target_head = git_rev_parse(ws.root(), &verify).ok_or_else(|| {
+        WorkspaceError::invalid_argument(format!("Unknown commit revision: {revision}"))
+    })?;
+    let before_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let flag = format!("--{mode}");
+    let completed = run_git(
+        ws.root(),
+        &["reset", flag.as_str(), target_head.as_str()],
+        Duration::from_secs(60),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let after_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    Ok(tool_ok(json!({
+        "before_head": before_head,
+        "target_head": target_head,
+        "after_head": after_head,
+        "mode": mode,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_revert(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let abort = args.get("abort").and_then(Value::as_bool).unwrap_or(false);
+    if abort {
+        let completed = run_git(ws.root(), &["revert", "--abort"], Duration::from_secs(30))?;
+        if !completed.success {
+            return Err(git_error(&completed.stderr));
+        }
+        return Ok(tool_ok(json!({
+            "aborted": true,
+            "reverted_commit": null,
+            "no_commit": true,
+            "staged_files": [],
+            "mutation_attributed": true,
+            "warnings": []
+        })));
+    }
+    let revision = args
+        .get("revision")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkspaceError::invalid_argument("revision is required unless abort=true")
+        })?;
+    let revision = validate_git_ref(revision)?;
+    let verify = format!("{revision}^{{commit}}");
+    let commit = git_rev_parse(ws.root(), &verify).ok_or_else(|| {
+        WorkspaceError::invalid_argument(format!("Unknown commit revision: {revision}"))
+    })?;
+    let status = run_git(
+        ws.root(),
+        &["status", "--porcelain=v1"],
+        Duration::from_secs(10),
+    )?;
+    if !status.success {
+        return Err(git_error(&status.stderr));
+    }
+    if !status.stdout.trim().is_empty() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_NOT_CLEAN",
+            message: "git_revert requires a clean index and working tree.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "recoverable": true,
+                "suggestion": "Commit, restore, or clean the current changes before reverting a commit."
+            }),
+        });
+    }
+    let completed = run_git(
+        ws.root(),
+        &["revert", "--no-commit", commit.as_str()],
+        Duration::from_secs(120),
+    )?;
+    if !completed.success {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_REVERT_CONFLICT",
+            message: completed.stderr.trim().to_string(),
+            category: "runtime",
+            retryable: false,
+            details: json!({
+                "revision": revision,
+                "commit": commit,
+                "recoverable": true,
+                "recovery_tool": "git_revert",
+                "recovery_args": {"abort": true},
+                "suggestion": "Resolve the conflicts and commit, or call git_revert with abort=true."
+            }),
+        });
+    }
+    let staged_files = git_name_list(ws.root(), &["diff", "--cached", "--name-only"])?;
+    Ok(tool_ok(json!({
+        "aborted": false,
+        "reverted_commit": commit,
+        "no_commit": true,
+        "staged_files": staged_files,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_clean(
+    ws: &Workspace,
+    args: &Value,
+    dangerous_mode: bool,
+) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+    let directories = args
+        .get("directories")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_ignored = args
+        .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let paths = optional_git_write_paths(ws, args)?;
+    if !dry_run && paths.is_empty() && !dangerous_mode {
+        return Err(WorkspaceError::ToolDetails {
+            code: "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
+            message: "Repository-wide git_clean requires operator-enabled dangerous mode.".into(),
+            category: "permission",
+            retryable: false,
+            details: json!({
+                "recoverable": true,
+                "suggestion": "Use dry_run=true, provide explicit paths, or enable dangerous mode."
+            }),
+        });
+    }
+    if !dry_run && include_ignored && !dangerous_mode {
+        return Err(WorkspaceError::ToolDetails {
+            code: "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
+            message: "Deleting ignored files requires operator-enabled dangerous mode.".into(),
+            category: "permission",
+            retryable: false,
+            details: json!({"recoverable": true}),
+        });
+    }
+    let mut command = vec!["clean".to_string()];
+    command.push(if dry_run { "-n" } else { "-f" }.to_string());
+    if directories {
+        command.push("-d".to_string());
+    }
+    if include_ignored {
+        command.push("-x".to_string());
+    }
+    if !paths.is_empty() {
+        command.push("--".to_string());
+        command.extend(paths.iter().cloned());
+    }
+    let completed = run_git_owned(ws.root(), &command, Duration::from_secs(60))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let candidates = parse_git_clean_paths(&completed.stdout);
+    Ok(tool_ok(json!({
+        "dry_run": dry_run,
+        "directories": directories,
+        "include_ignored": include_ignored,
+        "paths": paths,
+        "candidates": candidates,
+        "removed_paths": if dry_run { Vec::<String>::new() } else { candidates.clone() },
+        "mutation_attributed": !dry_run,
+        "warnings": []
+    })))
+}
+
 fn git_write_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, WorkspaceError> {
     let values = args
         .get("paths")
@@ -281,7 +483,7 @@ fn git_write_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, Workspac
             .filter(|path| !path.trim().is_empty())
             .ok_or_else(|| WorkspaceError::invalid_argument("paths must contain strings"))?;
         ws.reject_unsafe_text(path)?;
-        let resolved = ws.resolve_for_write(path)?;
+        let resolved = ws.resolve_lexical_write_path(path)?;
         if resolved.display == ".git" || resolved.display.starts_with(".git/") {
             return Err(WorkspaceError::invalid_argument(
                 "Git internal paths cannot be modified through Git tools",
@@ -292,6 +494,27 @@ fn git_write_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, Workspac
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+fn optional_git_write_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, WorkspaceError> {
+    match args.get("paths") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) if values.is_empty() => Ok(Vec::new()),
+        Some(Value::Array(_)) => git_write_paths(ws, args),
+        Some(_) => Err(WorkspaceError::invalid_argument("paths must be an array")),
+    }
+}
+
+fn parse_git_clean_paths(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("Would remove ")
+                .or_else(|| line.trim().strip_prefix("Removing "))
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn ensure_git_repo(ws: &Workspace) -> Result<(), WorkspaceError> {
@@ -399,8 +622,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        diagnose_metadata_only_change, git_commit, git_restore, git_stage, git_status,
-        parse_branch_line, run_process_with_timeout,
+        diagnose_metadata_only_change, git_clean, git_commit, git_reset, git_restore, git_revert,
+        git_stage, git_status, parse_branch_line, run_process_with_timeout,
     };
     use crate::tools::workspace::Workspace;
 
@@ -428,6 +651,93 @@ mod tests {
             parse_branch_line("main...origin/main [ahead 6, behind 2]"),
             ("main".into(), "origin/main".into(), 6, 2)
         );
+    }
+
+    #[test]
+    fn structured_reset_revert_and_clean_preserve_explicit_safety_boundaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(
+            &repo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(&repo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(repo.join("main.txt"), "initial\n").expect("initial file");
+        git(&repo, &["add", "main.txt"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let initial = String::from_utf8(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        fs::write(repo.join("main.txt"), "second\n").expect("second file");
+        git(&repo, &["add", "main.txt"]);
+        git(&repo, &["commit", "-m", "second"]);
+        let second = String::from_utf8(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let workspace = Workspace::new(repo.clone()).expect("workspace");
+
+        let soft = git_reset(
+            &workspace,
+            &json!({"revision": initial, "mode": "soft"}),
+            false,
+        )
+        .expect("soft reset");
+        assert_eq!(soft["mode"], "soft");
+        assert_eq!(soft["after_head"], initial);
+        let hard_denied = git_reset(
+            &workspace,
+            &json!({"revision": second, "mode": "hard"}),
+            false,
+        )
+        .expect_err("hard reset gate");
+        assert_eq!(
+            hard_denied.to_error_value()["code"],
+            "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
+        );
+        git(&repo, &["reset", "--hard", second.as_str()]);
+
+        let reverted = git_revert(&workspace, &json!({"revision": second})).expect("revert");
+        assert_eq!(reverted["reverted_commit"], second);
+        assert_eq!(reverted["staged_files"], json!(["main.txt"]));
+        git(&repo, &["reset", "--hard", "HEAD"]);
+
+        fs::write(repo.join("scratch.txt"), "scratch\n").expect("scratch");
+        let preview = git_clean(
+            &workspace,
+            &json!({"dry_run": true, "paths": ["scratch.txt"]}),
+            false,
+        )
+        .expect("clean preview");
+        assert_eq!(preview["candidates"], json!(["scratch.txt"]));
+        assert!(repo.join("scratch.txt").exists());
+        let cleaned = git_clean(
+            &workspace,
+            &json!({"dry_run": false, "paths": ["scratch.txt"]}),
+            false,
+        )
+        .expect("clean path");
+        assert_eq!(cleaned["removed_paths"], json!(["scratch.txt"]));
+        assert!(!repo.join("scratch.txt").exists());
     }
 
     #[test]

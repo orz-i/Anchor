@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 12;
+pub const CATALOG_VERSION: u32 = 13;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -300,6 +300,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "remove_path",
+        "Remove path",
+        "Remove one exact workspace-local file, empty directory, symlink, or junction without following the final link or invoking a child process.",
+        false,
+        true,
+        false,
+    ),
+    (
         "exec_command",
         "Execute command",
         "Run a bounded command in the workspace under runtime policy.",
@@ -372,6 +380,30 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "git_reset",
+        "Git reset",
+        "Move HEAD to an explicit commit using soft, mixed, or operator-approved hard reset.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "git_revert",
+        "Git revert",
+        "Apply the inverse of one commit to the index and worktree without committing, or abort an in-progress revert.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "git_clean",
+        "Git clean",
+        "Preview or remove untracked workspace paths with explicit scope and dangerous-mode gates for repository-wide or ignored-file deletion.",
+        false,
+        true,
+        false,
+    ),
+    (
         "git_diff",
         "Git diff",
         "Return unified git diff for workspace changes.",
@@ -434,6 +466,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "apply_patch",
+    "remove_path",
     "exec_command",
     "write_stdin",
     "wait_command",
@@ -443,6 +476,9 @@ pub const CORE_TOOLS: &[&str] = &[
     "git_stage",
     "git_commit",
     "git_restore",
+    "git_reset",
+    "git_revert",
+    "git_clean",
     "git_diff",
     "git_log",
     "git_show",
@@ -497,6 +533,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "search_text",
     "apply_patch",
     "patch_check",
+    "remove_path",
     "exec_command",
     "write_stdin",
     "wait_command",
@@ -506,6 +543,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "git_stage",
     "git_commit",
     "git_restore",
+    "git_reset",
+    "git_revert",
+    "git_clean",
     "git_diff",
     "git_log",
     "git_show",
@@ -535,10 +575,14 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "history_session_checkpoint",
     "history_session_validate",
     "apply_patch",
+    "remove_path",
     "exec_command",
     "git_stage",
     "git_commit",
     "git_restore",
+    "git_reset",
+    "git_revert",
+    "git_clean",
     "write_stdin",
     "kill_session",
     "set_default_cwd",
@@ -895,6 +939,86 @@ pub fn output_schema(name: &str) -> Value {
                 "current_proxy_tool_count",
                 "command_cost_policy",
                 "downstream_mcp",
+            ],
+        ),
+        "git_reset" => success_output_schema(
+            json!({
+                "before_head": { "type": "string" },
+                "target_head": { "type": "string", "minLength": 40 },
+                "after_head": { "type": "string", "minLength": 40 },
+                "mode": { "type": "string", "enum": ["soft", "mixed", "hard"] },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "before_head",
+                "target_head",
+                "after_head",
+                "mode",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_revert" => success_output_schema(
+            json!({
+                "aborted": { "type": "boolean" },
+                "reverted_commit": { "type": ["string", "null"] },
+                "no_commit": { "type": "boolean", "const": true },
+                "staged_files": { "type": "array", "items": { "type": "string" } },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "aborted",
+                "reverted_commit",
+                "no_commit",
+                "staged_files",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_clean" => success_output_schema(
+            json!({
+                "dry_run": { "type": "boolean" },
+                "directories": { "type": "boolean" },
+                "include_ignored": { "type": "boolean" },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "candidates": { "type": "array", "items": { "type": "string" } },
+                "removed_paths": { "type": "array", "items": { "type": "string" } },
+                "mutation_attributed": { "type": "boolean" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "dry_run",
+                "directories",
+                "include_ignored",
+                "paths",
+                "candidates",
+                "removed_paths",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "remove_path" => success_output_schema(
+            json!({
+                "path": { "type": "string", "minLength": 1 },
+                "kind": { "type": "string", "enum": ["file", "directory", "symlink_or_junction"] },
+                "recursive": { "type": "boolean" },
+                "link_like": { "type": "boolean" },
+                "target_preserved": { "type": "boolean" },
+                "affected_files": { "type": "array", "items": { "type": "object" } },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "path",
+                "kind",
+                "recursive",
+                "link_like",
+                "target_preserved",
+                "affected_files",
+                "mutation_attributed",
+                "warnings",
             ],
         ),
         "accept_current_baseline" => success_output_schema(
@@ -2147,6 +2271,15 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["patch"],
             "additionalProperties": false
         }),
+        "remove_path" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "minLength": 1 },
+                "recursive": { "type": "boolean", "default": false }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
         "patch_check" => json!({
             "type": "object",
             "properties": {
@@ -2291,6 +2424,37 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["paths"],
             "additionalProperties": false
         }),
+        "git_reset" => json!({
+            "type": "object",
+            "properties": {
+                "revision": { "type": "string", "default": "HEAD" },
+                "mode": { "type": "string", "enum": ["soft", "mixed", "hard"], "default": "mixed" }
+            },
+            "additionalProperties": false
+        }),
+        "git_revert" => json!({
+            "type": "object",
+            "properties": {
+                "revision": { "type": "string" },
+                "abort": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
+        "git_clean" => json!({
+            "type": "object",
+            "properties": {
+                "dry_run": { "type": "boolean", "default": true },
+                "directories": { "type": "boolean", "default": false },
+                "include_ignored": { "type": "boolean", "default": false },
+                "paths": {
+                    "type": "array",
+                    "maxItems": 256,
+                    "default": [],
+                    "items": { "type": "string", "minLength": 1 }
+                }
+            },
+            "additionalProperties": false
+        }),
         "git_commit" => json!({
             "type": "object",
             "properties": {
@@ -2407,7 +2571,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_33_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_37_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2415,7 +2579,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 33);
+        assert_eq!(tools.len(), 37);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -2431,6 +2595,10 @@ mod tests {
         assert!(names.contains(&"git_stage"));
         assert!(names.contains(&"git_commit"));
         assert!(names.contains(&"git_restore"));
+        assert!(names.contains(&"remove_path"));
+        assert!(names.contains(&"git_reset"));
+        assert!(names.contains(&"git_revert"));
+        assert!(names.contains(&"git_clean"));
         assert!(!names.contains(&"request_permissions"));
 
         for name in names {

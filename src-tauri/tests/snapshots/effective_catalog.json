@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 12,
+    "catalog_version": 13,
     "names": [
       "accept_current_baseline",
       "apply_patch",
@@ -14,10 +14,13 @@
       "finish_task",
       "get_default_cwd",
       "git_blame",
+      "git_clean",
       "git_commit",
       "git_diff",
       "git_log",
+      "git_reset",
       "git_restore",
+      "git_revert",
       "git_show",
       "git_stage",
       "git_status",
@@ -39,6 +42,7 @@
       "read_output",
       "read_skill_resource",
       "refresh_baseline",
+      "remove_path",
       "resume_task",
       "search_text",
       "server_info",
@@ -54,10 +58,10 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 51
+    "tool_count": 55
   },
   "core": {
-    "catalog_version": 12,
+    "catalog_version": 13,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -67,10 +71,13 @@
       "exec_command",
       "get_default_cwd",
       "git_blame",
+      "git_clean",
       "git_commit",
       "git_diff",
       "git_log",
+      "git_reset",
       "git_restore",
+      "git_revert",
       "git_show",
       "git_stage",
       "git_status",
@@ -85,6 +92,7 @@
       "read_file",
       "read_output",
       "read_skill_resource",
+      "remove_path",
       "search_text",
       "server_info",
       "set_default_cwd",
@@ -93,10 +101,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 33
+    "tool_count": 37
   },
   "read-only": {
-    "catalog_version": 12,
+    "catalog_version": 13,
     "names": [
       "check_exec_environment",
       "command_cost_explain",
