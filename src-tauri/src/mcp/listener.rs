@@ -9,9 +9,9 @@ use crate::auth::{
     AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm, OAUTH_MAX_BODY_BYTES,
 };
 use crate::mcp::protocol::{
-    negotiate_protocol_version, protocol_version_supported, requested_protocol_version,
-    validate_client_message, ClientMessage, InFlightRequests, InFlightReservation,
-    KeyedRateLimiter, RateLimiter, RequestReservation, SessionStore,
+    requested_protocol_version, require_current_protocol_version, validate_client_message,
+    ClientMessage, InFlightRequests, InFlightReservation, KeyedRateLimiter, RateLimiter,
+    RequestReservation, SessionStore,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{
@@ -474,7 +474,12 @@ async fn mcp_post(
                 return jsonrpc_error_response(StatusCode::BAD_REQUEST, request_id, error)
             }
         };
-        let negotiated = negotiate_protocol_version(requested);
+        let negotiated = match require_current_protocol_version(requested) {
+            Ok(version) => version,
+            Err(error) => {
+                return jsonrpc_error_response(StatusCode::BAD_REQUEST, request_id, error)
+            }
+        };
         let session_id = state.sessions.create(negotiated, &request_id);
         cleanup_retired_sessions(&state);
         let cancellation = crate::tools::CancellationToken::default();
@@ -511,7 +516,7 @@ async fn mcp_post(
                 "Invalid MCP-Protocol-Version header",
             );
         };
-        if !protocol_version_supported(version) || version != session_version {
+        if version != session_version {
             return http_error(
                 StatusCode::BAD_REQUEST,
                 "MCP-Protocol-Version does not match the negotiated session version",
@@ -1630,6 +1635,15 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+
+        let response = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(initialize_request("2025-06-18"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(response).await["error"]["code"], -32602);
 
         let initialized = mcp_post(
             State(state.clone()),

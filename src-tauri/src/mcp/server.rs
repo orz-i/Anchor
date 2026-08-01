@@ -19,16 +19,31 @@ const TOOLS_LIST_CURSOR_PREFIX: &str = "anchor-v1";
 
 #[cfg(test)]
 pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
-    let protocol_version = if body.get("method").and_then(Value::as_str) == Some("initialize") {
-        body.get("params")
-            .and_then(|params| params.get("protocolVersion"))
-            .and_then(Value::as_str)
-            .map(crate::mcp::protocol::negotiate_protocol_version)
-            .unwrap_or(crate::mcp::protocol::CURRENT_PROTOCOL_VERSION)
-    } else {
-        crate::mcp::protocol::CURRENT_PROTOCOL_VERSION
-    };
-    handle_request_with_protocol(state, body, protocol_version).await
+    if body.get("method").and_then(Value::as_str) == Some("initialize") {
+        let requested = match crate::mcp::protocol::requested_protocol_version(body) {
+            Ok(version) => version,
+            Err(error) => {
+                return serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body.get("id").cloned().unwrap_or(Value::Null),
+                    "error": error
+                })
+            }
+        };
+        if let Err(error) = crate::mcp::protocol::require_current_protocol_version(requested) {
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": body.get("id").cloned().unwrap_or(Value::Null),
+                "error": error
+            });
+        }
+    }
+    handle_request_with_protocol(
+        state,
+        body,
+        crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
+    )
+    .await
 }
 
 fn proxy_operation_summary(

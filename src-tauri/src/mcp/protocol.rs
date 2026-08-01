@@ -7,8 +7,6 @@ use serde_json::{json, Value};
 use crate::tools::CancellationToken;
 
 pub const CURRENT_PROTOCOL_VERSION: &str = "2025-11-25";
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &[CURRENT_PROTOCOL_VERSION, "2025-06-18", "2025-03-26"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMessage {
@@ -274,16 +272,16 @@ pub fn requested_protocol_version(body: &Value) -> Result<&str, Value> {
     Ok(version)
 }
 
-pub fn negotiate_protocol_version(requested: &str) -> &'static str {
-    SUPPORTED_PROTOCOL_VERSIONS
-        .iter()
-        .copied()
-        .find(|supported| *supported == requested)
-        .unwrap_or(CURRENT_PROTOCOL_VERSION)
-}
-
-pub fn protocol_version_supported(version: &str) -> bool {
-    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+pub fn require_current_protocol_version(requested: &str) -> Result<&'static str, Value> {
+    if requested == CURRENT_PROTOCOL_VERSION {
+        return Ok(CURRENT_PROTOCOL_VERSION);
+    }
+    Err(json!({
+        "code": -32602,
+        "message": format!(
+            "Unsupported initialize protocolVersion `{requested}`; this Anchor build requires {CURRENT_PROTOCOL_VERSION}"
+        )
+    }))
 }
 
 fn valid_request_id(id: &Value) -> bool {
@@ -569,10 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn negotiates_current_and_legacy_versions() {
-        assert_eq!(negotiate_protocol_version("2025-11-25"), "2025-11-25");
-        assert_eq!(negotiate_protocol_version("2025-06-18"), "2025-06-18");
-        assert_eq!(negotiate_protocol_version("unknown"), "2025-11-25");
+    fn only_accepts_the_current_protocol_version() {
+        assert_eq!(
+            require_current_protocol_version("2025-11-25").unwrap(),
+            "2025-11-25"
+        );
+        let error = require_current_protocol_version("2025-06-18").unwrap_err();
+        assert_eq!(error["code"], -32602);
+        assert!(error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("requires 2025-11-25")));
     }
 
     #[test]
