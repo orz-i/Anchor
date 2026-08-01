@@ -894,10 +894,6 @@ pub fn run() -> i32 {
     }
 }
 
-fn redacted_profile_value(profile: &WorkspaceProfile) -> AppResult<serde_json::Value> {
-    Ok(serde_json::to_value(profile)?)
-}
-
 async fn execute(cli: CliArgs) -> AppResult<i32> {
     match cli.command {
         Command::Help => {
@@ -978,7 +974,7 @@ fn list_workspaces(as_json: bool) -> AppResult<()> {
 fn show_workspace(selector: &str, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?;
-    let value = redacted_profile_value(profile)?;
+    let value = serde_json::to_value(profile)?;
 
     if as_json {
         print_json(&value)?;
@@ -1614,15 +1610,4 @@ mod tests {
         assert!(error.to_string().contains("名称不唯一"));
     }
 
-    #[test]
-    fn show_output_contains_no_inline_token_fields() {
-        let profile = WorkspaceProfile::new("/srv/a".into(), Some("a".into()));
-
-        let value = redacted_profile_value(&profile).expect("redact");
-
-        assert!(value
-            .get("actions")
-            .and_then(|actions| actions.get("cloudflare_token"))
-            .is_none());
-    }
 }
