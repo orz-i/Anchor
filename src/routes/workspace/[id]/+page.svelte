@@ -14,6 +14,7 @@
     type RuntimePolicyDraft,
   } from "$lib/components/RuntimePolicyForm.svelte";
   import ChatGptSessionPrompt from "$lib/components/ChatGptSessionPrompt.svelte";
+  import CanvsPanel from "$lib/components/CanvsPanel.svelte";
   import ServicePanel from "$lib/components/ServicePanel.svelte";
   import GptQuickCopy from "$lib/components/GptQuickCopy.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
@@ -60,8 +61,10 @@
     type RuntimeState,
     type WorkspaceProfile,
   } from "$lib/types";
+  import type { CanvsTaskStatus } from "$lib/api/canvs";
 
-  type ServiceTab = "mcp" | "actions";
+  type ServiceTab = "mcp" | "actions" | "canvs";
+  type RuntimeService = "mcp" | "actions";
   type SubTab = "config" | "logs" | "health";
   type BackendConnectionState = "connected" | "checking" | "recovering" | "offline";
 
@@ -98,6 +101,7 @@
   let statusPollTimer: number | null = null;
 
   let activeService = $state<ServiceTab>("mcp");
+  let canvsTaskStatus = $state<CanvsTaskStatus | null>(null);
   let mcpSubTab = $state<SubTab>("config");
   let actionsSubTab = $state<SubTab>("config");
   let loadGeneration = 0;
@@ -147,6 +151,40 @@
         return "错误";
       default:
         return "已停止";
+    }
+  }
+
+  function canvsStateLabel(status: CanvsTaskStatus | null): string {
+    switch (status) {
+      case "active":
+        return "进行中";
+      case "paused":
+        return "已暂停";
+      case "verifying":
+        return "验证中";
+      case "failed":
+        return "失败";
+      case "completed":
+      case "completed_unverified":
+        return "已完成";
+      case "rolled_back":
+        return "已回滚";
+      default:
+        return "当前任务";
+    }
+  }
+
+  function canvsOrbState(status: CanvsTaskStatus | null): RuntimeState {
+    switch (status) {
+      case "active":
+      case "completed":
+        return "running";
+      case "verifying":
+        return "recovering";
+      case "failed":
+        return "error";
+      default:
+        return "stopped";
     }
   }
 
@@ -370,7 +408,7 @@
   }
 
   async function afterServiceStart(
-    service: "mcp" | "actions",
+    service: RuntimeService,
     runtime: { state: RuntimeState; publicEndpoint: string },
     id: string,
   ) {
@@ -390,7 +428,7 @@
     }
   }
 
-  async function toggleService(service: ServiceTab) {
+  async function toggleService(service: RuntimeService) {
     const id = workspaceId;
     const isMcp = service === "mcp";
     if (!id || (isMcp ? mcpBusy : actionsBusy)) return;
@@ -817,6 +855,16 @@
           <span class="font-medium">Actions</span>
           <span class="text-[var(--text-muted)]">{stateLabel(actionsStatus)}</span>
         </button>
+        <button
+          type="button"
+          class="tx-status-pill"
+          class:active={activeService === "canvs"}
+          onclick={() => (activeService = "canvs")}
+        >
+          <StatusOrb state={canvsOrbState(canvsTaskStatus)} />
+          <span class="font-medium">Canvs</span>
+          <span class="text-[var(--text-muted)]">{canvsStateLabel(canvsTaskStatus)}</span>
+        </button>
       </div>
     </header>
 
@@ -918,7 +966,7 @@
             <HealthPanel workspaceId={workspaceId!} />
           </div>
         {/if}
-      {:else}
+      {:else if activeService === "actions"}
         <div class="mt-4 flex flex-col gap-3">
           <ServicePanel
             title="Actions"
@@ -1001,11 +1049,20 @@
             <HealthPanel workspaceId={workspaceId!} />
           </div>
         {/if}
+      {:else}
+        <div class="mt-4">
+          <CanvsPanel
+            workspaceId={workspaceId!}
+            onTaskStatusChange={(status) => {
+              canvsTaskStatus = status;
+            }}
+          />
+        </div>
       {/if}
     </div>
 
     <footer class="border-t border-[var(--border)] px-8 py-4 text-xs text-[var(--text-muted)]">
-      MCP 默认端口 28766，Actions 默认 8787，可同时运行。
+      MCP 默认端口 28766，Actions 默认 8787；Canvs 实时展示当前 Workspace 的 Harness 任务。
     </footer>
   </section>
 {:else}

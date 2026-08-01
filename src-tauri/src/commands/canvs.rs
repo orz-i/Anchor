@@ -231,11 +231,11 @@ fn task_view(task: TaskSession) -> CanvsTask {
     let completed = task.completed_steps.len();
     let pending = task.pending_steps.len();
     let total = completed + pending;
-    let progress_percent = if total == 0 {
-        0
-    } else {
-        ((completed * 100) / total).min(100) as u8
-    };
+    let progress_percent = completed
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100) as u8;
     CanvsTask {
         id: task.id,
         objective: task.objective,
