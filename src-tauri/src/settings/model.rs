@@ -181,8 +181,8 @@ impl AppSettings {
         data.mcp_gateway = self.mcp_gateway.clone();
     }
 
-    pub fn load_or_default() -> Self {
-        crate::data::DataStore::read_file(|data| Ok(Self::from_data(data))).unwrap_or_default()
+    pub fn load() -> crate::error::AppResult<Self> {
+        crate::data::DataStore::read_file(|data| Ok(Self::from_data(data)))
     }
 
     pub fn find_frp_profile(&self, id: &str) -> Option<&FrpProfile> {

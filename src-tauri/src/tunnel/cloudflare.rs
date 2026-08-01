@@ -101,7 +101,7 @@ const CLOUDFLARED_VERSION: &str = "2025.6.1";
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
 /// assets are `.tgz` archives that need extraction.
 pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
-    let settings = crate::settings::AppSettings::load_or_default();
+    let settings = crate::settings::AppSettings::load()?;
     let asset = cloudflared_release_asset()?;
     let url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/{asset}"
@@ -256,7 +256,7 @@ pub async fn spawn_cloudflare_tunnel(
 
     crate::platform::configure_supervised_tokio_process(&mut cmd);
 
-    let settings = crate::settings::AppSettings::load_or_default();
+    let settings = crate::settings::AppSettings::load()?;
     if use_proxy {
         apply_proxy_env(&mut cmd, &settings.proxy);
     }

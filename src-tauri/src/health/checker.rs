@@ -3,6 +3,7 @@ use std::time::Duration;
 use reqwest::header::ALLOW;
 use serde::Serialize;
 
+use crate::error::AppResult;
 use crate::workspace::WorkspaceProfile;
 
 const TIMEOUT: Duration = Duration::from_secs(4);
@@ -128,11 +129,11 @@ fn well_known_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
 }
 
-pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
+pub async fn run_health_checks(profile: &WorkspaceProfile) -> AppResult<Vec<HealthItem>> {
     let client = http_client();
-    let mcp_public = profile.effective_public_url();
+    let mcp_public = profile.effective_public_url()?;
     let actions_local = profile.actions_local_base_url();
-    let actions_public = profile.actions_effective_public_url();
+    let actions_public = profile.actions_effective_public_url()?;
     let actions_oauth_base = if actions_public.is_empty() {
         actions_local.clone()
     } else {
@@ -142,7 +143,7 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
     let (mcp_local_ok, mcp_local_detail) =
         check_mcp_endpoint(&client, &profile.local_endpoint()).await;
     let (mcp_public_ok, mcp_public_detail) =
-        check_mcp_endpoint(&client, &profile.public_endpoint()).await;
+        check_mcp_endpoint(&client, &profile.public_endpoint()?).await;
     let (mcp_oauth_ok, mcp_oauth_detail) = check_json_field(
         &client,
         &well_known_url(&mcp_public, ".well-known/oauth-authorization-server"),
@@ -158,7 +159,7 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
 
     let actions_health_url = format!("{actions_local}/health");
     let actions_openapi_local = format!("{actions_local}/openapi.json");
-    let actions_openapi_public = profile.actions_openapi_url();
+    let actions_openapi_public = profile.actions_openapi_url()?;
 
     let (actions_local_ok, actions_local_detail) =
         check_url(&client, &actions_health_url).await;
@@ -173,7 +174,7 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
     )
     .await;
 
-    vec![
+    Ok(vec![
         health_item("本地 MCP 协议入口", mcp_local_ok, mcp_local_detail, "确认 MCP 服务已启动；GET /mcp 应返回 405，并包含 Allow: POST。"),
         health_item("公网 MCP 协议入口", mcp_public_ok, mcp_public_detail, "检查隧道和反向代理；公网 GET /mcp 应保留 405 与 Allow: POST。"),
         health_item("MCP OAuth 授权元数据", mcp_oauth_ok, mcp_oauth_detail, "MCP 认证需设为 OAuth，且公网地址可访问。"),
@@ -182,7 +183,7 @@ pub async fn run_health_checks(profile: &WorkspaceProfile) -> Vec<HealthItem> {
         health_item("本地 Actions /openapi.json", actions_openapi_local_ok, actions_openapi_local_detail, "Actions 监听器异常时请查看 actions-stderr.log。"),
         health_item("公网 Actions /openapi.json", actions_openapi_public_ok, actions_openapi_public_detail, "检查 Actions 隧道与子域名配置。"),
         health_item("Actions OAuth 授权元数据", actions_oauth_ok, actions_oauth_detail, "Actions 认证需设为 OAuth，公网地址需可达。"),
-    ]
+    ])
 }
 
 fn health_item(label: &str, ok: bool, detail: String, hint: &str) -> HealthItem {

@@ -168,7 +168,7 @@ pub fn get_frp_snippet(
             profile.runtime.local_port = gateway.local_port;
         }
     }
-    Ok(frp_snippet(&profile, kind))
+    frp_snippet(&profile, kind)
 }
 
 #[tauri::command]

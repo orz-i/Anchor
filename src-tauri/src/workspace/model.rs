@@ -323,8 +323,8 @@ impl WorkspaceProfile {
         format!("http://127.0.0.1:{}/mcp", self.runtime.local_port)
     }
 
-    pub fn effective_public_url(&self) -> String {
-        self.effective_public_url_with(&AppSettings::load_or_default())
+    pub fn effective_public_url(&self) -> crate::error::AppResult<String> {
+        Ok(self.effective_public_url_with(&AppSettings::load()?))
     }
 
     pub fn effective_public_url_with(&self, settings: &AppSettings) -> String {
@@ -340,10 +340,6 @@ impl WorkspaceProfile {
 
     /// External base URL used by this logical MCP server. In gateway mode the
     /// public hostname is shared, while the workspace path remains unique.
-    pub fn mcp_external_base_url(&self) -> String {
-        self.mcp_external_base_url_with(&AppSettings::load_or_default())
-    }
-
     pub fn mcp_external_base_url_with(&self, settings: &AppSettings) -> String {
         if settings.mcp_gateway.enabled {
             let base = settings.mcp_gateway.effective_public_url();
@@ -352,8 +348,12 @@ impl WorkspaceProfile {
         self.effective_public_url_with(settings)
     }
 
-    pub fn public_endpoint(&self) -> String {
-        let base = self.mcp_external_base_url();
+    pub fn public_endpoint(&self) -> crate::error::AppResult<String> {
+        Ok(self.public_endpoint_with(&AppSettings::load()?))
+    }
+
+    pub fn public_endpoint_with(&self, settings: &AppSettings) -> String {
+        let base = self.mcp_external_base_url_with(settings);
         if base.is_empty() {
             return String::new();
         }
@@ -364,8 +364,8 @@ impl WorkspaceProfile {
         format!("http://127.0.0.1:{}", self.actions.local_port)
     }
 
-    pub fn actions_effective_public_url(&self) -> String {
-        self.actions_effective_public_url_with(&AppSettings::load_or_default())
+    pub fn actions_effective_public_url(&self) -> crate::error::AppResult<String> {
+        Ok(self.actions_effective_public_url_with(&AppSettings::load()?))
     }
 
     pub fn actions_effective_public_url_with(&self, settings: &AppSettings) -> String {
@@ -379,8 +379,12 @@ impl WorkspaceProfile {
         )
     }
 
-    pub fn actions_openapi_url(&self) -> String {
-        let base = self.actions_public_base_url();
+    pub fn actions_openapi_url(&self) -> crate::error::AppResult<String> {
+        Ok(self.actions_openapi_url_with(&AppSettings::load()?))
+    }
+
+    pub fn actions_openapi_url_with(&self, settings: &AppSettings) -> String {
+        let base = self.actions_public_base_url_with(settings);
         if base.is_empty() {
             return String::new();
         }
@@ -388,8 +392,12 @@ impl WorkspaceProfile {
     }
 
     /// Public URL for GPT schema import; falls back to localhost when no tunnel is configured.
-    pub fn actions_public_base_url(&self) -> String {
-        let public = self.actions_effective_public_url();
+    pub fn actions_public_base_url(&self) -> crate::error::AppResult<String> {
+        Ok(self.actions_public_base_url_with(&AppSettings::load()?))
+    }
+
+    pub fn actions_public_base_url_with(&self, settings: &AppSettings) -> String {
+        let public = self.actions_effective_public_url_with(settings);
         if public.is_empty() {
             self.actions_local_base_url()
         } else {

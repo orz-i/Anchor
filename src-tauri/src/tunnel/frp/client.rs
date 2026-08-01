@@ -610,7 +610,7 @@ fn successful_proxy_names(content: &str) -> HashSet<String> {
 }
 
 pub(crate) async fn download_frpc_to_cache() -> AppResult<PathBuf> {
-    let settings = crate::settings::AppSettings::load_or_default();
+    let settings = crate::settings::AppSettings::load()?;
     let (archive_name, binary_in_archive) = frp_release_asset()?;
     let url =
         format!("https://github.com/fatedier/frp/releases/download/v{FRP_VERSION}/{archive_name}");

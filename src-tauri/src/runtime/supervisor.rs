@@ -65,16 +65,26 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
-    pub fn mcp_status(&self, profile: &WorkspaceProfile) -> RuntimeStatusDto {
-        let mut status = self.status(profile, ServiceKind::Mcp);
+    pub fn mcp_status(&self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+        let settings = AppSettings::load()?;
+        Ok(self.mcp_status_with_settings(profile, &settings))
+    }
+
+    fn mcp_status_with_settings(
+        &self,
+        profile: &WorkspaceProfile,
+        settings: &AppSettings,
+    ) -> RuntimeStatusDto {
+        let mut status = self.status_with_settings(profile, ServiceKind::Mcp, settings);
         if status.state == "running" {
             status.activity = Some(mcp::activity_snapshot(&profile.id));
         }
         status
     }
 
-    pub fn actions_status(&self, profile: &WorkspaceProfile) -> RuntimeStatusDto {
-        self.status(profile, ServiceKind::Actions)
+    pub fn actions_status(&self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+        let settings = AppSettings::load()?;
+        Ok(self.status_with_settings(profile, ServiceKind::Actions, &settings))
     }
 
     pub fn start_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
@@ -179,7 +189,21 @@ impl RuntimeSupervisor {
         self.entries.remove(&(workspace_id.to_string(), kind));
     }
 
-    fn status(&self, profile: &WorkspaceProfile, kind: ServiceKind) -> RuntimeStatusDto {
+    fn status(
+        &self,
+        profile: &WorkspaceProfile,
+        kind: ServiceKind,
+    ) -> AppResult<RuntimeStatusDto> {
+        let settings = AppSettings::load()?;
+        Ok(self.status_with_settings(profile, kind, &settings))
+    }
+
+    fn status_with_settings(
+        &self,
+        profile: &WorkspaceProfile,
+        kind: ServiceKind,
+        settings: &AppSettings,
+    ) -> RuntimeStatusDto {
         let key = (profile.id.clone(), kind);
         let phase = self
             .entries
@@ -187,7 +211,7 @@ impl RuntimeSupervisor {
             .map(|entry| entry.phase)
             .unwrap_or(RuntimePhase::Stopped);
 
-        let (local_endpoint, public_endpoint) = endpoints(profile, kind);
+        let (local_endpoint, public_endpoint) = endpoints(profile, kind, settings);
         let port = port_for(profile, kind);
         let service_label = service_label(kind);
         let recovery = self.recovery_status(&key);
@@ -197,7 +221,7 @@ impl RuntimeSupervisor {
                 state: "running".into(),
                 pid: None,
                 local_message: format!("{service_label}正在监听 127.0.0.1:{port}"),
-                public_message: public_message_for(profile, kind),
+                public_message: public_message_for(profile, kind, settings),
                 local_endpoint,
                 public_endpoint,
                 recovery,
@@ -310,7 +334,7 @@ impl RuntimeSupervisor {
                 Some(RuntimePhase::Running) | Some(RuntimePhase::Starting)
             )
         {
-            return Ok(self.status(profile, kind));
+            return self.status(profile, kind);
         }
         if !recovery
             && matches!(
@@ -378,7 +402,7 @@ impl RuntimeSupervisor {
                         previous_recovered_count,
                         message,
                     );
-                    return Ok(self.status(profile, kind));
+                    return self.status(profile, kind);
                 }
                 self.entries.remove(&key);
                 return Err(crate::error::AppError::Message(message));
@@ -387,7 +411,7 @@ impl RuntimeSupervisor {
 
         let spawn_result = match kind {
             ServiceKind::Mcp => {
-                let settings = AppSettings::load_or_default();
+                let settings = AppSettings::load()?;
                 let mut runtime_config = profile.runtime.clone();
                 runtime_config.strict_workspace_reads = settings.mcp_gateway.enabled;
                 let use_shared = profile.auth.use_shared_secrets;
@@ -463,7 +487,7 @@ impl RuntimeSupervisor {
                 } else {
                     None
                 };
-                let public_base_url = profile.actions_public_base_url();
+                let public_base_url = profile.actions_public_base_url()?;
                 let policy = PolicySettings::from_actions_config(&profile.actions);
                 actions::spawn_listener(
                     &profile.id,
@@ -535,7 +559,7 @@ impl RuntimeSupervisor {
                         previous_recovered_count,
                         err,
                     );
-                    return Ok(self.status(profile, kind));
+                    return self.status(profile, kind);
                 }
                 self.entries.insert(
                     key,
@@ -555,7 +579,7 @@ impl RuntimeSupervisor {
             }
         }
 
-        Ok(self.status(profile, kind))
+        self.status(profile, kind)
     }
 
     fn record_recovery_failure(
@@ -662,7 +686,7 @@ impl RuntimeSupervisor {
                             stderr_log_name(kind),
                             &format!("[refresh] 检查端口 {port} 失败，保留当前线路：{error}"),
                         );
-                        return Ok(self.status(profile, kind));
+                        return self.status(profile, kind);
                     }
                 };
                 if task_finished || should_mark_runtime_error(entry, listening) {
@@ -719,7 +743,7 @@ impl RuntimeSupervisor {
         if should_retry {
             return self.attempt_start(profile, kind, true);
         }
-        Ok(self.status(profile, kind))
+        self.status(profile, kind)
     }
 }
 
@@ -776,20 +800,31 @@ fn port_for(profile: &WorkspaceProfile, kind: ServiceKind) -> u16 {
     }
 }
 
-fn endpoints(profile: &WorkspaceProfile, kind: ServiceKind) -> (String, String) {
+fn endpoints(
+    profile: &WorkspaceProfile,
+    kind: ServiceKind,
+    settings: &AppSettings,
+) -> (String, String) {
     match kind {
-        ServiceKind::Mcp => (profile.local_endpoint(), profile.public_endpoint()),
+        ServiceKind::Mcp => (
+            profile.local_endpoint(),
+            profile.public_endpoint_with(settings),
+        ),
         ServiceKind::Actions => (
             profile.actions_local_base_url(),
-            profile.actions_openapi_url(),
+            profile.actions_openapi_url_with(settings),
         ),
     }
 }
 
-fn public_message_for(profile: &WorkspaceProfile, kind: ServiceKind) -> String {
+fn public_message_for(
+    profile: &WorkspaceProfile,
+    kind: ServiceKind,
+    settings: &AppSettings,
+) -> String {
     match kind {
-        ServiceKind::Mcp => profile.mcp_external_base_url(),
-        ServiceKind::Actions => profile.actions_effective_public_url(),
+        ServiceKind::Mcp => profile.mcp_external_base_url_with(settings),
+        ServiceKind::Actions => profile.actions_effective_public_url_with(settings),
     }
 }
 
@@ -933,11 +968,18 @@ mod tests {
             entry(RuntimePhase::Running, Some(std::time::Instant::now())),
         );
 
-        let idle = supervisor.mcp_status(&profile).activity.expect("activity");
+        let settings = AppSettings::default();
+        let idle = supervisor
+            .mcp_status_with_settings(&profile, &settings)
+            .activity
+            .expect("activity");
         assert_eq!(idle.state, "idle");
 
         tracker.request_started("session", &json!(1), "tools/call", "read_file");
-        let active = supervisor.mcp_status(&profile).activity.expect("activity");
+        let active = supervisor
+            .mcp_status_with_settings(&profile, &settings)
+            .activity
+            .expect("activity");
         assert_eq!(active.state, "active");
         assert_eq!(active.current_tool, "read_file");
     }

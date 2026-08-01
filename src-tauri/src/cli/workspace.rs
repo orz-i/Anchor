@@ -744,7 +744,7 @@ fn select_mcp_endpoint(
     mode: EndpointSelection,
 ) -> AppResult<(String, &'static str)> {
     let local = profile.local_endpoint();
-    let public = profile.public_endpoint();
+    let public = profile.public_endpoint()?;
     select_endpoint(local, public, mode, "MCP")
 }
 
@@ -753,7 +753,7 @@ fn select_actions_base(
     mode: EndpointSelection,
 ) -> AppResult<(String, &'static str)> {
     let local = profile.actions_local_base_url();
-    let public = profile.actions_effective_public_url();
+    let public = profile.actions_effective_public_url()?;
     select_endpoint(local, public, mode, "Actions")
 }
 

@@ -338,8 +338,7 @@ pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<
 
     state.with_runtime(|runtime| {
         runtime.refresh_mcp(&profile);
-
-        Ok(runtime.mcp_status(&profile))
+        runtime.mcp_status(&profile)
     })
 }
 
@@ -356,8 +355,7 @@ pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<R
 
     state.with_runtime(|runtime| {
         runtime.finish_stop(&id, ServiceKind::Mcp);
-
-        Ok(runtime.mcp_status(&profile))
+        Ok(())
     })?;
     let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
     if gateway_enabled {
@@ -366,7 +364,7 @@ pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<R
         stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
     }
     sync_tunnel_routes_from_runtime(&state).await?;
-    state.with_runtime(|runtime| Ok(runtime.mcp_status(&profile)))
+    state.with_runtime(|runtime| runtime.mcp_status(&profile))
 }
 
 #[tauri::command]
@@ -376,8 +374,7 @@ pub fn get_runtime_status(state: State<'_, AppState>, id: String) -> AppResult<R
 
     state.with_runtime(|runtime| {
         runtime.refresh_mcp(&profile);
-
-        Ok(runtime.mcp_status(&profile))
+        runtime.mcp_status(&profile)
     })
 }
 
@@ -414,8 +411,7 @@ pub async fn start_actions_runtime(
 
     state.with_runtime(|runtime| {
         runtime.refresh_actions(&profile);
-
-        Ok(runtime.actions_status(&profile))
+        runtime.actions_status(&profile)
     })
 }
 
@@ -436,12 +432,11 @@ pub async fn stop_actions_runtime(
 
     state.with_runtime(|runtime| {
         runtime.finish_stop(&id, ServiceKind::Actions);
-
-        Ok(runtime.actions_status(&profile))
+        Ok(())
     })?;
     stop_for_runtime(&profile, TunnelServiceKind::Actions).await?;
     sync_tunnel_routes_from_runtime(&state).await?;
-    state.with_runtime(|runtime| Ok(runtime.actions_status(&profile)))
+    state.with_runtime(|runtime| runtime.actions_status(&profile))
 }
 
 #[tauri::command]
@@ -455,8 +450,7 @@ pub fn get_actions_runtime_status(
 
     state.with_runtime(|runtime| {
         runtime.refresh_actions(&profile);
-
-        Ok(runtime.actions_status(&profile))
+        runtime.actions_status(&profile)
     })
 }
 

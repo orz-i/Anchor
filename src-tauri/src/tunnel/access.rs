@@ -33,18 +33,20 @@ pub async fn ensure_for_runtime(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
 ) -> AppResult<Option<String>> {
-    if kind == TunnelServiceKind::Mcp && AppSettings::load_or_default().mcp_gateway.enabled {
+    let settings = AppSettings::load()?;
+    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
         return Ok(None);
     }
     let tunnel_type = tunnel_type_for(profile, kind);
     if tunnel_type.is_empty() || tunnel_type == "none" {
         return Ok(None);
     }
-    let settings = AppSettings::load_or_default();
     let mut guard = supervisor().lock().await;
     let current = guard.status(profile, kind, &settings);
     if current.state == "running" {
-        if let Err(error) = validate_automatic_recovery_url(profile, kind, &current.public_url) {
+        if let Err(error) =
+            validate_automatic_recovery_url(profile, kind, &current.public_url, &settings)
+        {
             let _ = guard.stop(profile, kind, &settings).await;
             return Err(error);
         }
@@ -52,7 +54,9 @@ pub async fn ensure_for_runtime(
         return Ok(Some(current.public_url));
     }
     let status = guard.start(profile, kind, &settings).await?;
-    if let Err(error) = validate_automatic_recovery_url(profile, kind, &status.public_url) {
+    if let Err(error) =
+        validate_automatic_recovery_url(profile, kind, &status.public_url, &settings)
+    {
         let _ = guard.stop(profile, kind, &settings).await;
         return Err(error);
     }
@@ -71,14 +75,14 @@ pub async fn maybe_start_for_runtime(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
 ) -> AppResult<Option<String>> {
-    if kind == TunnelServiceKind::Mcp && AppSettings::load_or_default().mcp_gateway.enabled {
+    let settings = AppSettings::load()?;
+    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
         return Ok(None);
     }
     let tunnel_type = tunnel_type_for(profile, kind);
     if tunnel_type.is_empty() || tunnel_type == "none" {
         return Ok(None);
     }
-    let settings = AppSettings::load_or_default();
     let mut guard = supervisor().lock().await;
     let status = guard.start(profile, kind, &settings).await?;
     publish_listener_url(profile, kind, &status.public_url);
@@ -95,8 +99,9 @@ fn validate_automatic_recovery_url(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
     recovered_url: &str,
+    settings: &AppSettings,
 ) -> AppResult<()> {
-    if kind == TunnelServiceKind::Mcp && AppSettings::load_or_default().mcp_gateway.enabled {
+    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
         return Ok(());
     }
     if !is_quick_cloudflare(profile, kind) {
@@ -152,10 +157,10 @@ pub async fn stop_for_runtime(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
 ) -> AppResult<()> {
-    if kind == TunnelServiceKind::Mcp && AppSettings::load_or_default().mcp_gateway.enabled {
+    let settings = AppSettings::load()?;
+    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
         return Ok(());
     }
-    let settings = AppSettings::load_or_default();
     let mut guard = supervisor().lock().await;
     guard.stop(profile, kind, &settings).await
 }
@@ -168,7 +173,7 @@ pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
 pub async fn sync_managed_runtime_routes(
     mut active_runtime_keys: HashSet<(String, TunnelServiceKind)>,
 ) -> AppResult<()> {
-    let settings = AppSettings::load_or_default();
+    let settings = AppSettings::load()?;
     let mut profiles = DataStore::read_file(|data| Ok(data.profiles.clone()))?;
     if settings.mcp_gateway.enabled {
         active_runtime_keys.retain(|(_, kind)| *kind != TunnelServiceKind::Mcp);
@@ -212,7 +217,7 @@ pub async fn reconcile_mcp_gateway(
     profiles: &[WorkspaceProfile],
     active_workspace_ids: &HashSet<String>,
 ) -> AppResult<Option<String>> {
-    let settings = AppSettings::load_or_default();
+    let settings = AppSettings::load()?;
     let mut binding = GATEWAY_TUNNEL_BINDING.lock().await;
     let mut guard = supervisor().lock().await;
 
@@ -352,7 +357,7 @@ mod tests {
         is_quick_tunnel_url_change_error, validate_automatic_recovery_url,
         validate_gateway_recovery_url, TunnelServiceKind,
     };
-    use crate::settings::McpGatewayConfig;
+    use crate::settings::{AppSettings, McpGatewayConfig};
 
     fn quick_profile() -> WorkspaceProfile {
         let mut profile = WorkspaceProfile::new("C:/workspace/quick".into(), Some("quick".into()));
@@ -369,13 +374,15 @@ mod tests {
         assert!(validate_automatic_recovery_url(
             &profile,
             TunnelServiceKind::Mcp,
-            "https://old.trycloudflare.com"
+            "https://old.trycloudflare.com",
+            &AppSettings::default()
         )
         .is_ok());
         let error = validate_automatic_recovery_url(
             &profile,
             TunnelServiceKind::Mcp,
             "https://new.trycloudflare.com",
+            &AppSettings::default(),
         )
         .expect_err("URL drift");
         assert!(is_quick_tunnel_url_change_error(&error));
@@ -389,7 +396,8 @@ mod tests {
         assert!(validate_automatic_recovery_url(
             &profile,
             TunnelServiceKind::Mcp,
-            "https://new.trycloudflare.com"
+            "https://new.trycloudflare.com",
+            &AppSettings::default()
         )
         .is_ok());
     }
@@ -401,7 +409,8 @@ mod tests {
         assert!(validate_automatic_recovery_url(
             &profile,
             TunnelServiceKind::Mcp,
-            "https://fixed.example.com"
+            "https://fixed.example.com",
+            &AppSettings::default()
         )
         .is_ok());
     }

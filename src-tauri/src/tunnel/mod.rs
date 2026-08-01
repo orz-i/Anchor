@@ -27,7 +27,10 @@ pub use supervisor::{
     append_profile_log, log_dir_for_profile, TunnelServiceKind, TunnelStatus, TunnelSupervisor,
 };
 
-pub fn frp_snippet(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> String {
-    let settings = AppSettings::load_or_default();
-    frp::frp_snippet(profile, kind, &settings)
+pub fn frp_snippet(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> crate::error::AppResult<String> {
+    let settings = AppSettings::load()?;
+    Ok(frp::frp_snippet(profile, kind, &settings))
 }

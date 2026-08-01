@@ -281,7 +281,7 @@ impl TunnelSupervisor {
     }
 
     pub async fn drop_workspace(&mut self, workspace_id: &str) -> AppResult<()> {
-        let settings = AppSettings::load_or_default();
+        let settings = AppSettings::load()?;
         let keys = [
             (workspace_id.to_string(), TunnelServiceKind::Mcp),
             (workspace_id.to_string(), TunnelServiceKind::Actions),
@@ -359,7 +359,7 @@ impl TunnelSupervisor {
         if runtime_listening {
             return Ok(());
         }
-        let settings = AppSettings::load_or_default();
+        let settings = AppSettings::load()?;
         let key = (profile.id.clone(), kind);
         if self.frp_routes.contains_key(&key)
             && !self.frp_route_matches(&key, profile, kind, &settings)
