@@ -8,7 +8,7 @@ mod software;
 mod tunnel;
 mod workspace;
 
-pub use canvs::get_canvs_snapshot;
+pub use canvs::{get_canvs_snapshot, get_canvs_task_snapshot, list_canvs_tasks};
 pub use frp_profiles::{
     delete_frp_profile, get_app_settings, get_last_workspace_id, get_proxy, list_frp_profiles,
     save_frp_profile, set_last_workspace, set_proxy,

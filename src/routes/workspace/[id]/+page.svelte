@@ -526,6 +526,12 @@
     return "";
   }
 
+  function canvsWebUrl(mcpEndpoint: string): string {
+    const endpoint = mcpEndpoint.trim().replace(/\/$/, "");
+    if (!endpoint) return "";
+    return `${endpoint.replace(/\/mcp$/, "")}/canvs`;
+  }
+
   async function restartTunnelIfConfigured(
     targetWorkspaceId: string,
     config: TunnelFormConfig,
@@ -1073,6 +1079,8 @@
         <div class="mt-4">
           <CanvsPanel
             workspaceId={workspaceId!}
+            localUrl={canvsWebUrl(mcpLocal)}
+            publicUrl={canvsWebUrl(mcpPublic)}
             onTaskStatusChange={(status) => {
               canvsTaskStatus = status;
             }}
@@ -1082,7 +1090,7 @@
     </div>
 
     <footer class="border-t border-[var(--border)] px-8 py-4 text-xs text-[var(--text-muted)]">
-      MCP 默认端口 28766，Actions 默认 8787；Canvs 实时展示当前 Workspace 的 Harness 任务。
+      MCP 默认端口 28766，Actions 默认 8787；Canvs 网页与 MCP 共用工作区隔离的公网入口。
     </footer>
   </section>
 {:else}

@@ -4,15 +4,18 @@
     type CanvsSnapshot,
     type CanvsTaskStatus,
   } from "$lib/api/canvs";
+  import CopyButton from "$lib/components/CopyButton.svelte";
 
   const AUTO_REFRESH_INTERVAL_MS = 2_000;
 
   interface Props {
     workspaceId: string;
+    localUrl?: string;
+    publicUrl?: string;
     onTaskStatusChange?: (status: CanvsTaskStatus | null) => void;
   }
 
-  let { workspaceId, onTaskStatusChange }: Props = $props();
+  let { workspaceId, localUrl = "", publicUrl = "", onTaskStatusChange }: Props = $props();
 
   let snapshot = $state<CanvsSnapshot | null>(null);
   let busy = $state(false);
@@ -185,6 +188,26 @@
           {busy ? "刷新中…" : "刷新"}
         </button>
       </div>
+    </div>
+
+    <div class="mt-4 grid gap-2 rounded-xl border border-[var(--border)] bg-[var(--page-bg)] p-3">
+      <div class="flex min-w-0 items-center gap-3">
+        <span class="w-16 shrink-0 text-xs text-[var(--text-muted)]">本地网页</span>
+        <code class="min-w-0 flex-1 truncate text-xs">{localUrl || "—"}</code>
+        {#if localUrl}
+          <CopyButton value={localUrl} label="复制" />
+        {/if}
+      </div>
+      <div class="flex min-w-0 items-center gap-3">
+        <span class="w-16 shrink-0 text-xs text-[var(--text-muted)]">公网网页</span>
+        <code class="min-w-0 flex-1 truncate text-xs">{publicUrl || "隧道未连接"}</code>
+        {#if publicUrl}
+          <CopyButton value={publicUrl} label="复制" />
+        {/if}
+      </div>
+      <p class="text-xs leading-5 text-[var(--text-muted)]">
+        网页入口与 MCP 共用当前工作区的 listener 和隧道。OAuth 模式使用授权口令，Bearer 模式使用 Bearer Token。
+      </p>
     </div>
 
     {#if error}

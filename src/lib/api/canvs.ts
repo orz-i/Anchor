@@ -14,6 +14,7 @@ export interface CanvsTask {
   id: string;
   objective: string;
   status: CanvsTaskStatus;
+  current: boolean;
   completedSteps: string[];
   pendingSteps: string[];
   progressPercent: number;
@@ -24,6 +25,12 @@ export interface CanvsTask {
   latestVerificationId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CanvsTaskList {
+  workspaceId: string;
+  tasks: CanvsTask[];
+  refreshedAt: string;
 }
 
 export interface CanvsEvent {
@@ -79,4 +86,19 @@ export interface CanvsSnapshot {
 
 export function getCanvsSnapshot(workspaceId: string): Promise<CanvsSnapshot> {
   return invokeRead<CanvsSnapshot>("get_canvs_snapshot", { id: workspaceId }, { attempts: 1 });
+}
+
+export function listCanvsTasks(workspaceId: string): Promise<CanvsTaskList> {
+  return invokeRead<CanvsTaskList>("list_canvs_tasks", { id: workspaceId }, { attempts: 1 });
+}
+
+export function getCanvsTaskSnapshot(
+  workspaceId: string,
+  taskId: string,
+): Promise<CanvsSnapshot> {
+  return invokeRead<CanvsSnapshot>(
+    "get_canvs_task_snapshot",
+    { id: workspaceId, taskId },
+    { attempts: 1 },
+  );
 }

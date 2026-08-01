@@ -565,6 +565,10 @@ impl Harness {
             .find(|task| task.status.is_writable()))
     }
 
+    pub fn list_tasks(&self) -> HarnessResult<Vec<TaskSession>> {
+        self.store.list_tasks(&self.workspace_id)
+    }
+
     pub fn task(&self, task_id: &str) -> HarnessResult<TaskSession> {
         self.store.load_task(&self.workspace_id, task_id)
     }

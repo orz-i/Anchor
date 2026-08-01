@@ -672,7 +672,11 @@ fn allowed_upstream_path(path: &str) -> bool {
             | ".well-known/oauth-protected-resource"
             | "oauth/authorize"
             | "oauth/token"
-    )
+            | "canvs"
+            | "canvs/"
+    ) || path.starts_with("canvs/tasks/")
+        || path == "canvs/api/tasks"
+        || path.starts_with("canvs/api/tasks/")
 }
 
 fn safe_workspace_segment(value: &str) -> bool {
@@ -819,8 +823,13 @@ mod tests {
     fn gateway_only_forwards_known_protocol_paths() {
         assert!(allowed_upstream_path("mcp"));
         assert!(allowed_upstream_path("oauth/token"));
+        assert!(allowed_upstream_path("canvs"));
+        assert!(allowed_upstream_path("canvs/tasks/task-123"));
+        assert!(allowed_upstream_path("canvs/api/tasks/task-123"));
         assert!(!allowed_upstream_path("admin"));
         assert!(!allowed_upstream_path("mcp/extra"));
+        assert!(!allowed_upstream_path("canvs-admin"));
+        assert!(!allowed_upstream_path("canvs/api/tasks-extra"));
     }
 
     #[test]

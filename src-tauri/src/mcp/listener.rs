@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth::{
-    authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, redirect_uri_log_label, register_oauth_runtime,
+    authorization_server_metadata, authorize_get, authorize_post, constant_time_eq_str,
+    external_base_url, protected_resource_metadata, redirect_uri_log_label, register_oauth_runtime,
     request_origin_allowed, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
     AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm, OAUTH_MAX_BODY_BYTES,
 };
@@ -25,14 +25,15 @@ use crate::tools::Workspace;
 use crate::tunnel::append_profile_log;
 use crate::workspace::{AuthConfig, RuntimeConfig};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Form, Query, State};
+use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{
-    header::{ACCEPT, ALLOW, CACHE_CONTROL},
+    header::{ACCEPT, ALLOW, AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE},
     HeaderMap, HeaderValue, StatusCode,
 };
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Semaphore};
@@ -54,6 +55,7 @@ struct ListenerState {
     auth: AuthConfig,
     workspace_id: String,
     workspace_name: String,
+    workspace_path: PathBuf,
     bind_port: u16,
     configured_public_url: SharedPublicUrl,
     bearer_token: Option<String>,
@@ -148,6 +150,7 @@ pub fn spawn_listener(
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
 ) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
+    let canvs_workspace_path = workspace_path.clone();
     let proxy_specs = parse_mcp_proxy_config(&runtime.mcp_config, &workspace_path)?;
     let allow_external_reads =
         !runtime.strict_workspace_reads && runtime.permission_mode == "dangerous";
@@ -233,6 +236,7 @@ pub fn spawn_listener(
         auth,
         workspace_id,
         workspace_name,
+        workspace_path: canvs_workspace_path,
         bind_port: port,
         configured_public_url,
         bearer_token,
@@ -316,9 +320,16 @@ async fn serve(
         )
         .route("/oauth/token", post(oauth_token_post))
         .layer(DefaultBodyLimit::max(OAUTH_MAX_BODY_BYTES));
+    let canvs_routes = Router::new()
+        .route("/canvs", get(canvs_task_list_page))
+        .route("/canvs/", get(canvs_task_list_page))
+        .route("/canvs/tasks/{task_id}", get(canvs_task_detail_page))
+        .route("/canvs/api/tasks", get(canvs_task_list_json))
+        .route("/canvs/api/tasks/{task_id}", get(canvs_task_detail_json));
     let app = Router::new()
         .merge(mcp_routes)
         .merge(oauth_routes)
+        .merge(canvs_routes)
         .with_state(state);
 
     append_profile_log(
@@ -361,6 +372,174 @@ fn mcp_method_not_allowed_response() -> Response {
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+async fn canvs_task_list_page(State(state): State<ListenerState>, headers: HeaderMap) -> Response {
+    if !canvs_authorized(&state, &headers) {
+        return canvs_unauthorized(&state, false);
+    }
+    match crate::canvs::list_workspace_tasks(&state.workspace_path) {
+        Ok(tasks) => canvs_html_response(
+            StatusCode::OK,
+            crate::canvs_web::task_list_page(&state.workspace_name, &tasks),
+        ),
+        Err(error) => canvs_harness_error(&state, error, false),
+    }
+}
+
+async fn canvs_task_detail_page(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Response {
+    if !canvs_authorized(&state, &headers) {
+        return canvs_unauthorized(&state, false);
+    }
+    match crate::canvs::workspace_task_snapshot(&state.workspace_path, &task_id) {
+        Ok(snapshot) => canvs_html_response(
+            StatusCode::OK,
+            crate::canvs_web::task_detail_page(&state.workspace_name, &snapshot),
+        ),
+        Err(error) => canvs_harness_error(&state, error, false),
+    }
+}
+
+async fn canvs_task_list_json(State(state): State<ListenerState>, headers: HeaderMap) -> Response {
+    if !canvs_authorized(&state, &headers) {
+        return canvs_unauthorized(&state, true);
+    }
+    match crate::canvs::list_workspace_tasks(&state.workspace_path) {
+        Ok(tasks) => canvs_json_response(StatusCode::OK, serde_json::to_value(tasks)),
+        Err(error) => canvs_harness_error(&state, error, true),
+    }
+}
+
+async fn canvs_task_detail_json(
+    State(state): State<ListenerState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Response {
+    if !canvs_authorized(&state, &headers) {
+        return canvs_unauthorized(&state, true);
+    }
+    match crate::canvs::workspace_task_snapshot(&state.workspace_path, &task_id) {
+        Ok(snapshot) => canvs_json_response(StatusCode::OK, serde_json::to_value(snapshot)),
+        Err(error) => canvs_harness_error(&state, error, true),
+    }
+}
+
+fn canvs_authorized(state: &ListenerState, headers: &HeaderMap) -> bool {
+    if state.auth.auth_type == "noauth" {
+        return true;
+    }
+    if headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "))
+        && require_mcp_auth(state, headers).is_none()
+    {
+        return true;
+    }
+    let Some(password) = basic_auth_password(headers) else {
+        return false;
+    };
+    let expected = if state.auth.bearer_enabled() {
+        state.bearer_token.as_deref()
+    } else if state.auth.oauth_enabled() {
+        state.oauth.as_ref().map(|oauth| oauth.password.as_str())
+    } else {
+        None
+    };
+    expected.is_some_and(|expected| constant_time_eq_str(&password, expected))
+}
+
+fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
+    let encoded = headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    let decoded = STANDARD.decode(encoded.trim()).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded
+        .split_once(':')
+        .map(|(_, password)| password.to_string())
+}
+
+fn canvs_unauthorized(state: &ListenerState, json_response: bool) -> Response {
+    let mut response = if json_response {
+        canvs_json_response(
+            StatusCode::UNAUTHORIZED,
+            Ok(json!({"error": "Canvs authentication required"})),
+        )
+    } else {
+        canvs_html_response(
+            StatusCode::UNAUTHORIZED,
+            crate::canvs_web::unauthorized_page(&state.workspace_name),
+        )
+    };
+    let challenge = format!(
+        "Basic realm=\"Anchor Canvs {}\", charset=\"UTF-8\"",
+        state.workspace_id
+    );
+    if let Ok(challenge) = HeaderValue::from_str(&challenge) {
+        response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+    }
+    response
+}
+
+fn canvs_harness_error(
+    state: &ListenerState,
+    error: crate::harness::HarnessError,
+    json_response: bool,
+) -> Response {
+    let code = error.code().to_string();
+    let message = crate::canvs::harness_error_message(error);
+    let status = if matches!(code.as_str(), "IO_ERROR" | "INVALID_TASK_ID") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    if json_response {
+        canvs_json_response(status, Ok(json!({"error": message, "code": code})))
+    } else {
+        canvs_html_response(
+            status,
+            crate::canvs_web::error_page(&state.workspace_name, "无法读取任务", &message),
+        )
+    }
+}
+
+fn canvs_json_response(status: StatusCode, value: Result<Value, serde_json::Error>) -> Response {
+    let body = value.unwrap_or_else(|error| json!({"error": error.to_string()}));
+    let mut response = (status, Json(body)).into_response();
+    apply_canvs_security_headers(&mut response);
+    response
+}
+
+fn canvs_html_response(status: StatusCode, body: String) -> Response {
+    let mut response = (status, Html(body)).into_response();
+    apply_canvs_security_headers(&mut response);
+    response
+}
+
+fn apply_canvs_security_headers(response: &mut Response) {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
 }
 
 fn resolve_oauth_base(state: &ListenerState, headers: &HeaderMap) -> String {
@@ -1131,11 +1310,12 @@ mod tests {
 
     use axum::extract::State;
     use axum::http::{
-        header::{ALLOW, CACHE_CONTROL},
+        header::{ALLOW, AUTHORIZATION, CACHE_CONTROL, WWW_AUTHENTICATE},
         HeaderMap, StatusCode,
     };
     use axum::response::IntoResponse;
     use axum::Json;
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use serde_json::{json, Value};
     use tokio::sync::Semaphore;
 
@@ -1148,8 +1328,9 @@ mod tests {
     use crate::workspace::AuthConfig;
 
     use super::{
-        accepts_streamable_http, bind_listener, mcp_delete, mcp_method_not_allowed_response,
-        mcp_post, origin_allowed, resolve_oauth_base, ListenerState,
+        accepts_streamable_http, basic_auth_password, bind_listener, canvs_authorized,
+        canvs_unauthorized, mcp_delete, mcp_method_not_allowed_response, mcp_post, origin_allowed,
+        resolve_oauth_base, ListenerState,
     };
 
     #[test]
@@ -1184,6 +1365,40 @@ mod tests {
         assert!(accepts_streamable_http(&headers));
     }
 
+    #[test]
+    fn canvs_basic_auth_is_scoped_to_the_workspace_secret() {
+        let (_workspace, mut state) = test_listener_state();
+        state.auth.auth_type = "bearer".into();
+        state.bearer_token = Some("workspace-secret".into());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode("viewer:workspace-secret"))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            basic_auth_password(&headers).as_deref(),
+            Some("workspace-secret")
+        );
+        assert!(canvs_authorized(&state, &headers));
+
+        headers.insert(
+            AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode("viewer:other-secret"))
+                .parse()
+                .unwrap(),
+        );
+        assert!(!canvs_authorized(&state, &headers));
+
+        let response = canvs_unauthorized(&state, false);
+        assert!(response.headers()[WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .contains(&state.workspace_id));
+    }
+
     fn test_listener_state() -> (tempfile::TempDir, ListenerState) {
         let workspace = tempfile::tempdir().expect("workspace");
         let auth = AuthConfig {
@@ -1198,6 +1413,7 @@ mod tests {
             "trusted".into(),
         );
         let workspace_id = format!("listener-test-{}", uuid::Uuid::new_v4());
+        let workspace_path = workspace.path().to_path_buf();
         (
             workspace,
             ListenerState {
@@ -1205,6 +1421,7 @@ mod tests {
                 auth,
                 workspace_id: workspace_id.clone(),
                 workspace_name: "Listener Test".into(),
+                workspace_path,
                 bind_port: 28766,
                 configured_public_url: register_public_url(
                     &workspace_id,
@@ -1217,11 +1434,7 @@ mod tests {
                 proxy_specs: Vec::new(),
                 sessions: SessionStore::default(),
                 mcp_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
-                mcp_identity_rate_limiter: KeyedRateLimiter::new(
-                    100,
-                    32,
-                    Duration::from_secs(60),
-                ),
+                mcp_identity_rate_limiter: KeyedRateLimiter::new(100, 32, Duration::from_secs(60)),
                 oauth_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
                 oauth_identity_rate_limiter: KeyedRateLimiter::new(
                     100,
