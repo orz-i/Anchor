@@ -488,6 +488,7 @@ fn call_tool_impl(
         "server_info" => server_info_for_session(ctx, session_id),
         "list_skills" => crate::skills::list_tool(ctx, &effective_args),
         "load_skill" => crate::skills::load_tool(ctx, &effective_args),
+        "list_skill_resources" => crate::skills::list_resources_tool(&ctx.skills, &effective_args),
         "read_skill_resource" => crate::skills::read_resource_tool(&ctx.skills, &effective_args),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),

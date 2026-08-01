@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 14,
+    "catalog_version": 15,
     "names": [
       "accept_current_baseline",
       "accept_latest_baseline",
@@ -32,6 +32,7 @@
       "kill_session",
       "list_dir",
       "list_files",
+      "list_skill_resources",
       "list_skills",
       "list_task_events",
       "load_skill",
@@ -60,10 +61,10 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 57
+    "tool_count": 58
   },
   "core": {
-    "catalog_version": 14,
+    "catalog_version": 15,
     "names": [
       "accept_latest_baseline",
       "apply_patch",
@@ -90,6 +91,7 @@
       "kill_session",
       "list_dir",
       "list_files",
+      "list_skill_resources",
       "list_skills",
       "load_skill",
       "read_file",
@@ -105,10 +107,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 39
+    "tool_count": 40
   },
   "read-only": {
-    "catalog_version": 14,
+    "catalog_version": 15,
     "names": [
       "check_exec_environment",
       "command_cost_explain",
@@ -120,6 +122,7 @@
       "git_status",
       "list_dir",
       "list_files",
+      "list_skill_resources",
       "list_skills",
       "load_skill",
       "read_file",
@@ -130,6 +133,6 @@
       "view_image",
       "wait_command"
     ],
-    "tool_count": 19
+    "tool_count": 20
   }
 }

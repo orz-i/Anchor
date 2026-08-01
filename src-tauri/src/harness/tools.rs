@@ -85,6 +85,124 @@ pub fn call(
     Ok(tool_ok(value))
 }
 
+fn operation_failure_diagnostics(operations: &[Value]) -> Vec<Value> {
+    let mut groups = BTreeMap::<String, FailureDiagnosticGroup>::new();
+    for operation in operations {
+        if operation.get("status").and_then(Value::as_str) != Some("failed") {
+            continue;
+        }
+        let code = operation
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN_FAILURE");
+        let details = operation
+            .get("result_summary")
+            .and_then(|value| value.get("error_details"));
+        let link_path = details
+            .and_then(|value| value.get("link_path"))
+            .and_then(Value::as_str);
+        let key = if matches!(code, "WORKSPACE_LINK_UNRESOLVED" | "WORKSPACE_LINK_ESCAPE") {
+            format!("workspace_link:{}", link_path.unwrap_or("unknown"))
+        } else {
+            code.to_string()
+        };
+        let group = groups.entry(key).or_insert_with(|| FailureDiagnosticGroup {
+            codes: BTreeSet::new(),
+            tools: BTreeSet::new(),
+            messages: BTreeSet::new(),
+            count: 0,
+            link_path: link_path.map(str::to_string),
+        });
+        group.count += 1;
+        group.codes.insert(code.to_string());
+        if let Some(tool) = operation.get("tool").and_then(Value::as_str) {
+            group.tools.insert(tool.to_string());
+        }
+        if let Some(message) = operation.get("error_message").and_then(Value::as_str) {
+            group.messages.insert(message.to_string());
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(key, group)| {
+            let codes = group.codes.into_iter().collect::<Vec<_>>();
+            let tools = group.tools.into_iter().collect::<Vec<_>>();
+            let sample_messages = group.messages.into_iter().take(3).collect::<Vec<_>>();
+            let (root_cause, recommended_actions) = diagnostic_recommendation(
+                codes
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("UNKNOWN_FAILURE"),
+                group.link_path.as_deref(),
+            );
+            json!({
+                "key": key,
+                "root_cause": root_cause,
+                "count": group.count,
+                "codes": codes,
+                "affected_tools": tools,
+                "sample_messages": sample_messages,
+                "link_path": group.link_path,
+                "recommended_actions": recommended_actions
+            })
+        })
+        .collect()
+}
+
+struct FailureDiagnosticGroup {
+    codes: BTreeSet<String>,
+    tools: BTreeSet<String>,
+    messages: BTreeSet<String>,
+    count: usize,
+    link_path: Option<String>,
+}
+
+fn diagnostic_recommendation(code: &str, link_path: Option<&str>) -> (String, Value) {
+    match code {
+        "WORKSPACE_LINK_UNRESOLVED" | "WORKSPACE_LINK_ESCAPE" => (
+            "工作区包含失效或越界的 symlink/junction，多个文件、Git 与命令工具可能因此出现级联失败。"
+                .into(),
+            json!([{
+                "tool": "remove_path",
+                "args": {"path": link_path.unwrap_or("")},
+                "description": "删除链接本体并保留目标目录。"
+            }]),
+        ),
+        "BASELINE_OBSERVATION_STALE" | "BASELINE_REFRESH_CAS_FAILED" | "BASELINE_UNSTABLE" => (
+            "工作区在基线读取与接受期间持续变化。".into(),
+            json!([{
+                "tool": "accept_latest_baseline",
+                "description": "在一次调用内重试捕获并接受稳定的最新状态。"
+            }]),
+        ),
+        "SKILL_RESOURCE_INVALID" => (
+            "请求的 Skill 资源不在当前受控清单中。".into(),
+            json!([{
+                "tool": "list_skill_resources",
+                "description": "先枚举该 Skill 当前可读取的精确资源路径。"
+            }]),
+        ),
+        "NOT_FOUND" => (
+            "请求路径不在当前受控文件或资源清单中。".into(),
+            json!([{
+                "tool": "list_dir",
+                "description": "重新读取当前目录后再执行。"
+            }]),
+        ),
+        "GIT_ERROR" | "GIT_REVERT_CONFLICT" => (
+            "Git 索引、工作树或回退操作存在冲突。".into(),
+            json!([{
+                "tool": "git_status",
+                "description": "检查结构化 Git 状态和冲突路径。"
+            }]),
+        ),
+        _ => (
+            format!("重复失败由错误代码 {code} 触发。"),
+            json!([]),
+        ),
+    }
+}
+
 fn switch_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task = ctx.harness.switch_task(task_id(args)?).map_err(map_error)?;
     Ok(json!({
@@ -674,6 +792,7 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     let total_matches = operations.len();
+    let diagnostics = operation_failure_diagnostics(&operations);
     let page = operations
         .into_iter()
         .skip(offset)
@@ -683,6 +802,7 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     Ok(json!({
         "operations": page,
         "summary": summary,
+        "diagnostics": diagnostics,
         "total_matches": total_matches,
         "next_cursor": if offset + page.len() < total_matches { Some(offset + page.len()) } else { None },
         "filters": {

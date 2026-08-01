@@ -404,6 +404,54 @@ fn operation_log_filters_and_collapses_bound_work_session_operations() {
 }
 
 #[test]
+fn operation_log_aggregates_repeated_failures_into_root_causes() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness"))
+        .expect("创建上下文");
+    let task = ctx.harness.start_task("失败聚合").expect("task");
+    for (tool, code) in [
+        ("exec_command", "WORKSPACE_LINK_UNRESOLVED"),
+        ("git_stage", "WORKSPACE_LINK_ESCAPE"),
+    ] {
+        ctx.harness
+            .record_operation(
+                None,
+                Some(&task.id),
+                None,
+                tool,
+                "failed",
+                json!({}),
+                json!({
+                    "ok": false,
+                    "error_code": code,
+                    "error_message": "broken workspace link",
+                    "error_details": {"link_path": "broken-link"}
+                }),
+            )
+            .expect("record failure");
+    }
+
+    let log = call_tool(
+        &ctx,
+        "operation_log",
+        &json!({"task_id": task.id, "failures_only": true, "limit": 20}),
+    );
+
+    assert_eq!(log["ok"], true);
+    assert_eq!(log["diagnostics"].as_array().unwrap().len(), 1);
+    let diagnostic = &log["diagnostics"][0];
+    assert_eq!(diagnostic["count"], 2);
+    assert_eq!(diagnostic["link_path"], "broken-link");
+    assert_eq!(diagnostic["recommended_actions"][0]["tool"], "remove_path");
+    assert!(diagnostic["affected_tools"]
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool == "exec_command")
+            && tools.iter().any(|tool| tool == "git_stage")));
+}
+
+#[test]
 fn 无任务时仍可执行_dry_run_预检() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

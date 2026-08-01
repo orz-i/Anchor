@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 14;
+pub const CATALOG_VERSION: u32 = 15;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -87,6 +87,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "load_skill",
         "Load Agent Skill",
         "Load bounded instructions for one discovered skill and resolve its declared tool dependencies against the current MCP catalog. Declarations never grant permissions.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "list_skill_resources",
+        "List Skill resources",
+        "List the exact bounded resource and script manifest that read_skill_resource is allowed to read for one discovered Skill.",
         true,
         false,
         false,
@@ -470,6 +478,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "accept_latest_baseline",
     "list_skills",
     "load_skill",
+    "list_skill_resources",
     "read_skill_resource",
     "switch_task",
     "history_session_bootstrap",
@@ -508,6 +517,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "server_info",
     "list_skills",
     "load_skill",
+    "list_skill_resources",
     "read_skill_resource",
     "check_exec_environment",
     "command_cost_explain",
@@ -537,6 +547,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "server_info",
     "list_skills",
     "load_skill",
+    "list_skill_resources",
     "read_skill_resource",
     "history_session_bootstrap",
     "history_session_checkpoint",
@@ -1067,6 +1078,28 @@ pub fn output_schema(name: &str) -> Value {
                 "harness": { "type": "object" }
             }),
             &["task", "harness"],
+        ),
+        "list_skill_resources" => success_output_schema(
+            json!({
+                "skill": { "type": "string", "minLength": 1 },
+                "resources": { "type": "array", "items": { "type": "object" } },
+                "totalResources": { "type": "integer", "minimum": 0 },
+                "nextCursor": nullable_integer_property(),
+                "resourceTruncated": { "type": "boolean" },
+                "snapshotMode": { "type": "string" },
+                "catalogDigest": { "type": "string" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "skill",
+                "resources",
+                "totalResources",
+                "nextCursor",
+                "resourceTruncated",
+                "snapshotMode",
+                "catalogDigest",
+                "warnings",
+            ],
         ),
         "read_file" => success_output_schema(
             json!({
@@ -1646,6 +1679,7 @@ pub fn output_schema(name: &str) -> Value {
             json!({
                 "operations": { "type": "array", "items": { "type": "object" } },
                 "summary": { "type": "object" },
+                "diagnostics": { "type": "array", "items": { "type": "object" } },
                 "total_matches": { "type": "integer", "minimum": 0 },
                 "next_cursor": nullable_integer_property(),
                 "filters": { "type": "object" }
@@ -1653,6 +1687,7 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "operations",
                 "summary",
+                "diagnostics",
                 "total_matches",
                 "next_cursor",
                 "filters",
@@ -2041,6 +2076,16 @@ pub fn input_schema(name: &str) -> Value {
                 "start_line": { "type": "integer", "minimum": 1, "default": 1 },
                 "end_line": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": 131072, "default": 65536 }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "list_skill_resources" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 }
             },
             "required": ["name"],
             "additionalProperties": false
@@ -2622,7 +2667,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_39_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_40_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2630,10 +2675,11 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 39);
+        assert_eq!(tools.len(), 40);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
+        assert!(names.contains(&"list_skill_resources"));
         assert!(names.contains(&"read_skill_resource"));
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
