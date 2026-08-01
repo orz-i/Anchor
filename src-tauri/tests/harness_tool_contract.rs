@@ -67,6 +67,87 @@ fn begin_work_session_binds_history_and_task_idempotently() {
 }
 
 #[test]
+fn latest_baseline_is_captured_and_accepted_in_one_call() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("main.txt"), "one\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
+        .expect("创建上下文");
+    let started = call_tool(&ctx, "start_task", &json!({"objective": "原子接受基线"}));
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    fs::write(workspace.join("main.txt"), "two\n").expect("外部修改");
+    assert_eq!(call_tool(&ctx, "harness_status", &json!({}))["baseline_matches"], false);
+
+    let accepted = call_tool(
+        &ctx,
+        "accept_latest_baseline",
+        &json!({
+            "task_id": task_id,
+            "reason": "接受已审阅的并发修改",
+            "max_attempts": 3
+        }),
+    );
+
+    assert_eq!(accepted["ok"], true);
+    assert_eq!(accepted["accepted"], true);
+    assert!(accepted["attempts"].as_u64().is_some_and(|attempts| attempts >= 1));
+    assert_eq!(accepted["harness"]["baseline_matches"], true);
+    assert_eq!(
+        accepted["accepted_state"]["worktree_fingerprint"],
+        accepted["harness"]["expected_fingerprint"]
+    );
+}
+
+#[test]
+fn begin_work_session_can_handoff_and_switch_between_tasks() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "handoff\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
+        .expect("创建上下文");
+
+    let first = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "任务 A",
+            "session_key": "task-handoff-contract",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+    );
+    assert_eq!(first["ok"], true);
+    let first_id = first["task"]["id"].as_str().expect("first id").to_string();
+
+    let second = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "任务 B",
+            "session_key": "task-handoff-contract",
+            "workspace_root": workspace.to_string_lossy(),
+            "pause_current_and_start": true
+        }),
+    );
+    assert_eq!(second["ok"], true);
+    assert_eq!(second["work_session"]["previous_task_id"], first_id);
+    let second_id = second["task"]["id"]
+        .as_str()
+        .expect("second id")
+        .to_string();
+    assert_ne!(second_id, first_id);
+    assert_eq!(ctx.harness.task(&first_id).unwrap().status, anchor_lib::harness::TaskStatus::Paused);
+    assert_eq!(second["harness"]["task_id"], second_id);
+
+    let switched = call_tool(&ctx, "switch_task", &json!({"task_id": first_id}));
+    assert_eq!(switched["ok"], true);
+    assert_eq!(switched["task"]["id"], first_id);
+    assert_eq!(switched["task"]["status"], "active");
+    assert_eq!(ctx.harness.task(&second_id).unwrap().status, anchor_lib::harness::TaskStatus::Paused);
+}
+
+#[test]
 fn continued_tool_activity_auto_resumes_a_paused_task() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

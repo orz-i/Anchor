@@ -45,6 +45,7 @@ fn tool_activity_resumes_paused_task(tool: &str) -> bool {
             | "get_default_cwd"
             | "pause_task"
             | "resume_task"
+            | "switch_task"
             | "finish_task"
             | "close_work_session"
             | "start_task"
@@ -179,6 +180,70 @@ impl Harness {
             })
     }
 
+    pub fn switch_task(&self, task_id: &str) -> HarnessResult<TaskSession> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut target = self.task(task_id)?;
+                if !matches!(target.status, TaskStatus::Active | TaskStatus::Paused) {
+                    return Err(HarnessError::new(
+                        "TASK_SWITCH_BLOCKED",
+                        format!("任务 {} 当前状态 {:?} 不允许切换", target.id, target.status),
+                    ));
+                }
+                if let Some(mut current) = self.current_task()? {
+                    if current.id == target.id {
+                        if target.status == TaskStatus::Paused {
+                            target.status = TaskStatus::Active;
+                            target.updated_at = timestamp();
+                            transaction.save_task(&target)?;
+                        }
+                    } else {
+                        if !matches!(current.status, TaskStatus::Active | TaskStatus::Paused) {
+                            return Err(HarnessError::new(
+                                "TASK_SWITCH_BLOCKED",
+                                format!(
+                                    "当前任务 {} 状态 {:?} 不允许自动挂起",
+                                    current.id, current.status
+                                ),
+                            ));
+                        }
+                        current.status = TaskStatus::Paused;
+                        current.updated_at = timestamp();
+                        transaction.save_task(&current)?;
+                        transaction.append_event(&harness_event(
+                            &self.workspace_id,
+                            &current.id,
+                            "task_switched_away",
+                            Some("switch_task"),
+                            json!({"next_task_id": target.id}),
+                            json!({"ok": true, "status": "paused"}),
+                        ))?;
+                        target.status = TaskStatus::Active;
+                        target.updated_at = timestamp();
+                        transaction.save_task(&target)?;
+                    }
+                } else {
+                    target.status = TaskStatus::Active;
+                    target.updated_at = timestamp();
+                    transaction.save_task(&target)?;
+                }
+                transaction.save_workspace_state(&self.workspace_state(
+                    Some(&target.id),
+                    HarnessSessionStatus::Active,
+                    &target.updated_at,
+                )?)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    &target.id,
+                    "task_switched_to",
+                    Some("switch_task"),
+                    json!({}),
+                    json!({"ok": true, "status": "active"}),
+                ))?;
+                Ok(target)
+            })
+    }
+
     pub fn resume_paused_task_for_activity(
         &self,
         tool: &str,
@@ -250,6 +315,71 @@ impl Harness {
         )
     }
 
+    pub fn accept_latest_baseline(
+        &self,
+        task_id: &str,
+        reason: &str,
+        max_attempts: u8,
+    ) -> HarnessResult<(TaskSession, u8, ProjectBaseline)> {
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "accept_latest_baseline 必须提供接受当前状态的原因",
+            ));
+        }
+        let max_attempts = max_attempts.clamp(1, 10);
+        for attempt in 1..=max_attempts {
+            let observed = capture_baseline(&self.workspace_root);
+            let confirmed = capture_baseline(&self.workspace_root);
+            if observed.branch != confirmed.branch
+                || observed.head != confirmed.head
+                || observed.worktree_fingerprint != confirmed.worktree_fingerprint
+            {
+                continue;
+            }
+            let operation_id = Uuid::new_v4().simple().to_string();
+            let task =
+                self.store
+                    .with_workspace_transaction(&self.workspace_id, |transaction| {
+                        let mut task = self.task(task_id)?;
+                        if !task.status.is_writable() {
+                            return Err(HarnessError::new(
+                                "TASK_NOT_WRITABLE",
+                                "当前任务状态不允许接受最新基线",
+                            ));
+                        }
+                        task.expected_state =
+                            expected_state_from_baseline(&confirmed, Some(&operation_id));
+                        task.updated_at = timestamp();
+                        transaction.save_task(&task)?;
+                        transaction.append_event(&harness_event(
+                            &self.workspace_id,
+                            task_id,
+                            "baseline_latest_accepted",
+                            Some("accept_latest_baseline"),
+                            json!({
+                                "reason": reason,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts
+                            }),
+                            json!({
+                                "ok": true,
+                                "branch": confirmed.branch,
+                                "head": confirmed.head,
+                                "worktree_fingerprint": confirmed.worktree_fingerprint,
+                                "operation_id": operation_id
+                            }),
+                        ))?;
+                        Ok(task)
+                    })?;
+            return Ok((task, attempt, confirmed));
+        }
+        Err(HarnessError::new(
+            "BASELINE_UNSTABLE",
+            format!("工作区在连续 {max_attempts} 次稳定性检查中持续变化；请停止并发写入后重试"),
+        ))
+    }
+
     pub fn default_root() -> HarnessResult<PathBuf> {
         let root = dirs::data_local_dir()
             .or_else(dirs::data_dir)
@@ -266,16 +396,45 @@ impl Harness {
     }
 
     pub fn start_task(&self, objective: &str) -> HarnessResult<TaskSession> {
+        self.start_task_with_handoff(objective, false)
+    }
+
+    pub fn start_task_with_handoff(
+        &self,
+        objective: &str,
+        pause_current: bool,
+    ) -> HarnessResult<TaskSession> {
         if objective.trim().is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
         }
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
-                if let Some(task) = self.current_task()? {
-                    return Err(HarnessError::new(
-                        "TASK_ALREADY_ACTIVE",
-                        format!("工作区已有活动任务 {}", task.id),
-                    ));
+                if let Some(mut task) = self.current_task()? {
+                    if !pause_current {
+                        return Err(HarnessError::new(
+                            "TASK_ALREADY_ACTIVE",
+                            format!("工作区已有活动任务 {}", task.id),
+                        ));
+                    }
+                    if !matches!(task.status, TaskStatus::Active | TaskStatus::Paused) {
+                        return Err(HarnessError::new(
+                            "TASK_HANDOFF_BLOCKED",
+                            format!("任务 {} 当前状态 {:?} 不允许自动挂起", task.id, task.status),
+                        ));
+                    }
+                    if task.status != TaskStatus::Paused {
+                        task.status = TaskStatus::Paused;
+                        task.updated_at = timestamp();
+                        transaction.save_task(&task)?;
+                        transaction.append_event(&harness_event(
+                            &self.workspace_id,
+                            &task.id,
+                            "task_paused_for_handoff",
+                            Some("start_task"),
+                            json!({"next_objective": objective.trim()}),
+                            json!({"ok": true, "status": "paused"}),
+                        ))?;
+                    }
                 }
                 let captured = capture_baseline_snapshot(&self.workspace_root);
                 let baseline = captured.baseline;
@@ -633,6 +792,15 @@ impl Harness {
     }
 
     pub fn current_task(&self) -> HarnessResult<Option<TaskSession>> {
+        if let Some(state) = self.store.load_workspace_state(&self.workspace_id)? {
+            return match state.active_task_id.as_deref() {
+                Some(task_id) => {
+                    let task = self.task(task_id)?;
+                    Ok(task.status.is_writable().then_some(task))
+                }
+                None => Ok(None),
+            };
+        }
         Ok(self
             .store
             .list_tasks(&self.workspace_id)?
@@ -652,6 +820,19 @@ impl Harness {
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;
+                if next == TaskStatus::Active {
+                    if let Some(current) = self.current_task()? {
+                        if current.id != task.id {
+                            return Err(HarnessError::new(
+                                "TASK_SWITCH_REQUIRED",
+                                format!(
+                                    "任务 {} 当前处于活动指针；请使用 switch_task 切换到 {}",
+                                    current.id, task.id
+                                ),
+                            ));
+                        }
+                    }
+                }
                 if !task.status.can_transition_to(next) {
                     return Err(HarnessError::new(
                         "INVALID_TASK_TRANSITION",

@@ -27,12 +27,14 @@ pub const TOOL_NAMES: &[&str] = &[
     "start_task",
     "refresh_baseline",
     "accept_current_baseline",
+    "accept_latest_baseline",
     "stage_commit",
     "stage_commit_status",
     "wait_stage_commit",
     "update_task",
     "pause_task",
     "resume_task",
+    "switch_task",
     "finish_task",
     "task_context",
     "list_task_events",
@@ -60,12 +62,14 @@ pub fn call(
         "start_task" => start_task(ctx, args),
         "refresh_baseline" => refresh_baseline(ctx, args),
         "accept_current_baseline" => accept_current_baseline(ctx, args),
+        "accept_latest_baseline" => accept_latest_baseline(ctx, args),
         "stage_commit" => super::stage_commit::run(ctx, args, cancellation),
         "stage_commit_status" => super::stage_commit::status(ctx, args),
         "wait_stage_commit" => super::stage_commit::wait(ctx, args, cancellation),
         "update_task" => update_task(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
         "resume_task" => transition(ctx, args, TaskStatus::Active),
+        "switch_task" => switch_task(ctx, args),
         "finish_task" => finish_task(ctx, args),
         "task_context" => task_context(ctx, args),
         "list_task_events" => list_task_events(ctx, args),
@@ -79,6 +83,43 @@ pub fn call(
         }
     }
     Ok(tool_ok(value))
+}
+
+fn switch_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task = ctx.harness.switch_task(task_id(args)?).map_err(map_error)?;
+    Ok(json!({
+        "task": task_view(&task),
+        "harness": ctx.harness.status().map_err(map_error)?
+    }))
+}
+
+fn accept_latest_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
+    let max_attempts = args
+        .get("max_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or(3)
+        .clamp(1, 10) as u8;
+    let (task, attempts, baseline) = ctx
+        .harness
+        .accept_latest_baseline(task_id, reason, max_attempts)
+        .map_err(map_error)?;
+    Ok(json!({
+        "task": task_view(&task),
+        "harness": ctx.harness.status().map_err(map_error)?,
+        "accepted": true,
+        "attempts": attempts,
+        "accepted_state": {
+            "branch": baseline.branch,
+            "head": baseline.head,
+            "worktree_fingerprint": baseline.worktree_fingerprint
+        }
+    }))
 }
 
 fn verification_identity_key(record: &VerificationRecord) -> String {
@@ -213,25 +254,56 @@ fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
             )
         })?;
 
-    let (task, task_created) = match ctx.harness.current_task().map_err(map_error)? {
+    let pause_current_and_start = args
+        .get("pause_current_and_start")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (task, task_created, previous_task_id) = match ctx
+        .harness
+        .current_task()
+        .map_err(map_error)?
+    {
         Some(task) => {
             if task.objective != objective {
-                return Err(tool_error(
-                    "WORK_SESSION_CONFLICT",
-                    format!("工作区已有活动任务 {}，目标与本次工作会话不同", task.id),
-                ));
-            }
-            let task = if task.status == TaskStatus::Paused {
-                ctx.harness
-                    .resume_paused_task_for_activity("begin_work_session", None)
-                    .map_err(map_error)?
-                    .ok_or_else(|| tool_error("TASK_NOT_FOUND", "暂停任务在恢复时消失"))?
+                if pause_current_and_start {
+                    let previous_task_id = task.id.clone();
+                    let next = ctx
+                        .harness
+                        .start_task_with_handoff(objective, true)
+                        .map_err(map_error)?;
+                    (next, true, Some(previous_task_id))
+                } else {
+                    return Err(WorkspaceError::ToolDetails {
+                        code: "WORK_SESSION_CONFLICT",
+                        message: format!("工作区已有活动任务 {}，目标与本次工作会话不同", task.id),
+                        category: "validation",
+                        retryable: true,
+                        details: json!({
+                            "active_task_id": task.id,
+                            "active_objective": task.objective,
+                            "requested_objective": objective,
+                            "recoverable": true,
+                            "suggestion": "Set pause_current_and_start=true to pause the current task and create a new one, or call switch_task with an existing paused task id."
+                        }),
+                    });
+                }
             } else {
-                task
-            };
-            (task, false)
+                let task = if task.status == TaskStatus::Paused {
+                    ctx.harness
+                        .resume_paused_task_for_activity("begin_work_session", None)
+                        .map_err(map_error)?
+                        .ok_or_else(|| tool_error("TASK_NOT_FOUND", "暂停任务在恢复时消失"))?
+                } else {
+                    task
+                };
+                (task, false, None)
+            }
         }
-        None => (ctx.harness.start_task(objective).map_err(map_error)?, true),
+        None => (
+            ctx.harness.start_task(objective).map_err(map_error)?,
+            true,
+            None,
+        ),
     };
     let task = ctx
         .harness
@@ -245,6 +317,7 @@ fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
             "history_session_path": current_path,
             "task_id": task.id,
             "task_created": task_created,
+            "previous_task_id": previous_task_id,
             "baseline": baseline_view(&task),
             "expected_state": task.expected_state
         },
@@ -883,7 +956,14 @@ fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
         .get("objective")
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
-    let task = ctx.harness.start_task(objective).map_err(map_error)?;
+    let pause_current = args
+        .get("pause_current")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let task = ctx
+        .harness
+        .start_task_with_handoff(objective, pause_current)
+        .map_err(map_error)?;
     Ok(json!({"task": task_view(&task), "next": ["project_state", "task_context"]}))
 }
 

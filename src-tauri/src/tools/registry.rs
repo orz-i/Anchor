@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 13;
+pub const CATALOG_VERSION: u32 = 14;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -15,6 +15,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "accept_current_baseline",
         "Accept current baseline",
         "Accept the currently observed workspace HEAD and fingerprint using a task-bound observation token.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "accept_latest_baseline",
+        "Accept latest baseline",
+        "Capture and accept a stable latest workspace baseline in one call, retrying bounded concurrent changes without a caller-managed observation token.",
         false,
         false,
         false,
@@ -183,6 +191,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "resume_task",
         "Resume task",
         "Resume a paused or failed coding task.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "switch_task",
+        "Switch task",
+        "Pause the current task and activate an existing paused task using the persisted workspace task pointer.",
         false,
         false,
         false,
@@ -451,9 +467,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "begin_work_session",
     "close_work_session",
     "update_verification_disposition",
+    "accept_latest_baseline",
     "list_skills",
     "load_skill",
     "read_skill_resource",
+    "switch_task",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -515,6 +533,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "close_work_session",
     "update_verification_disposition",
     "accept_current_baseline",
+    "accept_latest_baseline",
     "server_info",
     "list_skills",
     "load_skill",
@@ -559,6 +578,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "update_task",
     "pause_task",
     "resume_task",
+    "switch_task",
     "finish_task",
     "task_context",
     "list_task_events",
@@ -571,6 +591,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "close_work_session",
     "update_verification_disposition",
     "accept_current_baseline",
+    "accept_latest_baseline",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -593,6 +614,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "update_task",
     "pause_task",
     "resume_task",
+    "switch_task",
     "finish_task",
 ];
 
@@ -1028,6 +1050,23 @@ pub fn output_schema(name: &str) -> Value {
                 "harness": { "type": "object" }
             }),
             &["accepted", "task", "harness"],
+        ),
+        "accept_latest_baseline" => success_output_schema(
+            json!({
+                "accepted": { "type": "boolean", "const": true },
+                "attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+                "accepted_state": { "type": "object" },
+                "task": { "type": "object" },
+                "harness": { "type": "object" }
+            }),
+            &["accepted", "attempts", "accepted_state", "task", "harness"],
+        ),
+        "switch_task" => success_output_schema(
+            json!({
+                "task": { "type": "object" },
+                "harness": { "type": "object" }
+            }),
+            &["task", "harness"],
         ),
         "read_file" => success_output_schema(
             json!({
@@ -1902,6 +1941,16 @@ pub fn input_schema(name: &str) -> Value {
             },
             "additionalProperties": false
         }),
+        "accept_latest_baseline" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 }
+            },
+            "required": ["task_id", "reason"],
+            "additionalProperties": false
+        }),
         "stage_commit_status" => json!({
             "type": "object",
             "properties": {
@@ -2085,6 +2134,7 @@ pub fn input_schema(name: &str) -> Value {
                 "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
+                "pause_current_and_start": { "type": "boolean", "default": false },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "workspace_root": { "type": "string", "minLength": 1 }
             },
@@ -2127,7 +2177,8 @@ pub fn input_schema(name: &str) -> Value {
         "start_task" => json!({
             "type": "object",
             "properties": {
-                "objective": { "type": "string", "minLength": 1 }
+                "objective": { "type": "string", "minLength": 1 },
+                "pause_current": { "type": "boolean", "default": false }
             },
             "required": ["objective"],
             "additionalProperties": false
@@ -2153,7 +2204,7 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["task_id"],
             "additionalProperties": false
         }),
-        "pause_task" | "resume_task" => json!({
+        "pause_task" | "resume_task" | "switch_task" => json!({
             "type": "object",
             "properties": { "task_id": { "type": "string", "minLength": 1 } },
             "required": ["task_id"],
@@ -2571,7 +2622,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_37_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_39_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2579,7 +2630,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 39);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -2599,6 +2650,8 @@ mod tests {
         assert!(names.contains(&"git_reset"));
         assert!(names.contains(&"git_revert"));
         assert!(names.contains(&"git_clean"));
+        assert!(names.contains(&"accept_latest_baseline"));
+        assert!(names.contains(&"switch_task"));
         assert!(!names.contains(&"request_permissions"));
 
         for name in names {
