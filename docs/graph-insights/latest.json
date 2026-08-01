@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-08-01T00:14:27+08:00",
+  "updated_at": "2026-08-01T09:43:00+08:00",
   "project": "anchor",
   "analysis_status": "verified",
   "source_of_truth": [
@@ -22,16 +22,27 @@
     "legacy_config_formats_removed": true,
     "legacy_python_archive_removed": true,
     "legacy_mcp_api_aliases_removed": true,
+    "legacy_mcp_protocol_versions_removed": true,
     "harness_schema": 5,
     "harness_legacy_task_fallback_removed": true,
-    "legacy_css_token_aliases_removed": true
+    "legacy_css_token_aliases_removed": true,
+    "settings_fail_open_removed": true,
+    "dead_compatibility_surfaces_removed": true
   },
   "configuration": {
     "environment_override": "ANCHOR_CONFIG_DIR",
     "profiles": "data/profiles.json",
     "secrets": "data/secrets.json protected envelope",
     "plaintext_secrets_accepted": false,
-    "legacy_directory_import": false
+    "legacy_directory_import": false,
+    "unknown_fields_accepted": false,
+    "missing_persisted_fields_defaulted": false,
+    "invalid_tool_profile_normalized": false,
+    "settings_load_failure_uses_defaults": false
+  },
+  "protocol": {
+    "required_mcp_version": "2025-11-25",
+    "older_versions_negotiated": false
   },
   "catalog": {
     "catalog_version_in_source": 10,

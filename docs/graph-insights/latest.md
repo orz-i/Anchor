@@ -45,7 +45,7 @@ SvelteKit 页面
 
 ### MCP、Actions 与工具目录
 
-- `src-tauri/src/mcp/` 实现 MCP 2025-11-25、OAuth、Session、Gateway 和 downstream proxy。
+- `src-tauri/src/mcp/` 只接受 MCP 2025-11-25，并实现 OAuth、Session、Gateway 和 downstream proxy；旧协议版本初始化会明确返回 `-32602`。
 - `src-tauri/src/tools/registry.rs` 是 MCP、server_info 与 Actions OpenAPI 的统一工具目录事实源。
 - core 目录当前为 28 个工具；文本搜索只公开 `search_text`，不再保留 `grep` / `grep_text` 服务端别名。
 - `glob` 参数别名、`allowed_commands` 输出别名和 `session:<id>:full` 输出引用均已移除。
@@ -63,7 +63,7 @@ SvelteKit 页面
 - 组件不再通过 `--color-*` 别名访问设计系统。
 - Workspace 页面、设置页、健康检查、日志、OAuth、隧道和 Skill 表单已通过 Svelte 静态检查与生产构建。
 
-## 本次硬切结果
+## 已完成的硬切与精炼
 
 1. 删除旧 `coding-tools-mcp` CLI 二进制、旧 daemon 路径、旧 mutex 和旧 macOS App Bundle 识别。
 2. 删除旧品牌环境变量、配置目录扫描、目录复制和 Python 配置导入。
@@ -72,12 +72,18 @@ SvelteKit 页面
 5. 删除 MCP 工具名、参数、响应和输出引用兼容桥接。
 6. 完成 Harness Schema 5 Task 状态结构硬切。
 7. 删除前端 CSS Token 和失效文档兼容层。
+8. 删除旧 MCP 协议版本协商，只接受当前 2025-11-25。
+9. 将 `AppData` 与严格 `ProfilesData` / `SecretsData` 磁盘模型分离；未知字段、内联秘密和缺失字段不再静默接受。
+10. 删除 Workspace 配置缺失字段默认、`serverPort` 持久化别名、Actions 内联 Cloudflare Token 和未知工具档位回落 `core`。
+11. 将误导性的 `keyring_store` 改为真实的受保护 `secret/store`，并把秘密与 Tunnel 测试从真实用户配置目录改为显式内存状态。
+12. 删除 `AppSettings::load_or_default()`；Runtime、Tunnel、下载、CLI 和健康检查在配置损坏时 fail closed。
+13. 删除无引用门面、未读取 Cloudflare 握手字段、无职责 CLI 脱敏包装和多余 dead-code 抑制；CLI 专用 Gateway helper 不再进入桌面默认构建。
 
 ## 有意保留的兼容性
 
-- MCP 协议版本协商属于标准互操作能力，不是旧品牌桥接。
 - downstream MCP 缺少 outputSchema 时的安全结果规范化属于协议防护，不是旧配置迁移。
 - 对旧 SSE transport 的明确拒绝用于安全诊断，不表示继续支持该 transport。
+- Harness 对旧 Schema、未标记 Store 和损坏配置的明确拒绝属于 fail-closed 诊断，不表示存在迁移桥接。
 - README 中 `mybolide/coding-tools-mcp` 仅是当前远端仓库与 Release 地址；本轮按要求未改远端仓库。
 
 ## 验证结果
