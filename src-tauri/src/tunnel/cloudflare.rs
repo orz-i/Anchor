@@ -302,7 +302,6 @@ pub async fn spawn_cloudflare_tunnel(
             } else {
                 Some(named_public_url.trim_end_matches('/').to_string())
             },
-            named_ready: !quick,
         });
     }
 
@@ -339,8 +338,6 @@ pub async fn spawn_cloudflare_tunnel(
 
 struct QuickTunnelReady {
     public_url: Option<String>,
-    #[allow(dead_code)]
-    named_ready: bool,
 }
 
 async fn stream_cloudflare_output<R, E>(
@@ -368,21 +365,16 @@ async fn stream_cloudflare_output<R, E>(
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(QuickTunnelReady {
                     public_url: if quick { None } else { Some(named_url) },
-                    named_ready: !quick,
                 });
             }
             return;
         }
     };
 
-    let send_ready = |tx: &mut Option<oneshot::Sender<QuickTunnelReady>>,
-                      url: Option<String>,
-                      named_ready: bool| {
+    let send_ready =
+        |tx: &mut Option<oneshot::Sender<QuickTunnelReady>>, url: Option<String>| {
         if let Some(sender) = tx.take() {
-            let _ = sender.send(QuickTunnelReady {
-                public_url: url,
-                named_ready,
-            });
+            let _ = sender.send(QuickTunnelReady { public_url: url });
         }
     };
 
@@ -393,7 +385,7 @@ async fn stream_cloudflare_output<R, E>(
             if public_url.is_none() {
                 if let Some(url) = extract_trycloudflare_url(line) {
                     *public_url = Some(url.clone());
-                    send_ready(ready_tx, Some(url), false);
+                    send_ready(ready_tx, Some(url));
                 }
             }
         } else {
@@ -401,7 +393,7 @@ async fn stream_cloudflare_output<R, E>(
             if lowered.contains("registered tunnel connection")
                 || lowered.contains("starting metrics server")
             {
-                send_ready(ready_tx, Some(named_url.clone()), true);
+                send_ready(ready_tx, Some(named_url.clone()));
             }
         }
     };
@@ -438,7 +430,7 @@ async fn stream_cloudflare_output<R, E>(
         handle_line(&line, &mut public_url, &mut ready_tx);
     }
 
-    send_ready(&mut ready_tx, public_url, !quick);
+    send_ready(&mut ready_tx, public_url);
 }
 
 pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {

@@ -67,7 +67,6 @@ impl Default for TunnelSupervisor {
     }
 }
 
-#[allow(dead_code)]
 impl TunnelSupervisor {
     pub fn new() -> Self {
         Self {
@@ -75,15 +74,6 @@ impl TunnelSupervisor {
             frp_routes: HashMap::new(),
             frpc: HashMap::new(),
         }
-    }
-
-    pub fn frp_snippet(
-        &self,
-        profile: &WorkspaceProfile,
-        kind: TunnelServiceKind,
-        settings: &AppSettings,
-    ) -> String {
-        frp::frp_snippet(profile, kind, settings)
     }
 
     pub fn status(
@@ -108,23 +98,6 @@ impl TunnelSupervisor {
             public_url: public_url_for_profile(profile, kind, settings),
             tunnel_pid: None,
         }
-    }
-
-    pub fn public_url(
-        &self,
-        profile: &WorkspaceProfile,
-        kind: TunnelServiceKind,
-        settings: &AppSettings,
-    ) -> String {
-        let key = (profile.id.clone(), kind);
-        if self.session_is_running(&key) {
-            return self
-                .sessions
-                .get(&key)
-                .map(|session| session.public_url.clone())
-                .unwrap_or_default();
-        }
-        public_url_for_profile(profile, kind, settings)
     }
 
     pub fn route_profile(

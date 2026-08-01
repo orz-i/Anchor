@@ -895,14 +895,7 @@ pub fn run() -> i32 {
 }
 
 fn redacted_profile_value(profile: &WorkspaceProfile) -> AppResult<serde_json::Value> {
-    let mut value = serde_json::to_value(profile)?;
-    if let Some(actions) = value
-        .get_mut("actions")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        actions.remove("cloudflare_token");
-    }
-    Ok(value)
+    Ok(serde_json::to_value(profile)?)
 }
 
 async fn execute(cli: CliArgs) -> AppResult<i32> {

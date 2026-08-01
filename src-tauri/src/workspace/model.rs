@@ -297,7 +297,6 @@ impl Default for ActionsConfig {
     }
 }
 
-#[allow(dead_code)]
 impl WorkspaceProfile {
     pub fn new(path: String, name: Option<String>) -> Self {
         let cleaned = path.trim_end_matches(['\\', '/']).to_string();
@@ -386,30 +385,6 @@ impl WorkspaceProfile {
             return String::new();
         }
         format!("{}/openapi.json", base.trim_end_matches('/'))
-    }
-
-    pub fn actions_privacy_url(&self) -> String {
-        let base = self.actions_public_base_url();
-        if base.is_empty() {
-            return String::new();
-        }
-        format!("{}/privacy", base.trim_end_matches('/'))
-    }
-
-    pub fn actions_oauth_authorization_url(&self) -> String {
-        let base = self.actions_public_base_url();
-        if base.is_empty() {
-            return String::new();
-        }
-        format!("{}/oauth/authorize", base.trim_end_matches('/'))
-    }
-
-    pub fn actions_oauth_token_url(&self) -> String {
-        let base = self.actions_public_base_url();
-        if base.is_empty() {
-            return String::new();
-        }
-        format!("{}/oauth/token", base.trim_end_matches('/'))
     }
 
     /// Public URL for GPT schema import; falls back to localhost when no tunnel is configured.

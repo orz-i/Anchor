@@ -40,7 +40,6 @@ pub(crate) struct FrpServerConfig {
     pub proxy: FrpProxyConfig,
 }
 
-#[allow(dead_code)]
 pub fn frp_public_url(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
