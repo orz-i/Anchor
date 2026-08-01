@@ -256,6 +256,7 @@ pub fn ensure_workspace_is_not_owner(
     Ok(())
 }
 
+#[cfg(any(feature = "cli", test))]
 pub fn workspace_base_url(config: &McpGatewayConfig, workspace_id: &str) -> AppResult<String> {
     if !safe_workspace_segment(workspace_id) {
         return Err(AppError::Message("工作区 ID 不能用于 Gateway URL。".into()));
