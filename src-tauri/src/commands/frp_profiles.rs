@@ -6,7 +6,7 @@ use crate::app_state::AppState;
 
 use crate::error::{AppError, AppResult};
 
-use crate::settings::{AppSettings, FrpProfile, ProxyConfig};
+use crate::settings::{AppSettings, FrpProfile, FrpProfileInput, ProxyConfig};
 
 
 
@@ -80,7 +80,7 @@ pub fn save_frp_profile(
 
     state: State<'_, AppState>,
 
-    profile: FrpProfile,
+    profile: FrpProfileInput,
 
     token: Option<String>,
 
@@ -92,7 +92,7 @@ pub fn save_frp_profile(
 
     }
 
-    let mut saved = profile;
+    let mut saved = FrpProfile::from(profile);
 
     saved.name = saved.name.trim().to_string();
 

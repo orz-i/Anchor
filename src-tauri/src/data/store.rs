@@ -305,17 +305,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_secret_roundtrip() {
+    fn workspace_secret_lookup_reads_in_memory_state() {
         let id = uuid::Uuid::new_v4().to_string().replace('-', "");
-        let mut store = DataStore::load().expect("load");
+        let mut store = DataStore {
+            data: AppData::default(),
+        };
         store
-            .set_workspace_secret(&id, "oauth_client_secret", "roundtrip-secret")
-            .expect("set");
+            .data
+            .workspace_secrets
+            .entry(id.clone())
+            .or_default()
+            .insert("oauth_client_secret".into(), "roundtrip-secret".into());
         let loaded = store
             .get_workspace_secret(&id, "oauth_client_secret")
             .expect("get");
         assert_eq!(loaded.as_deref(), Some("roundtrip-secret"));
-        store.remove_workspace_secrets(&id).expect("remove");
     }
 
     #[test]

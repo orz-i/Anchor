@@ -1,40 +1,51 @@
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::data::AppData;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrpProfile {
     pub id: String,
     pub name: String,
     pub server: String,
-    #[serde(default = "default_frp_server_port", alias = "serverPort")]
     pub server_port: u16,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrpProfileInput {
+    pub id: String,
+    pub name: String,
+    pub server: String,
+    pub server_port: u16,
+}
+
+impl From<FrpProfileInput> for FrpProfile {
+    fn from(value: FrpProfileInput) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            server: value.server,
+            server_port: value.server_port,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpGatewayConfig {
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_mcp_gateway_port")]
     pub local_port: u16,
     /// Workspace whose existing MCP tunnel configuration owns the one public
     /// gateway tunnel. This does not grant access to other workspaces.
-    #[serde(default)]
     pub owner_workspace_id: String,
     /// Optional operator-configured public gateway base URL without a workspace
     /// path. Runtime-discovered tunnel URLs are stored separately.
-    #[serde(default)]
     pub public_url: String,
     /// Last successfully observed public tunnel URL. This is maintained by the
     /// runtime and must be cleared when the gateway identity changes.
-    #[serde(default)]
     pub observed_public_url: String,
-    #[serde(default)]
     pub observed_owner_workspace_id: String,
-    #[serde(default)]
     pub observed_tunnel_signature: String,
 }
 
@@ -87,16 +98,13 @@ impl McpGatewayConfig {
 /// prefix first (ghproxy-style: `{mirror}/{full_github_url}`) and fall back to
 /// the direct GitHub URL. An optional proxy can be layered on top.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DownloadConfig {
     /// Mirror prefix applied before the full GitHub URL. Empty = direct.
-    #[serde(default = "default_github_mirror")]
     pub github_mirror: String,
     /// "none" (no proxy) | "system" (env HTTP(S)_PROXY) | "manual".
-    #[serde(default = "default_proxy_mode")]
     pub proxy_mode: String,
     /// Proxy URL used when `proxy_mode == "manual"` (e.g. http://127.0.0.1:7890).
-    #[serde(default)]
     pub proxy_url: String,
 }
 
@@ -113,13 +121,11 @@ impl Default for DownloadConfig {
 /// Global outbound proxy used by network-facing operations such as the
 /// Cloudflare quick tunnel. Binary downloads use `download.proxy` separately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProxyConfig {
     /// "none" (no proxy) | "system" (env HTTP(S)_PROXY) | "manual".
-    #[serde(default = "default_proxy_mode")]
     pub mode: String,
     /// Proxy URL used when `mode == "manual"` (e.g. http://127.0.0.1:7890).
-    #[serde(default)]
     pub url: String,
 }
 
@@ -132,35 +138,16 @@ impl Default for ProxyConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AppSettings {
-    #[serde(default)]
     pub frp_profiles: Vec<FrpProfile>,
-    #[serde(default)]
     pub last_workspace_id: String,
-    #[serde(default)]
     pub download: DownloadConfig,
     /// Global outbound proxy (Cloudflare tunnel, etc.).
-    #[serde(default)]
     pub proxy: ProxyConfig,
     /// One local MCP gateway can expose multiple workspace listeners through
     /// `/w/<workspace_id>/...` paths and a single public tunnel.
-    #[serde(default)]
     pub mcp_gateway: McpGatewayConfig,
-    /// Shared secrets indexed by key name (e.g. "bearer_token").
-    /// Persisted alongside other app settings in app_settings.json.
-    #[serde(default)]
-    pub shared_secrets: HashMap<String, String>,
-    /// Per-workspace secrets: workspace_id -> secret_key -> value.
-    #[serde(default)]
-    pub workspace_secrets: HashMap<String, HashMap<String, String>>,
-    /// App-scoped secrets: scope -> item_id -> value (e.g. frp profile tokens).
-    #[serde(default)]
-    pub app_secrets: HashMap<String, HashMap<String, String>>,
-}
-
-fn default_frp_server_port() -> u16 {
-    7000
 }
 
 fn default_github_mirror() -> String {
@@ -183,9 +170,6 @@ impl AppSettings {
             download: data.download.clone(),
             proxy: data.proxy.clone(),
             mcp_gateway: data.mcp_gateway.clone(),
-            shared_secrets: data.shared_secrets.clone(),
-            workspace_secrets: data.workspace_secrets.clone(),
-            app_secrets: data.app_secrets.clone(),
         }
     }
 
@@ -195,9 +179,6 @@ impl AppSettings {
         data.download = self.download.clone();
         data.proxy = self.proxy.clone();
         data.mcp_gateway = self.mcp_gateway.clone();
-        data.shared_secrets = self.shared_secrets.clone();
-        data.workspace_secrets = self.workspace_secrets.clone();
-        data.app_secrets = self.app_secrets.clone();
     }
 
     pub fn load_or_default() -> Self {
@@ -212,25 +193,13 @@ impl AppSettings {
     }
 }
 
-#[allow(dead_code)]
-impl FrpProfile {
-    pub fn new(name: String, server: String, server_port: u16) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string().replace('-', ""),
-            name,
-            server: server.trim().to_string(),
-            server_port,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{FrpProfile, McpGatewayConfig};
+    use super::{FrpProfile, FrpProfileInput, McpGatewayConfig};
 
     #[test]
-    fn accepts_frontend_camel_case_server_port() {
-        let profile: FrpProfile = serde_json::from_value(serde_json::json!({
+    fn frontend_input_accepts_camel_case_server_port() {
+        let profile: FrpProfileInput = serde_json::from_value(serde_json::json!({
             "id": "p1",
             "name": "公司 FRP",
             "server": "frp.example.com",
@@ -242,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_persisted_snake_case_server_port() {
+    fn persisted_profile_only_accepts_snake_case_server_port() {
         let profile: FrpProfile = serde_json::from_value(serde_json::json!({
             "id": "p1",
             "name": "公司 FRP",
@@ -252,6 +221,13 @@ mod tests {
         .expect("persisted FRP profile should deserialize");
 
         assert_eq!(profile.server_port, 7005);
+        assert!(serde_json::from_value::<FrpProfile>(serde_json::json!({
+            "id": "p1",
+            "name": "公司 FRP",
+            "server": "frp.example.com",
+            "serverPort": 7004
+        }))
+        .is_err());
     }
 
     #[test]

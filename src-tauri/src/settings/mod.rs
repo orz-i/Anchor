@@ -1,3 +1,5 @@
 mod model;
 
-pub use model::{AppSettings, DownloadConfig, FrpProfile, McpGatewayConfig, ProxyConfig};
+pub use model::{
+    AppSettings, DownloadConfig, FrpProfile, FrpProfileInput, McpGatewayConfig, ProxyConfig,
+};

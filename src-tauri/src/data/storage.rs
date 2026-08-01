@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppResult;
 use crate::platform::platform;
 
-use super::model::{AppData, SecretsData};
+use super::model::{AppData, ProfilesData, SecretsData};
 use super::secret_protection;
 
 const SECRETS_ENVELOPE_VERSION: u32 = 1;
@@ -85,14 +85,21 @@ mod tests {
         let path = temp.path().join("profiles.json");
         let mut data = AppData::default();
         data.last_workspace_id = "recover-me".into();
+        let persisted = ProfilesData::from_app_data(&data);
         atomic_write(
             &backup_path(&path),
-            format!("{}\n", serde_json::to_string_pretty(&data).expect("json")).as_bytes(),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&persisted).expect("json")
+            )
+            .as_bytes(),
         )
         .expect("backup write");
         fs::write(&path, "{not-json").expect("corrupt primary");
 
-        let recovered = load_with_backup::<AppData>(&path).expect("recover");
+        let recovered = load_with_backup::<ProfilesData>(&path)
+            .expect("recover")
+            .into_app_data();
 
         assert_eq!(recovered.last_workspace_id, "recover-me");
         assert_eq!(
@@ -107,13 +114,20 @@ mod tests {
         let path = temp.path().join("profiles.json");
         let mut data = AppData::default();
         data.last_workspace_id = "backup-only".into();
+        let persisted = ProfilesData::from_app_data(&data);
         atomic_write(
             &backup_path(&path),
-            format!("{}\n", serde_json::to_string_pretty(&data).expect("json")).as_bytes(),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&persisted).expect("json")
+            )
+            .as_bytes(),
         )
         .expect("backup write");
 
-        let recovered = load_with_backup::<AppData>(&path).expect("recover");
+        let recovered = load_with_backup::<ProfilesData>(&path)
+            .expect("recover")
+            .into_app_data();
 
         assert_eq!(recovered.last_workspace_id, "backup-only");
         assert!(path.exists());
@@ -125,7 +139,8 @@ mod tests {
         let path = temp.path().join("profiles.json");
         fs::write(&path, "{not-json").expect("corrupt primary");
 
-        let error = load_with_backup::<AppData>(&path).expect_err("invalid config must fail");
+        let error =
+            load_with_backup::<ProfilesData>(&path).expect_err("invalid config must fail");
 
         assert!(error.to_string().contains("无法解析配置文件"));
     }
@@ -155,7 +170,7 @@ mod tests {
 pub fn load() -> AppResult<AppData> {
     let path = data_file_path()?;
     if has_primary_or_backup(&path) {
-        let mut data = load_with_backup(&path)?;
+        let mut data = load_with_backup::<ProfilesData>(&path)?.into_app_data();
         load_secrets(&mut data)?;
         return Ok(data);
     }
@@ -170,7 +185,7 @@ pub fn save(data: &AppData) -> AppResult<()> {
 }
 
 fn write_data(path: &Path, data: &AppData) -> AppResult<()> {
-    write_json(path, data)
+    write_json(path, &ProfilesData::from_app_data(data))
 }
 
 fn write_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> {
@@ -278,7 +293,7 @@ where
 
 #[cfg(test)]
 fn read_data(path: &Path) -> AppResult<AppData> {
-    read_json(path)
+    read_json::<ProfilesData>(path).map(ProfilesData::into_app_data)
 }
 
 fn read_json<T>(path: &Path) -> AppResult<T>
