@@ -127,7 +127,10 @@ pub fn get_canvs_snapshot(state: State<'_, AppState>, id: String) -> AppResult<C
             id: event.id,
             kind: event.kind,
             tool_name: event.tool_name,
-            ok: event.result_summary.get("ok").and_then(serde_json::Value::as_bool),
+            ok: event
+                .result_summary
+                .get("ok")
+                .and_then(serde_json::Value::as_bool),
             affected_files: event.affected_files.len(),
             created_at: event.created_at,
         })
@@ -300,6 +303,9 @@ mod tests {
             task_id: "task".into(),
             command: "cargo test".into(),
             kind: "test".into(),
+            verification_key: None,
+            test_file: None,
+            test_name: None,
             status: if passed { "passed" } else { "failed" }.into(),
             level: "blocking".into(),
             exit_code: Some(if passed { 0 } else { 1 }),

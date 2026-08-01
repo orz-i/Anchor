@@ -81,6 +81,44 @@ pub fn call(
     Ok(tool_ok(value))
 }
 
+fn verification_identity_key(record: &VerificationRecord) -> String {
+    if let Some(key) = record.verification_key.as_deref() {
+        return format!("{}:key:{key}", record.kind);
+    }
+    if record.test_file.is_some() || record.test_name.is_some() {
+        return format!(
+            "{}:test:{}:{}",
+            record.kind,
+            record.test_file.as_deref().unwrap_or_default(),
+            record.test_name.as_deref().unwrap_or_default()
+        );
+    }
+    format!("{}:command:{}", record.kind, record.command.trim())
+}
+
+fn blocking_verification_views(records: &[VerificationRecord]) -> Vec<Value> {
+    effective_verifications(records)
+        .into_iter()
+        .filter(|record| effective_disposition(record) == "active_failure")
+        .map(|record| {
+            json!({
+                "verification_id": record.id,
+                "verification_kind": record.kind,
+                "verification_key": record.verification_key,
+                "test_file": record.test_file,
+                "test_name": record.test_name,
+                "command": bounded_text(&record.command, 4_000),
+                "failure_disposition": "active_failure",
+                "level": record.level,
+                "suggested_actions": [
+                    "rerun_with_same_verification_identity",
+                    "update_verification_disposition"
+                ]
+            })
+        })
+        .collect()
+}
+
 fn accept_current_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
     let observation_token = args
@@ -335,6 +373,10 @@ fn resume_close_outbox(
             })
         };
         if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            let blocking = result
+                .get("blocking_verifications")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             outbox.last_error = Some(json!({
                 "phase": "finish_task",
                 "result": result
@@ -348,6 +390,16 @@ fn resume_close_outbox(
                 "finish": result,
                 "checkpoint": null,
                 "retryable": true,
+                "error": {
+                    "code": "WORK_SESSION_VERIFICATION_BLOCKED",
+                    "message": "Harness task could not be closed because verification or working-tree requirements are not satisfied.",
+                    "category": "validation",
+                    "retryable": true,
+                    "details": {
+                        "blocking_verifications": blocking,
+                        "suggestion": "Run the suggested verification action, or use update_verification_disposition for an audited false positive/expected failure."
+                    }
+                },
                 "outbox": close_outbox_view(&outbox)
             }));
         }
@@ -871,6 +923,13 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "session_status": "active",
             "next_stage_started": false,
             "reason": "工作区仍存在未提交的业务文件；提交或还原这些改动后才能关闭任务。",
+            "error": {
+                "code": "TASK_WORKTREE_NOT_CLEAN",
+                "message": "Workspace contains uncommitted business files.",
+                "category": "validation",
+                "retryable": true,
+                "details": {"working_tree_files": working_tree_files}
+            },
             "working_tree_files": working_tree_files,
             "next_actions": ["git_status", "stage_commit", "finish_task"],
             "task": task_view(&task),
@@ -893,6 +952,17 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "session_status": "active",
             "next_stage_started": false,
             "reason": reason,
+            "error": {
+                "code": if verification_status == "missing" { "TASK_VERIFICATION_MISSING" } else { "TASK_VERIFICATION_FAILED" },
+                "message": reason,
+                "category": "validation",
+                "retryable": true,
+                "details": {
+                    "blocking_verifications": blocking_verification_views(&verifications),
+                    "suggestion": "Run a later successful verification with verification_key/test_file/test_name, or update the blocking record disposition with an audited reason."
+                }
+            },
+            "blocking_verifications": blocking_verification_views(&verifications),
             "next_actions": ["exec_command", "change_summary", "finish_task"],
             "task": task_view(&task),
             "verification": verification_views(&verifications, "effective"),
@@ -1238,9 +1308,9 @@ fn verification_status_is_accepted(status: &str) -> bool {
 }
 
 fn effective_verifications(records: &[VerificationRecord]) -> Vec<&VerificationRecord> {
-    let mut latest = BTreeMap::<(&str, &str), &VerificationRecord>::new();
+    let mut latest = BTreeMap::<String, &VerificationRecord>::new();
     for record in records {
-        latest.insert((record.kind.as_str(), record.command.as_str()), record);
+        latest.insert(verification_identity_key(record), record);
     }
     latest
         .into_values()
@@ -1305,6 +1375,9 @@ fn verification_view(record: &VerificationRecord) -> Value {
     json!({
         "verification_id": record.id,
         "kind": record.kind,
+        "verification_key": record.verification_key,
+        "test_file": record.test_file,
+        "test_name": record.test_name,
         "status": record.status,
         "level": record.level,
         "passed": record.passed,

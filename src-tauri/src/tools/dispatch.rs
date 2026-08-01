@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::context::ToolContext;
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
 use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
@@ -94,7 +95,11 @@ fn policy_alternatives(message: &str) -> Vec<Value> {
 
 fn advances_expected_state(name: &str, output: &Value) -> bool {
     match name {
-        "apply_patch" | "history_session_checkpoint" => true,
+        "apply_patch"
+        | "history_session_checkpoint"
+        | "git_stage"
+        | "git_commit"
+        | "git_restore" => true,
         "exec_command" => command_output_is_terminal(output),
         _ => false,
     }
@@ -105,12 +110,19 @@ fn command_output_is_terminal(output: &Value) -> bool {
         && output.get("termination_reason").and_then(Value::as_str) != Some("running")
 }
 
+struct VerificationIdentity<'a> {
+    kind: &'a str,
+    command: &'a str,
+    verification_key: Option<&'a str>,
+    test_file: Option<&'a str>,
+    test_name: Option<&'a str>,
+    level: &'a str,
+}
+
 fn record_verification_from_output(
     ctx: &ToolContext,
     task_id: &str,
-    kind: &str,
-    command: &str,
-    level: &str,
+    identity: VerificationIdentity<'_>,
     supersede_previous_failures: bool,
     output: &mut Value,
 ) {
@@ -118,17 +130,39 @@ fn record_verification_from_output(
         .get("exit_code")
         .and_then(Value::as_i64)
         .and_then(|value| i32::try_from(value).ok());
-    let passed = output.get("command_ok").and_then(Value::as_bool) == Some(true);
+    if output.get("execution_started").and_then(Value::as_bool) == Some(false) {
+        if let Some(object) = output.as_object_mut() {
+            object.insert("verification_skipped".into(), Value::Bool(true));
+            object.insert(
+                "verification_skip_reason".into(),
+                Value::String("command_not_executed".into()),
+            );
+        }
+        return;
+    }
+    let Some(passed) = output.get("command_ok").and_then(Value::as_bool) else {
+        if let Some(object) = output.as_object_mut() {
+            object.insert("verification_skipped".into(), Value::Bool(true));
+            object.insert(
+                "verification_skip_reason".into(),
+                Value::String("command_not_executed".into()),
+            );
+        }
+        return;
+    };
     let duration_ms = output.get("duration_ms").and_then(Value::as_u64);
     if let Ok(verification) = ctx.harness.record_verification(
         task_id,
-        kind,
-        command,
+        identity.kind,
+        identity.command,
+        identity.verification_key,
+        identity.test_file,
+        identity.test_name,
         exit_code,
         passed,
         duration_ms,
         None,
-        level,
+        identity.level,
         supersede_previous_failures,
     ) {
         let effective_disposition = verification
@@ -167,6 +201,9 @@ fn record_verification_from_output(
                 json!({
                     "verification_id": verification.id,
                     "kind": verification.kind,
+                    "verification_key": verification.verification_key,
+                    "test_file": verification.test_file,
+                    "test_name": verification.test_name,
                     "status": verification.status,
                     "level": verification.level,
                     "effective_disposition": effective_disposition,
@@ -423,14 +460,13 @@ fn call_tool_impl(
         "read_skill_resource" => crate::skills::read_resource_tool(&ctx.skills, &effective_args),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),
+        "command_cost_explain" => exec::command_cost_explain(ctx, &effective_args),
         "get_default_cwd" => get_default_cwd_for_session(ctx, session_id),
         "set_default_cwd" => set_default_cwd_for_session(ctx, session_id, &effective_args),
         "read_file" => file::read_file(ws, &effective_args, cancellation),
         "list_dir" => file::list_dir(ws, &effective_args, cancellation),
         "list_files" => file::list_files(ws, &effective_args, cancellation),
-        "search_text" => {
-            file::search_text(ws, &effective_args, cancellation)
-        }
+        "search_text" => file::search_text(ws, &effective_args, cancellation),
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
         "exec_command" => exec::exec_command_with_cancellation(ctx, &effective_args, cancellation),
@@ -439,6 +475,9 @@ fn call_tool_impl(
         "wait_command" => session::wait_command(&ctx.sessions, &effective_args),
         "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
         "git_status" => git::git_status(ws, &effective_args),
+        "git_stage" => git::git_stage(ws, &effective_args),
+        "git_commit" => git::git_commit(ws, &effective_args),
+        "git_restore" => git::git_restore(ws, &effective_args),
         "git_diff" => git::git_diff(ws, &effective_args),
         "git_log" => git::git_log(ws, &effective_args),
         "git_show" => git::git_show(ws, &effective_args),
@@ -508,12 +547,22 @@ fn call_tool_impl(
                     .get("supersede_previous_failures")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
+                let verification_key = effective_args
+                    .get("verification_key")
+                    .and_then(Value::as_str);
+                let test_file = effective_args.get("test_file").and_then(Value::as_str);
+                let test_name = effective_args.get("test_name").and_then(Value::as_str);
                 record_verification_from_output(
                     ctx,
                     task_id,
-                    kind,
-                    command,
-                    level,
+                    VerificationIdentity {
+                        kind,
+                        command,
+                        verification_key,
+                        test_file,
+                        test_name,
+                        level,
+                    },
                     supersede,
                     &mut output,
                 );
@@ -527,6 +576,16 @@ fn call_tool_impl(
     if let Some(session) = retained_session {
         if command_output_is_terminal(&output) && session.mark_harness_finalized() {
             if let Some(metadata) = session.harness_metadata() {
+                let workspace_after = capture_baseline_entries(ctx.workspace.root());
+                let affected_files =
+                    diff_baseline_entries(&metadata.workspace_before, &workspace_after);
+                if let Some(object) = output.as_object_mut() {
+                    object.insert(
+                        "affected_files".into(),
+                        serde_json::to_value(affected_files).unwrap_or_else(|_| json!([])),
+                    );
+                    object.insert("mutation_attributed".into(), Value::Bool(true));
+                }
                 let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
                 let _ = ctx
                     .harness
@@ -535,9 +594,14 @@ fn call_tool_impl(
                     record_verification_from_output(
                         ctx,
                         &metadata.task_id,
-                        kind,
-                        &metadata.command,
-                        &metadata.verification_level,
+                        VerificationIdentity {
+                            kind,
+                            command: &metadata.command,
+                            verification_key: metadata.verification_key.as_deref(),
+                            test_file: metadata.test_file.as_deref(),
+                            test_name: metadata.test_name.as_deref(),
+                            level: &metadata.verification_level,
+                        },
                         metadata.supersede_previous_failures,
                         &mut output,
                     );
@@ -720,7 +784,11 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
 
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
-        "exec_command" | "history_session_checkpoint" => true,
+        "exec_command"
+        | "history_session_checkpoint"
+        | "git_stage"
+        | "git_commit"
+        | "git_restore" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -730,7 +798,10 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
 }
 
 fn standalone_operation(name: &str) -> bool {
-    matches!(name, "patch_check" | "apply_patch" | "exec_command")
+    matches!(
+        name,
+        "patch_check" | "apply_patch" | "exec_command" | "git_stage" | "git_commit" | "git_restore"
+    )
 }
 
 fn should_log_operation(name: &str) -> bool {
@@ -1031,7 +1102,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{call_tool_with_cancellation, preserve_completed_result};
+    use super::{
+        call_tool_with_cancellation, preserve_completed_result, record_verification_from_output,
+        VerificationIdentity,
+    };
     use crate::tools::{CancellationToken, ToolContext};
 
     #[test]
@@ -1062,5 +1136,45 @@ mod tests {
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["error"]["code"], "REQUEST_CANCELLED");
+    }
+
+    #[test]
+    fn command_that_never_started_is_not_recorded_as_a_business_verification_failure() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("policy rejection").expect("task");
+        let mut output = json!({
+            "ok": true,
+            "status": "command_rejected",
+            "termination_reason": "command_rejected",
+            "execution_started": false,
+            "command_ok": false
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "git add story-live-model.test.ts",
+                verification_key: Some("story-local"),
+                test_file: Some("tests/story-live-model.test.ts"),
+                test_name: Some("Story local test"),
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["verification_skipped"], true);
+        assert_eq!(output["verification_skip_reason"], "command_not_executed");
+        assert!(ctx
+            .harness
+            .list_verifications(&task.id)
+            .expect("verifications")
+            .is_empty());
     }
 }

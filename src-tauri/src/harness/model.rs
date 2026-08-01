@@ -306,6 +306,12 @@ pub struct VerificationRecord {
     pub task_id: String,
     pub command: String,
     pub kind: String,
+    #[serde(default)]
+    pub verification_key: Option<String>,
+    #[serde(default)]
+    pub test_file: Option<String>,
+    #[serde(default)]
+    pub test_name: Option<String>,
     #[serde(default = "default_verification_status")]
     pub status: String,
     #[serde(default = "default_verification_level")]

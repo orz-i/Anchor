@@ -7,6 +7,7 @@ use std::os::windows::process::CommandExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::context::ToolContext;
 use crate::tools::session::{ExecSession, SessionHarnessMetadata};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
@@ -17,6 +18,34 @@ const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     exec_command_with_cancellation(ctx, args, &CancellationToken::default())
+}
+
+pub fn command_cost_explain(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let cmd = args
+        .get("cmd")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkspaceError::invalid_argument("cmd is required"))?;
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
+    let cost_intent = args
+        .get("cost_intent")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let network_mode = args
+        .get("network_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let result = ctx.command_cost.explain(
+        ctx.workspace.root(),
+        cmd,
+        timeout_ms,
+        cost_intent,
+        network_mode,
+        &ctx.policy,
+    )?;
+    Ok(tool_ok(result))
 }
 
 fn cancelled_error(session: Option<Value>) -> WorkspaceError {
@@ -67,9 +96,22 @@ pub fn exec_command_with_cancellation(
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(30_000);
-    let cost_decision =
-        ctx.command_cost
-            .evaluate(ctx.workspace.root(), cmd, requested_timeout_ms, &ctx.policy)?;
+    let cost_intent = args
+        .get("cost_intent")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let network_mode = args
+        .get("network_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let cost_decision = ctx.command_cost.evaluate(
+        ctx.workspace.root(),
+        cmd,
+        requested_timeout_ms,
+        cost_intent,
+        network_mode,
+        &ctx.policy,
+    )?;
     let timeout_ms = cost_decision.effective_timeout_ms();
     if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
         if cancellation.is_cancelled() {
@@ -109,6 +151,21 @@ pub fn exec_command_with_cancellation(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let verification_key = args
+        .get("verification_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let test_file = args
+        .get("test_file")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let test_name = args
+        .get("test_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let verification_level = args
         .get("verification_level")
         .and_then(Value::as_str)
@@ -117,6 +174,7 @@ pub fn exec_command_with_cancellation(
         .get("supersede_previous_failures")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let workspace_before = capture_baseline_entries(ctx.workspace.root());
 
     ctx.workspace.ensure_child_process_boundary()?;
 
@@ -131,6 +189,10 @@ pub fn exec_command_with_cancellation(
             tty,
             stdin_text,
             verification_kind,
+            verification_key,
+            test_file,
+            test_name,
+            workspace_before.clone(),
             verification_level,
             supersede_previous_failures,
             cancellation,
@@ -140,6 +202,7 @@ pub fn exec_command_with_cancellation(
 
     match result {
         Ok(mut out) => {
+            attach_command_file_changes(ctx, &workspace_before, &mut out);
             if let Some(object) = out.as_object_mut() {
                 object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
                 object.insert("sandbox_enforced".into(), Value::Bool(false));
@@ -154,6 +217,7 @@ pub fn exec_command_with_cancellation(
         }
         Err(error) => match execution_failure_result(&error, cmd, &workdir.path) {
             Some(mut result) => {
+                attach_command_file_changes(ctx, &workspace_before, &mut result);
                 if let Some(object) = result.as_object_mut() {
                     object.insert("cost_policy".into(), cost_decision.to_value());
                 }
@@ -187,6 +251,27 @@ fn validate_child_process_scope(_ctx: &ToolContext, args: &Value) -> Result<(), 
         _ => Err(WorkspaceError::invalid_argument(
             "filesystem_scope must be workspace",
         )),
+    }
+}
+
+fn attach_command_file_changes(
+    ctx: &ToolContext,
+    workspace_before: &[crate::harness::model::BaselineEntry],
+    output: &mut Value,
+) {
+    if output.get("status").and_then(Value::as_str) == Some("running")
+        || output.get("termination_reason").and_then(Value::as_str) == Some("running")
+    {
+        return;
+    }
+    let workspace_after = capture_baseline_entries(ctx.workspace.root());
+    let affected_files = diff_baseline_entries(workspace_before, &workspace_after);
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "affected_files".into(),
+            serde_json::to_value(affected_files).unwrap_or_else(|_| json!([])),
+        );
+        object.insert("mutation_attributed".into(), Value::Bool(true));
     }
 }
 
@@ -238,6 +323,7 @@ fn run_native_diagnostic(
             "duration_ms": 0,
             "elapsed_ms": 0,
             "execution_mode": "native_builtin",
+            "execution_started": true,
             "command_runner": "native_builtin",
             "warnings": ["native diagnostic without child process"]
         })
@@ -298,6 +384,10 @@ async fn run_command(
     tty: bool,
     stdin_text: &str,
     verification_kind: Option<&str>,
+    verification_key: Option<&str>,
+    test_file: Option<&str>,
+    test_name: Option<&str>,
+    workspace_before: Vec<crate::harness::model::BaselineEntry>,
     verification_level: &str,
     supersede_previous_failures: bool,
     cancellation: &CancellationToken,
@@ -343,6 +433,10 @@ async fn run_command(
                 task_id: task.id,
                 command: cmd.to_string(),
                 verification_kind: verification_kind.map(str::to_string),
+                verification_key: verification_key.map(str::to_string),
+                test_file: test_file.map(str::to_string),
+                test_name: test_name.map(str::to_string),
+                workspace_before,
                 verification_level: verification_level.to_string(),
                 supersede_previous_failures,
             });
@@ -495,6 +589,10 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         false,
         "",
         None,
+        None,
+        None,
+        None,
+        capture_baseline_entries(&cwd),
         "blocking",
         true,
         &CancellationToken::default(),
@@ -641,6 +739,7 @@ fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -
         object.insert("sandbox_enforced".into(), Value::Bool(false));
         object.insert("execution_boundary".into(), json!("policy_only"));
         object.insert("child_process".into(), Value::Bool(code == "TIMEOUT"));
+        object.insert("execution_started".into(), Value::Bool(code == "TIMEOUT"));
         object.insert("transport_ok".into(), Value::Bool(true));
         object.insert("command_ok".into(), Value::Bool(false));
         object.insert("error".into(), error_value);
@@ -680,6 +779,7 @@ fn merge_exec_result(
             command_ok.map(Value::Bool).unwrap_or(Value::Null),
         );
         obj.insert("execution_mode".into(), json!("direct"));
+        obj.insert("execution_started".into(), Value::Bool(true));
         obj.insert(
             "warnings".into(),
             json!(if keep_session {
@@ -818,6 +918,7 @@ mod tests {
         assert_eq!(result["status"], expected_status);
         assert_eq!(result["termination_reason"], expected_reason);
         assert_eq!(result["child_process"], false);
+        assert_eq!(result["execution_started"], false);
         assert_eq!(result["error"]["code"], expected_code);
         assert!(result["suggestion"].is_string());
         assert!(result["duration_ms"].is_u64());

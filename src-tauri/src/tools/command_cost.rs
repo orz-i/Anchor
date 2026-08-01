@@ -75,6 +75,10 @@ pub struct CommandCostDecision {
     max_tokens: Option<u64>,
     max_cost_usd: Option<f64>,
     source: &'static str,
+    executable: Option<String>,
+    indicators: Vec<String>,
+    cost_intent: String,
+    network_mode: String,
 }
 
 impl CommandCostDecision {
@@ -87,6 +91,10 @@ impl CommandCostDecision {
             "cost_class": self.cost_class.as_str(),
             "rule": self.rule_name,
             "source": self.source,
+            "executable": self.executable,
+            "indicators": self.indicators,
+            "cost_intent": self.cost_intent,
+            "network_mode": self.network_mode,
             "confirmation_required": self.confirmation_required,
             "operator_approved": self.operator_approved,
             "requested_timeout_ms": self.requested_timeout_ms,
@@ -135,28 +143,93 @@ impl CommandCostGuard {
         workspace_root: &Path,
         command: &str,
         requested_timeout_ms: u64,
+        cost_intent: &str,
+        network_mode: &str,
         policy: &PolicySettings,
     ) -> Result<CommandCostDecision, WorkspaceError> {
+        self.evaluate_internal(
+            workspace_root,
+            command,
+            requested_timeout_ms,
+            cost_intent,
+            network_mode,
+            policy,
+            true,
+        )
+    }
+
+    pub fn explain(
+        &self,
+        workspace_root: &Path,
+        command: &str,
+        requested_timeout_ms: u64,
+        cost_intent: &str,
+        network_mode: &str,
+        policy: &PolicySettings,
+    ) -> Result<Value, WorkspaceError> {
+        let decision = self.evaluate_internal(
+            workspace_root,
+            command,
+            requested_timeout_ms,
+            cost_intent,
+            network_mode,
+            policy,
+            false,
+        )?;
+        Ok(json!({
+            "command": command,
+            "classification": decision.to_value(),
+            "would_require_operator_approval": decision.cost_class == CostClass::ExternalPaid
+                && !decision.operator_approved,
+            "executed": false,
+            "run_budget_reserved": false
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_internal(
+        &self,
+        workspace_root: &Path,
+        command: &str,
+        requested_timeout_ms: u64,
+        cost_intent: &str,
+        network_mode: &str,
+        policy: &PolicySettings,
+        enforce: bool,
+    ) -> Result<CommandCostDecision, WorkspaceError> {
+        validate_declarations(cost_intent, network_mode)?;
         let configured = load_policy(workspace_root)?;
         let matched = match_rule(&configured, command)?;
-        let (rule_name, rule, source) = match matched {
-            Some((name, rule)) => (Some(name), rule, "workspace_policy"),
-            None if looks_external_paid(command) => (
-                Some("anchor_heuristic_external_paid".to_string()),
+        let heuristic = command_cost_heuristic(command, cost_intent, network_mode)?;
+        let (rule_name, rule, source, indicators) = match matched {
+            Some((name, rule)) => (
+                Some(name),
+                rule,
+                "workspace_policy",
+                vec!["workspace_policy_match".to_string()],
+            ),
+            None if heuristic.cost_class == CostClass::ExternalPaid => (
+                Some("anchor_evidence_external_paid".to_string()),
                 CommandPolicyRule {
                     cost_class: CostClass::ExternalPaid,
                     require_confirmation: true,
                     ..CommandPolicyRule::default()
                 },
-                "anchor_heuristic",
+                "anchor_evidence",
+                heuristic.indicators.clone(),
             ),
-            None => (None, CommandPolicyRule::default(), "default"),
+            None => (
+                None,
+                CommandPolicyRule::default(),
+                "default_local",
+                heuristic.indicators.clone(),
+            ),
         };
 
         let confirmation_required =
             rule.require_confirmation || rule.cost_class == CostClass::ExternalPaid;
-        let operator_approved = rule.cost_class != CostClass::ExternalPaid
-            || policy.external_paid_commands_enabled;
+        let operator_approved =
+            rule.cost_class != CostClass::ExternalPaid || policy.external_paid_commands_enabled;
         let global_duration_ms = policy
             .external_paid_max_duration_seconds
             .max(1)
@@ -174,7 +247,7 @@ impl CommandCostGuard {
             requested_timeout_ms
         };
 
-        if rule.cost_class == CostClass::ExternalPaid && !operator_approved {
+        if enforce && rule.cost_class == CostClass::ExternalPaid && !operator_approved {
             return Err(WorkspaceError::ToolDetails {
                 code: "EXTERNAL_PAID_COMMAND_APPROVAL_REQUIRED",
                 message: "该命令可能调用真实付费上游；必须先由操作者在受信任 GUI/CLI 控制面启用付费命令。".into(),
@@ -188,6 +261,13 @@ impl CommandCostGuard {
                     "requested_timeout_ms": requested_timeout_ms,
                     "effective_timeout_ms": effective_timeout_ms,
                     "operator_setting": "external_paid_commands_enabled",
+                    "classification": {
+                        "source": source,
+                        "executable": heuristic.executable,
+                        "indicators": indicators,
+                        "cost_intent": cost_intent,
+                        "network_mode": network_mode
+                    },
                     "recoverable": true,
                     "suggestion": "审阅命令、项目成本策略和预算后，在 Anchor GUI 或 CLI 中启用付费命令；模型参数不能作为批准凭证。"
                 }),
@@ -204,8 +284,12 @@ impl CommandCostGuard {
         } else {
             rule.max_runs.filter(|runs| *runs > 0)
         };
-        let run_number = if let Some(max_runs) = max_runs {
-            Some(self.reserve_run(command, rule_name.as_deref(), max_runs)?)
+        let run_number = if enforce {
+            if let Some(max_runs) = max_runs {
+                Some(self.reserve_run(command, rule_name.as_deref(), max_runs)?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -224,6 +308,10 @@ impl CommandCostGuard {
             max_tokens: rule.max_tokens,
             max_cost_usd: rule.max_cost_usd,
             source,
+            executable: heuristic.executable,
+            indicators,
+            cost_intent: cost_intent.to_string(),
+            network_mode: network_mode.to_string(),
         })
     }
 
@@ -315,22 +403,97 @@ fn match_rule(
     Ok(None)
 }
 
-fn looks_external_paid(command: &str) -> bool {
-    let upper = command.to_ascii_uppercase();
-    [
-        "LIVE=1",
-        "REAL_MODEL=1",
-        "E2E_LIVE",
-        "STORY-LIVE",
-        "STORY_LIVE",
-        "LIVE-E2E",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-    ]
-    .iter()
-    .any(|marker| upper.contains(marker))
+#[derive(Debug)]
+struct CommandCostHeuristic {
+    cost_class: CostClass,
+    executable: Option<String>,
+    indicators: Vec<String>,
+}
+
+fn validate_declarations(cost_intent: &str, network_mode: &str) -> Result<(), WorkspaceError> {
+    if !matches!(cost_intent, "auto" | "local_only" | "external_paid") {
+        return Err(WorkspaceError::invalid_argument(
+            "cost_intent must be auto, local_only, or external_paid",
+        ));
+    }
+    if !matches!(network_mode, "auto" | "disabled" | "enabled") {
+        return Err(WorkspaceError::invalid_argument(
+            "network_mode must be auto, disabled, or enabled",
+        ));
+    }
+    Ok(())
+}
+
+fn command_cost_heuristic(
+    command: &str,
+    cost_intent: &str,
+    network_mode: &str,
+) -> Result<CommandCostHeuristic, WorkspaceError> {
+    let tokens = shell_words::split(command)
+        .map_err(|_| WorkspaceError::invalid_argument("Invalid command syntax"))?;
+    let executable = tokens
+        .iter()
+        .find(|token| !looks_like_env_assignment(token))
+        .map(|token| {
+            Path::new(token)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(token)
+                .trim_end_matches(".exe")
+                .to_ascii_lowercase()
+        });
+    let mut indicators = Vec::new();
+    if cost_intent == "external_paid" {
+        indicators.push("declared_external_paid".to_string());
+    }
+    for token in &tokens {
+        let upper = token.to_ascii_uppercase();
+        if matches!(upper.as_str(), "LIVE=1" | "REAL_MODEL=1" | "E2E_LIVE=1") {
+            indicators.push(format!("exact_runtime_flag:{upper}"));
+        }
+        if token.contains("api.openai.com")
+            || token.contains("api.anthropic.com")
+            || token.contains("generativelanguage.googleapis.com")
+        {
+            indicators.push(format!("known_paid_api_host:{token}"));
+        }
+    }
+    let external_paid = !indicators.is_empty();
+    if external_paid && (cost_intent == "local_only" || network_mode == "disabled") {
+        return Err(WorkspaceError::ToolDetails {
+            code: "COMMAND_COST_DECLARATION_CONFLICT",
+            message: "Command contains explicit paid/network evidence that conflicts with local-only declarations.".into(),
+            category: "policy",
+            retryable: false,
+            details: json!({
+                "stage": "command_cost_policy",
+                "executable": executable,
+                "indicators": indicators,
+                "cost_intent": cost_intent,
+                "network_mode": network_mode,
+                "recoverable": true,
+                "suggestion": "Remove the explicit paid/network marker for a local test, or declare cost_intent=external_paid and network_mode=enabled."
+            }),
+        });
+    }
+    Ok(CommandCostHeuristic {
+        cost_class: if external_paid {
+            CostClass::ExternalPaid
+        } else {
+            CostClass::Free
+        },
+        executable,
+        indicators,
+    })
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 fn persist_state(path: &Path, state: &CostState) -> Result<(), WorkspaceError> {
@@ -390,6 +553,8 @@ mod tests {
                 workspace.path(),
                 "pnpm story-live REAL_MODEL=1",
                 30_000,
+                "auto",
+                "auto",
                 &PolicySettings::default(),
             )
             .expect_err("paid command must be blocked");
@@ -428,6 +593,8 @@ mod tests {
                 workspace.path(),
                 "pnpm story-live",
                 30_000,
+                "auto",
+                "auto",
                 &policy,
             )
             .expect("first run");
@@ -438,12 +605,60 @@ mod tests {
                 workspace.path(),
                 "pnpm story-live",
                 30_000,
+                "auto",
+                "auto",
                 &policy,
             )
             .expect_err("second run blocked");
         assert_eq!(
             error.to_error_value()["code"],
             "EXTERNAL_PAID_COMMAND_BUDGET_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn local_commands_are_not_paid_because_arguments_contain_model_words() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let guard = CommandCostGuard::new(harness.path(), workspace.path());
+        for command in [
+            "git add tests/story-live-model.test.ts",
+            "rg DeepSeek src",
+            "pnpm vitest StoryLiveModel",
+            "go test ./... -run GPTModelOrdering",
+        ] {
+            let decision = guard
+                .evaluate(
+                    workspace.path(),
+                    command,
+                    30_000,
+                    "local_only",
+                    "disabled",
+                    &PolicySettings::default(),
+                )
+                .expect("local command");
+            assert_eq!(decision.to_value()["cost_class"], "free", "{command}");
+        }
+    }
+
+    #[test]
+    fn local_only_declaration_rejects_an_explicit_real_model_flag() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let guard = CommandCostGuard::new(harness.path(), workspace.path());
+        let error = guard
+            .evaluate(
+                workspace.path(),
+                "pnpm test REAL_MODEL=1",
+                30_000,
+                "local_only",
+                "disabled",
+                &PolicySettings::default(),
+            )
+            .expect_err("declaration conflict");
+        assert_eq!(
+            error.to_error_value()["code"],
+            "COMMAND_COST_DECLARATION_CONFLICT"
         );
     }
 }

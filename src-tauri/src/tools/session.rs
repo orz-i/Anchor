@@ -9,6 +9,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use crate::harness::model::BaselineEntry;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use serde_json::{json, Value};
 
@@ -326,6 +327,10 @@ pub struct SessionHarnessMetadata {
     pub task_id: String,
     pub command: String,
     pub verification_kind: Option<String>,
+    pub verification_key: Option<String>,
+    pub test_file: Option<String>,
+    pub test_name: Option<String>,
+    pub workspace_before: Vec<BaselineEntry>,
     pub verification_level: String,
     pub supersede_previous_failures: bool,
 }

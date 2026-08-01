@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,6 +24,27 @@ pub struct Harness {
     workspace_root: PathBuf,
     workspace_id: String,
     store: HarnessStore,
+}
+
+fn verification_identity_matches(
+    previous: &VerificationRecord,
+    kind: &str,
+    command: &str,
+    verification_key: Option<&str>,
+    test_file: Option<&str>,
+    test_name: Option<&str>,
+) -> bool {
+    if previous.kind != kind {
+        return false;
+    }
+    if let Some(key) = verification_key {
+        return previous.verification_key.as_deref() == Some(key);
+    }
+    if test_file.is_some() || test_name.is_some() {
+        return test_file.is_none_or(|value| previous.test_file.as_deref() == Some(value))
+            && test_name.is_none_or(|value| previous.test_name.as_deref() == Some(value));
+    }
+    previous.command == command || previous.verification_key.is_none()
 }
 
 fn normalize_verification_level(level: &str) -> HarnessResult<&str> {
@@ -258,6 +279,9 @@ impl Harness {
         task_id: &str,
         kind: &str,
         command: &str,
+        verification_key: Option<&str>,
+        test_file: Option<&str>,
+        test_name: Option<&str>,
         exit_code: Option<i32>,
         passed: bool,
         duration_ms: Option<u64>,
@@ -273,7 +297,14 @@ impl Harness {
                 let mut supersedes = Vec::new();
                 if passed && supersede_previous_failures {
                     for mut previous in self.list_verifications(task_id)? {
-                        if previous.kind != kind
+                        if !verification_identity_matches(
+                            &previous,
+                            kind,
+                            command,
+                            verification_key,
+                            test_file,
+                            test_name,
+                        )
                             || previous.passed
                             || verification_effective_disposition(&previous) != "active_failure"
                         {
@@ -297,6 +328,9 @@ impl Harness {
                     task_id: task_id.to_string(),
                     command: command.to_string(),
                     kind: kind.trim().to_string(),
+                    verification_key: verification_key.map(str::to_string),
+                    test_file: test_file.map(str::to_string),
+                    test_name: test_name.map(str::to_string),
                     status: if passed { "passed" } else { "failed" }.into(),
                     level: level.to_string(),
                     exit_code,
@@ -679,8 +713,7 @@ impl Harness {
                         "当前任务状态不允许刷新基线",
                     ));
                 }
-                task.expected_state =
-                    expected_state_from_baseline(&current, Some(&operation_id));
+                task.expected_state = expected_state_from_baseline(&current, Some(&operation_id));
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
                 transaction.append_event(&harness_event(
@@ -1202,6 +1235,34 @@ pub(crate) fn capture_baseline(root: &Path) -> ProjectBaseline {
 }
 
 fn capture_baseline_snapshot(root: &Path) -> CapturedBaseline {
+    let entries = capture_baseline_entries(root);
+    let mut fingerprint = Sha256::new();
+    for entry in &entries {
+        fingerprint.update(entry.path.as_bytes());
+        fingerprint.update(entry.sha256.as_bytes());
+        fingerprint.update(entry.bytes.to_le_bytes());
+    }
+    let worktree_fingerprint = format!("{:x}", fingerprint.finalize());
+    let object_id = baseline_object_id(&entries).expect("baseline entries are serializable");
+    CapturedBaseline {
+        baseline: ProjectBaseline {
+            schema_version: SCHEMA_VERSION,
+            branch: git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            head: git_value(root, &["rev-parse", "HEAD"]),
+            worktree_fingerprint,
+            object_id: object_id.clone(),
+            file_count: entries.len(),
+            captured_at: timestamp(),
+        },
+        object: BaselineObject {
+            schema_version: SCHEMA_VERSION,
+            id: object_id,
+            entries,
+        },
+    }
+}
+
+pub(crate) fn capture_baseline_entries(root: &Path) -> Vec<BaselineEntry> {
     let mut entries = Vec::new();
     for path in baseline_paths(root) {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -1235,30 +1296,54 @@ fn capture_baseline_snapshot(root: &Path) -> CapturedBaseline {
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut fingerprint = Sha256::new();
-    for entry in &entries {
-        fingerprint.update(entry.path.as_bytes());
-        fingerprint.update(entry.sha256.as_bytes());
-        fingerprint.update(entry.bytes.to_le_bytes());
-    }
-    let worktree_fingerprint = format!("{:x}", fingerprint.finalize());
-    let object_id = baseline_object_id(&entries).expect("baseline entries are serializable");
-    CapturedBaseline {
-        baseline: ProjectBaseline {
-            schema_version: SCHEMA_VERSION,
-            branch: git_value(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            head: git_value(root, &["rev-parse", "HEAD"]),
-            worktree_fingerprint,
-            object_id: object_id.clone(),
-            file_count: entries.len(),
-            captured_at: timestamp(),
-        },
-        object: BaselineObject {
-            schema_version: SCHEMA_VERSION,
-            id: object_id,
-            entries,
-        },
-    }
+    entries
+}
+
+pub(crate) fn diff_baseline_entries(
+    before: &[BaselineEntry],
+    after: &[BaselineEntry],
+) -> Vec<FileChangeRecord> {
+    let before = before
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let after = after
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = before
+        .keys()
+        .chain(after.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| match (before.get(path), after.get(path)) {
+            (None, Some(current)) => Some(FileChangeRecord {
+                path: path.to_string(),
+                status: "added".into(),
+                before_sha256: None,
+                after_sha256: Some(current.sha256.clone()),
+            }),
+            (Some(previous), None) => Some(FileChangeRecord {
+                path: path.to_string(),
+                status: "deleted".into(),
+                before_sha256: Some(previous.sha256.clone()),
+                after_sha256: None,
+            }),
+            (Some(previous), Some(current)) if previous.sha256 != current.sha256 => {
+                Some(FileChangeRecord {
+                    path: path.to_string(),
+                    status: "modified".into(),
+                    before_sha256: Some(previous.sha256.clone()),
+                    after_sha256: Some(current.sha256.clone()),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn should_skip(path: &Path, root: &Path) -> bool {
@@ -1428,15 +1513,9 @@ mod tests {
             .expect("refresh");
         harness.check_baseline(&started.id).expect("baseline valid");
         assert_eq!(refreshed.baseline.head, initial_head);
-        assert_ne!(
-            refreshed.expected_state.head,
-            initial_head
-        );
+        assert_ne!(refreshed.expected_state.head, initial_head);
         assert_eq!(
-            refreshed
-                .expected_state
-                .accepted_by_operation_id
-                .as_deref(),
+            refreshed.expected_state.accepted_by_operation_id.as_deref(),
             Some("commit-operation")
         );
     }
@@ -1598,6 +1677,9 @@ mod tests {
                 &task.id,
                 "environment_probe",
                 "pnpm --version",
+                None,
+                None,
+                None,
                 Some(1),
                 false,
                 Some(10),
@@ -1620,6 +1702,9 @@ mod tests {
                 &task.id,
                 "lint",
                 "make lint",
+                None,
+                None,
+                None,
                 Some(1),
                 false,
                 Some(20),
@@ -1633,6 +1718,9 @@ mod tests {
                 &task.id,
                 "lint",
                 "make lint",
+                None,
+                None,
+                None,
                 Some(0),
                 true,
                 Some(30),
@@ -1655,5 +1743,59 @@ mod tests {
                 .map(|entry| entry.disposition.as_str()),
             Some("superseded")
         );
+    }
+
+    #[test]
+    fn verification_key_supersedes_a_prior_failure_even_when_command_changes() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("verification identity").expect("start");
+
+        let failed = harness
+            .record_verification(
+                &task.id,
+                "test",
+                "pnpm vitest story-old",
+                Some("story-live"),
+                Some("tests/story-live.test.ts"),
+                Some("Story live integration"),
+                Some(1),
+                false,
+                Some(20),
+                None,
+                "blocking",
+                true,
+            )
+            .expect("failed test");
+        let passed = harness
+            .record_verification(
+                &task.id,
+                "test",
+                "pnpm vitest story-new --runInBand",
+                Some("story-live"),
+                Some("tests/story-live.test.ts"),
+                Some("Story live integration"),
+                Some(0),
+                true,
+                Some(30),
+                None,
+                "blocking",
+                true,
+            )
+            .expect("passed test");
+
+        assert_eq!(passed.supersedes, vec![failed.id.clone()]);
+        let records = harness.list_verifications(&task.id).expect("records");
+        let previous = records
+            .iter()
+            .find(|record| record.id == failed.id)
+            .expect("previous verification");
+        assert_eq!(verification_effective_disposition(previous), "superseded");
     }
 }

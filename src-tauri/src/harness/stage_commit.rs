@@ -383,6 +383,9 @@ fn execute_new_workflow(
                 task_id,
                 verification_kind(&command),
                 &command,
+                None,
+                None,
+                None,
                 result
                     .get("exit_code")
                     .and_then(Value::as_i64)
@@ -885,6 +888,9 @@ fn persist_deferred_check_result(
             &receipt.task_id,
             verification_kind(&command),
             &command,
+            None,
+            None,
+            None,
             result
                 .get("exit_code")
                 .and_then(Value::as_i64)
