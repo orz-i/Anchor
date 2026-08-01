@@ -1597,17 +1597,19 @@ pub fn output_schema(name: &str) -> Value {
     }
 }
 
-pub fn normalize_tool_profile(profile: &str) -> &'static str {
+pub fn require_tool_profile(profile: &str) -> Result<&'static str, String> {
     match profile {
-        "advanced" => "advanced",
-        "core" => "core",
-        "read-only" => "read-only",
-        _ => "core",
+        "advanced" => Ok("advanced"),
+        "core" => Ok("core"),
+        "read-only" => Ok("read-only"),
+        _ => Err(format!(
+            "unsupported tool profile `{profile}`; expected core, advanced, or read-only"
+        )),
     }
 }
 
 pub fn exposed_tool_names(tool_profile: &str) -> Vec<&'static str> {
-    match normalize_tool_profile(tool_profile) {
+    match require_tool_profile(tool_profile).expect("tool profile must be validated") {
         "read-only" => CORE_READ_ONLY_TOOLS.to_vec(),
         "advanced" => P0_TOOLS.iter().map(|(name, ..)| *name).collect(),
         _ => CORE_TOOLS.to_vec(),
@@ -2202,7 +2204,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{input_schema, list_tools_for_profile, normalize_tool_profile, output_schema};
+    use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
     fn core_catalog_exposes_28_chatgpt_compatible_tools() {
@@ -2243,10 +2245,10 @@ mod tests {
 
     #[test]
     fn only_current_profile_names_are_accepted() {
-        assert_eq!(normalize_tool_profile("core"), "core");
-        assert_eq!(normalize_tool_profile("advanced"), "advanced");
-        assert_eq!(normalize_tool_profile("read-only"), "read-only");
-        assert_eq!(normalize_tool_profile("unknown"), "core");
+        assert_eq!(require_tool_profile("core").unwrap(), "core");
+        assert_eq!(require_tool_profile("advanced").unwrap(), "advanced");
+        assert_eq!(require_tool_profile("read-only").unwrap(), "read-only");
+        assert!(require_tool_profile("unknown").is_err());
     }
 
     #[test]

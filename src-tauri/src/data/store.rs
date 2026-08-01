@@ -17,10 +17,17 @@ struct DataFileGuard {
     lock_file: File,
 }
 
-fn normalize_workspace_profile(mut profile: WorkspaceProfile) -> WorkspaceProfile {
-    profile.runtime.tool_profile =
-        crate::tools::registry::normalize_tool_profile(&profile.runtime.tool_profile).to_string();
-    profile
+fn validate_workspace_profile(profile: &WorkspaceProfile) -> AppResult<()> {
+    crate::tools::registry::require_tool_profile(&profile.runtime.tool_profile)
+        .map(|_| ())
+        .map_err(AppError::Message)
+}
+
+fn validate_data(data: &AppData) -> AppResult<()> {
+    for profile in &data.profiles {
+        validate_workspace_profile(profile)?;
+    }
+    Ok(())
 }
 
 fn populate_workspace_secrets(data: &mut AppData, profile_id: &str) {
@@ -71,6 +78,7 @@ impl DataStore {
         let path = data_file_path()?;
         let existed_before = path.exists();
         let data = load()?;
+        validate_data(&data)?;
         let store = Self { data };
         if !existed_before {
             store.persist_unlocked()?;
@@ -81,13 +89,16 @@ impl DataStore {
     pub fn read_file<R>(f: impl FnOnce(&AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
         let data = load()?;
+        validate_data(&data)?;
         f(&data)
     }
 
     pub fn update_file<R>(f: impl FnOnce(&mut AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
         let mut data = load()?;
+        validate_data(&data)?;
         let result = f(&mut data)?;
+        validate_data(&data)?;
         save(&data)?;
         Ok(result)
     }
@@ -123,7 +134,7 @@ impl DataStore {
     }
 
     pub fn register_workspace(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
-        let profile = normalize_workspace_profile(profile);
+        validate_workspace_profile(&profile)?;
         if self.data.profiles.iter().any(|item| item.id == profile.id) {
             return Err(AppError::Message(format!(
                 "workspace already exists: {}",
@@ -136,7 +147,7 @@ impl DataStore {
     }
 
     pub fn update(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
-        let profile = normalize_workspace_profile(profile);
+        validate_workspace_profile(&profile)?;
         let Some(index) = self
             .data
             .profiles
@@ -344,6 +355,19 @@ mod tests {
         assert!(secrets.contains_key("oauth_password"));
         assert!(secrets.contains_key("actions_api_key"));
         assert!(!secrets.contains_key("oauth_client_secret"));
+    }
+
+    #[test]
+    fn invalid_tool_profile_is_rejected_instead_of_normalized() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        profile.runtime.tool_profile = "full".into();
+        let data = AppData {
+            profiles: vec![profile],
+            ..AppData::default()
+        };
+
+        let error = validate_data(&data).expect_err("invalid profile must fail");
+        assert!(error.to_string().contains("unsupported tool profile `full`"));
     }
 
 }

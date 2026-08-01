@@ -56,7 +56,9 @@ impl ToolContext {
             workspace,
             auth,
             policy,
-            crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
+            crate::tools::registry::require_tool_profile(&tool_profile)
+                .expect("tool profile must be validated")
+                .into(),
             permission_mode,
             harness_root,
         )
@@ -76,7 +78,9 @@ impl ToolContext {
             workspace,
             auth,
             policy,
-            tool_profile: crate::tools::registry::normalize_tool_profile(&tool_profile).into(),
+            tool_profile: crate::tools::registry::require_tool_profile(&tool_profile)
+                .expect("tool profile must be validated")
+                .into(),
             permission_mode,
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
