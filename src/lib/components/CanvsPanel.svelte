@@ -48,6 +48,23 @@
     }
   }
 
+  function eventKindLabel(kind: string): string {
+    switch (kind) {
+      case "task_auto_resumed":
+        return "任务自动恢复";
+      case "task_status_changed":
+        return "任务状态变更";
+      case "operation_started":
+        return "操作开始";
+      case "operation_finished":
+        return "操作完成";
+      case "proxy_operation_finished":
+        return "代理操作完成";
+      default:
+        return kind;
+    }
+  }
+
   function statusClass(status: CanvsTaskStatus): string {
     if (status === "failed") {
       return "border-[var(--danger)]/30 bg-[var(--danger)]/10 text-[var(--danger)]";
@@ -431,7 +448,7 @@
             {#each snapshot.recentEvents as event (event.id)}
               <div class="flex items-start justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--page-bg)] p-3">
                 <div class="min-w-0">
-                  <p class="truncate text-sm font-medium">{event.kind}</p>
+                  <p class="truncate text-sm font-medium">{eventKindLabel(event.kind)}</p>
                   <p class="mt-1 text-xs text-[var(--text-muted)]">
                     {event.toolName ?? "Harness"} · {formatTime(event.createdAt)}
                   </p>

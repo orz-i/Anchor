@@ -117,7 +117,7 @@ pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> Strin
             .map(|event| {
                 format!(
                     "<article class='row'><div><strong>{}</strong><p>{} · <time data-time='{}'>{}</time></p></div><div class='row-end {}'><span>{}</span></div></article>",
-                    escape_html(&event.kind),
+                    escape_html(&event_kind_label(&event.kind)),
                     escape_html(event.tool_name.as_deref().unwrap_or("Harness")),
                     escape_attr(&event.created_at),
                     escape_html(&event.created_at),
@@ -296,6 +296,18 @@ fn disposition_label(disposition: &str) -> String {
         "expected_failure" => "预期失败",
         "superseded" => "已取代",
         "waived" => "已豁免",
+        other => other,
+    }
+    .into()
+}
+
+fn event_kind_label(kind: &str) -> String {
+    match kind {
+        "task_auto_resumed" => "任务自动恢复",
+        "task_status_changed" => "任务状态变更",
+        "operation_started" => "操作开始",
+        "operation_finished" => "操作完成",
+        "proxy_operation_finished" => "代理操作完成",
         other => other,
     }
     .into()

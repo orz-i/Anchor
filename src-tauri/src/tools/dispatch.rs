@@ -350,6 +350,18 @@ fn call_tool_impl(
     ) {
         return policy_tool_err(e);
     }
+    if name != "begin_work_session" {
+        if let Err(error) = ctx
+            .harness
+            .resume_paused_task_for_activity(name, session_id)
+        {
+            return attach_harness_status(
+                ctx,
+                tool_err_code(error.code(), error.to_string(), "internal"),
+                false,
+            );
+        }
+    }
 
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
         let active_task = ctx.harness.current_task().ok().flatten();

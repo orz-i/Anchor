@@ -40,6 +40,73 @@ fn begin_work_session_binds_history_and_task_idempotently() {
     assert_eq!(second["ok"], true);
     assert_eq!(second["work_session"]["task_created"], false);
     assert_eq!(second["work_session"]["task_id"], task_id);
+
+    let paused = call_tool(&ctx, "pause_task", &json!({"task_id": task_id}));
+    assert_eq!(paused["task"]["status"], "paused");
+    let conflict = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "不匹配的重连目标",
+            "session_key": "work-session-contract",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+    );
+    assert_eq!(conflict["ok"], false);
+    assert_eq!(conflict["error"]["code"], "WORK_SESSION_CONFLICT");
+    assert_eq!(
+        call_tool(&ctx, "harness_status", &json!({}))["task_state"],
+        "paused"
+    );
+    let reconnected = call_tool(&ctx, "begin_work_session", &arguments);
+    assert_eq!(reconnected["ok"], true);
+    assert_eq!(reconnected["work_session"]["task_created"], false);
+    assert_eq!(reconnected["work_session"]["task_id"], task_id);
+    assert_eq!(reconnected["task"]["status"], "active");
+    assert_eq!(reconnected["harness"]["task_state"], "active");
+}
+
+#[test]
+fn continued_tool_activity_auto_resumes_a_paused_task() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "resume me\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness"))
+        .expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "暂停后继续执行"}),
+    );
+    let task_id = started["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let paused = call_tool(&ctx, "pause_task", &json!({"task_id": task_id}));
+    assert_eq!(paused["ok"], true);
+    assert_eq!(paused["task"]["status"], "paused");
+    let inspected = call_tool(&ctx, "harness_status", &json!({}));
+    assert_eq!(inspected["task_state"], "paused");
+
+    let read = call_tool(&ctx, "read_file", &json!({"path": "README.md"}));
+    assert_eq!(read["ok"], true);
+    let resumed = call_tool(&ctx, "harness_status", &json!({}));
+    assert_eq!(resumed["task_state"], "active");
+    assert_eq!(resumed["session_status"], "active");
+
+    let events = call_tool(
+        &ctx,
+        "list_task_events",
+        &json!({"task_id": task_id, "limit": 200}),
+    );
+    assert_eq!(events["ok"], true);
+    assert!(events["events"].as_array().is_some_and(|items| {
+        items.iter().any(|event| {
+            event["kind"] == "task_auto_resumed" && event["tool_name"] == "read_file"
+        })
+    }));
 }
 
 #[test]

@@ -26,6 +26,32 @@ pub struct Harness {
     store: HarnessStore,
 }
 
+fn tool_activity_resumes_paused_task(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "server_info"
+            | "harness_status"
+            | "operation_log"
+            | "project_state"
+            | "task_context"
+            | "list_task_events"
+            | "change_summary"
+            | "history_session_bootstrap"
+            | "history_session_checkpoint"
+            | "history_session_validate"
+            | "check_exec_environment"
+            | "exec_health_check"
+            | "command_cost_explain"
+            | "get_default_cwd"
+            | "pause_task"
+            | "resume_task"
+            | "finish_task"
+            | "close_work_session"
+            | "start_task"
+            | "stage_commit_status"
+    )
+}
+
 fn verification_identity_matches(
     previous: &VerificationRecord,
     kind: &str,
@@ -150,6 +176,55 @@ impl Harness {
                     json!({"ok": true}),
                 ))?;
                 Ok(task)
+            })
+    }
+
+    pub fn resume_paused_task_for_activity(
+        &self,
+        tool: &str,
+        mcp_session_id: Option<&str>,
+    ) -> HarnessResult<Option<TaskSession>> {
+        if !tool_activity_resumes_paused_task(tool) {
+            return self.current_task();
+        }
+        let Some(current) = self.current_task()? else {
+            return Ok(None);
+        };
+        if current.status != TaskStatus::Paused {
+            return Ok(Some(current));
+        }
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(&current.id)?;
+                if task.status != TaskStatus::Paused {
+                    return Ok(Some(task));
+                }
+                task.status = TaskStatus::Active;
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.save_workspace_state(&self.workspace_state(
+                    Some(task.id.as_str()),
+                    HarnessSessionStatus::Active,
+                    &task.updated_at,
+                )?)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    &task.id,
+                    "task_auto_resumed",
+                    Some(tool),
+                    json!({
+                        "previous_status": "paused",
+                        "trigger": "tool_activity",
+                        "tool": tool,
+                        "mcp_session_id": mcp_session_id,
+                    }),
+                    json!({
+                        "ok": true,
+                        "status": "active",
+                        "auto_resumed": true,
+                    }),
+                ))?;
+                Ok(Some(task))
             })
     }
 
@@ -1455,6 +1530,122 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn meaningful_tool_activity_auto_resumes_a_paused_task_once() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("resume activity").expect("start task");
+        harness
+            .transition(&task.id, TaskStatus::Paused)
+            .expect("pause task");
+
+        let resumed = harness
+            .resume_paused_task_for_activity("read_file", Some("mcp-session"))
+            .expect("auto resume")
+            .expect("current task");
+        assert_eq!(resumed.status, TaskStatus::Active);
+        let status = harness.status().expect("status");
+        assert_eq!(status.task_state, Some(TaskStatus::Active));
+        assert_eq!(status.session_status, HarnessSessionStatus::Active);
+
+        let events = harness
+            .list_events(&task.id, 0, usize::MAX)
+            .expect("events");
+        let auto_resumed = events
+            .iter()
+            .filter(|event| event.kind == "task_auto_resumed")
+            .collect::<Vec<_>>();
+        assert_eq!(auto_resumed.len(), 1);
+        assert_eq!(auto_resumed[0].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(
+            auto_resumed[0].input_summary["payload"]["mcp_session_id"],
+            "mcp-session"
+        );
+
+        harness
+            .resume_paused_task_for_activity("git_status", Some("mcp-session"))
+            .expect("already active");
+        let events = harness
+            .list_events(&task.id, 0, usize::MAX)
+            .expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "task_auto_resumed")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn status_and_lifecycle_tools_do_not_auto_resume_paused_tasks() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("stay paused").expect("start task");
+        harness
+            .transition(&task.id, TaskStatus::Paused)
+            .expect("pause task");
+
+        for tool in [
+            "harness_status",
+            "task_context",
+            "pause_task",
+            "resume_task",
+            "finish_task",
+            "close_work_session",
+        ] {
+            let current = harness
+                .resume_paused_task_for_activity(tool, None)
+                .expect("inspect paused task")
+                .expect("current task");
+            assert_eq!(current.status, TaskStatus::Paused, "tool={tool}");
+        }
+        assert_eq!(
+            harness.task(&task.id).expect("task").status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[test]
+    fn auto_resume_does_not_override_verifying_or_failed_states() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("preserve status").expect("start task");
+        harness
+            .transition(&task.id, TaskStatus::Verifying)
+            .expect("verifying");
+        let verifying = harness
+            .resume_paused_task_for_activity("read_file", None)
+            .expect("activity")
+            .expect("current task");
+        assert_eq!(verifying.status, TaskStatus::Verifying);
+
+        harness
+            .transition(&task.id, TaskStatus::Failed)
+            .expect("failed");
+        let failed = harness
+            .resume_paused_task_for_activity("read_file", None)
+            .expect("activity")
+            .expect("current task");
+        assert_eq!(failed.status, TaskStatus::Failed);
     }
 
     #[test]

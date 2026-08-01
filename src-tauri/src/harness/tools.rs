@@ -221,6 +221,14 @@ fn begin_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
                     format!("工作区已有活动任务 {}，目标与本次工作会话不同", task.id),
                 ));
             }
+            let task = if task.status == TaskStatus::Paused {
+                ctx.harness
+                    .resume_paused_task_for_activity("begin_work_session", None)
+                    .map_err(map_error)?
+                    .ok_or_else(|| tool_error("TASK_NOT_FOUND", "暂停任务在恢复时消失"))?
+            } else {
+                task
+            };
             (task, false)
         }
         None => (ctx.harness.start_task(objective).map_err(map_error)?, true),

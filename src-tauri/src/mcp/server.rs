@@ -363,6 +363,20 @@ async fn handle_tools_call(
     }
 
     if state.mcp_proxies.contains_tool(name) {
+        if let Err(error) = state
+            .harness
+            .resume_paused_task_for_activity(name, session_id)
+        {
+            return Err(serde_json::json!({
+                "code": -32603,
+                "message": "Failed to resume paused Harness task for proxy activity",
+                "data": {
+                    "reason": "task_auto_resume_failed",
+                    "harness_error": error.code(),
+                    "details": error.to_string()
+                }
+            }));
+        }
         let active_task = state.harness.current_task().ok().flatten();
         let operation = state
             .harness
