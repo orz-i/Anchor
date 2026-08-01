@@ -109,7 +109,6 @@ export interface ActionsConfig {
   frp_profile_id?: string;
   frp_server_port?: number;
   cloudflare_mode: string;
-  cloudflare_token?: string;
   use_proxy?: boolean;
   local_port: number;
   permission_mode: string;

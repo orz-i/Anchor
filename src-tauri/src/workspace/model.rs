@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::settings::AppSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceProfile {
     pub id: String,
     pub name: String,
@@ -10,129 +11,86 @@ pub struct WorkspaceProfile {
     pub tunnel: TunnelConfig,
     pub auth: AuthConfig,
     pub runtime: RuntimeConfig,
-    #[serde(default)]
     pub actions: ActionsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
-    #[serde(rename = "type", default = "default_tunnel_type")]
+    #[serde(rename = "type")]
     pub tunnel_type: String,
-    #[serde(default)]
     pub public_url: String,
-    #[serde(default)]
     pub frp_server: String,
-    #[serde(default)]
     pub frp_subdomain: String,
-    #[serde(default)]
     pub frp_profile_id: String,
-    #[serde(default = "default_frp_server_port")]
     pub frp_server_port: u16,
-    #[serde(default = "default_cloudflare_mode")]
     pub cloudflare_mode: String,
     /// When true, apply global proxy from Settings → General when starting the tunnel.
-    #[serde(default = "default_use_proxy")]
     pub use_proxy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    #[serde(rename = "type", default = "default_auth_type")]
+    #[serde(rename = "type")]
     pub auth_type: String,
-    #[serde(default = "default_oauth_client_id")]
     pub oauth_client_id: String,
     /// Exact OAuth callback URLs registered for this MCP client, one per line.
-    #[serde(default)]
     pub oauth_redirect_uris: String,
     /// Callback host enrollment allowlist, one host or `*.suffix` per line.
-    #[serde(default)]
     pub oauth_redirect_hosts: String,
-    #[serde(default)]
     pub use_shared_secrets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    #[serde(default = "default_mcp_port")]
     pub local_port: u16,
-    #[serde(default = "default_tool_profile")]
     pub tool_profile: String,
-    #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
-    #[serde(default)]
     pub runtime_command: String,
     /// Optional JSON configuration containing stdio MCP servers to merge into this service.
-    #[serde(default)]
     pub mcp_config: String,
     /// Workspace execution policy shared by MCP clients.
-    #[serde(default = "default_allowed_commands")]
     pub allowed_commands: String,
-    #[serde(default = "default_workspace_local_entries")]
     pub workspace_local_entries: bool,
-    #[serde(default = "default_workspace_script_extensions")]
     pub workspace_script_extensions: String,
     /// Expose Agent Skills from configured directories through MCP tools/resources.
-    #[serde(default = "default_skill_service_enabled")]
     pub skill_service_enabled: bool,
     /// Newline-separated Skill roots. Relative paths resolve from the workspace root.
-    #[serde(default = "default_skill_roots")]
     pub skill_roots: String,
     /// Runtime-enforced read boundary. It is strict by default; only an
     /// operator-enabled dangerous profile may explicitly opt out.
-    #[serde(default = "default_strict_workspace_reads")]
     pub strict_workspace_reads: bool,
     /// Trusted-control-plane approval for commands classified as external_paid.
-    #[serde(default)]
     pub external_paid_commands_enabled: bool,
-    #[serde(default = "default_external_paid_max_runs_per_day")]
     pub external_paid_max_runs_per_day: u32,
-    #[serde(default = "default_external_paid_max_duration_seconds")]
     pub external_paid_max_duration_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionsConfig {
-    #[serde(default)]
     pub public_url: String,
-    #[serde(default = "default_tunnel_type")]
     pub tunnel_type: String,
-    #[serde(default)]
     pub frp_server: String,
-    #[serde(default)]
     pub frp_subdomain: String,
-    #[serde(default)]
     pub frp_profile_id: String,
-    #[serde(default = "default_frp_server_port")]
     pub frp_server_port: u16,
-    #[serde(default = "default_cloudflare_mode")]
     pub cloudflare_mode: String,
-    #[serde(default)]
-    pub cloudflare_token: String,
-    #[serde(default = "default_use_proxy")]
     pub use_proxy: bool,
-    #[serde(default = "default_actions_port")]
     pub local_port: u16,
-    #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
-    #[serde(default)]
     pub runtime_command: String,
-    #[serde(default = "default_actions_auth_type")]
     pub auth_type: String,
-    #[serde(default = "default_actions_oauth_client_id")]
     pub oauth_client_id: String,
     /// Exact OAuth callback URLs registered for this Actions client, one per line.
-    #[serde(default)]
     pub oauth_redirect_uris: String,
     /// Callback host enrollment allowlist, one host or `*.suffix` per line.
-    #[serde(default)]
     pub oauth_redirect_hosts: String,
-    #[serde(default)]
     pub oauth_scopes: String,
-    #[serde(default = "default_allowed_commands")]
     pub allowed_commands: String,
-    #[serde(default = "default_max_patch_bytes")]
     pub max_patch_bytes: u32,
-    #[serde(default)]
     pub use_shared_secrets: bool,
 }
 
@@ -180,10 +138,6 @@ pub struct RuntimeRecoveryDto {
 
 fn default_tunnel_type() -> String {
     "cloudflare".to_string()
-}
-
-fn default_cloudflare_mode() -> String {
-    "quick".to_string()
 }
 
 fn default_new_cloudflare_mode() -> String {
@@ -327,7 +281,6 @@ impl Default for ActionsConfig {
             frp_profile_id: String::new(),
             frp_server_port: default_frp_server_port(),
             cloudflare_mode: default_new_cloudflare_mode(),
-            cloudflare_token: String::new(),
             use_proxy: default_use_proxy(),
             local_port: default_actions_port(),
             permission_mode: default_permission_mode(),
@@ -505,34 +458,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_tunnel_type_defaults_to_cloudflare_quick() {
-        let tunnel: TunnelConfig =
-            serde_json::from_value(serde_json::json!({})).expect("tunnel config with missing fields");
-        let actions: ActionsConfig = serde_json::from_value(serde_json::json!({}))
-            .expect("actions config with missing fields");
-
-        assert_eq!(tunnel.tunnel_type, "cloudflare");
-        assert_eq!(tunnel.cloudflare_mode, "quick");
-        assert_eq!(actions.tunnel_type, "cloudflare");
-        assert_eq!(actions.cloudflare_mode, "quick");
+    fn persisted_tunnel_configs_reject_missing_fields() {
+        assert!(serde_json::from_value::<TunnelConfig>(serde_json::json!({})).is_err());
+        assert!(serde_json::from_value::<ActionsConfig>(serde_json::json!({})).is_err());
     }
 
     #[test]
     fn explicit_frp_tunnel_type_is_preserved() {
-        let tunnel: TunnelConfig = serde_json::from_value(serde_json::json!({ "type": "frp" }))
-            .expect("explicit FRP tunnel config");
+        let mut value = serde_json::to_value(TunnelConfig::default()).expect("default tunnel");
+        value["type"] = serde_json::json!("frp");
+        let tunnel: TunnelConfig =
+            serde_json::from_value(value).expect("explicit FRP tunnel config");
 
         assert_eq!(tunnel.tunnel_type, "frp");
-        assert_eq!(tunnel.cloudflare_mode, "quick");
+        assert_eq!(tunnel.cloudflare_mode, "named");
     }
 
     #[test]
-    fn runtime_config_with_missing_fields_enables_default_skill_roots() {
-        let runtime: RuntimeConfig =
-            serde_json::from_value(serde_json::json!({}))
-                .expect("runtime config with missing fields");
-
-        assert!(runtime.skill_service_enabled);
-        assert_eq!(runtime.skill_roots, ".agents/skills\n.codex/skills\nskills");
+    fn persisted_runtime_config_rejects_missing_fields() {
+        assert!(serde_json::from_value::<RuntimeConfig>(serde_json::json!({})).is_err());
     }
 }

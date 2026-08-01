@@ -107,7 +107,6 @@ fn restore_tunnel_config(
                 current.actions.frp_profile_id = restored.actions.frp_profile_id.clone();
                 current.actions.frp_server_port = restored.actions.frp_server_port;
                 current.actions.cloudflare_mode = restored.actions.cloudflare_mode.clone();
-                current.actions.cloudflare_token = restored.actions.cloudflare_token.clone();
                 current.actions.use_proxy = restored.actions.use_proxy;
             }
         }
@@ -140,7 +139,6 @@ fn actions_tunnel_matches(
         && left.actions.frp_profile_id == right.actions.frp_profile_id
         && left.actions.frp_server_port == right.actions.frp_server_port
         && left.actions.cloudflare_mode == right.actions.cloudflare_mode
-        && left.actions.cloudflare_token == right.actions.cloudflare_token
         && left.actions.use_proxy == right.actions.use_proxy
 }
 

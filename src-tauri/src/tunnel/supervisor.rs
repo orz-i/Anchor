@@ -767,11 +767,7 @@ fn validate_tunnel_requirements(
         ),
         TunnelServiceKind::Actions => (
             profile.actions.cloudflare_mode.as_str(),
-            if profile.actions.cloudflare_token.trim().is_empty() {
-                SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default()
-            } else {
-                profile.actions.cloudflare_token.clone()
-            },
+            SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default(),
             profile.actions.public_url.clone(),
         ),
     };
@@ -815,11 +811,8 @@ fn cloudflare_config(
             ))
         }
         TunnelServiceKind::Actions => {
-            let token = if profile.actions.cloudflare_token.trim().is_empty() {
-                SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default()
-            } else {
-                profile.actions.cloudflare_token.clone()
-            };
+            let token =
+                SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default();
             Ok((
                 profile.actions.local_port,
                 profile.actions.cloudflare_mode.as_str(),

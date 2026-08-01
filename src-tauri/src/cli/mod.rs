@@ -1622,9 +1622,8 @@ mod tests {
     }
 
     #[test]
-    fn show_output_removes_inline_tokens() {
-        let mut profile = WorkspaceProfile::new("/srv/a".into(), Some("a".into()));
-        profile.actions.cloudflare_token = "must-not-leak".into();
+    fn show_output_contains_no_inline_token_fields() {
+        let profile = WorkspaceProfile::new("/srv/a".into(), Some("a".into()));
 
         let value = redacted_profile_value(&profile).expect("redact");
 
@@ -1632,6 +1631,5 @@ mod tests {
             .get("actions")
             .and_then(|actions| actions.get("cloudflare_token"))
             .is_none());
-        assert!(!value.to_string().contains("must-not-leak"));
     }
 }
