@@ -16,6 +16,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use uuid::Uuid;
 
 use crate::tools::CancellationToken;
 use crate::tunnel::append_profile_log;
@@ -41,6 +42,193 @@ struct SanitizedProxyTool {
     input_schema: Value,
     output_schema: Value,
     synthesized_output_schema: bool,
+}
+
+fn wrap_proxy_structured_result(structured: Value, output_schema: &Value) -> Value {
+    let validation = jsonschema::validator_for(output_schema)
+        .and_then(|validator| validator.validate(&structured));
+    let structured = match validation {
+        Ok(()) => structured,
+        Err(error) => json!({
+            "ok": false,
+            "status": "error",
+            "server": "proxy",
+            "connection": {},
+            "error": {
+                "code": "DOWNSTREAM_SCHEMA_MISMATCH",
+                "message": format!("Proxy result violates outputSchema: {error}"),
+                "retryable": false
+            },
+            "error_code": "DOWNSTREAM_SCHEMA_MISMATCH",
+            "error_message": format!("Proxy result violates outputSchema: {error}"),
+            "retryable": false,
+            "browser_session_id": "unknown",
+            "connection_status": "unknown",
+            "page_count": 0,
+            "pages": [],
+            "selected_page": null,
+            "page_state": {}
+        }),
+    };
+    let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
+    json!({
+        "content": [{"type": "text", "text": structured.to_string()}],
+        "structuredContent": structured,
+        "isError": is_error
+    })
+}
+
+fn browser_proxy_error_code(public_name: &str, detail: &str) -> &'static str {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("structuredcontent")
+        || detail.contains("outputschema")
+        || detail.contains("schema")
+    {
+        "DOWNSTREAM_SCHEMA_MISMATCH"
+    } else if detail.contains("target closed")
+        || detail.contains("page closed")
+        || detail.contains("page has been closed")
+    {
+        "PAGE_CLOSED"
+    } else if detail.contains("no active page")
+        || detail.contains("no page selected")
+        || detail.contains("no pages")
+        || (public_name.contains("snapshot") && detail.contains("page"))
+    {
+        "NO_ACTIVE_PAGE"
+    } else if detail.contains("cdp")
+        || detail.contains("devtools")
+        || detail.contains("browser disconnected")
+        || detail.contains("connection lost")
+    {
+        "CDP_CONNECTION_LOST"
+    } else if detail.contains("not connected")
+        || detail.contains("connection refused")
+        || detail.contains("failed to connect")
+    {
+        "BROWSER_NOT_CONNECTED"
+    } else {
+        "PROXIED_TOOL_FAILED"
+    }
+}
+
+fn proxy_result_payload(result: &Value) -> Value {
+    let Some(object) = result.as_object() else {
+        return json!({"value": result});
+    };
+    if let Some(structured) = object
+        .get("structuredContent")
+        .filter(|value| value.is_object())
+    {
+        return structured.clone();
+    }
+    let content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let text = content
+        .iter()
+        .filter(|item| item.get("type") == Some(&json!("text")))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Ok(parsed) = serde_json::from_str::<Value>(text.trim()) {
+        if parsed.is_object() {
+            return parsed;
+        }
+    }
+    json!({
+        "text": text,
+        "content": content.iter().map(proxy_content_summary).collect::<Vec<_>>()
+    })
+}
+
+fn proxy_content_summary(item: &Value) -> Value {
+    let Some(object) = item.as_object() else {
+        return json!({"type": "unknown"});
+    };
+    let content_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if matches!(content_type, "image" | "audio") {
+        let encoded_bytes = object
+            .get("data")
+            .and_then(Value::as_str)
+            .map(|value| value.len().saturating_mul(3) / 4)
+            .unwrap_or_default();
+        return json!({
+            "type": content_type,
+            "mimeType": object.get("mimeType").cloned().unwrap_or(Value::Null),
+            "encoded_bytes": encoded_bytes,
+            "data_omitted": true
+        });
+    }
+    if content_type == "resource" {
+        let resource = object.get("resource").and_then(Value::as_object);
+        return json!({
+            "type": "resource",
+            "uri": resource.and_then(|value| value.get("uri")).cloned().unwrap_or(Value::Null),
+            "name": resource.and_then(|value| value.get("name")).cloned().unwrap_or(Value::Null),
+            "mimeType": resource.and_then(|value| value.get("mimeType")).cloned().unwrap_or(Value::Null),
+            "payload_omitted": resource.is_some_and(|value| value.contains_key("blob") || value.contains_key("text"))
+        });
+    }
+    item.clone()
+}
+
+fn proxy_page_state(result: &Value) -> Value {
+    let payload = proxy_result_payload(result);
+    let payload = payload.get("result").cloned().unwrap_or(payload);
+    let mut pages = payload
+        .get("pages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if pages.is_empty() {
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for line in text.lines() {
+            let trimmed = line.trim().trim_start_matches(['-', '*', ' ']);
+            let Some((id, rest)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let Ok(page_id) = id.trim().parse::<u64>() else {
+                continue;
+            };
+            let selected = rest.contains("[selected]") || rest.contains("(selected)");
+            let url = rest
+                .replace("[selected]", "")
+                .replace("(selected)", "")
+                .trim()
+                .to_string();
+            pages.push(json!({
+                "page_id": page_id,
+                "url": url,
+                "selected": selected
+            }));
+        }
+    }
+    let selected_page = payload
+        .get("selected_page")
+        .or_else(|| payload.get("selectedPage"))
+        .cloned()
+        .or_else(|| {
+            pages
+                .iter()
+                .find(|page| page.get("selected").and_then(Value::as_bool) == Some(true))
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "pages": pages,
+        "selected_page": selected_page,
+        "page_count": pages.len(),
+        "raw": payload
+    })
 }
 
 fn proxy_timestamp() -> String {
@@ -213,9 +401,21 @@ fn proxy_management_tools(
             "status": {"type": "string"},
             "server": {"type": "string"},
             "connection": {"type": "object", "additionalProperties": true},
-            "error": {"type": ["object", "null"]}
+            "error": {"type": ["object", "null"]},
+            "error_code": {"type": ["string", "null"]},
+            "error_message": {"type": ["string", "null"]},
+            "retryable": {"type": "boolean"},
+            "browser_session_id": {"type": "string", "minLength": 1},
+            "connection_status": {"type": "string"},
+            "page_count": {"type": "integer", "minimum": 0},
+            "pages": {"type": "array", "items": {"type": "object"}},
+            "selected_page": {"type": ["object", "null"]},
+            "page_state": {"type": "object", "additionalProperties": true}
         },
-        "required": ["ok", "status", "server", "connection"],
+        "required": [
+            "ok", "status", "server", "connection", "retryable",
+            "browser_session_id", "connection_status", "page_count", "pages"
+        ],
         "additionalProperties": true
     });
     [
@@ -260,7 +460,16 @@ fn fallback_proxy_output_schema() -> Value {
             "result": {
                 "type": "object",
                 "additionalProperties": true
-            }
+            },
+            "error": { "type": ["object", "null"] },
+            "error_code": { "type": ["string", "null"] },
+            "error_message": { "type": ["string", "null"] },
+            "retryable": { "type": "boolean" },
+            "browser_session_id": { "type": ["string", "null"] },
+            "connection_status": { "type": "string" },
+            "page_count": { "type": ["integer", "null"], "minimum": 0 },
+            "pages": { "type": "array", "items": { "type": "object" } },
+            "selected_page": { "type": ["object", "null"] }
         },
         "required": ["ok"],
         "additionalProperties": true
@@ -559,7 +768,9 @@ struct ProxyServer {
     spec: McpProxyServerSpec,
     workspace_id: String,
     catalog_digest: String,
+    downstream_tools: BTreeSet<String>,
     client: Mutex<Option<Arc<McpProxyClient>>>,
+    session_id: StdMutex<String>,
     concurrency: Semaphore,
     reconnect_scheduled: AtomicBool,
     calls: AtomicU64,
@@ -953,7 +1164,10 @@ impl McpProxyRegistry {
             let structured = server
                 .handle_management_call(route.kind, cancellation)
                 .await;
-            return Some(Ok(crate::tools::workspace::wrap_tool_result(structured)));
+            return Some(Ok(wrap_proxy_structured_result(
+                structured,
+                &route.output_schema,
+            )));
         }
         let permit = timeout(server.spec.request_timeout, server.concurrency.acquire());
         tokio::pin!(permit);
@@ -1051,33 +1265,40 @@ impl McpProxyRegistry {
                     &route.output_schema,
                     route.synthesized_output_schema,
                 ) {
-                    Ok(normalized) => {
+                    Ok(mut normalized) => {
+                        if route.synthesized_output_schema {
+                            server.decorate_proxy_result(public_name, &mut normalized);
+                        }
                         server.record_success(public_name, Some(&normalized));
                         normalized
                     }
                     Err(message) => {
                         server.record_failure("proxy_result_invalid", &message);
-                        proxy_call_error_result(
+                        let mut error_result = proxy_call_error_result(
                             &server_name,
                             public_name,
                             "proxy_result_invalid",
                             message,
                             false,
                             false,
-                        )
+                        );
+                        server.decorate_proxy_result(public_name, &mut error_result);
+                        error_result
                     }
                 }
             }
             Err(error) => {
                 let connection_lost = error.invalidates_connection();
-                proxy_call_error_result(
+                let mut error_result = proxy_call_error_result(
                     &server_name,
                     public_name,
                     &proxy_failure_reason(public_name, &error),
                     error.to_string(),
                     error.retryable(),
                     connection_lost,
-                )
+                );
+                server.decorate_proxy_result(public_name, &mut error_result);
+                error_result
             }
         }))
     }
@@ -1091,13 +1312,20 @@ impl ProxyServer {
         let (client, catalog) = McpProxyClient::connect(spec.clone(), &workspace_id).await?;
         let catalog = sanitize_proxy_catalog(&spec, catalog)?;
         let catalog_digest = proxy_catalog_digest(&catalog.tools)?;
+        let downstream_tools = catalog
+            .tools
+            .iter()
+            .map(|tool| tool.downstream_name.clone())
+            .collect();
         let max_concurrent_requests = spec.max_concurrent_requests;
         Ok((
             Arc::new(Self {
                 spec,
                 workspace_id,
                 catalog_digest,
+                downstream_tools,
                 client: Mutex::new(Some(client)),
+                session_id: StdMutex::new(Uuid::new_v4().to_string()),
                 concurrency: Semaphore::new(max_concurrent_requests),
                 reconnect_scheduled: AtomicBool::new(false),
                 calls: AtomicU64::new(0),
@@ -1137,6 +1365,7 @@ impl ProxyServer {
             );
         }
         *client = Some(connected.clone());
+        *self.session_id.lock().expect("mcp proxy session id lock") = Uuid::new_v4().to_string();
         append_profile_log(
             &self.workspace_id,
             "stdout.log",
@@ -1170,25 +1399,233 @@ impl ProxyServer {
             }
             ProxyRouteKind::Downstream => Ok("healthy"),
         };
+        let page_state = if result.is_ok() {
+            self.management_page_state(cancellation).await
+        } else {
+            self.last_known_page_state()
+        };
+        let connection = self.status(0);
+        let connection_status = if connection
+            .get("connected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "connected"
+        } else {
+            "disconnected"
+        };
+        let session_id = self
+            .session_id
+            .lock()
+            .expect("mcp proxy session id lock")
+            .clone();
+        let pages = page_state
+            .get("pages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let selected_page = page_state
+            .get("selected_page")
+            .cloned()
+            .unwrap_or(Value::Null);
         match result {
             Ok(status) => json!({
                 "ok": true,
                 "status": status,
                 "server": self.spec.name,
-                "connection": self.status(0),
-                "error": null
+                "connection": connection,
+                "error": null,
+                "error_code": null,
+                "error_message": null,
+                "retryable": false,
+                "browser_session_id": session_id,
+                "connection_status": connection_status,
+                "page_count": pages.len(),
+                "pages": pages,
+                "selected_page": selected_page,
+                "page_state": page_state
             }),
-            Err(message) => json!({
-                "ok": false,
-                "status": "unhealthy",
-                "server": self.spec.name,
-                "connection": self.status(0),
-                "error": {
-                    "code": self.last_error_code.lock().expect("mcp proxy error code lock").clone().unwrap_or_else(|| "proxy_management_failed".into()),
-                    "message": message,
-                    "retryable": true
+            Err(message) => {
+                let error_code = browser_proxy_error_code("management", &message);
+                json!({
+                    "ok": false,
+                    "status": "unhealthy",
+                    "server": self.spec.name,
+                    "connection": connection,
+                    "error": {
+                        "code": error_code,
+                        "message": message,
+                        "retryable": true
+                    },
+                    "error_code": error_code,
+                    "error_message": message,
+                    "retryable": true,
+                    "browser_session_id": session_id,
+                    "connection_status": connection_status,
+                    "page_count": pages.len(),
+                    "pages": pages,
+                    "selected_page": selected_page,
+                    "page_state": page_state
+                })
+            }
+        }
+    }
+
+    async fn management_page_state(&self, cancellation: &CancellationToken) -> Value {
+        if !self
+            .spec
+            .tool_prefix
+            .to_ascii_lowercase()
+            .contains("browser")
+            && !self.spec.name.to_ascii_lowercase().contains("browser")
+        {
+            return self.last_known_page_state();
+        }
+        let Some(tool_name) = self
+            .downstream_tools
+            .iter()
+            .find(|name| matches!(name.as_str(), "list_pages" | "listPages"))
+            .cloned()
+        else {
+            return self.last_known_page_state();
+        };
+        let client = match self.ensure_client().await {
+            Ok(client) => client,
+            Err(message) => {
+                return json!({
+                    "pages": [],
+                    "selected_page": null,
+                    "page_count": 0,
+                    "error_code": "BROWSER_NOT_CONNECTED",
+                    "error_message": message
+                })
+            }
+        };
+        match client
+            .request_with_cancellation(
+                "tools/call",
+                json!({"name": tool_name, "arguments": {}}),
+                cancellation,
+            )
+            .await
+        {
+            Ok(result) => proxy_page_state(&result),
+            Err(error) => json!({
+                "pages": [],
+                "selected_page": null,
+                "page_count": 0,
+                "error_code": browser_proxy_error_code("list_pages", &error.to_string()),
+                "error_message": error.to_string()
+            }),
+        }
+    }
+
+    fn last_known_page_state(&self) -> Value {
+        let summary = self
+            .last_success_summary
+            .lock()
+            .expect("mcp proxy success summary lock")
+            .clone()
+            .unwrap_or_else(|| json!({}));
+        let pages = summary
+            .get("pages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let selected_page = summary
+            .get("selected_page")
+            .or_else(|| summary.get("current_page"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        json!({
+            "pages": pages,
+            "selected_page": selected_page,
+            "page_count": pages.len(),
+            "source": "last_known_state"
+        })
+    }
+
+    fn decorate_proxy_result(&self, public_name: &str, result: &mut Value) {
+        let Some(structured) = result
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        let session_id = self
+            .session_id
+            .lock()
+            .expect("mcp proxy session id lock")
+            .clone();
+        let connected = self
+            .client
+            .try_lock()
+            .ok()
+            .and_then(|client| client.as_ref().map(|client| !client.is_closed()))
+            .unwrap_or(false);
+        structured.insert("browser_session_id".into(), Value::String(session_id));
+        structured.insert(
+            "connection_status".into(),
+            Value::String(
+                if connected {
+                    "connected"
+                } else {
+                    "disconnected"
                 }
-            }),
+                .into(),
+            ),
+        );
+        let page_state = proxy_page_state(&Value::Object(structured.clone()));
+        structured.insert(
+            "page_count".into(),
+            page_state
+                .get("page_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0)),
+        );
+        structured.insert(
+            "pages".into(),
+            page_state
+                .get("pages")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        );
+        structured.insert(
+            "selected_page".into(),
+            page_state
+                .get("selected_page")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        let failed = structured.get("ok").and_then(Value::as_bool) == Some(false);
+        if failed {
+            let error = structured.get("error").and_then(Value::as_object);
+            let detail = error
+                .and_then(|value| value.get("message"))
+                .or_else(|| {
+                    error
+                        .and_then(|value| value.get("details"))
+                        .and_then(Value::as_object)
+                        .and_then(|details| details.get("detail"))
+                })
+                .and_then(Value::as_str)
+                .unwrap_or("Proxied browser operation failed")
+                .to_string();
+            let code = browser_proxy_error_code(public_name, &detail);
+            let retryable = error
+                .and_then(|value| value.get("retryable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(matches!(
+                    code,
+                    "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" | "PAGE_CLOSED"
+                ));
+            structured.insert("error_code".into(), Value::String(code.into()));
+            structured.insert("error_message".into(), Value::String(detail));
+            structured.insert("retryable".into(), Value::Bool(retryable));
+        } else {
+            structured.insert("error_code".into(), Value::Null);
+            structured.insert("error_message".into(), Value::Null);
+            structured.insert("retryable".into(), Value::Bool(false));
         }
     }
 
@@ -1417,6 +1854,7 @@ fn normalize_proxy_tool_result(
     output_schema: &Value,
     synthesized_output_schema: bool,
 ) -> Result<Value, String> {
+    let payload = proxy_result_payload(&result);
     let Some(object) = result.as_object() else {
         return Err("downstream tools/call result is not an object".into());
     };
@@ -1442,10 +1880,49 @@ fn normalize_proxy_tool_result(
         return Err("downstream structuredContent must be an object".into());
     }
     if synthesized_output_schema {
-        structured = Some(json!({
-            "ok": !is_error,
-            "result": structured.unwrap_or_else(|| json!({}))
-        }));
+        let payload = structured.unwrap_or(payload);
+        structured = Some(if is_error {
+            let message = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("Downstream MCP tool returned an error")
+                .to_string();
+            let code = browser_proxy_error_code(public_name, &message);
+            json!({
+                "ok": false,
+                "result": payload,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "category": "runtime",
+                    "retryable": matches!(
+                        code,
+                        "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" | "PAGE_CLOSED"
+                    ),
+                    "details": {
+                        "server": server_name,
+                        "tool": public_name,
+                        "downstream_is_error": true
+                    }
+                },
+                "error_code": code,
+                "error_message": message,
+                "retryable": matches!(
+                    code,
+                    "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" | "PAGE_CLOSED"
+                )
+            })
+        } else {
+            json!({
+                "ok": true,
+                "result": payload,
+                "error": null,
+                "error_code": null,
+                "error_message": null,
+                "retryable": false
+            })
+        });
     } else {
         let structured = structured.as_ref().ok_or_else(|| {
             "downstream tool declared outputSchema but omitted structuredContent".to_string()
@@ -2790,15 +3267,15 @@ mod tests {
     use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::{Json, Router};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use crate::tools::CancellationToken;
 
     use super::{
         expand_proxy_placeholders, normalize_proxy_tool_result, parse_mcp_proxy_config,
         proxy_catalog_digest, proxy_failure_reason, proxy_management_tools,
-        proxy_result_state_summary, sanitize_proxy_catalog, McpProxyRegistry, McpProxyServerSpec,
-        McpProxyTransportSpec, ProxyClientError,
+        proxy_result_state_summary, sanitize_proxy_catalog, wrap_proxy_structured_result,
+        McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -3242,12 +3719,39 @@ mod tests {
         .expect("normalized result");
 
         assert_eq!(normalized["structuredContent"]["ok"], true);
-        assert_eq!(normalized["structuredContent"]["result"], json!({}));
+        assert_eq!(normalized["structuredContent"]["result"]["text"], "clicked");
+        assert_eq!(
+            normalized["structuredContent"]["result"]["content"][0]["type"],
+            "text"
+        );
         assert_eq!(normalized["isError"], false);
         assert!(jsonschema::validator_for(&tool.output_schema)
             .expect("fallback output schema")
             .validate(&normalized["structuredContent"])
             .is_ok());
+
+        let screenshot = normalize_proxy_tool_result(
+            "browser",
+            "test__take_screenshot",
+            json!({
+                "content": [{
+                    "type": "image",
+                    "data": "QUJDREVGRw==",
+                    "mimeType": "image/png"
+                }]
+            }),
+            &tool.output_schema,
+            tool.synthesized_output_schema,
+        )
+        .expect("screenshot result");
+        assert_eq!(screenshot["content"][0]["data"], "QUJDREVGRw==");
+        assert_eq!(
+            screenshot["structuredContent"]["result"]["content"][0]["data_omitted"],
+            true
+        );
+        assert!(screenshot["structuredContent"]["result"]["content"][0]
+            .get("data")
+            .is_none());
     }
 
     #[test]
@@ -3325,6 +3829,44 @@ mod tests {
                 "browser__reset_session"
             ]
         );
+    }
+
+    #[test]
+    fn management_results_accept_null_error_and_never_publish_null_structured_content() {
+        let mut spec = test_spec();
+        spec.management_tools = true;
+        let tools = proxy_management_tools(&spec);
+        let output_schema = tools[0].4.clone();
+        let wrapped = wrap_proxy_structured_result(
+            json!({
+                "ok": true,
+                "status": "healthy",
+                "server": "browser",
+                "connection": {"connected": true},
+                "error": null,
+                "error_code": null,
+                "error_message": null,
+                "retryable": false,
+                "browser_session_id": "session-1",
+                "connection_status": "connected",
+                "page_count": 0,
+                "pages": [],
+                "selected_page": null,
+                "page_state": {}
+            }),
+            &output_schema,
+        );
+        assert!(wrapped["structuredContent"].is_object());
+        assert_eq!(wrapped["structuredContent"]["error"], Value::Null);
+        assert_eq!(wrapped["isError"], false);
+
+        let invalid = wrap_proxy_structured_result(Value::Null, &output_schema);
+        assert!(invalid["structuredContent"].is_object());
+        assert_eq!(
+            invalid["structuredContent"]["error_code"],
+            "DOWNSTREAM_SCHEMA_MISMATCH"
+        );
+        assert_eq!(invalid["isError"], true);
     }
 
     #[test]
