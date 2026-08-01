@@ -38,12 +38,7 @@ pub async fn handle_request(state: &SharedState, body: &Value) -> Value {
             });
         }
     }
-    handle_request_with_protocol(
-        state,
-        body,
-        crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
-    )
-    .await
+    handle_request_with_protocol(state, body, crate::mcp::protocol::CURRENT_PROTOCOL_VERSION).await
 }
 
 fn proxy_operation_summary(
@@ -620,7 +615,7 @@ mod tests {
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
         assert_eq!(first_tools.len(), 64);
-        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 33);
+        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 40);
         assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 48);
         assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
             .as_u64()

@@ -85,6 +85,19 @@ fn browser_proxy_error_code(public_name: &str, detail: &str) -> &'static str {
         || detail.contains("schema")
     {
         "DOWNSTREAM_SCHEMA_MISMATCH"
+    } else if (detail.contains("uid") || detail.contains("element"))
+        && (detail.contains("stale")
+            || detail.contains("not found")
+            || detail.contains("does not exist")
+            || detail.contains("no longer valid"))
+    {
+        "STALE_ELEMENT_REFERENCE"
+    } else if detail.contains("timed out") && public_name.contains("wait_for") {
+        "ELEMENT_WAIT_TIMEOUT"
+    } else if detail.contains("timed out") && public_name.contains("navigate") {
+        "PAGE_LOAD_TIMEOUT"
+    } else if detail.contains("timed out") && public_name.contains("evaluate_script") {
+        "SCRIPT_TIMEOUT"
     } else if detail.contains("target closed")
         || detail.contains("page closed")
         || detail.contains("page has been closed")
@@ -913,7 +926,7 @@ impl ProxyClientError {
     }
 
     fn invalidates_connection(&self) -> bool {
-        matches!(self, Self::Timeout { .. } | Self::Transport(_))
+        matches!(self, Self::Transport(_))
     }
 
     fn retryable(&self) -> bool {
@@ -1617,11 +1630,48 @@ impl ProxyServer {
                 .and_then(Value::as_bool)
                 .unwrap_or(matches!(
                     code,
-                    "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" | "PAGE_CLOSED"
+                    "BROWSER_NOT_CONNECTED"
+                        | "CDP_CONNECTION_LOST"
+                        | "PAGE_CLOSED"
+                        | "STALE_ELEMENT_REFERENCE"
+                        | "ELEMENT_WAIT_TIMEOUT"
+                        | "PAGE_LOAD_TIMEOUT"
+                        | "SCRIPT_TIMEOUT"
                 ));
+            let recovery_hint = match code {
+                "STALE_ELEMENT_REFERENCE" => {
+                    "Call browser__take_snapshot and use a fresh element UID."
+                }
+                "NO_ACTIVE_PAGE" | "PAGE_CLOSED" => {
+                    "Call browser__list_pages, browser__select_page, then browser__take_snapshot."
+                }
+                "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" => {
+                    "Call browser__health_check, reconnect only if disconnected, then list pages again."
+                }
+                "ELEMENT_WAIT_TIMEOUT" | "PAGE_LOAD_TIMEOUT" | "SCRIPT_TIMEOUT" => {
+                    "The browser connection was preserved; inspect the current page with browser__take_snapshot before retrying."
+                }
+                _ => "Inspect error_message and the current browser page state before retrying.",
+            };
             structured.insert("error_code".into(), Value::String(code.into()));
             structured.insert("error_message".into(), Value::String(detail));
             structured.insert("retryable".into(), Value::Bool(retryable));
+            structured.insert("recovery_hint".into(), Value::String(recovery_hint.into()));
+            structured.insert(
+                "page_reacquire_required".into(),
+                Value::Bool(matches!(code, "NO_ACTIVE_PAGE" | "PAGE_CLOSED")),
+            );
+            structured.insert(
+                "element_reacquire_required".into(),
+                Value::Bool(code == "STALE_ELEMENT_REFERENCE"),
+            );
+            structured.insert(
+                "connection_reconnect_required".into(),
+                Value::Bool(matches!(
+                    code,
+                    "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST"
+                )),
+            );
         } else {
             structured.insert("error_code".into(), Value::Null);
             structured.insert("error_message".into(), Value::Null);
@@ -3272,8 +3322,8 @@ mod tests {
     use crate::tools::CancellationToken;
 
     use super::{
-        expand_proxy_placeholders, normalize_proxy_tool_result, parse_mcp_proxy_config,
-        proxy_catalog_digest, proxy_failure_reason, proxy_management_tools,
+        browser_proxy_error_code, expand_proxy_placeholders, normalize_proxy_tool_result,
+        parse_mcp_proxy_config, proxy_catalog_digest, proxy_failure_reason, proxy_management_tools,
         proxy_result_state_summary, sanitize_proxy_catalog, wrap_proxy_structured_result,
         McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
     };
@@ -3594,11 +3644,26 @@ mod tests {
             ),
             "devtools_channel_disconnected"
         );
-        assert!(ProxyClientError::Timeout {
+        assert!(!ProxyClientError::Timeout {
             method: "tools/call".into(),
             seconds: 30,
         }
         .invalidates_connection());
+        assert_eq!(
+            browser_proxy_error_code("browser__fill", "Element uid=12 is stale and not found"),
+            "STALE_ELEMENT_REFERENCE"
+        );
+        assert_eq!(
+            browser_proxy_error_code("browser__wait_for", "request timed out after 30 seconds"),
+            "ELEMENT_WAIT_TIMEOUT"
+        );
+        assert_eq!(
+            browser_proxy_error_code(
+                "browser__evaluate_script",
+                "request timed out after 30 seconds"
+            ),
+            "SCRIPT_TIMEOUT"
+        );
     }
 
     #[test]
