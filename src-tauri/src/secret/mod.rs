@@ -1,3 +1,3 @@
-mod keyring_store;
+mod store;
 
-pub use keyring_store::SecretStore;
+pub use store::SecretStore;

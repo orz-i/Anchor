@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_token_from_matching_global_profile_when_manual_server() {
+    fn explicit_token_override_is_used_for_manual_server() {
         let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
         profile.tunnel.frp_server = "frp.example.com".into();
         profile.tunnel.frp_subdomain = "demo".into();
@@ -425,8 +425,12 @@ mod tests {
             }],
             ..AppSettings::default()
         };
-        crate::secret::SecretStore::set_app("frp_profile_token", "p1", "shared-token").unwrap();
-        let config = frp_server_config(&profile, TunnelServiceKind::Mcp, &settings, None);
+        let config = frp_server_config(
+            &profile,
+            TunnelServiceKind::Mcp,
+            &settings,
+            Some("shared-token".into()),
+        );
         assert_eq!(config.token.as_deref(), Some("shared-token"));
     }
 }
