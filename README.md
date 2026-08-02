@@ -270,9 +270,11 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 环境要求：Node.js 20+、Rust stable，以及当前系统的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
-npm install
-npm run desktop
+pnpm install --frozen-lockfile
+pnpm desktop
 ```
+
+仓库使用 `pnpm@11.18.0` 作为依赖解析和锁文件的唯一来源。Windows 下采用 hoisted `node_modules`，避免启用 RedirectionGuard 时 pnpm 的 isolated 符号链接无法遍历。安装完成后，`npm run ...`、`npm exec`、`npx` 和 `pnpm exec` 均可正常使用；`.npmrc` 会阻止 npm 生成第二份锁文件。
 
 常用验证命令：
 

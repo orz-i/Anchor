@@ -262,9 +262,11 @@ The project uses a Workspace-first permission model:
 Requirements: Node.js 20+, Rust stable, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
 
 ```bash
-npm install
-npm run desktop
+pnpm install --frozen-lockfile
+pnpm desktop
 ```
+
+The repository uses `pnpm@11.18.0` as the single dependency-resolution and lockfile authority. On Windows it uses a hoisted `node_modules` layout so pnpm's isolated symlinks are not blocked when RedirectionGuard is enabled. After installation, `npm run ...`, `npm exec`, `npx`, and `pnpm exec` remain supported; `.npmrc` prevents npm from generating a second lockfile.
 
 Useful verification commands:
 

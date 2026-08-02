@@ -2,6 +2,7 @@
   "name": "anchor-desktop",
   "version": "0.1.23",
   "description": "Anchor desktop workspace gateway",
+  "packageManager": "pnpm@11.18.0",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
