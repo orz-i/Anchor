@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,6 +36,10 @@ const MAX_PROXY_CONCURRENT_REQUESTS: usize = 64;
 const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const BROWSER_DEBUGGING_PORT_BASE: u32 = 42_000;
+const BROWSER_DEBUGGING_PORT_SPAN: u32 = 20_000;
+const BROWSER_DEBUGGING_PORT_STEP: u32 = 7_919;
+const BROWSER_DEBUGGING_PORT_ATTEMPTS: u32 = 2_048;
 
 #[derive(Debug, Clone)]
 struct SanitizedProxyTool {
@@ -76,8 +82,9 @@ fn prepare_my_agent_browser_isolation(
             home.display()
         )
     })?;
-    let debugging_port = browser_debugging_port(workspace_id, &spec.name);
     let config_path = home.join("config.json");
+    let debugging_port =
+        select_managed_browser_debugging_port(&config_path, workspace_id, &spec.name)?;
     reconcile_managed_browser_config(&config_path, &user_data_dir, debugging_port)?;
     spec.env
         .insert("MY_AGENT_BROWSER_HOME".into(), display_proxy_path(&home));
@@ -161,7 +168,71 @@ fn is_my_agent_browser_spec(spec: &McpProxyServerSpec) -> bool {
 
 fn browser_debugging_port(workspace_id: &str, server_name: &str) -> u16 {
     let digest = Sha256::digest(format!("{workspace_id}:{server_name}"));
-    42_000 + u16::from_be_bytes([digest[0], digest[1]]) % 12_000
+    let offset =
+        u32::from(u16::from_be_bytes([digest[0], digest[1]])) % BROWSER_DEBUGGING_PORT_SPAN;
+    u16::try_from(BROWSER_DEBUGGING_PORT_BASE + offset)
+        .expect("managed browser debugging port is within the u16 range")
+}
+
+fn select_managed_browser_debugging_port(
+    config_path: &Path,
+    workspace_id: &str,
+    server_name: &str,
+) -> Result<u16, String> {
+    if let Some(existing) = read_browser_debugging_port(config_path) {
+        let existing = u32::from(existing);
+        let in_managed_range = (BROWSER_DEBUGGING_PORT_BASE
+            ..BROWSER_DEBUGGING_PORT_BASE + BROWSER_DEBUGGING_PORT_SPAN)
+            .contains(&existing);
+        let existing = u16::try_from(existing).expect("existing browser port remains u16");
+        if in_managed_range
+            && (browser_cdp_port_reachable(existing) || browser_port_is_bindable(existing))
+        {
+            return Ok(existing);
+        }
+    }
+
+    let preferred = u32::from(browser_debugging_port(workspace_id, server_name));
+    let preferred_offset = preferred.saturating_sub(BROWSER_DEBUGGING_PORT_BASE);
+    for attempt in 0..BROWSER_DEBUGGING_PORT_ATTEMPTS {
+        let offset = (preferred_offset + attempt.saturating_mul(BROWSER_DEBUGGING_PORT_STEP))
+            % BROWSER_DEBUGGING_PORT_SPAN;
+        let port = u16::try_from(BROWSER_DEBUGGING_PORT_BASE + offset)
+            .expect("managed browser debugging port is within the u16 range");
+        if browser_port_is_bindable(port) {
+            return Ok(port);
+        }
+    }
+
+    Err(format!(
+        "failed to find an available managed browser debugging port after {BROWSER_DEBUGGING_PORT_ATTEMPTS} deterministic probes"
+    ))
+}
+
+fn browser_port_is_bindable(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+fn browser_cdp_port_reachable(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) else {
+        return false;
+    };
+    let io_timeout = Some(Duration::from_millis(200));
+    let _ = stream.set_read_timeout(io_timeout);
+    let _ = stream.set_write_timeout(io_timeout);
+    if stream
+        .write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = [0u8; 8_192];
+    let Ok(bytes) = stream.read(&mut response) else {
+        return false;
+    };
+    let response = String::from_utf8_lossy(&response[..bytes]);
+    response.starts_with("HTTP/1.1 200") && response.contains("\"Browser\"")
 }
 
 fn read_browser_debugging_port(path: &Path) -> Option<u16> {
@@ -2256,8 +2327,7 @@ fn proxy_browser_cdp_reachable(client_status: &Value) -> Option<bool> {
         .and_then(Value::as_u64)
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port != 0)?;
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    Some(std::net::TcpStream::connect_timeout(&address, Duration::from_millis(75)).is_ok())
+    Some(browser_cdp_port_reachable(port))
 }
 
 fn proxy_connection_status(connection: &Value) -> &'static str {
@@ -3720,12 +3790,12 @@ mod tests {
     use crate::tools::CancellationToken;
 
     use super::{
-        browser_proxy_error_code, expand_proxy_placeholders, normalize_proxy_tool_result,
-        normalized_proxy_failure, parse_mcp_proxy_config, prepare_my_agent_browser_isolation,
-        proxy_browser_cdp_reachable, proxy_catalog_digest, proxy_connection_status,
-        proxy_failure_reason, proxy_management_tools, proxy_page_state, proxy_result_state_summary,
-        sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
-        McpProxyTransportSpec, ProxyClientError,
+        browser_debugging_port, browser_proxy_error_code, expand_proxy_placeholders,
+        normalize_proxy_tool_result, normalized_proxy_failure, parse_mcp_proxy_config,
+        prepare_my_agent_browser_isolation, proxy_browser_cdp_reachable, proxy_catalog_digest,
+        proxy_connection_status, proxy_failure_reason, proxy_management_tools, proxy_page_state,
+        proxy_result_state_summary, sanitize_proxy_catalog, wrap_proxy_structured_result,
+        McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -4219,6 +4289,33 @@ mod tests {
     }
 
     #[test]
+    fn managed_browser_skips_an_unbindable_deterministic_port() {
+        let root = tempfile::tempdir().expect("browser workspace");
+        let (workspace_id, blocked_port, _reservation) = (0..4_096)
+            .find_map(|index| {
+                let workspace_id = format!("blocked-workspace-{index}");
+                let port = browser_debugging_port(&workspace_id, "browser");
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .ok()
+                    .map(|listener| (workspace_id, port, listener))
+            })
+            .expect("find a bindable deterministic candidate");
+
+        let mut spec = test_spec();
+        spec.command = "node".into();
+        spec.args = vec!["tools/my-agent-browser/start-mcp.js".into()];
+        spec.cwd = root.path().to_path_buf();
+        spec.name = "browser".into();
+        let isolation = prepare_my_agent_browser_isolation(&mut spec, &workspace_id)
+            .expect("browser isolation")
+            .expect("managed browser");
+
+        assert_ne!(isolation.debugging_port, blocked_port);
+        std::net::TcpListener::bind(("127.0.0.1", isolation.debugging_port))
+            .expect("selected replacement port remains bindable");
+    }
+
+    #[test]
     fn proxy_catalog_applies_include_exclude_and_max_tools_deterministically() {
         let mut spec = test_spec();
         spec.include_tools = Some(
@@ -4375,14 +4472,24 @@ mod tests {
     fn browser_cdp_reachability_reflects_the_actual_debugging_port() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test listener");
         let port = listener.local_addr().expect("listener address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept CDP probe");
+            let mut request = [0u8; 1_024];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"Browser\":\"Chrome\"}",
+            )
+            .expect("write CDP response");
+        });
         let status = json!({
             "workspace_isolation": {
                 "debugging_port": port
             }
         });
         assert_eq!(proxy_browser_cdp_reachable(&status), Some(true));
+        server.join().expect("CDP probe server");
 
-        drop(listener);
         assert_eq!(proxy_browser_cdp_reachable(&status), Some(false));
         assert_eq!(proxy_browser_cdp_reachable(&json!({})), None);
         assert_eq!(
