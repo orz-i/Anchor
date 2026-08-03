@@ -1654,10 +1654,37 @@ mod tests {
     }
 
     fn browser_proxy_tools(count: usize) -> Vec<serde_json::Value> {
+        const DISCOVERY_TOOLS: &[&str] = &[
+            "health_check",
+            "reconnect",
+            "reset_session",
+            "list_pages",
+            "new_page",
+            "navigate_page",
+            "take_snapshot",
+            "take_screenshot",
+            "evaluate_script",
+            "click",
+            "fill",
+            "fill_form",
+            "wait_for",
+            "select_page",
+            "close_page",
+            "press_key",
+            "type_text",
+            "hover",
+            "handle_dialog",
+            "upload_file",
+            "resize_page",
+        ];
         (0..count)
             .map(|index| {
+                let name = DISCOVERY_TOOLS
+                    .get(index)
+                    .map(|suffix| format!("browser__{suffix}"))
+                    .unwrap_or_else(|| format!("browser__action_{index:02}"));
                 json!({
-                    "name": format!("browser__action_{index:02}"),
+                    "name": name,
                     "title": format!("Browser action {index}"),
                     "description": "Representative browser MCP action",
                     "inputSchema": {
@@ -1707,6 +1734,12 @@ mod tests {
             "server_info",
             "browser_build_info",
             "browser_wait_for_build",
+            "browser__health_check",
+            "browser__reconnect",
+            "browser__reset_session",
+            "browser__list_pages",
+            "browser__navigate_page",
+            "browser__take_snapshot",
         ] {
             assert!(
                 first_names.contains(required),
@@ -1717,7 +1750,7 @@ mod tests {
             !tool["name"]
                 .as_str()
                 .unwrap_or_default()
-                .starts_with("browser__action_")
+                .starts_with("browser__")
         }));
         let cursor = first["nextCursor"].as_str().expect("next cursor");
 
@@ -1725,6 +1758,35 @@ mod tests {
         let second_tools = second["tools"].as_array().expect("second tools");
         assert_eq!(first_tools.len() + second_tools.len(), catalog.tools.len());
         assert!(second.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn advanced_tools_list_keeps_browser_recovery_tools_on_the_first_page() {
+        let catalog = build_effective_catalog_from_parts("advanced", true, browser_proxy_tools(48))
+            .expect("advanced browser catalog");
+        let first = tools_list_result(&catalog, &json!({})).expect("first page");
+        let first_names = first["tools"]
+            .as_array()
+            .expect("first tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+
+        for required in [
+            "browser__health_check",
+            "browser__reconnect",
+            "browser__reset_session",
+            "browser__list_pages",
+            "browser__new_page",
+            "browser__navigate_page",
+            "browser__take_snapshot",
+            "browser__take_screenshot",
+        ] {
+            assert!(
+                first_names.contains(required),
+                "{required} missing from advanced first page"
+            );
+        }
     }
 
     #[test]

@@ -22,6 +22,37 @@ pub struct EffectiveCatalog {
     pub estimated_tokens: usize,
 }
 
+fn proxy_discovery_priority(tool: &Value) -> Option<usize> {
+    const FIRST_PAGE_SUFFIXES: &[&str] = &[
+        "health_check",
+        "reconnect",
+        "reset_session",
+        "list_pages",
+        "new_page",
+        "navigate_page",
+        "take_snapshot",
+        "take_screenshot",
+        "evaluate_script",
+        "click",
+        "fill",
+        "fill_form",
+        "wait_for",
+        "select_page",
+        "close_page",
+        "press_key",
+        "type_text",
+        "hover",
+        "handle_dialog",
+        "upload_file",
+        "resize_page",
+    ];
+    let name = tool.get("name").and_then(Value::as_str)?;
+    let suffix = name.rsplit_once("__").map_or(name, |(_, suffix)| suffix);
+    FIRST_PAGE_SUFFIXES
+        .iter()
+        .position(|candidate| *candidate == suffix)
+}
+
 impl EffectiveCatalog {
     pub fn metrics_value(&self) -> Value {
         json!({
@@ -60,7 +91,35 @@ pub fn build_effective_catalog_from_parts(
     proxy_tools.sort_by(tool_name_order);
     let local_count = tools.len();
     let proxy_count = proxy_tools.len();
-    tools.extend(proxy_tools);
+    if proxy_tools.is_empty() {
+        tools.extend(proxy_tools);
+    } else {
+        let core_names = crate::tools::registry::exposed_tool_names("core")
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let (mut core_tools, mut extended_tools): (Vec<_>, Vec<_>) =
+            tools.into_iter().partition(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| core_names.contains(name))
+            });
+        let (mut priority_proxy_tools, mut remaining_proxy_tools): (Vec<_>, Vec<_>) = proxy_tools
+            .into_iter()
+            .partition(|tool| proxy_discovery_priority(tool).is_some());
+        core_tools.sort_by(tool_name_order);
+        extended_tools.sort_by(tool_name_order);
+        priority_proxy_tools.sort_by(|left, right| {
+            proxy_discovery_priority(left)
+                .cmp(&proxy_discovery_priority(right))
+                .then_with(|| tool_name_order(left, right))
+        });
+        remaining_proxy_tools.sort_by(tool_name_order);
+
+        tools = core_tools;
+        tools.extend(priority_proxy_tools);
+        tools.extend(extended_tools);
+        tools.extend(remaining_proxy_tools);
+    }
 
     let mut names = HashSet::with_capacity(tools.len());
     let mut total_bytes = 0usize;
@@ -335,8 +394,37 @@ mod tests {
     }
 
     fn browser_tools(count: usize) -> Vec<serde_json::Value> {
+        const DISCOVERY_TOOLS: &[&str] = &[
+            "health_check",
+            "reconnect",
+            "reset_session",
+            "list_pages",
+            "new_page",
+            "navigate_page",
+            "take_snapshot",
+            "take_screenshot",
+            "evaluate_script",
+            "click",
+            "fill",
+            "fill_form",
+            "wait_for",
+            "select_page",
+            "close_page",
+            "press_key",
+            "type_text",
+            "hover",
+            "handle_dialog",
+            "upload_file",
+            "resize_page",
+        ];
         (0..count)
-            .map(|index| proxy_tool(&format!("browser__action_{index:02}")))
+            .map(|index| {
+                let name = DISCOVERY_TOOLS
+                    .get(index)
+                    .map(|suffix| format!("browser__{suffix}"))
+                    .unwrap_or_else(|| format!("browser__action_{index:02}"));
+                proxy_tool(&name)
+            })
             .collect()
     }
 
@@ -347,6 +435,23 @@ mod tests {
 
         assert_eq!(catalog.local_count, 61);
         assert_eq!(catalog.proxy_count, 48);
+        let first_page_names = catalog.tools[..64]
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<BTreeSet<_>>();
+        for required in [
+            "browser__health_check",
+            "browser__reconnect",
+            "browser__reset_session",
+            "browser__list_pages",
+            "browser__navigate_page",
+            "browser__take_snapshot",
+        ] {
+            assert!(
+                first_page_names.contains(required),
+                "{required} missing from advanced first page"
+            );
+        }
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
@@ -363,13 +468,13 @@ mod tests {
             !tool["name"]
                 .as_str()
                 .unwrap_or_default()
-                .starts_with("browser__action_")
+                .starts_with("browser__")
         }));
         assert!(catalog.tools[catalog.local_count..].iter().all(|tool| {
             tool["name"]
                 .as_str()
                 .unwrap_or_default()
-                .starts_with("browser__action_")
+                .starts_with("browser__")
         }));
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
