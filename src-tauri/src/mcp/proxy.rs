@@ -40,6 +40,9 @@ const BROWSER_DEBUGGING_PORT_BASE: u32 = 42_000;
 const BROWSER_DEBUGGING_PORT_SPAN: u32 = 20_000;
 const BROWSER_DEBUGGING_PORT_STEP: u32 = 7_919;
 const BROWSER_DEBUGGING_PORT_ATTEMPTS: u32 = 2_048;
+const BROWSER_MANAGEMENT_PAGE_TIMEOUT_SECONDS: u64 = 20;
+const PROXY_CONNECTION_REPLACEMENT_TIMEOUT_SECONDS: u64 = 45;
+const PROXY_TERMINATION_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
 struct SanitizedProxyTool {
@@ -49,6 +52,29 @@ struct SanitizedProxyTool {
     input_schema: Value,
     output_schema: Value,
     synthesized_output_schema: bool,
+}
+
+fn proxy_management_failure(connection: &Value, page_state: &Value) -> Option<String> {
+    if let Some(message) = page_state.get("error_message").and_then(Value::as_str) {
+        if !message.trim().is_empty() {
+            return Some(message.to_string());
+        }
+    }
+    let raw = page_state.get("raw").unwrap_or(&Value::Null);
+    if raw.get("isError").and_then(Value::as_bool) == Some(true) {
+        return proxy_text_content(raw)
+            .filter(|message| !message.trim().is_empty())
+            .or_else(|| Some("Downstream browser page-state request failed".into()));
+    }
+    if connection.get("operational").and_then(Value::as_bool) == Some(false) {
+        return connection
+            .get("last_error")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .map(ToString::to_string)
+            .or_else(|| Some("Downstream browser connection is not operational".into()));
+    }
+    None
 }
 
 fn prepare_my_agent_browser_isolation(
@@ -1681,28 +1707,89 @@ impl ProxyServer {
         kind: ProxyRouteKind,
         cancellation: &CancellationToken,
     ) -> Value {
-        let result = match kind {
+        let browser_server = self.is_browser_server();
+        let (mut result, page_state) = match kind {
+            ProxyRouteKind::HealthCheck if browser_server => (
+                Ok("healthy"),
+                self.bounded_management_page_state(cancellation).await,
+            ),
+            ProxyRouteKind::Reconnect if browser_server => {
+                let current = self.status(self.downstream_tools.len());
+                let operational = current
+                    .get("operational")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if operational {
+                    let page_state = self.bounded_management_page_state(cancellation).await;
+                    if proxy_management_failure(&current, &page_state).is_none() {
+                        (Ok("already_healthy"), page_state)
+                    } else {
+                        let result = self.replace_connection().await.map(|_| "reconnected");
+                        let page_state = if result.is_ok() {
+                            self.bounded_management_page_state(cancellation).await
+                        } else {
+                            self.last_known_page_state()
+                        };
+                        (result, page_state)
+                    }
+                } else {
+                    let result = self.replace_connection().await.map(|_| "reconnected");
+                    let page_state = if result.is_ok() {
+                        self.bounded_management_page_state(cancellation).await
+                    } else {
+                        self.last_known_page_state()
+                    };
+                    (result, page_state)
+                }
+            }
+            ProxyRouteKind::ResetSession if browser_server => {
+                let result = self.replace_connection().await.map(|_| "session_reset");
+                let page_state = if result.is_ok() {
+                    self.bounded_management_page_state(cancellation).await
+                } else {
+                    self.last_known_page_state()
+                };
+                (result, page_state)
+            }
             ProxyRouteKind::HealthCheck => {
-                self.probe_connection(cancellation).await.map(|_| "healthy")
+                let result = self.probe_connection(cancellation).await.map(|_| "healthy");
+                let page_state = if result.is_ok() {
+                    self.management_page_state(cancellation).await
+                } else {
+                    self.last_known_page_state()
+                };
+                (result, page_state)
             }
             ProxyRouteKind::Reconnect => {
-                if self.probe_connection(cancellation).await.is_ok() {
+                let result = if self.probe_connection(cancellation).await.is_ok() {
                     Ok("already_healthy")
                 } else {
                     self.replace_connection().await.map(|_| "reconnected")
-                }
+                };
+                let page_state = if result.is_ok() {
+                    self.management_page_state(cancellation).await
+                } else {
+                    self.last_known_page_state()
+                };
+                (result, page_state)
             }
             ProxyRouteKind::ResetSession => {
-                self.replace_connection().await.map(|_| "session_reset")
+                let result = self.replace_connection().await.map(|_| "session_reset");
+                let page_state = if result.is_ok() {
+                    self.management_page_state(cancellation).await
+                } else {
+                    self.last_known_page_state()
+                };
+                (result, page_state)
             }
-            ProxyRouteKind::Downstream => Ok("healthy"),
-        };
-        let page_state = if result.is_ok() {
-            self.management_page_state(cancellation).await
-        } else {
-            self.last_known_page_state()
+            ProxyRouteKind::Downstream => (Ok("healthy"), self.last_known_page_state()),
         };
         let connection = self.status(self.downstream_tools.len());
+        if result.is_ok() {
+            if let Some(message) = proxy_management_failure(&connection, &page_state) {
+                result = Err(message);
+            }
+        }
         let connection_status = proxy_connection_status(&connection);
         let transport_connected = connection
             .get("transport_connected")
@@ -1780,13 +1867,7 @@ impl ProxyServer {
     }
 
     async fn management_page_state(&self, cancellation: &CancellationToken) -> Value {
-        if !self
-            .spec
-            .tool_prefix
-            .to_ascii_lowercase()
-            .contains("browser")
-            && !self.spec.name.to_ascii_lowercase().contains("browser")
-        {
+        if !self.is_browser_server() {
             return self.last_known_page_state();
         }
         let Some(tool_name) = self
@@ -1826,6 +1907,34 @@ impl ProxyServer {
                 "error_message": error.to_string()
             }),
         }
+    }
+
+    async fn bounded_management_page_state(&self, cancellation: &CancellationToken) -> Value {
+        let limit = self
+            .spec
+            .request_timeout
+            .min(Duration::from_secs(BROWSER_MANAGEMENT_PAGE_TIMEOUT_SECONDS));
+        match timeout(limit, self.management_page_state(cancellation)).await {
+            Ok(page_state) => page_state,
+            Err(_) => json!({
+                "pages": [],
+                "selected_page": null,
+                "page_count": 0,
+                "error_code": "BROWSER_MANAGEMENT_TIMEOUT",
+                "error_message": format!(
+                    "browser page-state request timed out after {} seconds",
+                    limit.as_secs()
+                )
+            }),
+        }
+    }
+
+    fn is_browser_server(&self) -> bool {
+        self.spec
+            .tool_prefix
+            .to_ascii_lowercase()
+            .contains("browser")
+            || self.spec.name.to_ascii_lowercase().contains("browser")
     }
 
     fn last_known_page_state(&self) -> Value {
@@ -2048,11 +2157,39 @@ impl ProxyServer {
 
     async fn replace_connection(&self) -> Result<(), String> {
         self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
-        let previous = self.client.lock().await.take();
+        let previous = {
+            let mut client = self.client.lock().await;
+            client.take()
+        };
         if let Some(previous) = previous {
-            previous.terminate().await;
+            if timeout(
+                Duration::from_secs(PROXY_TERMINATION_TIMEOUT_SECONDS),
+                previous.terminate(),
+            )
+            .await
+            .is_err()
+            {
+                append_profile_log(
+                    &self.workspace_id,
+                    "stderr.log",
+                    &format!(
+                        "[mcp-proxy:{}] timed out terminating the previous downstream process",
+                        self.spec.name
+                    ),
+                );
+            }
         }
-        self.ensure_client().await.map(|_| ())
+        timeout(
+            Duration::from_secs(PROXY_CONNECTION_REPLACEMENT_TIMEOUT_SECONDS),
+            self.ensure_client(),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out replacing downstream MCP connection after {PROXY_CONNECTION_REPLACEMENT_TIMEOUT_SECONDS} seconds"
+            )
+        })?
+        .map(|_| ())
     }
 
     async fn invalidate_client(&self, failed: &Arc<McpProxyClient>) {
@@ -3298,8 +3435,19 @@ impl StdioMcpProxyClient {
     async fn terminate(&self) {
         self.mark_closed("downstream MCP connection terminated".into());
         if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            #[cfg(target_os = "windows")]
+            if let Some(pid) = child.id() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::platform::platform().terminate_process_tree(pid)
+                })
+                .await;
+            }
+            let _ = child.start_kill();
+            let _ = timeout(
+                Duration::from_secs(PROXY_TERMINATION_TIMEOUT_SECONDS),
+                child.wait(),
+            )
+            .await;
         }
     }
 
@@ -3796,6 +3944,7 @@ mod tests {
         proxy_connection_status, proxy_failure_reason, proxy_management_tools, proxy_page_state,
         proxy_result_state_summary, sanitize_proxy_catalog, wrap_proxy_structured_result,
         McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
+        StdioMcpProxyClient,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -4631,6 +4780,135 @@ mod tests {
             "DOWNSTREAM_SCHEMA_MISMATCH"
         );
         assert_eq!(invalid["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn browser_health_check_rejects_downstream_page_errors() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("browser_health_error.py");
+        fs::write(
+            &script,
+            r#"import json
+import sys
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "browser", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "list_pages", "description": "List pages", "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": "Chrome failed to start (port unavailable)"}], "isError": True}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .expect("write browser fixture");
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![McpProxyServerSpec {
+                    name: "browser".into(),
+                    transport: McpProxyTransportSpec::Stdio,
+                    command: python.display().to_string(),
+                    args: vec![script.display().to_string()],
+                    env: BTreeMap::new(),
+                    cwd: temp.path().to_path_buf(),
+                    tool_prefix: "browser".into(),
+                    include_tools: None,
+                    exclude_tools: BTreeSet::new(),
+                    max_tools: None,
+                    max_concurrent_requests: 2,
+                    request_timeout: Duration::from_secs(3),
+                    management_tools: true,
+                }],
+                "browser-health-error-test",
+            )
+            .await;
+
+        let health = registry
+            .call_tool("browser__health_check", &json!({}))
+            .await
+            .expect("health route")
+            .expect("health result");
+        assert_eq!(health["structuredContent"]["ok"], false);
+        assert_eq!(health["structuredContent"]["status"], "unhealthy");
+        assert_eq!(health["isError"], true);
+        assert!(health["structuredContent"]["error_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Chrome failed to start")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn stdio_termination_kills_windows_descendant_processes() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("process_tree_mcp.py");
+        let child_pid_path = temp.path().join("child.pid");
+        fs::write(
+            &script,
+            r#"import json
+import subprocess
+import sys
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(sys.argv[1], "w", encoding="utf-8") as marker:
+    marker.write(str(child.pid))
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "tree", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": []}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .expect("write process-tree fixture");
+
+        let mut spec = test_spec();
+        spec.command = python.display().to_string();
+        spec.args = vec![
+            script.display().to_string(),
+            child_pid_path.display().to_string(),
+        ];
+        spec.cwd = temp.path().to_path_buf();
+        spec.name = "tree".into();
+        let (client, _) = StdioMcpProxyClient::connect(spec, "process-tree-test")
+            .await
+            .expect("connect process-tree fixture");
+        let child_pid = fs::read_to_string(&child_pid_path)
+            .expect("read child pid")
+            .parse::<u32>()
+            .expect("child pid number");
+        assert!(crate::platform::platform().is_process_alive(child_pid));
+
+        client.terminate().await;
+        for _ in 0..20 {
+            if !crate::platform::platform().is_process_alive(child_pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!crate::platform::platform().is_process_alive(child_pid));
     }
 
     #[test]
