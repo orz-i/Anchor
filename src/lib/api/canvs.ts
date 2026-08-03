@@ -15,6 +15,7 @@ export interface CanvsTask {
   objective: string;
   status: CanvsTaskStatus;
   current: boolean;
+  active: boolean;
   completedSteps: string[];
   pendingSteps: string[];
   progressPercent: number;

@@ -24,6 +24,20 @@ pub fn task_list_page(workspace_name: &str, list: &CanvsTaskList) -> String {
     )
 }
 
+fn task_scope_badges(task: &CanvsTask) -> String {
+    let mut badges = String::new();
+    if task.active {
+        badges.push_str("<span class='badge current'>活动任务</span>");
+    }
+    if task.current {
+        badges.push_str("<span class='badge neutral'>默认任务</span>");
+    }
+    if badges.is_empty() {
+        badges.push_str("<span class='badge history'>历史任务</span>");
+    }
+    badges
+}
+
 pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> String {
     let Some(task) = snapshot.task.as_ref() else {
         return error_page(
@@ -134,14 +148,10 @@ pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> Strin
             .collect::<Vec<_>>()
             .join("")
     };
-    let current_badge = if task.current {
-        "<span class='badge current'>当前任务</span>"
-    } else {
-        "<span class='badge history'>历史任务</span>"
-    };
+    let scope_badges = task_scope_badges(task);
     let total_steps = task.completed_steps.len() + task.pending_steps.len();
     let body = format!(
-        "<nav><a href='../../canvs'>← 返回任务列表</a><span>{}</span></nav><header class='detail-hero'><div class='badges'>{current_badge}<span class='badge {}'>{}</span></div><h1>{}</h1><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><p class='subtitle'>更新于 <time data-time='{}'>{}</time> · 分支 {} · HEAD {}</p></header><main class='detail-grid'><section class='panel wide'><h2>步骤</h2><div class='columns'><div><h3>已完成</h3>{completed}</div><div><h3>待处理</h3>{pending}</div></div></section><section class='panel'><h2>任务基线</h2><dl class='facts'><div><dt>初始 HEAD</dt><dd><code>{}</code></dd></div><div><dt>当前预期 HEAD</dt><dd><code>{}</code></dd></div><div><dt>最新变更</dt><dd><code>{}</code></dd></div><div><dt>最新验证</dt><dd><code>{}</code></dd></div></dl></section><section class='panel'><h2>最近操作</h2>{operations}</section><section class='panel'><h2>有效验证</h2>{verifications}</section><section class='panel'><h2>分段提交</h2>{changes}</section><section class='panel'><h2>任务事件</h2>{events}</section></main>",
+        "<nav><a href='../../canvs'>← 返回任务列表</a><span>{}</span></nav><header class='detail-hero'><div class='badges'>{scope_badges}<span class='badge {}'>{}</span></div><h1>{}</h1><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><p class='subtitle'>更新于 <time data-time='{}'>{}</time> · 分支 {} · HEAD {}</p></header><main class='detail-grid'><section class='panel wide'><h2>步骤</h2><div class='columns'><div><h3>已完成</h3>{completed}</div><div><h3>待处理</h3>{pending}</div></div></section><section class='panel'><h2>任务基线</h2><dl class='facts'><div><dt>初始 HEAD</dt><dd><code>{}</code></dd></div><div><dt>当前预期 HEAD</dt><dd><code>{}</code></dd></div><div><dt>最新变更</dt><dd><code>{}</code></dd></div><div><dt>最新验证</dt><dd><code>{}</code></dd></div></dl></section><section class='panel'><h2>最近操作</h2>{operations}</section><section class='panel'><h2>有效验证</h2>{verifications}</section><section class='panel'><h2>分段提交</h2>{changes}</section><section class='panel'><h2>任务事件</h2>{events}</section></main>",
         escape_html(workspace_name),
         status_class(&task.status),
         escape_html(&status_label(&task.status)),
@@ -163,7 +173,7 @@ pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> Strin
     page(
         &format!("{} · Canvs", escape_html(&task.objective)),
         &body,
-        if task.current { 5_000 } else { 0 },
+        if task.active { 5_000 } else { 0 },
     )
 }
 
@@ -192,14 +202,10 @@ pub fn error_page(workspace_name: &str, title: &str, message: &str) -> String {
 }
 
 fn task_card(task: &CanvsTask) -> String {
-    let current = if task.current {
-        "<span class='badge current'>当前任务</span>"
-    } else {
-        "<span class='badge history'>历史任务</span>"
-    };
+    let scope_badges = task_scope_badges(task);
     let total = task.completed_steps.len() + task.pending_steps.len();
     format!(
-        "<a class='task-card' href='./canvs/tasks/{}'><div class='badges'>{current}<span class='badge {}'>{}</span></div><h2>{}</h2><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><footer><span>更新于 <time data-time='{}'>{}</time></span><span>{} · {}</span></footer></a>",
+        "<a class='task-card' href='./canvs/tasks/{}'><div class='badges'>{scope_badges}<span class='badge {}'>{}</span></div><h2>{}</h2><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><footer><span>更新于 <time data-time='{}'>{}</time></span><span>{} · {}</span></footer></a>",
         escape_attr(&task.id),
         status_class(&task.status),
         escape_html(&status_label(&task.status)),
@@ -399,6 +405,7 @@ mod tests {
                     objective: "objective".into(),
                     status: "active".into(),
                     current: true,
+                    active: true,
                     completed_steps: Vec::new(),
                     pending_steps: Vec::new(),
                     progress_percent: 0,

@@ -2,6 +2,7 @@ mod markdown;
 mod model;
 mod storage;
 
+use std::collections::HashSet;
 use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -157,11 +158,19 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             )
         };
 
+    let parallel_history_session_keys = ctx
+        .harness
+        .active_tasks()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|task| task.history_session_key)
+        .collect::<HashSet<_>>();
     let paused_previous_sessions = pause_other_active_sessions(
         &history_dir,
         &report.documents,
         current_number,
         &mut current_archive_bytes,
+        &parallel_history_session_keys,
     )?;
     if !paused_previous_sessions.is_empty() {
         warnings.push(format!(
@@ -382,12 +391,17 @@ fn pause_other_active_sessions(
     documents: &[model::HistoryDocument],
     current_number: u64,
     archive_bytes: &mut u64,
+    preserved_session_keys: &HashSet<String>,
 ) -> WorkspaceResult<Vec<u64>> {
     let timestamp = now_timestamp();
     let mut paused = Vec::new();
     for document in documents {
         if document.number == current_number
             || normalized_status(document.status.as_deref()) != "active"
+            || document
+                .session_key
+                .as_ref()
+                .is_some_and(|session_key| preserved_session_keys.contains(session_key))
         {
             continue;
         }
@@ -596,11 +610,15 @@ pub fn auto_checkpoint_after_tool(
     tool_name: &str,
     args: &Value,
     output: &Value,
+    task_id: Option<&str>,
 ) -> WorkspaceResult<Option<Value>> {
     if !is_auto_checkpoint_tool(tool_name, args, output) {
         return Ok(None);
     }
-    let Some(task) = ctx.harness.current_task().ok().flatten() else {
+    let task = task_id
+        .and_then(|task_id| ctx.harness.task(task_id).ok())
+        .or_else(|| ctx.harness.current_task().ok().flatten());
+    let Some(task) = task else {
         return Ok(None);
     };
     let (Some(session_key), Some(expected_path)) = (
@@ -672,7 +690,7 @@ pub fn auto_checkpoint_after_tool(
             files_changed.push(path.to_string());
         }
     }
-    let harness = ctx.harness.status().ok();
+    let harness = ctx.harness.status_for_task(Some(&task.id)).ok();
     let mut runtime_state = vec![
         format!("task_id={}", task.id),
         format!("task_status={:?}", task.status).to_ascii_lowercase(),

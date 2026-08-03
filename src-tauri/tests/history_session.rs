@@ -512,6 +512,78 @@ fn bootstrap_keeps_only_the_current_history_session_active() {
 }
 
 #[test]
+fn bootstrap_preserves_history_sessions_bound_to_parallel_active_tasks() {
+    let (workspace, _harness, ctx) = test_context();
+    let first = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "parallel-history-one"}),
+    );
+    let first = assert_ok(&first);
+    let first_task = ctx
+        .harness
+        .start_task("parallel task one")
+        .expect("first task");
+    ctx.harness
+        .bind_history_session(
+            &first_task.id,
+            "parallel-history-one",
+            first["current_path"].as_str().expect("first path"),
+        )
+        .expect("bind first history");
+
+    let second = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "parallel-history-two"}),
+    );
+    let second = assert_ok(&second);
+    assert_eq!(second["paused_previous_sessions"], json!([]));
+    let second_task = ctx
+        .harness
+        .start_task("parallel task two")
+        .expect("second task");
+    ctx.harness
+        .bind_history_session(
+            &second_task.id,
+            "parallel-history-two",
+            second["current_path"].as_str().expect("second path"),
+        )
+        .expect("bind second history");
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+            .expect("first parallel history")
+            .contains("**Status:** active")
+    );
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
+            .expect("second parallel history")
+            .contains("**Status:** active")
+    );
+
+    ctx.harness
+        .transition(&first_task.id, anchor_lib::harness::TaskStatus::Paused)
+        .expect("pause first task");
+    let third = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "parallel-history-three"}),
+    );
+    let third = assert_ok(&third);
+    assert_eq!(third["paused_previous_sessions"], json!([1]));
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+            .expect("paused first history")
+            .contains("**Status:** paused")
+    );
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
+            .expect("preserved second history")
+            .contains("**Status:** active")
+    );
+}
+
+#[test]
 fn bootstrap_bounds_large_archives_and_latest_handoff() {
     let (workspace, _harness, ctx) = test_context();
     let dir = workspace.path().join("docs/history-session");

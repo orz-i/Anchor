@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 18;
+pub const CATALOG_VERSION: u32 = 19;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -38,7 +38,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "begin_work_session",
         "Begin work session",
-        "Create or resume a History Session, create a Harness Task, capture its baseline, and bind both lifecycles.",
+        "Create or resume a History Session and bind the calling MCP session to its Harness Task. Other work sessions may remain active in parallel.",
         false,
         false,
         false,
@@ -158,7 +158,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "project_state",
         "Project state",
-        "Return the current project, task, change, and verification state.",
+        "Return the current project plus the selected task and all active parallel task ids.",
         true,
         false,
         false,
@@ -166,7 +166,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "start_task",
         "Start task",
-        "Start a durable coding task and capture the workspace baseline.",
+        "Start a durable coding task, capture the shared workspace baseline, and bind it to the calling MCP session without pausing other tasks unless pause_current=true.",
         false,
         false,
         false,
@@ -214,7 +214,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "pause_task",
         "Pause task",
-        "Pause the active coding task.",
+        "Pause one explicit coding task without changing other active tasks.",
         false,
         false,
         false,
@@ -222,7 +222,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "resume_task",
         "Resume task",
-        "Resume a paused or failed coding task.",
+        "Resume a paused or failed coding task and bind it to the calling MCP session without pausing peers.",
         false,
         false,
         false,
@@ -230,7 +230,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "switch_task",
         "Switch task",
-        "Pause the current task and activate an existing paused task using the persisted workspace task pointer.",
+        "Bind the calling MCP session to an existing task and activate it if paused, without pausing other active tasks.",
         false,
         false,
         false,
@@ -246,7 +246,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "task_context",
         "Task context",
-        "Return a bounded durable task context for a new conversation.",
+        "Return bounded durable context for an explicit task or the task bound to the calling MCP session.",
         true,
         false,
         false,
@@ -1767,6 +1767,9 @@ pub fn output_schema(name: &str) -> Value {
             json!({
                 "schema_version": { "type": "integer", "minimum": 1 },
                 "workspace_id": { "type": "string", "minLength": 1 },
+                "default_task_id": { "type": ["string", "null"] },
+                "active_task_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                "active_task_count": { "type": "integer", "minimum": 0 },
                 "task_id": { "type": ["string", "null"] },
                 "task_state": { "type": ["string", "null"] },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
@@ -1789,6 +1792,9 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "schema_version",
                 "workspace_id",
+                "default_task_id",
+                "active_task_ids",
+                "active_task_count",
                 "session_status",
                 "next_stage_started",
                 "writable",
@@ -1932,6 +1938,7 @@ pub fn output_schema(name: &str) -> Value {
                 "verification_status": { "type": "string", "enum": ["missing", "failed", "verified", "verified_with_exceptions", "unverified"] },
                 "closed": { "type": "boolean" },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
+                "requested_session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
                 "next_stage_started": { "type": "boolean", "const": false },
                 "reason": { "type": "string" },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
@@ -1979,6 +1986,9 @@ pub fn output_schema(name: &str) -> Value {
                 "committed_files": { "type": "array", "items": { "type": "string" } },
                 "net_changed_files": { "type": "array", "items": { "type": "string" } },
                 "working_tree_files": { "type": "array", "items": { "type": "string" } },
+                "task_working_tree_files": { "type": "array", "items": { "type": "string" } },
+                "peer_working_tree_files": { "type": "array", "items": { "type": "string" } },
+                "unattributed_working_tree_files": { "type": "array", "items": { "type": "string" } },
                 "runtime_artifacts": { "type": "array", "items": { "type": "string" } },
                 "ignored_files": { "type": "array", "items": { "type": "string" } },
                 "verification": { "type": "array", "items": { "type": "object" } },
@@ -2407,7 +2417,7 @@ pub fn input_schema(name: &str) -> Value {
                     "type": "string",
                     "enum": ["active", "paused", "completed"],
                     "default": "paused",
-                    "description": "Persisted overall Harness session state after the task closes."
+                    "description": "Requested workspace session state after this task closes. If peer tasks remain active, the actual returned session_status stays active."
                 }
             },
             "required": ["task_id"],

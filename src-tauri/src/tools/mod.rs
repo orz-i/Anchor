@@ -21,7 +21,7 @@ pub use cancellation::CancellationToken;
 pub use catalog::{build_effective_catalog, build_effective_catalog_from_parts, EffectiveCatalog};
 pub use context::{SharedToolContext, ToolContext};
 /// 唯一工具执行入口；MCP 与 Actions 必须调用此函数，不得分叉实现。
-pub use dispatch::{call_tool, call_tool_with_cancellation};
+pub use dispatch::{call_tool, call_tool_for_session, call_tool_with_cancellation};
 pub use policy::{validate_actions_exposure, PolicySettings};
 pub use registry::{
     exposed_tool_names, is_allowed_tool, list_tools, list_tools_for_profile, MUTATING_TOOLS,

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::harness::Harness;
 use crate::tools::catalog::EffectiveCatalog;
@@ -21,6 +21,9 @@ pub struct ToolContext {
     pub skills: crate::skills::SkillCatalog,
     default_cwd: Mutex<PathBuf>,
     session_default_cwds: Mutex<HashMap<String, PathBuf>>,
+    session_task_ids: Mutex<HashMap<String, String>>,
+    unbound_task_sessions: Mutex<HashSet<String>>,
+    workspace_mutation_lock: Mutex<()>,
     pub sessions: SessionStore,
     pub command_cost: CommandCostGuard,
     published_catalog: Mutex<Option<EffectiveCatalog>>,
@@ -87,6 +90,9 @@ impl ToolContext {
             skills: crate::skills::SkillCatalog::new(root.clone()),
             default_cwd: Mutex::new(root),
             session_default_cwds: Mutex::new(HashMap::new()),
+            session_task_ids: Mutex::new(HashMap::new()),
+            unbound_task_sessions: Mutex::new(HashSet::new()),
+            workspace_mutation_lock: Mutex::new(()),
             sessions: SessionStore::new(),
             command_cost,
             published_catalog: Mutex::new(None),
@@ -167,6 +173,109 @@ impl ToolContext {
             .lock()
             .expect("session cwd lock")
             .remove(session_id);
+        self.session_task_ids
+            .lock()
+            .expect("session task lock")
+            .remove(session_id);
+        self.unbound_task_sessions
+            .lock()
+            .expect("unbound task session lock")
+            .remove(session_id);
+    }
+
+    pub fn bind_task_for_session(
+        &self,
+        session_id: Option<&str>,
+        task_id: &str,
+    ) -> Result<crate::harness::model::TaskSession, String> {
+        let task = self
+            .harness
+            .task(task_id)
+            .map_err(|error| error.to_string())?;
+        if !task.status.is_writable() {
+            return Err(format!("Task {task_id} is not writable"));
+        }
+        if let Some(session_id) = session_id {
+            self.session_task_ids
+                .lock()
+                .expect("session task lock")
+                .insert(session_id.to_string(), task_id.to_string());
+            self.unbound_task_sessions
+                .lock()
+                .expect("unbound task session lock")
+                .remove(session_id);
+        }
+        Ok(task)
+    }
+
+    pub fn task_for_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<crate::harness::model::TaskSession> {
+        if let Some(session_id) = session_id {
+            if let Some(task) = self.bound_task_for_session(Some(session_id)) {
+                return Some(task);
+            }
+            if self
+                .unbound_task_sessions
+                .lock()
+                .expect("unbound task session lock")
+                .contains(session_id)
+            {
+                return None;
+            }
+        }
+        let writable_tasks = self
+            .harness
+            .list_tasks()
+            .ok()?
+            .into_iter()
+            .filter(|task| task.status.is_writable())
+            .collect::<Vec<_>>();
+        if writable_tasks.len() > 1 {
+            return None;
+        }
+        let task = writable_tasks.into_iter().next();
+        if let (Some(session_id), Some(task)) = (session_id, task.as_ref()) {
+            self.session_task_ids
+                .lock()
+                .expect("session task lock")
+                .insert(session_id.to_string(), task.id.clone());
+        }
+        task
+    }
+
+    pub fn bound_task_for_session(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<crate::harness::model::TaskSession> {
+        let session_id = session_id?;
+        let task_id = self
+            .session_task_ids
+            .lock()
+            .expect("session task lock")
+            .get(session_id)
+            .cloned()?;
+        if let Ok(task) = self.harness.task(&task_id) {
+            if task.status.is_writable() {
+                return Some(task);
+            }
+        }
+        self.session_task_ids
+            .lock()
+            .expect("session task lock")
+            .remove(session_id);
+        self.unbound_task_sessions
+            .lock()
+            .expect("unbound task session lock")
+            .insert(session_id.to_string());
+        None
+    }
+
+    pub fn workspace_mutation_guard(&self) -> MutexGuard<'_, ()> {
+        self.workspace_mutation_lock
+            .lock()
+            .expect("workspace mutation lock")
     }
 
     pub fn publish_catalog(&self, current: EffectiveCatalog) -> (EffectiveCatalog, bool) {

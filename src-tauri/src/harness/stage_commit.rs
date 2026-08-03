@@ -375,7 +375,13 @@ fn execute_new_workflow(
     }
 
     for command in checks.into_iter().skip(receipt.checks.len()) {
-        let mut result = run_required_check(ctx, &command, check_timeout_ms, cancellation)?;
+        let mut result = run_required_check(
+            ctx,
+            &receipt.task_id,
+            &command,
+            check_timeout_ms,
+            cancellation,
+        )?;
         let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
         let verification = ctx
             .harness
@@ -856,7 +862,12 @@ fn start_deferred_check(
             json!({"command": command}),
         )
     })?;
-    let result = exec::exec_command_with_cancellation(ctx, &arguments, cancellation)?;
+    let result = exec::exec_command_with_cancellation(
+        ctx,
+        &arguments,
+        cancellation,
+        Some(&receipt.task_id),
+    )?;
     if result.get("status").and_then(Value::as_str) == Some("running") {
         receipt.current_session_id = result
             .get("session_id")
@@ -1027,6 +1038,7 @@ fn resume_checkpoint(
 
 fn run_required_check(
     ctx: &ToolContext,
+    task_id: &str,
     command: &str,
     timeout_ms: u64,
     cancellation: &CancellationToken,
@@ -1053,7 +1065,8 @@ fn run_required_check(
             json!({"command": command}),
         )
     })?;
-    let mut result = exec::exec_command_with_cancellation(ctx, &arguments, cancellation)?;
+    let mut result =
+        exec::exec_command_with_cancellation(ctx, &arguments, cancellation, Some(task_id))?;
     while result.get("status").and_then(Value::as_str) == Some("running") {
         let session_id = result
             .get("session_id")

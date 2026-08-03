@@ -236,9 +236,8 @@ fn record_verification_from_output(
             object.insert(
                 "affected_task_status".into(),
                 ctx.harness
-                    .current_task()
+                    .task(task_id)
                     .ok()
-                    .flatten()
                     .map(|task| serde_json::to_value(task.status).unwrap_or(Value::Null))
                     .unwrap_or(Value::Null),
             );
@@ -358,6 +357,23 @@ pub fn call_tool_with_cancellation(
     call_tool_impl(ctx, name, args, cancellation, true, None)
 }
 
+#[doc(hidden)]
+pub fn call_tool_for_session(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    session_id: &str,
+) -> Value {
+    call_tool_impl(
+        ctx,
+        name,
+        args,
+        &CancellationToken::default(),
+        true,
+        Some(session_id),
+    )
+}
+
 pub(crate) fn call_tool_prevalidated_with_session_cancellation(
     ctx: &ToolContext,
     name: &str,
@@ -399,28 +415,48 @@ fn call_tool_impl(
         let output = policy_tool_err(e);
         return normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
     }
+    let mut selected_task = if name == "begin_work_session" {
+        ctx.bound_task_for_session(session_id)
+    } else {
+        ctx.task_for_session(session_id)
+    };
     if name != "begin_work_session" {
-        if let Err(error) = ctx
-            .harness
-            .resume_paused_task_for_activity(name, session_id)
-        {
-            return attach_harness_status(
-                ctx,
-                tool_err_code(error.code(), error.to_string(), "internal"),
-                false,
-            );
+        if let Some(task) = selected_task.as_ref() {
+            match ctx
+                .harness
+                .resume_task_for_activity(&task.id, name, session_id)
+            {
+                Ok(task) => selected_task = Some(task),
+                Err(error) => {
+                    return attach_harness_status(
+                        ctx,
+                        tool_err_code(error.code(), error.to_string(), "internal"),
+                        false,
+                        session_id,
+                    )
+                }
+            }
         }
     }
+    let _workspace_mutation_guard =
+        requires_write_baseline(name, &effective_args).then(|| ctx.workspace_mutation_guard());
 
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
-        let active_task = ctx.harness.current_task().ok().flatten();
+        let active_task = selected_task.clone();
+        let requested_task_id = args
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let operation_task_id = requested_task_id
+            .as_deref()
+            .or_else(|| active_task.as_ref().map(|task| task.id.as_str()));
         let operation = if name == "operation_log" {
             None
         } else {
             ctx.harness
                 .record_operation(
                     None,
-                    active_task.as_ref().map(|task| task.id.as_str()),
+                    operation_task_id,
                     session_id,
                     name,
                     "started",
@@ -429,17 +465,19 @@ fn call_tool_impl(
                 )
                 .ok()
         };
-        let mut output = match crate::harness::tools::call(ctx, name, args, cancellation) {
-            Ok(value) => value,
-            Err(error) => attach_harness_status(ctx, tool_err(error), false),
-        };
+        let mut output =
+            match crate::harness::tools::call(ctx, name, args, cancellation, session_id) {
+                Ok(value) => value,
+                Err(error) => attach_harness_status(ctx, tool_err(error), false, session_id),
+            };
+        let result_task_id = output
+            .get("task")
+            .and_then(|task| task.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(requested_task_id)
+            .or_else(|| active_task.as_ref().map(|task| task.id.clone()));
         if let Some(operation) = operation {
-            let result_task_id = output
-                .get("task")
-                .and_then(|task| task.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| active_task.as_ref().map(|task| task.id.clone()));
             if let Some(object) = output.as_object_mut() {
                 object.insert("operation_id".into(), Value::String(operation.id.clone()));
                 object.insert("trace_id".into(), Value::String(operation.id.clone()));
@@ -458,11 +496,11 @@ fn call_tool_impl(
                 operation_result_summary(name, &output),
             );
         }
-        attach_auto_checkpoint(ctx, name, args, &mut output);
+        attach_auto_checkpoint(ctx, name, args, &mut output, result_task_id.as_deref());
         return output;
     }
 
-    let active_task = ctx.harness.current_task().ok().flatten();
+    let active_task = selected_task;
     let retained_session = if matches!(name, "write_stdin" | "kill_session" | "wait_command") {
         effective_args
             .get("session_id")
@@ -491,6 +529,7 @@ fn call_tool_impl(
                     ctx,
                     tool_err_code(error.code(), error.to_string(), "permission"),
                     false,
+                    session_id,
                 );
             }
             let _ = ctx.harness.record_event(
@@ -546,7 +585,12 @@ fn call_tool_impl(
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
         "remove_path" => recovery::remove_path(ctx, &effective_args),
-        "exec_command" => exec::exec_command_with_cancellation(ctx, &effective_args, cancellation),
+        "exec_command" => exec::exec_command_with_cancellation(
+            ctx,
+            &effective_args,
+            cancellation,
+            active_task.as_ref().map(|task| task.id.as_str()),
+        ),
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
         "wait_command" => session::wait_command(&ctx.sessions, &effective_args),
@@ -596,7 +640,7 @@ fn call_tool_impl(
         }
     }
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
-        output = attach_harness_status(ctx, output, task_id.is_none());
+        output = attach_harness_status(ctx, output, task_id.is_none(), session_id);
     }
     if let Some(task_id) = task_id.as_deref() {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
@@ -742,30 +786,36 @@ fn call_tool_impl(
             operation_result_summary(name, &output),
         );
     }
-    attach_auto_checkpoint(ctx, name, &effective_args, &mut output);
+    attach_auto_checkpoint(
+        ctx,
+        name,
+        &effective_args,
+        &mut output,
+        active_task.as_ref().map(|task| task.id.as_str()),
+    );
     output
 }
 
-fn attach_auto_checkpoint(ctx: &ToolContext, name: &str, args: &Value, output: &mut Value) {
+fn attach_auto_checkpoint(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    output: &mut Value,
+    task_id: Option<&str>,
+) {
     let baseline_was_current = ctx
         .harness
-        .status()
+        .status_for_task(task_id)
         .ok()
         .and_then(|status| status.baseline_matches)
         == Some(true);
-    match history::auto_checkpoint_after_tool(ctx, name, args, output) {
+    match history::auto_checkpoint_after_tool(ctx, name, args, output, task_id) {
         Ok(Some(checkpoint)) => {
             if baseline_was_current {
-                if let Some(task_id) = ctx
-                    .harness
-                    .current_task()
-                    .ok()
-                    .flatten()
-                    .map(|task| task.id)
-                {
+                if let Some(task_id) = task_id {
                     let _ = ctx
                         .harness
-                        .refresh_expected_state_for_operation(&task_id, None);
+                        .refresh_expected_state_for_operation(task_id, None);
                 }
             }
             if let Some(object) = output.as_object_mut() {
@@ -937,6 +987,9 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
         "exec_command"
         | "history_session_checkpoint"
+        | "stage_commit"
+        | "wait_stage_commit"
+        | "remove_path"
         | "git_stage"
         | "git_commit"
         | "git_restore"
@@ -987,8 +1040,17 @@ fn operation_input(args: &Value) -> Value {
     })
 }
 
-fn attach_harness_status(ctx: &ToolContext, mut output: Value, standalone: bool) -> Value {
-    if let Ok(mut status) = ctx.harness.status() {
+fn attach_harness_status(
+    ctx: &ToolContext,
+    mut output: Value,
+    standalone: bool,
+    session_id: Option<&str>,
+) -> Value {
+    let selected = ctx.task_for_session(session_id);
+    if let Ok(mut status) = ctx
+        .harness
+        .status_for_task(selected.as_ref().map(|task| task.id.as_str()))
+    {
         if standalone && status.task_id.is_none() {
             status.next_actions.clear();
         }

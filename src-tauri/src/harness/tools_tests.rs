@@ -33,6 +33,7 @@ fn close_outbox_recovers_checkpoint_after_history_storage_returns() {
             "workspace_root": workspace.to_string_lossy()
         }),
         &CancellationToken::default(),
+        None,
     )
     .expect("begin");
     let task_id = started["work_session"]["task_id"]

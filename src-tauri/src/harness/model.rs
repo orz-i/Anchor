@@ -144,6 +144,9 @@ pub struct ExpectedWorkspaceState {
 pub struct HarnessStatus {
     pub schema_version: u32,
     pub workspace_id: String,
+    pub default_task_id: Option<String>,
+    pub active_task_ids: Vec<String>,
+    pub active_task_count: usize,
     pub task_id: Option<String>,
     pub task_state: Option<TaskStatus>,
     pub task_updated_at: Option<String>,
@@ -390,6 +393,7 @@ pub struct ProjectState {
     pub total_files: usize,
     pub truncated: bool,
     pub active_task_id: Option<String>,
+    pub active_task_ids: Vec<String>,
     pub task: Option<TaskSession>,
     pub recent_events: usize,
 }
@@ -398,6 +402,8 @@ pub struct ProjectState {
 pub struct WorkspaceHarnessState {
     pub schema_version: u32,
     pub active_task_id: Option<String>,
+    #[serde(default)]
+    pub active_task_ids: Vec<String>,
     #[serde(default)]
     pub session_status: HarnessSessionStatus,
     #[serde(default)]

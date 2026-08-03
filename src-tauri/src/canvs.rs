@@ -47,6 +47,7 @@ pub struct CanvsTask {
     pub objective: String,
     pub status: String,
     pub current: bool,
+    pub active: bool,
     pub completed_steps: Vec<String>,
     pub pending_steps: Vec<String>,
     pub progress_percent: u8,
@@ -298,11 +299,16 @@ fn task_view(task: TaskSession, current: bool) -> CanvsTask {
         .checked_div(total)
         .unwrap_or(0)
         .min(100) as u8;
+    let active = matches!(
+        task.status,
+        crate::harness::TaskStatus::Active | crate::harness::TaskStatus::Verifying
+    );
     CanvsTask {
         id: task.id,
         objective: task.objective,
         status: task_status(task.status),
         current,
+        active,
         completed_steps: task.completed_steps,
         pending_steps: task.pending_steps,
         progress_percent,
@@ -469,13 +475,20 @@ mod tests {
             .transition(&history.id, crate::harness::TaskStatus::CompletedUnverified)
             .expect("complete history task");
         std::thread::sleep(Duration::from_millis(2));
+        let parallel = harness.start_task("parallel task").expect("parallel task");
+        std::thread::sleep(Duration::from_millis(2));
         let current = harness.start_task("current task").expect("current task");
 
         let list = task_list(&harness).expect("task list");
-        assert_eq!(list.tasks.len(), 2);
+        assert_eq!(list.tasks.len(), 3);
         assert_eq!(list.tasks[0].id, current.id);
         assert!(list.tasks[0].current);
-        assert_eq!(list.tasks[1].id, history.id);
+        assert!(list.tasks[0].active);
+        assert_eq!(list.tasks[1].id, parallel.id);
         assert!(!list.tasks[1].current);
+        assert!(list.tasks[1].active);
+        assert_eq!(list.tasks[2].id, history.id);
+        assert!(!list.tasks[2].current);
+        assert!(!list.tasks[2].active);
     }
 }

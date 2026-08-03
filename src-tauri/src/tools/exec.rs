@@ -21,7 +21,7 @@ const COMPLETION_GRACE: Duration = Duration::from_millis(50);
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
-    exec_command_with_cancellation(ctx, args, &CancellationToken::default())
+    exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None)
 }
 
 #[cfg(not(windows))]
@@ -146,6 +146,7 @@ pub fn exec_command_with_cancellation(
     ctx: &ToolContext,
     args: &Value,
     cancellation: &CancellationToken,
+    task_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     if cancellation.is_cancelled() {
         return Err(cancelled_error(None));
@@ -275,6 +276,7 @@ pub fn exec_command_with_cancellation(
             verification_level,
             supersede_previous_failures,
             cancellation,
+            task_id,
         )
         .await
     });
@@ -476,6 +478,7 @@ async fn run_command(
     verification_level: &str,
     supersede_previous_failures: bool,
     cancellation: &CancellationToken,
+    task_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     if cancellation.is_cancelled() {
         return Err(cancelled_error(None));
@@ -511,22 +514,19 @@ async fn run_command(
         }),
     })?;
 
-    let harness_metadata =
-        ctx.harness
-            .current_task()
-            .ok()
-            .flatten()
-            .map(|task| SessionHarnessMetadata {
-                task_id: task.id,
-                command: cmd.to_string(),
-                verification_kind: verification_kind.map(str::to_string),
-                verification_key: verification_key.map(str::to_string),
-                test_file: test_file.map(str::to_string),
-                test_name: test_name.map(str::to_string),
-                workspace_before,
-                verification_level: verification_level.to_string(),
-                supersede_previous_failures,
-            });
+    let harness_metadata = task_id
+        .and_then(|task_id| ctx.harness.task(task_id).ok())
+        .map(|task| SessionHarnessMetadata {
+            task_id: task.id,
+            command: cmd.to_string(),
+            verification_kind: verification_kind.map(str::to_string),
+            verification_key: verification_key.map(str::to_string),
+            test_file: test_file.map(str::to_string),
+            test_name: test_name.map(str::to_string),
+            workspace_before,
+            verification_level: verification_level.to_string(),
+            supersede_previous_failures,
+        });
     let session = match ctx
         .sessions
         .insert(ExecSession::new_with_details_and_encoding(
@@ -688,6 +688,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "blocking",
         true,
         &CancellationToken::default(),
+        None,
     ));
 
     let mut response = json!({

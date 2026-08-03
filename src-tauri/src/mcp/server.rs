@@ -424,21 +424,26 @@ async fn handle_tools_call(
     }
 
     if state.mcp_proxies.contains_tool(name) {
-        if let Err(error) = state
-            .harness
-            .resume_paused_task_for_activity(name, session_id)
-        {
-            return Err(serde_json::json!({
-                "code": -32603,
-                "message": "Failed to resume paused Harness task for proxy activity",
-                "data": {
-                    "reason": "task_auto_resume_failed",
-                    "harness_error": error.code(),
-                    "details": error.to_string()
+        let mut active_task = state.task_for_session(session_id);
+        if let Some(task) = active_task.as_ref() {
+            match state
+                .harness
+                .resume_task_for_activity(&task.id, name, session_id)
+            {
+                Ok(task) => active_task = Some(task),
+                Err(error) => {
+                    return Err(serde_json::json!({
+                        "code": -32603,
+                        "message": "Failed to resume paused Harness task for proxy activity",
+                        "data": {
+                            "reason": "task_auto_resume_failed",
+                            "harness_error": error.code(),
+                            "details": error.to_string()
+                        }
+                    }))
                 }
-            }));
+            }
         }
-        let active_task = state.harness.current_task().ok().flatten();
         let (proxy_args, artifact_targets) =
             match prepare_browser_workspace_arguments(&state.workspace, name, &raw_args) {
                 Ok(prepared) => prepared,
@@ -472,7 +477,7 @@ async fn handle_tools_call(
                     value,
                 );
                 attach_browser_build_info(state.as_ref(), name, value, cancellation).await;
-                attach_proxy_auto_checkpoint(state.as_ref(), name, &proxy_args, value);
+                attach_proxy_auto_checkpoint(state.as_ref(), name, &proxy_args, value, session_id);
             }
             if let Some(operation) = operation {
                 if let Ok(value) = &mut result {
@@ -523,7 +528,13 @@ async fn handle_tools_call(
         } else {
             browser_wait_for_build(state.as_ref(), &raw_args, cancellation).await
         };
-        attach_local_browser_checkpoint(state.as_ref(), name, &raw_args, &mut structured);
+        attach_local_browser_checkpoint(
+            state.as_ref(),
+            name,
+            &raw_args,
+            &mut structured,
+            session_id,
+        );
         return Ok(wrap_mcp_tool_result(name, &raw_args, structured));
     }
 
@@ -931,25 +942,27 @@ fn attach_proxy_auto_checkpoint(
     tool_name: &str,
     arguments: &Value,
     result: &mut Value,
+    session_id: Option<&str>,
 ) {
     let primary_succeeded = result
         .get("structuredContent")
         .and_then(|structured| structured.get("ok"))
         .and_then(Value::as_bool)
         == Some(true);
-    match crate::tools::history::auto_checkpoint_after_tool(ctx, tool_name, arguments, result) {
+    let task_id = ctx.task_for_session(session_id).map(|task| task.id);
+    match crate::tools::history::auto_checkpoint_after_tool(
+        ctx,
+        tool_name,
+        arguments,
+        result,
+        task_id.as_deref(),
+    ) {
         Ok(Some(checkpoint)) => {
             if primary_succeeded {
-                if let Some(task_id) = ctx
-                    .harness
-                    .current_task()
-                    .ok()
-                    .flatten()
-                    .map(|task| task.id)
-                {
+                if let Some(task_id) = task_id.as_deref() {
                     let _ = ctx
                         .harness
-                        .refresh_expected_state_for_operation(&task_id, None);
+                        .refresh_expected_state_for_operation(task_id, None);
                 }
             }
             if let Some(structured) = result
@@ -1438,21 +1451,23 @@ fn attach_local_browser_checkpoint(
     tool_name: &str,
     arguments: &Value,
     output: &mut Value,
+    session_id: Option<&str>,
 ) {
     let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-    match crate::tools::history::auto_checkpoint_after_tool(ctx, tool_name, arguments, output) {
+    let task_id = ctx.task_for_session(session_id).map(|task| task.id);
+    match crate::tools::history::auto_checkpoint_after_tool(
+        ctx,
+        tool_name,
+        arguments,
+        output,
+        task_id.as_deref(),
+    ) {
         Ok(Some(checkpoint)) => {
             if succeeded {
-                if let Some(task_id) = ctx
-                    .harness
-                    .current_task()
-                    .ok()
-                    .flatten()
-                    .map(|task| task.id)
-                {
+                if let Some(task_id) = task_id.as_deref() {
                     let _ = ctx
                         .harness
-                        .refresh_expected_state_for_operation(&task_id, None);
+                        .refresh_expected_state_for_operation(task_id, None);
                 }
             }
             if let Some(object) = output.as_object_mut() {

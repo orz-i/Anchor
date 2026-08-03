@@ -45,29 +45,34 @@ fn 任务创建会捕获基线并在重启后恢复() {
 }
 
 #[test]
-fn 同一工作区只允许一个可写任务且拒绝非法迁移() {
+fn 同一工作区允许多个可写任务且仍拒绝非法迁移() {
     let (_temp, workspace, harness_root) = fixture();
     let harness = Harness::new(workspace, harness_root).expect("创建 Harness");
-    let task = harness.start_task("第一个任务").expect("启动任务");
+    let first = harness.start_task("第一个任务").expect("启动任务");
+    let second = harness.start_task("第二个任务").expect("启动并行任务");
 
-    let duplicate = harness
-        .start_task("第二个任务")
-        .expect_err("应拒绝第二个任务");
-    assert_eq!(duplicate.code(), "TASK_ALREADY_ACTIVE");
+    assert_eq!(first.status, TaskStatus::Active);
+    assert_eq!(second.status, TaskStatus::Active);
+    assert_eq!(harness.active_tasks().expect("活动任务").len(), 2);
 
     let invalid = harness
-        .transition(&task.id, TaskStatus::Completed)
+        .transition(&first.id, TaskStatus::Completed)
         .expect_err("active 不应直接完成");
     assert_eq!(invalid.code(), "INVALID_TASK_TRANSITION");
 
     let paused = harness
-        .transition(&task.id, TaskStatus::Paused)
+        .transition(&first.id, TaskStatus::Paused)
         .expect("暂停任务");
     assert_eq!(paused.status, TaskStatus::Paused);
+    assert_eq!(
+        harness.task(&second.id).expect("并行任务").status,
+        TaskStatus::Active
+    );
     let resumed = harness
-        .transition(&task.id, TaskStatus::Active)
+        .transition(&first.id, TaskStatus::Active)
         .expect("恢复任务");
     assert_eq!(resumed.status, TaskStatus::Active);
+    assert_eq!(harness.active_tasks().expect("活动任务").len(), 2);
 }
 
 #[test]

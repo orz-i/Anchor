@@ -241,6 +241,16 @@
             <span class={`rounded-full border px-2.5 py-1 text-xs font-medium ${statusClass(task.status)}`}>
               {taskStatusLabel(task.status)}
             </span>
+            {#if task.active}
+              <span class="rounded-full border border-blue-200 bg-blue-50 px-2.5 py-1 text-xs font-medium text-blue-700 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-300">
+                并行活动
+              </span>
+            {/if}
+            {#if task.current}
+              <span class="rounded-full border border-[var(--border)] bg-[var(--surface-hover)] px-2.5 py-1 text-xs font-medium text-[var(--text-muted)]">
+                默认任务
+              </span>
+            {/if}
             <span class="font-mono text-xs text-[var(--text-muted)]">{task.id}</span>
           </div>
           <p class="mt-3 text-sm font-medium leading-6">{task.objective}</p>
