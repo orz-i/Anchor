@@ -347,6 +347,8 @@ fn wait_command_returns_terminal_state_and_incremental_output() {
     assert_eq!(waited["state"], "completed");
     assert_eq!(waited["exit_code"], 0);
     assert_eq!(waited["command_ok"], true);
+    assert_eq!(waited["affected_files"], json!([]));
+    assert_eq!(waited["mutation_attributed"], false);
     assert!(waited["started_at"]
         .as_str()
         .is_some_and(|value| value.ends_with('Z')));

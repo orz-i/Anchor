@@ -661,17 +661,29 @@ fn call_tool_impl(
         }
     }
     if let Some(session) = retained_session {
+        if command_output_is_terminal(&output) {
+            if let Some(object) = output.as_object_mut() {
+                object.entry("affected_files").or_insert_with(|| json!([]));
+                object
+                    .entry("mutation_attributed")
+                    .or_insert(Value::Bool(false));
+            }
+        }
         if command_output_is_terminal(&output) && session.mark_harness_finalized() {
             if let Some(metadata) = session.harness_metadata() {
                 let workspace_after = capture_baseline_entries(ctx.workspace.root());
                 let affected_files =
                     diff_baseline_entries(&metadata.workspace_before, &workspace_after);
                 if let Some(object) = output.as_object_mut() {
+                    let mutation_attributed = !affected_files.is_empty();
                     object.insert(
                         "affected_files".into(),
                         serde_json::to_value(affected_files).unwrap_or_else(|_| json!([])),
                     );
-                    object.insert("mutation_attributed".into(), Value::Bool(true));
+                    object.insert(
+                        "mutation_attributed".into(),
+                        Value::Bool(mutation_attributed),
+                    );
                 }
                 let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
                 let _ = ctx

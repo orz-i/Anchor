@@ -257,6 +257,8 @@ fn browser_proxy_error_code(public_name: &str, detail: &str) -> &'static str {
     } else if detail.contains("not connected")
         || detail.contains("connection refused")
         || detail.contains("failed to connect")
+        || detail.contains("failed to start")
+        || detail.contains("not reachable")
     {
         "BROWSER_NOT_CONNECTED"
     } else {
@@ -1437,7 +1439,11 @@ impl McpProxyRegistry {
                         if route.synthesized_output_schema {
                             server.decorate_proxy_result(public_name, &mut normalized);
                         }
-                        server.record_success(public_name, Some(&normalized));
+                        if let Some((code, message)) = normalized_proxy_failure(&normalized) {
+                            server.record_failure(&code, &message);
+                        } else {
+                            server.record_success(public_name, Some(&normalized));
+                        }
                         normalized
                     }
                     Err(message) => {
@@ -1969,6 +1975,15 @@ impl ProxyServer {
     }
 
     fn record_success(&self, tool: &str, result: Option<&Value>) {
+        *self.last_error.lock().expect("mcp proxy last error lock") = None;
+        *self
+            .last_error_code
+            .lock()
+            .expect("mcp proxy error code lock") = None;
+        *self
+            .last_error_at
+            .lock()
+            .expect("mcp proxy error time lock") = None;
         *self
             .last_success_at
             .lock()
@@ -1984,7 +1999,7 @@ impl ProxyServer {
     }
 
     fn status(&self, tool_count: usize) -> Value {
-        let (connected, state_busy, client_status) = match self.client.try_lock() {
+        let (transport_connected, state_busy, mut client_status) = match self.client.try_lock() {
             Ok(client) => {
                 let connected = client.as_ref().is_some_and(|client| !client.is_closed());
                 let status = client
@@ -1995,6 +2010,18 @@ impl ProxyServer {
             }
             Err(_) => (true, true, json!({"state": "busy"})),
         };
+        let browser_cdp_reachable = proxy_browser_cdp_reachable(&client_status);
+        if let Some(object) = client_status.as_object_mut() {
+            object.insert(
+                "cdp_reachable".into(),
+                browser_cdp_reachable
+                    .map(Value::Bool)
+                    .unwrap_or(Value::Null),
+            );
+            if browser_cdp_reachable == Some(false) {
+                object.insert("state".into(), Value::String("degraded".into()));
+            }
+        }
         let available_slots = self.concurrency.available_permits();
         let last_success_summary = self
             .last_success_summary
@@ -2005,10 +2032,37 @@ impl ProxyServer {
             .as_ref()
             .and_then(|value| value.get("current_page"))
             .cloned();
+        let stored_last_error_code = self
+            .last_error_code
+            .lock()
+            .expect("mcp proxy error code lock")
+            .clone();
+        let stored_last_error = self
+            .last_error
+            .lock()
+            .expect("mcp proxy last error lock")
+            .clone();
+        let cdp_error = (browser_cdp_reachable == Some(false)).then(|| {
+            let port = client_status
+                .pointer("/workspace_isolation/debugging_port")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            format!("browser debugging port {port} is not reachable")
+        });
+        let last_error_code = stored_last_error_code.or_else(|| {
+            cdp_error
+                .as_ref()
+                .map(|_| "BROWSER_NOT_CONNECTED".to_string())
+        });
+        let last_error = stored_last_error.or(cdp_error);
+        let operational = transport_connected && browser_cdp_reachable != Some(false);
         json!({
             "name": self.spec.name,
             "transport": self.spec.transport.label(),
-            "connected": connected,
+            "connected": operational,
+            "transport_connected": transport_connected,
+            "operational": operational,
+            "browser_cdp_reachable": browser_cdp_reachable,
             "state_busy": state_busy,
             "client": client_status,
             "reconnect_scheduled": self.reconnect_scheduled.load(Ordering::Acquire),
@@ -2028,13 +2082,9 @@ impl ProxyServer {
             "last_success_tool": self.last_success_tool.lock().expect("mcp proxy success tool lock").clone(),
             "last_success_summary": last_success_summary,
             "current_page": current_page,
-            "last_error_code": self.last_error_code.lock().expect("mcp proxy error code lock").clone(),
+            "last_error_code": last_error_code,
             "last_error_at": self.last_error_at.lock().expect("mcp proxy error time lock").clone(),
-            "last_error": self
-                .last_error
-                .lock()
-                .expect("mcp proxy last error lock")
-                .clone()
+            "last_error": last_error
         })
     }
 
@@ -2094,6 +2144,50 @@ fn proxy_call_error_result(
             }
         }
     }))
+}
+
+fn normalized_proxy_failure(result: &Value) -> Option<(String, String)> {
+    let structured = result.get("structuredContent").unwrap_or(&Value::Null);
+    let failed = result.get("isError").and_then(Value::as_bool) == Some(true)
+        || structured.get("ok").and_then(Value::as_bool) == Some(false);
+    if !failed {
+        return None;
+    }
+    let code = structured
+        .get("error_code")
+        .and_then(Value::as_str)
+        .or_else(|| structured.pointer("/error/code").and_then(Value::as_str))
+        .unwrap_or("PROXIED_TOOL_FAILED")
+        .to_string();
+    let message = structured
+        .get("error_message")
+        .and_then(Value::as_str)
+        .or_else(|| structured.pointer("/error/message").and_then(Value::as_str))
+        .or_else(|| {
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content.iter().find_map(|item| {
+                        (item.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| item.get("text").and_then(Value::as_str))
+                            .flatten()
+                    })
+                })
+        })
+        .unwrap_or("Downstream MCP tool returned an error")
+        .to_string();
+    Some((code, message))
+}
+
+fn proxy_browser_cdp_reachable(client_status: &Value) -> Option<bool> {
+    let port = client_status
+        .pointer("/workspace_isolation/debugging_port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    Some(std::net::TcpStream::connect_timeout(&address, Duration::from_millis(75)).is_ok())
 }
 
 fn normalize_proxy_tool_result(
@@ -3535,8 +3629,9 @@ mod tests {
 
     use super::{
         browser_proxy_error_code, expand_proxy_placeholders, normalize_proxy_tool_result,
-        parse_mcp_proxy_config, prepare_my_agent_browser_isolation, proxy_catalog_digest,
-        proxy_failure_reason, proxy_management_tools, proxy_page_state, proxy_result_state_summary,
+        normalized_proxy_failure, parse_mcp_proxy_config, prepare_my_agent_browser_isolation,
+        proxy_browser_cdp_reachable, proxy_catalog_digest, proxy_failure_reason,
+        proxy_management_tools, proxy_page_state, proxy_result_state_summary,
         sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
         McpProxyTransportSpec, ProxyClientError,
     };
@@ -4070,7 +4165,7 @@ mod tests {
 
         let normalized = normalize_proxy_tool_result(
             "browser",
-            "test__click",
+            "browser__click",
             json!({
                 "content": [{"type": "text", "text": "clicked"}]
             }),
@@ -4113,6 +4208,45 @@ mod tests {
         assert!(screenshot["structuredContent"]["result"]["content"][0]
             .get("data")
             .is_none());
+    }
+
+    #[test]
+    fn normalized_proxy_errors_are_not_counted_as_successes() {
+        let catalog = sanitize_proxy_catalog(&test_spec(), vec![raw_proxy_tool("click")])
+            .expect("proxy catalog");
+        let tool = &catalog.tools[0];
+        let normalized = normalize_proxy_tool_result(
+            "browser",
+            "test__click",
+            json!({
+                "content": [{"type": "text", "text": "Chrome failed to start (port 45678 not reachable)"}],
+                "isError": true
+            }),
+            &tool.output_schema,
+            tool.synthesized_output_schema,
+        )
+        .expect("normalized browser failure");
+
+        let (code, message) = normalized_proxy_failure(&normalized).expect("proxy failure");
+        assert_eq!(code, "BROWSER_NOT_CONNECTED");
+        assert!(message.contains("port 45678 not reachable"));
+        assert_eq!(normalized["structuredContent"]["ok"], false);
+    }
+
+    #[test]
+    fn browser_cdp_reachability_reflects_the_actual_debugging_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let status = json!({
+            "workspace_isolation": {
+                "debugging_port": port
+            }
+        });
+        assert_eq!(proxy_browser_cdp_reachable(&status), Some(true));
+
+        drop(listener);
+        assert_eq!(proxy_browser_cdp_reachable(&status), Some(false));
+        assert_eq!(proxy_browser_cdp_reachable(&json!({})), None);
     }
 
     #[test]

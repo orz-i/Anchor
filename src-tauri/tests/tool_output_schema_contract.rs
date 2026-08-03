@@ -36,6 +36,10 @@ fn high_value_local_tool_successes_match_published_output_schemas() {
             }),
         ),
         (
+            "command_cost_explain",
+            json!({"cmd": "cargo test", "cost_intent": "local_only"}),
+        ),
+        (
             "exec_command",
             json!({"cmd": "echo schema-contract", "yield_time_ms": 10_000}),
         ),

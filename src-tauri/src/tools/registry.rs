@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 17;
+pub const CATALOG_VERSION: u32 = 18;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -1352,7 +1352,6 @@ pub fn output_schema(name: &str) -> Value {
                 "run_budget_reserved": { "type": "boolean", "const": false }
             }),
             &[
-                "session_id",
                 "command",
                 "classification",
                 "would_require_operator_approval",

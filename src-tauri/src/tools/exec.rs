@@ -1195,7 +1195,7 @@ mod tests {
                 r"\\?\C:\workspace\Life Brain\run & tooling.cmd",
                 &["argument & value".to_string()]
             ),
-            r#"call "C:\workspace\Life Brain\run & tooling.cmd" "argument & value""#
+            r#"chcp 65001>nul & call "C:\workspace\Life Brain\run & tooling.cmd" "argument & value""#
         );
 
         let script = command_for_program("C:/workspace/run-anything.ps1", &[]);
@@ -1215,7 +1215,7 @@ mod tests {
         let harness = tempdir().expect("harness");
         std::fs::write(
             workspace.path().join("any-name.cmd"),
-            "@echo tooling-cmd-ok\r\n",
+            "@echo off\r\npython -c \"print('批处理中文✓│')\"\r\n",
         )
         .expect("cmd script");
         std::fs::write(
@@ -1261,6 +1261,20 @@ mod tests {
                 .unwrap_or_default()
                 .contains("workflow-ok"));
         }
+
+        let batch_unicode = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({ "cmd": "any-name.cmd", "timeout_ms": 10_000, "yield_time_ms": 10_000 }),
+        );
+        assert_eq!(batch_unicode["command_ok"], true, "{batch_unicode}");
+        assert!(
+            batch_unicode["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("批处理中文✓│"),
+            "{batch_unicode}"
+        );
 
         let cmd_unicode = call_tool(
             &ctx,
@@ -1436,7 +1450,7 @@ fn command_for_program(program: &str, args: &[String]) -> Command {
 
 #[cfg(windows)]
 fn windows_batch_command_line(program: &str, args: &[String]) -> String {
-    let mut command_line = String::from("call ");
+    let mut command_line = String::from("chcp 65001>nul & call ");
     command_line.push_str(&windows_batch_token(&windows_command_path(program)));
     for arg in args {
         command_line.push(' ');
@@ -1459,12 +1473,7 @@ fn stream_encoding_for_program(program: &str) -> StreamEncoding {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if stem == "cmd" || matches!(extension.as_str(), "cmd" | "bat") {
+        if stem == "cmd" {
             return StreamEncoding::WindowsOem;
         }
     }
