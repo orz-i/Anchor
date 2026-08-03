@@ -58,7 +58,7 @@ pub(crate) fn resolve_system_program_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn configure_windows_command_environment(command: &mut Command, program: &str) {
+pub(crate) fn configure_windows_command_environment(command: &mut Command, program: &str) {
     let stem = Path::new(program)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -72,6 +72,17 @@ fn configure_windows_command_environment(command: &mut Command, program: &str) {
     }
     if let Some(rustdoc) = rustup_tool_path("rustdoc") {
         command.env("RUSTDOC", rustdoc);
+    }
+    if let Some(cargo) = rustup_tool_path("cargo") {
+        if let Some(toolchain_bin) = Path::new(cargo).parent() {
+            let mut paths = vec![toolchain_bin.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                command.env("PATH", joined);
+            }
+        }
     }
 }
 
@@ -1352,6 +1363,40 @@ mod tests {
         let resolved = resolve_system_program_path(&proxy);
         assert_eq!(resolved, PathBuf::from(real_cargo));
         assert!(resolved.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cargo_environment_exposes_toolchain_subcommands() {
+        let Some(real_cargo) = rustup_tool_path("cargo") else {
+            return;
+        };
+        let toolchain_bin = Path::new(real_cargo).parent().expect("toolchain bin");
+        let mut command = Command::new(real_cargo);
+
+        configure_windows_command_environment(&mut command, real_cargo);
+
+        let path = command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                key.eq_ignore_ascii_case("PATH")
+                    .then(|| value.map(std::ffi::OsStr::to_os_string))
+                    .flatten()
+            })
+            .expect("configured PATH");
+        assert_eq!(
+            std::env::split_paths(&path).next().as_deref(),
+            Some(toolchain_bin)
+        );
+        assert_eq!(
+            command
+                .as_std()
+                .get_envs()
+                .find_map(|(key, value)| (key == "RUSTC").then_some(value))
+                .flatten(),
+            rustup_tool_path("rustc").map(std::ffi::OsStr::new)
+        );
     }
 
     #[test]

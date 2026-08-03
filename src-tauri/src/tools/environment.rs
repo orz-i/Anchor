@@ -27,6 +27,13 @@ pub fn diagnose(root: &Path) -> Value {
         unavailable_probe("corepack is unavailable")
     };
     let cargo = probe("cargo", &["--version"], root, Duration::from_secs(3));
+    let cargo_clippy = probe(
+        "cargo",
+        &["clippy", "--version"],
+        root,
+        Duration::from_secs(5),
+    );
+    let cargo_fmt = probe("cargo", &["fmt", "--version"], root, Duration::from_secs(5));
     let rustc = probe("rustc", &["--version"], root, Duration::from_secs(3));
     let rustup = probe("rustup", &["--version"], root, Duration::from_secs(3));
     let rustup_cargo = if rustup["healthy"] == true {
@@ -62,7 +69,10 @@ pub fn diagnose(root: &Path) -> Value {
         && node_modules["traversable"] == true
         && node_modules["direct_packages_healthy"] == true
         && node_modules["required_bins_healthy"] == true;
-    let host_rust_healthy = cargo["healthy"] == true && rustc["healthy"] == true;
+    let host_rust_healthy = cargo["healthy"] == true
+        && cargo_clippy["healthy"] == true
+        && cargo_fmt["healthy"] == true
+        && rustc["healthy"] == true;
     let host_healthy = host_frontend_healthy && host_rust_healthy;
     let docker_project = has_docker_project(root);
     let recommended_route = if host_healthy {
@@ -85,6 +95,18 @@ pub fn diagnose(root: &Path) -> Value {
     if cargo["healthy"] != true && rustup_cargo["healthy"] == true {
         findings.push(
             "The cargo proxy is unhealthy, but `rustup run stable cargo` is available".to_string(),
+        );
+    }
+    if cargo["healthy"] == true && cargo_clippy["healthy"] != true {
+        findings.push(
+            "Cargo cannot execute Clippy; ensure the active Rust toolchain bin directory is on PATH"
+                .to_string(),
+        );
+    }
+    if cargo["healthy"] == true && cargo_fmt["healthy"] != true {
+        findings.push(
+            "Cargo cannot execute rustfmt; ensure the active Rust toolchain bin directory is on PATH"
+                .to_string(),
         );
     }
     if rustc["healthy"] != true && rustup_rustc_path["healthy"] == true {
@@ -132,6 +154,8 @@ pub fn diagnose(root: &Path) -> Value {
             "corepack": corepack,
             "corepack_pnpm": corepack_pnpm,
             "cargo": cargo,
+            "cargo_clippy": cargo_clippy,
+            "cargo_fmt": cargo_fmt,
             "rustc": rustc,
             "rustup": rustup,
             "rustup_cargo": rustup_cargo,
@@ -242,6 +266,11 @@ fn probe_command(program: &str, resolved: Option<&Path>, args: &[&str]) -> Comma
     }
     let mut command = Command::new(executable);
     command.args(args);
+    #[cfg(windows)]
+    crate::tools::exec::configure_windows_command_environment(
+        &mut command,
+        &executable.to_string_lossy(),
+    );
     command
 }
 
@@ -620,5 +649,26 @@ mod tests {
         );
         assert_eq!(extended_result["healthy"], true, "{extended_result}");
         assert_eq!(extended_result["version"], "wrapper-ok");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cargo_component_probes_use_the_resolved_toolchain_environment() {
+        let root = tempfile::tempdir().expect("root");
+        let clippy = probe(
+            "cargo",
+            &["clippy", "--version"],
+            root.path(),
+            Duration::from_secs(10),
+        );
+        let fmt = probe(
+            "cargo",
+            &["fmt", "--version"],
+            root.path(),
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(clippy["healthy"], true, "{clippy}");
+        assert_eq!(fmt["healthy"], true, "{fmt}");
     }
 }
