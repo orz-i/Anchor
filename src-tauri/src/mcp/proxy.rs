@@ -78,33 +78,76 @@ fn prepare_my_agent_browser_isolation(
     })?;
     let debugging_port = browser_debugging_port(workspace_id, &spec.name);
     let config_path = home.join("config.json");
-    if !config_path.exists() {
-        let config = json!({
-            "browser": {
-                "userDataDir": display_proxy_path(&user_data_dir),
-                "debuggingPort": debugging_port,
-                "lazyStart": true
-            }
-        });
-        fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&config)
-                .map_err(|error| format!("failed to encode browser isolation config: {error}"))?
-                + "\n",
-        )
-        .map_err(|error| {
-            format!(
-                "failed to write workspace browser isolation config `{}`: {error}",
-                config_path.display()
-            )
-        })?;
-    }
+    reconcile_managed_browser_config(&config_path, &user_data_dir, debugging_port)?;
     spec.env
         .insert("MY_AGENT_BROWSER_HOME".into(), display_proxy_path(&home));
     Ok(Some(BrowserWorkspaceIsolation {
         home,
         debugging_port: read_browser_debugging_port(&config_path).unwrap_or(debugging_port),
     }))
+}
+
+fn reconcile_managed_browser_config(
+    config_path: &Path,
+    user_data_dir: &Path,
+    debugging_port: u16,
+) -> Result<(), String> {
+    let mut config = if config_path.exists() {
+        let content = fs::read_to_string(config_path).map_err(|error| {
+            format!(
+                "failed to read workspace browser isolation config `{}`: {error}",
+                config_path.display()
+            )
+        })?;
+        serde_json::from_str::<Value>(&content).map_err(|error| {
+            format!(
+                "workspace browser isolation config `{}` is invalid JSON: {error}",
+                config_path.display()
+            )
+        })?
+    } else {
+        json!({})
+    };
+    let root = config.as_object_mut().ok_or_else(|| {
+        format!(
+            "workspace browser isolation config `{}` must contain a JSON object",
+            config_path.display()
+        )
+    })?;
+    let browser = root.entry("browser").or_insert_with(|| json!({}));
+    let browser = browser.as_object_mut().ok_or_else(|| {
+        format!(
+            "workspace browser isolation config `{}` must contain a browser object",
+            config_path.display()
+        )
+    })?;
+
+    browser.insert(
+        "userDataDir".into(),
+        Value::String(display_proxy_path(user_data_dir)),
+    );
+    browser.insert(
+        "debuggingPort".into(),
+        Value::Number(u64::from(debugging_port).into()),
+    );
+    browser.entry("headless").or_insert(Value::Bool(true));
+    browser.entry("lazyStart").or_insert(Value::Bool(true));
+
+    let encoded = serde_json::to_string_pretty(&config)
+        .map_err(|error| format!("failed to encode browser isolation config: {error}"))?
+        + "\n";
+    let unchanged = fs::read_to_string(config_path)
+        .ok()
+        .is_some_and(|current| current == encoded);
+    if !unchanged {
+        fs::write(config_path, encoded).map_err(|error| {
+            format!(
+                "failed to write workspace browser isolation config `{}`: {error}",
+                config_path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn is_my_agent_browser_spec(spec: &McpProxyServerSpec) -> bool {
@@ -165,6 +208,9 @@ fn wrap_proxy_structured_result(structured: Value, output_schema: &Value) -> Val
             "retryable": false,
             "browser_session_id": "unknown",
             "connection_status": "unknown",
+            "transport_connected": false,
+            "operational": false,
+            "browser_cdp_reachable": null,
             "page_count": 0,
             "pages": [],
             "selected_page": null,
@@ -570,6 +616,9 @@ fn proxy_management_tools(
             "retryable": {"type": "boolean"},
             "browser_session_id": {"type": "string", "minLength": 1},
             "connection_status": {"type": "string"},
+            "transport_connected": {"type": "boolean"},
+            "operational": {"type": "boolean"},
+            "browser_cdp_reachable": {"type": ["boolean", "null"]},
             "page_count": {"type": "integer", "minimum": 0},
             "pages": {"type": "array", "items": {"type": "object"}},
             "selected_page": {"type": ["object", "null"]},
@@ -577,7 +626,8 @@ fn proxy_management_tools(
         },
         "required": [
             "ok", "status", "server", "connection", "retryable",
-            "browser_session_id", "connection_status", "page_count", "pages"
+            "browser_session_id", "connection_status", "transport_connected",
+            "operational", "page_count", "pages"
         ],
         "additionalProperties": true
     });
@@ -630,6 +680,9 @@ fn fallback_proxy_output_schema() -> Value {
             "retryable": { "type": "boolean" },
             "browser_session_id": { "type": ["string", "null"] },
             "connection_status": { "type": "string" },
+            "transport_connected": { "type": "boolean" },
+            "operational": { "type": "boolean" },
+            "browser_cdp_reachable": { "type": ["boolean", "null"] },
             "page_count": { "type": ["integer", "null"], "minimum": 0 },
             "pages": { "type": "array", "items": { "type": "object" } },
             "selected_page": { "type": ["object", "null"] }
@@ -1579,15 +1632,19 @@ impl ProxyServer {
             self.last_known_page_state()
         };
         let connection = self.status(self.downstream_tools.len());
-        let connection_status = if connection
-            .get("connected")
+        let connection_status = proxy_connection_status(&connection);
+        let transport_connected = connection
+            .get("transport_connected")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            "connected"
-        } else {
-            "disconnected"
-        };
+            .unwrap_or(false);
+        let operational = connection
+            .get("operational")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let browser_cdp_reachable = connection
+            .get("browser_cdp_reachable")
+            .cloned()
+            .unwrap_or(Value::Null);
         let session_id = self
             .session_id
             .lock()
@@ -1614,6 +1671,9 @@ impl ProxyServer {
                 "retryable": false,
                 "browser_session_id": session_id,
                 "connection_status": connection_status,
+                "transport_connected": transport_connected,
+                "operational": operational,
+                "browser_cdp_reachable": browser_cdp_reachable,
                 "page_count": pages.len(),
                 "pages": pages,
                 "selected_page": selected_page,
@@ -1636,6 +1696,9 @@ impl ProxyServer {
                     "retryable": true,
                     "browser_session_id": session_id,
                     "connection_status": connection_status,
+                    "transport_connected": transport_connected,
+                    "operational": operational,
+                    "browser_cdp_reachable": browser_cdp_reachable,
                     "page_count": pages.len(),
                     "pages": pages,
                     "selected_page": selected_page,
@@ -1731,24 +1794,31 @@ impl ProxyServer {
             .lock()
             .expect("mcp proxy session id lock")
             .clone();
-        let connected = self
-            .client
-            .try_lock()
-            .ok()
-            .and_then(|client| client.as_ref().map(|client| !client.is_closed()))
+        let connection = self.status(self.downstream_tools.len());
+        let connection_status = proxy_connection_status(&connection);
+        let transport_connected = connection
+            .get("transport_connected")
+            .and_then(Value::as_bool)
             .unwrap_or(false);
+        let operational = connection
+            .get("operational")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let browser_cdp_reachable = connection
+            .get("browser_cdp_reachable")
+            .cloned()
+            .unwrap_or(Value::Null);
         structured.insert("browser_session_id".into(), Value::String(session_id));
         structured.insert(
             "connection_status".into(),
-            Value::String(
-                if connected {
-                    "connected"
-                } else {
-                    "disconnected"
-                }
-                .into(),
-            ),
+            Value::String(connection_status.into()),
         );
+        structured.insert(
+            "transport_connected".into(),
+            Value::Bool(transport_connected),
+        );
+        structured.insert("operational".into(), Value::Bool(operational));
+        structured.insert("browser_cdp_reachable".into(), browser_cdp_reachable);
         let mut page_state = proxy_page_state(&Value::Object(structured.clone()));
         if page_state
             .get("pages")
@@ -2188,6 +2258,28 @@ fn proxy_browser_cdp_reachable(client_status: &Value) -> Option<bool> {
         .filter(|port| *port != 0)?;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     Some(std::net::TcpStream::connect_timeout(&address, Duration::from_millis(75)).is_ok())
+}
+
+fn proxy_connection_status(connection: &Value) -> &'static str {
+    let fallback_connected = connection
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let transport_connected = connection
+        .get("transport_connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(fallback_connected);
+    let operational = connection
+        .get("operational")
+        .and_then(Value::as_bool)
+        .unwrap_or(fallback_connected);
+    if operational {
+        "connected"
+    } else if transport_connected {
+        "degraded"
+    } else {
+        "disconnected"
+    }
 }
 
 fn normalize_proxy_tool_result(
@@ -3630,8 +3722,8 @@ mod tests {
     use super::{
         browser_proxy_error_code, expand_proxy_placeholders, normalize_proxy_tool_result,
         normalized_proxy_failure, parse_mcp_proxy_config, prepare_my_agent_browser_isolation,
-        proxy_browser_cdp_reachable, proxy_catalog_digest, proxy_failure_reason,
-        proxy_management_tools, proxy_page_state, proxy_result_state_summary,
+        proxy_browser_cdp_reachable, proxy_catalog_digest, proxy_connection_status,
+        proxy_failure_reason, proxy_management_tools, proxy_page_state, proxy_result_state_summary,
         sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
         McpProxyTransportSpec, ProxyClientError,
     };
@@ -4053,12 +4145,58 @@ mod tests {
             first_config["browser"]["debuggingPort"],
             first_isolation.debugging_port
         );
+        assert_eq!(first_config["browser"]["headless"], true);
+        assert_eq!(first_config["browser"]["lazyStart"], true);
         assert!(Path::new(
             first_config["browser"]["userDataDir"]
                 .as_str()
                 .expect("user data dir")
         )
         .ends_with("user-data"));
+
+        fs::write(
+            first_isolation.home.join("config.json"),
+            serde_json::to_string_pretty(&json!({
+                "browser": {
+                    "userDataDir": "D:\\wrong-profile",
+                    "debuggingPort": 1,
+                    "headless": false,
+                    "lazyStart": false,
+                    "proxy": {"server": "http://127.0.0.1:8080"}
+                }
+            }))
+            .expect("custom config"),
+        )
+        .expect("write custom config");
+        let mut repaired = test_spec();
+        repaired.command = "node".into();
+        repaired.args = vec!["tools/my-agent-browser/start-mcp.js".into()];
+        repaired.cwd = root.path().to_path_buf();
+        repaired.name = "browser".into();
+        let repaired_isolation = prepare_my_agent_browser_isolation(&mut repaired, "workspace-one")
+            .expect("repaired isolation")
+            .expect("browser isolation");
+        let repaired_config: Value = serde_json::from_str(
+            &fs::read_to_string(repaired_isolation.home.join("config.json"))
+                .expect("repaired browser config"),
+        )
+        .expect("repaired config json");
+        assert_eq!(
+            repaired_config["browser"]["debuggingPort"],
+            first_isolation.debugging_port
+        );
+        assert!(Path::new(
+            repaired_config["browser"]["userDataDir"]
+                .as_str()
+                .expect("repaired user data dir")
+        )
+        .ends_with("user-data"));
+        assert_eq!(repaired_config["browser"]["headless"], false);
+        assert_eq!(repaired_config["browser"]["lazyStart"], false);
+        assert_eq!(
+            repaired_config["browser"]["proxy"]["server"],
+            "http://127.0.0.1:8080"
+        );
 
         let explicit_home = root.path().join("explicit-browser-home");
         fs::create_dir_all(&explicit_home).expect("explicit browser home");
@@ -4247,6 +4385,27 @@ mod tests {
         drop(listener);
         assert_eq!(proxy_browser_cdp_reachable(&status), Some(false));
         assert_eq!(proxy_browser_cdp_reachable(&json!({})), None);
+        assert_eq!(
+            proxy_connection_status(&json!({
+                "transport_connected": true,
+                "operational": true
+            })),
+            "connected"
+        );
+        assert_eq!(
+            proxy_connection_status(&json!({
+                "transport_connected": true,
+                "operational": false
+            })),
+            "degraded"
+        );
+        assert_eq!(
+            proxy_connection_status(&json!({
+                "transport_connected": false,
+                "operational": false
+            })),
+            "disconnected"
+        );
     }
 
     #[test]
@@ -4344,6 +4503,9 @@ mod tests {
                 "retryable": false,
                 "browser_session_id": "session-1",
                 "connection_status": "connected",
+                "transport_connected": true,
+                "operational": true,
+                "browser_cdp_reachable": true,
                 "page_count": 0,
                 "pages": [],
                 "selected_page": null,
