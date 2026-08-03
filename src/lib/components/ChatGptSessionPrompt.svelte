@@ -9,8 +9,9 @@
 检查 history_summaries_omitted、history_summary_truncated 和 latest_handoff_truncated；只有当前任务确实需要被省略的细节时，才用 read_file 读取对应的精确归档路径。
 不要在同一 ChatGPT 会话中重复调用 bootstrap 或创建重复历史会话。
 保存 bootstrap 返回的 session_key 和 current_path；每次调用 history_session_checkpoint 时，将 session_key 原样传入 session_key，并将 current_path 原样作为 expected_path。
+插件会在受支持的代码变更、提交、命令阶段和浏览器证据阶段同步写入幂等里程碑检查点，但这不能替代最终交接。
 每个用户任务完成后、发送最终答复前调用 history_session_checkpoint，记录已脱敏的结论、决策、文件变更、验证结果、遗留问题和下一步。
-只有 checkpoint 返回 ok=true，且返回的 session_key、path 和 expected_path 仍指向同一会话目标时，才能说明进度已保存；保存不是后台自动完成的。`;
+只有最终 checkpoint 返回 ok=true，且返回的 session_key、path 和 expected_path 仍指向同一会话目标时，才能说明最终进度已保存。`;
 
   let copying = $state(false);
   let copied = $state(false);

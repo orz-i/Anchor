@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +45,106 @@ struct SanitizedProxyTool {
     synthesized_output_schema: bool,
 }
 
+fn prepare_my_agent_browser_isolation(
+    spec: &mut McpProxyServerSpec,
+    workspace_id: &str,
+) -> Result<Option<BrowserWorkspaceIsolation>, String> {
+    if !is_my_agent_browser_spec(spec) {
+        return Ok(None);
+    }
+    if let Some(explicit) = spec.env.get("MY_AGENT_BROWSER_HOME") {
+        let home = PathBuf::from(explicit);
+        return Ok(Some(BrowserWorkspaceIsolation {
+            debugging_port: read_browser_debugging_port(&home.join("config.json"))
+                .unwrap_or_default(),
+            home,
+        }));
+    }
+
+    let workspace_segment = sanitize_tool_segment(workspace_id);
+    let server_segment = sanitize_tool_segment(&spec.name);
+    let home = spec
+        .cwd
+        .join(".anchor")
+        .join("browser")
+        .join(workspace_segment)
+        .join(server_segment);
+    let user_data_dir = home.join("user-data");
+    fs::create_dir_all(&user_data_dir).map_err(|error| {
+        format!(
+            "failed to create workspace browser isolation directory `{}`: {error}",
+            home.display()
+        )
+    })?;
+    let debugging_port = browser_debugging_port(workspace_id, &spec.name);
+    let config_path = home.join("config.json");
+    if !config_path.exists() {
+        let config = json!({
+            "browser": {
+                "userDataDir": display_proxy_path(&user_data_dir),
+                "debuggingPort": debugging_port,
+                "lazyStart": true
+            }
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&config)
+                .map_err(|error| format!("failed to encode browser isolation config: {error}"))?
+                + "\n",
+        )
+        .map_err(|error| {
+            format!(
+                "failed to write workspace browser isolation config `{}`: {error}",
+                config_path.display()
+            )
+        })?;
+    }
+    spec.env
+        .insert("MY_AGENT_BROWSER_HOME".into(), display_proxy_path(&home));
+    Ok(Some(BrowserWorkspaceIsolation {
+        home,
+        debugging_port: read_browser_debugging_port(&config_path).unwrap_or(debugging_port),
+    }))
+}
+
+fn is_my_agent_browser_spec(spec: &McpProxyServerSpec) -> bool {
+    let identity = std::iter::once(spec.command.as_str())
+        .chain(spec.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    identity.contains("my-agent-browser") || identity.contains("start-mcp.js")
+}
+
+fn browser_debugging_port(workspace_id: &str, server_name: &str) -> u16 {
+    let digest = Sha256::digest(format!("{workspace_id}:{server_name}"));
+    42_000 + u16::from_be_bytes([digest[0], digest[1]]) % 12_000
+}
+
+fn read_browser_debugging_port(path: &Path) -> Option<u16> {
+    let value = serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()?;
+    value
+        .get("browser")
+        .and_then(|browser| browser.get("debuggingPort"))
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+}
+
+fn display_proxy_path(path: &Path) -> String {
+    let display = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        display
+            .strip_prefix("\\\\?\\")
+            .unwrap_or(&display)
+            .to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        display.into_owned()
+    }
+}
+
 fn wrap_proxy_structured_result(structured: Value, output_schema: &Value) -> Value {
     let validation = jsonschema::validator_for(output_schema)
         .and_then(|validator| validator.validate(&structured));
@@ -78,6 +179,39 @@ fn wrap_proxy_structured_result(structured: Value, output_schema: &Value) -> Val
     })
 }
 
+fn proxy_text_content(value: &Value) -> Option<String> {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter(|item| item.get("type") == Some(&json!("text")))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn parse_browser_page_label(label: &str) -> (String, String) {
+    if let Some(open) = label.rfind(" (") {
+        if label.ends_with(')') {
+            let candidate = &label[open + 2..label.len() - 1];
+            if candidate.starts_with("http://")
+                || candidate.starts_with("https://")
+                || candidate.starts_with("file://")
+                || candidate.starts_with("about:")
+                || candidate.starts_with("chrome://")
+            {
+                return (label[..open].trim().to_string(), candidate.to_string());
+            }
+        }
+    }
+
+    (String::new(), label.to_string())
+}
+
 fn browser_proxy_error_code(public_name: &str, detail: &str) -> &'static str {
     let detail = detail.to_ascii_lowercase();
     if detail.contains("structuredcontent")
@@ -98,6 +232,11 @@ fn browser_proxy_error_code(public_name: &str, detail: &str) -> &'static str {
         "PAGE_LOAD_TIMEOUT"
     } else if detail.contains("timed out") && public_name.contains("evaluate_script") {
         "SCRIPT_TIMEOUT"
+    } else if detail.contains("chrome was closed or crashed")
+        || detail.contains("browser crashed")
+        || detail.contains("chrome crashed")
+    {
+        "BROWSER_CRASHED"
     } else if detail.contains("target closed")
         || detail.contains("page closed")
         || detail.contains("page has been closed")
@@ -192,7 +331,11 @@ fn proxy_content_summary(item: &Value) -> Value {
 }
 
 fn proxy_page_state(result: &Value) -> Value {
-    let payload = proxy_result_payload(result);
+    let payload = if result.get("structuredContent").is_some() {
+        proxy_result_payload(result)
+    } else {
+        result.clone()
+    };
     let payload = payload.get("result").cloned().unwrap_or(payload);
     let mut pages = payload
         .get("pages")
@@ -203,6 +346,9 @@ fn proxy_page_state(result: &Value) -> Value {
         let text = payload
             .get("text")
             .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| proxy_text_content(&payload))
+            .or_else(|| proxy_text_content(result))
             .unwrap_or_default();
         for line in text.lines() {
             let trimmed = line.trim().trim_start_matches(['-', '*', ' ']);
@@ -213,14 +359,16 @@ fn proxy_page_state(result: &Value) -> Value {
                 continue;
             };
             let selected = rest.contains("[selected]") || rest.contains("(selected)");
-            let url = rest
+            let label = rest
                 .replace("[selected]", "")
                 .replace("(selected)", "")
                 .trim()
                 .to_string();
+            let (title, url) = parse_browser_page_label(&label);
             pages.push(json!({
                 "page_id": page_id,
                 "url": url,
+                "title": title,
                 "selected": selected
             }));
         }
@@ -896,6 +1044,13 @@ struct StdioMcpProxyClient {
     close_reason: StdMutex<Option<String>>,
     workspace_id: String,
     server_name: String,
+    workspace_isolation: Option<BrowserWorkspaceIsolation>,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserWorkspaceIsolation {
+    home: PathBuf,
+    debugging_port: u16,
 }
 
 struct HttpMcpProxyClient {
@@ -1417,7 +1572,7 @@ impl ProxyServer {
         } else {
             self.last_known_page_state()
         };
-        let connection = self.status(0);
+        let connection = self.status(self.downstream_tools.len());
         let connection_status = if connection
             .get("connected")
             .and_then(Value::as_bool)
@@ -1588,7 +1743,44 @@ impl ProxyServer {
                 .into(),
             ),
         );
-        let page_state = proxy_page_state(&Value::Object(structured.clone()));
+        let mut page_state = proxy_page_state(&Value::Object(structured.clone()));
+        if page_state
+            .get("pages")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            let last_known = self.last_known_page_state();
+            if last_known
+                .get("pages")
+                .and_then(Value::as_array)
+                .is_some_and(|pages| !pages.is_empty())
+            {
+                if let Some(object) = page_state.as_object_mut() {
+                    object.insert(
+                        "pages".into(),
+                        last_known
+                            .get("pages")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    );
+                    object.insert(
+                        "selected_page".into(),
+                        last_known
+                            .get("selected_page")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                    object.insert(
+                        "page_count".into(),
+                        last_known
+                            .get("page_count")
+                            .cloned()
+                            .unwrap_or_else(|| json!(0)),
+                    );
+                    object.insert("source".into(), Value::String("last_known_state".into()));
+                }
+            }
+        }
         structured.insert(
             "page_count".into(),
             page_state
@@ -1632,6 +1824,7 @@ impl ProxyServer {
                     code,
                     "BROWSER_NOT_CONNECTED"
                         | "CDP_CONNECTION_LOST"
+                        | "BROWSER_CRASHED"
                         | "PAGE_CLOSED"
                         | "STALE_ELEMENT_REFERENCE"
                         | "ELEMENT_WAIT_TIMEOUT"
@@ -1644,6 +1837,9 @@ impl ProxyServer {
                 }
                 "NO_ACTIVE_PAGE" | "PAGE_CLOSED" => {
                     "Call browser__list_pages, browser__select_page, then browser__take_snapshot."
+                }
+                "BROWSER_CRASHED" => {
+                    "Chrome is being relaunched; call browser__health_check, then open or navigate to the target page again."
                 }
                 "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" => {
                     "Call browser__health_check, reconnect only if disconnected, then list pages again."
@@ -1659,7 +1855,10 @@ impl ProxyServer {
             structured.insert("recovery_hint".into(), Value::String(recovery_hint.into()));
             structured.insert(
                 "page_reacquire_required".into(),
-                Value::Bool(matches!(code, "NO_ACTIVE_PAGE" | "PAGE_CLOSED")),
+                Value::Bool(matches!(
+                    code,
+                    "NO_ACTIVE_PAGE" | "PAGE_CLOSED" | "BROWSER_CRASHED"
+                )),
             );
             structured.insert(
                 "element_reacquire_required".into(),
@@ -1948,7 +2147,10 @@ fn normalize_proxy_tool_result(
                     "category": "runtime",
                     "retryable": matches!(
                         code,
-                        "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" | "PAGE_CLOSED"
+                        "BROWSER_NOT_CONNECTED"
+                            | "CDP_CONNECTION_LOST"
+                            | "BROWSER_CRASHED"
+                            | "PAGE_CLOSED"
                     ),
                     "details": {
                         "server": server_name,
@@ -1960,7 +2162,10 @@ fn normalize_proxy_tool_result(
                 "error_message": message,
                 "retryable": matches!(
                     code,
-                    "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" | "PAGE_CLOSED"
+                    "BROWSER_NOT_CONNECTED"
+                        | "CDP_CONNECTION_LOST"
+                        | "BROWSER_CRASHED"
+                        | "PAGE_CLOSED"
                 )
             })
         } else {
@@ -2054,7 +2259,12 @@ impl McpProxyClient {
                     "state": if client.is_closed() { "closed" } else { "connected" },
                     "process_id": process_id,
                     "process_state": process_state,
-                    "cdp_connection": "downstream_managed"
+                    "cdp_connection": "downstream_managed",
+                    "workspace_isolation": client.workspace_isolation.as_ref().map(|isolation| json!({
+                        "mode": "process_and_profile",
+                        "home": display_proxy_path(&isolation.home),
+                        "debugging_port": isolation.debugging_port
+                    })).unwrap_or(Value::Null)
                 })
             }
             ProxyClientTransport::StreamableHttp(client) => json!({
@@ -2631,9 +2841,10 @@ fn truncate_log_detail(value: &str, maximum: usize) -> String {
 
 impl StdioMcpProxyClient {
     async fn connect(
-        spec: McpProxyServerSpec,
+        mut spec: McpProxyServerSpec,
         workspace_id: &str,
     ) -> Result<(Arc<Self>, Vec<Value>), String> {
+        let workspace_isolation = prepare_my_agent_browser_isolation(&mut spec, workspace_id)?;
         let mut command = Command::new(&spec.command);
         crate::platform::hide_tokio_console(&mut command);
         command
@@ -2686,6 +2897,7 @@ impl StdioMcpProxyClient {
             close_reason: StdMutex::new(None),
             workspace_id: workspace_id.to_string(),
             server_name: spec.name.clone(),
+            workspace_isolation,
         });
         Self::spawn_reader(&client, stdout);
 
@@ -3323,9 +3535,10 @@ mod tests {
 
     use super::{
         browser_proxy_error_code, expand_proxy_placeholders, normalize_proxy_tool_result,
-        parse_mcp_proxy_config, proxy_catalog_digest, proxy_failure_reason, proxy_management_tools,
-        proxy_result_state_summary, sanitize_proxy_catalog, wrap_proxy_structured_result,
-        McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
+        parse_mcp_proxy_config, prepare_my_agent_browser_isolation, proxy_catalog_digest,
+        proxy_failure_reason, proxy_management_tools, proxy_page_state, proxy_result_state_summary,
+        sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
+        McpProxyTransportSpec, ProxyClientError,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -3687,6 +3900,89 @@ mod tests {
             summary["dismissableLayerStack"],
             json!(["tooltip", "sheet"])
         );
+    }
+
+    #[test]
+    fn browser_page_state_parses_normalized_list_pages_text() {
+        let state = proxy_page_state(&json!({
+            "ok": true,
+            "result": {
+                "text": "## Pages\n6: Gaoge (http://127.0.0.1:8080/characters/one) [selected]\n7: Blank (about:blank)"
+            }
+        }));
+
+        assert_eq!(state["page_count"], 2);
+        assert_eq!(state["pages"][0]["page_id"], 6);
+        assert_eq!(state["pages"][0]["title"], "Gaoge");
+        assert_eq!(
+            state["pages"][0]["url"],
+            "http://127.0.0.1:8080/characters/one"
+        );
+        assert_eq!(state["selected_page"]["page_id"], 6);
+        assert_eq!(state["pages"][1]["url"], "about:blank");
+    }
+
+    #[test]
+    fn my_agent_browser_is_scoped_to_each_workspace_profile() {
+        let root = tempfile::tempdir().expect("browser workspace");
+        let mut first = test_spec();
+        first.command = "node".into();
+        first.args = vec!["tools/my-agent-browser/start-mcp.js".into()];
+        first.cwd = root.path().to_path_buf();
+        first.name = "browser".into();
+        let first_isolation = prepare_my_agent_browser_isolation(&mut first, "workspace-one")
+            .expect("first isolation")
+            .expect("browser isolation");
+
+        let mut second = first.clone();
+        second.env.clear();
+        let second_isolation = prepare_my_agent_browser_isolation(&mut second, "workspace-two")
+            .expect("second isolation")
+            .expect("browser isolation");
+
+        assert_ne!(first_isolation.home, second_isolation.home);
+        assert_ne!(
+            first_isolation.debugging_port,
+            second_isolation.debugging_port
+        );
+        assert_eq!(
+            first.env.get("MY_AGENT_BROWSER_HOME"),
+            Some(&super::display_proxy_path(&first_isolation.home))
+        );
+        let first_config: Value = serde_json::from_str(
+            &fs::read_to_string(first_isolation.home.join("config.json"))
+                .expect("first browser config"),
+        )
+        .expect("first config json");
+        assert_eq!(
+            first_config["browser"]["debuggingPort"],
+            first_isolation.debugging_port
+        );
+        assert!(Path::new(
+            first_config["browser"]["userDataDir"]
+                .as_str()
+                .expect("user data dir")
+        )
+        .ends_with("user-data"));
+
+        let explicit_home = root.path().join("explicit-browser-home");
+        fs::create_dir_all(&explicit_home).expect("explicit browser home");
+        fs::write(
+            explicit_home.join("config.json"),
+            r#"{"browser":{"debuggingPort":45678}}"#,
+        )
+        .expect("explicit config");
+        let mut explicit = first.clone();
+        explicit.env.insert(
+            "MY_AGENT_BROWSER_HOME".into(),
+            explicit_home.display().to_string(),
+        );
+        let explicit_isolation =
+            prepare_my_agent_browser_isolation(&mut explicit, "workspace-three")
+                .expect("explicit isolation")
+                .expect("browser isolation");
+        assert_eq!(explicit_isolation.home, explicit_home);
+        assert_eq!(explicit_isolation.debugging_port, 45_678);
     }
 
     #[test]

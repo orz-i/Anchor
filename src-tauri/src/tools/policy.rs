@@ -27,6 +27,7 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "npx",
     "node",
     "pnpm",
+    "corepack",
     "yarn",
     "make",
     "mvn",
@@ -34,8 +35,11 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "gradle",
     "gradlew",
     "cargo",
+    "rustup",
     "go",
     "ruff",
+    "rg",
+    "ripgrep",
     "mypy",
     "eslint",
     "tsc",
@@ -126,6 +130,86 @@ impl PolicySettings {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct PolicyError(pub String);
+
+pub(crate) fn split_command_line(command: &str) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        split_windows_command_line(command)
+    }
+    #[cfg(not(windows))]
+    {
+        shell_words::split(command).map_err(|_| "Invalid command syntax".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn split_windows_command_line(command: &str) -> Result<Vec<String>, String> {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut parts = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        while index < chars.len() && chars[index].is_whitespace() {
+            index += 1;
+        }
+        if index >= chars.len() {
+            break;
+        }
+
+        let mut value = String::new();
+        let mut started = false;
+        let mut in_double_quotes = false;
+        let mut in_single_quotes = false;
+        while index < chars.len() {
+            let current = chars[index];
+            if !in_double_quotes && !in_single_quotes && current.is_whitespace() {
+                break;
+            }
+            if current == '\\' && !in_single_quotes {
+                let start = index;
+                while index < chars.len() && chars[index] == '\\' {
+                    index += 1;
+                }
+                let count = index - start;
+                if index < chars.len() && chars[index] == '"' {
+                    value.extend(std::iter::repeat_n('\\', count / 2));
+                    if count.is_multiple_of(2) {
+                        in_double_quotes = !in_double_quotes;
+                    } else {
+                        value.push('"');
+                    }
+                    started = true;
+                    index += 1;
+                } else {
+                    value.extend(std::iter::repeat_n('\\', count));
+                    started = true;
+                }
+                continue;
+            }
+            if current == '"' && !in_single_quotes {
+                in_double_quotes = !in_double_quotes;
+                started = true;
+                index += 1;
+                continue;
+            }
+            if current == '\'' && !in_double_quotes {
+                in_single_quotes = !in_single_quotes;
+                started = true;
+                index += 1;
+                continue;
+            }
+            value.push(current);
+            started = true;
+            index += 1;
+        }
+        if in_double_quotes || in_single_quotes {
+            return Err("Invalid command syntax: unterminated quote".to_string());
+        }
+        if started {
+            parts.push(value);
+        }
+    }
+    Ok(parts)
+}
 
 pub fn parse_allowed_commands(configured: &str) -> HashSet<String> {
     let trimmed = configured.trim();
@@ -293,8 +377,7 @@ pub fn validate_command_for_workspace(
         ));
     }
 
-    let parts =
-        shell_words::split(command).map_err(|_| PolicyError("Invalid command syntax".into()))?;
+    let parts = split_command_line(command).map_err(PolicyError)?;
     if parts.is_empty() {
         return Err(PolicyError("Empty command".into()));
     }
@@ -321,6 +404,16 @@ pub fn validate_command_for_workspace(
         return Err(PolicyError(format!("Command is not allowlisted: {stem}")));
     }
 
+    if let Some(wrapped_command) = wrapped_command_payload(&parts) {
+        for nested_command in
+            wrapped_command_segments(&parts, &wrapped_command).map_err(PolicyError)?
+        {
+            let mut nested_arguments = arguments.clone();
+            nested_arguments["cmd"] = Value::String(nested_command);
+            validate_command_for_workspace(&nested_arguments, policy, workspace)?;
+        }
+    }
+
     if arguments.get("env").is_some() {
         return Err(PolicyError(
             "Environment variables cannot be supplied by GPT".into(),
@@ -334,6 +427,208 @@ pub fn validate_command_for_workspace(
     }
 
     Ok(())
+}
+
+pub(crate) fn wrapped_command_payload(parts: &[String]) -> Option<String> {
+    let executable = parts
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    let stem = executable
+        .strip_suffix(".exe")
+        .or_else(|| executable.strip_suffix(".cmd"))
+        .or_else(|| executable.strip_suffix(".bat"))
+        .unwrap_or(&executable);
+    let switches: &[&str] = match stem {
+        "powershell" | "pwsh" => &["-command", "-c"],
+        "cmd" => &["/c", "/k"],
+        _ => return None,
+    };
+    let index = parts.iter().position(|part| {
+        switches
+            .iter()
+            .any(|switch| part.eq_ignore_ascii_case(switch))
+    })?;
+    (index + 1 < parts.len()).then(|| parts[index + 1..].join(" "))
+}
+
+pub(crate) fn wrapped_command_segments(
+    parts: &[String],
+    payload: &str,
+) -> Result<Vec<String>, String> {
+    let executable = parts
+        .first()
+        .and_then(|part| part.rsplit(['/', '\\']).next())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let stem = executable.strip_suffix(".exe").unwrap_or(&executable);
+    if !matches!(stem, "powershell" | "pwsh") {
+        return Ok(vec![payload.trim().to_string()]);
+    }
+    let mut commands = Vec::new();
+    for statement in split_powershell_statements(payload)? {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if let Some(rhs) = powershell_assignment_rhs(statement) {
+            let rhs = rhs.trim();
+            if rhs.starts_with('(') && rhs.ends_with(')') {
+                let nested = rhs[1..rhs.len() - 1].trim();
+                if nested.is_empty() {
+                    return Err("PowerShell assignment contains an empty subcommand".into());
+                }
+                commands.push(nested.to_string());
+            } else if rhs.contains("$(") || rhs.contains("${") || rhs.contains('`') {
+                return Err("PowerShell assignment contains unsupported dynamic expansion".into());
+            }
+            continue;
+        }
+        let mut nested = split_command_line(statement)?;
+        let first = nested
+            .first()
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if is_safe_powershell_builtin(&first) {
+            continue;
+        }
+        if first == "&" {
+            if nested.get(1).is_none_or(|value| value.starts_with('$')) {
+                return Err("Dynamic PowerShell command invocation is not allowed".into());
+            }
+            nested.remove(0);
+            commands.push(join_command_tokens(&nested));
+            continue;
+        }
+        if first.starts_with('$')
+            || matches!(
+                first.as_str(),
+                "if" | "else" | "elseif" | "while" | "for" | "foreach" | "do" | "switch"
+            )
+        {
+            return Err("Dynamic PowerShell control flow is not allowed".into());
+        }
+        commands.push(statement.to_string());
+    }
+    Ok(commands)
+}
+
+fn split_powershell_statements(payload: &str) -> Result<Vec<String>, String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut quote = None::<char>;
+    let mut escaped = false;
+    let mut parentheses = 0usize;
+    for character in payload.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                current.push(character);
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                current.push(character);
+                if character == '`' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            Some(_) => unreachable!(),
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    current.push(character);
+                }
+                '(' => {
+                    parentheses = parentheses.saturating_add(1);
+                    current.push(character);
+                }
+                ')' => {
+                    if parentheses == 0 {
+                        return Err(
+                            "PowerShell wrapper has an unmatched closing parenthesis".into()
+                        );
+                    }
+                    parentheses -= 1;
+                    current.push(character);
+                }
+                ';' | '\r' | '\n' if parentheses == 0 => {
+                    if !current.trim().is_empty() {
+                        statements.push(current.trim().to_string());
+                    }
+                    current.clear();
+                }
+                '|' | '>' | '<' if parentheses == 0 => {
+                    return Err(
+                        "PowerShell wrapper pipelines and redirection are not allowed".into(),
+                    );
+                }
+                '`' => {
+                    return Err("PowerShell wrapper escape expansion is not allowed".into());
+                }
+                _ => current.push(character),
+            },
+        }
+    }
+    if quote.is_some() || parentheses != 0 {
+        return Err("PowerShell wrapper contains an unterminated quote or subcommand".into());
+    }
+    if !current.trim().is_empty() {
+        statements.push(current.trim().to_string());
+    }
+    Ok(statements)
+}
+
+fn powershell_assignment_rhs(statement: &str) -> Option<&str> {
+    let (left, right) = statement.split_once('=')?;
+    let left = left.trim();
+    let name = left
+        .strip_prefix("$env:")
+        .or_else(|| left.strip_prefix('$'))?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_'))
+    .then_some(right)
+}
+
+fn is_safe_powershell_builtin(command: &str) -> bool {
+    matches!(
+        command,
+        "write-output"
+            | "get-content"
+            | "get-childitem"
+            | "select-object"
+            | "where-object"
+            | "test-path"
+            | "resolve-path"
+            | "join-path"
+            | "split-path"
+            | "get-process"
+            | "start-sleep"
+    )
+}
+
+fn join_command_tokens(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| {
+            if token.is_empty() || token.chars().any(char::is_whitespace) {
+                format!("\"{}\"", token.replace('"', "\\\""))
+            } else {
+                token.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn workspace_local_entry_exists(
@@ -460,9 +755,7 @@ fn interpreter_mutation_pattern() -> &'static regex::Regex {
 fn command_contains_external_path(command: &str) -> bool {
     let normalized = command.replace('\\', "/");
     let posix_absolute = POSIX_ABSOLUTE_PATH_PATTERN
-        .get_or_init(|| {
-            regex::Regex::new(r#"(?i)(^|["'\s])(/[^\s"']*)"#).expect("valid regex")
-        })
+        .get_or_init(|| regex::Regex::new(r#"(?i)(^|["'\s])(/[^\s"']*)"#).expect("valid regex"))
         .captures_iter(&normalized)
         .filter_map(|captures| captures.get(2).map(|value| value.as_str()))
         .any(|value| !is_windows_command_switch(value));
@@ -477,8 +770,7 @@ fn command_contains_external_path(command: &str) -> bool {
 fn is_windows_command_switch(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
-        "/a"
-            | "/c"
+        "/a" | "/c"
             | "/d"
             | "/e:off"
             | "/e:on"
@@ -589,11 +881,9 @@ mod tests {
             workspace_script_extensions: parse_workspace_script_extensions(".cmd,.launcher"),
             ..PolicySettings::default()
         };
-        assert!(validate_command(
-            &serde_json::json!({ "cmd": "anything.launcher" }),
-            &policy
-        )
-        .is_err());
+        assert!(
+            validate_command(&serde_json::json!({ "cmd": "anything.launcher" }), &policy).is_err()
+        );
         policy.allowed_commands.insert("anything.launcher".into());
         policy.allowed_commands.insert("another-name".into());
         assert!(
@@ -666,6 +956,66 @@ mod tests {
         )
         .is_err());
         assert!(validate_command(&json!({"cmd": "echo hello > output.txt"}), &policy).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_line_preserves_unquoted_backslashes_and_quoted_spaces() {
+        let parts =
+            split_command_line(r#"python -c "print('ok')" foo\bar "C:\Program Files\tool.exe""#)
+                .expect("windows command line");
+        assert_eq!(parts[3], r"foo\bar");
+        assert_eq!(parts[4], r"C:\Program Files\tool.exe");
+    }
+
+    #[test]
+    fn shell_wrappers_cannot_bypass_the_inner_command_allowlist() {
+        let mut policy = PolicySettings::default();
+        policy
+            .allowed_commands
+            .retain(|command| command == "powershell");
+        let blocked = validate_command(
+            &json!({"cmd": "powershell -NoProfile -Command \"corepack --version\""}),
+            &policy,
+        )
+        .expect_err("inner command must be checked");
+        assert!(blocked.0.contains("corepack"));
+
+        assert!(validate_command(
+            &json!({"cmd": "powershell -NoProfile -Command \"Write-Output safe\""}),
+            &policy,
+        )
+        .is_ok());
+        assert!(validate_command(
+            &json!({"cmd": "powershell -NoProfile -Command \"Write-Output safe; corepack --version\""}),
+            &policy,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn powershell_wrapper_allows_checked_environment_setup_and_sequential_commands() {
+        let policy = PolicySettings::default();
+        assert!(validate_command(&json!({
+            "cmd": "powershell -NoProfile -Command \"$env:RUSTC=(rustup which rustc); rustup run stable cargo --version\""
+        }), &policy).is_ok());
+        assert!(validate_command(&json!({
+            "cmd": "powershell -NoProfile -Command \"$env:RUSTC=(winget --version); rustup run stable cargo --version\""
+        }), &policy).is_err());
+        assert!(validate_command(
+            &json!({
+                "cmd": "powershell -NoProfile -Command \"rustup --version | Write-Output\""
+            }),
+            &policy
+        )
+        .is_err());
+        assert!(validate_command(
+            &json!({
+                "cmd": "powershell -NoProfile -Command \"$tool='cargo'; & $tool --version\""
+            }),
+            &policy
+        )
+        .is_err());
     }
 
     #[test]

@@ -6,14 +6,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "desktop": "tauri dev",
-    "desktop:build": "node scripts/prepare-desktop-build.mjs && tauri build",
-    "cli:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
-    "start": "tauri dev",
+    "desktop": "node scripts/run-with-rust-toolchain.mjs tauri dev",
+    "desktop:build": "node scripts/prepare-desktop-build.mjs && node scripts/run-with-rust-toolchain.mjs tauri build",
+    "cli:build": "node scripts/run-with-rust-toolchain.mjs cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
+    "start": "node scripts/run-with-rust-toolchain.mjs tauri dev",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "tauri": "tauri"
+    "tauri": "node scripts/run-with-rust-toolchain.mjs tauri"
   },
   "license": "Apache-2.0",
   "dependencies": {

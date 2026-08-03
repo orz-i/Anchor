@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 15;
+pub const CATALOG_VERSION: u32 = 17;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -60,6 +60,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "list_command_sessions",
+        "List command sessions",
+        "Return all retained command sessions with command identity, execution state, output references, and recent activity timestamps for reliable resume.",
+        true,
+        false,
+        false,
+    ),
+    (
         "operation_log",
         "Operation log",
         "Return Workspace-level operation history independent of Task state.",
@@ -74,6 +82,22 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         true,
         false,
         false,
+    ),
+    (
+        "browser_build_info",
+        "Browser build info",
+        "Read the selected page build hash, Git commit, app version, loaded asset hashes, Service Worker registrations, and cache names.",
+        true,
+        false,
+        true,
+    ),
+    (
+        "browser_wait_for_build",
+        "Wait for browser build",
+        "Clear selected-page Service Workers and Cache Storage, reload without cache, and wait until the expected frontend build hash or Git commit is loaded.",
+        false,
+        true,
+        true,
     ),
     (
         "list_skills",
@@ -472,6 +496,8 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
 /// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
 pub const CORE_TOOLS: &[&str] = &[
     "server_info",
+    "browser_build_info",
+    "browser_wait_for_build",
     "begin_work_session",
     "close_work_session",
     "update_verification_disposition",
@@ -497,6 +523,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "exec_command",
     "write_stdin",
     "wait_command",
+    "list_command_sessions",
     "kill_session",
     "read_output",
     "git_status",
@@ -515,6 +542,7 @@ pub const CORE_TOOLS: &[&str] = &[
 
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "server_info",
+    "browser_build_info",
     "list_skills",
     "load_skill",
     "list_skill_resources",
@@ -528,6 +556,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "search_text",
     "read_output",
     "wait_command",
+    "list_command_sessions",
     "git_status",
     "git_diff",
     "git_log",
@@ -545,6 +574,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "accept_current_baseline",
     "accept_latest_baseline",
     "server_info",
+    "browser_build_info",
+    "browser_wait_for_build",
     "list_skills",
     "load_skill",
     "list_skill_resources",
@@ -567,6 +598,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "exec_command",
     "write_stdin",
     "wait_command",
+    "list_command_sessions",
     "kill_session",
     "read_output",
     "git_status",
@@ -599,6 +631,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 
 pub const MUTATING_TOOLS: &[&str] = &[
     "begin_work_session",
+    "browser_wait_for_build",
     "close_work_session",
     "update_verification_disposition",
     "accept_current_baseline",
@@ -634,6 +667,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "operation_log",
     "stage_commit_status",
     "server_info",
+    "browser_build_info",
     "list_skills",
     "load_skill",
     "read_skill_resource",
@@ -647,6 +681,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "search_text",
     "read_output",
     "wait_command",
+    "list_command_sessions",
     "git_status",
     "git_diff",
     "git_log",
@@ -773,6 +808,9 @@ fn history_bootstrap_output_properties() -> Value {
             "all_history_summary": { "type": "string", "maxLength": 60000 },
             "inherited_summary": { "type": ["string", "null"] },
             "latest_handoff": { "type": ["string", "null"], "maxLength": 64000 },
+            "latest_handoff_source": { "type": "string", "enum": ["current_session", "latest_prior", "none"] },
+            "latest_handoff_session_number": nullable_integer_property(),
+            "latest_handoff_session_path": { "type": ["string", "null"] },
             "latest_handoff_truncated": { "type": "boolean" },
             "latest_handoff_total_bytes": { "type": "integer", "minimum": 0 }
         }),
@@ -803,6 +841,7 @@ fn history_bootstrap_output_properties() -> Value {
             "assistant_instructions": { "type": "string", "minLength": 1 },
             "required_next_actions": { "type": "array", "items": { "type": "string" } },
             "checkpoint_policy": { "type": "object" },
+            "resume_state": { "type": "object" },
             "persistence": {
                 "type": "object",
                 "properties": {
@@ -825,6 +864,8 @@ fn session_snapshot_output_schema() -> Value {
     success_output_schema(
         json!({
             "session_id": { "type": "string", "minLength": 1 },
+            "command": { "type": "string" },
+            "resolved_cwd": { "type": "string" },
             "interactive": { "type": "boolean" },
             "stdin_open": { "type": "boolean" },
             "status": { "type": "string", "minLength": 1 },
@@ -833,6 +874,10 @@ fn session_snapshot_output_schema() -> Value {
             "suggestion": { "type": "string" },
             "exit_code": nullable_integer_property(),
             "transport_ok": { "type": "boolean" },
+            "transport_status": { "type": "string", "enum": ["ok", "error"] },
+            "execution_status": { "type": "string", "enum": ["running", "succeeded", "failed", "cancelled", "timed_out", "killed", "spawn_failed", "rejected", "interrupted"] },
+            "success": { "type": ["boolean", "null"] },
+            "retryable": { "type": "boolean" },
             "command_ok": { "type": ["boolean", "null"] },
             "stdout": { "type": "string" },
             "stderr": { "type": "string" },
@@ -856,6 +901,8 @@ fn session_snapshot_output_schema() -> Value {
         }),
         &[
             "session_id",
+            "command",
+            "resolved_cwd",
             "interactive",
             "stdin_open",
             "status",
@@ -864,6 +911,10 @@ fn session_snapshot_output_schema() -> Value {
             "suggestion",
             "exit_code",
             "transport_ok",
+            "transport_status",
+            "execution_status",
+            "success",
+            "retryable",
             "command_ok",
             "stdout",
             "stderr",
@@ -933,7 +984,8 @@ pub fn output_schema(name: &str) -> Value {
                         },
                         "required": ["configured", "server_count", "servers"],
                         "additionalProperties": false
-                    }
+                    },
+                    "connection_layers": { "type": "object" }
                 }),
             ]),
             &[
@@ -972,6 +1024,58 @@ pub fn output_schema(name: &str) -> Value {
                 "current_proxy_tool_count",
                 "command_cost_policy",
                 "downstream_mcp",
+                "connection_layers",
+            ],
+        ),
+        "browser_build_info" => success_output_schema(
+            json!({
+                "build_info": { "type": "object" },
+                "current_build": { "type": ["string", "null"] },
+                "source_tool": { "type": "string", "minLength": 1 },
+                "warnings": warnings_property()
+            }),
+            &["build_info", "current_build", "source_tool", "warnings"],
+        ),
+        "browser_wait_for_build" => success_output_schema(
+            json!({
+                "expected_build": { "type": "string", "minLength": 1 },
+                "matched": { "type": "boolean", "const": true },
+                "build_info": { "type": "object" },
+                "current_build": { "type": ["string", "null"] },
+                "attempts": { "type": "integer", "minimum": 1 },
+                "elapsed_ms": { "type": "integer", "minimum": 0 },
+                "cleanup": { "type": "object" },
+                "reload": { "type": "object" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "expected_build",
+                "matched",
+                "build_info",
+                "current_build",
+                "attempts",
+                "elapsed_ms",
+                "cleanup",
+                "reload",
+                "warnings",
+            ],
+        ),
+        "list_command_sessions" => success_output_schema(
+            json!({
+                "sessions": { "type": "array", "items": { "type": "object" } },
+                "session_count": { "type": "integer", "minimum": 0 },
+                "running_count": { "type": "integer", "minimum": 0 },
+                "terminal_count": { "type": "integer", "minimum": 0 },
+                "process_bound": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "sessions",
+                "session_count",
+                "running_count",
+                "terminal_count",
+                "process_bound",
+                "warnings",
             ],
         ),
         "git_reset" => success_output_schema(
@@ -1248,6 +1352,7 @@ pub fn output_schema(name: &str) -> Value {
                 "run_budget_reserved": { "type": "boolean", "const": false }
             }),
             &[
+                "session_id",
                 "command",
                 "classification",
                 "would_require_operator_approval",
@@ -1257,6 +1362,7 @@ pub fn output_schema(name: &str) -> Value {
         ),
         "exec_command" => success_output_schema(
             json!({
+                "session_id": { "type": ["string", "null"] },
                 "command": { "type": "string", "minLength": 1 },
                 "resolved_cwd": { "type": "string", "minLength": 1 },
                 "status": { "type": "string", "minLength": 1 },
@@ -1279,6 +1385,10 @@ pub fn output_schema(name: &str) -> Value {
                 "child_process": { "type": "boolean" },
                 "execution_started": { "type": "boolean" },
                 "transport_ok": { "type": "boolean" },
+                "transport_status": { "type": "string", "enum": ["ok", "error"] },
+                "execution_status": { "type": "string", "enum": ["running", "succeeded", "failed", "cancelled", "timed_out", "killed", "spawn_failed", "rejected", "interrupted"] },
+                "success": { "type": ["boolean", "null"] },
+                "retryable": { "type": "boolean" },
                 "command_ok": { "type": ["boolean", "null"] },
                 "verification_pending": { "type": "boolean" },
                 "verification_id": { "type": "string", "minLength": 1 },
@@ -1316,6 +1426,10 @@ pub fn output_schema(name: &str) -> Value {
                 "child_process",
                 "execution_started",
                 "transport_ok",
+                "transport_status",
+                "execution_status",
+                "success",
+                "retryable",
                 "command_ok",
                 "warnings",
             ],
@@ -1329,6 +1443,10 @@ pub fn output_schema(name: &str) -> Value {
                 "termination_reason": { "type": "string", "minLength": 1 },
                 "exit_code": nullable_integer_property(),
                 "command_ok": { "type": ["boolean", "null"] },
+                "transport_status": { "type": "string", "enum": ["ok", "error"] },
+                "execution_status": { "type": "string", "enum": ["running", "succeeded", "failed", "cancelled", "timed_out", "killed", "spawn_failed", "rejected", "interrupted"] },
+                "success": { "type": ["boolean", "null"] },
+                "retryable": { "type": "boolean" },
                 "started_at": { "type": "string", "minLength": 1 },
                 "elapsed_ms": { "type": "integer", "minimum": 0 },
                 "last_output_at": { "type": "string", "minLength": 1 },
@@ -1351,6 +1469,10 @@ pub fn output_schema(name: &str) -> Value {
                 "termination_reason",
                 "exit_code",
                 "command_ok",
+                "transport_status",
+                "execution_status",
+                "success",
+                "retryable",
                 "started_at",
                 "elapsed_ms",
                 "last_output_at",
@@ -1518,6 +1640,9 @@ pub fn output_schema(name: &str) -> Value {
                 "inherited_summary",
                 "session_summaries",
                 "latest_handoff",
+                "latest_handoff_source",
+                "latest_handoff_session_number",
+                "latest_handoff_session_path",
                 "latest_handoff_truncated",
                 "latest_handoff_total_bytes",
                 "history_read_mode",
@@ -1528,6 +1653,7 @@ pub fn output_schema(name: &str) -> Value {
                 "assistant_instructions",
                 "required_next_actions",
                 "checkpoint_policy",
+                "resume_state",
                 "persistence",
                 "warnings",
             ],
@@ -1968,6 +2094,23 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
 
 pub fn input_schema(name: &str) -> Value {
     match name {
+        "browser_build_info" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "browser_wait_for_build" => json!({
+            "type": "object",
+            "properties": {
+                "expected_build": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 180000, "default": 60000 },
+                "poll_interval_ms": { "type": "integer", "minimum": 250, "maximum": 5000, "default": 1000 },
+                "clear_service_worker": { "type": "boolean", "default": true },
+                "clear_cache": { "type": "boolean", "default": true }
+            },
+            "required": ["expected_build"],
+            "additionalProperties": false
+        }),
         "list_skills" => json!({
             "type": "object",
             "properties": {
@@ -2485,6 +2628,14 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["session_id"],
             "additionalProperties": false
         }),
+        "list_command_sessions" => json!({
+            "type": "object",
+            "properties": {
+                "include_terminal": { "type": "boolean", "default": true },
+                "max_output_bytes": { "type": "integer", "minimum": 0, "maximum": 65536, "default": 4096 }
+            },
+            "additionalProperties": false
+        }),
         "kill_session" => json!({
             "type": "object",
             "properties": {
@@ -2667,7 +2818,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_40_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_43_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2675,7 +2826,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 40);
+        assert_eq!(tools.len(), 43);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"load_skill"));
@@ -2687,6 +2838,9 @@ mod tests {
         assert!(names.contains(&"begin_work_session"));
         assert!(names.contains(&"close_work_session"));
         assert!(names.contains(&"wait_command"));
+        assert!(names.contains(&"list_command_sessions"));
+        assert!(names.contains(&"browser_build_info"));
+        assert!(names.contains(&"browser_wait_for_build"));
         assert!(names.contains(&"search_text"));
         assert!(names.contains(&"command_cost_explain"));
         assert!(names.contains(&"git_stage"));

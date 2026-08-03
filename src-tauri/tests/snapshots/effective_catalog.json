@@ -1,11 +1,13 @@
 {
   "advanced": {
-    "catalog_version": 15,
+    "catalog_version": 17,
     "names": [
       "accept_current_baseline",
       "accept_latest_baseline",
       "apply_patch",
       "begin_work_session",
+      "browser_build_info",
+      "browser_wait_for_build",
       "change_summary",
       "check_exec_environment",
       "close_work_session",
@@ -30,6 +32,7 @@
       "history_session_checkpoint",
       "history_session_validate",
       "kill_session",
+      "list_command_sessions",
       "list_dir",
       "list_files",
       "list_skill_resources",
@@ -61,14 +64,16 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 58
+    "tool_count": 61
   },
   "core": {
-    "catalog_version": 15,
+    "catalog_version": 17,
     "names": [
       "accept_latest_baseline",
       "apply_patch",
       "begin_work_session",
+      "browser_build_info",
+      "browser_wait_for_build",
       "check_exec_environment",
       "close_work_session",
       "command_cost_explain",
@@ -89,6 +94,7 @@
       "history_session_checkpoint",
       "history_session_validate",
       "kill_session",
+      "list_command_sessions",
       "list_dir",
       "list_files",
       "list_skill_resources",
@@ -107,11 +113,12 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 40
+    "tool_count": 43
   },
   "read-only": {
-    "catalog_version": 15,
+    "catalog_version": 17,
     "names": [
+      "browser_build_info",
       "check_exec_environment",
       "command_cost_explain",
       "get_default_cwd",
@@ -120,6 +127,7 @@
       "git_log",
       "git_show",
       "git_status",
+      "list_command_sessions",
       "list_dir",
       "list_files",
       "list_skill_resources",
@@ -133,6 +141,6 @@
       "view_image",
       "wait_command"
     ],
-    "tool_count": 20
+    "tool_count": 22
   }
 }

@@ -1,15 +1,19 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::context::ToolContext;
-use crate::tools::session::{ExecSession, SessionHarnessMetadata};
+use crate::tools::session::{
+    finalize_execution_result, ExecSession, SessionHarnessMetadata, StreamEncoding,
+};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::CancellationToken;
 
@@ -18,6 +22,81 @@ const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     exec_command_with_cancellation(ctx, args, &CancellationToken::default())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn resolve_system_program_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_system_program_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(stem.as_str(), "cargo" | "rustc" | "rustdoc") {
+        if let Some(resolved) = rustup_tool_path(&stem) {
+            return PathBuf::from(resolved);
+        }
+    }
+    let Ok(target) = std::fs::read_link(path) else {
+        return path.to_path_buf();
+    };
+    let target = if target.is_absolute() {
+        target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+    };
+    let normalized = PathBuf::from(windows_command_path(&target.to_string_lossy()));
+    if normalized.is_file() {
+        normalized
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
+fn configure_windows_command_environment(command: &mut Command, program: &str) {
+    let stem = Path::new(program)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if stem != "cargo" {
+        return;
+    }
+    if let Some(rustc) = rustup_tool_path("rustc") {
+        command.env("RUSTC", rustc);
+    }
+    if let Some(rustdoc) = rustup_tool_path("rustdoc") {
+        command.env("RUSTDOC", rustdoc);
+    }
+}
+
+#[cfg(windows)]
+fn rustup_tool_path(tool: &str) -> Option<&'static str> {
+    static CARGO: OnceLock<Option<String>> = OnceLock::new();
+    static RUSTC: OnceLock<Option<String>> = OnceLock::new();
+    static RUSTDOC: OnceLock<Option<String>> = OnceLock::new();
+    let slot = match tool {
+        "cargo" => &CARGO,
+        "rustc" => &RUSTC,
+        "rustdoc" => &RUSTDOC,
+        _ => return None,
+    };
+    slot.get_or_init(|| {
+        let mut command = std::process::Command::new("rustup");
+        crate::platform::hide_std_console(&mut command);
+        let output = command.args(["which", tool]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!path.is_empty() && Path::new(&path).is_file()).then_some(path)
+    })
+    .as_deref()
 }
 
 pub fn command_cost_explain(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -133,7 +212,7 @@ pub fn exec_command_with_cancellation(
             object.insert("command_ok".into(), Value::Bool(true));
             object.insert("cost_policy".into(), cost_decision.to_value());
         }
-        return Ok(tool_ok(result));
+        return Ok(finalize_execution_result(result));
     }
     let max_output = args
         .get("max_output_bytes")
@@ -213,7 +292,7 @@ pub fn exec_command_with_cancellation(
                 object.insert("child_process".into(), Value::Bool(true));
                 object.insert("cost_policy".into(), cost_decision.to_value());
             }
-            Ok(tool_ok(out))
+            Ok(finalize_execution_result(out))
         }
         Err(error) => match execution_failure_result(&error, cmd, &workdir.path) {
             Some(mut result) => {
@@ -221,7 +300,7 @@ pub fn exec_command_with_cancellation(
                 if let Some(object) = result.as_object_mut() {
                     object.insert("cost_policy".into(), cost_decision.to_value());
                 }
-                Ok(tool_ok(result))
+                Ok(finalize_execution_result(result))
             }
             None => Err(error),
         },
@@ -266,12 +345,16 @@ fn attach_command_file_changes(
     }
     let workspace_after = capture_baseline_entries(ctx.workspace.root());
     let affected_files = diff_baseline_entries(workspace_before, &workspace_after);
+    let mutation_attributed = !affected_files.is_empty();
     if let Some(object) = output.as_object_mut() {
         object.insert(
             "affected_files".into(),
             serde_json::to_value(affected_files).unwrap_or_else(|_| json!([])),
         );
-        object.insert("mutation_attributed".into(), Value::Bool(true));
+        object.insert(
+            "mutation_attributed".into(),
+            Value::Bool(mutation_attributed),
+        );
     }
 }
 
@@ -280,8 +363,8 @@ fn run_native_diagnostic(
     cmd: &str,
     cwd: &Path,
 ) -> Result<Option<Value>, WorkspaceError> {
-    let parts = shell_words::split(cmd)
-        .map_err(|_| WorkspaceError::invalid_argument("Invalid command syntax"))?;
+    let parts =
+        crate::tools::policy::split_command_line(cmd).map_err(WorkspaceError::invalid_argument)?;
     if parts.is_empty() {
         return Ok(None);
     }
@@ -325,6 +408,8 @@ fn run_native_diagnostic(
             "execution_mode": "native_builtin",
             "execution_started": true,
             "command_runner": "native_builtin",
+            "affected_files": [],
+            "mutation_attributed": false,
             "warnings": ["native diagnostic without child process"]
         })
     }))
@@ -411,6 +496,8 @@ async fn run_command(
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONLEGACYWINDOWSSTDIO", "0");
+    #[cfg(windows)]
+    configure_windows_command_environment(&mut command, &program);
 
     let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
         code: "COMMAND_SPAWN_FAILED",
@@ -440,11 +527,16 @@ async fn run_command(
                 verification_level: verification_level.to_string(),
                 supersede_previous_failures,
             });
-    let session = match ctx.sessions.insert(ExecSession::new_with_harness_metadata(
-        child,
-        tty,
-        harness_metadata,
-    )) {
+    let session = match ctx
+        .sessions
+        .insert(ExecSession::new_with_details_and_encoding(
+            child,
+            tty,
+            cmd.to_string(),
+            cwd.display().to_string(),
+            harness_metadata,
+            stream_encoding_for_program(&program),
+        )) {
         Ok(session) => session,
         Err(rejected) => {
             rejected.mark_termination_reason("session_limit");
@@ -798,8 +890,8 @@ fn parse_and_resolve(
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
 ) -> Result<(String, Vec<String>), WorkspaceError> {
-    let parts = shell_words::split(cmd)
-        .map_err(|_| WorkspaceError::invalid_argument("Invalid command syntax"))?;
+    let parts =
+        crate::tools::policy::split_command_line(cmd).map_err(WorkspaceError::invalid_argument)?;
     if parts.is_empty() {
         return Err(WorkspaceError::invalid_argument("Empty command"));
     }
@@ -877,7 +969,11 @@ fn resolve_program(
     }
 
     which::which(trimmed)
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            resolve_system_program_path(&p)
+                .to_string_lossy()
+                .into_owned()
+        })
         .map_err(|_| WorkspaceError::Tool {
             code: "COMMAND_REJECTED",
             message: format!("Program not found on PATH: {trimmed}"),
@@ -905,7 +1001,7 @@ mod tests {
         expected_status: &str,
         expected_reason: &str,
     ) {
-        let result = tool_ok(
+        let result = finalize_execution_result(
             execution_failure_result(&error, "missing-command", Path::new("C:/workspace"))
                 .expect("应转换为统一执行结果"),
         );
@@ -913,7 +1009,12 @@ mod tests {
             .expect("exec output schema")
             .validate(&result)
             .expect("failure result must satisfy exec output schema");
+        assert_eq!(result["ok"], false);
         assert_eq!(result["transport_ok"], true);
+        assert_eq!(result["transport_status"], "ok");
+        assert_eq!(result["success"], false);
+        assert!(result["execution_status"].is_string());
+        assert_eq!(result["session_id"], Value::Null);
         assert_eq!(result["command_ok"], false);
         assert_eq!(result["status"], expected_status);
         assert_eq!(result["termination_reason"], expected_reason);
@@ -1160,6 +1261,20 @@ mod tests {
                 .unwrap_or_default()
                 .contains("workflow-ok"));
         }
+
+        let cmd_unicode = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({ "cmd": "cmd /d /c echo 中文输出", "timeout_ms": 10_000, "yield_time_ms": 10_000 }),
+        );
+        assert_eq!(cmd_unicode["command_ok"], true, "{cmd_unicode}");
+        assert!(
+            cmd_unicode["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("中文输出"),
+            "{cmd_unicode}"
+        );
     }
 
     #[cfg(windows)]
@@ -1194,6 +1309,47 @@ mod tests {
                 "{script_name}: {output}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_program_resolution_follows_winget_style_symlink() {
+        let directory = tempfile::tempdir().expect("program directory");
+        let target = directory.path().join("real-rg.exe");
+        std::fs::write(&target, b"stub").expect("target executable");
+        let link = directory.path().join("rg.exe");
+        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+            return;
+        }
+
+        assert_eq!(resolve_system_program_path(&link), target);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cargo_proxy_resolves_to_the_real_rustup_toolchain() {
+        let Some(real_cargo) = rustup_tool_path("cargo") else {
+            return;
+        };
+        let Ok(proxy) = which::which("cargo") else {
+            return;
+        };
+        let resolved = resolve_system_program_path(&proxy);
+        assert_eq!(resolved, PathBuf::from(real_cargo));
+        assert!(resolved.is_file());
+    }
+
+    #[test]
+    fn read_only_command_does_not_claim_a_workspace_mutation() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let output = call_tool(&ctx, "exec_command", &json!({"cmd": "echo read-only"}));
+        assert_eq!(output["command_ok"], true, "{output}");
+        assert_eq!(output["mutation_attributed"], false, "{output}");
+        assert_eq!(output["affected_files"], json!([]), "{output}");
     }
 
     #[cfg(unix)]
@@ -1292,6 +1448,27 @@ fn windows_batch_command_line(program: &str, args: &[String]) -> String {
 #[cfg(windows)]
 fn windows_batch_token(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn stream_encoding_for_program(program: &str) -> StreamEncoding {
+    #[cfg(windows)]
+    {
+        let path = Path::new(program);
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if stem == "cmd" || matches!(extension.as_str(), "cmd" | "bat") {
+            return StreamEncoding::WindowsOem;
+        }
+    }
+    StreamEncoding::Utf8
 }
 
 fn platform_command_path(path: &Path) -> std::path::PathBuf {

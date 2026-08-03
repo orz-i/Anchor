@@ -62,8 +62,10 @@ pub fn diagnose(root: &Path) -> Value {
         && node_modules["traversable"] == true
         && node_modules["direct_packages_healthy"] == true
         && node_modules["required_bins_healthy"] == true;
+    let host_rust_healthy = cargo["healthy"] == true && rustc["healthy"] == true;
+    let host_healthy = host_frontend_healthy && host_rust_healthy;
     let docker_project = has_docker_project(root);
-    let recommended_route = if host_frontend_healthy {
+    let recommended_route = if host_healthy {
         "host"
     } else if docker_daemon["healthy"] == true && docker_project {
         "docker"
@@ -140,6 +142,8 @@ pub fn diagnose(root: &Path) -> Value {
         "node_modules": node_modules,
         "docker_project_detected": docker_project,
         "host_frontend_healthy": host_frontend_healthy,
+        "host_rust_healthy": host_rust_healthy,
+        "host_healthy": host_healthy,
         "recommended_verification_route": recommended_route,
         "findings": findings
     })
@@ -243,10 +247,9 @@ fn probe_command(program: &str, resolved: Option<&Path>, args: &[&str]) -> Comma
 
 #[cfg(windows)]
 fn windows_batch_command_line(program: &Path, args: &[&str]) -> String {
-    let mut command_line = format!(
-        "call \"{}\"",
-        program.display().to_string().replace('"', "\"\"")
-    );
+    let display = program.to_string_lossy();
+    let display = display.strip_prefix("\\\\?\\").unwrap_or(&display);
+    let mut command_line = format!("call \"{}\"", display.replace('"', "\"\""));
     for arg in args {
         command_line.push(' ');
         command_line.push('"');
@@ -466,7 +469,9 @@ fn unavailable_probe(message: &str) -> Value {
 }
 
 fn probe(program: &str, args: &[&str], cwd: &Path, limit: Duration) -> Value {
-    let resolved = which::which(program).ok();
+    let resolved = which::which(program)
+        .ok()
+        .map(|path| crate::tools::exec::resolve_system_program_path(&path));
     probe_resolved(program, resolved, args, cwd, limit)
 }
 
@@ -605,5 +610,15 @@ mod tests {
 
         assert_eq!(result["healthy"], true, "{result}");
         assert_eq!(result["version"], "wrapper-ok");
+
+        let extended = PathBuf::from(format!(r"\\?\{}", wrapper.display()));
+        let extended_result = probe_path(
+            &extended,
+            &["--version"],
+            root.path(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(extended_result["healthy"], true, "{extended_result}");
+        assert_eq!(extended_result["version"], "wrapper-ok");
     }
 }

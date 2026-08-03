@@ -60,7 +60,7 @@ fn patch_check_reports_hunk_and_nearest_context_diagnostics() {
 fn policy_rejection_returns_safe_structured_alternatives() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    let out = invoke(&ctx, "exec_command", json!({"cmd": "rg hello"}));
+    let out = invoke(&ctx, "exec_command", json!({"cmd": "findstr hello"}));
     let error = assert_err(&out);
     assert_eq!(error["error"]["code"], "POLICY_REJECTED");
     assert_eq!(error["error"]["retryable"], true);
@@ -122,6 +122,12 @@ fn check_exec_environment_reports_policy_metadata() {
     let payload = assert_ok(&out);
     assert_eq!(payload["permission_mode"], "trusted");
     assert!(payload["system_command_allowlist"].is_array());
+    assert!(payload["healthy"].is_boolean());
+    assert!(matches!(
+        payload["status"].as_str(),
+        Some("healthy" | "degraded")
+    ));
+    assert!(payload["retryable"].is_boolean());
 }
 
 #[test]
@@ -213,7 +219,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 40);
+    assert_eq!(names.len(), 43);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("list_skill_resources"));
@@ -228,6 +234,9 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
     assert!(names.contains("wait_command"));
+    assert!(names.contains("list_command_sessions"));
+    assert!(names.contains("browser_build_info"));
+    assert!(names.contains("browser_wait_for_build"));
     assert!(names.contains("begin_work_session"));
     assert!(names.contains("close_work_session"));
     assert!(!names.contains("harness_status"));
@@ -361,13 +370,17 @@ fn nonzero_command_exit_keeps_transport_ok_but_sets_command_ok_false() {
             "filesystem_scope": "workspace"
         }),
     );
-    let payload = assert_ok(&result);
+    let payload = assert_err(&result);
 
-    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["ok"], false);
     assert_eq!(payload["transport_ok"], true);
+    assert_eq!(payload["transport_status"], "ok");
+    assert_eq!(payload["execution_status"], "failed");
+    assert_eq!(payload["success"], false);
     assert_eq!(payload["command_ok"], false);
     assert_eq!(payload["status"], "exited");
     assert_eq!(payload["exit_code"], 1);
+    assert_eq!(payload["error"]["code"], "COMMAND_EXIT_NONZERO");
 }
 
 #[test]
@@ -428,11 +441,15 @@ fn killed_session_reports_command_failure_even_when_transport_succeeds() {
         "kill_session",
         json!({"session_id": session_id, "wait_ms": 2_000}),
     );
-    let killed = assert_ok(&killed);
+    let killed = assert_err(&killed);
     assert_eq!(killed["status"], "killed");
     assert_eq!(killed["killed"], true);
     assert_eq!(killed["transport_ok"], true);
+    assert_eq!(killed["transport_status"], "ok");
+    assert_eq!(killed["execution_status"], "killed");
+    assert_eq!(killed["success"], false);
     assert_eq!(killed["command_ok"], false);
+    assert_eq!(killed["error"]["code"], "COMMAND_KILLED");
     #[cfg(unix)]
     assert_eq!(killed["exit_code"], Value::Null);
 }
@@ -514,11 +531,14 @@ fn blocking_exec_timeout_preserves_the_declared_output_contract() {
             "yield_time_ms": 1_000
         }),
     );
-    let payload = assert_ok(&result);
+    let payload = assert_err(&result);
 
     assert_eq!(payload["termination_reason"], "timeout");
     assert_eq!(payload["child_process"], true);
     assert_eq!(payload["transport_ok"], true);
+    assert_eq!(payload["transport_status"], "ok");
+    assert_eq!(payload["execution_status"], "timed_out");
+    assert_eq!(payload["success"], false);
     assert_eq!(payload["command_ok"], false);
     assert_eq!(payload["error"]["code"], "TIMEOUT");
     assert!(payload["suggestion"].is_string());

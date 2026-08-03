@@ -46,7 +46,7 @@ pub fn build_effective_catalog(ctx: &ToolContext) -> Result<EffectiveCatalog, Wo
 pub fn build_effective_catalog_from_parts(
     tool_profile: &str,
     skill_service_enabled: bool,
-    proxy_tools: Vec<Value>,
+    mut proxy_tools: Vec<Value>,
 ) -> Result<EffectiveCatalog, WorkspaceError> {
     let mut tools = crate::tools::registry::list_tools_for_profile(tool_profile);
     if !skill_service_enabled {
@@ -56,6 +56,8 @@ pub fn build_effective_catalog_from_parts(
                 .is_none_or(|name| !crate::skills::is_skill_tool(name))
         });
     }
+    tools.sort_by(tool_name_order);
+    proxy_tools.sort_by(tool_name_order);
     let local_count = tools.len();
     let proxy_count = proxy_tools.len();
     tools.extend(proxy_tools);
@@ -101,11 +103,6 @@ pub fn build_effective_catalog_from_parts(
         estimated_tokens,
     )?;
 
-    tools.sort_by(|left, right| {
-        left.get("name")
-            .and_then(Value::as_str)
-            .cmp(&right.get("name").and_then(Value::as_str))
-    });
     let digest = digest_tools(&tools)?;
     Ok(EffectiveCatalog {
         tools,
@@ -115,6 +112,12 @@ pub fn build_effective_catalog_from_parts(
         total_bytes,
         estimated_tokens,
     })
+}
+
+fn tool_name_order(left: &Value, right: &Value) -> std::cmp::Ordering {
+    left.get("name")
+        .and_then(Value::as_str)
+        .cmp(&right.get("name").and_then(Value::as_str))
 }
 
 pub fn estimate_catalog_tokens(total_bytes: usize) -> usize {
@@ -342,7 +345,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(48))
             .expect("advanced plus browser catalog");
 
-        assert_eq!(catalog.local_count, 58);
+        assert_eq!(catalog.local_count, 61);
         assert_eq!(catalog.proxy_count, 48);
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
@@ -354,8 +357,20 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 40);
+        assert_eq!(catalog.local_count, 43);
         assert_eq!(catalog.proxy_count, 48);
+        assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
+            !tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("browser__action_")
+        }));
+        assert!(catalog.tools[catalog.local_count..].iter().all(|tool| {
+            tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("browser__action_")
+        }));
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
@@ -366,9 +381,9 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 40);
+        assert_eq!(catalog.local_count, 43);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 48);
+        assert_eq!(catalog.tools.len(), 51);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
@@ -387,7 +402,7 @@ mod tests {
             diagnostic["details"]["reason"],
             "chatgpt_catalog_budget_exceeded"
         );
-        assert_eq!(diagnostic["details"]["local_tool_count"], 58);
+        assert_eq!(diagnostic["details"]["local_tool_count"], 61);
         assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
         assert!(diagnostic["details"]["suggestions"]
             .as_array()

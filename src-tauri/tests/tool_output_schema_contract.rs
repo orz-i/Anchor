@@ -1,7 +1,7 @@
 mod common;
 
 use anchor_lib::tools::registry::output_schema;
-use common::{assert_ok, ctx_for, invoke, tiny_js_fixture};
+use common::{assert_err, assert_ok, ctx_for, invoke, tiny_js_fixture};
 use serde_json::{json, Value};
 
 #[cfg(windows)]
@@ -158,6 +158,10 @@ fn retained_session_tools_match_published_output_schemas() {
         "kill_session",
         json!({"session_id": session_id, "signal": "TERM", "wait_ms": 5_000}),
     );
-    assert_ok(&killed);
+    assert_err(&killed);
+    assert_eq!(killed["transport_status"], "ok");
+    assert_eq!(killed["execution_status"], "killed");
+    assert_eq!(killed["success"], false);
+    assert_eq!(killed["error"]["code"], "COMMAND_KILLED");
     assert_matches_output_schema("kill_session", &killed);
 }

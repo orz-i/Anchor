@@ -292,6 +292,20 @@ impl Workspace {
                 }
 
                 let path = entry.path();
+                let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                let generated_subtree = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| DEFAULT_EXCLUDED_NAMES.contains(&name));
+                // Package managers and build systems commonly materialize their
+                // generated roots as Windows junctions (notably node_modules and
+                // target). These trees are intentionally excluded from the
+                // recursive boundary walk, so apply that exclusion before trying
+                // to resolve the final entry as a link. Broken links elsewhere in
+                // the workspace remain blocked and recoverable via remove_path.
+                if generated_subtree && (is_directory || is_link_like(&path)) {
+                    continue;
+                }
                 if is_link_like(&path) {
                     let link_path = relative_display(&self.root, &path);
                     let resolved = path.canonicalize().map_err(|error| WorkspaceError::ToolDetails {
@@ -332,14 +346,6 @@ impl Workspace {
                             }),
                         });
                     }
-                    continue;
-                }
-                let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-                let generated_subtree = entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| DEFAULT_EXCLUDED_NAMES.contains(&name));
-                if is_directory && generated_subtree {
                     continue;
                 }
                 if is_directory {
@@ -784,6 +790,24 @@ mod tests {
         workspace
             .ensure_child_process_boundary()
             .expect("generated dependency internals are not part of the recursive boundary scan");
+    }
+
+    #[test]
+    fn child_process_boundary_allows_generated_root_junctions() {
+        let root = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external dependency root");
+        let generated = root.path().join("node_modules");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(external.path(), &generated).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(external.path(), &generated).is_err() {
+            return;
+        }
+
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        workspace
+            .ensure_child_process_boundary()
+            .expect("generated root junctions must not block package-manager commands");
     }
 
     #[test]

@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::Router;
+use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
@@ -21,6 +21,7 @@ use crate::workspace::WorkspaceProfile;
 const GATEWAY_MAX_BODY_BYTES: usize = 1_048_576;
 const GATEWAY_MAX_HEADER_BYTES: usize = 32 * 1024;
 const GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 64;
+const GATEWAY_MAX_AUTH_CONCURRENT_REQUESTS: usize = 8;
 const GATEWAY_MAX_REQUESTS_PER_MINUTE: usize = 1_200;
 const GATEWAY_MAX_REQUESTS_PER_WORKSPACE_PER_MINUTE: usize = 300;
 const GATEWAY_REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -28,6 +29,10 @@ const GATEWAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GATEWAY_UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const GATEWAY_NON_SSE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
 const GATEWAY_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(not(test))]
+const GATEWAY_AUTH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const GATEWAY_AUTH_QUEUE_TIMEOUT: Duration = Duration::from_millis(150);
 #[cfg(not(test))]
 const GATEWAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
@@ -42,6 +47,10 @@ pub struct McpGatewayStatus {
     pub route_count: usize,
     pub owner_workspace_id: String,
     pub error: String,
+}
+
+fn oauth_gateway_path(path: &str) -> bool {
+    path.starts_with("oauth/") || path.starts_with(".well-known/oauth-")
 }
 
 pub fn tunnel_identity_signature(
@@ -174,6 +183,7 @@ struct GatewayState {
     client: reqwest::Client,
     rate_limiter: RateLimiter,
     concurrency: Arc<Semaphore>,
+    auth_concurrency: Arc<Semaphore>,
 }
 
 struct GatewayRuntime {
@@ -477,6 +487,9 @@ async fn spawn_with_limits(
             .map_err(|error| AppError::Message(format!("MCP Gateway HTTP 客户端失败：{error}")))?,
         rate_limiter: RateLimiter::new(max_requests_per_minute, Duration::from_secs(60)),
         concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
+        auth_concurrency: Arc::new(Semaphore::new(
+            max_concurrent_requests.clamp(1, GATEWAY_MAX_AUTH_CONCURRENT_REQUESTS),
+        )),
     };
     let app = Router::new()
         .route("/w/{workspace_id}/{*upstream_path}", any(proxy_request))
@@ -536,13 +549,34 @@ async fn proxy_request(
             "Workspace gateway request rate limit exceeded",
         );
     }
-    let permit = match state.concurrency.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return gateway_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Gateway concurrency limit exceeded",
-            )
+    let permit = if oauth_gateway_path(&upstream_path) {
+        match tokio::time::timeout(
+            GATEWAY_AUTH_QUEUE_TIMEOUT,
+            state.auth_concurrency.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) => {
+                return diagnostic_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "oauth_gateway",
+                    "auth_capacity",
+                    "OAUTH_GATEWAY_BUSY",
+                    "OAuth gateway capacity is temporarily busy",
+                    true,
+                )
+            }
+        }
+    } else {
+        match state.concurrency.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return gateway_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Gateway concurrency limit exceeded",
+                )
+            }
         }
     };
     let (parts, request_body) = request.into_parts();
@@ -588,7 +622,15 @@ async fn proxy_request(
         .build()
     {
         Ok(request) => request,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(_) => {
+            return upstream_error(
+                StatusCode::BAD_GATEWAY,
+                &upstream_path,
+                "UPSTREAM_REQUEST_BUILD_FAILED",
+                "Gateway could not construct the local listener request",
+                true,
+            )
+        }
     };
     for (name, value) in &parts.headers {
         if !hop_by_hop_header(name.as_str())
@@ -608,8 +650,32 @@ async fn proxy_request(
     .await
     {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => return StatusCode::BAD_GATEWAY.into_response(),
-        Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
+        Ok(Err(_)) => {
+            return upstream_error(
+                StatusCode::BAD_GATEWAY,
+                &upstream_path,
+                if upstream_path.starts_with("oauth/") {
+                    "OAUTH_LISTENER_UNAVAILABLE"
+                } else {
+                    "APPLICATION_LISTENER_UNAVAILABLE"
+                },
+                "Gateway could not connect to the workspace listener",
+                true,
+            )
+        }
+        Err(_) => {
+            return upstream_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                &upstream_path,
+                if upstream_path.starts_with("oauth/") {
+                    "OAUTH_LISTENER_TIMEOUT"
+                } else {
+                    "APPLICATION_LISTENER_TIMEOUT"
+                },
+                "Workspace listener did not respond before the gateway deadline",
+                true,
+            )
+        }
     };
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
@@ -639,7 +705,92 @@ async fn proxy_request(
 }
 
 fn gateway_error(status: StatusCode, message: &'static str) -> Response {
-    (status, message).into_response()
+    diagnostic_error(
+        status,
+        "gateway",
+        "request_filter",
+        match status {
+            StatusCode::TOO_MANY_REQUESTS => "GATEWAY_RATE_LIMITED",
+            StatusCode::SERVICE_UNAVAILABLE => "GATEWAY_BUSY",
+            StatusCode::REQUEST_TIMEOUT => "GATEWAY_REQUEST_TIMEOUT",
+            StatusCode::PAYLOAD_TOO_LARGE => "GATEWAY_PAYLOAD_TOO_LARGE",
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE => "GATEWAY_HEADERS_TOO_LARGE",
+            StatusCode::METHOD_NOT_ALLOWED => "GATEWAY_METHOD_NOT_ALLOWED",
+            StatusCode::BAD_GATEWAY => "GATEWAY_UPSTREAM_INVALID",
+            _ => "GATEWAY_REQUEST_FAILED",
+        },
+        message,
+        matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::REQUEST_TIMEOUT
+                | StatusCode::BAD_GATEWAY
+        ),
+    )
+}
+
+fn upstream_error(
+    status: StatusCode,
+    upstream_path: &str,
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+) -> Response {
+    diagnostic_error(
+        status,
+        if upstream_path.starts_with("oauth/") {
+            "oauth_listener"
+        } else {
+            "application_listener"
+        },
+        "upstream_connection",
+        code,
+        message,
+        retryable,
+    )
+}
+
+fn diagnostic_error(
+    status: StatusCode,
+    component: &'static str,
+    stage: &'static str,
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+) -> Response {
+    let diagnostic_id = uuid::Uuid::new_v4().to_string();
+    let mut response = (
+        status,
+        Json(serde_json::json!({
+            "ok": false,
+            "status": "error",
+            "component": component,
+            "stage": stage,
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+            "diagnostic_id": diagnostic_id,
+            "next_action": if retryable {
+                "Retry after the listener or gateway health check succeeds"
+            } else {
+                "Correct the request before retrying"
+            }
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-anchor-error-code", HeaderValue::from_static(code));
+    response
+        .headers_mut()
+        .insert("x-anchor-component", HeaderValue::from_static(component));
+    if retryable {
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+    }
+    response
 }
 
 fn allowed_method(method: &Method) -> bool {
@@ -937,6 +1088,61 @@ mod tests {
 
         let _ = runtime.shutdown.send(());
         let _ = runtime.handle.await;
+        let _ = upstream_shutdown.send(());
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn oauth_lane_remains_available_while_mcp_stream_capacity_is_full() {
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind upstream");
+        let upstream_port = upstream_listener
+            .local_addr()
+            .expect("upstream addr")
+            .port();
+        let (upstream_shutdown, upstream_shutdown_rx) = oneshot::channel();
+        let upstream_handle = tokio::spawn(async move {
+            let app = Router::new()
+                .route("/mcp", get(never_ending_stream))
+                .route("/oauth/token", get(|| async { "token-ok" }));
+            axum::serve(upstream_listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = upstream_shutdown_rx.await;
+                })
+                .await
+                .expect("upstream serve");
+        });
+        let gateway_port = free_port();
+        let runtime = spawn_with_limits(
+            gateway_port,
+            HashMap::from([("workspace-a".to_string(), upstream_port)]),
+            1,
+            10,
+            10,
+        )
+        .await
+        .expect("gateway");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mcp_url = format!("http://127.0.0.1:{gateway_port}/w/workspace-a/mcp");
+        let token_url = format!("http://127.0.0.1:{gateway_port}/w/workspace-a/oauth/token");
+        let stream = client.get(&mcp_url).send().await.expect("MCP stream");
+        assert_eq!(stream.status(), StatusCode::OK);
+
+        let token = client
+            .get(&token_url)
+            .send()
+            .await
+            .expect("OAuth token request");
+        assert_eq!(token.status(), StatusCode::OK);
+        assert_eq!(token.text().await.unwrap(), "token-ok");
+
+        let mut supervisor = GatewaySupervisor {
+            runtime: Some(runtime),
+            last_error: String::new(),
+        };
+        supervisor.stop().await.unwrap();
+        drop(stream);
         let _ = upstream_shutdown.send(());
         let _ = upstream_handle.await;
     }

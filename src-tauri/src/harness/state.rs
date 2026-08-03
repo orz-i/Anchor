@@ -43,6 +43,7 @@ fn tool_activity_resumes_paused_task(tool: &str) -> bool {
             | "exec_health_check"
             | "command_cost_explain"
             | "get_default_cwd"
+            | "list_command_sessions"
             | "pause_task"
             | "resume_task"
             | "switch_task"

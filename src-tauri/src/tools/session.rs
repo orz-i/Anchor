@@ -23,6 +23,238 @@ pub struct SessionStore {
     terminal_retention: Duration,
 }
 
+struct StreamDecoder {
+    encoding: StreamEncoding,
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    fn new(encoding: StreamEncoding) -> Self {
+        Self {
+            encoding,
+            pending: Vec::new(),
+        }
+    }
+
+    fn decode(&mut self, chunk: &[u8], finish: bool) -> Vec<u8> {
+        match self.encoding {
+            StreamEncoding::Utf8 => chunk.to_vec(),
+            #[cfg(windows)]
+            StreamEncoding::WindowsOem => {
+                self.pending.extend_from_slice(chunk);
+                if !finish
+                    && self
+                        .pending
+                        .last()
+                        .is_some_and(|byte| windows_oem_is_lead_byte(*byte))
+                {
+                    let lead = self.pending.pop().expect("pending lead byte");
+                    let decoded = decode_windows_oem(&self.pending).into_bytes();
+                    self.pending.clear();
+                    self.pending.push(lead);
+                    decoded
+                } else {
+                    let decoded = decode_windows_oem(&self.pending).into_bytes();
+                    self.pending.clear();
+                    decoded
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetOEMCP() -> u32;
+    fn IsDBCSLeadByteEx(code_page: u32, test_char: u8) -> i32;
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        source: *const u8,
+        source_len: i32,
+        destination: *mut u16,
+        destination_len: i32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_oem_is_lead_byte(byte: u8) -> bool {
+    unsafe { IsDBCSLeadByteEx(GetOEMCP(), byte) != 0 }
+}
+
+#[cfg(windows)]
+fn decode_windows_oem(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let Ok(source_len) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    let code_page = unsafe { GetOEMCP() };
+    let required = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            source_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if required <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; required as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            source_len,
+            wide.as_mut_ptr(),
+            required,
+        )
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    String::from_utf16_lossy(&wide[..written as usize])
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum StreamEncoding {
+    #[default]
+    Utf8,
+    #[cfg(windows)]
+    WindowsOem,
+}
+
+pub fn finalize_execution_result(mut value: Value) -> Value {
+    let transport_ok = value
+        .get("transport_ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let command_ok = value.get("command_ok").and_then(Value::as_bool);
+    let reason = value
+        .get("termination_reason")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if value.get("status").and_then(Value::as_str) == Some("running") {
+                "running"
+            } else {
+                "exited"
+            }
+        })
+        .to_string();
+    let execution_status = value
+        .get("execution_status")
+        .and_then(Value::as_str)
+        .unwrap_or(match reason.as_str() {
+            "running" => "running",
+            "exited" if command_ok == Some(true) => "succeeded",
+            "exited" => "failed",
+            "cancelled" => "cancelled",
+            "timeout" => "timed_out",
+            "killed" => "killed",
+            "spawn_failed" => "spawn_failed",
+            "command_rejected" => "rejected",
+            "server_restart" => "interrupted",
+            _ => "failed",
+        })
+        .to_string();
+    let retryable = value
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .or_else(|| value.get("recoverable").and_then(Value::as_bool))
+        .unwrap_or(matches!(
+            reason.as_str(),
+            "timeout" | "killed" | "spawn_failed" | "server_restart"
+        ));
+
+    if let Some(object) = value.as_object_mut() {
+        object.entry("session_id").or_insert(Value::Null);
+        object.entry("exit_code").or_insert(Value::Null);
+        object.insert(
+            "transport_status".into(),
+            Value::String(if transport_ok { "ok" } else { "error" }.into()),
+        );
+        object.insert(
+            "execution_status".into(),
+            Value::String(execution_status.clone()),
+        );
+        object.insert(
+            "success".into(),
+            command_ok.map(Value::Bool).unwrap_or(Value::Null),
+        );
+        object.insert("retryable".into(), Value::Bool(retryable));
+        if command_ok == Some(false) || !transport_ok {
+            object.insert("ok".into(), Value::Bool(false));
+            let exit_code = object.get("exit_code").cloned().unwrap_or(Value::Null);
+            let session_id = object.get("session_id").cloned().unwrap_or(Value::Null);
+            let error_code = match reason.as_str() {
+                "timeout" => "COMMAND_TIMEOUT",
+                "killed" => "COMMAND_KILLED",
+                "cancelled" => "COMMAND_CANCELLED",
+                "spawn_failed" => "COMMAND_SPAWN_FAILED",
+                "command_rejected" => "COMMAND_REJECTED",
+                _ if !transport_ok => "EXECUTION_TRANSPORT_FAILED",
+                _ => "COMMAND_EXIT_NONZERO",
+            };
+            let summary = match object.get("summary").and_then(Value::as_str) {
+                Some(summary) if !summary.trim().is_empty() => summary.to_string(),
+                _ => format!("Command execution failed ({execution_status})"),
+            };
+            object.insert("summary".into(), Value::String(summary.clone()));
+            object.entry("status").or_insert_with(|| json!("error"));
+            object.entry("error").or_insert_with(|| {
+                json!({
+                    "code": error_code,
+                    "message": summary,
+                    "category": "runtime",
+                    "retryable": retryable,
+                    "details": {
+                        "termination_reason": reason,
+                        "execution_status": execution_status,
+                        "exit_code": exit_code,
+                        "session_id": session_id
+                    }
+                })
+            });
+        } else {
+            object.entry("ok").or_insert(Value::Bool(true));
+        }
+    }
+    value
+}
+
+pub fn list_command_sessions(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+    let include_terminal = args
+        .get("include_terminal")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let max_output_bytes = args
+        .get("max_output_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(4_096)
+        .clamp(0, 65_536) as usize;
+    let sessions = store.list_snapshots(include_terminal, max_output_bytes);
+    let running_count = sessions
+        .iter()
+        .filter(|session| session.get("execution_status") == Some(&json!("running")))
+        .count();
+    let session_count = sessions.len();
+    let terminal_count = session_count.saturating_sub(running_count);
+    Ok(tool_ok(json!({
+        "sessions": sessions,
+        "session_count": session_count,
+        "running_count": running_count,
+        "terminal_count": terminal_count,
+        "process_bound": true,
+        "warnings": []
+    })))
+}
+
 pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
@@ -106,13 +338,17 @@ pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         "stderr": format!("session:{session_id}:stderr")
     });
 
-    Ok(tool_ok(json!({
+    Ok(finalize_execution_result(json!({
         "session_id": session_id,
         "state": state,
         "status": snapshot["status"],
         "termination_reason": termination_reason,
         "exit_code": snapshot["exit_code"],
         "command_ok": snapshot["command_ok"],
+        "transport_status": snapshot["transport_status"],
+        "execution_status": snapshot["execution_status"],
+        "success": snapshot["success"],
+        "retryable": snapshot["retryable"],
         "started_at": snapshot["started_at"],
         "elapsed_ms": snapshot["elapsed_ms"],
         "last_output_at": snapshot["last_output_at"],
@@ -165,6 +401,42 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_result_exposes_unambiguous_failure_contract() {
+        let result = finalize_execution_result(json!({
+            "status": "exited",
+            "termination_reason": "exited",
+            "exit_code": 7,
+            "transport_ok": true,
+            "command_ok": false
+        }));
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["transport_status"], "ok");
+        assert_eq!(result["execution_status"], "failed");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["retryable"], false);
+        assert_eq!(result["session_id"], Value::Null);
+        assert_eq!(result["error"]["code"], "COMMAND_EXIT_NONZERO");
+    }
+
+    #[test]
+    fn running_execution_keeps_nullable_success_and_session_identity() {
+        let result = finalize_execution_result(json!({
+            "session_id": "session-1",
+            "status": "running",
+            "termination_reason": "running",
+            "exit_code": null,
+            "transport_ok": true,
+            "command_ok": null
+        }));
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["execution_status"], "running");
+        assert_eq!(result["success"], Value::Null);
+        assert_eq!(result["session_id"], "session-1");
+    }
 
     #[test]
     fn retained_output_offsets_are_absolute_after_ring_buffer_eviction() {
@@ -265,6 +537,30 @@ impl SessionStore {
         Ok(session)
     }
 
+    pub fn list_snapshots(&self, include_terminal: bool, max_output_bytes: usize) -> Vec<Value> {
+        let sessions = {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            prune_terminal_sessions(&mut sessions, self.terminal_retention);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        let mut snapshots = sessions
+            .into_iter()
+            .filter_map(|session| {
+                crate::async_runtime::block_on(session.refresh_status());
+                if !include_terminal && session.has_exited() {
+                    return None;
+                }
+                Some(session.snapshot(max_output_bytes))
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            right["started_at"]
+                .as_str()
+                .cmp(&left["started_at"].as_str())
+        });
+        snapshots
+    }
+
     pub fn remove(&self, session_id: &str) {
         self.sessions
             .lock()
@@ -308,6 +604,9 @@ pub struct ExecSession {
     pub stdin: AsyncMutex<Option<ChildStdin>>,
     stdin_open: Mutex<bool>,
     interactive: bool,
+    command: String,
+    resolved_cwd: String,
+    output_encoding: StreamEncoding,
     stdout: Mutex<StreamBuffer>,
     stderr: Mutex<StreamBuffer>,
     pub started_at: Instant,
@@ -345,9 +644,43 @@ impl ExecSession {
     }
 
     pub fn new_with_harness_metadata(
-        mut child: Child,
+        child: Child,
         interactive: bool,
         harness_metadata: Option<SessionHarnessMetadata>,
+    ) -> Self {
+        Self::new_with_details(
+            child,
+            interactive,
+            String::new(),
+            String::new(),
+            harness_metadata,
+        )
+    }
+
+    pub fn new_with_details(
+        child: Child,
+        interactive: bool,
+        command: String,
+        resolved_cwd: String,
+        harness_metadata: Option<SessionHarnessMetadata>,
+    ) -> Self {
+        Self::new_with_details_and_encoding(
+            child,
+            interactive,
+            command,
+            resolved_cwd,
+            harness_metadata,
+            StreamEncoding::Utf8,
+        )
+    }
+
+    pub fn new_with_details_and_encoding(
+        mut child: Child,
+        interactive: bool,
+        command: String,
+        resolved_cwd: String,
+        harness_metadata: Option<SessionHarnessMetadata>,
+        output_encoding: StreamEncoding,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let stdin = child.stdin.take();
@@ -359,6 +692,9 @@ impl ExecSession {
             stdin: AsyncMutex::new(stdin),
             stdin_open: Mutex::new(stdin_open),
             interactive,
+            command,
+            resolved_cwd,
+            output_encoding,
             stdout: Mutex::new(StreamBuffer::default()),
             stderr: Mutex::new(StreamBuffer::default()),
             started_at: Instant::now(),
@@ -421,11 +757,13 @@ impl ExecSession {
         T: tokio::io::AsyncRead + Unpin,
     {
         let mut buf = [0u8; 4096];
+        let mut decoder = StreamDecoder::new(self.output_encoding);
         loop {
             match stream.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = &buf[..n];
+                    let decoded = decoder.decode(&buf[..n], false);
+                    let chunk = decoded.as_slice();
                     if is_stdout {
                         self.stdout
                             .lock()
@@ -441,6 +779,21 @@ impl ExecSession {
                 }
                 Err(_) => break,
             }
+        }
+        let tail = decoder.decode(&[], true);
+        if !tail.is_empty() {
+            if is_stdout {
+                self.stdout
+                    .lock()
+                    .expect("stdout lock")
+                    .append(&tail, SESSION_BUFFER_BYTES);
+            } else {
+                self.stderr
+                    .lock()
+                    .expect("stderr lock")
+                    .append(&tail, SESSION_BUFFER_BYTES);
+            }
+            *self.last_output_at.lock().expect("last output lock") = timestamp();
         }
     }
 
@@ -534,13 +887,34 @@ impl ExecSession {
             "running" => None,
             _ => Some(false),
         };
+        let execution_status = match reason {
+            "running" => "running",
+            "exited" if command_ok == Some(true) => "succeeded",
+            "exited" => "failed",
+            "cancelled" => "cancelled",
+            "timeout" => "timed_out",
+            "killed" => "killed",
+            "spawn_failed" => "spawn_failed",
+            "server_restart" => "interrupted",
+            _ => "failed",
+        };
+        let retryable = matches!(
+            reason,
+            "timeout" | "killed" | "spawn_failed" | "server_restart"
+        );
         json!({
             "session_id": self.session_id,
+            "command": self.command,
+            "resolved_cwd": self.resolved_cwd,
             "interactive": self.interactive,
             "stdin_open": *self.stdin_open.lock().expect("stdin_open lock"),
             "status": status,
             "termination_reason": reason,
-            "recoverable": matches!(reason, "timeout" | "killed" | "spawn_failed" | "server_restart"),
+            "recoverable": retryable,
+            "transport_status": "ok",
+            "execution_status": execution_status,
+            "success": command_ok,
+            "retryable": retryable,
             "suggestion": match reason {
                 "timeout" => "读取保留输出，调整 timeout_ms 后重试",
                 "killed" => "确认终止原因后重新执行命令",
@@ -683,7 +1057,9 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
                 retryable: false,
             });
         }
-        return Ok(tool_ok(session.snapshot(max_output_bytes)));
+        return Ok(finalize_execution_result(
+            session.snapshot(max_output_bytes),
+        ));
     }
 
     if !chars.is_empty() {
@@ -716,7 +1092,9 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         .min(30_000);
     std::thread::sleep(std::time::Duration::from_millis(yield_ms));
     crate::async_runtime::block_on(session.refresh_status());
-    Ok(tool_ok(session.snapshot(max_output_bytes)))
+    Ok(finalize_execution_result(
+        session.snapshot(max_output_bytes),
+    ))
 }
 
 pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
@@ -787,7 +1165,7 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         store.remove(session_id);
     }
 
-    Ok(tool_ok(payload))
+    Ok(finalize_execution_result(payload))
 }
 
 #[cfg(unix)]

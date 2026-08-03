@@ -31,7 +31,7 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let _lock = storage::lock_directory(&history_dir)?;
     let report = storage::scan(&ctx.workspace, &history_dir)?;
     reject_ambiguous_history(&report)?;
-    let current_archive_bytes = report
+    let mut current_archive_bytes = report
         .documents
         .iter()
         .map(|document| document.size_bytes)
@@ -157,11 +157,28 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             )
         };
 
+    let paused_previous_sessions = pause_other_active_sessions(
+        &history_dir,
+        &report.documents,
+        current_number,
+        &mut current_archive_bytes,
+    )?;
+    if !paused_previous_sessions.is_empty() {
+        warnings.push(format!(
+            "已自动暂停其他 active History Session：{}",
+            paused_previous_sessions
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     let refreshed = storage::scan(&ctx.workspace, &history_dir)?;
     reject_ambiguous_history(&refreshed)?;
     storage::write_index(&history_dir, &storage::rebuild_index(&refreshed))?;
 
-    let prior = report
+    let prior = refreshed
         .documents
         .iter()
         .filter(|document| document.number != current_number)
@@ -207,7 +224,20 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .rev()
         .find(|document| normalized_status(document.status.as_deref()) == "completed")
         .copied();
-    let (latest_handoff, latest_handoff_truncated) = latest
+    let current_document = refreshed
+        .documents
+        .iter()
+        .find(|document| document.number == current_number);
+    let current_has_checkpoints = current_document
+        .is_some_and(|document| !markdown::parse_checkpoint_records(&document.content).is_empty());
+    let (handoff_document, latest_handoff_source) = if resumed && current_has_checkpoints {
+        (current_document, "current_session")
+    } else if latest.is_some() {
+        (latest, "latest_prior")
+    } else {
+        (None, "none")
+    };
+    let (latest_handoff, latest_handoff_truncated) = handoff_document
         .map(|document| bounded_handoff(&document.content, MAX_LATEST_HANDOFF_CHARS))
         .map_or((None, false), |(handoff, truncated)| {
             (Some(handoff), truncated)
@@ -217,10 +247,6 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "latest_handoff 已按 {MAX_LATEST_HANDOFF_CHARS} 字符预算保留头尾内容。"
         ));
     }
-    let current_document = refreshed
-        .documents
-        .iter()
-        .find(|document| document.number == current_number);
     let checkpoint_count = current_document
         .map(|document| markdown::parse_checkpoint_records(&document.content).len())
         .unwrap_or_default();
@@ -262,12 +288,15 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         ),
         "session_summaries": session_summaries,
         "latest_handoff": latest_handoff,
+        "latest_handoff_source": latest_handoff_source,
+        "latest_handoff_session_number": handoff_document.map(|document| document.number),
+        "latest_handoff_session_path": handoff_document.map(|document| document.path.clone()),
         "history_read_mode": "bounded_recent_summaries_plus_latest_handoff",
         "total_history_bytes": total_bytes,
         "full_history_included": false,
         "history_digest": format!("{:x}", digest.finalize()),
-        "persistence_mode": "model_mediated_tool_calls",
-        "assistant_instructions": "Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. These fields are bounded context windows: inspect history_summaries_omitted, history_summary_truncated, and latest_handoff_truncated, and use read_file on the exact archived path only when the current task requires omitted detail. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.",
+        "persistence_mode": "hybrid_explicit_and_automatic_milestones",
+        "assistant_instructions": "Read all_history_summary, latest_handoff, inherited_summary, and resume_state before continuing the project. These fields are bounded context windows: inspect history_summaries_omitted, history_summary_truncated, and latest_handoff_truncated, and use read_file on the exact archived path only when the current task requires omitted detail. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. Anchor synchronously writes idempotent milestone checkpoints after code changes, commits, retained command stages, and browser visual/artifact stages. After completing each user-requested task, still call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.",
         "required_next_actions": [
             "read_all_history_summary",
             "read_latest_handoff",
@@ -282,9 +311,17 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "stable_target_required": true,
             "required_before_final_response": true,
             "applies_after_bootstrap": true,
-            "automatic_background_persistence": false
+            "automatic_background_persistence": false,
+            "automatic_milestone_persistence": true,
+            "automatic_milestones": [
+                "code_change",
+                "commit",
+                "retained_command_stage",
+                "browser_visual_or_artifact_stage"
+            ]
         },
         "persistence": persistence_details(ctx, &current_path),
+        "resume_state": build_resume_state(ctx),
         "warnings": warnings
     });
     let object = payload
@@ -322,6 +359,10 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     object.insert("session_status".into(), json!(current_status));
     object.insert("previous_status".into(), json!(previous_status));
     object.insert("reactivated".into(), json!(reactivated));
+    object.insert(
+        "paused_previous_sessions".into(),
+        json!(paused_previous_sessions),
+    );
     object.insert("checkpoint_count".into(), json!(checkpoint_count));
     object.insert(
         "latest_handoff_truncated".into(),
@@ -329,9 +370,43 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     );
     object.insert(
         "latest_handoff_total_bytes".into(),
-        json!(latest.map(|document| document.size_bytes).unwrap_or(0)),
+        json!(handoff_document
+            .map(|document| document.size_bytes)
+            .unwrap_or(0)),
     );
     Ok(tool_ok(payload))
+}
+
+fn pause_other_active_sessions(
+    history_dir: &std::path::Path,
+    documents: &[model::HistoryDocument],
+    current_number: u64,
+    archive_bytes: &mut u64,
+) -> WorkspaceResult<Vec<u64>> {
+    let timestamp = now_timestamp();
+    let mut paused = Vec::new();
+    for document in documents {
+        if document.number == current_number
+            || normalized_status(document.status.as_deref()) != "active"
+        {
+            continue;
+        }
+        let content = markdown::update_document_lifecycle(&document.content, &timestamp, "paused");
+        storage::ensure_history_archive_capacity(
+            *archive_bytes,
+            document.size_bytes,
+            content.len() as u64,
+        )?;
+        storage::write_markdown(
+            &history_dir.join(format!("{}.md", document.number)),
+            &content,
+        )?;
+        *archive_bytes = archive_bytes
+            .saturating_sub(document.size_bytes)
+            .saturating_add(content.len() as u64);
+        paused.push(document.number);
+    }
+    Ok(paused)
 }
 
 fn host_session_key(args: &Value) -> Option<&str> {
@@ -516,6 +591,239 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     })))
 }
 
+pub fn auto_checkpoint_after_tool(
+    ctx: &ToolContext,
+    tool_name: &str,
+    args: &Value,
+    output: &Value,
+) -> WorkspaceResult<Option<Value>> {
+    if !is_auto_checkpoint_tool(tool_name, args, output) {
+        return Ok(None);
+    }
+    let Some(task) = ctx.harness.current_task().ok().flatten() else {
+        return Ok(None);
+    };
+    let (Some(session_key), Some(expected_path)) = (
+        task.history_session_key.as_deref(),
+        task.history_session_path.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let structured = output.get("structuredContent").unwrap_or(output);
+    let identity = structured
+        .get("session_id")
+        .or_else(|| structured.get("commit_sha"))
+        .or_else(|| structured.get("operation_id"))
+        .or_else(|| structured.get("trace_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("stage");
+    let turn_seed = format!("{}:{tool_name}:{identity}", task.id);
+    let turn_hash = storage::sha256(turn_seed.as_bytes());
+    let turn_id = format!(
+        "auto-{}-{}",
+        sanitize_checkpoint_segment(tool_name),
+        &turn_hash[..16]
+    );
+    let success = structured.get("ok").and_then(Value::as_bool) == Some(true);
+    let mut findings = vec![format!(
+        "自动阶段检查点：tool={tool_name}, status={}, success={success}",
+        structured
+            .get("execution_status")
+            .or_else(|| structured.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+    )];
+    if let Some(summary) = structured.get("summary").and_then(Value::as_str) {
+        findings.push(format!(
+            "summary={}",
+            bounded_checkpoint_text(summary, 1_000)
+        ));
+    }
+    if let Some(command) = structured.get("command").and_then(Value::as_str) {
+        findings.push(format!(
+            "command={}",
+            bounded_checkpoint_text(command, 1_000)
+        ));
+    }
+    let mut files_changed = structured
+        .get("affected_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.get("path")
+                .and_then(Value::as_str)
+                .or_else(|| item.as_str())
+        })
+        .take(markdown::MAX_ARRAY_ITEMS)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for path in structured
+        .get("workspace_artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("workspace_path").and_then(Value::as_str))
+    {
+        if files_changed.len() >= markdown::MAX_ARRAY_ITEMS {
+            break;
+        }
+        if !files_changed.iter().any(|existing| existing == path) {
+            files_changed.push(path.to_string());
+        }
+    }
+    let harness = ctx.harness.status().ok();
+    let mut runtime_state = vec![
+        format!("task_id={}", task.id),
+        format!("task_status={:?}", task.status).to_ascii_lowercase(),
+        format!("tool={tool_name}"),
+    ];
+    for key in [
+        "session_id",
+        "execution_status",
+        "exit_code",
+        "last_output_at",
+        "browser_session_id",
+        "connection_status",
+        "selected_page",
+        "commit_sha",
+    ] {
+        if let Some(value) = structured.get(key).filter(|value| !value.is_null()) {
+            runtime_state.push(format!(
+                "{key}={}",
+                bounded_checkpoint_text(&value.to_string(), 1_000)
+            ));
+        }
+    }
+    if let Some(status) = harness.as_ref() {
+        runtime_state.push(format!(
+            "branch={}",
+            status.branch.as_deref().unwrap_or("unknown")
+        ));
+        runtime_state.push(format!(
+            "head={}",
+            status.head.as_deref().unwrap_or("unknown")
+        ));
+        runtime_state.push(format!("baseline_matches={:?}", status.baseline_matches));
+    }
+    let tests = args
+        .get("verification_kind")
+        .and_then(Value::as_str)
+        .map(|kind| {
+            vec![format!(
+                "verification_kind={kind}, success={}",
+                structured
+                    .get("success")
+                    .or_else(|| structured.get("command_ok"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(success)
+            )]
+        })
+        .unwrap_or_default();
+    let remaining_issues = if success {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{}: {}",
+            structured
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("TOOL_FAILED"),
+            bounded_checkpoint_text(
+                structured
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("阶段执行失败"),
+                1_000,
+            )
+        )]
+    };
+    let checkpoint_args = json!({
+        "session_key": session_key,
+        "expected_path": expected_path,
+        "turn_id": turn_id,
+        "user_intent": task.objective,
+        "findings": findings,
+        "files_changed": files_changed,
+        "tests": tests,
+        "runtime_state": runtime_state,
+        "remaining_issues": remaining_issues,
+        "next_actions": task.pending_steps,
+        "session_status": "active",
+        "notes": "Anchor 自动保存的结构化阶段检查点；相同阶段身份会幂等更新。"
+    });
+    checkpoint(ctx, &checkpoint_args).map(Some)
+}
+
+fn is_auto_checkpoint_tool(tool_name: &str, args: &Value, output: &Value) -> bool {
+    if matches!(
+        tool_name,
+        "apply_patch" | "git_commit" | "stage_commit" | "kill_session"
+    ) {
+        return true;
+    }
+    if matches!(
+        tool_name,
+        "wait_stage_commit" | "wait_command" | "write_stdin"
+    ) {
+        return command_stage_is_terminal(output);
+    }
+    if tool_name == "exec_command" {
+        return args.get("verification_kind").is_some()
+            || output.get("execution_status") == Some(&json!("running"))
+            || output.get("status") == Some(&json!("running"))
+            || output_has_workspace_changes(output);
+    }
+    let normalized = tool_name.to_ascii_lowercase();
+    normalized.contains("browser")
+        && [
+            "take_screenshot",
+            "take_snapshot",
+            "lighthouse_audit",
+            "performance_stop_trace",
+            "wait_for_build",
+        ]
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
+}
+
+fn command_stage_is_terminal(output: &Value) -> bool {
+    output.get("execution_status").and_then(Value::as_str) != Some("running")
+        && output.get("status").and_then(Value::as_str) != Some("running")
+        && output.get("termination_reason").and_then(Value::as_str) != Some("running")
+}
+
+fn output_has_workspace_changes(output: &Value) -> bool {
+    output.get("mutation_attributed").and_then(Value::as_bool) == Some(true)
+        || output
+            .get("affected_files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| !files.is_empty())
+}
+
+fn sanitize_checkpoint_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect()
+}
+
+fn bounded_checkpoint_text(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        return value.to_string();
+    }
+    value.chars().take(maximum).collect::<String>() + "…"
+}
+
 fn persistence_details(ctx: &ToolContext, relative_path: &str) -> Value {
     let root = ctx.workspace.root();
     let git_tracked = git_path_command(root, &["ls-files", "--error-unmatch", "--", relative_path])
@@ -551,6 +859,73 @@ fn persistence_details(ctx: &ToolContext, relative_path: &str) -> Value {
         "git_ignored": git_ignored,
         "git_dirty_after_write": git_dirty_after_write,
         "reason": reason
+    })
+}
+
+fn build_resume_state(ctx: &ToolContext) -> Value {
+    let harness_status = ctx
+        .harness
+        .status()
+        .ok()
+        .and_then(|status| serde_json::to_value(status).ok())
+        .unwrap_or_else(|| json!({"available": false}));
+    let task = ctx.harness.current_task().ok().flatten().map(|task| {
+        json!({
+            "task_id": task.id,
+            "workspace_id": task.workspace_id,
+            "objective": task.objective,
+            "status": task.status,
+            "baseline": {
+                "branch": task.baseline.branch,
+                "head": task.baseline.head,
+                "fingerprint": task.baseline.worktree_fingerprint,
+                "object_id": task.baseline.object_id,
+                "file_count": task.baseline.file_count,
+                "captured_at": task.baseline.captured_at
+            },
+            "expected_state": task.expected_state,
+            "completed_steps": task.completed_steps,
+            "pending_steps": task.pending_steps,
+            "latest_change_id": task.latest_change_id,
+            "latest_verification_id": task.latest_verification_id,
+            "updated_at": task.updated_at
+        })
+    });
+    let git_status =
+        crate::tools::git::git_status(&ctx.workspace, &json!({})).unwrap_or_else(|error| {
+            json!({
+                "ok": false,
+                "error": error.to_error_value()
+            })
+        });
+    let command_sessions = ctx.sessions.list_snapshots(true, 4_096);
+    let running_command_sessions = command_sessions
+        .iter()
+        .filter(|session| session.get("execution_status") == Some(&json!("running")))
+        .count();
+    let next_actions = task
+        .as_ref()
+        .and_then(|task| task.get("pending_steps"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            harness_status
+                .get("next_actions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        });
+    json!({
+        "workspace": ctx.workspace.root_display(),
+        "task": task,
+        "harness": harness_status,
+        "git": git_status,
+        "command_sessions": command_sessions,
+        "running_command_session_count": running_command_sessions,
+        "downstream_mcp": ctx.mcp_proxies.status(),
+        "next_actions": next_actions,
+        "captured_at": now_timestamp(),
+        "command_sessions_process_bound": true
     })
 }
 
@@ -858,4 +1233,57 @@ fn truncate_chars_with_flag(value: &str, max_chars: usize) -> (String, bool) {
     let mut truncated = value.chars().take(keep).collect::<String>();
     truncated.push_str(suffix);
     (truncated, true)
+}
+
+#[cfg(test)]
+mod auto_checkpoint_tests {
+    use serde_json::json;
+
+    use super::is_auto_checkpoint_tool;
+
+    #[test]
+    fn read_only_terminal_commands_do_not_create_automatic_checkpoints() {
+        assert!(!is_auto_checkpoint_tool(
+            "exec_command",
+            &json!({}),
+            &json!({
+                "status": "exited",
+                "execution_status": "succeeded",
+                "session_id": "terminal-session",
+                "affected_files": [],
+                "mutation_attributed": false
+            })
+        ));
+        assert!(is_auto_checkpoint_tool(
+            "exec_command",
+            &json!({}),
+            &json!({"status": "running", "execution_status": "running"})
+        ));
+        assert!(is_auto_checkpoint_tool(
+            "exec_command",
+            &json!({}),
+            &json!({
+                "status": "exited",
+                "execution_status": "succeeded",
+                "affected_files": [{"path": "src/main.rs"}],
+                "mutation_attributed": true
+            })
+        ));
+    }
+
+    #[test]
+    fn retained_command_polling_only_checkpoints_terminal_stages() {
+        for tool in ["wait_command", "write_stdin", "wait_stage_commit"] {
+            assert!(!is_auto_checkpoint_tool(
+                tool,
+                &json!({}),
+                &json!({"status": "running", "termination_reason": "running"})
+            ));
+            assert!(is_auto_checkpoint_tool(
+                tool,
+                &json!({}),
+                &json!({"status": "exited", "termination_reason": "exited"})
+            ));
+        }
+    }
 }

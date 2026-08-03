@@ -62,6 +62,46 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn normalize_exec_preflight_result(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    mut output: Value,
+    execution_status: &str,
+) -> Value {
+    if name != "exec_command" {
+        return output;
+    }
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "command".into(),
+            args.get("cmd")
+                .cloned()
+                .unwrap_or_else(|| json!("<invalid>")),
+        );
+        object.insert(
+            "resolved_cwd".into(),
+            Value::String(ctx.default_cwd_path_for(None).display().to_string()),
+        );
+        object.insert("status".into(), Value::String(execution_status.into()));
+        object.insert(
+            "termination_reason".into(),
+            Value::String(
+                if execution_status == "cancelled" {
+                    "cancelled"
+                } else {
+                    "command_rejected"
+                }
+                .into(),
+            ),
+        );
+        object.insert("transport_ok".into(), Value::Bool(true));
+        object.insert("command_ok".into(), Value::Bool(false));
+        object.insert("execution_started".into(), Value::Bool(false));
+    }
+    session::finalize_execution_result(output)
+}
+
 fn policy_alternatives(message: &str) -> Vec<Value> {
     let executable = message
         .strip_prefix("Command is not allowlisted: ")
@@ -337,11 +377,13 @@ fn call_tool_impl(
     session_id: Option<&str>,
 ) -> Value {
     if cancellation.is_cancelled() {
-        return cancelled_tool_result();
+        let output = cancelled_tool_result();
+        return normalize_exec_preflight_result(ctx, name, args, output, "cancelled");
     }
     if validate_schema {
         if let Err(error) = crate::tools::schema::validate_tool_input(name, args) {
-            return tool_err(error);
+            let output = tool_err(error);
+            return normalize_exec_preflight_result(ctx, name, args, output, "rejected");
         }
     }
     let effective_args = apply_default_cwd(ctx, session_id, name, args);
@@ -354,7 +396,8 @@ fn call_tool_impl(
         &ctx.policy,
         Some(&ctx.workspace),
     ) {
-        return policy_tool_err(e);
+        let output = policy_tool_err(e);
+        return normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
     }
     if name != "begin_work_session" {
         if let Err(error) = ctx
@@ -415,6 +458,7 @@ fn call_tool_impl(
                 operation_result_summary(name, &output),
             );
         }
+        attach_auto_checkpoint(ctx, name, args, &mut output);
         return output;
     }
 
@@ -506,6 +550,7 @@ fn call_tool_impl(
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
         "wait_command" => session::wait_command(&ctx.sessions, &effective_args),
+        "list_command_sessions" => session::list_command_sessions(&ctx.sessions, &effective_args),
         "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
         "git_status" => git::git_status(ws, &effective_args),
         "git_stage" => git::git_stage(ws, &effective_args),
@@ -562,7 +607,13 @@ fn call_tool_impl(
             operation_input(args),
             operation_result_summary(name, &output),
         );
-        if succeeded && advances_expected_state(name, &output) {
+        let execution_started = output
+            .get("execution_started")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let should_advance_expected_state = advances_expected_state(name, &output)
+            && (succeeded || (name == "exec_command" && execution_started));
+        if should_advance_expected_state {
             let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
             let _ = ctx
                 .harness
@@ -679,7 +730,59 @@ fn call_tool_impl(
             operation_result_summary(name, &output),
         );
     }
+    attach_auto_checkpoint(ctx, name, &effective_args, &mut output);
     output
+}
+
+fn attach_auto_checkpoint(ctx: &ToolContext, name: &str, args: &Value, output: &mut Value) {
+    let baseline_was_current = ctx
+        .harness
+        .status()
+        .ok()
+        .and_then(|status| status.baseline_matches)
+        == Some(true);
+    match history::auto_checkpoint_after_tool(ctx, name, args, output) {
+        Ok(Some(checkpoint)) => {
+            if baseline_was_current {
+                if let Some(task_id) = ctx
+                    .harness
+                    .current_task()
+                    .ok()
+                    .flatten()
+                    .map(|task| task.id)
+                {
+                    let _ = ctx
+                        .harness
+                        .refresh_expected_state_for_operation(&task_id, None);
+                }
+            }
+            if let Some(object) = output.as_object_mut() {
+                object.insert("auto_checkpoint".into(), checkpoint);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if let Some(object) = output.as_object_mut() {
+                object.insert(
+                    "auto_checkpoint_error".into(),
+                    json!({
+                        "code": error.to_error_value()["code"],
+                        "message": error.to_string(),
+                        "retryable": true
+                    }),
+                );
+                let warnings = object
+                    .entry("warnings")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(warnings) = warnings.as_array_mut() {
+                    warnings.push(Value::String(
+                        "Automatic History checkpoint failed; the primary tool result remains authoritative."
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn operation_result_summary(name: &str, output: &Value) -> Value {
@@ -943,6 +1046,50 @@ fn server_info_for_session(
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
     let current_tool_groups = tool_group_manifest(&current_tools);
+    let command_sessions = ctx.sessions.list_snapshots(true, 0);
+    let running_command_sessions = command_sessions
+        .iter()
+        .filter(|session| session.get("execution_status") == Some(&json!("running")))
+        .count();
+    let downstream_mcp = ctx.mcp_proxies.status();
+    let command_cost_policy = json!({
+        "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
+        "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
+        "external_paid_max_duration_seconds": ctx.policy.external_paid_max_duration_seconds,
+        "workspace_policy_path": ".anchor/command-policy.yml",
+        "approval_source": "trusted_runtime_config"
+    });
+    let connection_layers = json!({
+        "plugin": {
+            "status": "healthy",
+            "server": crate::brand::SERVER_NAME,
+            "version": env!("CARGO_PKG_VERSION"),
+            "catalog_changed": catalog_changed,
+            "reconnect_required": catalog_changed
+        },
+        "application": {
+            "status": "healthy",
+            "workspace": ctx.workspace.root_display(),
+            "listener_path": "/mcp"
+        },
+        "authentication": {
+            "status": if ctx.auth.auth_enabled() { "configured" } else { "disabled" },
+            "type": ctx.auth.auth_type,
+            "token_issuer": "workspace_listener",
+            "refresh_strategy": if ctx.auth.auth_type == "oauth" {
+                "rotating_refresh_token_with_persisted_replay_protection"
+            } else {
+                "not_applicable"
+            }
+        },
+        "execution": {
+            "status": "available",
+            "retained_session_count": command_sessions.len(),
+            "running_session_count": running_command_sessions,
+            "sessions_process_bound": true
+        },
+        "downstream_mcp": downstream_mcp.clone()
+    });
     Ok(tool_ok(json!({
         "server": crate::brand::SERVER_NAME,
         "title": crate::brand::PRODUCT_NAME,
@@ -977,14 +1124,9 @@ fn server_info_for_session(
         "current_catalog_estimated_tokens": current_catalog.estimated_tokens,
         "current_local_tool_count": current_catalog.local_count,
         "current_proxy_tool_count": current_catalog.proxy_count,
-        "command_cost_policy": {
-            "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
-            "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
-            "external_paid_max_duration_seconds": ctx.policy.external_paid_max_duration_seconds,
-            "workspace_policy_path": ".anchor/command-policy.yml",
-            "approval_source": "trusted_runtime_config"
-        },
-        "downstream_mcp": ctx.mcp_proxies.status()
+        "command_cost_policy": command_cost_policy,
+        "downstream_mcp": downstream_mcp.clone(),
+        "connection_layers": connection_layers
     })))
 }
 
@@ -1004,6 +1146,7 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
             "exec_command"
                 | "exec_health_check"
                 | "wait_command"
+                | "list_command_sessions"
                 | "write_stdin"
                 | "read_output"
                 | "kill_session"
@@ -1071,7 +1214,11 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         warnings.push(error.message());
     }
     let development_environment = crate::tools::environment::diagnose(ctx.workspace.root());
+    let healthy = workspace_exec_available && development_environment["host_healthy"] == true;
     Ok(tool_ok(json!({
+        "healthy": healthy,
+        "status": if healthy { "healthy" } else { "degraded" },
+        "retryable": !healthy,
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
         "network_allowed": ctx.policy.network_allowed(),
@@ -1224,5 +1371,35 @@ mod tests {
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
+    }
+
+    #[test]
+    fn terminal_nonzero_command_advances_expected_workspace_state() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        ctx.harness.start_task("failing mutation").expect("task");
+
+        let result = call_tool_with_cancellation(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": "python -c \"from pathlib import Path; Path('failed-output.txt').write_text('changed'); raise SystemExit(3)\"",
+                "timeout_ms": 10_000,
+                "yield_time_ms": 10_000
+            }),
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["command_ok"], false, "{result}");
+        assert_eq!(result["execution_started"], true, "{result}");
+        assert!(workspace.path().join("failed-output.txt").is_file());
+        assert_eq!(
+            ctx.harness.status().expect("status").baseline_matches,
+            Some(true)
+        );
     }
 }

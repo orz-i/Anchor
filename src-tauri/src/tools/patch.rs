@@ -86,7 +86,6 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             summaries.push(format!("D {}", resolved.display));
             continue;
         }
-
         let (updated, matches) =
             apply_hunks(&resolved.display, &original, &fp.hunks, diagnostic_mode)?;
         hunk_matches.extend(matches);
@@ -332,6 +331,7 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
     let chars = content.chars().collect::<Vec<_>>();
     let mut stack = Vec::<(char, usize)>::new();
     let mut quote = None::<char>;
+    let mut raw_string_hashes = None::<usize>;
     let mut escaped = false;
     let mut line_comment = false;
     let mut block_comment = false;
@@ -339,6 +339,15 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
     while index < chars.len() {
         let ch = chars[index];
         let next = chars.get(index + 1).copied();
+        if let Some(hashes) = raw_string_hashes {
+            if ch == '"' && (0..hashes).all(|offset| chars.get(index + 1 + offset) == Some(&'#')) {
+                raw_string_hashes = None;
+                index += 1 + hashes;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
         if line_comment {
             if ch == '\n' {
                 line_comment = false;
@@ -354,6 +363,13 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
                 index += 1;
             }
             continue;
+        }
+        if rust_lifetimes {
+            if let Some((content_start, hashes)) = rust_raw_string_start(&chars, index) {
+                raw_string_hashes = Some(hashes);
+                index = content_start;
+                continue;
+            }
         }
         if let Some(active_quote) = quote {
             if escaped {
@@ -418,6 +434,9 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
     if let Some(active_quote) = quote {
         return Err(format!("unterminated {active_quote} string"));
     }
+    if raw_string_hashes.is_some() {
+        return Err("unterminated Rust raw string".into());
+    }
     if block_comment {
         return Err("unterminated block comment".into());
     }
@@ -428,6 +447,20 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn rust_raw_string_start(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    let mut cursor = match (chars.get(index), chars.get(index + 1)) {
+        (Some('r'), _) => index + 1,
+        (Some('b'), Some('r')) => index + 2,
+        _ => return None,
+    };
+    let mut hashes = 0usize;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    (chars.get(cursor) == Some(&'"')).then_some((cursor + 1, hashes))
 }
 
 fn hunk_context_mismatch(
@@ -1196,7 +1229,20 @@ mod tests {
     fn balanced_structure_handles_rust_lifetimes_and_detects_unclosed_blocks() {
         validate_balanced_structure("fn borrow<'a>(value: &'a str) -> &'a str { value }", true)
             .expect("Rust lifetime is not a quote");
+        validate_balanced_structure(
+            r##"fn regex() { let value = r#"(?i)(^|["'\s])(/[^\s"']*)"#; }"##,
+            true,
+        )
+        .expect("Rust raw regex contents are not code delimiters");
+        validate_balanced_structure(
+            r###"fn json() { let value = br##"{"content":[{"text":"[ok]"}]}"##; }"###,
+            true,
+        )
+        .expect("Rust byte raw JSON contents are not code delimiters");
         assert!(validate_balanced_structure("export const broken = {", false).is_err());
+        assert!(
+            validate_balanced_structure("fn broken() { let value = r#\"missing; }", true).is_err()
+        );
     }
 
     #[test]

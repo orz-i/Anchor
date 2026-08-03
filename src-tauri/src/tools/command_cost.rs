@@ -376,6 +376,33 @@ fn load_policy(workspace_root: &Path) -> Result<CommandPolicyFile, WorkspaceErro
     })
 }
 
+fn collect_effective_command_tokens(
+    command: &str,
+    depth: usize,
+    maximum_depth: &mut usize,
+    output: &mut Vec<Vec<String>>,
+) -> Result<(), WorkspaceError> {
+    if depth > 8 {
+        return Err(WorkspaceError::invalid_argument(
+            "Command wrapper nesting exceeds the supported depth",
+        ));
+    }
+    let tokens = crate::tools::policy::split_command_line(command)
+        .map_err(WorkspaceError::invalid_argument)?;
+    let Some(payload) = crate::tools::policy::wrapped_command_payload(&tokens) else {
+        output.push(tokens);
+        *maximum_depth = (*maximum_depth).max(depth);
+        return Ok(());
+    };
+    let segments = crate::tools::policy::wrapped_command_segments(&tokens, &payload)
+        .map_err(WorkspaceError::invalid_argument)?;
+    *maximum_depth = (*maximum_depth).max(depth + 1);
+    for segment in segments {
+        collect_effective_command_tokens(&segment, depth + 1, maximum_depth, output)?;
+    }
+    Ok(())
+}
+
 fn match_rule(
     policy: &CommandPolicyFile,
     command: &str,
@@ -429,9 +456,14 @@ fn command_cost_heuristic(
     cost_intent: &str,
     network_mode: &str,
 ) -> Result<CommandCostHeuristic, WorkspaceError> {
-    let tokens = shell_words::split(command)
-        .map_err(|_| WorkspaceError::invalid_argument("Invalid command syntax"))?;
-    let executable = tokens
+    let tokens = crate::tools::policy::split_command_line(command)
+        .map_err(WorkspaceError::invalid_argument)?;
+    let mut effective_token_sets = Vec::<Vec<String>>::new();
+    let mut wrapper_depth = 0usize;
+    collect_effective_command_tokens(command, 0, &mut wrapper_depth, &mut effective_token_sets)?;
+    let executable = effective_token_sets
+        .last()
+        .unwrap_or(&tokens)
         .iter()
         .find(|token| !looks_like_env_assignment(token))
         .map(|token| {
@@ -446,7 +478,7 @@ fn command_cost_heuristic(
     if cost_intent == "external_paid" {
         indicators.push("declared_external_paid".to_string());
     }
-    for token in &tokens {
+    for token in tokens.iter().chain(effective_token_sets.iter().flatten()) {
         let upper = token.to_ascii_uppercase();
         if matches!(upper.as_str(), "LIVE=1" | "REAL_MODEL=1" | "E2E_LIVE=1") {
             indicators.push(format!("exact_runtime_flag:{upper}"));
@@ -483,7 +515,13 @@ fn command_cost_heuristic(
             CostClass::Free
         },
         executable,
-        indicators,
+        indicators: if wrapper_depth == 0 {
+            indicators
+        } else {
+            let mut wrapped = vec![format!("wrapper_depth:{wrapper_depth}")];
+            wrapped.extend(indicators);
+            wrapped
+        },
     })
 }
 
@@ -687,5 +725,30 @@ mod tests {
             error.to_error_value()["code"],
             "COMMAND_COST_DECLARATION_CONFLICT"
         );
+    }
+
+    #[test]
+    fn wrapped_command_cost_uses_the_inner_executable_and_indicators() {
+        let heuristic = command_cost_heuristic(
+            "powershell -NoProfile -Command \"pnpm test REAL_MODEL=1\"",
+            "auto",
+            "auto",
+        )
+        .expect("wrapped heuristic");
+        assert_eq!(heuristic.executable.as_deref(), Some("pnpm"));
+        assert_eq!(heuristic.cost_class, CostClass::ExternalPaid);
+        assert!(heuristic
+            .indicators
+            .iter()
+            .any(|indicator| indicator == "wrapper_depth:1"));
+
+        let sequential = command_cost_heuristic(
+            "powershell -NoProfile -Command \"$env:RUSTC=(rustup which rustc); pnpm test REAL_MODEL=1\"",
+            "auto",
+            "auto",
+        )
+        .expect("sequential wrapped heuristic");
+        assert_eq!(sequential.executable.as_deref(), Some("pnpm"));
+        assert_eq!(sequential.cost_class, CostClass::ExternalPaid);
     }
 }

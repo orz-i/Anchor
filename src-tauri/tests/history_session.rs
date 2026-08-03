@@ -292,6 +292,15 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(first["history_summary_truncated"], false);
     assert_eq!(first["latest_handoff_truncated"], false);
     assert!(first["latest_handoff_total_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(first["latest_handoff_source"], "latest_prior");
+    assert_eq!(first["latest_handoff_session_number"], 2);
+    assert_eq!(
+        first["latest_handoff_session_path"],
+        "docs/history-session/2.md"
+    );
+    assert!(first["resume_state"].is_object());
+    assert!(first["resume_state"]["git"].is_object());
+    assert!(first["resume_state"]["command_sessions"].is_array());
     assert_eq!(first["session_status"], "active");
     assert_eq!(first["previous_status"], "active");
     assert_eq!(first["reactivated"], false);
@@ -299,7 +308,10 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(first["full_history_included"], false);
     assert!(first["total_history_bytes"].as_u64().unwrap_or(0) > 0);
     assert_eq!(first["history_digest"].as_str().unwrap_or("").len(), 64);
-    assert_eq!(first["persistence_mode"], "model_mediated_tool_calls");
+    assert_eq!(
+        first["persistence_mode"],
+        "hybrid_explicit_and_automatic_milestones"
+    );
     assert!(first["assistant_instructions"]
         .as_str()
         .unwrap_or("")
@@ -318,6 +330,10 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
         .contains("checkpoint returns ok=true"));
     assert_eq!(
         first["checkpoint_policy"]["required_before_final_response"],
+        true
+    );
+    assert_eq!(
+        first["checkpoint_policy"]["automatic_milestone_persistence"],
         true
     );
     assert_eq!(
@@ -411,6 +427,13 @@ fn completed_history_session_reactivates_without_losing_content() {
     assert!(completed.contains("**Status:** completed"));
     assert!(completed.contains("关键内容必须保留"));
 
+    let unrelated = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "unrelated-newer-session"}),
+    );
+    assert_eq!(assert_ok(&unrelated)["current_number"], 2);
+
     let resumed = invoke(
         &ctx,
         "history_session_bootstrap",
@@ -423,11 +446,69 @@ fn completed_history_session_reactivates_without_losing_content() {
     assert_eq!(resumed["session_status"], "active");
     assert_eq!(resumed["reactivated"], true);
     assert_eq!(resumed["checkpoint_count"], 1);
+    assert_eq!(resumed["latest_handoff_source"], "current_session");
+    assert_eq!(resumed["latest_handoff_session_number"], 1);
+    assert_eq!(
+        resumed["latest_handoff_session_path"],
+        "docs/history-session/1.md"
+    );
+    assert!(resumed["latest_handoff"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("关键内容必须保留"));
     let active = fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
         .expect("reactivated history");
     assert!(active.contains("**Status:** active"));
     assert!(active.contains("关键内容必须保留"));
     assert_eq!(active.matches("### finish-phase").count(), 1);
+}
+
+#[test]
+fn bootstrap_keeps_only_the_current_history_session_active() {
+    let (workspace, _harness, ctx) = test_context();
+    let first = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "active-one"}),
+    );
+    assert_eq!(assert_ok(&first)["paused_previous_sessions"], json!([]));
+
+    let second = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "active-two"}),
+    );
+    let second = assert_ok(&second);
+    assert_eq!(second["paused_previous_sessions"], json!([1]));
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+            .expect("first session")
+            .contains("**Status:** paused")
+    );
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
+            .expect("second session")
+            .contains("**Status:** active")
+    );
+
+    let resumed = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "active-one"}),
+    );
+    let resumed = assert_ok(&resumed);
+    assert_eq!(resumed["reactivated"], true);
+    assert_eq!(resumed["paused_previous_sessions"], json!([2]));
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+            .expect("first session resumed")
+            .contains("**Status:** active")
+    );
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
+            .expect("second session paused")
+            .contains("**Status:** paused")
+    );
 }
 
 #[test]
