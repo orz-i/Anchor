@@ -602,6 +602,10 @@ fn proxy_result_state_summary(result: &Value) -> Value {
         "title",
         "pageTitle",
         "currentPage",
+        "current_page",
+        "pages",
+        "selected_page",
+        "page_count",
         "activeElement",
         "focusPath",
         "openDialogs",
@@ -637,6 +641,39 @@ fn proxy_result_state_summary(result: &Value) -> Value {
         );
     }
     Value::Object(summary)
+}
+
+fn merge_proxy_success_summary(previous: Option<&Value>, result: &Value) -> Value {
+    let mut next = proxy_result_state_summary(result);
+    let Some(previous) = previous.and_then(Value::as_object) else {
+        return next;
+    };
+    let Some(next_object) = next.as_object_mut() else {
+        return next;
+    };
+    let has_pages = next_object
+        .get("pages")
+        .and_then(Value::as_array)
+        .is_some_and(|pages| !pages.is_empty());
+    if !has_pages {
+        for key in ["pages", "page_count"] {
+            if let Some(value) = previous.get(key) {
+                next_object.insert(key.into(), value.clone());
+            }
+        }
+    }
+    let has_selected_page = next_object
+        .get("selected_page")
+        .is_some_and(|value| !value.is_null());
+    if !has_selected_page {
+        if let Some(value) = previous
+            .get("selected_page")
+            .or_else(|| previous.get("current_page"))
+        {
+            next_object.insert("selected_page".into(), value.clone());
+        }
+    }
+    next
 }
 
 fn find_proxy_state_value<'a>(value: &'a Value, key: &str, depth: usize) -> Option<&'a Value> {
@@ -2270,10 +2307,14 @@ impl ProxyServer {
             .last_success_tool
             .lock()
             .expect("mcp proxy success tool lock") = Some(tool.to_string());
-        *self
-            .last_success_summary
-            .lock()
-            .expect("mcp proxy success summary lock") = result.map(proxy_result_state_summary);
+        if let Some(result) = result {
+            let mut summary = self
+                .last_success_summary
+                .lock()
+                .expect("mcp proxy success summary lock");
+            let merged = merge_proxy_success_summary(summary.as_ref(), result);
+            *summary = Some(merged);
+        }
     }
 
     fn status(&self, tool_count: usize) -> Value {
@@ -3939,12 +3980,12 @@ mod tests {
 
     use super::{
         browser_debugging_port, browser_proxy_error_code, expand_proxy_placeholders,
-        normalize_proxy_tool_result, normalized_proxy_failure, parse_mcp_proxy_config,
-        prepare_my_agent_browser_isolation, proxy_browser_cdp_reachable, proxy_catalog_digest,
-        proxy_connection_status, proxy_failure_reason, proxy_management_tools, proxy_page_state,
-        proxy_result_state_summary, sanitize_proxy_catalog, wrap_proxy_structured_result,
-        McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
-        StdioMcpProxyClient,
+        merge_proxy_success_summary, normalize_proxy_tool_result, normalized_proxy_failure,
+        parse_mcp_proxy_config, prepare_my_agent_browser_isolation, proxy_browser_cdp_reachable,
+        proxy_catalog_digest, proxy_connection_status, proxy_failure_reason,
+        proxy_management_tools, proxy_page_state, proxy_result_state_summary,
+        sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
+        McpProxyTransportSpec, ProxyClientError, StdioMcpProxyClient,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -4326,6 +4367,41 @@ mod tests {
         );
         assert_eq!(state["selected_page"]["page_id"], 6);
         assert_eq!(state["pages"][1]["url"], "about:blank");
+    }
+
+    #[test]
+    fn browser_success_summary_preserves_last_known_page_state_for_non_page_tools() {
+        let previous = proxy_result_state_summary(&json!({
+            "structuredContent": {
+                "ok": true,
+                "page_count": 1,
+                "pages": [{
+                    "page_id": 3,
+                    "title": "Workspace",
+                    "url": "https://example.test/workspace",
+                    "selected": true
+                }],
+                "selected_page": {
+                    "page_id": 3,
+                    "title": "Workspace",
+                    "url": "https://example.test/workspace",
+                    "selected": true
+                }
+            }
+        }));
+        let merged = merge_proxy_success_summary(
+            Some(&previous),
+            &json!({
+                "structuredContent": {
+                    "ok": true,
+                    "result": {"value": 42}
+                }
+            }),
+        );
+
+        assert_eq!(merged["page_count"], 1);
+        assert_eq!(merged["pages"][0]["page_id"], 3);
+        assert_eq!(merged["selected_page"]["page_id"], 3);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::tools::dispatch::call_tool_prevalidated_with_session_cancellation;
 use crate::tools::workspace::{tool_err, tool_ok, WorkspaceError};
@@ -15,8 +16,8 @@ use crate::workspace::AuthConfig;
 
 pub type SharedState = SharedToolContext;
 
-const TOOLS_LIST_PAGE_MAX_TOOLS: usize = 64;
-const TOOLS_LIST_PAGE_MAX_BYTES: usize = 192 * 1024;
+const TOOLS_LIST_PAGE_MAX_TOOLS: usize = crate::tools::catalog::MAX_CHATGPT_CATALOG_TOOLS;
+const TOOLS_LIST_PAGE_MAX_BYTES: usize = crate::tools::catalog::MAX_CHATGPT_CATALOG_BYTES;
 const TOOLS_LIST_CURSOR_PREFIX: &str = "anchor-v1";
 const MAX_BROWSER_ARTIFACTS: usize = 256;
 const BROWSER_BUILD_PROBE_JS: &str = r#"async () => {
@@ -79,6 +80,8 @@ const BROWSER_BUILD_PROBE_JS: &str = r#"async () => {
 struct BrowserArtifactTarget {
     relative_path: String,
     absolute_path: PathBuf,
+    proxy_path: PathBuf,
+    bridge_root: Option<PathBuf>,
     direction: &'static str,
     kind: &'static str,
 }
@@ -465,6 +468,7 @@ async fn handle_tools_call(
         }
         let (proxy_args, artifact_targets) = match prepare_browser_workspace_arguments(
             &execution_state.workspace,
+            &state.workspace,
             name,
             &raw_args,
         ) {
@@ -492,12 +496,17 @@ async fn handle_tools_call(
             .call_tool_with_cancellation(name, &proxy_args, cancellation)
             .await
         {
+            let artifact_result = finalize_browser_workspace_artifacts(&artifact_targets);
             if let Ok(value) = &mut result {
-                attach_browser_workspace_artifacts(
-                    execution_state.workspace.root(),
-                    &artifact_targets,
-                    value,
-                );
+                if let Err(error) = artifact_result {
+                    *value = browser_workspace_path_error(name, error);
+                } else {
+                    attach_browser_workspace_artifacts(
+                        execution_state.workspace.root(),
+                        &artifact_targets,
+                        value,
+                    );
+                }
                 attach_browser_build_info(execution_state, name, value, cancellation).await;
                 attach_proxy_auto_checkpoint(state.as_ref(), name, &proxy_args, value, session_id);
             }
@@ -735,6 +744,7 @@ fn tool_arguments(name: &str, params: &Value) -> Value {
 
 fn prepare_browser_workspace_arguments(
     workspace: &Workspace,
+    proxy_workspace: &Workspace,
     tool_name: &str,
     arguments: &Value,
 ) -> Result<(Value, Vec<BrowserArtifactTarget>), WorkspaceError> {
@@ -744,11 +754,30 @@ fn prepare_browser_workspace_arguments(
     let mut prepared = arguments.clone();
     let mut targets = Vec::new();
     let normalized_name = tool_name.to_ascii_lowercase();
+    let bridge_root =
+        if workspace.root() != proxy_workspace.root() {
+            let relative = format!(".anchor/browser-bridge/{}", Uuid::new_v4());
+            let probe = proxy_workspace.resolve_for_write(&format!("{relative}/.anchor-probe"))?;
+            Some(probe.path.parent().map(Path::to_path_buf).ok_or_else(|| {
+                WorkspaceError::Tool {
+                    code: "BROWSER_ARTIFACT_BRIDGE_FAILED",
+                    message: "Browser artifact bridge path has no parent directory".into(),
+                    category: "runtime",
+                    retryable: false,
+                }
+            })?)
+        } else {
+            None
+        };
 
     if let Some(raw) = arguments.get("outputDirPath").and_then(Value::as_str) {
         if !Path::new(raw).is_absolute() {
-            let target = resolve_browser_output_directory(workspace, raw)?;
-            prepared["outputDirPath"] = Value::String(browser_os_path(&target.absolute_path));
+            let target = route_browser_artifact_target(
+                resolve_browser_output_directory(workspace, raw)?,
+                bridge_root.as_deref(),
+                targets.len(),
+            )?;
+            prepared["outputDirPath"] = Value::String(browser_os_path(&target.proxy_path));
             targets.push(target);
         }
     }
@@ -760,7 +789,9 @@ fn prepare_browser_workspace_arguments(
             } else {
                 resolve_browser_output_file(workspace, raw)?
             };
-            prepared["filePath"] = Value::String(browser_os_path(&target.absolute_path));
+            let target =
+                route_browser_artifact_target(target, bridge_root.as_deref(), targets.len())?;
+            prepared["filePath"] = Value::String(browser_os_path(&target.proxy_path));
             targets.push(target);
         }
     }
@@ -780,8 +811,12 @@ fn prepare_browser_workspace_arguments(
                     resolved_paths.push(Value::String(raw.to_string()));
                     continue;
                 }
-                let target = resolve_browser_input_file(workspace, raw)?;
-                resolved_paths.push(Value::String(browser_os_path(&target.absolute_path)));
+                let target = route_browser_artifact_target(
+                    resolve_browser_input_file(workspace, raw)?,
+                    bridge_root.as_deref(),
+                    targets.len(),
+                )?;
+                resolved_paths.push(Value::String(browser_os_path(&target.proxy_path)));
                 targets.push(target);
             }
             prepared[key] = Value::Array(resolved_paths);
@@ -789,6 +824,38 @@ fn prepare_browser_workspace_arguments(
     }
 
     Ok((prepared, targets))
+}
+
+fn route_browser_artifact_target(
+    mut target: BrowserArtifactTarget,
+    bridge_root: Option<&Path>,
+    index: usize,
+) -> Result<BrowserArtifactTarget, WorkspaceError> {
+    let Some(bridge_root) = bridge_root else {
+        return Ok(target);
+    };
+    let mut proxy_path =
+        bridge_root.join(format!("{index:03}-{}-{}", target.direction, target.kind));
+    if target.kind == "file" {
+        if let Some(extension) = target.absolute_path.extension() {
+            proxy_path.set_extension(extension);
+        }
+        if let Some(parent) = proxy_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| browser_artifact_bridge_error("prepare", parent, error))?;
+        }
+        if target.direction == "input" {
+            fs::copy(&target.absolute_path, &proxy_path).map_err(|error| {
+                browser_artifact_bridge_error("stage_input", &target.absolute_path, error)
+            })?;
+        }
+    } else {
+        fs::create_dir_all(&proxy_path)
+            .map_err(|error| browser_artifact_bridge_error("prepare", &proxy_path, error))?;
+    }
+    target.proxy_path = proxy_path;
+    target.bridge_root = Some(bridge_root.to_path_buf());
+    Ok(target)
 }
 
 fn is_browser_file_tool(tool_name: &str) -> bool {
@@ -828,7 +895,9 @@ fn resolve_browser_output_file(
     }
     Ok(BrowserArtifactTarget {
         relative_path: raw.replace('\\', "/"),
+        proxy_path: resolved.path.clone(),
         absolute_path: resolved.path,
+        bridge_root: None,
         direction: "output",
         kind: "file",
     })
@@ -868,7 +937,9 @@ fn resolve_browser_output_directory(
         } else {
             relative_path.replace('\\', "/")
         },
+        proxy_path: directory.clone(),
         absolute_path: directory,
+        bridge_root: None,
         direction: "output",
         kind: "directory",
     })
@@ -889,7 +960,9 @@ fn resolve_browser_input_file(
     }
     Ok(BrowserArtifactTarget {
         relative_path: resolved.display,
+        proxy_path: resolved.path.clone(),
         absolute_path: resolved.path,
+        bridge_root: None,
         direction: "input",
         kind: "file",
     })
@@ -906,6 +979,119 @@ fn browser_os_path(path: &Path) -> String {
     }
     #[cfg(not(windows))]
     display.into_owned()
+}
+
+fn browser_artifact_bridge_error(
+    stage: &'static str,
+    path: &Path,
+    error: std::io::Error,
+) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "BROWSER_ARTIFACT_BRIDGE_FAILED",
+        message: format!("Browser artifact bridge failed during {stage}: {error}"),
+        category: "runtime",
+        retryable: true,
+        details: serde_json::json!({
+            "stage": stage,
+            "path": path.to_string_lossy(),
+            "error_kind": format!("{:?}", error.kind())
+        }),
+    }
+}
+
+fn finalize_browser_workspace_artifacts(
+    targets: &[BrowserArtifactTarget],
+) -> Result<(), WorkspaceError> {
+    let mut bridge_roots = Vec::<PathBuf>::new();
+    let result = (|| {
+        for target in targets {
+            let Some(bridge_root) = target.bridge_root.as_ref() else {
+                continue;
+            };
+            if !bridge_roots.iter().any(|root| root == bridge_root) {
+                bridge_roots.push(bridge_root.clone());
+            }
+            if target.direction != "output" || !target.proxy_path.exists() {
+                continue;
+            }
+            if target.kind == "file" {
+                copy_browser_bridge_file(&target.proxy_path, &target.absolute_path)?;
+            } else {
+                copy_browser_bridge_directory(&target.proxy_path, &target.absolute_path)?;
+            }
+        }
+        Ok(())
+    })();
+    for bridge_root in bridge_roots {
+        if let Err(error) = fs::remove_dir_all(&bridge_root) {
+            if error.kind() != std::io::ErrorKind::NotFound && result.is_ok() {
+                return Err(browser_artifact_bridge_error(
+                    "cleanup",
+                    &bridge_root,
+                    error,
+                ));
+            }
+        }
+    }
+    result
+}
+
+fn copy_browser_bridge_file(source: &Path, destination: &Path) -> Result<(), WorkspaceError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            browser_artifact_bridge_error("create_output_parent", parent, error)
+        })?;
+    }
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| browser_artifact_bridge_error("copy_output", destination, error))
+}
+
+fn copy_browser_bridge_directory(source: &Path, destination: &Path) -> Result<(), WorkspaceError> {
+    fs::create_dir_all(destination).map_err(|error| {
+        browser_artifact_bridge_error("create_output_directory", destination, error)
+    })?;
+    for entry in walkdir::WalkDir::new(source)
+        .min_depth(1)
+        .max_depth(16)
+        .follow_links(false)
+    {
+        let entry = entry.map_err(|error| WorkspaceError::ToolDetails {
+            code: "BROWSER_ARTIFACT_BRIDGE_FAILED",
+            message: format!("Failed to enumerate Browser artifact bridge: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: serde_json::json!({
+                "stage": "enumerate_output_directory",
+                "path": source.to_string_lossy()
+            }),
+        })?;
+        let relative =
+            entry
+                .path()
+                .strip_prefix(source)
+                .map_err(|error| WorkspaceError::ToolDetails {
+                    code: "BROWSER_ARTIFACT_BRIDGE_FAILED",
+                    message: format!(
+                        "Browser artifact path escaped its staging directory: {error}"
+                    ),
+                    category: "runtime",
+                    retryable: false,
+                    details: serde_json::json!({
+                        "stage": "validate_output_directory",
+                        "path": entry.path().to_string_lossy()
+                    }),
+                })?;
+        let target = destination.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).map_err(|error| {
+                browser_artifact_bridge_error("create_output_subdirectory", &target, error)
+            })?;
+        } else if entry.file_type().is_file() {
+            copy_browser_bridge_file(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn browser_workspace_path_error(tool_name: &str, error: WorkspaceError) -> Value {
@@ -1618,13 +1804,16 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    use crate::tools::{build_effective_catalog_from_parts, CancellationToken, ToolContext};
+    use crate::tools::{
+        build_effective_catalog_from_parts, CancellationToken, ToolContext, Workspace,
+    };
 
     use super::{
         attach_browser_workspace_artifacts, await_local_tool_worker_with_limits,
         browser_build_matches, browser_current_build, effective_catalog_error,
-        extract_browser_json_payload, handle_request, handle_tools_call, initialize_result,
-        prepare_browser_workspace_arguments, tool_arguments, tools_list_result,
+        extract_browser_json_payload, finalize_browser_workspace_artifacts, handle_request,
+        handle_tools_call, initialize_result, prepare_browser_workspace_arguments, tool_arguments,
+        tools_list_result,
     };
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {
@@ -1673,6 +1862,7 @@ mod tests {
         let (workspace, _harness, state) = test_state();
         let (prepared, targets) = prepare_browser_workspace_arguments(
             &state.workspace,
+            &state.workspace,
             "browser__take_screenshot",
             &json!({"filePath": "docs/artifacts/browser/page.png"}),
         )
@@ -1698,6 +1888,7 @@ mod tests {
     fn browser_workspace_artifacts_return_stable_handles() {
         let (_workspace, _harness, state) = test_state();
         let (_prepared, targets) = prepare_browser_workspace_arguments(
+            &state.workspace,
             &state.workspace,
             "browser__take_screenshot",
             &json!({"filePath": "docs/artifacts/browser/page.png"}),
@@ -1764,6 +1955,7 @@ mod tests {
         fs::write(workspace.path().join("fixtures/upload.txt"), b"upload").expect("upload fixture");
         let (prepared, targets) = prepare_browser_workspace_arguments(
             &state.workspace,
+            &state.workspace,
             "browser__upload_file",
             &json!({"filePath": "fixtures/upload.txt"}),
         )
@@ -1774,6 +1966,98 @@ mod tests {
         );
         assert_eq!(targets[0].direction, "input");
         assert_eq!(targets[0].relative_path, "fixtures/upload.txt");
+    }
+
+    #[test]
+    fn browser_worktree_outputs_are_staged_in_the_primary_workspace_and_copied_back() {
+        let (workspace, _harness, state) = test_state();
+        let worktree_root = workspace.path().join(".anchor/worktrees/task-output");
+        fs::create_dir_all(&worktree_root).expect("worktree root");
+        let worktree = Workspace::new(worktree_root).expect("worktree workspace");
+        let (prepared, targets) = prepare_browser_workspace_arguments(
+            &worktree,
+            &state.workspace,
+            "browser__take_screenshot",
+            &json!({"filePath": "artifacts/page.png"}),
+        )
+        .expect("prepare worktree screenshot");
+        let prepared_path = std::path::Path::new(
+            prepared["filePath"]
+                .as_str()
+                .expect("prepared screenshot path"),
+        );
+        assert!(prepared_path.is_absolute());
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].proxy_path.starts_with(state.workspace.root()));
+        assert!(!targets[0].proxy_path.starts_with(worktree.root()));
+        let bridge_root = targets[0].bridge_root.clone().expect("bridge root");
+        fs::write(&targets[0].proxy_path, b"image").expect("staged screenshot");
+
+        finalize_browser_workspace_artifacts(&targets).expect("finalize worktree screenshot");
+
+        assert_eq!(
+            fs::read(worktree.root().join("artifacts/page.png")).expect("copied screenshot"),
+            b"image"
+        );
+        assert!(!bridge_root.exists());
+    }
+
+    #[test]
+    fn browser_worktree_output_directories_and_uploads_use_the_primary_bridge() {
+        let (workspace, _harness, state) = test_state();
+        let worktree_root = workspace.path().join(".anchor/worktrees/task-directory");
+        fs::create_dir_all(worktree_root.join("fixtures")).expect("worktree fixtures");
+        fs::write(worktree_root.join("fixtures/upload.txt"), b"upload").expect("worktree upload");
+        let worktree = Workspace::new(worktree_root).expect("worktree workspace");
+
+        let (upload_args, upload_targets) = prepare_browser_workspace_arguments(
+            &worktree,
+            &state.workspace,
+            "browser__upload_file",
+            &json!({"filePath": "fixtures/upload.txt"}),
+        )
+        .expect("prepare worktree upload");
+        let staged_upload = std::path::Path::new(
+            upload_args["filePath"]
+                .as_str()
+                .expect("prepared upload path"),
+        );
+        assert_eq!(fs::read(staged_upload).expect("staged upload"), b"upload");
+        let upload_bridge = upload_targets[0]
+            .bridge_root
+            .clone()
+            .expect("upload bridge");
+        finalize_browser_workspace_artifacts(&upload_targets).expect("cleanup upload bridge");
+        assert!(!upload_bridge.exists());
+
+        let (directory_args, directory_targets) = prepare_browser_workspace_arguments(
+            &worktree,
+            &state.workspace,
+            "browser__lighthouse_audit",
+            &json!({"outputDirPath": "artifacts/audit"}),
+        )
+        .expect("prepare worktree output directory");
+        let staged_directory = std::path::Path::new(
+            directory_args["outputDirPath"]
+                .as_str()
+                .expect("prepared output directory"),
+        );
+        fs::create_dir_all(staged_directory.join("nested")).expect("staged nested directory");
+        fs::write(staged_directory.join("nested/report.json"), b"{}").expect("staged report");
+        let directory_bridge = directory_targets[0]
+            .bridge_root
+            .clone()
+            .expect("directory bridge");
+
+        finalize_browser_workspace_artifacts(&directory_targets)
+            .expect("finalize output directory");
+
+        assert_eq!(
+            fs::read(worktree.root().join("artifacts/audit/nested/report.json"))
+                .expect("copied report"),
+            b"{}"
+        );
+        assert!(!directory_bridge.exists());
     }
 
     #[tokio::test]
@@ -1854,12 +2138,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_paginates_a_budget_compliant_catalog() {
+    fn tools_list_returns_a_budget_compliant_catalog_in_one_response() {
         let catalog = build_effective_catalog_from_parts("core", true, browser_proxy_tools(48))
             .expect("budget-compliant catalog");
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
-        assert_eq!(first_tools.len(), 64);
+        assert_eq!(first_tools.len(), catalog.tools.len());
         assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 44);
         assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 48);
         assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
@@ -1896,12 +2180,7 @@ mod tests {
                 .unwrap_or_default()
                 .starts_with("browser__")
         }));
-        let cursor = first["nextCursor"].as_str().expect("next cursor");
-
-        let second = tools_list_result(&catalog, &json!({"cursor": cursor})).expect("second page");
-        let second_tools = second["tools"].as_array().expect("second tools");
-        assert_eq!(first_tools.len() + second_tools.len(), catalog.tools.len());
-        assert!(second.get("nextCursor").is_none());
+        assert!(first.get("nextCursor").is_none());
     }
 
     #[test]
@@ -1917,6 +2196,12 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
 
         for required in [
+            "export_work_session",
+            "git_worktree_create",
+            "git_worktree_prune",
+            "git_worktree_remove",
+            "stage_commit",
+            "stage_commit_status",
             "browser__health_check",
             "browser__reconnect",
             "browser__reset_session",
@@ -1931,6 +2216,11 @@ mod tests {
                 "{required} missing from advanced first page"
             );
         }
+        assert_eq!(
+            first["tools"].as_array().map(Vec::len),
+            Some(catalog.tools.len())
+        );
+        assert!(first.get("nextCursor").is_none());
     }
 
     #[test]

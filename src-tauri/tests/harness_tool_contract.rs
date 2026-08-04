@@ -575,7 +575,10 @@ fn work_session_export_is_versioned_portable_and_overwrite_safe() {
     let document: serde_json::Value = serde_json::from_slice(&bytes).expect("解析导出 JSON");
     assert_eq!(document["format"], "anchor.work-session-handoff");
     assert_eq!(document["schema_version"], 1);
-    assert_eq!(document["plugin"]["catalog_version"], 23);
+    assert_eq!(
+        document["plugin"]["catalog_version"],
+        anchor_lib::tools::registry::CATALOG_VERSION
+    );
     assert_eq!(document["task"]["id"], task_id);
     assert_eq!(
         document["history_session"]["session_key"],
