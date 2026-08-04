@@ -717,8 +717,8 @@ fn call_tool_impl(
         "list_dir" => file::list_dir(ws, &effective_args, cancellation),
         "list_files" => file::list_files(ws, &effective_args, cancellation),
         "search_text" => file::search_text(ws, &effective_args, cancellation),
-        "patch_check" => patch::patch_check(ctx, &effective_args),
-        "apply_patch" => patch::apply_patch(ctx, &effective_args),
+        "patch_check" => patch::patch_check_with_cancellation(ctx, &effective_args, cancellation),
+        "apply_patch" => patch::apply_patch_with_cancellation(ctx, &effective_args, cancellation),
         "remove_path" => recovery::remove_path(ctx, &effective_args),
         "exec_command" => exec::exec_command_with_cancellation(
             ctx,
@@ -1596,6 +1596,34 @@ mod tests {
 
         assert_eq!(result["ok"], false);
         assert_eq!(result["error"]["code"], "REQUEST_CANCELLED");
+    }
+
+    #[test]
+    fn cancelled_apply_patch_returns_terminal_error_without_writing() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        std::fs::write(workspace.path().join("main.txt"), "old\n").expect("file");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = call_tool_with_cancellation(
+            &ctx,
+            "apply_patch",
+            &json!({
+                "patch": "*** Begin Patch\n*** Update File: main.txt\n@@\n-old\n+new\n*** End Patch\n"
+            }),
+            &cancellation,
+        );
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["code"], "REQUEST_CANCELLED");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("main.txt")).expect("read file"),
+            "old\n"
+        );
     }
 
     #[test]

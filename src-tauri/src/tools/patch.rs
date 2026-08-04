@@ -1,14 +1,122 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
+use crate::tools::CancellationToken;
+
+const DEFAULT_PATCH_TIMEOUT_MS: u64 = 20_000;
+const MIN_PATCH_TIMEOUT_MS: u64 = 1_000;
+const MAX_PATCH_TIMEOUT_MS: u64 = 60_000;
+
+pub(crate) fn requested_patch_timeout_ms(args: &Value) -> u64 {
+    args.get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_PATCH_TIMEOUT_MS)
+        .clamp(MIN_PATCH_TIMEOUT_MS, MAX_PATCH_TIMEOUT_MS)
+}
+
+struct PatchExecution<'a> {
+    cancellation: &'a CancellationToken,
+    started: Instant,
+    timeout: Duration,
+    timeout_ms: u64,
+}
+
+impl<'a> PatchExecution<'a> {
+    fn from_args(
+        args: &Value,
+        cancellation: &'a CancellationToken,
+    ) -> Result<Self, WorkspaceError> {
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_PATCH_TIMEOUT_MS);
+        if !(MIN_PATCH_TIMEOUT_MS..=MAX_PATCH_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(WorkspaceError::invalid_argument(format!(
+                "timeout_ms must be between {MIN_PATCH_TIMEOUT_MS} and {MAX_PATCH_TIMEOUT_MS}"
+            )));
+        }
+        Ok(Self {
+            cancellation,
+            started: Instant::now(),
+            timeout: Duration::from_millis(timeout_ms),
+            timeout_ms,
+        })
+    }
+
+    fn checkpoint(&self, phase: &str) -> Result<(), WorkspaceError> {
+        if self.cancellation.is_cancelled() {
+            return Err(WorkspaceError::ToolDetails {
+                code: "REQUEST_CANCELLED",
+                message: "Patch request was cancelled before completion.".into(),
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "reason": "client_cancelled",
+                    "phase": phase,
+                    "elapsed_ms": self.elapsed_ms(),
+                    "workspace_modified": false,
+                    "suggestion": "Read the current target files before retrying the patch."
+                }),
+            });
+        }
+        if self.started.elapsed() >= self.timeout {
+            return Err(self.timeout_error(phase));
+        }
+        Ok(())
+    }
+
+    fn timeout_error(&self, phase: &str) -> WorkspaceError {
+        WorkspaceError::ToolDetails {
+            code: "PATCH_TIMEOUT",
+            message: format!(
+                "Patch processing exceeded its {} ms timeout.",
+                self.timeout_ms
+            ),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "reason": "patch_timeout",
+                "phase": phase,
+                "timeout_ms": self.timeout_ms,
+                "elapsed_ms": self.elapsed_ms(),
+                "workspace_modified": false,
+                "suggestion": "Split the change into a smaller patch, or retry with a larger timeout_ms up to 60000."
+            }),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+}
 
 pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let cancellation = CancellationToken::default();
+    apply_patch_with_cancellation(ctx, args, &cancellation)
+}
+
+pub fn apply_patch_with_cancellation(
+    ctx: &ToolContext,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    let execution = PatchExecution::from_args(args, cancellation)?;
+    apply_patch_with_execution(ctx, args, &execution)
+}
+
+fn apply_patch_with_execution(
+    ctx: &ToolContext,
+    args: &Value,
+    execution: &PatchExecution<'_>,
+) -> Result<Value, WorkspaceError> {
+    execution.checkpoint("start")?;
     let ws = &ctx.workspace;
     let patch = args
         .get("patch")
@@ -29,6 +137,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         ));
     }
     let file_patches = parse_unified_diff(patch)?;
+    execution.checkpoint("parse_patch")?;
     if file_patches.is_empty() {
         return Err(patch_failed("No files were modified."));
     }
@@ -58,7 +167,8 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let mut hunk_matches = Vec::new();
     let mut staged: HashMap<String, Option<String>> = HashMap::new();
 
-    for fp in &file_patches {
+    for (file_index, fp) in file_patches.iter().enumerate() {
+        execution.checkpoint(&format!("prepare_file_{}", file_index + 1))?;
         ws.reject_unsafe_text(&fp.path)?;
         let resolved = if fp.is_new_file {
             ws.resolve_for_write(&fp.path)?
@@ -79,6 +189,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         } else {
             return Err(patch_failed(format!("File not found: {}", fp.path)));
         };
+        execution.checkpoint(&format!("read_file_{}", file_index + 1))?;
 
         if fp.is_deleted {
             staged.insert(resolved.display.clone(), None);
@@ -86,8 +197,13 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             summaries.push(format!("D {}", resolved.display));
             continue;
         }
-        let (updated, matches) =
-            apply_hunks(&resolved.display, &original, &fp.hunks, diagnostic_mode)?;
+        let (updated, matches) = apply_hunks(
+            &resolved.display,
+            &original,
+            &fp.hunks,
+            diagnostic_mode,
+            execution,
+        )?;
         hunk_matches.extend(matches);
         let op = if resolved.existed { "update" } else { "add" };
         staged.insert(resolved.display.clone(), Some(updated));
@@ -102,10 +218,11 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let files_created = affected_paths(&affected, "add");
     let files_modified = affected_paths(&affected, "update");
     let files_deleted = affected_paths(&affected, "delete");
-    let post_validation = validate_staged_post_images(&staged, validation_mode)?;
+    let post_validation = validate_staged_post_images(&staged, validation_mode, execution)?;
+    execution.checkpoint("pre_commit")?;
 
     if !dry_run {
-        let _transaction_backups = commit_staged(ws, &staged)?;
+        let _transaction_backups = commit_staged(ws, &staged, execution)?;
         let change_id = Uuid::new_v4().simple().to_string();
         return Ok(tool_ok(json!({
             "dry_run": false,
@@ -127,6 +244,9 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
                 "renamed": []
             },
             "recovery": "git",
+            "duration_ms": execution.elapsed_ms(),
+            "timeout_ms": execution.timeout_ms,
+            "terminal_status": "completed",
             "warnings": []
         })));
     }
@@ -150,6 +270,9 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
             "deleted": files_deleted,
             "renamed": []
         },
+        "duration_ms": execution.elapsed_ms(),
+        "timeout_ms": execution.timeout_ms,
+        "terminal_status": "dry_run_completed",
         "warnings": []
     })))
 }
@@ -228,6 +351,7 @@ fn validation_snippet(content: &str, line: usize) -> String {
 fn validate_staged_post_images(
     staged: &HashMap<String, Option<String>>,
     mode: &str,
+    execution: &PatchExecution<'_>,
 ) -> Result<Vec<Value>, WorkspaceError> {
     if mode == "none" {
         return Ok(Vec::new());
@@ -235,7 +359,8 @@ fn validate_staged_post_images(
     let mut paths = staged.keys().cloned().collect::<Vec<_>>();
     paths.sort();
     let mut results = Vec::new();
-    for path in paths {
+    for (index, path) in paths.into_iter().enumerate() {
+        execution.checkpoint(&format!("validate_file_{}", index + 1))?;
         let Some(content) = staged.get(&path).and_then(Option::as_ref) else {
             continue;
         };
@@ -470,11 +595,13 @@ fn hunk_context_mismatch(
     expected: &[String],
     diagnostic_mode: &str,
     line_ending: &str,
-) -> WorkspaceError {
-    let (nearest_index, nearest_context, matched_lines) = nearest_hunk_context(lines, expected);
+    execution: &PatchExecution<'_>,
+) -> Result<WorkspaceError, WorkspaceError> {
+    let (nearest_index, nearest_context, matched_lines) =
+        nearest_hunk_context(lines, expected, execution)?;
     let denominator = expected.len().max(1) as f64;
     let confidence = matched_lines as f64 / denominator;
-    WorkspaceError::ToolDetails {
+    Ok(WorkspaceError::ToolDetails {
         code: "PATCH_CONTEXT_MISMATCH",
         message: format!(
             "Patch hunk {} did not match {} near line {}.",
@@ -513,17 +640,24 @@ fn hunk_context_mismatch(
             },
             "suggestion": "读取 line_hint 附近的当前文件内容，基于 nearest_context 重新生成 patch；不要盲目重复同一 hunk。"
         }),
-    }
+    })
 }
 
-fn nearest_hunk_context(lines: &[String], expected: &[String]) -> (usize, Vec<String>, usize) {
+fn nearest_hunk_context(
+    lines: &[String],
+    expected: &[String],
+    execution: &PatchExecution<'_>,
+) -> Result<(usize, Vec<String>, usize), WorkspaceError> {
     if lines.is_empty() || expected.is_empty() {
-        return (0, Vec::new(), 0);
+        return Ok((0, Vec::new(), 0));
     }
     let window = expected.len().min(lines.len());
     let mut best_index = 0usize;
     let mut best_score = 0usize;
     for index in 0..=lines.len().saturating_sub(window) {
+        if index % 128 == 0 {
+            execution.checkpoint("nearest_context_search")?;
+        }
         let score = lines[index..index + window]
             .iter()
             .zip(expected.iter())
@@ -535,17 +669,26 @@ fn nearest_hunk_context(lines: &[String], expected: &[String]) -> (usize, Vec<St
         }
     }
     let end = (best_index + expected.len()).min(lines.len());
-    (
+    Ok((
         best_index,
         lines[best_index..end].iter().take(24).cloned().collect(),
         best_score,
-    )
+    ))
 }
 
 pub fn patch_check(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let cancellation = CancellationToken::default();
+    patch_check_with_cancellation(ctx, args, &cancellation)
+}
+
+pub fn patch_check_with_cancellation(
+    ctx: &ToolContext,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
     let mut check_args = args.clone();
     check_args["dry_run"] = Value::Bool(true);
-    let mut result = apply_patch(ctx, &check_args)?;
+    let mut result = apply_patch_with_cancellation(ctx, &check_args, cancellation)?;
     if let Some(object) = result.as_object_mut() {
         object.insert("preflight".into(), Value::Bool(true));
     }
@@ -753,6 +896,7 @@ fn apply_hunks(
     original: &str,
     hunks: &[Hunk],
     diagnostic_mode: &str,
+    execution: &PatchExecution<'_>,
 ) -> Result<(String, Vec<Value>), WorkspaceError> {
     let line_ending = if original.contains("\r\n") {
         "\r\n"
@@ -772,6 +916,7 @@ fn apply_hunks(
     let mut matches = Vec::new();
 
     for (hunk_index, hunk) in hunks.iter().enumerate() {
+        execution.checkpoint(&format!("match_hunk_{}", hunk_index + 1))?;
         let search_at = 0usize;
         let hunk_old: Vec<String> = hunk
             .lines
@@ -782,20 +927,24 @@ fn apply_hunks(
             })
             .collect();
 
-        let exact = find_hunk_position(&lines, &hunk_old, search_at);
+        let exact = find_hunk_position(&lines, &hunk_old, search_at, execution)?;
         let (pos, match_mode, confidence) = if let Some(pos) = exact {
             (pos, "exact", 1.0)
         } else if diagnostic_mode == "fuzzy" {
-            find_fuzzy_hunk_position(&lines, &hunk_old, search_at).ok_or_else(|| {
-                hunk_context_mismatch(
-                    file,
-                    hunk_index,
-                    &lines,
-                    &hunk_old,
-                    diagnostic_mode,
-                    if line_ending == "\r\n" { "crlf" } else { "lf" },
-                )
-            })?
+            match find_fuzzy_hunk_position(&lines, &hunk_old, search_at, execution)? {
+                Some(position) => position,
+                None => {
+                    return Err(hunk_context_mismatch(
+                        file,
+                        hunk_index,
+                        &lines,
+                        &hunk_old,
+                        diagnostic_mode,
+                        if line_ending == "\r\n" { "crlf" } else { "lf" },
+                        execution,
+                    )?)
+                }
+            }
         } else {
             return Err(hunk_context_mismatch(
                 file,
@@ -804,8 +953,10 @@ fn apply_hunks(
                 &hunk_old,
                 diagnostic_mode,
                 if line_ending == "\r\n" { "crlf" } else { "lf" },
-            ));
+                execution,
+            )?);
         };
+        execution.checkpoint(&format!("apply_hunk_{}", hunk_index + 1))?;
         matches.push(json!({
             "file": file,
             "hunk_index": hunk_index + 1,
@@ -815,7 +966,10 @@ fn apply_hunks(
         }));
 
         let mut idx = pos;
-        for hl in &hunk.lines {
+        for (line_index, hl) in hunk.lines.iter().enumerate() {
+            if line_index % 256 == 0 {
+                execution.checkpoint(&format!("apply_hunk_{}", hunk_index + 1))?;
+            }
             match hl {
                 HunkLine::Context(_) => idx += 1,
                 HunkLine::Remove(_) => {
@@ -843,17 +997,21 @@ fn find_fuzzy_hunk_position(
     lines: &[String],
     pattern: &[String],
     start: usize,
-) -> Option<(usize, &'static str, f64)> {
+    execution: &PatchExecution<'_>,
+) -> Result<Option<(usize, &'static str, f64)>, WorkspaceError> {
     if pattern.is_empty() {
-        return Some((start, "fuzzy", 1.0));
+        return Ok(Some((start, "fuzzy", 1.0)));
     }
     if start > lines.len() || pattern.len() > lines.len().saturating_sub(start) {
-        return None;
+        return Ok(None);
     }
     let minimum_matches = (pattern.len() * 4).div_ceil(5);
     let mut best = None::<(usize, usize)>;
     let mut best_count = 0usize;
     for index in start..=lines.len().saturating_sub(pattern.len()) {
+        if index % 128 == 0 {
+            execution.checkpoint("fuzzy_hunk_search")?;
+        }
         let score = lines[index..index + pattern.len()]
             .iter()
             .zip(pattern.iter())
@@ -866,35 +1024,46 @@ fn find_fuzzy_hunk_position(
             best = None;
         }
     }
-    let (index, score) = best?;
+    let Some((index, score)) = best else {
+        return Ok(None);
+    };
     if score < minimum_matches || (pattern.len() == 1 && score != 1) {
-        return None;
+        return Ok(None);
     }
-    Some((index, "fuzzy", score as f64 / pattern.len() as f64))
+    Ok(Some((index, "fuzzy", score as f64 / pattern.len() as f64)))
 }
 
-fn find_hunk_position(lines: &[String], pattern: &[String], start: usize) -> Option<usize> {
+fn find_hunk_position(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    execution: &PatchExecution<'_>,
+) -> Result<Option<usize>, WorkspaceError> {
     if pattern.is_empty() {
-        return Some(start);
+        return Ok(Some(start));
     }
     if start > lines.len() || pattern.len() > lines.len().saturating_sub(start) {
-        return None;
+        return Ok(None);
     }
     for i in start..=lines.len().saturating_sub(pattern.len()) {
+        if i % 128 == 0 {
+            execution.checkpoint("exact_hunk_search")?;
+        }
         if lines[i..i + pattern.len()]
             .iter()
             .zip(pattern.iter())
             .all(|(a, b)| a == b)
         {
-            return Some(i);
+            return Ok(Some(i));
         }
     }
-    None
+    Ok(None)
 }
 
 fn commit_staged(
     ws: &Workspace,
     staged: &HashMap<String, Option<String>>,
+    execution: &PatchExecution<'_>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let staged_bytes = staged
         .iter()
@@ -905,16 +1074,20 @@ fn commit_staged(
             )
         })
         .collect::<HashMap<_, _>>();
-    commit_staged_bytes(ws, &staged_bytes)
+    commit_staged_bytes_with_execution(ws, &staged_bytes, Some(execution))
 }
 
-pub(crate) fn commit_staged_bytes(
+fn commit_staged_bytes_with_execution(
     ws: &Workspace,
     staged: &HashMap<String, Option<Vec<u8>>>,
+    execution: Option<&PatchExecution<'_>>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
     let mut temporary_files = HashMap::new();
-    for (rel, content) in staged {
+    for (index, (rel, content)) in staged.iter().enumerate() {
+        if let Some(execution) = execution {
+            execution.checkpoint(&format!("stage_file_{}", index + 1))?;
+        }
         ws.reject_protected_write_path(rel)?;
         let resolved = if content.is_none() {
             ws.resolve_existing(rel)?
@@ -946,9 +1119,23 @@ pub(crate) fn commit_staged_bytes(
             }
             temporary_files.insert(path.clone(), temp);
         }
+        if let Some(execution) = execution {
+            if let Err(error) = execution.checkpoint(&format!("stage_file_{}", index + 1)) {
+                cleanup_temporary_files(temporary_files.values());
+                restore_backups(&backups);
+                return Err(error);
+            }
+        }
     }
 
-    for (rel, content) in staged {
+    for (index, (rel, content)) in staged.iter().enumerate() {
+        if let Some(execution) = execution {
+            if let Err(error) = execution.checkpoint(&format!("commit_file_{}", index + 1)) {
+                cleanup_temporary_files(temporary_files.values());
+                restore_backups(&backups);
+                return Err(error);
+            }
+        }
         let resolved = if content.is_none() {
             ws.resolve_existing(rel)?
         } else {
@@ -973,6 +1160,13 @@ pub(crate) fn commit_staged_bytes(
             cleanup_temporary_files(temporary_files.values());
             restore_backups(&backups);
             return Err(patch_failed(format!("Failed to write file: {err}")));
+        }
+        if let Some(execution) = execution {
+            if let Err(error) = execution.checkpoint(&format!("commit_file_{}", index + 1)) {
+                cleanup_temporary_files(temporary_files.values());
+                restore_backups(&backups);
+                return Err(error);
+            }
         }
     }
     cleanup_temporary_files(temporary_files.values());
@@ -1087,6 +1281,10 @@ mod tests {
         })
     }
 
+    fn test_execution(cancellation: &CancellationToken) -> PatchExecution<'_> {
+        PatchExecution::from_args(&json!({}), cancellation).expect("patch execution")
+    }
+
     #[test]
     fn patch_check_does_not_modify_workspace() {
         let (_workspace, _harness, context) = context_with_file();
@@ -1096,6 +1294,62 @@ mod tests {
             std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
             "old\n"
         );
+    }
+
+    #[test]
+    fn cancelled_patch_returns_terminal_error_without_modifying_workspace() {
+        let (_workspace, _harness, context) = context_with_file();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let error = apply_patch_with_cancellation(&context, &patch(), &cancellation)
+            .expect_err("cancelled patch");
+        let value = error.to_error_value();
+        assert_eq!(value["code"], "REQUEST_CANCELLED");
+        assert_eq!(value["details"]["workspace_modified"], false);
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn expired_patch_deadline_returns_timeout_without_modifying_workspace() {
+        let (_workspace, _harness, context) = context_with_file();
+        let cancellation = CancellationToken::default();
+        let execution = PatchExecution {
+            cancellation: &cancellation,
+            started: Instant::now() - Duration::from_millis(10),
+            timeout: Duration::from_millis(1),
+            timeout_ms: 1,
+        };
+
+        let error = apply_patch_with_execution(&context, &patch(), &execution)
+            .expect_err("timed out patch");
+        let value = error.to_error_value();
+        assert_eq!(value["code"], "PATCH_TIMEOUT");
+        assert_eq!(value["details"]["phase"], "start");
+        assert_eq!(value["details"]["workspace_modified"], false);
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn successful_patch_reports_terminal_timing_metadata() {
+        let (_workspace, _harness, context) = context_with_file();
+        let result = apply_patch(
+            &context,
+            &json!({
+                "patch": patch()["patch"],
+                "timeout_ms": 1_000
+            }),
+        )
+        .expect("patch");
+        assert_eq!(result["terminal_status"], "completed");
+        assert_eq!(result["timeout_ms"], 1_000);
+        assert!(result["duration_ms"].as_u64().is_some());
     }
 
     #[test]
@@ -1109,8 +1363,10 @@ mod tests {
                 HunkLine::Context("}".into()),
             ],
         };
+        let cancellation = CancellationToken::default();
+        let execution = test_execution(&cancellation);
         let (updated, matches) =
-            apply_hunks("main.rs", input, &[hunk], "fuzzy").expect("fuzzy patch");
+            apply_hunks("main.rs", input, &[hunk], "fuzzy", &execution).expect("fuzzy patch");
         assert_eq!(updated, "fn main() {\nlet value = 2;\n}\n");
         assert_eq!(matches[0]["mode"], "fuzzy");
         assert_eq!(matches[0]["hunk_index"], 1);
@@ -1127,7 +1383,10 @@ mod tests {
                 HunkLine::Context("omega".into()),
             ],
         };
-        let error = apply_hunks("main.txt", input, &[hunk], "exact").expect_err("exact mismatch");
+        let cancellation = CancellationToken::default();
+        let execution = test_execution(&cancellation);
+        let error = apply_hunks("main.txt", input, &[hunk], "exact", &execution)
+            .expect_err("exact mismatch");
         let value = error.to_error_value();
         assert_eq!(value["code"], "PATCH_CONTEXT_MISMATCH");
         assert_eq!(value["details"]["file"], "main.txt");
@@ -1147,8 +1406,10 @@ mod tests {
                 HunkLine::Context("two".into()),
             ],
         };
+        let cancellation = CancellationToken::default();
+        let execution = test_execution(&cancellation);
         assert_eq!(
-            apply_hunks("main.txt", input, &[hunk], "exact")
+            apply_hunks("main.txt", input, &[hunk], "exact", &execution)
                 .expect("patch")
                 .0,
             "one\r\ninsert-a\r\ninsert-b\r\ntwo\r\n"

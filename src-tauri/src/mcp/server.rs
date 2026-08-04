@@ -613,19 +613,89 @@ async fn handle_tools_call(
     let state = state.clone();
     let call_name = name.to_string();
     let call_args = args.clone();
-    let cancellation = cancellation.clone();
+    let worker_cancellation = cancellation.clone();
     let session_id = session_id.map(str::to_string);
-    let structured = tokio::task::spawn_blocking(move || {
+    let worker = tokio::task::spawn_blocking(move || {
         call_tool_prevalidated_with_session_cancellation(
             state.as_ref(),
             &call_name,
             &call_args,
-            &cancellation,
+            &worker_cancellation,
             session_id.as_deref(),
         )
-    })
+    });
+    let structured = await_local_tool_worker(name, &raw_args, cancellation, worker).await?;
+    Ok(wrap_mcp_tool_result(name, &raw_args, structured))
+}
+
+async fn await_local_tool_worker(
+    name: &str,
+    args: &Value,
+    cancellation: &CancellationToken,
+    worker: tokio::task::JoinHandle<Value>,
+) -> Result<Value, Value> {
+    await_local_tool_worker_with_limits(
+        name,
+        args,
+        cancellation,
+        worker,
+        None,
+        Duration::from_secs(2),
+    )
     .await
-    .map_err(|error| {
+}
+
+async fn await_local_tool_worker_with_limits(
+    name: &str,
+    args: &Value,
+    cancellation: &CancellationToken,
+    mut worker: tokio::task::JoinHandle<Value>,
+    timeout_override: Option<Duration>,
+    cancellation_grace: Duration,
+) -> Result<Value, Value> {
+    let Some(timeout) = timeout_override.or_else(|| local_tool_worker_timeout(name, args)) else {
+        return join_local_tool_worker(worker.await);
+    };
+    match tokio::time::timeout(timeout, &mut worker).await {
+        Ok(result) => join_local_tool_worker(result),
+        Err(_) => {
+            cancellation.cancel();
+            match tokio::time::timeout(cancellation_grace, &mut worker).await {
+                Ok(result) => join_local_tool_worker(result),
+                Err(_) => {
+                    worker.abort();
+                    Ok(tool_err(WorkspaceError::ToolDetails {
+                        code: "PATCH_TIMEOUT",
+                        message:
+                            "Patch worker did not stop within the bounded cancellation window."
+                                .into(),
+                        category: "runtime",
+                        retryable: true,
+                        details: serde_json::json!({
+                            "reason": "patch_worker_timeout",
+                            "phase": "worker_wait",
+                            "timeout_ms": crate::tools::patch::requested_patch_timeout_ms(args),
+                            "worker_stopped": false,
+                            "workspace_modified": null,
+                            "suggestion": "Inspect git_status and the target files before retrying with a smaller patch."
+                        }),
+                    }))
+                }
+            }
+        }
+    }
+}
+
+fn local_tool_worker_timeout(name: &str, args: &Value) -> Option<Duration> {
+    matches!(name, "apply_patch" | "patch_check").then(|| {
+        Duration::from_millis(
+            crate::tools::patch::requested_patch_timeout_ms(args).saturating_add(2_000),
+        )
+    })
+}
+
+fn join_local_tool_worker(result: Result<Value, tokio::task::JoinError>) -> Result<Value, Value> {
+    result.map_err(|error| {
         serde_json::json!({
             "code": -32603,
             "message": "Local MCP tool worker failed",
@@ -634,8 +704,7 @@ async fn handle_tools_call(
                 "detail": error.to_string()
             }
         })
-    })?;
-    Ok(wrap_mcp_tool_result(name, &raw_args, structured))
+    })
 }
 
 fn raw_tool_arguments(params: &Value) -> Value {
@@ -1545,15 +1614,17 @@ pub fn new_state(
 mod tests {
     use std::fs;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use crate::tools::{build_effective_catalog_from_parts, CancellationToken, ToolContext};
 
     use super::{
-        attach_browser_workspace_artifacts, browser_build_matches, browser_current_build,
-        effective_catalog_error, extract_browser_json_payload, handle_request, handle_tools_call,
-        initialize_result, prepare_browser_workspace_arguments, tool_arguments, tools_list_result,
+        attach_browser_workspace_artifacts, await_local_tool_worker_with_limits,
+        browser_build_matches, browser_current_build, effective_catalog_error,
+        extract_browser_json_payload, handle_request, handle_tools_call, initialize_result,
+        prepare_browser_workspace_arguments, tool_arguments, tools_list_result,
     };
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {
@@ -1564,6 +1635,37 @@ mod tests {
                 .expect("tool context"),
         );
         (workspace, harness, state)
+    }
+
+    #[tokio::test]
+    async fn patch_worker_watchdog_returns_a_terminal_timeout_before_global_request_timeout() {
+        let cancellation = CancellationToken::default();
+        let started = Instant::now();
+        let worker = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(250));
+            json!({"ok": true, "unexpected": "late patch result"})
+        });
+
+        let result = await_local_tool_worker_with_limits(
+            "apply_patch",
+            &json!({"timeout_ms": 10}),
+            &cancellation,
+            worker,
+            Some(Duration::from_millis(10)),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("terminal tool result");
+
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "PATCH_TIMEOUT");
+        assert_eq!(result["error"]["details"]["worker_stopped"], false);
+        assert_eq!(
+            result["error"]["details"]["workspace_modified"],
+            Value::Null
+        );
     }
 
     #[test]

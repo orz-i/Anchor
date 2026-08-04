@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 22;
+pub const CATALOG_VERSION: u32 = 23;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -342,7 +342,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "apply_patch",
         "Apply patch",
-        "Apply a patch envelope transactionally inside the workspace.",
+        "Apply a patch envelope transactionally with cooperative cancellation, bounded processing time, and atomic rollback inside the workspace.",
         false,
         true,
         false,
@@ -1352,6 +1352,9 @@ pub fn output_schema(name: &str) -> Value {
                         "hunk_matches": { "type": "array", "items": { "type": "object" } },
                         "transaction": { "type": "object" },
                         "recovery": { "type": "string", "minLength": 1 },
+                        "duration_ms": { "type": "integer", "minimum": 0 },
+                        "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+                        "terminal_status": { "type": "string", "enum": ["completed", "dry_run_completed"] },
                         "warnings": warnings_property()
                     }),
                     &[
@@ -1360,6 +1363,9 @@ pub fn output_schema(name: &str) -> Value {
                         "summary",
                         "affected_files",
                         "post_validation",
+                        "duration_ms",
+                        "timeout_ms",
+                        "terminal_status",
                         "warnings",
                     ],
                 ),
@@ -1402,6 +1408,9 @@ pub fn output_schema(name: &str) -> Value {
                 "would_modify": { "type": "array", "items": { "type": "string" } },
                 "would_delete": { "type": "array", "items": { "type": "string" } },
                 "post_validation": { "type": "array", "items": { "type": "object" } },
+                "duration_ms": { "type": "integer", "minimum": 0 },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
+                "terminal_status": { "type": "string", "const": "dry_run_completed" },
                 "warnings": warnings_property()
             }),
             &[
@@ -1414,6 +1423,9 @@ pub fn output_schema(name: &str) -> Value {
                 "would_modify",
                 "would_delete",
                 "post_validation",
+                "duration_ms",
+                "timeout_ms",
+                "terminal_status",
                 "warnings",
             ],
         ),
@@ -2661,6 +2673,7 @@ pub fn input_schema(name: &str) -> Value {
                 "dry_run": { "type": "boolean", "default": false },
                 "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" },
                 "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 20000 },
                 "reason": { "type": "string", "default": "" }
             },
             "required": ["patch"],
@@ -2680,7 +2693,8 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "patch": { "type": "string", "minLength": 1 },
                 "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" },
-                "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" }
+                "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" },
+                "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 20000 }
             },
             "required": ["patch"],
             "additionalProperties": false

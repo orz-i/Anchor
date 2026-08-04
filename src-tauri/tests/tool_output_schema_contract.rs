@@ -117,6 +117,9 @@ fn high_value_local_tool_successes_match_published_output_schemas() {
     );
     assert_ok(&applied);
     assert_matches_output_schema("apply_patch", &applied);
+    assert_eq!(applied["terminal_status"], "completed");
+    assert_eq!(applied["timeout_ms"], 20_000);
+    assert!(applied["duration_ms"].as_u64().is_some());
 }
 
 #[test]
