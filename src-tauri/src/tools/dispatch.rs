@@ -62,6 +62,57 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn tasks_share_write_domain(
+    left: &crate::harness::model::TaskSession,
+    right: &crate::harness::model::TaskSession,
+) -> bool {
+    match (left.git_worktree.as_ref(), right.git_worktree.as_ref()) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.path == right.path,
+        _ => false,
+    }
+}
+
+fn worktree_remove_task_conflict(ctx: &ToolContext, args: &Value) -> Option<Value> {
+    let raw_path = args.get("path").and_then(Value::as_str)?;
+    let candidate = {
+        let path = std::path::PathBuf::from(raw_path);
+        if path.is_absolute() {
+            path
+        } else {
+            ctx.workspace.root().join(path)
+        }
+    };
+    let candidate = candidate.canonicalize().unwrap_or(candidate);
+    let blocking_task_ids = ctx
+        .harness
+        .list_tasks()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|task| task.status.is_writable())
+        .filter(|task| {
+            task.git_worktree
+                .as_ref()
+                .map(|worktree| {
+                    let path = std::path::PathBuf::from(&worktree.path);
+                    path.canonicalize().unwrap_or(path) == candidate
+                })
+                .unwrap_or(false)
+        })
+        .map(|task| task.id)
+        .collect::<Vec<_>>();
+    (!blocking_task_ids.is_empty()).then(|| {
+        tool_err_code(
+            "GIT_WORKTREE_IN_USE",
+            format!(
+                "The worktree is still attached to writable task(s): {}",
+                blocking_task_ids.join(", ")
+            ),
+            "conflict",
+        )
+    })
+}
+
 fn normalize_exec_preflight_result(
     ctx: &ToolContext,
     name: &str,
@@ -392,6 +443,7 @@ fn call_tool_impl(
     validate_schema: bool,
     session_id: Option<&str>,
 ) -> Value {
+    let primary_ctx = ctx;
     if cancellation.is_cancelled() {
         let output = cancelled_tool_result();
         return normalize_exec_preflight_result(ctx, name, args, output, "cancelled");
@@ -402,6 +454,27 @@ fn call_tool_impl(
             return normalize_exec_preflight_result(ctx, name, args, output, "rejected");
         }
     }
+    let initial_task = resolve_task_for_call(ctx, name, args, session_id);
+    let scoped_context = if tool_uses_task_worktree(name) {
+        match initial_task
+            .as_ref()
+            .map(|task| ctx.scoped_for_task(task, session_id))
+            .transpose()
+        {
+            Ok(context) => context.flatten(),
+            Err(message) => {
+                return attach_harness_status(
+                    ctx,
+                    tool_err_code("TASK_WORKTREE_UNAVAILABLE", message, "runtime"),
+                    false,
+                    session_id,
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let ctx = scoped_context.as_ref().unwrap_or(ctx);
     let mut effective_args = apply_default_cwd(ctx, session_id, name, args);
     if name == "exec_command" {
         if let Err(error) = exec::normalize_exec_arguments(&mut effective_args) {
@@ -424,18 +497,18 @@ fn call_tool_impl(
         let output = policy_tool_err(e);
         return normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
     }
-    let mut selected_task = if name == "begin_work_session" {
-        ctx.bound_task_for_session(session_id)
-    } else {
-        ctx.task_for_session(session_id)
-    };
+    let mut selected_task = initial_task;
     if name != "begin_work_session" {
         if let Some(task) = selected_task.as_ref() {
-            let competing_running_task = ctx
-                .sessions
-                .running_task_ids()
-                .into_iter()
-                .any(|task_id| task_id != task.id);
+            let competing_running_task =
+                ctx.sessions.running_task_ids().into_iter().any(|task_id| {
+                    task_id != task.id
+                        && ctx
+                            .harness
+                            .task(&task_id)
+                            .map(|peer| tasks_share_write_domain(task, &peer))
+                            .unwrap_or(true)
+                });
             if competing_running_task && requires_write_baseline(name, &effective_args) {
                 return attach_harness_status(
                     ctx,
@@ -547,7 +620,13 @@ fn call_tool_impl(
                 operation_result_summary(name, &output),
             );
         }
-        attach_auto_checkpoint(ctx, name, args, &mut output, result_task_id.as_deref());
+        attach_auto_checkpoint(
+            primary_ctx,
+            name,
+            args,
+            &mut output,
+            result_task_id.as_deref(),
+        );
         return output;
     }
 
@@ -615,6 +694,11 @@ fn call_tool_impl(
     };
 
     let ws = &ctx.workspace;
+    if name == "git_worktree_remove" {
+        if let Some(error) = worktree_remove_task_conflict(ctx, &effective_args) {
+            return error;
+        }
+    }
     let result = match name {
         "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
         "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
@@ -648,6 +732,12 @@ fn call_tool_impl(
         "list_command_sessions" => session::list_command_sessions(&ctx.sessions, &effective_args),
         "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
         "git_status" => git::git_status(ws, &effective_args),
+        "git_worktree_list" => git::git_worktree_list(ws, &effective_args),
+        "git_worktree_create" => git::git_worktree_create(ws, &effective_args),
+        "git_worktree_remove" => {
+            git::git_worktree_remove(ws, &effective_args, ctx.policy.skip_permission_gates())
+        }
+        "git_worktree_prune" => git::git_worktree_prune(ws, &effective_args),
         "git_stage" => git::git_stage(ws, &effective_args),
         "git_commit" => git::git_commit(ws, &effective_args),
         "git_restore" => git::git_restore(ws, &effective_args),
@@ -837,7 +927,7 @@ fn call_tool_impl(
         );
     }
     attach_auto_checkpoint(
-        ctx,
+        primary_ctx,
         name,
         &effective_args,
         &mut output,
@@ -1032,6 +1122,34 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
         .join("\n")
 }
 
+fn resolve_task_for_call(
+    ctx: &ToolContext,
+    name: &str,
+    args: &Value,
+    mcp_session_id: Option<&str>,
+) -> Option<crate::harness::model::TaskSession> {
+    if name == "begin_work_session" {
+        return ctx.bound_task_for_session(mcp_session_id);
+    }
+    if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
+        if let Ok(task) = ctx.harness.task(task_id) {
+            return Some(task);
+        }
+    }
+    if matches!(name, "wait_command" | "write_stdin" | "kill_session") {
+        if let Some(task) = args
+            .get("session_id")
+            .and_then(Value::as_str)
+            .and_then(|command_session_id| ctx.sessions.get(command_session_id).ok())
+            .and_then(|session| session.harness_metadata())
+            .and_then(|metadata| ctx.harness.task(&metadata.task_id).ok())
+        {
+            return Some(task);
+        }
+    }
+    ctx.task_for_session(mcp_session_id)
+}
+
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
         "exec_command"
@@ -1053,6 +1171,27 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
     }
 }
 
+fn tool_uses_task_worktree(name: &str) -> bool {
+    !matches!(
+        name,
+        "begin_work_session"
+            | "close_work_session"
+            | "start_task"
+            | "switch_task"
+            | "resume_task"
+            | "pause_task"
+            | "history_session_bootstrap"
+            | "history_session_checkpoint"
+            | "history_session_validate"
+            | "git_worktree_list"
+            | "git_worktree_create"
+            | "git_worktree_remove"
+            | "git_worktree_prune"
+            | "export_work_session"
+            | "server_info"
+    )
+}
+
 fn standalone_operation(name: &str) -> bool {
     matches!(
         name,
@@ -1066,6 +1205,9 @@ fn standalone_operation(name: &str) -> bool {
             | "git_reset"
             | "git_revert"
             | "git_clean"
+            | "git_worktree_create"
+            | "git_worktree_remove"
+            | "git_worktree_prune"
     )
 }
 

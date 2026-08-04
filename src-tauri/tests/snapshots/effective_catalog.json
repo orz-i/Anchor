@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 21,
+    "catalog_version": 22,
     "names": [
       "accept_current_baseline",
       "accept_latest_baseline",
@@ -28,6 +28,10 @@
       "git_show",
       "git_stage",
       "git_status",
+      "git_worktree_create",
+      "git_worktree_list",
+      "git_worktree_prune",
+      "git_worktree_remove",
       "harness_status",
       "history_session_bootstrap",
       "history_session_checkpoint",
@@ -65,10 +69,10 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 62
+    "tool_count": 66
   },
   "core": {
-    "catalog_version": 21,
+    "catalog_version": 22,
     "names": [
       "accept_latest_baseline",
       "apply_patch",
@@ -91,6 +95,7 @@
       "git_show",
       "git_stage",
       "git_status",
+      "git_worktree_list",
       "history_session_bootstrap",
       "history_session_checkpoint",
       "history_session_validate",
@@ -114,10 +119,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 43
+    "tool_count": 44
   },
   "read-only": {
-    "catalog_version": 21,
+    "catalog_version": 22,
     "names": [
       "browser_build_info",
       "check_exec_environment",
@@ -128,6 +133,7 @@
       "git_log",
       "git_show",
       "git_status",
+      "git_worktree_list",
       "list_command_sessions",
       "list_dir",
       "list_files",
@@ -142,6 +148,6 @@
       "view_image",
       "wait_command"
     ],
-    "tool_count": 22
+    "tool_count": 23
   }
 }

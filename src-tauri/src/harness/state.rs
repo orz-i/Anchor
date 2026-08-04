@@ -13,9 +13,9 @@ use walkdir::WalkDir;
 use super::model::{
     BaselineEntry, BaselineObject, CapabilityStatus, ChangeSet, ExpectedWorkspaceState,
     FileChangeRecord, HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord,
-    ProjectBaseline, ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt, TaskSession,
-    TaskStatus, VerificationDispositionRecord, VerificationRecord, WorkSessionCloseOutbox,
-    WorkspaceHarnessState, SCHEMA_VERSION,
+    ProjectBaseline, ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt,
+    TaskGitWorktree, TaskSession, TaskStatus, VerificationDispositionRecord, VerificationRecord,
+    WorkSessionCloseOutbox, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{baseline_object_id, HarnessError, HarnessResult, HarnessStore};
 
@@ -24,6 +24,22 @@ pub struct Harness {
     workspace_root: PathBuf,
     workspace_id: String,
     store: HarnessStore,
+}
+
+fn same_write_domain(left: &TaskSession, right: &TaskSession) -> bool {
+    match (left.git_worktree.as_ref(), right.git_worktree.as_ref()) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.path == right.path,
+        _ => false,
+    }
+}
+
+fn same_requested_write_domain(task: &TaskSession, worktree: Option<&TaskGitWorktree>) -> bool {
+    match (task.git_worktree.as_ref(), worktree) {
+        (None, None) => true,
+        (Some(existing), Some(requested)) => existing.path == requested.path,
+        _ => false,
+    }
 }
 
 fn tool_activity_resumes_paused_task(tool: &str) -> bool {
@@ -141,6 +157,67 @@ impl Harness {
         })
     }
 
+    pub fn with_workspace_root(&self, workspace_root: PathBuf) -> HarnessResult<Self> {
+        let workspace_root = workspace_root
+            .canonicalize()
+            .map_err(|e| HarnessError::new("WORKTREE_UNAVAILABLE", e.to_string()))?;
+        if !workspace_root.is_dir() {
+            return Err(HarnessError::new(
+                "WORKTREE_UNAVAILABLE",
+                "Task worktree root is not a directory",
+            ));
+        }
+        Ok(Self {
+            workspace_root,
+            workspace_id: self.workspace_id.clone(),
+            store: self.store.clone(),
+        })
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    pub fn attach_git_worktree(
+        &self,
+        task_id: &str,
+        worktree: TaskGitWorktree,
+    ) -> HarnessResult<TaskSession> {
+        let scoped = self.with_workspace_root(PathBuf::from(&worktree.path))?;
+        let captured = capture_baseline_snapshot(scoped.workspace_root());
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if task.git_worktree.is_some() {
+                    return Err(HarnessError::new(
+                        "TASK_WORKTREE_ALREADY_ATTACHED",
+                        "Task already has a Git worktree",
+                    ));
+                }
+                task.baseline = captured.baseline.clone();
+                task.expected_state = expected_state_from_baseline(&task.baseline, None);
+                task.git_worktree = Some(worktree.clone());
+                task.updated_at = timestamp();
+                transaction.save_baseline_object(&captured.object)?;
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "git_worktree_attached",
+                    Some("start_task"),
+                    json!({
+                        "path": worktree.path,
+                        "branch": worktree.branch,
+                        "base_ref": worktree.base_ref,
+                        "managed": worktree.managed,
+                        "remove_on_close": worktree.remove_on_close
+                    }),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
+    }
+
     pub fn all_operations(&self, limit: usize) -> HarnessResult<Vec<OperationRecord>> {
         self.store
             .list_operations(&self.workspace_id, 0, limit.clamp(1, 20_000))
@@ -195,6 +272,7 @@ impl Harness {
                 for mut peer in self.store.list_tasks(&self.workspace_id)? {
                     if peer.id == target.id
                         || !matches!(peer.status, TaskStatus::Active | TaskStatus::Verifying)
+                        || !same_write_domain(&peer, &target)
                     {
                         continue;
                     }
@@ -271,6 +349,7 @@ impl Harness {
                 for mut peer in self.store.list_tasks(&self.workspace_id)? {
                     if peer.id == task.id
                         || !matches!(peer.status, TaskStatus::Active | TaskStatus::Verifying)
+                        || !same_write_domain(&peer, &task)
                     {
                         continue;
                     }
@@ -429,14 +508,39 @@ impl Harness {
         objective: &str,
         _pause_current: bool,
     ) -> HarnessResult<TaskSession> {
+        self.start_task_configured(objective, Uuid::new_v4().simple().to_string(), None)
+    }
+
+    pub fn start_task_in_git_worktree(
+        &self,
+        objective: &str,
+        task_id: String,
+        worktree: TaskGitWorktree,
+    ) -> HarnessResult<TaskSession> {
+        self.start_task_configured(objective, task_id, Some(worktree))
+    }
+
+    fn start_task_configured(
+        &self,
+        objective: &str,
+        task_id: String,
+        git_worktree: Option<TaskGitWorktree>,
+    ) -> HarnessResult<TaskSession> {
         if objective.trim().is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
         }
+        let baseline_root = git_worktree
+            .as_ref()
+            .map(|worktree| PathBuf::from(&worktree.path))
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let captured = capture_baseline_snapshot(&baseline_root);
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut paused_task_ids = Vec::new();
                 for mut task in self.store.list_tasks(&self.workspace_id)? {
-                    if !matches!(task.status, TaskStatus::Active | TaskStatus::Verifying) {
+                    if !matches!(task.status, TaskStatus::Active | TaskStatus::Verifying)
+                        || !same_requested_write_domain(&task, git_worktree.as_ref())
+                    {
                         continue;
                     }
                     task.status = TaskStatus::Paused;
@@ -452,12 +556,11 @@ impl Harness {
                     ))?;
                     paused_task_ids.push(task.id);
                 }
-                let captured = capture_baseline_snapshot(&self.workspace_root);
-                let baseline = captured.baseline;
+                let baseline = captured.baseline.clone();
                 let now = timestamp();
                 let task = TaskSession {
                     schema_version: SCHEMA_VERSION,
-                    id: Uuid::new_v4().simple().to_string(),
+                    id: task_id.clone(),
                     workspace_id: self.workspace_id.clone(),
                     objective: objective.trim().to_string(),
                     status: TaskStatus::Active,
@@ -469,6 +572,7 @@ impl Harness {
                     latest_verification_id: None,
                     history_session_key: None,
                     history_session_path: None,
+                    git_worktree: git_worktree.clone(),
                     created_at: now.clone(),
                     updated_at: now,
                 };
@@ -484,8 +588,17 @@ impl Harness {
                     &task.id,
                     "task_started",
                     None,
-                    json!({"single_writer": true, "paused_task_ids": paused_task_ids}),
-                    json!({"ok": true, "single_writer": true}),
+                    json!({
+                        "single_writer": true,
+                        "paused_task_ids": paused_task_ids,
+                        "workspace_mode": if task.git_worktree.is_some() { "worktree" } else { "shared" },
+                        "worktree": task.git_worktree
+                    }),
+                    json!({
+                        "ok": true,
+                        "single_writer": true,
+                        "workspace_mode": if task.git_worktree.is_some() { "worktree" } else { "shared" }
+                    }),
                 ))?;
                 Ok(task)
             })
@@ -965,6 +1078,7 @@ impl Harness {
         task_id: &str,
         operation_id: Option<&str>,
     ) -> HarnessResult<TaskSession> {
+        let selected_task = self.task(task_id)?;
         let current = capture_baseline(&self.workspace_root);
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
@@ -972,7 +1086,7 @@ impl Harness {
                 let mut selected = None;
                 let mut synchronized_task_ids = Vec::new();
                 for mut task in self.store.list_tasks(&self.workspace_id)? {
-                    if !task.status.is_writable() {
+                    if !task.status.is_writable() || !same_write_domain(&task, &selected_task) {
                         continue;
                     }
                     task.expected_state = expected_state_from_baseline(&current, operation_id);
@@ -992,10 +1106,12 @@ impl Harness {
                 transaction.append_event(&harness_event(
                     &self.workspace_id,
                     task_id,
-                    "workspace_baseline_synchronized",
+                    "write_domain_baseline_synchronized",
                     None,
                     json!({
                         "operation_id": operation_id,
+                        "workspace_mode": if selected_task.git_worktree.is_some() { "worktree" } else { "shared" },
+                        "write_domain": selected_task.git_worktree.as_ref().map(|worktree| worktree.path.as_str()).unwrap_or("shared"),
                         "synchronized_task_ids": synchronized_task_ids
                     }),
                     json!({"ok": true}),

@@ -255,7 +255,7 @@
           </div>
           <p class="mt-3 text-sm font-medium leading-6">{task.objective}</p>
           <p class="mt-2 text-xs text-[var(--text-muted)]">
-            更新于 {formatTime(task.updatedAt)} · 分支 {task.branch ?? "—"} · HEAD {shortHash(task.expectedHead)}
+            更新于 {formatTime(task.updatedAt)} · {task.workspaceMode === "worktree" ? "Git Worktree" : "共享工作区"} · 分支 {task.branch ?? "—"} · HEAD {shortHash(task.expectedHead)}
           </p>
         </div>
         <div class="w-full max-w-xs shrink-0">

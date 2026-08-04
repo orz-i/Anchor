@@ -245,6 +245,8 @@ Open Workspace
 
 The advanced profile retains project-state and operation-history Harness capabilities, but normal edits and command execution do not require a Task.
 
+Harness tasks continue to use the configured Workspace by default. When independent branches, indexes, and files are useful, a task can explicitly opt into Git worktree isolation. See [Optional Git worktree tasks](docs/git-worktrees.md).
+
 ## Permission and recovery model
 
 The project uses a Workspace-first permission model:

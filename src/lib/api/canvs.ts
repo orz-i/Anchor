@@ -14,6 +14,7 @@ export interface CanvsTask {
   id: string;
   objective: string;
   status: CanvsTaskStatus;
+  workspaceMode: "shared" | "worktree";
   current: boolean;
   active: boolean;
   completedSteps: string[];

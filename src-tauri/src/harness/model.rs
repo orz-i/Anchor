@@ -249,8 +249,20 @@ pub struct TaskSession {
     pub history_session_key: Option<String>,
     #[serde(default)]
     pub history_session_path: Option<String>,
+    #[serde(default)]
+    pub git_worktree: Option<TaskGitWorktree>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskGitWorktree {
+    pub path: String,
+    pub branch: String,
+    pub base_ref: String,
+    pub managed: bool,
+    pub remove_on_close: bool,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -19,15 +19,16 @@ pub struct ToolContext {
     pub harness: Harness,
     pub mcp_proxies: crate::mcp::proxy::McpProxyRegistry,
     pub skills: crate::skills::SkillCatalog,
-    default_cwd: Mutex<PathBuf>,
-    session_default_cwds: Mutex<HashMap<String, PathBuf>>,
-    session_task_ids: Mutex<HashMap<String, String>>,
-    unbound_task_sessions: Mutex<HashSet<String>>,
-    command_output_cursors: Mutex<HashMap<String, (usize, usize)>>,
-    workspace_mutation_lock: Mutex<()>,
-    pub sessions: SessionStore,
-    pub command_cost: CommandCostGuard,
-    published_catalog: Mutex<Option<EffectiveCatalog>>,
+    primary_workspace_root: PathBuf,
+    default_cwd: Arc<Mutex<PathBuf>>,
+    session_default_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+    session_task_ids: Arc<Mutex<HashMap<String, String>>>,
+    unbound_task_sessions: Arc<Mutex<HashSet<String>>>,
+    command_output_cursors: Arc<Mutex<HashMap<String, (usize, usize)>>>,
+    workspace_mutation_lock: Arc<Mutex<()>>,
+    pub sessions: Arc<SessionStore>,
+    pub command_cost: Arc<CommandCostGuard>,
+    published_catalog: Arc<Mutex<Option<EffectiveCatalog>>>,
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
@@ -46,6 +47,60 @@ impl ToolContext {
             "core".into(),
             "trusted".into(),
         ))
+    }
+
+    pub fn scoped_for_task(
+        &self,
+        task: &crate::harness::model::TaskSession,
+        session_id: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        let Some(worktree) = task.git_worktree.as_ref() else {
+            return Ok(None);
+        };
+        let root = PathBuf::from(&worktree.path);
+        let workspace = Workspace::new(root.clone())
+            .map_err(|error| error.message())?
+            .with_strict_read_boundary(self.workspace.strict_read_boundary());
+        let harness = self
+            .harness
+            .with_workspace_root(root.clone())
+            .map_err(|error| error.to_string())?;
+        let scoped = Self {
+            workspace,
+            auth: self.auth.clone(),
+            policy: self.policy.clone(),
+            tool_profile: self.tool_profile.clone(),
+            permission_mode: self.permission_mode.clone(),
+            harness,
+            mcp_proxies: self.mcp_proxies.clone(),
+            skills: crate::skills::SkillCatalog::new(root.clone()),
+            primary_workspace_root: self.primary_workspace_root.clone(),
+            default_cwd: Arc::new(Mutex::new(root.clone())),
+            session_default_cwds: self.session_default_cwds.clone(),
+            session_task_ids: self.session_task_ids.clone(),
+            unbound_task_sessions: self.unbound_task_sessions.clone(),
+            command_output_cursors: self.command_output_cursors.clone(),
+            workspace_mutation_lock: self.workspace_mutation_lock.clone(),
+            sessions: self.sessions.clone(),
+            command_cost: self.command_cost.clone(),
+            published_catalog: self.published_catalog.clone(),
+        };
+        if let Some(session_id) = session_id {
+            let current = scoped
+                .session_default_cwds
+                .lock()
+                .expect("session cwd lock")
+                .get(session_id)
+                .cloned();
+            if current.as_ref().is_none_or(|path| !path.starts_with(&root)) {
+                scoped.set_default_cwd_for(Some(session_id), root);
+            }
+        }
+        Ok(Some(scoped))
+    }
+
+    pub fn is_primary_workspace(&self) -> bool {
+        self.workspace.root() == self.primary_workspace_root
     }
 
     pub fn from_workspace(
@@ -89,15 +144,16 @@ impl ToolContext {
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
-            default_cwd: Mutex::new(root),
-            session_default_cwds: Mutex::new(HashMap::new()),
-            session_task_ids: Mutex::new(HashMap::new()),
-            unbound_task_sessions: Mutex::new(HashSet::new()),
-            command_output_cursors: Mutex::new(HashMap::new()),
-            workspace_mutation_lock: Mutex::new(()),
-            sessions: SessionStore::new(),
-            command_cost,
-            published_catalog: Mutex::new(None),
+            primary_workspace_root: root.clone(),
+            default_cwd: Arc::new(Mutex::new(root)),
+            session_default_cwds: Arc::new(Mutex::new(HashMap::new())),
+            session_task_ids: Arc::new(Mutex::new(HashMap::new())),
+            unbound_task_sessions: Arc::new(Mutex::new(HashSet::new())),
+            command_output_cursors: Arc::new(Mutex::new(HashMap::new())),
+            workspace_mutation_lock: Arc::new(Mutex::new(())),
+            sessions: Arc::new(SessionStore::new()),
+            command_cost: Arc::new(command_cost),
+            published_catalog: Arc::new(Mutex::new(None)),
         };
         let _ = crate::harness::tools::recover_close_outboxes(&context);
         context
@@ -206,6 +262,12 @@ impl ToolContext {
                 .lock()
                 .expect("unbound task session lock")
                 .remove(session_id);
+            let execution_root = task
+                .git_worktree
+                .as_ref()
+                .map(|worktree| PathBuf::from(&worktree.path))
+                .unwrap_or_else(|| self.primary_workspace_root.clone());
+            self.set_default_cwd_for(Some(session_id), execution_root);
         }
         Ok(task)
     }

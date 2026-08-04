@@ -295,7 +295,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 43);
+    assert_eq!(names.len(), 44);
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("list_skill_resources"));
@@ -303,6 +303,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("search_text"));
     assert!(names.contains("command_cost_explain"));
     assert!(names.contains("git_stage"));
+    assert!(names.contains("git_worktree_list"));
     assert!(names.contains("git_commit"));
     assert!(names.contains("git_restore"));
     assert!(names.contains("update_verification_disposition"));

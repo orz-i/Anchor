@@ -32,6 +32,9 @@ fn task_scope_badges(task: &CanvsTask) -> String {
     if task.current {
         badges.push_str("<span class='badge neutral'>默认任务</span>");
     }
+    if task.workspace_mode == "worktree" {
+        badges.push_str("<span class='badge neutral'>Git Worktree</span>");
+    }
     if badges.is_empty() {
         badges.push_str("<span class='badge history'>历史任务</span>");
     }
@@ -404,6 +407,7 @@ mod tests {
                     id: "task-id".into(),
                     objective: "objective".into(),
                     status: "active".into(),
+                    workspace_mode: "shared".into(),
                     current: true,
                     active: true,
                     completed_steps: Vec::new(),

@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 21;
+pub const CATALOG_VERSION: u32 = 22;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -38,7 +38,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "begin_work_session",
         "Begin work session",
-        "Create or resume a History Session and bind the calling MCP session to the workspace's single writable Harness Task. Starting or selecting another task transfers the writer lease.",
+        "Create or resume a History Session and bind the calling MCP session to a shared-checkout task by default or an explicitly requested isolated Git worktree task.",
         false,
         false,
         false,
@@ -230,7 +230,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "switch_task",
         "Switch task",
-        "Bind the calling MCP session to an existing task, pause any other writable task, and transfer the workspace writer lease.",
+        "Bind the calling MCP session to an existing task and transfer the writer lease only within that task's shared checkout or linked-worktree write domain.",
         false,
         false,
         false,
@@ -412,6 +412,38 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "git_worktree_list",
+        "Git worktree list",
+        "List linked worktrees with branch, HEAD, lock, prune, main-worktree, and Anchor-managed status.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "git_worktree_create",
+        "Git worktree create",
+        "Create an Anchor-managed linked worktree under .anchor/worktrees from a base ref and optional branch.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "git_worktree_remove",
+        "Git worktree remove",
+        "Remove an Anchor-managed linked worktree; dirty worktrees require operator-approved force removal.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "git_worktree_prune",
+        "Git worktree prune",
+        "Prune stale linked-worktree administrative records and report the remaining worktree count.",
+        false,
+        false,
+        false,
+    ),
+    (
         "git_stage",
         "Git stage",
         "Stage explicit workspace-relative paths without invoking a shell.",
@@ -535,6 +567,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "kill_session",
     "read_output",
     "git_status",
+    "git_worktree_list",
     "git_stage",
     "git_commit",
     "git_restore",
@@ -566,6 +599,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "wait_command",
     "list_command_sessions",
     "git_status",
+    "git_worktree_list",
     "git_diff",
     "git_log",
     "git_show",
@@ -610,6 +644,10 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "kill_session",
     "read_output",
     "git_status",
+    "git_worktree_list",
+    "git_worktree_create",
+    "git_worktree_remove",
+    "git_worktree_prune",
     "git_stage",
     "git_commit",
     "git_restore",
@@ -651,6 +689,9 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "apply_patch",
     "remove_path",
     "exec_command",
+    "git_worktree_create",
+    "git_worktree_remove",
+    "git_worktree_prune",
     "git_stage",
     "git_commit",
     "git_restore",
@@ -693,6 +734,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "wait_command",
     "list_command_sessions",
     "git_status",
+    "git_worktree_list",
     "git_diff",
     "git_log",
     "git_show",
@@ -1565,6 +1607,71 @@ pub fn output_schema(name: &str) -> Value {
                 "warnings",
             ],
         ),
+        "git_worktree_list" => success_output_schema(
+            json!({
+                "worktrees": { "type": "array", "items": { "type": "object" } },
+                "count": { "type": "integer", "minimum": 1 },
+                "managed_root": { "type": "string", "const": ".anchor/worktrees" },
+                "warnings": warnings_property()
+            }),
+            &["worktrees", "count", "managed_root", "warnings"],
+        ),
+        "git_worktree_create" => success_output_schema(
+            json!({
+                "path": { "type": "string", "minLength": 1 },
+                "absolute_path": { "type": "string", "minLength": 1 },
+                "branch": { "type": "string", "minLength": 1 },
+                "base_ref": { "type": "string", "minLength": 1 },
+                "managed": { "type": "boolean", "const": true },
+                "remove_on_close": { "type": "boolean" },
+                "created_at": { "type": "string", "minLength": 1 },
+                "mutation_attributed": { "type": "boolean", "const": false },
+                "warnings": warnings_property()
+            }),
+            &[
+                "path",
+                "absolute_path",
+                "branch",
+                "base_ref",
+                "managed",
+                "remove_on_close",
+                "created_at",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_worktree_remove" => success_output_schema(
+            json!({
+                "path": { "type": "string", "minLength": 1 },
+                "removed": { "type": "boolean", "const": true },
+                "force": { "type": "boolean" },
+                "mutation_attributed": { "type": "boolean", "const": false },
+                "warnings": warnings_property()
+            }),
+            &[
+                "path",
+                "removed",
+                "force",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_worktree_prune" => success_output_schema(
+            json!({
+                "pruned_count": { "type": "integer", "minimum": 0 },
+                "remaining_count": { "type": "integer", "minimum": 1 },
+                "details": { "type": "array", "items": { "type": "string" } },
+                "mutation_attributed": { "type": "boolean", "const": false },
+                "warnings": warnings_property()
+            }),
+            &[
+                "pruned_count",
+                "remaining_count",
+                "details",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
         "git_stage" => success_output_schema(
             json!({
                 "staged_paths": { "type": "array", "items": { "type": "string" } },
@@ -2364,6 +2471,10 @@ pub fn input_schema(name: &str) -> Value {
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
                 "pause_current_and_start": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Anchor always enforces a single writable task per workspace." },
+                "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
+                "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
+                "worktree_remove_on_close": { "type": "boolean", "default": false },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "workspace_root": { "type": "string", "minLength": 1 }
             },
@@ -2407,7 +2518,11 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "objective": { "type": "string", "minLength": 1 },
-                "pause_current": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Anchor always pauses the previous writable task." }
+                "pause_current": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Shared-checkout tasks transfer the shared writer lease; worktree tasks use independent write domains." },
+                "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared" },
+                "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
+                "worktree_remove_on_close": { "type": "boolean", "default": false }
             },
             "required": ["objective"],
             "additionalProperties": false
@@ -2704,6 +2819,31 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["output_ref"],
             "additionalProperties": false
         }),
+        "git_worktree_list" | "git_worktree_prune" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "git_worktree_create" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "branch": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
+                "remove_on_close": { "type": "boolean", "default": false }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "git_worktree_remove" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "minLength": 1 },
+                "force": { "type": "boolean", "default": false }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
         "git_stage" => json!({
             "type": "object",
             "properties": {
@@ -2864,7 +3004,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_43_chatgpt_compatible_tools() {
+    fn core_catalog_exposes_44_chatgpt_compatible_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -2872,9 +3012,10 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 43);
+        assert_eq!(tools.len(), 44);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"list_skills"));
+        assert!(names.contains(&"git_worktree_list"));
         assert!(names.contains(&"load_skill"));
         assert!(names.contains(&"list_skill_resources"));
         assert!(names.contains(&"read_skill_resource"));

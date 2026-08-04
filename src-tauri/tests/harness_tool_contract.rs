@@ -575,7 +575,7 @@ fn work_session_export_is_versioned_portable_and_overwrite_safe() {
     let document: serde_json::Value = serde_json::from_slice(&bytes).expect("解析导出 JSON");
     assert_eq!(document["format"], "anchor.work-session-handoff");
     assert_eq!(document["schema_version"], 1);
-    assert_eq!(document["plugin"]["catalog_version"], 21);
+    assert_eq!(document["plugin"]["catalog_version"], 22);
     assert_eq!(document["task"]["id"], task_id);
     assert_eq!(
         document["history_session"]["session_key"],
@@ -602,6 +602,435 @@ fn work_session_export_is_versioned_portable_and_overwrite_safe() {
         caller_session,
     );
     assert_eq!(overwritten["ok"], true, "{overwritten}");
+}
+
+#[test]
+fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary_checkout() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "optional worktree\n").expect("写入文件");
+    fs::write(
+        workspace.join(".gitignore"),
+        "/.anchor/worktrees/\n/.anchor/handoffs/\n/docs/history-session/\n",
+    )
+    .expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let shared = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "默认共享工作区"}),
+        "optional-shared-session",
+    );
+    assert_eq!(shared["ok"], true, "{shared}");
+    assert_eq!(shared["workspace_mode"], "shared");
+    assert!(shared["git_worktree"].is_null());
+    let shared_task_id = shared["task"]["id"].as_str().expect("shared task id");
+    let shared_branch = shared["task"]["expected_state"]["branch"]
+        .as_str()
+        .expect("shared branch")
+        .to_string();
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "显式隔离工作区",
+            "session_key": "optional-worktree-history",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_base_ref": "HEAD"
+        }),
+        "optional-worktree-session",
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    assert_eq!(started["work_session"]["workspace_mode"], "worktree");
+    assert_eq!(started["work_session"]["parallel"], true);
+    assert_eq!(started["harness"]["baseline_matches"], true);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let worktree_path = std::path::PathBuf::from(
+        started["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    assert!(worktree_path.is_dir());
+    assert!(worktree_path.ends_with(task_id));
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared after worktree create")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+
+    let patched = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: isolated.txt\n+isolated\n*** End Patch\n"
+        }),
+        "optional-worktree-session",
+    );
+    assert_eq!(patched["ok"], true, "{patched}");
+    assert!(worktree_path.join("isolated.txt").exists());
+    assert!(!workspace.join("isolated.txt").exists());
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared after isolated patch")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+
+    let status = call_tool_for_session(&ctx, "git_status", &json!({}), "optional-worktree-session");
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["branch"], format!("anchor/task/{task_id}"));
+    assert_eq!(status["clean"], false);
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared after worktree status")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+
+    let primary_status = Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["status", "--porcelain=v1"])
+        .output()
+        .expect("读取主工作区状态");
+    assert!(primary_status.status.success());
+    let primary_status = String::from_utf8_lossy(&primary_status.stdout);
+    assert!(!primary_status.contains("isolated.txt"), "{primary_status}");
+    assert!(
+        !primary_status.contains(".anchor/worktrees"),
+        "{primary_status}"
+    );
+
+    let exported = call_tool_for_session(
+        &ctx,
+        "export_work_session",
+        &json!({"path": ".anchor/handoffs/worktree.json"}),
+        "optional-worktree-session",
+    );
+    assert_eq!(exported["ok"], true, "{exported}");
+    let handoff: Value = serde_json::from_slice(
+        &fs::read(workspace.join(".anchor/handoffs/worktree.json")).expect("读取交接"),
+    )
+    .expect("解析交接");
+    assert_eq!(handoff["workspace"]["mode"], "worktree");
+    assert_eq!(
+        handoff["workspace"]["execution_path"],
+        worktree_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared after export")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+
+    let remove_in_use = call_tool_for_session(
+        &ctx,
+        "git_worktree_remove",
+        &json!({"path": format!(".anchor/worktrees/{task_id}")}),
+        "optional-worktree-session",
+    );
+    assert_eq!(remove_in_use["ok"], false, "{remove_in_use}");
+    assert_eq!(remove_in_use["error"]["code"], "GIT_WORKTREE_IN_USE");
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared before switch")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+
+    let switched = call_tool_for_session(
+        &ctx,
+        "switch_task",
+        &json!({"task_id": shared_task_id}),
+        "optional-worktree-session",
+    );
+    assert_eq!(switched["ok"], true, "{switched}");
+    assert_eq!(switched["workspace_mode"], "shared");
+    assert_eq!(switched["task"]["id"], shared_task_id);
+    assert!(switched["task"]["git_worktree"].is_null());
+    assert_eq!(
+        ctx.bound_task_for_session(Some("optional-worktree-session"))
+            .expect("bound shared task")
+            .id,
+        shared_task_id
+    );
+    assert!(ctx
+        .harness
+        .task(shared_task_id)
+        .expect("persisted shared task")
+        .git_worktree
+        .is_none());
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared after switch")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+    let cwd = call_tool_for_session(
+        &ctx,
+        "get_default_cwd",
+        &json!({}),
+        "optional-worktree-session",
+    );
+    assert_eq!(cwd["ok"], true, "{cwd}");
+    assert_eq!(cwd["default_cwd"], ".");
+    assert_eq!(
+        ctx.harness
+            .task(shared_task_id)
+            .expect("shared after cwd")
+            .expected_state
+            .branch
+            .as_deref(),
+        Some(shared_branch.as_str())
+    );
+    let shared_patch = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: shared-only.txt\n+shared\n*** End Patch\n"
+        }),
+        "optional-worktree-session",
+    );
+    assert_eq!(shared_patch["ok"], true, "{shared_patch}");
+    assert!(workspace.join("shared-only.txt").exists());
+    assert!(!worktree_path.join("shared-only.txt").exists());
+}
+
+#[test]
+fn independent_worktree_tasks_remain_active_and_do_not_share_running_command_leases() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "parallel worktrees\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let first = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "隔离任务 A", "workspace_mode": "worktree"}),
+        "worktree-parallel-a",
+    );
+    let second = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "隔离任务 B", "workspace_mode": "worktree"}),
+        "worktree-parallel-b",
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(ctx.harness.active_tasks().expect("active tasks").len(), 2);
+
+    let first_path = std::path::PathBuf::from(
+        first["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("first path"),
+    );
+    let second_path = std::path::PathBuf::from(
+        second["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("second path"),
+    );
+    assert_ne!(first_path, second_path);
+
+    let running = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "import time; time.sleep(2)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 10_000
+        }),
+        "worktree-parallel-a",
+    );
+    assert_eq!(running["ok"], true, "{running}");
+    assert_eq!(running["status"], "running", "{running}");
+
+    let second_write = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: task-b.txt\n+B\n*** End Patch\n"
+        }),
+        "worktree-parallel-b",
+    );
+    assert_eq!(second_write["ok"], true, "{second_write}");
+    assert!(second_path.join("task-b.txt").exists());
+    assert!(!first_path.join("task-b.txt").exists());
+
+    let killed = call_tool_for_session(
+        &ctx,
+        "kill_session",
+        &json!({"session_id": running["session_id"]}),
+        "worktree-parallel-observer",
+    );
+    assert_eq!(killed["killed"], true, "{killed}");
+}
+
+#[test]
+fn close_work_session_can_remove_a_clean_managed_worktree_when_explicitly_requested() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "cleanup worktree\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let caller = "worktree-cleanup-session";
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "关闭后清理隔离目录",
+            "session_key": "worktree-cleanup-history",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": true
+        }),
+        caller,
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let worktree_path = std::path::PathBuf::from(
+        started["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+
+    let patched = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: committed.txt\n+committed\n*** End Patch\n"
+        }),
+        caller,
+    );
+    assert_eq!(patched["ok"], true, "{patched}");
+    assert_eq!(
+        call_tool_for_session(
+            &ctx,
+            "git_stage",
+            &json!({"paths": ["committed.txt"]}),
+            caller,
+        )["ok"],
+        true
+    );
+    let committed = call_tool_for_session(
+        &ctx,
+        "git_commit",
+        &json!({"message": "test: commit isolated worktree"}),
+        caller,
+    );
+    assert_eq!(committed["ok"], true, "{committed}");
+
+    let verified = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "git status --porcelain=v1",
+            "verification_kind": "test",
+            "verification_key": "worktree-clean-close",
+            "verification_level": "blocking"
+        }),
+        caller,
+    );
+    assert_eq!(verified["ok"], true, "{verified}");
+
+    let closed = call_tool_for_session(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "session_status": "completed",
+            "summary": "worktree cleanup test"
+        }),
+        caller,
+    );
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert_eq!(closed["worktree_cleanup"]["requested"], true);
+    assert_eq!(closed["worktree_cleanup"]["removed"], true);
+    assert!(!worktree_path.exists());
+    assert_eq!(
+        ctx.harness.task(task_id).expect("task").status,
+        anchor_lib::harness::TaskStatus::Completed
+    );
+}
+
+#[test]
+fn direct_worktree_tools_create_list_remove_and_prune_only_managed_paths() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "manual worktree\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let created = call_tool(
+        &ctx,
+        "git_worktree_create",
+        &json!({"name": "manual_test", "base_ref": "HEAD"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    assert_eq!(created["path"], ".anchor/worktrees/manual_test");
+    assert!(
+        std::path::Path::new(created["absolute_path"].as_str().expect("absolute path")).is_dir()
+    );
+
+    let listed = call_tool(&ctx, "git_worktree_list", &json!({}));
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert_eq!(listed["count"], 2);
+    assert!(listed["worktrees"].as_array().is_some_and(|worktrees| {
+        worktrees.iter().any(|entry| {
+            entry["managed"] == true && entry["managed_path"] == ".anchor/worktrees/manual_test"
+        })
+    }));
+
+    let outside = call_tool(&ctx, "git_worktree_remove", &json!({"path": "."}));
+    assert_eq!(outside["ok"], false, "{outside}");
+    assert_eq!(outside["error"]["code"], "GIT_WORKTREE_PATH_NOT_MANAGED");
+
+    let removed = call_tool(
+        &ctx,
+        "git_worktree_remove",
+        &json!({"path": ".anchor/worktrees/manual_test"}),
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+    let pruned = call_tool(&ctx, "git_worktree_prune", &json!({}));
+    assert_eq!(pruned["ok"], true, "{pruned}");
+    assert_eq!(pruned["remaining_count"], 1);
 }
 
 #[test]

@@ -1,5 +1,8 @@
 mod common;
 
+use std::fs;
+use std::process::Command;
+
 use anchor_lib::tools::registry::output_schema;
 use common::{assert_err, assert_ok, ctx_for, invoke, tiny_js_fixture};
 use serde_json::{json, Value};
@@ -15,6 +18,59 @@ fn assert_matches_output_schema(tool: &str, value: &Value) {
     validator
         .validate(value)
         .unwrap_or_else(|error| panic!("{tool} output schema violation: {error}\n{value}"));
+}
+
+#[test]
+fn worktree_management_successes_match_published_output_schemas() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "schema worktree\n").expect("readme");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("ignore");
+    for args in [
+        ["init"].as_slice(),
+        ["config", "user.email", "anchor@example.invalid"].as_slice(),
+        ["config", "user.name", "Anchor Tests"].as_slice(),
+        ["add", "."].as_slice(),
+        ["commit", "--no-gpg-sign", "--no-verify", "-m", "initial"].as_slice(),
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let ctx = ctx_for(&workspace);
+
+    let created = invoke(
+        &ctx,
+        "git_worktree_create",
+        json!({"name": "schema_test", "base_ref": "HEAD"}),
+    );
+    assert_ok(&created);
+    assert_matches_output_schema("git_worktree_create", &created);
+
+    let listed = invoke(&ctx, "git_worktree_list", json!({}));
+    assert_ok(&listed);
+    assert_matches_output_schema("git_worktree_list", &listed);
+
+    let removed = invoke(
+        &ctx,
+        "git_worktree_remove",
+        json!({"path": ".anchor/worktrees/schema_test"}),
+    );
+    assert_ok(&removed);
+    assert_matches_output_schema("git_worktree_remove", &removed);
+
+    let pruned = invoke(&ctx, "git_worktree_prune", json!({}));
+    assert_ok(&pruned);
+    assert_matches_output_schema("git_worktree_prune", &pruned);
 }
 
 #[test]

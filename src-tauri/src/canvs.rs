@@ -46,6 +46,7 @@ pub struct CanvsTask {
     pub id: String,
     pub objective: String,
     pub status: String,
+    pub workspace_mode: String,
     pub current: bool,
     pub active: bool,
     pub completed_steps: Vec<String>,
@@ -303,10 +304,16 @@ fn task_view(task: TaskSession, current: bool) -> CanvsTask {
         task.status,
         crate::harness::TaskStatus::Active | crate::harness::TaskStatus::Verifying
     );
+    let workspace_mode = if task.git_worktree.is_some() {
+        "worktree"
+    } else {
+        "shared"
+    };
     CanvsTask {
         id: task.id,
         objective: task.objective,
         status: task_status(task.status),
+        workspace_mode: workspace_mode.into(),
         current,
         active,
         completed_steps: task.completed_steps,

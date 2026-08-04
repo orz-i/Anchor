@@ -1117,6 +1117,7 @@ mod tests {
             latest_verification_id: None,
             history_session_key: None,
             history_session_path: None,
+            git_worktree: None,
             created_at: "0".into(),
             updated_at: "0".into(),
         };

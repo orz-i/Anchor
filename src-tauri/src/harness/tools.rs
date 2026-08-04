@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::{CancellationToken, ToolContext};
@@ -52,7 +53,7 @@ pub fn call(
     cancellation: &CancellationToken,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
-    let recovered_outboxes = if name == "close_work_session" {
+    let recovered_outboxes = if name == "close_work_session" || !ctx.is_primary_workspace() {
         Vec::new()
     } else {
         recover_close_outboxes(ctx)?
@@ -88,7 +89,47 @@ pub fn call(
             object.insert("outbox_recovery".into(), json!(recovered_outboxes));
         }
     }
+
     Ok(tool_ok(value))
+}
+
+fn cleanup_closed_task_worktree(ctx: &ToolContext, task_id: &str) -> Result<Value, WorkspaceError> {
+    let task = ctx.harness.task(task_id).map_err(map_error)?;
+    let Some(worktree) = task.git_worktree.as_ref() else {
+        return Ok(json!({"requested": false, "removed": false}));
+    };
+    if !worktree.remove_on_close {
+        return Ok(json!({
+            "requested": false,
+            "removed": false,
+            "path": worktree.path,
+            "branch": worktree.branch
+        }));
+    }
+    if !Path::new(&worktree.path).exists() {
+        return Ok(json!({
+            "requested": true,
+            "removed": true,
+            "idempotent": true,
+            "path": worktree.path,
+            "branch": worktree.branch
+        }));
+    }
+    crate::tools::git::remove_managed_task_worktree(&ctx.workspace, worktree)?;
+    let _ = ctx.harness.record_event(
+        task_id,
+        "git_worktree_removed",
+        Some("close_work_session"),
+        json!({"path": worktree.path, "branch": worktree.branch}),
+        json!({"ok": true}),
+    );
+    Ok(json!({
+        "requested": true,
+        "removed": true,
+        "idempotent": false,
+        "path": worktree.path,
+        "branch": worktree.branch
+    }))
 }
 
 fn export_work_session(
@@ -128,8 +169,12 @@ fn export_work_session(
         });
     }
 
+    let scoped = ctx
+        .scoped_for_task(&task, session_id)
+        .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
+    let task_context = scoped.as_ref().unwrap_or(ctx);
     let summary = change_summary(
-        ctx,
+        task_context,
         &json!({"task_id": task.id, "limit": 1024, "verification_view": "all"}),
         session_id,
     )?;
@@ -138,7 +183,7 @@ fn export_work_session(
         .list_verifications(&task.id)
         .map_err(map_error)?;
     let git = crate::tools::git::git_status(
-        &ctx.workspace,
+        &task_context.workspace,
         &json!({"path": ".", "include_untracked": true, "refresh_index": true}),
     )?;
     let exported_at_unix_ms = SystemTime::now()
@@ -172,6 +217,8 @@ fn export_work_session(
         "exported_at_unix_ms": exported_at_unix_ms,
         "workspace": {
             "path": ctx.workspace.root().display().to_string(),
+            "execution_path": task_context.workspace.root().display().to_string(),
+            "mode": task_workspace_mode(&task),
             "workspace_id": task.workspace_id,
             "git": git
         },
@@ -265,15 +312,18 @@ fn resume_task(
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     let target_task_id = task_id(args)?;
-    ensure_writer_handoff_available(ctx, Some(target_task_id))?;
+    ensure_writer_handoff_available(ctx, Some(target_task_id), None)?;
     let task = ctx.harness.switch_task(target_task_id).map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
+    let parallel = task.git_worktree.is_some();
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel_tasks_preserved": false,
-        "writer_mode": "single_workspace_writer"
+        "parallel_tasks_preserved": parallel,
+        "workspace_mode": task_workspace_mode(&task),
+        "writer_mode": if parallel { "isolated_worktree" } else { "single_shared_writer" },
+        "git_worktree": task.git_worktree
     }))
 }
 
@@ -401,40 +451,70 @@ fn switch_task(
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     let target_task_id = task_id(args)?;
-    ensure_writer_handoff_available(ctx, Some(target_task_id))?;
+    ensure_writer_handoff_available(ctx, Some(target_task_id), None)?;
     let task = ctx.harness.switch_task(target_task_id).map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
+    let scoped = ctx
+        .scoped_for_task(&task, session_id)
+        .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
+    let status_context = scoped.as_ref().unwrap_or(ctx);
+    let parallel = task.git_worktree.is_some();
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel_tasks_preserved": false,
-        "writer_mode": "single_workspace_writer",
-        "harness": ctx.harness.status_for_task(Some(&task.id)).map_err(map_error)?
+        "parallel_tasks_preserved": parallel,
+        "workspace_mode": task_workspace_mode(&task),
+        "writer_mode": if parallel { "isolated_worktree" } else { "single_shared_writer" },
+        "git_worktree": task.git_worktree,
+        "harness": status_context.harness.status_for_task(Some(&task.id)).map_err(map_error)?
     }))
 }
 
 fn ensure_writer_handoff_available(
     ctx: &ToolContext,
     target_task_id: Option<&str>,
+    requested_worktree_path: Option<&str>,
 ) -> Result<(), WorkspaceError> {
+    let target_domain = if let Some(task_id) = target_task_id {
+        let task = ctx.harness.task(task_id).map_err(map_error)?;
+        task.git_worktree
+            .map(|worktree| worktree.path)
+            .unwrap_or_else(|| "shared".to_string())
+    } else {
+        requested_worktree_path
+            .map(str::to_string)
+            .unwrap_or_else(|| "shared".to_string())
+    };
     let blocking_task_ids = ctx
         .sessions
         .running_task_ids()
         .into_iter()
         .filter(|task_id| Some(task_id.as_str()) != target_task_id)
+        .filter(|task_id| {
+            ctx.harness
+                .task(task_id)
+                .map(|task| {
+                    task.git_worktree
+                        .map(|worktree| worktree.path)
+                        .unwrap_or_else(|| "shared".to_string())
+                        == target_domain
+                })
+                .unwrap_or(true)
+        })
         .collect::<Vec<_>>();
     if blocking_task_ids.is_empty() {
         return Ok(());
     }
     Err(WorkspaceError::ToolDetails {
         code: "WORKSPACE_WRITER_BUSY",
-        message: "Another task still owns a running command in this workspace.".into(),
+        message: "Another task still owns a running command in this write domain.".into(),
         category: "conflict",
         retryable: true,
         details: json!({
             "blocking_task_ids": blocking_task_ids,
-            "suggestion": "Wait for or stop the running command before transferring the workspace writer lease"
+            "write_domain": target_domain,
+            "suggestion": "Wait for or stop the running command before transferring this writer lease"
         }),
     })
 }
@@ -624,27 +704,19 @@ fn begin_work_session(
     let selected_task = history_task.or(explicit_task).or(fallback_task);
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
+            validate_requested_workspace_mode(args, &task)?;
             if task.objective != objective {
                 let previous_task_id = task.id.clone();
-                ensure_writer_handoff_available(ctx, None)?;
-                let next = ctx
-                    .harness
-                    .start_task_with_handoff(objective, true)
-                    .map_err(map_error)?;
+                let next = start_task_for_workspace_mode(ctx, objective, args)?;
                 (next, true, Some(previous_task_id))
             } else {
-                ensure_writer_handoff_available(ctx, Some(&task.id))?;
+                ensure_writer_handoff_available(ctx, Some(&task.id), None)?;
                 let task = ctx.harness.switch_task(&task.id).map_err(map_error)?;
                 (task, false, None)
             }
         }
         None => (
-            {
-                ensure_writer_handoff_available(ctx, None)?;
-                ctx.harness
-                    .start_task_with_handoff(objective, true)
-                    .map_err(map_error)?
-            },
+            start_task_for_workspace_mode(ctx, objective, args)?,
             true,
             None,
         ),
@@ -655,7 +727,11 @@ fn begin_work_session(
         .map_err(map_error)?;
     ctx.bind_task_for_session(mcp_session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
-    let harness = ctx
+    let scoped = ctx
+        .scoped_for_task(&task, mcp_session_id)
+        .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
+    let status_context = scoped.as_ref().unwrap_or(ctx);
+    let harness = status_context
         .harness
         .status_for_task(Some(&task.id))
         .map_err(map_error)?;
@@ -667,8 +743,10 @@ fn begin_work_session(
             "task_id": task.id,
             "task_created": task_created,
             "previous_task_id": previous_task_id,
-            "parallel": false,
-            "writer_mode": "single_workspace_writer",
+            "parallel": task.git_worktree.is_some(),
+            "workspace_mode": task_workspace_mode(&task),
+            "writer_mode": if task.git_worktree.is_some() { "isolated_worktree" } else { "single_shared_writer" },
+            "git_worktree": task.git_worktree,
             "baseline": baseline_view(&task),
             "expected_state": task.expected_state
         },
@@ -805,8 +883,12 @@ fn resume_close_outbox(
     }
     if outbox.phase == WorkSessionClosePhase::Prepared {
         let task_before = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+        let scoped = ctx
+            .scoped_for_task(&task_before, None)
+            .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
+        let finish_context = scoped.as_ref().unwrap_or(ctx);
         let result = if task_before.status.is_writable() {
-            finish_task(ctx, &outbox.finish_args)?
+            finish_task(finish_context, &outbox.finish_args)?
         } else {
             json!({
                 "ok": true,
@@ -898,8 +980,13 @@ fn resume_close_outbox(
         }
     }
 
-    let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
     let completed = outbox.phase == WorkSessionClosePhase::Completed;
+    let worktree_cleanup = if completed {
+        cleanup_closed_task_worktree(ctx, &outbox.task_id)?
+    } else {
+        Value::Null
+    };
+    let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
     Ok(json!({
         "ok": completed,
         "work_session": {
@@ -913,6 +1000,7 @@ fn resume_close_outbox(
         },
         "finish": finish,
         "checkpoint": checkpoint,
+        "worktree_cleanup": worktree_cleanup,
         "outbox": close_outbox_view(&outbox),
         "task": task_view(&task),
         "harness": ctx.harness.status().map_err(map_error)?
@@ -1355,20 +1443,103 @@ fn start_task(
         .get("objective")
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
-    ensure_writer_handoff_available(ctx, None)?;
-    let task = ctx
-        .harness
-        .start_task_with_handoff(objective, true)
-        .map_err(map_error)?;
+    let task = start_task_for_workspace_mode(ctx, objective, args)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel": false,
-        "writer_mode": "single_workspace_writer",
+        "parallel": task.git_worktree.is_some(),
+        "workspace_mode": task_workspace_mode(&task),
+        "writer_mode": if task.git_worktree.is_some() { "isolated_worktree" } else { "single_shared_writer" },
+        "git_worktree": task.git_worktree,
         "next": ["project_state", "task_context"]
     }))
+}
+
+fn start_task_for_workspace_mode(
+    ctx: &ToolContext,
+    objective: &str,
+    args: &Value,
+) -> Result<TaskSession, WorkspaceError> {
+    let mode = args
+        .get("workspace_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("shared");
+    match mode {
+        "shared" => {
+            ensure_writer_handoff_available(ctx, None, None)?;
+            ctx.harness
+                .start_task_with_handoff(objective, true)
+                .map_err(map_error)
+        }
+        "worktree" => {
+            let task_id = Uuid::new_v4().simple().to_string();
+            let branch = args.get("worktree_branch").and_then(Value::as_str);
+            let base_ref = args
+                .get("worktree_base_ref")
+                .and_then(Value::as_str)
+                .unwrap_or("HEAD");
+            let remove_on_close = args
+                .get("worktree_remove_on_close")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let worktree = crate::tools::git::create_managed_worktree(
+                &ctx.workspace,
+                &task_id,
+                branch,
+                base_ref,
+                remove_on_close,
+            )?;
+            ensure_writer_handoff_available(ctx, None, Some(&worktree.path))?;
+            match ctx
+                .harness
+                .start_task_in_git_worktree(objective, task_id, worktree.clone())
+            {
+                Ok(task) => Ok(task),
+                Err(error) => {
+                    let _ =
+                        crate::tools::git::remove_managed_task_worktree(&ctx.workspace, &worktree);
+                    Err(map_error(error))
+                }
+            }
+        }
+        _ => Err(tool_error(
+            "INVALID_ARGUMENT",
+            "workspace_mode must be shared or worktree",
+        )),
+    }
+}
+
+fn validate_requested_workspace_mode(
+    args: &Value,
+    task: &TaskSession,
+) -> Result<(), WorkspaceError> {
+    let Some(requested) = args.get("workspace_mode").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if requested != task_workspace_mode(task) {
+        return Err(WorkspaceError::ToolDetails {
+            code: "TASK_WORKSPACE_MODE_CONFLICT",
+            message: "The existing task uses a different workspace mode.".into(),
+            category: "conflict",
+            retryable: false,
+            details: json!({
+                "requested_workspace_mode": requested,
+                "task_workspace_mode": task_workspace_mode(task),
+                "task_id": task.id
+            }),
+        });
+    }
+    Ok(())
+}
+
+fn task_workspace_mode(task: &TaskSession) -> &'static str {
+    if task.git_worktree.is_some() {
+        "worktree"
+    } else {
+        "shared"
+    }
 }
 
 fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -1806,6 +1977,8 @@ fn task_view(task: &TaskSession) -> Value {
         "latest_verification_id": task.latest_verification_id,
         "history_session_key": task.history_session_key,
         "history_session_path": task.history_session_path,
+        "workspace_mode": task_workspace_mode(task),
+        "git_worktree": task.git_worktree,
         "created_at": task.created_at,
         "updated_at": task.updated_at
     })

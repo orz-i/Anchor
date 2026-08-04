@@ -253,6 +253,8 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 高级 profile 还保留项目状态、操作记录等 Harness 能力，但普通文件修改和命令执行不要求先创建 Task。
 
+Harness Task 默认继续使用当前 Workspace；需要并行隔离分支、索引和文件时，可显式选择可选的 Git worktree 模式。见 [可选 Git worktree 任务](docs/git-worktrees.md)。
+
 ## 权限与恢复模型
 
 项目采用 Workspace-first 权限模型：

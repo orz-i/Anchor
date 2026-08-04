@@ -425,8 +425,27 @@ async fn handle_tools_call(
 
     if state.mcp_proxies.contains_tool(name) {
         let mut active_task = state.task_for_session(session_id);
+        let scoped_context = match active_task
+            .as_ref()
+            .map(|task| state.scoped_for_task(task, session_id))
+            .transpose()
+        {
+            Ok(context) => context.flatten(),
+            Err(message) => {
+                return Ok(browser_workspace_path_error(
+                    name,
+                    crate::tools::workspace::WorkspaceError::Tool {
+                        code: "TASK_WORKTREE_UNAVAILABLE",
+                        message,
+                        category: "runtime",
+                        retryable: true,
+                    },
+                ))
+            }
+        };
+        let execution_state = scoped_context.as_ref().unwrap_or(state.as_ref());
         if let Some(task) = active_task.as_ref() {
-            match state
+            match execution_state
                 .harness
                 .resume_task_for_activity(&task.id, name, session_id)
             {
@@ -444,12 +463,15 @@ async fn handle_tools_call(
                 }
             }
         }
-        let (proxy_args, artifact_targets) =
-            match prepare_browser_workspace_arguments(&state.workspace, name, &raw_args) {
-                Ok(prepared) => prepared,
-                Err(error) => return Ok(browser_workspace_path_error(name, error)),
-            };
-        let operation = state
+        let (proxy_args, artifact_targets) = match prepare_browser_workspace_arguments(
+            &execution_state.workspace,
+            name,
+            &raw_args,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok(browser_workspace_path_error(name, error)),
+        };
+        let operation = execution_state
             .harness
             .record_operation(
                 None,
@@ -472,11 +494,11 @@ async fn handle_tools_call(
         {
             if let Ok(value) = &mut result {
                 attach_browser_workspace_artifacts(
-                    state.workspace.root(),
+                    execution_state.workspace.root(),
                     &artifact_targets,
                     value,
                 );
-                attach_browser_build_info(state.as_ref(), name, value, cancellation).await;
+                attach_browser_build_info(execution_state, name, value, cancellation).await;
                 attach_proxy_auto_checkpoint(state.as_ref(), name, &proxy_args, value, session_id);
             }
             if let Some(operation) = operation {
@@ -491,7 +513,7 @@ async fn handle_tools_call(
                 }
                 let summary = proxy_operation_summary(name, session_id, &result);
                 let succeeded = summary.get("ok").and_then(Value::as_bool) == Some(true);
-                let _ = state.harness.record_operation(
+                let _ = execution_state.harness.record_operation(
                     Some(&operation.id),
                     active_task.as_ref().map(|task| task.id.as_str()),
                     session_id,
@@ -505,7 +527,7 @@ async fn handle_tools_call(
                     summary.clone(),
                 );
                 if let Some(task) = active_task.as_ref() {
-                    let _ = state.harness.record_event(
+                    let _ = execution_state.harness.record_event(
                         &task.id,
                         "proxy_operation_finished",
                         Some(name),
@@ -522,10 +544,31 @@ async fn handle_tools_call(
         if let Err(error) = crate::tools::schema::validate_tool_input(name, &raw_args) {
             return Ok(wrap_mcp_tool_result(name, &raw_args, tool_err(error)));
         }
+        let active_task = state.task_for_session(session_id);
+        let scoped_context = match active_task
+            .as_ref()
+            .map(|task| state.scoped_for_task(task, session_id))
+            .transpose()
+        {
+            Ok(context) => context.flatten(),
+            Err(message) => {
+                return Ok(wrap_mcp_tool_result(
+                    name,
+                    &raw_args,
+                    tool_err(crate::tools::workspace::WorkspaceError::Tool {
+                        code: "TASK_WORKTREE_UNAVAILABLE",
+                        message,
+                        category: "runtime",
+                        retryable: true,
+                    }),
+                ))
+            }
+        };
+        let execution_state = scoped_context.as_ref().unwrap_or(state.as_ref());
         let mut structured = if name == "browser_build_info" {
-            browser_build_info(state.as_ref(), cancellation).await
+            browser_build_info(execution_state, cancellation).await
         } else {
-            browser_wait_for_build(state.as_ref(), &raw_args, cancellation).await
+            browser_wait_for_build(execution_state, &raw_args, cancellation).await
         };
         attach_local_browser_checkpoint(
             state.as_ref(),
@@ -1715,7 +1758,7 @@ mod tests {
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
         assert_eq!(first_tools.len(), 64);
-        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 43);
+        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 44);
         assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 48);
         assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
             .as_u64()

@@ -705,7 +705,16 @@ pub fn auto_checkpoint_after_tool(
             files_changed.push(path.to_string());
         }
     }
-    let harness = ctx.harness.status_for_task(Some(&task.id)).ok();
+    let scoped_harness = task.git_worktree.as_ref().and_then(|worktree| {
+        ctx.harness
+            .with_workspace_root(std::path::PathBuf::from(&worktree.path))
+            .ok()
+    });
+    let harness = scoped_harness
+        .as_ref()
+        .unwrap_or(&ctx.harness)
+        .status_for_task(Some(&task.id))
+        .ok();
     let mut runtime_state = vec![
         format!("task_id={}", task.id),
         format!("task_status={:?}", task.status).to_ascii_lowercase(),

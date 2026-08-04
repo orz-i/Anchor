@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -5,7 +6,368 @@ use regex::Regex;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+use crate::harness::model::TaskGitWorktree;
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
+
+const MANAGED_WORKTREE_ROOT: &str = ".anchor/worktrees";
+
+pub fn git_worktree_list(ws: &Workspace, _args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let completed = run_git(
+        ws.root(),
+        &["worktree", "list", "--porcelain", "-z"],
+        Duration::from_secs(15),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let main_root = ws
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| ws.root().to_path_buf());
+    let managed_root = main_root.join(MANAGED_WORKTREE_ROOT);
+    let worktrees = parse_worktree_porcelain(&completed.stdout)
+        .into_iter()
+        .map(|mut entry| {
+            if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                let path = PathBuf::from(path);
+                let canonical = path.canonicalize().unwrap_or(path);
+                entry["is_main"] = json!(canonical == main_root);
+                entry["managed"] = json!(canonical.starts_with(&managed_root));
+                entry["managed_path"] = if canonical.starts_with(&managed_root) {
+                    json!(relative_managed_worktree_display(ws, &canonical))
+                } else {
+                    Value::Null
+                };
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    Ok(tool_ok(json!({
+        "worktrees": worktrees,
+        "count": worktrees.len(),
+        "managed_root": MANAGED_WORKTREE_ROOT,
+        "warnings": []
+    })))
+}
+
+pub fn git_worktree_create(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    let branch = args.get("branch").and_then(Value::as_str);
+    let base_ref = args
+        .get("base_ref")
+        .and_then(Value::as_str)
+        .unwrap_or("HEAD");
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkspaceError::invalid_argument("name is required"))?;
+    let remove_on_close = args
+        .get("remove_on_close")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let worktree = create_managed_worktree(ws, name, branch, base_ref, remove_on_close)?;
+    Ok(tool_ok(json!({
+        "path": relative_managed_worktree_display(ws, Path::new(&worktree.path)),
+        "absolute_path": worktree.path,
+        "branch": worktree.branch,
+        "base_ref": worktree.base_ref,
+        "managed": worktree.managed,
+        "remove_on_close": worktree.remove_on_close,
+        "created_at": worktree.created_at,
+        "mutation_attributed": false,
+        "warnings": []
+    })))
+}
+
+pub fn git_worktree_remove(
+    ws: &Workspace,
+    args: &Value,
+    dangerous_mode: bool,
+) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let raw_path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkspaceError::invalid_argument("path is required"))?;
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    if force && !dangerous_mode {
+        return Err(WorkspaceError::ToolDetails {
+            code: "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
+            message: "Force-removing a Git worktree requires operator-enabled dangerous mode."
+                .into(),
+            category: "permission",
+            retryable: false,
+            details: json!({"path": raw_path, "suggestion": "Remove or commit worktree changes first, then retry without force."}),
+        });
+    }
+    let path = managed_worktree_path(ws, raw_path)?;
+    let status = run_git(
+        &path,
+        &["status", "--porcelain=v1"],
+        Duration::from_secs(10),
+    )?;
+    if !status.success && !force {
+        return Err(git_error(&status.stderr));
+    }
+    if !status.stdout.trim().is_empty() && !force {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_NOT_CLEAN",
+            message: "Git worktree contains uncommitted changes.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "path": relative_managed_worktree_display(ws, &path),
+                "suggestion": "Commit or restore the worktree changes before removal."
+            }),
+        });
+    }
+    let mut command = vec!["worktree", "remove"];
+    if force {
+        command.push("--force");
+    }
+    let path_text = path.to_string_lossy().into_owned();
+    command.push(path_text.as_str());
+    let completed = run_git(ws.root(), &command, Duration::from_secs(60))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(tool_ok(json!({
+        "path": relative_managed_worktree_display(ws, &path),
+        "removed": true,
+        "force": force,
+        "mutation_attributed": false,
+        "warnings": []
+    })))
+}
+
+pub fn git_worktree_prune(ws: &Workspace, _args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let before = run_git(
+        ws.root(),
+        &["worktree", "list", "--porcelain", "-z"],
+        Duration::from_secs(15),
+    )?;
+    let completed = run_git(
+        ws.root(),
+        &["worktree", "prune", "--verbose"],
+        Duration::from_secs(30),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let after = run_git(
+        ws.root(),
+        &["worktree", "list", "--porcelain", "-z"],
+        Duration::from_secs(15),
+    )?;
+    let before_count = parse_worktree_porcelain(&before.stdout).len();
+    let after_count = parse_worktree_porcelain(&after.stdout).len();
+    Ok(tool_ok(json!({
+        "pruned_count": before_count.saturating_sub(after_count),
+        "remaining_count": after_count,
+        "details": completed.stderr.lines().chain(completed.stdout.lines()).collect::<Vec<_>>(),
+        "mutation_attributed": false,
+        "warnings": []
+    })))
+}
+
+pub(crate) fn create_managed_worktree(
+    ws: &Workspace,
+    name: &str,
+    branch: Option<&str>,
+    base_ref: &str,
+    remove_on_close: bool,
+) -> Result<TaskGitWorktree, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let name = validate_worktree_name(name)?;
+    let base_ref = validate_git_ref(base_ref)?;
+    let branch = branch
+        .map(validate_worktree_branch)
+        .transpose()?
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("anchor/task/{name}"));
+    validate_worktree_branch(&branch)?;
+    let relative_path = format!("{MANAGED_WORKTREE_ROOT}/{name}");
+    let resolved = ws.resolve_for_write(&relative_path)?;
+    if resolved.path.exists() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_PATH_EXISTS",
+            message: format!("Managed worktree path already exists: {relative_path}"),
+            category: "conflict",
+            retryable: true,
+            details: json!({"path": relative_path}),
+        });
+    }
+    if let Some(parent) = resolved.path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_CREATE_FAILED",
+            message: error.to_string(),
+            category: "runtime",
+            retryable: true,
+            details: json!({"path": relative_path}),
+        })?;
+    }
+    let command = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        "-b".to_string(),
+        branch.clone(),
+        relative_path.clone(),
+        base_ref.to_string(),
+    ];
+    let completed = run_git_owned(ws.root(), &command, Duration::from_secs(120))?;
+    if !completed.success {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_CREATE_FAILED",
+            message: completed.stderr.trim().to_string(),
+            category: "runtime",
+            retryable: true,
+            details: json!({"path": relative_path, "branch": branch, "base_ref": base_ref}),
+        });
+    }
+    let path = resolved
+        .path
+        .canonicalize()
+        .map_err(|error| WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_CREATE_FAILED",
+            message: error.to_string(),
+            category: "runtime",
+            retryable: true,
+            details: json!({"path": relative_path}),
+        })?;
+    Ok(TaskGitWorktree {
+        path: path.to_string_lossy().into_owned(),
+        branch,
+        base_ref: base_ref.to_string(),
+        managed: true,
+        remove_on_close,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+pub(crate) fn remove_managed_task_worktree(
+    ws: &Workspace,
+    worktree: &TaskGitWorktree,
+) -> Result<(), WorkspaceError> {
+    if !worktree.managed {
+        return Err(WorkspaceError::invalid_argument(
+            "Only Anchor-managed worktrees can be removed automatically",
+        ));
+    }
+    let path = managed_worktree_path(ws, &worktree.path)?;
+    let path_text = path.to_string_lossy().into_owned();
+    let completed = run_git(
+        ws.root(),
+        &["worktree", "remove", path_text.as_str()],
+        Duration::from_secs(60),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(())
+}
+
+fn parse_worktree_porcelain(raw: &str) -> Vec<Value> {
+    let mut records = Vec::new();
+    let mut current = serde_json::Map::new();
+    for token in raw
+        .split('\0')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Some(path) = token.strip_prefix("worktree ") {
+            if !current.is_empty() {
+                records.push(Value::Object(std::mem::take(&mut current)));
+            }
+            current.insert("path".into(), json!(path));
+        } else if let Some(head) = token.strip_prefix("HEAD ") {
+            current.insert("head".into(), json!(head));
+        } else if let Some(branch) = token.strip_prefix("branch ") {
+            current.insert(
+                "branch".into(),
+                json!(branch.strip_prefix("refs/heads/").unwrap_or(branch)),
+            );
+        } else if token == "detached" {
+            current.insert("detached".into(), json!(true));
+        } else if let Some(reason) = token.strip_prefix("locked") {
+            current.insert("locked".into(), json!(true));
+            current.insert("locked_reason".into(), json!(reason.trim()));
+        } else if let Some(reason) = token.strip_prefix("prunable") {
+            current.insert("prunable".into(), json!(true));
+            current.insert("prunable_reason".into(), json!(reason.trim()));
+        }
+    }
+    if !current.is_empty() {
+        records.push(Value::Object(current));
+    }
+    for record in &mut records {
+        if let Some(object) = record.as_object_mut() {
+            object.entry("branch").or_insert(Value::Null);
+            object.entry("detached").or_insert(json!(false));
+            object.entry("locked").or_insert(json!(false));
+            object.entry("locked_reason").or_insert(Value::Null);
+            object.entry("prunable").or_insert(json!(false));
+            object.entry("prunable_reason").or_insert(Value::Null);
+        }
+    }
+    records
+}
+
+fn validate_worktree_name(name: &str) -> Result<&str, WorkspaceError> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(WorkspaceError::invalid_argument(
+            "worktree name must contain only ASCII letters, digits, hyphen, or underscore",
+        ));
+    }
+    Ok(name)
+}
+
+fn validate_worktree_branch(branch: &str) -> Result<&str, WorkspaceError> {
+    let branch = validate_git_ref(branch)?;
+    if branch == "HEAD" || branch.starts_with("refs/") {
+        return Err(WorkspaceError::invalid_argument(
+            "worktree branch must be a local branch name",
+        ));
+    }
+    Ok(branch)
+}
+
+fn managed_worktree_path(ws: &Workspace, raw_path: &str) -> Result<PathBuf, WorkspaceError> {
+    let managed_root = ws.root().join(MANAGED_WORKTREE_ROOT);
+    let candidate = PathBuf::from(raw_path);
+    let candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        ws.root().join(candidate)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| WorkspaceError::not_found("Managed Git worktree path does not exist"))?;
+    let canonical_root = managed_root.canonicalize().unwrap_or(managed_root);
+    if !canonical.starts_with(&canonical_root) || canonical == canonical_root {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_PATH_NOT_MANAGED",
+            message: "Only worktrees under .anchor/worktrees can be managed by this tool.".into(),
+            category: "security",
+            retryable: false,
+            details: json!({"path": raw_path, "managed_root": MANAGED_WORKTREE_ROOT}),
+        });
+    }
+    Ok(canonical)
+}
+
+fn relative_managed_worktree_display(ws: &Workspace, path: &Path) -> String {
+    path.strip_prefix(ws.root())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
 pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
