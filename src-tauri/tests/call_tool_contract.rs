@@ -108,6 +108,56 @@ fn wait_command_maintains_the_output_cursor_for_each_caller_session() {
 }
 
 #[test]
+fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("cursor transport rebind")
+        .expect("task");
+    let first_caller = "managed-cursor-transport-a";
+    let second_caller = "managed-cursor-transport-b";
+    let started = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('transport-rebind-line', flush=True)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+        first_caller,
+    );
+    let started = assert_ok(&started);
+    let command_session = started["session_id"].as_str().expect("command session");
+
+    let first = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 5_000}),
+        first_caller,
+    );
+    let first = assert_ok(&first);
+    assert!(first["stdout"]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("transport-rebind-line")));
+
+    let second = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+        second_caller,
+    );
+    let second = assert_ok(&second);
+    assert_eq!(second["stdout"]["content"], "");
+    assert_eq!(
+        ctx.task_for_session(Some(second_caller))
+            .map(|bound| bound.id),
+        Some(task.id)
+    );
+}
+
+#[test]
 fn patch_check_reports_hunk_and_nearest_context_diagnostics() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

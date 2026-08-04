@@ -359,11 +359,9 @@ impl ToolContext {
     pub fn apply_command_output_cursor(
         &self,
         mcp_session_id: Option<&str>,
+        task_id: Option<&str>,
         args: &mut serde_json::Value,
     ) {
-        let Some(mcp_session_id) = mcp_session_id else {
-            return;
-        };
         let Some(command_session_id) = args
             .get("session_id")
             .and_then(serde_json::Value::as_str)
@@ -377,12 +375,17 @@ impl ToolContext {
         if object.contains_key("stdout_offset") || object.contains_key("stderr_offset") {
             return;
         }
-        let key = format!("{mcp_session_id}\0{command_session_id}");
-        let (stdout_offset, stderr_offset) = self
+        let cursors = self
             .command_output_cursors
             .lock()
-            .expect("command output cursors lock")
-            .get(&key)
+            .expect("command output cursors lock");
+        let transport_key = mcp_session_id
+            .map(|session_id| format!("transport:{session_id}\0{command_session_id}"));
+        let task_key = task_id.map(|task_id| format!("task:{task_id}\0{command_session_id}"));
+        let (stdout_offset, stderr_offset) = transport_key
+            .as_ref()
+            .and_then(|key| cursors.get(key))
+            .or_else(|| task_key.as_ref().and_then(|key| cursors.get(key)))
             .copied()
             .unwrap_or((0, 0));
         object.insert("stdout_offset".into(), serde_json::json!(stdout_offset));
@@ -392,13 +395,12 @@ impl ToolContext {
     pub fn update_command_output_cursor(
         &self,
         mcp_session_id: Option<&str>,
+        task_id: Option<&str>,
         args: &serde_json::Value,
         output: &serde_json::Value,
     ) {
-        let (Some(mcp_session_id), Some(command_session_id)) = (
-            mcp_session_id,
-            args.get("session_id").and_then(serde_json::Value::as_str),
-        ) else {
+        let Some(command_session_id) = args.get("session_id").and_then(serde_json::Value::as_str)
+        else {
             return;
         };
         let next_offset = |stream: &str| {
@@ -413,11 +415,22 @@ impl ToolContext {
         else {
             return;
         };
-        let key = format!("{mcp_session_id}\0{command_session_id}");
-        self.command_output_cursors
+        let mut cursors = self
+            .command_output_cursors
             .lock()
-            .expect("command output cursors lock")
-            .insert(key, (stdout_offset, stderr_offset));
+            .expect("command output cursors lock");
+        if let Some(mcp_session_id) = mcp_session_id {
+            cursors.insert(
+                format!("transport:{mcp_session_id}\0{command_session_id}"),
+                (stdout_offset, stderr_offset),
+            );
+        }
+        if let Some(task_id) = task_id {
+            cursors.insert(
+                format!("task:{task_id}\0{command_session_id}"),
+                (stdout_offset, stderr_offset),
+            );
+        }
     }
 
     pub fn publish_catalog(&self, current: EffectiveCatalog) -> (EffectiveCatalog, bool) {

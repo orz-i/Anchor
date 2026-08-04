@@ -483,7 +483,11 @@ fn call_tool_impl(
         }
     }
     if name == "wait_command" {
-        ctx.apply_command_output_cursor(session_id, &mut effective_args);
+        ctx.apply_command_output_cursor(
+            session_id,
+            initial_task.as_ref().map(|task| task.id.as_str()),
+            &mut effective_args,
+        );
     }
     if let Some(error) = skill_script_permission_error(ctx, name, &effective_args) {
         return tool_err(error);
@@ -762,7 +766,12 @@ fn call_tool_impl(
         Err(e) => tool_err(e),
     };
     if name == "wait_command" {
-        ctx.update_command_output_cursor(session_id, &effective_args, &output);
+        ctx.update_command_output_cursor(
+            session_id,
+            active_task.as_ref().map(|task| task.id.as_str()),
+            &effective_args,
+            &output,
+        );
     }
     // Cancellation is checked before execution and by cooperative long-running
     // tools. Once a synchronous mutation returns, preserve its committed result
