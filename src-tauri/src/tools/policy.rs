@@ -414,10 +414,8 @@ pub fn validate_command_for_workspace(
         }
     }
 
-    if arguments.get("env").is_some() {
-        return Err(PolicyError(
-            "Environment variables cannot be supplied by GPT".into(),
-        ));
+    if let Some(environment) = arguments.get("env") {
+        validate_model_environment(environment)?;
     }
 
     if let Some(timeout_ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
@@ -427,6 +425,75 @@ pub fn validate_command_for_workspace(
     }
 
     Ok(())
+}
+
+fn validate_model_environment(environment: &Value) -> Result<(), PolicyError> {
+    let variables = environment
+        .as_object()
+        .ok_or_else(|| PolicyError("Environment variables must be a string map".into()))?;
+    for (name, value) in variables {
+        let upper = name.to_ascii_uppercase();
+        if environment_variable_is_sensitive(&upper) {
+            return Err(PolicyError(format!(
+                "Environment variable is protected and cannot be supplied by the model: {name}"
+            )));
+        }
+        if !value.is_string() {
+            return Err(PolicyError(format!(
+                "Environment variable values must be strings: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn environment_variable_is_sensitive(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "SYSTEMROOT",
+        "WINDIR",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "SHELL",
+        "ENV",
+        "BASH_ENV",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTFLAGS",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    ];
+    EXACT.contains(&name)
+        || name.starts_with("DYLD_")
+        || name.starts_with("GIT_CONFIG_")
+        || name.starts_with("GIT_SSH")
+        || [
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "API_KEY",
+            "APIKEY",
+            "PRIVATE_KEY",
+            "ACCESS_KEY",
+            "CREDENTIAL",
+            "COOKIE",
+        ]
+        .iter()
+        .any(|marker| name.contains(marker))
 }
 
 pub(crate) fn wrapped_command_payload(parts: &[String]) -> Option<String> {
@@ -617,7 +684,7 @@ fn is_safe_powershell_builtin(command: &str) -> bool {
     )
 }
 
-fn join_command_tokens(tokens: &[String]) -> String {
+pub(crate) fn join_command_tokens(tokens: &[String]) -> String {
     tokens
         .iter()
         .map(|token| {

@@ -89,6 +89,13 @@ fn validate_value(value: &Value, schema: &Value, path: &str, tool: &str) -> Resu
     }
 
     if let Some(object) = value.as_object() {
+        if let Some(minimum) = schema.get("minProperties").and_then(Value::as_u64) {
+            if object.len() < minimum as usize {
+                return Err(format!(
+                    "Invalid arguments for {tool}: {path} must contain at least {minimum} properties"
+                ));
+            }
+        }
         if let Some(required) = schema.get("required").and_then(Value::as_array) {
             for property in required.iter().filter_map(Value::as_str) {
                 if !object.contains_key(property) {

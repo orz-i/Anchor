@@ -13,6 +13,39 @@ use tokio::time::timeout;
 pub fn diagnose(root: &Path) -> Value {
     let package = read_package_json(root);
     let declared = declared_package_manager(root, package.as_ref());
+    let git = probe("git", &["--version"], root, Duration::from_secs(3));
+    let git_line_endings = if git["healthy"] == true {
+        git_line_ending_diagnostics(root)
+    } else {
+        json!({
+            "core_autocrlf": null,
+            "core_eol": null,
+            "attributes_file": root.join(".gitattributes").exists(),
+            "healthy": false,
+            "error": "git is unavailable"
+        })
+    };
+    let pwsh = probe(
+        "pwsh",
+        &[
+            "-NoProfile",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ],
+        root,
+        Duration::from_secs(3),
+    );
+    let windows_powershell = probe(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "$PSVersionTable.PSVersion.ToString()",
+        ],
+        root,
+        Duration::from_secs(3),
+    );
+    let go = probe("go", &["version"], root, Duration::from_secs(3));
     let node = probe("node", &["--version"], root, Duration::from_secs(3));
     let pnpm = probe("pnpm", &["--version"], root, Duration::from_secs(3));
     let corepack = probe("corepack", &["--version"], root, Duration::from_secs(3));
@@ -75,6 +108,32 @@ pub fn diagnose(root: &Path) -> Value {
         && rustc["healthy"] == true;
     let host_healthy = host_frontend_healthy && host_rust_healthy;
     let docker_project = has_docker_project(root);
+    let requirements = project_requirements(root, package.as_ref(), docker_project);
+    let mut missing_required_tools = Vec::new();
+    if requirements["git"] == true && git["healthy"] != true {
+        missing_required_tools.push("git");
+    }
+    if requirements["node"] == true && node["healthy"] != true {
+        missing_required_tools.push("node");
+    }
+    if requirements["pnpm"] == true && !package_manager_probe(&declared, &pnpm, &corepack_pnpm) {
+        missing_required_tools.push("pnpm");
+    }
+    if requirements["rust"] == true && !host_rust_healthy {
+        missing_required_tools.push("rust-toolchain");
+    }
+    if requirements["go"] == true && go["healthy"] != true {
+        missing_required_tools.push("go");
+    }
+    if requirements["docker"] == true && docker_daemon["healthy"] != true {
+        missing_required_tools.push("docker-daemon");
+    }
+    if requirements["powershell"] == true
+        && pwsh["healthy"] != true
+        && windows_powershell["healthy"] != true
+    {
+        missing_required_tools.push("powershell");
+    }
     let recommended_route = if host_healthy {
         "host"
     } else if docker_daemon["healthy"] == true && docker_project {
@@ -136,6 +195,18 @@ pub fn diagnose(root: &Path) -> Value {
     if recommended_route == "docker" {
         findings.push("Docker frontend verification is healthy and preferred".to_string());
     }
+    if git_line_endings["core_autocrlf"] == "true" && !root.join(".gitattributes").exists() {
+        findings.push(
+            "Git core.autocrlf=true without a repository .gitattributes file can create platform-dependent diffs"
+                .to_string(),
+        );
+    }
+    if !missing_required_tools.is_empty() {
+        findings.push(format!(
+            "Required tools are unavailable or unhealthy: {}",
+            missing_required_tools.join(", ")
+        ));
+    }
 
     json!({
         "platform": {
@@ -147,8 +218,15 @@ pub fn diagnose(root: &Path) -> Value {
             "path_separator": if cfg!(windows) { ";" } else { ":" }
         },
         "windows_redirection_trust": redirection_trust,
+        "project_requirements": requirements,
+        "missing_required_tools": missing_required_tools,
+        "git_line_endings": git_line_endings,
         "package_manager": declared,
         "probes": {
+            "git": git,
+            "pwsh": pwsh,
+            "windows_powershell": windows_powershell,
+            "go": go,
             "node": node,
             "pnpm": pnpm,
             "corepack": corepack,
@@ -170,6 +248,53 @@ pub fn diagnose(root: &Path) -> Value {
         "host_healthy": host_healthy,
         "recommended_verification_route": recommended_route,
         "findings": findings
+    })
+}
+
+fn project_requirements(root: &Path, package: Option<&Value>, docker_project: bool) -> Value {
+    json!({
+        "git": root.join(".git").exists(),
+        "node": package.is_some(),
+        "pnpm": package
+            .and_then(|value| value.get("packageManager"))
+            .and_then(Value::as_str)
+            .is_some_and(|manager| manager.starts_with("pnpm@"))
+            || root.join("pnpm-lock.yaml").exists(),
+        "rust": root.join("Cargo.toml").exists() || root.join("src-tauri/Cargo.toml").exists(),
+        "go": root.join("go.mod").exists() || root.join("go.work").exists(),
+        "docker": docker_project,
+        "powershell": cfg!(windows)
+    })
+}
+
+fn git_line_ending_diagnostics(root: &Path) -> Value {
+    let autocrlf = optional_git_config(root, "core.autocrlf");
+    let core_eol = optional_git_config(root, "core.eol");
+    json!({
+        "core_autocrlf": autocrlf["value"],
+        "core_eol": core_eol["value"],
+        "attributes_file": root.join(".gitattributes").exists(),
+        "healthy": autocrlf["healthy"] == true && core_eol["healthy"] == true,
+        "error": if autocrlf["healthy"] == true && core_eol["healthy"] == true {
+            Value::Null
+        } else {
+            Value::String("unable to read Git line-ending configuration".into())
+        }
+    })
+}
+
+fn optional_git_config(root: &Path, key: &str) -> Value {
+    let result = probe(
+        "git",
+        &["config", "--get", key],
+        root,
+        Duration::from_secs(3),
+    );
+    let exit_code = result.get("exit_code").and_then(Value::as_i64);
+    json!({
+        "healthy": result["found"] == true && matches!(exit_code, Some(0 | 1)),
+        "configured": exit_code == Some(0),
+        "value": if exit_code == Some(0) { result["version"].clone() } else { Value::Null }
     })
 }
 

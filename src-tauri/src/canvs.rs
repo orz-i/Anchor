@@ -486,7 +486,7 @@ mod tests {
         assert!(list.tasks[0].active);
         assert_eq!(list.tasks[1].id, parallel.id);
         assert!(!list.tasks[1].current);
-        assert!(list.tasks[1].active);
+        assert!(!list.tasks[1].active);
         assert_eq!(list.tasks[2].id, history.id);
         assert!(!list.tasks[2].current);
         assert!(!list.tasks[2].active);

@@ -78,7 +78,8 @@ fn history_successes_match_published_output_schemas() {
     );
     assert_ok(&bootstrap);
     assert_eq!(bootstrap["target_preserved"], true);
-    assert_eq!(bootstrap["host_session_key_mismatch_level"], "none");
+    assert!(bootstrap.get("host_session_key_mismatch").is_none());
+    assert!(bootstrap.get("host_session_key_mismatch_level").is_none());
     assert_eq!(bootstrap["persistence"]["storage"], "workspace_file");
     assert_matches_output_schema("history_session_bootstrap", &bootstrap);
 

@@ -24,6 +24,166 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None)
 }
 
+fn parse_and_resolve_execution(
+    execution: &Value,
+    cmd: &str,
+    cwd: &Path,
+    workspace_root: &Path,
+    policy: &crate::tools::policy::PolicySettings,
+) -> Result<(String, Vec<String>), WorkspaceError> {
+    let structured = execution.get("executable").is_some() || execution.get("shell").is_some();
+    if !structured {
+        return parse_and_resolve(cmd, cwd, workspace_root, policy);
+    }
+    let shell = execution
+        .get("shell")
+        .and_then(Value::as_str)
+        .unwrap_or("direct");
+    let raw_program = match shell {
+        "direct" => execution
+            .get("executable")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceError::invalid_argument("executable is required"))?,
+        "pwsh" => "pwsh",
+        "powershell" => "powershell",
+        "cmd" => "cmd.exe",
+        _ => return Err(WorkspaceError::invalid_argument("unsupported shell")),
+    };
+    let program = resolve_program(raw_program, cwd, workspace_root, policy)?;
+    Ok((program, structured_args(execution.get("args"))?))
+}
+
+fn execution_mode(execution: &Value) -> &str {
+    match execution.get("shell").and_then(Value::as_str) {
+        Some("pwsh") => "pwsh",
+        Some("powershell") => "powershell",
+        Some("cmd") => "cmd",
+        Some("direct") if execution.get("executable").is_some() => "structured_direct",
+        _ if execution.get("executable").is_some() => "structured_direct",
+        _ => "direct",
+    }
+}
+
+pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), WorkspaceError> {
+    let object = args.as_object_mut().ok_or_else(|| {
+        WorkspaceError::invalid_argument("exec_command arguments must be an object")
+    })?;
+    let cmd = object
+        .get("cmd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let executable = object
+        .get("executable")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let shell = object
+        .get("shell")
+        .and_then(Value::as_str)
+        .unwrap_or("direct");
+    let has_structured_program = executable.is_some() || object.get("shell").is_some();
+    let has_structured_args = object.get("args").is_some();
+
+    if cmd.is_some() && (has_structured_program || has_structured_args) {
+        return Err(WorkspaceError::invalid_argument(
+            "cmd cannot be combined with executable, args, or shell",
+        ));
+    }
+    if cmd.is_some() {
+        validate_exec_env(object.get("env"))?;
+        return Ok(());
+    }
+
+    let program = match shell {
+        "direct" => executable.ok_or_else(|| {
+            WorkspaceError::invalid_argument(
+                "executable is required for direct structured execution",
+            )
+        })?,
+        "pwsh" => {
+            if executable.is_some() {
+                return Err(WorkspaceError::invalid_argument(
+                    "executable cannot be combined with a named shell",
+                ));
+            }
+            "pwsh"
+        }
+        "powershell" => {
+            if executable.is_some() {
+                return Err(WorkspaceError::invalid_argument(
+                    "executable cannot be combined with a named shell",
+                ));
+            }
+            "powershell"
+        }
+        "cmd" => {
+            if executable.is_some() {
+                return Err(WorkspaceError::invalid_argument(
+                    "executable cannot be combined with a named shell",
+                ));
+            }
+            "cmd.exe"
+        }
+        _ => {
+            return Err(WorkspaceError::invalid_argument(
+                "shell must be direct, pwsh, powershell, or cmd",
+            ))
+        }
+    };
+    let command_args = structured_args(object.get("args"))?;
+    validate_exec_env(object.get("env"))?;
+    let mut tokens = Vec::with_capacity(command_args.len() + 1);
+    tokens.push(program.to_string());
+    tokens.extend(command_args);
+    object.insert(
+        "cmd".into(),
+        Value::String(crate::tools::policy::join_command_tokens(&tokens)),
+    );
+    Ok(())
+}
+
+fn structured_args(value: Option<&Value>) -> Result<Vec<String>, WorkspaceError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| WorkspaceError::invalid_argument("args must be an array of strings"))?;
+    array
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| WorkspaceError::invalid_argument("args must contain only strings"))
+        })
+        .collect()
+}
+
+fn validate_exec_env(value: Option<&Value>) -> Result<(), WorkspaceError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let env = value.as_object().ok_or_else(|| {
+        WorkspaceError::invalid_argument("env must be an object of string values")
+    })?;
+    for (name, value) in env {
+        if name.is_empty() || name.contains(['=', '\0']) {
+            return Err(WorkspaceError::invalid_argument(
+                "env contains an invalid variable name",
+            ));
+        }
+        let value = value.as_str().ok_or_else(|| {
+            WorkspaceError::invalid_argument("env must contain only string values")
+        })?;
+        if value.contains('\0') {
+            return Err(WorkspaceError::invalid_argument("env contains a NUL byte"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(windows))]
 pub(crate) fn resolve_system_program_path(path: &Path) -> PathBuf {
     path.to_path_buf()
@@ -204,32 +364,40 @@ pub fn exec_command_with_cancellation(
         &ctx.policy,
     )?;
     let timeout_ms = cost_decision.effective_timeout_ms();
-    if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
-        if cancellation.is_cancelled() {
-            return Err(cancelled_error(None));
+    let include_diagnostics = args
+        .get("include_diagnostics")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if args.get("executable").is_none() && args.get("shell").is_none() {
+        if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
+            if cancellation.is_cancelled() {
+                return Err(cancelled_error(None));
+            }
+            let mut result = result;
+            if let Some(object) = result.as_object_mut() {
+                object.insert("child_process".into(), Value::Bool(false));
+                object.insert("transport_ok".into(), Value::Bool(true));
+                object.insert("command_ok".into(), Value::Bool(true));
+                if include_diagnostics {
+                    object.insert(
+                        "filesystem_scope".into(),
+                        Value::String(filesystem_scope.clone()),
+                    );
+                    object.insert("sandbox_enforced".into(), Value::Bool(false));
+                    object.insert(
+                        "execution_boundary".into(),
+                        Value::String("policy_only".into()),
+                    );
+                    object.insert("cost_policy".into(), cost_decision.to_value());
+                }
+            }
+            return Ok(finalize_execution_result(result));
         }
-        let mut result = result;
-        if let Some(object) = result.as_object_mut() {
-            object.insert(
-                "filesystem_scope".into(),
-                Value::String(filesystem_scope.clone()),
-            );
-            object.insert("sandbox_enforced".into(), Value::Bool(false));
-            object.insert(
-                "execution_boundary".into(),
-                Value::String("policy_only".into()),
-            );
-            object.insert("child_process".into(), Value::Bool(false));
-            object.insert("transport_ok".into(), Value::Bool(true));
-            object.insert("command_ok".into(), Value::Bool(true));
-            object.insert("cost_policy".into(), cost_decision.to_value());
-        }
-        return Ok(finalize_execution_result(result));
     }
     let max_output = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(65_536) as usize;
+        .unwrap_or(32_768) as usize;
     let yield_ms = args
         .get("yield_time_ms")
         .and_then(Value::as_u64)
@@ -272,6 +440,7 @@ pub fn exec_command_with_cancellation(
     let result = crate::async_runtime::block_on(async {
         run_command(
             ctx,
+            args,
             cmd,
             &workdir.path,
             Duration::from_millis(timeout_ms),
@@ -295,23 +464,44 @@ pub fn exec_command_with_cancellation(
     match result {
         Ok(mut out) => {
             attach_command_file_changes(ctx, &workspace_before, &mut out);
+            if include_diagnostics {
+                if let Some(object) = out.as_object_mut() {
+                    object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
+                    object.insert("sandbox_enforced".into(), Value::Bool(false));
+                    object.insert(
+                        "execution_boundary".into(),
+                        Value::String("policy_only".into()),
+                    );
+                    object.insert("cost_policy".into(), cost_decision.to_value());
+                }
+            }
             if let Some(object) = out.as_object_mut() {
-                object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
-                object.insert("sandbox_enforced".into(), Value::Bool(false));
-                object.insert(
-                    "execution_boundary".into(),
-                    Value::String("policy_only".into()),
-                );
                 object.insert("child_process".into(), Value::Bool(true));
-                object.insert("cost_policy".into(), cost_decision.to_value());
             }
             Ok(finalize_execution_result(out))
         }
         Err(error) => match execution_failure_result(&error, cmd, &workdir.path) {
             Some(mut result) => {
                 attach_command_file_changes(ctx, &workspace_before, &mut result);
-                if let Some(object) = result.as_object_mut() {
-                    object.insert("cost_policy".into(), cost_decision.to_value());
+                if include_diagnostics {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
+                        object.insert("sandbox_enforced".into(), Value::Bool(false));
+                        object.insert(
+                            "execution_boundary".into(),
+                            Value::String("policy_only".into()),
+                        );
+                        object.insert("cost_policy".into(), cost_decision.to_value());
+                    }
+                } else if let Some(object) = result.as_object_mut() {
+                    for key in [
+                        "filesystem_scope",
+                        "sandbox_enforced",
+                        "execution_boundary",
+                        "cost_policy",
+                    ] {
+                        object.remove(key);
+                    }
                 }
                 Ok(finalize_execution_result(result))
             }
@@ -474,6 +664,7 @@ fn list_directory(
 #[allow(clippy::too_many_arguments)]
 async fn run_command(
     ctx: &ToolContext,
+    execution: &Value,
     cmd: &str,
     cwd: &Path,
     limit: Duration,
@@ -494,7 +685,9 @@ async fn run_command(
     if cancellation.is_cancelled() {
         return Err(cancelled_error(None));
     }
-    let (program, args) = parse_and_resolve(cmd, cwd, ctx.workspace.root(), &ctx.policy)?;
+    let (program, args) =
+        parse_and_resolve_execution(execution, cmd, cwd, ctx.workspace.root(), &ctx.policy)?;
+    let execution_mode = execution_mode(execution);
     let start = Instant::now();
 
     let mut command = command_for_program(&program, &args);
@@ -504,6 +697,13 @@ async fn run_command(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(env) = execution.get("env").and_then(Value::as_object) {
+        for (name, value) in env {
+            if let Some(value) = value.as_str() {
+                command.env(name, value);
+            }
+        }
+    }
 
     #[cfg(windows)]
     command
@@ -561,7 +761,14 @@ async fn run_command(
     if yield_time.is_zero() {
         let snapshot = session.snapshot(max_output);
         spawn_timeout_monitor(session.clone(), deadline);
-        return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
+        return Ok(merge_exec_result(
+            snapshot,
+            start,
+            cmd,
+            cwd,
+            true,
+            execution_mode,
+        ));
     }
 
     if !tty && !stdin_text.is_empty() {
@@ -600,7 +807,14 @@ async fn run_command(
             session.wait_for_readers().await;
             let snapshot = session.snapshot(max_output);
             ctx.sessions.remove(&session.session_id);
-            return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
+            return Ok(merge_exec_result(
+                snapshot,
+                start,
+                cmd,
+                cwd,
+                false,
+                execution_mode,
+            ));
         }
         if !tty && Instant::now() >= deadline {
             session.mark_termination_reason("timeout");
@@ -642,12 +856,26 @@ async fn run_command(
                     session.wait_for_readers().await;
                     let snapshot = session.snapshot(max_output);
                     ctx.sessions.remove(&session.session_id);
-                    return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
+                    return Ok(merge_exec_result(
+                        snapshot,
+                        start,
+                        cmd,
+                        cwd,
+                        false,
+                        execution_mode,
+                    ));
                 }
             }
             let snapshot = session.snapshot(max_output);
             spawn_timeout_monitor(session.clone(), deadline);
-            return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
+            return Ok(merge_exec_result(
+                snapshot,
+                start,
+                cmd,
+                cwd,
+                true,
+                execution_mode,
+            ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -681,9 +909,11 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     let probe = r#"cmd.exe /d /c "echo exec-health && echo exec-health-stderr 1>&2""#;
     #[cfg(not(windows))]
     let probe = r#"sh -c "printf exec-health; printf exec-health-stderr >&2""#;
+    let execution = json!({"cmd": probe});
 
     let result = crate::async_runtime::block_on(run_command(
         ctx,
+        &execution,
         probe,
         &cwd,
         Duration::from_secs(5),
@@ -856,7 +1086,8 @@ fn merge_exec_result(
     start: Instant,
     command: &str,
     cwd: &Path,
-    keep_session: bool,
+    _keep_session: bool,
+    execution_mode: &str,
 ) -> Value {
     if let Some(obj) = snapshot.as_object_mut() {
         let duration_ms = start.elapsed().as_millis();
@@ -882,16 +1113,9 @@ fn merge_exec_result(
             "command_ok".into(),
             command_ok.map(Value::Bool).unwrap_or(Value::Null),
         );
-        obj.insert("execution_mode".into(), json!("direct"));
+        obj.insert("execution_mode".into(), json!(execution_mode));
         obj.insert("execution_started".into(), Value::Bool(true));
-        obj.insert(
-            "warnings".into(),
-            json!(if keep_session {
-                vec!["session retained for read_output/write_stdin/kill_session"]
-            } else {
-                vec!["direct execution without shell"]
-            }),
-        );
+        obj.insert("warnings".into(), json!([]));
     }
     snapshot
 }

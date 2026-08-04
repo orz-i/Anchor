@@ -402,7 +402,16 @@ fn call_tool_impl(
             return normalize_exec_preflight_result(ctx, name, args, output, "rejected");
         }
     }
-    let effective_args = apply_default_cwd(ctx, session_id, name, args);
+    let mut effective_args = apply_default_cwd(ctx, session_id, name, args);
+    if name == "exec_command" {
+        if let Err(error) = exec::normalize_exec_arguments(&mut effective_args) {
+            let output = tool_err(error);
+            return normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+        }
+    }
+    if name == "wait_command" {
+        ctx.apply_command_output_cursor(session_id, &mut effective_args);
+    }
     if let Some(error) = skill_script_permission_error(ctx, name, &effective_args) {
         return tool_err(error);
     }
@@ -422,20 +431,63 @@ fn call_tool_impl(
     };
     if name != "begin_work_session" {
         if let Some(task) = selected_task.as_ref() {
-            match ctx
-                .harness
-                .resume_task_for_activity(&task.id, name, session_id)
-            {
-                Ok(task) => selected_task = Some(task),
-                Err(error) => {
-                    return attach_harness_status(
-                        ctx,
-                        tool_err_code(error.code(), error.to_string(), "internal"),
-                        false,
-                        session_id,
-                    )
+            let competing_running_task = ctx
+                .sessions
+                .running_task_ids()
+                .into_iter()
+                .any(|task_id| task_id != task.id);
+            if competing_running_task && requires_write_baseline(name, &effective_args) {
+                return attach_harness_status(
+                    ctx,
+                    tool_err_code(
+                        "WORKSPACE_WRITER_BUSY",
+                        "另一任务仍有运行中的命令，当前任务暂不能取得工作区写租约。",
+                        "conflict",
+                    ),
+                    false,
+                    session_id,
+                );
+            }
+            if competing_running_task {
+                // Read-only inspection can continue without transferring the writer lease.
+            } else {
+                match ctx
+                    .harness
+                    .resume_task_for_activity(&task.id, name, session_id)
+                {
+                    Ok(task) => selected_task = Some(task),
+                    Err(error) => {
+                        return attach_harness_status(
+                            ctx,
+                            tool_err_code(error.code(), error.to_string(), "internal"),
+                            false,
+                            session_id,
+                        )
+                    }
                 }
             }
+        }
+    }
+    if selected_task.is_none() && requires_write_baseline(name, &effective_args) {
+        let writable_task_ids = ctx
+            .harness
+            .list_tasks()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|task| task.status.is_writable())
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        if !writable_task_ids.is_empty() {
+            return attach_harness_status(
+                ctx,
+                tool_err_code(
+                    "TASK_BINDING_REQUIRED",
+                    "工作区已有可恢复的 Harness Task，但当前 MCP 会话无法唯一确定任务绑定，不能静默退化为 standalone。",
+                    "permission",
+                ),
+                false,
+                session_id,
+            );
         }
     }
     let _workspace_mutation_guard =
@@ -480,7 +532,6 @@ fn call_tool_impl(
         if let Some(operation) = operation {
             if let Some(object) = output.as_object_mut() {
                 object.insert("operation_id".into(), Value::String(operation.id.clone()));
-                object.insert("trace_id".into(), Value::String(operation.id.clone()));
             }
             if output.get("response_bytes").is_some() {
                 crate::harness::tools::update_response_bytes(&mut output);
@@ -620,6 +671,9 @@ fn call_tool_impl(
         Ok(v) => v,
         Err(e) => tool_err(e),
     };
+    if name == "wait_command" {
+        ctx.update_command_output_cursor(session_id, &effective_args, &output);
+    }
     // Cancellation is checked before execution and by cooperative long-running
     // tools. Once a synchronous mutation returns, preserve its committed result
     // instead of reporting a false cancellation that could trigger a retry.
@@ -636,11 +690,7 @@ fn call_tool_impl(
     if let Some(operation) = operation.as_ref() {
         if let Some(object) = output.as_object_mut() {
             object.insert("operation_id".into(), Value::String(operation.id.clone()));
-            object.insert("trace_id".into(), Value::String(operation.id.clone()));
         }
-    }
-    if output.get("ok").and_then(Value::as_bool) == Some(false) {
-        output = attach_harness_status(ctx, output, task_id.is_none(), session_id);
     }
     if let Some(task_id) = task_id.as_deref() {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
@@ -793,6 +843,9 @@ fn call_tool_impl(
         &mut output,
         active_task.as_ref().map(|task| task.id.as_str()),
     );
+    if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        output = attach_harness_status(ctx, output, task_id.is_none(), session_id);
+    }
     output
 }
 
@@ -819,20 +872,16 @@ fn attach_auto_checkpoint(
                 }
             }
             if let Some(object) = output.as_object_mut() {
-                object.insert("auto_checkpoint".into(), checkpoint);
+                object.insert(
+                    "checkpoint".into(),
+                    history::checkpoint_reference(&checkpoint),
+                );
             }
         }
         Ok(None) => {}
-        Err(error) => {
+        Err(_error) => {
             if let Some(object) = output.as_object_mut() {
-                object.insert(
-                    "auto_checkpoint_error".into(),
-                    json!({
-                        "code": error.to_error_value()["code"],
-                        "message": error.to_string(),
-                        "retryable": true
-                    }),
-                );
+                object.insert("checkpoint_saved".into(), Value::Bool(false));
                 let warnings = object
                     .entry("warnings")
                     .or_insert_with(|| Value::Array(Vec::new()));

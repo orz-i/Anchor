@@ -23,6 +23,7 @@ pub struct ToolContext {
     session_default_cwds: Mutex<HashMap<String, PathBuf>>,
     session_task_ids: Mutex<HashMap<String, String>>,
     unbound_task_sessions: Mutex<HashSet<String>>,
+    command_output_cursors: Mutex<HashMap<String, (usize, usize)>>,
     workspace_mutation_lock: Mutex<()>,
     pub sessions: SessionStore,
     pub command_cost: CommandCostGuard,
@@ -92,6 +93,7 @@ impl ToolContext {
             session_default_cwds: Mutex::new(HashMap::new()),
             session_task_ids: Mutex::new(HashMap::new()),
             unbound_task_sessions: Mutex::new(HashSet::new()),
+            command_output_cursors: Mutex::new(HashMap::new()),
             workspace_mutation_lock: Mutex::new(()),
             sessions: SessionStore::new(),
             command_cost,
@@ -225,17 +227,31 @@ impl ToolContext {
                 return None;
             }
         }
-        let writable_tasks = self
-            .harness
-            .list_tasks()
-            .ok()?
-            .into_iter()
-            .filter(|task| task.status.is_writable())
+        let tasks = self.harness.list_tasks().ok()?;
+        let active_tasks = tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    crate::harness::model::TaskStatus::Active
+                        | crate::harness::model::TaskStatus::Verifying
+                )
+            })
+            .cloned()
             .collect::<Vec<_>>();
-        if writable_tasks.len() > 1 {
-            return None;
-        }
-        let task = writable_tasks.into_iter().next();
+        let task = if active_tasks.len() == 1 {
+            active_tasks.into_iter().next()
+        } else if active_tasks.is_empty() {
+            let writable_tasks = tasks
+                .into_iter()
+                .filter(|task| task.status.is_writable())
+                .collect::<Vec<_>>();
+            (writable_tasks.len() == 1)
+                .then(|| writable_tasks.into_iter().next())
+                .flatten()
+        } else {
+            None
+        };
         if let (Some(session_id), Some(task)) = (session_id, task.as_ref()) {
             self.session_task_ids
                 .lock()
@@ -276,6 +292,70 @@ impl ToolContext {
         self.workspace_mutation_lock
             .lock()
             .expect("workspace mutation lock")
+    }
+
+    pub fn apply_command_output_cursor(
+        &self,
+        mcp_session_id: Option<&str>,
+        args: &mut serde_json::Value,
+    ) {
+        let Some(mcp_session_id) = mcp_session_id else {
+            return;
+        };
+        let Some(command_session_id) = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(object) = args.as_object_mut() else {
+            return;
+        };
+        if object.contains_key("stdout_offset") || object.contains_key("stderr_offset") {
+            return;
+        }
+        let key = format!("{mcp_session_id}\0{command_session_id}");
+        let (stdout_offset, stderr_offset) = self
+            .command_output_cursors
+            .lock()
+            .expect("command output cursors lock")
+            .get(&key)
+            .copied()
+            .unwrap_or((0, 0));
+        object.insert("stdout_offset".into(), serde_json::json!(stdout_offset));
+        object.insert("stderr_offset".into(), serde_json::json!(stderr_offset));
+    }
+
+    pub fn update_command_output_cursor(
+        &self,
+        mcp_session_id: Option<&str>,
+        args: &serde_json::Value,
+        output: &serde_json::Value,
+    ) {
+        let (Some(mcp_session_id), Some(command_session_id)) = (
+            mcp_session_id,
+            args.get("session_id").and_then(serde_json::Value::as_str),
+        ) else {
+            return;
+        };
+        let next_offset = |stream: &str| {
+            output
+                .get(stream)
+                .and_then(|value| value.get("next_offset"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+        };
+        let (Some(stdout_offset), Some(stderr_offset)) =
+            (next_offset("stdout"), next_offset("stderr"))
+        else {
+            return;
+        };
+        let key = format!("{mcp_session_id}\0{command_session_id}");
+        self.command_output_cursors
+            .lock()
+            .expect("command output cursors lock")
+            .insert(key, (stdout_offset, stderr_offset));
     }
 
     pub fn publish_catalog(&self, current: EffectiveCatalog) -> (EffectiveCatalog, bool) {

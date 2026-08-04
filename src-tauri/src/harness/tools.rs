@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::{CancellationToken, ToolContext};
@@ -39,6 +42,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "task_context",
     "list_task_events",
     "change_summary",
+    "export_work_session",
 ];
 
 pub fn call(
@@ -75,6 +79,7 @@ pub fn call(
         "task_context" => task_context(ctx, args, session_id),
         "list_task_events" => list_task_events(ctx, args),
         "change_summary" => change_summary(ctx, args, session_id),
+        "export_work_session" => export_work_session(ctx, args, session_id),
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     let mut value = value;
@@ -86,21 +91,189 @@ pub fn call(
     Ok(tool_ok(value))
 }
 
+fn export_work_session(
+    ctx: &ToolContext,
+    args: &Value,
+    session_id: Option<&str>,
+) -> Result<Value, WorkspaceError> {
+    let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
+        ctx.harness.task(task_id).map_err(map_error)?
+    } else {
+        ctx.task_for_session(session_id)
+            .ok_or_else(|| tool_error("TASK_STATE_REQUIRED", "没有可导出的任务"))?
+    };
+    let output_path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!(".anchor/handoffs/{}.json", task.id));
+    let overwrite = args
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    ctx.workspace.reject_write_symlink(&output_path)?;
+    let resolved = ctx.workspace.resolve_for_write(&output_path)?;
+    if resolved.existed && !overwrite {
+        return Err(WorkspaceError::ToolDetails {
+            code: "HANDOFF_EXPORT_EXISTS",
+            message: format!("Handoff export already exists: {}", resolved.display),
+            category: "conflict",
+            retryable: true,
+            details: json!({
+                "path": resolved.display,
+                "suggestion": "Choose a new path or pass overwrite=true"
+            }),
+        });
+    }
+
+    let summary = change_summary(
+        ctx,
+        &json!({"task_id": task.id, "limit": 1024, "verification_view": "all"}),
+        session_id,
+    )?;
+    let verifications = ctx
+        .harness
+        .list_verifications(&task.id)
+        .map_err(map_error)?;
+    let git = crate::tools::git::git_status(
+        &ctx.workspace,
+        &json!({"path": ".", "include_untracked": true, "refresh_index": true}),
+    )?;
+    let exported_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string();
+    let active_failures = verifications
+        .iter()
+        .filter(|record| {
+            record.status == "failed" && effective_disposition(record) == "active_failure"
+        })
+        .map(|record| {
+            json!({
+                "verification_id": record.id,
+                "kind": record.kind,
+                "command": record.command,
+                "level": record.level,
+                "status": record.status
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = json!({
+        "format": "anchor.work-session-handoff",
+        "schema_version": 1,
+        "plugin": {
+            "name": "anchor",
+            "version": env!("CARGO_PKG_VERSION"),
+            "catalog_version": crate::tools::registry::CATALOG_VERSION
+        },
+        "exported_at_unix_ms": exported_at_unix_ms,
+        "workspace": {
+            "path": ctx.workspace.root().display().to_string(),
+            "workspace_id": task.workspace_id,
+            "git": git
+        },
+        "history_session": {
+            "session_key": task.history_session_key,
+            "path": task.history_session_path
+        },
+        "task": task_view(&task),
+        "commits": summary.get("commits").cloned().unwrap_or_else(|| json!([])),
+        "change_summary": summary,
+        "verifications": verifications,
+        "remaining_issues": active_failures,
+        "next_actions": task.pending_steps,
+        "resume": {
+            "strategy": "begin_work_session",
+            "objective": task.objective,
+            "note": "Import this JSON as source evidence, then create a fresh local History Session and Harness Task instead of injecting private storage files."
+        }
+    });
+    let encoded =
+        serde_json::to_vec_pretty(&document).map_err(|error| WorkspaceError::ToolDetails {
+            code: "HANDOFF_EXPORT_SERIALIZATION_FAILED",
+            message: error.to_string(),
+            category: "internal",
+            retryable: false,
+            details: json!({}),
+        })?;
+    const MAX_HANDOFF_EXPORT_BYTES: usize = 8 * 1024 * 1024;
+    if encoded.len() > MAX_HANDOFF_EXPORT_BYTES {
+        return Err(WorkspaceError::ToolDetails {
+            code: "HANDOFF_EXPORT_TOO_LARGE",
+            message: "The work-session handoff exceeds the 8 MiB export limit.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "content_bytes": encoded.len(),
+                "max_content_bytes": MAX_HANDOFF_EXPORT_BYTES,
+                "suggestion": "Dispose or supersede obsolete verification evidence before exporting"
+            }),
+        });
+    }
+    if let Some(parent) = resolved.path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| handoff_write_error(&resolved.display, error))?;
+    }
+    let temp_name = format!(
+        ".{}.{}.tmp",
+        resolved
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("handoff"),
+        exported_at_unix_ms
+    );
+    let temp_path = resolved.path.with_file_name(temp_name);
+    fs::write(&temp_path, &encoded)
+        .map_err(|error| handoff_write_error(&resolved.display, error))?;
+    if resolved.existed {
+        fs::remove_file(&resolved.path)
+            .map_err(|error| handoff_write_error(&resolved.display, error))?;
+    }
+    fs::rename(&temp_path, &resolved.path)
+        .map_err(|error| handoff_write_error(&resolved.display, error))?;
+    let content_hash = format!("{:x}", Sha256::digest(&encoded));
+    Ok(json!({
+        "format": "anchor.work-session-handoff",
+        "schema_version": 1,
+        "path": resolved.display,
+        "task_id": task.id,
+        "content_bytes": encoded.len(),
+        "content_hash": content_hash,
+        "git_ignored_recommended": output_path.starts_with(".anchor/handoffs/"),
+        "resume_strategy": "begin_work_session",
+        "warnings": []
+    }))
+}
+
+fn handoff_write_error(path: &str, error: std::io::Error) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "HANDOFF_EXPORT_WRITE_FAILED",
+        message: format!("Failed to write handoff export {path}: {error}"),
+        category: "runtime",
+        retryable: true,
+        details: json!({"path": path}),
+    }
+}
+
 fn resume_task(
     ctx: &ToolContext,
     args: &Value,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
-    let task = ctx
-        .harness
-        .transition(task_id(args)?, TaskStatus::Active)
-        .map_err(map_error)?;
+    let target_task_id = task_id(args)?;
+    ensure_writer_handoff_available(ctx, Some(target_task_id))?;
+    let task = ctx.harness.switch_task(target_task_id).map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel_tasks_preserved": true
+        "parallel_tasks_preserved": false,
+        "writer_mode": "single_workspace_writer"
     }))
 }
 
@@ -227,15 +400,43 @@ fn switch_task(
     args: &Value,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
-    let task = ctx.harness.switch_task(task_id(args)?).map_err(map_error)?;
+    let target_task_id = task_id(args)?;
+    ensure_writer_handoff_available(ctx, Some(target_task_id))?;
+    let task = ctx.harness.switch_task(target_task_id).map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel_tasks_preserved": true,
+        "parallel_tasks_preserved": false,
+        "writer_mode": "single_workspace_writer",
         "harness": ctx.harness.status_for_task(Some(&task.id)).map_err(map_error)?
     }))
+}
+
+fn ensure_writer_handoff_available(
+    ctx: &ToolContext,
+    target_task_id: Option<&str>,
+) -> Result<(), WorkspaceError> {
+    let blocking_task_ids = ctx
+        .sessions
+        .running_task_ids()
+        .into_iter()
+        .filter(|task_id| Some(task_id.as_str()) != target_task_id)
+        .collect::<Vec<_>>();
+    if blocking_task_ids.is_empty() {
+        return Ok(());
+    }
+    Err(WorkspaceError::ToolDetails {
+        code: "WORKSPACE_WRITER_BUSY",
+        message: "Another task still owns a running command in this workspace.".into(),
+        category: "conflict",
+        retryable: true,
+        details: json!({
+            "blocking_task_ids": blocking_task_ids,
+            "suggestion": "Wait for or stop the running command before transferring the workspace writer lease"
+        }),
+    })
 }
 
 fn accept_latest_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -403,58 +604,47 @@ fn begin_work_session(
             )
         })?;
 
-    let pause_current_and_start = args
-        .get("pause_current_and_start")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let explicit_task = ctx.bound_task_for_session(mcp_session_id);
-    let history_task = if explicit_task.is_none() {
-        ctx.harness
-            .list_tasks()
-            .map_err(map_error)?
-            .into_iter()
-            .find(|task| {
-                task.status.is_writable()
-                    && task.objective == objective
-                    && task.history_session_key.as_deref() == Some(session_key)
-                    && task.history_session_path.as_deref() == Some(current_path)
-            })
-    } else {
-        None
-    };
+    let history_task = ctx
+        .harness
+        .list_tasks()
+        .map_err(map_error)?
+        .into_iter()
+        .find(|task| {
+            task.status.is_writable()
+                && task.objective == objective
+                && task.history_session_key.as_deref() == Some(session_key)
+                && task.history_session_path.as_deref() == Some(current_path)
+        });
     let fallback_task = if mcp_session_id.is_none() {
         ctx.harness.current_task().map_err(map_error)?
     } else {
         None
     };
-    let selected_task = explicit_task.or(history_task).or(fallback_task);
+    let selected_task = history_task.or(explicit_task).or(fallback_task);
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
             if task.objective != objective {
                 let previous_task_id = task.id.clone();
-                if pause_current_and_start && task.status == TaskStatus::Active {
-                    ctx.harness
-                        .transition(&task.id, TaskStatus::Paused)
-                        .map_err(map_error)?;
-                }
+                ensure_writer_handoff_available(ctx, None)?;
                 let next = ctx
                     .harness
-                    .start_task_with_handoff(objective, false)
+                    .start_task_with_handoff(objective, true)
                     .map_err(map_error)?;
                 (next, true, Some(previous_task_id))
             } else {
-                let task = if task.status == TaskStatus::Paused {
-                    ctx.harness
-                        .resume_task_for_activity(&task.id, "begin_work_session", mcp_session_id)
-                        .map_err(map_error)?
-                } else {
-                    task
-                };
+                ensure_writer_handoff_available(ctx, Some(&task.id))?;
+                let task = ctx.harness.switch_task(&task.id).map_err(map_error)?;
                 (task, false, None)
             }
         }
         None => (
-            ctx.harness.start_task(objective).map_err(map_error)?,
+            {
+                ensure_writer_handoff_available(ctx, None)?;
+                ctx.harness
+                    .start_task_with_handoff(objective, true)
+                    .map_err(map_error)?
+            },
             true,
             None,
         ),
@@ -477,15 +667,30 @@ fn begin_work_session(
             "task_id": task.id,
             "task_created": task_created,
             "previous_task_id": previous_task_id,
-            "parallel": !pause_current_and_start,
+            "parallel": false,
+            "writer_mode": "single_workspace_writer",
             "baseline": baseline_view(&task),
             "expected_state": task.expected_state
         },
-        "history": history,
+        "history": compact_history_view(&history),
         "task": task_view(&task),
         "harness": harness,
         "reconnect_required": false
     }))
+}
+
+fn compact_history_view(history: &Value) -> Value {
+    json!({
+        "session_key": history.get("session_key").cloned().unwrap_or(Value::Null),
+        "current_path": history.get("current_path").cloned().unwrap_or(Value::Null),
+        "current_number": history.get("current_number").cloned().unwrap_or(Value::Null),
+        "created": history.get("created").cloned().unwrap_or(Value::Bool(false)),
+        "resumed": history.get("resumed").cloned().unwrap_or(Value::Bool(false)),
+        "session_status": history.get("session_status").cloned().unwrap_or(Value::Null),
+        "checkpoint_count": history.get("checkpoint_count").cloned().unwrap_or(Value::Null),
+        "persistence": history.get("persistence").cloned().unwrap_or(Value::Null),
+        "warnings": history.get("warnings").cloned().unwrap_or_else(|| json!([]))
+    })
 }
 
 fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -1150,20 +1355,18 @@ fn start_task(
         .get("objective")
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
-    let pause_current = args
-        .get("pause_current")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    ensure_writer_handoff_available(ctx, None)?;
     let task = ctx
         .harness
-        .start_task_with_handoff(objective, pause_current)
+        .start_task_with_handoff(objective, true)
         .map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel": !pause_current,
+        "parallel": false,
+        "writer_mode": "single_workspace_writer",
         "next": ["project_state", "task_context"]
     }))
 }

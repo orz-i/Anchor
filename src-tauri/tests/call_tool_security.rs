@@ -190,7 +190,11 @@ fn exec_command_rejects_workdir_escape_via_policy() {
 fn exec_command_allows_workspace_child_process_during_transition() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    let out = invoke(&ctx, "exec_command", json!({"cmd": "python --version"}));
+    let out = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": "python --version", "include_diagnostics": true}),
+    );
     let result = assert_ok(&out);
     assert_eq!(result["filesystem_scope"], "workspace");
     assert_eq!(result["sandbox_enforced"], false);

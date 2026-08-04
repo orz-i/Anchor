@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 20;
+pub const CATALOG_VERSION: u32 = 21;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -38,7 +38,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "begin_work_session",
         "Begin work session",
-        "Create or resume a History Session and bind the calling MCP session to its Harness Task. Other work sessions may remain active in parallel.",
+        "Create or resume a History Session and bind the calling MCP session to the workspace's single writable Harness Task. Starting or selecting another task transfers the writer lease.",
         false,
         false,
         false,
@@ -230,7 +230,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "switch_task",
         "Switch task",
-        "Bind the calling MCP session to an existing task and activate it if paused, without pausing other active tasks.",
+        "Bind the calling MCP session to an existing task, pause any other writable task, and transfer the workspace writer lease.",
         false,
         false,
         false,
@@ -263,6 +263,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "change_summary",
         "Change summary",
         "Explain what changed, why, and what evidence exists.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "export_work_session",
+        "Export work session",
+        "Write a versioned, portable JSON handoff containing task, History binding, commits, verifications, remaining issues, and Git state without copying private Harness storage.",
         true,
         false,
         false,
@@ -626,6 +634,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "task_context",
     "list_task_events",
     "change_summary",
+    "export_work_session",
     "view_image",
 ];
 
@@ -660,6 +669,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "resume_task",
     "switch_task",
     "finish_task",
+    "export_work_session",
 ];
 
 pub const READ_ONLY_TOOLS: &[&str] = &[
@@ -779,8 +789,6 @@ fn history_bootstrap_output_properties() -> Value {
             "is_new_session": { "type": "boolean" },
             "session_key": { "type": "string", "minLength": 1 },
             "session_key_source": { "type": "string", "minLength": 1 },
-            "host_session_key_mismatch": { "type": "boolean" },
-            "host_session_key_mismatch_level": { "type": "string", "enum": ["none", "debug"] },
             "target_preserved": { "type": "boolean", "const": true },
             "history_numbers": { "type": "array", "maxItems": 256, "items": { "type": "integer", "minimum": 1 } },
             "history_numbers_total": { "type": "integer", "minimum": 0 },
@@ -1025,6 +1033,30 @@ pub fn output_schema(name: &str) -> Value {
                 "command_cost_policy",
                 "downstream_mcp",
                 "connection_layers",
+            ],
+        ),
+        "export_work_session" => success_output_schema(
+            json!({
+                "format": { "type": "string", "const": "anchor.work-session-handoff" },
+                "schema_version": { "type": "integer", "const": 1 },
+                "path": { "type": "string", "minLength": 1 },
+                "task_id": { "type": "string", "minLength": 1 },
+                "content_bytes": { "type": "integer", "minimum": 1, "maximum": 8388608 },
+                "content_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "git_ignored_recommended": { "type": "boolean" },
+                "resume_strategy": { "type": "string", "const": "begin_work_session" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "format",
+                "schema_version",
+                "path",
+                "task_id",
+                "content_bytes",
+                "content_hash",
+                "git_ignored_recommended",
+                "resume_strategy",
+                "warnings",
             ],
         ),
         "browser_build_info" => success_output_schema(
@@ -1419,9 +1451,6 @@ pub fn output_schema(name: &str) -> Value {
                 "duration_ms",
                 "elapsed_ms",
                 "execution_mode",
-                "filesystem_scope",
-                "sandbox_enforced",
-                "execution_boundary",
                 "child_process",
                 "execution_started",
                 "transport_ok",
@@ -1611,8 +1640,6 @@ pub fn output_schema(name: &str) -> Value {
                 "is_new_session",
                 "session_key",
                 "session_key_source",
-                "host_session_key_mismatch",
-                "host_session_key_mismatch_level",
                 "target_preserved",
                 "history_numbers",
                 "history_numbers_total",
@@ -1663,8 +1690,6 @@ pub fn output_schema(name: &str) -> Value {
                 "path": { "type": "string", "minLength": 1 },
                 "session_key": { "type": "string", "minLength": 1 },
                 "expected_path": { "type": "string", "minLength": 1 },
-                "host_session_key_mismatch": { "type": "boolean" },
-                "host_session_key_mismatch_level": { "type": "string", "enum": ["none", "debug"] },
                 "target_preserved": { "type": "boolean", "const": true },
                 "turn_id": { "type": "string", "minLength": 1 },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
@@ -1689,8 +1714,6 @@ pub fn output_schema(name: &str) -> Value {
                 "path",
                 "session_key",
                 "expected_path",
-                "host_session_key_mismatch",
-                "host_session_key_mismatch_level",
                 "target_preserved",
                 "turn_id",
                 "session_status",
@@ -2108,6 +2131,15 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {},
             "additionalProperties": false
         }),
+        "export_work_session" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "path": { "type": "string", "minLength": 1, "default": ".anchor/handoffs/<task_id>.json" },
+                "overwrite": { "type": "boolean", "default": false }
+            },
+            "additionalProperties": false
+        }),
         "browser_wait_for_build" => json!({
             "type": "object",
             "properties": {
@@ -2331,7 +2363,7 @@ pub fn input_schema(name: &str) -> Value {
                 "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
-                "pause_current_and_start": { "type": "boolean", "default": false },
+                "pause_current_and_start": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Anchor always enforces a single writable task per workspace." },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "workspace_root": { "type": "string", "minLength": 1 }
             },
@@ -2375,7 +2407,7 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "objective": { "type": "string", "minLength": 1 },
-                "pause_current": { "type": "boolean", "default": false }
+                "pause_current": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Anchor always pauses the previous writable task." }
             },
             "required": ["objective"],
             "additionalProperties": false
@@ -2551,11 +2583,16 @@ pub fn input_schema(name: &str) -> Value {
         }),
         "exec_command" => json!({
             "type": "object",
+            "minProperties": 1,
             "properties": {
                 "cmd": { "type": "string", "minLength": 1 },
+                "executable": { "type": "string", "minLength": 1, "description": "Executable to run directly without shell parsing." },
+                "args": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 32768 }, "description": "Exact argument vector for executable or shell mode." },
+                "env": { "type": "object", "maxProperties": 128, "additionalProperties": { "type": "string", "maxLength": 131072 }, "description": "Environment variables applied only to this command." },
+                "shell": { "type": "string", "enum": ["direct", "pwsh", "powershell", "cmd"], "description": "Optional explicit Windows shell. Use direct with executable for shell-free execution." },
                 "workdir": { "type": "string", "default": "." },
                 "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 30000 },
-                "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
+                "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 32768 },
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
                 "stdin": { "type": "string", "default": "" },
@@ -2607,9 +2644,9 @@ pub fn input_schema(name: &str) -> Value {
                     "description": "When a verification passes, supersede active failures matching verification_key, test_file/test_name, or the same verification kind for legacy callers."
                 },
                 "filesystem_scope": { "type": "string", "enum": ["workspace"], "default": "workspace" },
+                "include_diagnostics": { "type": "boolean", "default": false, "description": "Include cost policy, execution boundary, and sandbox diagnostics in the response." },
                 "reason": { "type": "string", "default": "" }
             },
-            "required": ["cmd"],
             "additionalProperties": false
         }),
         "write_stdin" => json!({
@@ -2628,8 +2665,8 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "session_id": { "type": "string", "minLength": 1 },
                 "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 30000 },
-                "stdout_offset": { "type": "integer", "minimum": 0, "default": 0 },
-                "stderr_offset": { "type": "integer", "minimum": 0, "default": 0 },
+                "stdout_offset": { "type": "integer", "minimum": 0, "description": "Optional explicit cursor. Omit it to continue from the caller session's last returned stdout offset." },
+                "stderr_offset": { "type": "integer", "minimum": 0, "description": "Optional explicit cursor. Omit it to continue from the caller session's last returned stderr offset." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536 },
                 "return_incremental_output": { "type": "boolean", "default": true },
                 "stop_on_patterns": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1 } }

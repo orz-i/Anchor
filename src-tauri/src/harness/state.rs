@@ -191,6 +191,26 @@ impl Harness {
                         format!("任务 {} 当前状态 {:?} 不允许切换", target.id, target.status),
                     ));
                 }
+                let mut paused_task_ids = Vec::new();
+                for mut peer in self.store.list_tasks(&self.workspace_id)? {
+                    if peer.id == target.id
+                        || !matches!(peer.status, TaskStatus::Active | TaskStatus::Verifying)
+                    {
+                        continue;
+                    }
+                    peer.status = TaskStatus::Paused;
+                    peer.updated_at = timestamp();
+                    transaction.save_task(&peer)?;
+                    transaction.append_event(&harness_event(
+                        &self.workspace_id,
+                        &peer.id,
+                        "task_paused_for_writer_handoff",
+                        Some("switch_task"),
+                        json!({"next_writer_task_id": target.id.clone()}),
+                        json!({"ok": true, "status": "paused"}),
+                    ))?;
+                    paused_task_ids.push(peer.id);
+                }
                 if target.status == TaskStatus::Paused {
                     target.status = TaskStatus::Active;
                     target.updated_at = timestamp();
@@ -206,8 +226,8 @@ impl Harness {
                     &target.id,
                     "task_selected",
                     Some("switch_task"),
-                    json!({"parallel_tasks_preserved": true}),
-                    json!({"ok": true, "status": "active", "parallel_tasks_preserved": true}),
+                    json!({"single_writer": true, "paused_task_ids": paused_task_ids}),
+                    json!({"ok": true, "status": "active", "single_writer": true}),
                 ))?;
                 Ok(target)
             })
@@ -247,16 +267,31 @@ impl Harness {
                 if task.status != TaskStatus::Paused {
                     return Ok(task);
                 }
+                let mut paused_task_ids = Vec::new();
+                for mut peer in self.store.list_tasks(&self.workspace_id)? {
+                    if peer.id == task.id
+                        || !matches!(peer.status, TaskStatus::Active | TaskStatus::Verifying)
+                    {
+                        continue;
+                    }
+                    peer.status = TaskStatus::Paused;
+                    peer.updated_at = timestamp();
+                    transaction.save_task(&peer)?;
+                    transaction.append_event(&harness_event(
+                        &self.workspace_id,
+                        &peer.id,
+                        "task_paused_for_writer_handoff",
+                        Some(tool),
+                        json!({"next_writer_task_id": task.id.clone()}),
+                        json!({"ok": true, "status": "paused"}),
+                    ))?;
+                    paused_task_ids.push(peer.id);
+                }
                 task.status = TaskStatus::Active;
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
-                let default_task_id = self
-                    .store
-                    .load_workspace_state(&self.workspace_id)?
-                    .and_then(|state| state.active_task_id)
-                    .unwrap_or_else(|| task.id.clone());
                 transaction.save_workspace_state(&self.workspace_state(
-                    Some(default_task_id.as_str()),
+                    Some(task.id.as_str()),
                     HarnessSessionStatus::Active,
                     &task.updated_at,
                 )?)?;
@@ -270,6 +305,8 @@ impl Harness {
                         "trigger": "tool_activity",
                         "tool": tool,
                         "mcp_session_id": mcp_session_id,
+                        "single_writer": true,
+                        "paused_task_ids": paused_task_ids,
                     }),
                     json!({
                         "ok": true,
@@ -390,38 +427,30 @@ impl Harness {
     pub fn start_task_with_handoff(
         &self,
         objective: &str,
-        pause_current: bool,
+        _pause_current: bool,
     ) -> HarnessResult<TaskSession> {
         if objective.trim().is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
         }
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
-                if let Some(mut task) = self.current_task()? {
-                    if pause_current {
-                        if !matches!(task.status, TaskStatus::Active | TaskStatus::Paused) {
-                            return Err(HarnessError::new(
-                                "TASK_HANDOFF_BLOCKED",
-                                format!(
-                                    "任务 {} 当前状态 {:?} 不允许自动挂起",
-                                    task.id, task.status
-                                ),
-                            ));
-                        }
-                        if task.status != TaskStatus::Paused {
-                            task.status = TaskStatus::Paused;
-                            task.updated_at = timestamp();
-                            transaction.save_task(&task)?;
-                            transaction.append_event(&harness_event(
-                                &self.workspace_id,
-                                &task.id,
-                                "task_paused_for_handoff",
-                                Some("start_task"),
-                                json!({"next_objective": objective.trim()}),
-                                json!({"ok": true, "status": "paused"}),
-                            ))?;
-                        }
+                let mut paused_task_ids = Vec::new();
+                for mut task in self.store.list_tasks(&self.workspace_id)? {
+                    if !matches!(task.status, TaskStatus::Active | TaskStatus::Verifying) {
+                        continue;
                     }
+                    task.status = TaskStatus::Paused;
+                    task.updated_at = timestamp();
+                    transaction.save_task(&task)?;
+                    transaction.append_event(&harness_event(
+                        &self.workspace_id,
+                        &task.id,
+                        "task_paused_for_writer_handoff",
+                        Some("start_task"),
+                        json!({"next_objective": objective.trim()}),
+                        json!({"ok": true, "status": "paused"}),
+                    ))?;
+                    paused_task_ids.push(task.id);
                 }
                 let captured = capture_baseline_snapshot(&self.workspace_root);
                 let baseline = captured.baseline;
@@ -455,8 +484,8 @@ impl Harness {
                     &task.id,
                     "task_started",
                     None,
-                    json!({"parallel": !pause_current}),
-                    json!({"ok": true, "parallel": !pause_current}),
+                    json!({"single_writer": true, "paused_task_ids": paused_task_ids}),
+                    json!({"ok": true, "single_writer": true}),
                 ))?;
                 Ok(task)
             })
@@ -1307,41 +1336,40 @@ impl Harness {
                 }
             });
         let expected = task.as_ref().map(expected_state);
-        let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) = match task
-            .as_ref()
-        {
-            Some(task) => {
-                let expected = expected_state(task);
-                let matches = expected.branch == current.branch
-                    && expected.head == current.head
-                    && expected.worktree_fingerprint == current.worktree_fingerprint;
-                let reason = if matches && active_task_count > 1 {
-                    format!("任务可继续执行；当前有 {active_task_count} 个并行活动任务")
-                } else if matches {
-                    "任务可继续执行".to_string()
-                } else {
-                    "工作区基线已变化，写入和执行已暂停".to_string()
-                };
-                (
-                    Some(task.id.clone()),
-                    Some(task.status),
-                    Some(task.updated_at.clone()),
-                    matches && task.status.is_writable(),
-                    Some(matches),
-                    reason,
-                )
-            }
-            None => {
-                let reason = if active_task_count > 0 {
-                    format!(
-                            "当前 MCP 会话未绑定 Harness Task；工作区另有 {active_task_count} 个并行活动任务"
-                        )
-                } else {
-                    "当前没有活动任务，工作区采用无任务模式；修改不会进入任务事件流".to_string()
-                };
-                (None, None, None, true, None, reason)
-            }
-        };
+        let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
+            match task.as_ref() {
+                Some(task) => {
+                    let expected = expected_state(task);
+                    let matches = expected.branch == current.branch
+                        && expected.head == current.head
+                        && expected.worktree_fingerprint == current.worktree_fingerprint;
+                    let reason = if matches && active_task_count > 1 {
+                        format!("任务可继续执行；当前有 {active_task_count} 个并行活动任务")
+                    } else if matches {
+                        "任务可继续执行".to_string()
+                    } else {
+                        "工作区基线已变化，写入和执行已暂停".to_string()
+                    };
+                    (
+                        Some(task.id.clone()),
+                        Some(task.status),
+                        Some(task.updated_at.clone()),
+                        matches && task.status.is_writable(),
+                        Some(matches),
+                        reason,
+                    )
+                }
+                None => {
+                    let writable = active_task_count == 0;
+                    let reason = if !writable {
+                        "当前 MCP 会话未绑定 Harness Task；工作区已有活动写任务，必须先绑定该任务"
+                            .to_string()
+                    } else {
+                        "当前没有活动任务，工作区采用无任务模式；修改不会进入任务事件流".to_string()
+                    };
+                    (None, None, None, writable, None, reason)
+                }
+            };
 
         let mut capabilities = HashMap::new();
         capabilities.insert(
@@ -1360,7 +1388,7 @@ impl Harness {
                     if task_id.is_some() {
                         "活动任务和工作区基线有效"
                     } else if active_task_count > 0 {
-                        "当前会话未绑定任务；可使用 switch_task 选择并行任务，或以 standalone 模式修改"
+                        "当前会话未绑定活动写任务；必须使用 switch_task 或 begin_work_session 建立绑定"
                     } else {
                         "无任务模式允许直接修改，建议需要长期追踪时调用 start_task"
                     }
@@ -1379,7 +1407,7 @@ impl Harness {
                     if task_id.is_some() {
                         "活动任务和工作区基线有效"
                     } else if active_task_count > 0 {
-                        "当前会话未绑定任务；可使用 switch_task 选择并行任务，或以 standalone 模式执行"
+                        "当前会话未绑定活动写任务；必须使用 switch_task 或 begin_work_session 建立绑定"
                     } else {
                         "无任务模式允许直接执行，建议需要长期追踪时调用 start_task"
                     }

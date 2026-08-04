@@ -561,6 +561,26 @@ impl SessionStore {
         snapshots
     }
 
+    pub fn running_task_ids(&self) -> Vec<String> {
+        let sessions = {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            prune_terminal_sessions(&mut sessions, self.terminal_retention);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        let mut task_ids = sessions
+            .into_iter()
+            .filter_map(|session| {
+                crate::async_runtime::block_on(session.refresh_status());
+                (!session.has_exited())
+                    .then(|| session.harness_metadata().map(|metadata| metadata.task_id))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        task_ids.sort_unstable();
+        task_ids.dedup();
+        task_ids
+    }
+
     pub fn remove(&self, session_id: &str) {
         self.sessions
             .lock()

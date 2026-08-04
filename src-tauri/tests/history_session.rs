@@ -512,7 +512,7 @@ fn bootstrap_keeps_only_the_current_history_session_active() {
 }
 
 #[test]
-fn bootstrap_preserves_history_sessions_bound_to_parallel_active_tasks() {
+fn bootstrap_preserves_the_active_writer_history_and_pauses_the_previous_writer_history() {
     let (workspace, _harness, ctx) = test_context();
     let first = invoke(
         &ctx,
@@ -561,9 +561,17 @@ fn bootstrap_preserves_history_sessions_bound_to_parallel_active_tasks() {
             .contains("**Status:** active")
     );
 
-    ctx.harness
-        .transition(&first_task.id, anchor_lib::harness::TaskStatus::Paused)
-        .expect("pause first task");
+    assert_eq!(
+        ctx.harness.task(&first_task.id).expect("first task").status,
+        anchor_lib::harness::TaskStatus::Paused
+    );
+    assert_eq!(
+        ctx.harness
+            .task(&second_task.id)
+            .expect("second task")
+            .status,
+        anchor_lib::harness::TaskStatus::Active
+    );
     let third = invoke(
         &ctx,
         "history_session_bootstrap",

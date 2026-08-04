@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::process::Command;
 
-use anchor_lib::tools::list_tools_for_profile;
+use anchor_lib::tools::{call_tool_for_session, list_tools_for_profile};
 use common::*;
 use serde_json::{json, Value};
 
@@ -29,6 +29,82 @@ fn server_info_returns_workspace_and_tools() {
         payload["running_catalog_digest"],
         payload["current_catalog_digest"]
     );
+}
+
+#[test]
+fn structured_exec_rejects_sensitive_or_process_control_environment() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    for protected_name in ["PATH", "OPENAI_API_KEY", "LD_PRELOAD", "NODE_OPTIONS"] {
+        let result = invoke(
+            &ctx,
+            "exec_command",
+            json!({
+                "executable": TEST_PYTHON,
+                "args": ["-c", "print('not-run')"],
+                "env": {protected_name: "blocked"}
+            }),
+        );
+        let payload = assert_err(&result);
+        assert_eq!(payload["error"]["code"], "POLICY_REJECTED");
+        assert_eq!(payload["execution_started"], false);
+    }
+}
+
+#[test]
+fn wait_command_maintains_the_output_cursor_for_each_caller_session() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let caller_session = "managed-cursor-caller";
+    let started = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('cursor-line', flush=True)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+        caller_session,
+    );
+    let started = assert_ok(&started);
+    let command_session = started["session_id"].as_str().expect("command session");
+
+    let first = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 5_000}),
+        caller_session,
+    );
+    let first = assert_ok(&first);
+    assert!(first["stdout"]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("cursor-line")));
+
+    let second = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+        caller_session,
+    );
+    let second = assert_ok(&second);
+    assert_eq!(second["stdout"]["content"], "");
+
+    let replay = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({
+            "session_id": command_session,
+            "timeout_ms": 0,
+            "stdout_offset": 0,
+            "stderr_offset": 0
+        }),
+        caller_session,
+    );
+    let replay = assert_ok(&replay);
+    assert!(replay["stdout"]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("cursor-line")));
 }
 
 #[test]
@@ -310,7 +386,67 @@ fn direct_exec_uses_the_same_result_contract() {
     assert_eq!(payload["duration_ms"], payload["elapsed_ms"]);
     assert_eq!(payload["transport_ok"], true);
     assert_eq!(payload["command_ok"], true);
-    assert_eq!(payload["cost_policy"]["cost_class"], "free");
+    assert!(payload.get("cost_policy").is_none());
+    assert!(payload.get("filesystem_scope").is_none());
+    assert!(payload.get("execution_boundary").is_none());
+
+    let diagnostic_result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": format!("{TEST_PYTHON} --version"),
+            "include_diagnostics": true
+        }),
+    );
+    let diagnostic = assert_ok(&diagnostic_result);
+    assert_eq!(diagnostic["cost_policy"]["cost_class"], "free");
+    assert_eq!(diagnostic["filesystem_scope"], "workspace");
+    assert_eq!(diagnostic["execution_boundary"], "policy_only");
+}
+
+#[test]
+fn structured_exec_preserves_exact_args_and_environment() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-c",
+                "import os,sys; print(os.environ['ANCHOR_STRUCTURED_ENV']); print(sys.argv[1])",
+                "value with spaces\\and-backslashes"
+            ],
+            "env": {"ANCHOR_STRUCTURED_ENV": "structured-ok"}
+        }),
+    );
+    let payload = assert_ok(&result);
+    assert_eq!(payload["execution_mode"], "structured_direct");
+    let stdout = payload["stdout"].as_str().expect("stdout");
+    assert!(stdout.contains("structured-ok"));
+    assert!(stdout.contains("value with spaces\\and-backslashes"));
+}
+
+#[cfg(windows)]
+#[test]
+fn structured_powershell_exec_uses_explicit_shell_args_and_env() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "shell": "powershell",
+            "args": ["-NoProfile", "-Command", "Write-Output $env:ANCHOR_PS_ENV"],
+            "env": {"ANCHOR_PS_ENV": "powershell-ok"}
+        }),
+    );
+    let payload = assert_ok(&result);
+    assert_eq!(payload["execution_mode"], "powershell");
+    assert!(payload["stdout"]
+        .as_str()
+        .is_some_and(|stdout| stdout.contains("powershell-ok")));
 }
 
 #[test]

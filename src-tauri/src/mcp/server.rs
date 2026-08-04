@@ -487,7 +487,6 @@ async fn handle_tools_call(
                     {
                         structured
                             .insert("operation_id".into(), Value::String(operation.id.clone()));
-                        structured.insert("trace_id".into(), Value::String(operation.id.clone()));
                     }
                 }
                 let summary = proxy_operation_summary(name, session_id, &result);
@@ -969,22 +968,19 @@ fn attach_proxy_auto_checkpoint(
                 .get_mut("structuredContent")
                 .and_then(Value::as_object_mut)
             {
-                structured.insert("auto_checkpoint".into(), checkpoint);
+                structured.insert(
+                    "checkpoint".into(),
+                    crate::tools::history::checkpoint_reference(&checkpoint),
+                );
             }
         }
         Ok(None) => {}
-        Err(error) => {
+        Err(_error) => {
             if let Some(structured) = result
                 .get_mut("structuredContent")
                 .and_then(Value::as_object_mut)
             {
-                structured.insert(
-                    "auto_checkpoint_error".into(),
-                    serde_json::json!({
-                        "error": error.to_error_value(),
-                        "retryable": true
-                    }),
-                );
+                structured.insert("checkpoint_saved".into(), Value::Bool(false));
             }
         }
     }
@@ -1471,13 +1467,16 @@ fn attach_local_browser_checkpoint(
                 }
             }
             if let Some(object) = output.as_object_mut() {
-                object.insert("auto_checkpoint".into(), checkpoint);
+                object.insert(
+                    "checkpoint".into(),
+                    crate::tools::history::checkpoint_reference(&checkpoint),
+                );
             }
         }
         Ok(None) => {}
-        Err(error) => {
+        Err(_error) => {
             if let Some(object) = output.as_object_mut() {
-                object.insert("auto_checkpoint_error".into(), error.to_error_value());
+                object.insert("checkpoint_saved".into(), Value::Bool(false));
             }
         }
     }
@@ -1930,8 +1929,8 @@ mod tests {
         assert_eq!(structured["ok"], true);
         assert_eq!(structured["session_key_source"], "explicit_session_key");
         assert_eq!(structured["session_key"], "explicit-session");
-        assert_eq!(structured["host_session_key_mismatch"], true);
-        assert_eq!(structured["host_session_key_mismatch_level"], "debug");
+        assert!(structured.get("host_session_key_mismatch").is_none());
+        assert!(structured.get("host_session_key_mismatch_level").is_none());
         assert_eq!(structured["target_preserved"], true);
         assert!(!structured["warnings"]
             .as_array()
