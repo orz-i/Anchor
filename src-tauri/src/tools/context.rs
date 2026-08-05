@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::harness::Harness;
@@ -101,6 +101,10 @@ impl ToolContext {
 
     pub fn is_primary_workspace(&self) -> bool {
         self.workspace.root() == self.primary_workspace_root
+    }
+
+    pub(crate) fn primary_workspace_root(&self) -> &Path {
+        &self.primary_workspace_root
     }
 
     pub fn from_workspace(
@@ -289,9 +293,11 @@ impl ToolContext {
                 return None;
             }
         }
-        let tasks = self.harness.list_tasks().ok()?;
-        let active_tasks = tasks
-            .iter()
+        let task = self
+            .harness
+            .current_task()
+            .ok()
+            .flatten()
             .filter(|task| {
                 matches!(
                     task.status,
@@ -299,26 +305,18 @@ impl ToolContext {
                         | crate::harness::model::TaskStatus::Verifying
                 )
             })
-            .cloned()
-            .collect::<Vec<_>>();
-        let task = if active_tasks.len() == 1 {
-            active_tasks.into_iter().next()
-        } else if active_tasks.is_empty() {
-            let writable_tasks = tasks
-                .into_iter()
-                .filter(|task| task.status.is_writable())
-                .collect::<Vec<_>>();
-            (writable_tasks.len() == 1)
-                .then(|| writable_tasks.into_iter().next())
-                .flatten()
-        } else {
-            None
-        };
+            .or_else(|| {
+                let tasks = self.harness.list_tasks().ok()?;
+                let writable_tasks = tasks
+                    .into_iter()
+                    .filter(|task| task.status.is_writable())
+                    .collect::<Vec<_>>();
+                (writable_tasks.len() == 1)
+                    .then(|| writable_tasks.into_iter().next())
+                    .flatten()
+            });
         if let (Some(session_id), Some(task)) = (session_id, task.as_ref()) {
-            self.session_task_ids
-                .lock()
-                .expect("session task lock")
-                .insert(session_id.to_string(), task.id.clone());
+            let _ = self.bind_task_for_session(Some(session_id), &task.id);
         }
         task
     }

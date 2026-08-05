@@ -175,6 +175,33 @@ fn history_successes_match_published_output_schemas() {
 }
 
 #[test]
+fn finish_task_success_matches_published_output_schema() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "start_task",
+        json!({"objective": "finish task schema contract"}),
+    );
+    assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let finished = invoke(
+        &ctx,
+        "finish_task",
+        json!({
+            "task_id": task_id,
+            "allow_unverified": true,
+            "session_status": "active"
+        }),
+    );
+    assert_ok(&finished);
+    assert_eq!(finished["worktree_cleanup"]["requested"], false);
+    assert_eq!(finished["worktree_cleanup"]["removed"], false);
+    assert_matches_output_schema("finish_task", &finished);
+}
+
+#[test]
 fn retained_session_tools_match_published_output_schemas() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

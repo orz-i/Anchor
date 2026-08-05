@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::tools::workspace::{tool_ok, WorkspaceError};
+use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 use crate::tools::{CancellationToken, ToolContext};
 
 use super::model::{
@@ -110,7 +110,11 @@ fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn cleanup_closed_task_worktree(ctx: &ToolContext, task_id: &str) -> Result<Value, WorkspaceError> {
+fn cleanup_closed_task_worktree(
+    ctx: &ToolContext,
+    task_id: &str,
+    source_tool: &str,
+) -> Result<Value, WorkspaceError> {
     let task = ctx.harness.task(task_id).map_err(map_error)?;
     let Some(worktree) = task.git_worktree.as_ref() else {
         return Ok(json!({"requested": false, "removed": false}));
@@ -132,11 +136,20 @@ fn cleanup_closed_task_worktree(ctx: &ToolContext, task_id: &str) -> Result<Valu
             "branch": worktree.branch
         }));
     }
-    crate::tools::git::remove_managed_task_worktree(&ctx.workspace, worktree)?;
+    let primary_workspace = if ctx.is_primary_workspace() {
+        None
+    } else {
+        Some(
+            Workspace::new(ctx.primary_workspace_root().to_path_buf())?
+                .with_strict_read_boundary(ctx.workspace.strict_read_boundary()),
+        )
+    };
+    let workspace = primary_workspace.as_ref().unwrap_or(&ctx.workspace);
+    crate::tools::git::remove_managed_task_worktree(workspace, worktree)?;
     let _ = ctx.harness.record_event(
         task_id,
         "git_worktree_removed",
-        Some("close_work_session"),
+        Some(source_tool),
         json!({"path": worktree.path, "branch": worktree.branch}),
         json!({"ok": true}),
     );
@@ -147,6 +160,33 @@ fn cleanup_closed_task_worktree(ctx: &ToolContext, task_id: &str) -> Result<Valu
         "path": worktree.path,
         "branch": worktree.branch
     }))
+}
+
+fn finish_task_worktree_cleanup(ctx: &ToolContext, task_id: &str) -> Value {
+    match cleanup_closed_task_worktree(ctx, task_id, "finish_task") {
+        Ok(result) => result,
+        Err(error) => {
+            let error_value = error.to_error_value();
+            let _ = ctx.harness.record_event(
+                task_id,
+                "git_worktree_cleanup_pending",
+                Some("finish_task"),
+                json!({}),
+                json!({
+                    "ok": false,
+                    "error": error_value.clone(),
+                    "next_actions": ["git_worktree_list", "git_worktree_remove"]
+                }),
+            );
+            json!({
+                "requested": true,
+                "removed": false,
+                "pending": true,
+                "error": error_value,
+                "next_actions": ["git_worktree_list", "git_worktree_remove"]
+            })
+        }
+    }
 }
 
 fn export_work_session(
@@ -999,7 +1039,7 @@ fn resume_close_outbox(
 
     let completed = outbox.phase == WorkSessionClosePhase::Completed;
     let worktree_cleanup = if completed {
-        cleanup_closed_task_worktree(ctx, &outbox.task_id)?
+        cleanup_closed_task_worktree(ctx, &outbox.task_id, "close_work_session")?
     } else {
         Value::Null
     };
@@ -1677,6 +1717,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .harness
         .complete_task(task_id, verified, session_status)
         .map_err(map_error)?;
+    let worktree_cleanup = finish_task_worktree_cleanup(ctx, task_id);
     let workspace_session_status = ctx.harness.status().map_err(map_error)?.session_status;
     let mut response = json!({
         "ok": true,
@@ -1687,6 +1728,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         "requested_session_status": session_status,
         "next_stage_started": false,
         "task": task_view(&task),
+        "worktree_cleanup": worktree_cleanup,
         "change_summary": change_summary,
         "truncated": false,
         "details_tool": {

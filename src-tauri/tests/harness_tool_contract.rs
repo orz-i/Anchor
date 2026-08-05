@@ -826,6 +826,119 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
 }
 
 #[test]
+fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_on_finish() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "stateless task routing\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let shared = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "共享任务"}),
+        "stateless-start-shared",
+    );
+    assert_eq!(shared["ok"], true, "{shared}");
+    let shared_branch = shared["task"]["expected_state"]["branch"]
+        .as_str()
+        .expect("shared branch")
+        .to_string();
+
+    let isolated = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "隔离任务",
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": true
+        }),
+        "stateless-start-worktree",
+    );
+    assert_eq!(isolated["ok"], true, "{isolated}");
+    let task_id = isolated["task"]["id"].as_str().expect("task id");
+    let worktree_path = std::path::PathBuf::from(
+        isolated["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    let worktree_branch = isolated["task"]["expected_state"]["branch"]
+        .as_str()
+        .expect("worktree branch");
+
+    let cwd = call_tool_for_session(
+        &ctx,
+        "get_default_cwd",
+        &json!({}),
+        "stateless-cwd-after-start",
+    );
+    assert_eq!(cwd["ok"], true, "{cwd}");
+    assert_eq!(cwd["default_cwd"], ".");
+    assert_eq!(
+        std::path::PathBuf::from(cwd["resolved_cwd"].as_str().expect("resolved cwd"))
+            .canonicalize()
+            .expect("canonical cwd"),
+        worktree_path.canonicalize().expect("canonical worktree")
+    );
+
+    let status = call_tool_for_session(
+        &ctx,
+        "git_status",
+        &json!({}),
+        "stateless-status-after-start",
+    );
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["branch"], worktree_branch);
+
+    let patched = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: stateless-route.txt\n+worktree\n*** End Patch\n"
+        }),
+        "stateless-patch-after-start",
+    );
+    assert_eq!(patched["ok"], true, "{patched}");
+    assert!(worktree_path.join("stateless-route.txt").exists());
+    assert!(!workspace.join("stateless-route.txt").exists());
+
+    let removed = call_tool_for_session(
+        &ctx,
+        "remove_path",
+        &json!({"path": "stateless-route.txt"}),
+        "stateless-remove-after-start",
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+
+    let finished = call_tool_for_session(
+        &ctx,
+        "finish_task",
+        &json!({
+            "task_id": task_id,
+            "allow_unverified": true,
+            "session_status": "active"
+        }),
+        "stateless-finish-worktree",
+    );
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert_eq!(finished["worktree_cleanup"]["requested"], true);
+    assert_eq!(finished["worktree_cleanup"]["removed"], true);
+    assert!(!worktree_path.exists());
+
+    let primary_status = call_tool_for_session(
+        &ctx,
+        "git_status",
+        &json!({}),
+        "stateless-status-after-finish",
+    );
+    assert_eq!(primary_status["ok"], true, "{primary_status}");
+    assert_eq!(primary_status["branch"], shared_branch);
+}
+
+#[test]
 fn independent_worktree_tasks_remain_active_and_do_not_share_running_command_leases() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

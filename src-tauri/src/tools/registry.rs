@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 25;
+pub const CATALOG_VERSION: u32 = 26;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -2104,6 +2104,7 @@ pub fn output_schema(name: &str) -> Value {
                 "verification": { "type": "array", "items": { "type": "object" } },
                 "verification_summary": { "type": "object" },
                 "change_summary": { "type": "object" },
+                "worktree_cleanup": { "type": "object" },
                 "truncated": { "type": "boolean" },
                 "details_tool": { "type": "object" },
                 "max_response_bytes": { "type": "integer", "minimum": 1 },
@@ -2115,7 +2116,7 @@ pub fn output_schema(name: &str) -> Value {
                     "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
                     "then": {
                         "properties": { "closed": { "const": true } },
-                        "required": ["change_summary", "truncated", "details_tool", "max_response_bytes", "response_bytes"]
+                        "required": ["change_summary", "worktree_cleanup", "truncated", "details_tool", "max_response_bytes", "response_bytes"]
                     }
                 },
                 {
