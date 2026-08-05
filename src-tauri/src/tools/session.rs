@@ -238,18 +238,48 @@ pub fn list_command_sessions(store: &SessionStore, args: &Value) -> Result<Value
         .and_then(Value::as_u64)
         .unwrap_or(4_096)
         .clamp(0, 65_536) as usize;
-    let sessions = store.list_snapshots(include_terminal, max_output_bytes);
-    let running_count = sessions
+    let all_sessions = store.list_snapshots(true, max_output_bytes);
+    let unobserved_terminal_session_ids = all_sessions
+        .iter()
+        .filter(|session| session.get("execution_status") != Some(&json!("running")))
+        .filter(|session| session.get("result_observed") == Some(&Value::Bool(false)))
+        .filter_map(|session| session.get("session_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let running_session_ids = all_sessions
         .iter()
         .filter(|session| session.get("execution_status") == Some(&json!("running")))
-        .count();
+        .filter_map(|session| session.get("session_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let running_count = running_session_ids.len();
+    let sessions = if include_terminal {
+        all_sessions
+    } else {
+        all_sessions
+            .into_iter()
+            .filter(|session| session.get("execution_status") == Some(&json!("running")))
+            .collect::<Vec<_>>()
+    };
     let session_count = sessions.len();
     let terminal_count = session_count.saturating_sub(running_count);
+    let unobserved_terminal_count = unobserved_terminal_session_ids.len();
+    let pending_result_count = running_count.saturating_add(unobserved_terminal_count);
     Ok(tool_ok(json!({
         "sessions": sessions,
         "session_count": session_count,
         "running_count": running_count,
         "terminal_count": terminal_count,
+        "unobserved_terminal_count": unobserved_terminal_count,
+        "pending_result_count": pending_result_count,
+        "running_session_ids": running_session_ids,
+        "unobserved_terminal_session_ids": unobserved_terminal_session_ids,
+        "requires_followup": pending_result_count > 0,
+        "next_actions": if pending_result_count > 0 {
+            json!(["wait_command", "kill_session"])
+        } else {
+            json!([])
+        },
         "process_bound": true,
         "warnings": []
     })))
@@ -317,6 +347,7 @@ pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     });
     if session.has_exited() {
         crate::async_runtime::block_on(session.wait_for_readers());
+        session.mark_terminal_observed();
     }
     let snapshot = session.snapshot(limit);
     let termination_reason = snapshot
@@ -351,6 +382,11 @@ pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         "retryable": snapshot["retryable"],
         "started_at": snapshot["started_at"],
         "elapsed_ms": snapshot["elapsed_ms"],
+        "execution_duration_ms": snapshot["execution_duration_ms"],
+        "session_age_ms": snapshot["session_age_ms"],
+        "retained_ms": snapshot["retained_ms"],
+        "finished_at": snapshot["finished_at"],
+        "result_observed": snapshot["result_observed"],
         "last_output_at": snapshot["last_output_at"],
         "stdin_open": snapshot["stdin_open"],
         "stdout": stdout,
@@ -581,6 +617,64 @@ impl SessionStore {
         task_ids
     }
 
+    pub fn pending_for_task(
+        &self,
+        task_id: &str,
+        max_output_bytes: usize,
+    ) -> (Vec<Value>, Vec<Value>) {
+        self.pending_matching(
+            |session| {
+                session
+                    .harness_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.task_id == task_id)
+            },
+            max_output_bytes,
+        )
+    }
+
+    pub fn pending_for_owner(
+        &self,
+        owner_scope: &str,
+        max_output_bytes: usize,
+    ) -> (Vec<Value>, Vec<Value>) {
+        self.pending_matching(
+            |session| {
+                session.harness_metadata.is_none() && session.owner_scope() == Some(owner_scope)
+            },
+            max_output_bytes,
+        )
+    }
+
+    fn pending_matching<F>(
+        &self,
+        matches_scope: F,
+        max_output_bytes: usize,
+    ) -> (Vec<Value>, Vec<Value>)
+    where
+        F: Fn(&ExecSession) -> bool,
+    {
+        let sessions = {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            prune_terminal_sessions(&mut sessions, self.terminal_retention);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        let mut running = Vec::new();
+        let mut unobserved_terminal = Vec::new();
+        for session in sessions {
+            if !matches_scope(&session) {
+                continue;
+            }
+            crate::async_runtime::block_on(session.refresh_status());
+            if !session.has_exited() {
+                running.push(session.snapshot(max_output_bytes));
+            } else if !session.terminal_observed() {
+                unobserved_terminal.push(session.snapshot(max_output_bytes));
+            }
+        }
+        (running, unobserved_terminal)
+    }
+
     pub fn remove(&self, session_id: &str) {
         self.sessions
             .lock()
@@ -631,6 +725,8 @@ pub struct ExecSession {
     stderr: Mutex<StreamBuffer>,
     pub started_at: Instant,
     started_at_iso: String,
+    finished_at: Mutex<Option<Instant>>,
+    finished_at_iso: Mutex<Option<String>>,
     last_output_at: Mutex<String>,
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
@@ -638,7 +734,9 @@ pub struct ExecSession {
     termination_reason: Mutex<Option<String>>,
     reader_tasks: AsyncMutex<Vec<crate::async_runtime::JoinHandle<()>>>,
     harness_metadata: Option<SessionHarnessMetadata>,
+    owner_scope: Option<String>,
     harness_finalized: AtomicBool,
+    terminal_observed: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +772,7 @@ impl ExecSession {
             String::new(),
             String::new(),
             harness_metadata,
+            None,
         )
     }
 
@@ -683,6 +782,7 @@ impl ExecSession {
         command: String,
         resolved_cwd: String,
         harness_metadata: Option<SessionHarnessMetadata>,
+        owner_scope: Option<String>,
     ) -> Self {
         Self::new_with_details_and_encoding(
             child,
@@ -690,6 +790,7 @@ impl ExecSession {
             command,
             resolved_cwd,
             harness_metadata,
+            owner_scope,
             StreamEncoding::Utf8,
         )
     }
@@ -700,6 +801,7 @@ impl ExecSession {
         command: String,
         resolved_cwd: String,
         harness_metadata: Option<SessionHarnessMetadata>,
+        owner_scope: Option<String>,
         output_encoding: StreamEncoding,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
@@ -719,6 +821,8 @@ impl ExecSession {
             stderr: Mutex::new(StreamBuffer::default()),
             started_at: Instant::now(),
             started_at_iso: started_at_iso.clone(),
+            finished_at: Mutex::new(None),
+            finished_at_iso: Mutex::new(None),
             last_output_at: Mutex::new(started_at_iso),
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
@@ -726,12 +830,28 @@ impl ExecSession {
             termination_reason: Mutex::new(None),
             reader_tasks: AsyncMutex::new(Vec::new()),
             harness_metadata,
+            owner_scope,
             harness_finalized: AtomicBool::new(false),
+            terminal_observed: AtomicBool::new(false),
         }
     }
 
     pub fn harness_metadata(&self) -> Option<SessionHarnessMetadata> {
         self.harness_metadata.clone()
+    }
+
+    pub fn owner_scope(&self) -> Option<&str> {
+        self.owner_scope.as_deref()
+    }
+
+    pub fn terminal_observed(&self) -> bool {
+        self.terminal_observed.load(Ordering::Acquire)
+    }
+
+    pub fn mark_terminal_observed(&self) {
+        if self.has_exited() {
+            self.terminal_observed.store(true, Ordering::Release);
+        }
     }
 
     pub fn mark_harness_finalized(&self) -> bool {
@@ -837,6 +957,11 @@ impl ExecSession {
 
     fn record_exit_status(&self, status: std::process::ExitStatus) {
         *self.exit_code.lock().expect("exit_code lock") = status.code();
+        let mut finished_at = self.finished_at.lock().expect("finished_at lock");
+        if finished_at.is_none() {
+            *finished_at = Some(Instant::now());
+            *self.finished_at_iso.lock().expect("finished_at_iso lock") = Some(timestamp());
+        }
         self.exited.store(true, Ordering::Release);
         *self.stdin_open.lock().expect("stdin_open lock") = false;
         let mut reason = self.termination_reason.lock().expect("termination lock");
@@ -922,6 +1047,14 @@ impl ExecSession {
             reason,
             "timeout" | "killed" | "spawn_failed" | "server_restart"
         );
+        let session_age_ms = self.started_at.elapsed().as_millis();
+        let finished_at = *self.finished_at.lock().expect("finished_at lock");
+        let execution_duration_ms = finished_at
+            .map(|finished_at| finished_at.duration_since(self.started_at).as_millis())
+            .unwrap_or(session_age_ms);
+        let retained_ms = finished_at
+            .map(|finished_at| finished_at.elapsed().as_millis())
+            .unwrap_or(0);
         json!({
             "session_id": self.session_id,
             "command": self.command,
@@ -951,9 +1084,14 @@ impl ExecSession {
             "stderr_truncated": stderr.truncated,
             "stdout_complete": self.has_exited() && !stdout.truncated,
             "stderr_complete": self.has_exited() && !stderr.truncated,
-            "elapsed_ms": self.started_at.elapsed().as_millis(),
+            "elapsed_ms": execution_duration_ms,
+            "execution_duration_ms": execution_duration_ms,
+            "session_age_ms": session_age_ms,
+            "retained_ms": retained_ms,
             "started_at": self.started_at_iso,
+            "finished_at": self.finished_at_iso.lock().expect("finished_at_iso lock").clone(),
             "last_output_at": self.last_output_at.lock().expect("last output lock").clone(),
+            "result_observed": self.terminal_observed(),
             "output_refs": {
                 "stdout": format!("session:{}:stdout", self.session_id),
                 "stderr": format!("session:{}:stderr", self.session_id)
@@ -1077,6 +1215,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
                 retryable: false,
             });
         }
+        session.mark_terminal_observed();
         return Ok(finalize_execution_result(
             session.snapshot(max_output_bytes),
         ));
@@ -1112,6 +1251,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         .min(30_000);
     std::thread::sleep(std::time::Duration::from_millis(yield_ms));
     crate::async_runtime::block_on(session.refresh_status());
+    session.mark_terminal_observed();
     Ok(finalize_execution_result(
         session.snapshot(max_output_bytes),
     ))
@@ -1166,6 +1306,10 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
             killed = true;
             status = "killed";
         }
+    }
+
+    if evicted {
+        session.mark_terminal_observed();
     }
 
     let mut payload = session.snapshot(max_output_bytes);

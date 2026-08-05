@@ -178,6 +178,115 @@ fn wait_command_cursor_survives_stateless_transport_for_the_same_principal_only(
 }
 
 #[test]
+fn list_command_sessions_separates_execution_duration_from_retention_age() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let caller_session = "session-duration-caller";
+    let started = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-u",
+                "-c",
+                "import time; print('duration-line', flush=True); time.sleep(0.15)"
+            ],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+        caller_session,
+    );
+    let started = assert_ok(&started);
+    let command_session = started["session_id"].as_str().expect("command session");
+    std::thread::sleep(std::time::Duration::from_millis(350));
+
+    let first = call_tool_for_session(
+        &ctx,
+        "list_command_sessions",
+        &json!({"include_terminal": true, "max_output_bytes": 1_024}),
+        caller_session,
+    );
+    let first = assert_ok(&first);
+    assert_eq!(first["requires_followup"], true);
+    assert_eq!(first["pending_result_count"], 1);
+    assert_eq!(first["unobserved_terminal_count"], 1);
+    let first_session = first["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["session_id"] == command_session)
+        })
+        .expect("retained command session");
+    assert_eq!(first_session["execution_status"], "succeeded");
+    assert_eq!(first_session["result_observed"], false);
+    assert_eq!(
+        first_session["elapsed_ms"],
+        first_session["execution_duration_ms"]
+    );
+    let execution_duration = first_session["execution_duration_ms"]
+        .as_u64()
+        .expect("execution duration");
+    let first_age = first_session["session_age_ms"]
+        .as_u64()
+        .expect("session age");
+    let first_retained = first_session["retained_ms"].as_u64().expect("retained age");
+
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let second = call_tool_for_session(
+        &ctx,
+        "list_command_sessions",
+        &json!({"include_terminal": true, "max_output_bytes": 1_024}),
+        caller_session,
+    );
+    let second = assert_ok(&second);
+    let second_session = second["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["session_id"] == command_session)
+        })
+        .expect("retained command session");
+    assert_eq!(second_session["execution_duration_ms"], execution_duration);
+    assert!(second_session["session_age_ms"].as_u64().unwrap_or(0) > first_age);
+    assert!(second_session["retained_ms"].as_u64().unwrap_or(0) >= first_retained);
+
+    let running_only = call_tool_for_session(
+        &ctx,
+        "list_command_sessions",
+        &json!({"include_terminal": false, "max_output_bytes": 0}),
+        caller_session,
+    );
+    let running_only = assert_ok(&running_only);
+    assert_eq!(running_only["session_count"], 0);
+    assert_eq!(running_only["pending_result_count"], 1);
+    assert_eq!(running_only["unobserved_terminal_count"], 1);
+    assert_eq!(running_only["requires_followup"], true);
+
+    let waited = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+        caller_session,
+    );
+    let waited = assert_ok(&waited);
+    assert_eq!(waited["result_observed"], true);
+    assert_eq!(waited["execution_duration_ms"], execution_duration);
+
+    let final_list = call_tool_for_session(
+        &ctx,
+        "list_command_sessions",
+        &json!({"include_terminal": true, "max_output_bytes": 0}),
+        caller_session,
+    );
+    let final_list = assert_ok(&final_list);
+    assert_eq!(final_list["pending_result_count"], 0);
+    assert_eq!(final_list["requires_followup"], false);
+}
+
+#[test]
 fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

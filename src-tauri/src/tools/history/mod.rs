@@ -442,7 +442,11 @@ fn required_checkpoint_argument(args: &Value, name: &str) -> WorkspaceResult<Str
     Ok(value)
 }
 
-pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
+pub fn checkpoint(
+    ctx: &ToolContext,
+    args: &Value,
+    mcp_session_id: Option<&str>,
+) -> WorkspaceResult<Value> {
     let session_key = required_checkpoint_argument(args, "session_key")?;
     let expected_path = required_checkpoint_argument(args, "expected_path")?;
     let history_dir = resolve_dir(ctx, args)?;
@@ -514,6 +518,23 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 json!({
                     "task_ids": active_bound_tasks,
                     "suggestion": "使用 close_work_session 完成验证、关闭任务并写入最终 checkpoint"
+                }),
+            ));
+        }
+    }
+    if let Some(owner_scope) = ctx.command_owner_scope_for_session(mcp_session_id) {
+        let (running_sessions, unobserved_terminal_sessions) =
+            ctx.sessions.pending_for_owner(&owner_scope, 2_048);
+        if !running_sessions.is_empty() || !unobserved_terminal_sessions.is_empty() {
+            return Err(history_error(
+                "HISTORY_COMMAND_RESULTS_PENDING",
+                "当前会话仍有运行中或终态尚未消费的 retained command；写入显式 checkpoint 前必须先检查结果。",
+                "validation",
+                true,
+                json!({
+                    "running_sessions": running_sessions,
+                    "unobserved_terminal_sessions": unobserved_terminal_sessions,
+                    "suggestion": "调用 list_command_sessions 定位会话；对每个会话调用 wait_command，或使用 kill_session 终止后消费结果"
                 }),
             ));
         }
@@ -796,7 +817,7 @@ pub fn auto_checkpoint_after_tool(
         "session_status": "active",
         "notes": "Anchor 自动保存的结构化阶段检查点；相同阶段身份会幂等更新。"
     });
-    checkpoint(ctx, &checkpoint_args).map(Some)
+    checkpoint(ctx, &checkpoint_args, None).map(Some)
 }
 
 pub(crate) fn checkpoint_reference(checkpoint: &Value) -> Value {

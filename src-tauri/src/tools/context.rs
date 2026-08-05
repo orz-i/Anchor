@@ -267,6 +267,16 @@ impl ToolContext {
         }
     }
 
+    pub fn command_owner_scope_for_session(&self, session_id: Option<&str>) -> Option<String> {
+        let session_id = session_id?;
+        self.session_cursor_scopes
+            .lock()
+            .expect("session cursor scope lock")
+            .get(session_id)
+            .cloned()
+            .or_else(|| Some(format!("transport:{session_id}")))
+    }
+
     pub fn bind_task_for_session(
         &self,
         session_id: Option<&str>,

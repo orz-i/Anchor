@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 26;
+pub const CATALOG_VERSION: u32 = 27;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -38,7 +38,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "begin_work_session",
         "Begin work session",
-        "Create or resume a History Session and bind the calling MCP session to a shared-checkout task by default or an explicitly requested isolated Git worktree task.",
+        "[anchor-core] Create or resume a History Session and bind the calling MCP session to a shared-checkout task by default or an explicitly requested isolated Git worktree task.",
         false,
         false,
         false,
@@ -46,7 +46,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "close_work_session",
         "Close work session",
-        "Validate and close the bound Harness Task, then persist the matching History Session checkpoint as a recoverable workflow.",
+        "[anchor-core] Validate and close the bound Harness Task, then persist the matching History Session checkpoint as a recoverable workflow. Closure is rejected while retained commands are running or their terminal results are unconsumed.",
         false,
         false,
         false,
@@ -54,7 +54,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "wait_command",
         "Wait for command",
-        "Wait for a retained command session and return explicit terminal state plus incremental stdout/stderr.",
+        "[anchor-core anchor-command] Wait for a retained command session and return explicit terminal state plus incremental stdout/stderr; a terminal response consumes the retained result for completion gates.",
         true,
         false,
         false,
@@ -62,7 +62,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "list_command_sessions",
         "List command sessions",
-        "Return all retained command sessions with command identity, execution state, output references, and recent activity timestamps for reliable resume.",
+        "[anchor-core anchor-command] Return retained command sessions, stable execution duration, separate session age/retention time, and running or terminal-unconsumed result counts for reliable resume and final-response checks.",
         true,
         false,
         false,
@@ -78,7 +78,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "server_info",
         "Server info",
-        "Return server, workspace, auth, profile, and exposed-tool metadata.",
+        "[anchor-core] Return server, workspace, auth, profile, exposed-tool metadata, and lazy-schema discovery guidance.",
         true,
         false,
         false,
@@ -134,7 +134,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "history_session_bootstrap",
         "Initialize or restore development session",
-        "At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
+        "[anchor-core] At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
         false,
         false,
         false,
@@ -142,7 +142,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "history_session_checkpoint",
         "Save development checkpoint",
-        "Save or update one idempotent, redacted development handoff. Pass session_key and expected_path exactly as returned by history_session_bootstrap so changing host metadata cannot redirect the checkpoint. The turn_id is optional and generated deterministically when omitted.",
+        "[anchor-core] Save or update one idempotent, redacted development handoff. Pass session_key and expected_path exactly as returned by history_session_bootstrap. Any explicit checkpoint is rejected while this caller still owns running or terminal-unconsumed retained commands.",
         false,
         false,
         false,
@@ -310,7 +310,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "read_file",
         "Read file",
-        "Read a UTF-8 or BOM-marked UTF-16 text file slice strictly inside the configured workspace.",
+        "[anchor-core anchor-files] Read a UTF-8 or BOM-marked UTF-16 text file slice strictly inside the configured workspace.",
         true,
         false,
         false,
@@ -326,7 +326,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "list_files",
         "List files",
-        "List workspace files using glob filters.",
+        "[anchor-core anchor-files] List workspace files using glob filters.",
         true,
         false,
         false,
@@ -334,7 +334,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "search_text",
         "Search text",
-        "Search UTF-8 or BOM-marked UTF-16 workspace files for text or regex matches.",
+        "[anchor-core anchor-files] Search UTF-8 or BOM-marked UTF-16 workspace files for text or regex matches.",
         true,
         false,
         false,
@@ -342,7 +342,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "apply_patch",
         "Apply patch",
-        "Apply a patch envelope transactionally with cooperative cancellation, bounded processing time, and atomic rollback inside the workspace.",
+        "[anchor-core anchor-files] Apply a patch envelope transactionally with cooperative cancellation, bounded processing time, and atomic rollback inside the workspace.",
         false,
         true,
         false,
@@ -366,7 +366,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "exec_command",
         "Execute command",
-        "Run a bounded command in the workspace under runtime policy.",
+        "[anchor-core anchor-command] Run a bounded command in the workspace under runtime policy.",
         false,
         true,
         true,
@@ -382,7 +382,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "write_stdin",
         "Write stdin",
-        "Write characters to a server-managed running command session.",
+        "[anchor-core anchor-command] Write characters to a server-managed running command session.",
         false,
         true,
         false,
@@ -390,7 +390,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "kill_session",
         "Kill session",
-        "Terminate a server-managed running command session.",
+        "[anchor-core anchor-command] Terminate a server-managed running command session and return its consumed terminal result.",
         false,
         true,
         false,
@@ -398,7 +398,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "read_output",
         "Read output",
-        "Read retained stdout or stderr by output_ref with per-stream byte offset pagination.",
+        "[anchor-core anchor-command] Read retained stdout or stderr by output_ref with per-stream byte offset pagination.",
         true,
         false,
         false,
@@ -406,7 +406,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "git_status",
         "Git status",
-        "Return git working tree status for the workspace.",
+        "[anchor-core anchor-git] Return git working tree status for the workspace.",
         true,
         false,
         false,
@@ -446,7 +446,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "git_stage",
         "Git stage",
-        "Stage explicit workspace-relative paths without invoking a shell.",
+        "[anchor-core anchor-git] Stage explicit workspace-relative paths without invoking a shell.",
         false,
         false,
         false,
@@ -454,7 +454,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "git_commit",
         "Git commit",
-        "Commit the currently staged changes with an explicit message and return the exact committed files.",
+        "[anchor-core anchor-git] Commit the currently staged changes with an explicit message and return the exact committed files.",
         false,
         false,
         false,
@@ -494,7 +494,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "git_diff",
         "Git diff",
-        "Return unified git diff for workspace changes.",
+        "[anchor-core anchor-git] Return unified git diff for workspace changes.",
         true,
         false,
         false,
@@ -936,6 +936,11 @@ fn session_snapshot_output_schema() -> Value {
             "stdout_complete": { "type": "boolean" },
             "stderr_complete": { "type": "boolean" },
             "elapsed_ms": { "type": "integer", "minimum": 0 },
+            "execution_duration_ms": { "type": "integer", "minimum": 0 },
+            "session_age_ms": { "type": "integer", "minimum": 0 },
+            "retained_ms": { "type": "integer", "minimum": 0 },
+            "finished_at": { "type": ["string", "null"] },
+            "result_observed": { "type": "boolean" },
             "affected_files": { "type": "array", "items": { "type": "object" } },
             "mutation_attributed": { "type": "boolean" },
             "output_refs": {
@@ -973,6 +978,11 @@ fn session_snapshot_output_schema() -> Value {
             "stdout_complete",
             "stderr_complete",
             "elapsed_ms",
+            "execution_duration_ms",
+            "session_age_ms",
+            "retained_ms",
+            "finished_at",
+            "result_observed",
             "output_refs",
         ],
     )
@@ -1030,6 +1040,17 @@ pub fn output_schema(name: &str) -> Value {
                     "current_proxy_tool_count": { "type": "integer", "minimum": 0 }
                 }),
                 json!({
+                    "schema_discovery": {
+                        "type": "object",
+                        "properties": {
+                            "recommended_query": { "type": "string", "const": "anchor-core" },
+                            "group_queries": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                            "strategy": { "type": "string", "minLength": 1 },
+                            "host_followup_notice": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["recommended_query", "group_queries", "strategy", "host_followup_notice"],
+                        "additionalProperties": false
+                    },
                     "command_cost_policy": { "type": "object" },
                     "downstream_mcp": {
                         "type": "object",
@@ -1085,6 +1106,7 @@ pub fn output_schema(name: &str) -> Value {
                 "current_catalog_estimated_tokens",
                 "current_local_tool_count",
                 "current_proxy_tool_count",
+                "schema_discovery",
                 "command_cost_policy",
                 "downstream_mcp",
                 "connection_layers",
@@ -1153,6 +1175,12 @@ pub fn output_schema(name: &str) -> Value {
                 "session_count": { "type": "integer", "minimum": 0 },
                 "running_count": { "type": "integer", "minimum": 0 },
                 "terminal_count": { "type": "integer", "minimum": 0 },
+                "unobserved_terminal_count": { "type": "integer", "minimum": 0 },
+                "pending_result_count": { "type": "integer", "minimum": 0 },
+                "running_session_ids": { "type": "array", "items": { "type": "string" } },
+                "unobserved_terminal_session_ids": { "type": "array", "items": { "type": "string" } },
+                "requires_followup": { "type": "boolean" },
+                "next_actions": { "type": "array", "items": { "type": "string" } },
                 "process_bound": { "type": "boolean", "const": true },
                 "warnings": warnings_property()
             }),
@@ -1161,6 +1189,12 @@ pub fn output_schema(name: &str) -> Value {
                 "session_count",
                 "running_count",
                 "terminal_count",
+                "unobserved_terminal_count",
+                "pending_result_count",
+                "running_session_ids",
+                "unobserved_terminal_session_ids",
+                "requires_followup",
+                "next_actions",
                 "process_bound",
                 "warnings",
             ],
@@ -1544,6 +1578,11 @@ pub fn output_schema(name: &str) -> Value {
                 "retryable": { "type": "boolean" },
                 "started_at": { "type": "string", "minLength": 1 },
                 "elapsed_ms": { "type": "integer", "minimum": 0 },
+                "execution_duration_ms": { "type": "integer", "minimum": 0 },
+                "session_age_ms": { "type": "integer", "minimum": 0 },
+                "retained_ms": { "type": "integer", "minimum": 0 },
+                "finished_at": { "type": ["string", "null"] },
+                "result_observed": { "type": "boolean" },
                 "last_output_at": { "type": "string", "minLength": 1 },
                 "stdin_open": { "type": "boolean" },
                 "stdout": { "type": "object" },
@@ -1570,6 +1609,11 @@ pub fn output_schema(name: &str) -> Value {
                 "retryable",
                 "started_at",
                 "elapsed_ms",
+                "execution_duration_ms",
+                "session_age_ms",
+                "retained_ms",
+                "finished_at",
+                "result_observed",
                 "last_output_at",
                 "stdin_open",
                 "stdout",
@@ -3080,6 +3124,58 @@ mod tests {
             assert_eq!(output["type"], "object", "{name} output type");
             assert!(output["properties"].is_object(), "{name} output properties");
             assert_eq!(output["required"], json!(["ok"]));
+        }
+    }
+
+    #[test]
+    fn lazy_schema_tags_expose_a_bounded_core_workflow_bundle() {
+        let tools = list_tools_for_profile("advanced");
+        let core = tools
+            .iter()
+            .filter(|tool| {
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("anchor-core"))
+            })
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<HashSet<_>>();
+        for required in [
+            "server_info",
+            "history_session_bootstrap",
+            "history_session_checkpoint",
+            "begin_work_session",
+            "close_work_session",
+            "read_file",
+            "search_text",
+            "apply_patch",
+            "exec_command",
+            "wait_command",
+            "list_command_sessions",
+            "write_stdin",
+            "kill_session",
+            "git_status",
+            "git_stage",
+            "git_commit",
+        ] {
+            assert!(
+                core.contains(required),
+                "missing core schema tag: {required}"
+            );
+        }
+        assert!(
+            core.len() <= 20,
+            "core schema group must stay bounded: {core:?}"
+        );
+
+        for tag in ["anchor-files", "anchor-command", "anchor-git"] {
+            assert!(
+                tools.iter().any(|tool| {
+                    tool["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains(tag))
+                }),
+                "missing lazy schema group tag: {tag}"
+            );
         }
     }
 

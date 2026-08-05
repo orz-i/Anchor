@@ -812,7 +812,7 @@ fn call_tool_impl(
     }
     let result = match name {
         "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
-        "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
+        "history_session_checkpoint" => history::checkpoint(ctx, &effective_args, session_id),
         "history_session_validate" => history::validate(ctx, &effective_args),
         "server_info" => server_info_for_session(ctx, session_id),
         "list_skills" => crate::skills::list_tool(ctx, &effective_args),
@@ -836,6 +836,7 @@ fn call_tool_impl(
             &effective_args,
             cancellation,
             active_task.as_ref().map(|task| task.id.as_str()),
+            session_id,
         ),
         "read_output" => session::read_output(&ctx.sessions, &effective_args),
         "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
@@ -1517,6 +1518,12 @@ fn server_info_for_session(
         "current_catalog_estimated_tokens": current_catalog.estimated_tokens,
         "current_local_tool_count": current_catalog.local_count,
         "current_proxy_tool_count": current_catalog.proxy_count,
+        "schema_discovery": {
+            "recommended_query": "anchor-core",
+            "group_queries": ["anchor-core", "anchor-files", "anchor-command", "anchor-git"],
+            "strategy": "Load one tagged schema group per workflow instead of repeatedly discovering exact tool names.",
+            "host_followup_notice": "A separate 'found tools; listed in the follow-up message' response is rendered by the lazy-schema host, not by the Anchor MCP server."
+        },
         "command_cost_policy": command_cost_policy,
         "downstream_mcp": downstream_mcp.clone(),
         "connection_layers": connection_layers

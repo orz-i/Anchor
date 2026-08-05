@@ -2258,6 +2258,80 @@ fn harness_tools_support_task_lifecycle() {
 }
 
 #[test]
+fn finish_task_rejects_running_and_terminal_unobserved_commands() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "消费后台命令后再结束"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+    let command = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-u", "-c", "import time; print('pending', flush=True); time.sleep(0.4)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+    );
+    let command_session = command["session_id"].as_str().expect("命令 Session");
+
+    let running_blocked = call_tool(
+        &ctx,
+        "finish_task",
+        &json!({"task_id": task_id, "allow_unverified": true}),
+    );
+    assert_eq!(running_blocked["ok"], false);
+    assert_eq!(
+        running_blocked["error"]["code"],
+        "TASK_COMMAND_RESULTS_PENDING"
+    );
+    assert_eq!(
+        running_blocked["running_sessions"][0]["session_id"],
+        command_session
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    let terminal_blocked = call_tool(
+        &ctx,
+        "finish_task",
+        &json!({"task_id": task_id, "allow_unverified": true}),
+    );
+    assert_eq!(terminal_blocked["ok"], false);
+    assert_eq!(
+        terminal_blocked["error"]["code"],
+        "TASK_COMMAND_RESULTS_PENDING"
+    );
+    assert_eq!(
+        terminal_blocked["unobserved_terminal_sessions"][0]["session_id"],
+        command_session
+    );
+
+    let observed = call_tool(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+    );
+    assert_eq!(observed["ok"], true);
+    assert_eq!(observed["result_observed"], true);
+
+    let finished = call_tool(
+        &ctx,
+        "finish_task",
+        &json!({"task_id": task_id, "allow_unverified": true}),
+    );
+    assert_eq!(finished["ok"], true);
+    assert_eq!(finished["closed"], true);
+}
+
+#[test]
 fn finish_task_requires_structured_verification_and_then_closes_atomically() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

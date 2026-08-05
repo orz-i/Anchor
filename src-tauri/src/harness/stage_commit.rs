@@ -867,6 +867,7 @@ fn start_deferred_check(
         &arguments,
         cancellation,
         Some(&receipt.task_id),
+        None,
     )?;
     if result.get("status").and_then(Value::as_str) == Some("running") {
         receipt.current_session_id = result
@@ -1011,7 +1012,7 @@ fn resume_checkpoint(
         finish_operation(ctx, receipt, false);
         return receipt_response(receipt, false, true);
     };
-    match history::checkpoint(ctx, checkpoint) {
+    match history::checkpoint(ctx, checkpoint, None) {
         Ok(result) => {
             receipt.checkpoint_hash = result
                 .get("content_hash")
@@ -1066,7 +1067,7 @@ fn run_required_check(
         )
     })?;
     let mut result =
-        exec::exec_command_with_cancellation(ctx, &arguments, cancellation, Some(task_id))?;
+        exec::exec_command_with_cancellation(ctx, &arguments, cancellation, Some(task_id), None)?;
     while result.get("status").and_then(Value::as_str) == Some("running") {
         let session_id = result
             .get("session_id")

@@ -3,10 +3,15 @@ mod common;
 use std::fs;
 use std::sync::{Arc, Barrier};
 
-use anchor_lib::tools::{list_tools_for_profile, ToolContext};
+use anchor_lib::tools::{call_tool_for_session, list_tools_for_profile, ToolContext};
 use serde_json::{json, Value};
 
 use common::{assert_err, assert_ok, invoke};
+
+#[cfg(windows)]
+const TEST_PYTHON: &str = "python";
+#[cfg(not(windows))]
+const TEST_PYTHON: &str = "python3";
 
 fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -14,6 +19,80 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
     let ctx = ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
         .expect("tool context");
     (workspace, harness, ctx)
+}
+
+#[test]
+fn completed_checkpoint_requires_retained_command_results_to_be_consumed() {
+    let (_workspace, _harness, ctx) = test_context();
+    let caller_session = "history-pending-command";
+    let boot = call_tool_for_session(
+        &ctx,
+        "history_session_bootstrap",
+        &json!({"session_key": "history-pending-command-session"}),
+        caller_session,
+    );
+    let boot = assert_ok(&boot);
+    let started = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-u", "-c", "import time; print('history-pending', flush=True); time.sleep(0.4)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+        caller_session,
+    );
+    let started = assert_ok(&started);
+    let command_session = started["session_id"].as_str().expect("command session");
+    let pending_checkpoint_args = json!({
+        "session_key": boot["session_key"],
+        "expected_path": boot["current_path"],
+        "turn_id": "pending-command-finish",
+        "user_intent": "检查后台结果后完成",
+        "session_status": "active"
+    });
+
+    let running = call_tool_for_session(
+        &ctx,
+        "history_session_checkpoint",
+        &pending_checkpoint_args,
+        caller_session,
+    );
+    let running = assert_err(&running);
+    assert_eq!(running["error"]["code"], "HISTORY_COMMAND_RESULTS_PENDING");
+
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    let terminal = call_tool_for_session(
+        &ctx,
+        "history_session_checkpoint",
+        &pending_checkpoint_args,
+        caller_session,
+    );
+    let terminal = assert_err(&terminal);
+    assert_eq!(terminal["error"]["code"], "HISTORY_COMMAND_RESULTS_PENDING");
+
+    let waited = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+        caller_session,
+    );
+    assert_eq!(assert_ok(&waited)["result_observed"], true);
+
+    let completed = call_tool_for_session(
+        &ctx,
+        "history_session_checkpoint",
+        &json!({
+            "session_key": boot["session_key"],
+            "expected_path": boot["current_path"],
+            "turn_id": "pending-command-finish",
+            "user_intent": "检查后台结果后完成",
+            "session_status": "completed"
+        }),
+        caller_session,
+    );
+    assert_eq!(assert_ok(&completed)["session_status"], "completed");
 }
 
 #[test]

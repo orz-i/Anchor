@@ -21,7 +21,7 @@ const COMPLETION_GRACE: Duration = Duration::from_millis(50);
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
-    exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None)
+    exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None, None)
 }
 
 fn parse_and_resolve_execution(
@@ -318,6 +318,7 @@ pub fn exec_command_with_cancellation(
     args: &Value,
     cancellation: &CancellationToken,
     task_id: Option<&str>,
+    mcp_session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     if cancellation.is_cancelled() {
         return Err(cancelled_error(None));
@@ -457,6 +458,7 @@ pub fn exec_command_with_cancellation(
             supersede_previous_failures,
             cancellation,
             task_id,
+            mcp_session_id,
         )
         .await
     });
@@ -681,6 +683,7 @@ async fn run_command(
     supersede_previous_failures: bool,
     cancellation: &CancellationToken,
     task_id: Option<&str>,
+    mcp_session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     if cancellation.is_cancelled() {
         return Err(cancelled_error(None));
@@ -746,6 +749,7 @@ async fn run_command(
             cmd.to_string(),
             cwd.display().to_string(),
             harness_metadata,
+            ctx.command_owner_scope_for_session(mcp_session_id),
             stream_encoding_for_program(&program),
         )) {
         Ok(session) => session,
@@ -897,7 +901,7 @@ fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant
                 session.wait_for_readers().await;
                 break;
             }
-            tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
         }
     });
 }
@@ -929,6 +933,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "blocking",
         true,
         &CancellationToken::default(),
+        None,
         None,
     ));
 

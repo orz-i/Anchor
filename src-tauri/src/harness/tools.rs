@@ -999,7 +999,7 @@ fn resume_close_outbox(
         outbox.phase,
         WorkSessionClosePhase::TaskClosed | WorkSessionClosePhase::CheckpointPending
     ) {
-        match crate::tools::history::checkpoint(ctx, &outbox.checkpoint_args) {
+        match crate::tools::history::checkpoint(ctx, &outbox.checkpoint_args, None) {
             Ok(result) => {
                 checkpoint = Some(result);
                 outbox.phase = WorkSessionClosePhase::Completed;
@@ -1624,6 +1624,34 @@ fn transition(
 
 fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
+    let (running_sessions, unobserved_terminal_sessions) =
+        ctx.sessions.pending_for_task(task_id, 2_048);
+    if !running_sessions.is_empty() || !unobserved_terminal_sessions.is_empty() {
+        let task = ctx.harness.task(task_id).map_err(map_error)?;
+        return Ok(json!({
+            "ok": false,
+            "task_status": task.status,
+            "closed": false,
+            "session_status": "active",
+            "next_stage_started": false,
+            "reason": "当前任务仍有运行中或终态尚未消费的 retained command；必须先读取最终结果或显式终止后才能关闭任务。",
+            "error": {
+                "code": "TASK_COMMAND_RESULTS_PENDING",
+                "message": "Retained command results must be consumed before task completion.",
+                "category": "validation",
+                "retryable": true,
+                "details": {
+                    "running_sessions": running_sessions,
+                    "unobserved_terminal_sessions": unobserved_terminal_sessions,
+                    "suggestion": "调用 list_command_sessions 定位会话；对每个会话使用 wait_command 获取终态，或使用 kill_session 终止后消费结果。"
+                }
+            },
+            "running_sessions": running_sessions,
+            "unobserved_terminal_sessions": unobserved_terminal_sessions,
+            "next_actions": ["list_command_sessions", "wait_command", "kill_session", "finish_task"],
+            "task": task_view(&task)
+        }));
+    }
     ctx.harness.check_baseline(task_id).map_err(map_error)?;
     let allow_unverified = args
         .get("allow_unverified")
