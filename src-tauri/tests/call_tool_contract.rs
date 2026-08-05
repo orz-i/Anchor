@@ -22,6 +22,18 @@ fn server_info_returns_workspace_and_tools() {
     assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     assert!(payload["tools"].is_array());
     assert!(payload["tool_count"].as_u64().unwrap_or(0) > 0);
+    assert!(payload["build_identity"]["git_sha"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(payload["build_identity"]["git_dirty"].is_boolean());
+    assert_eq!(
+        payload["build_identity"]["catalog_version"],
+        payload["catalog_version"]
+    );
+    assert_eq!(
+        payload["build_identity"]["package_version"],
+        payload["version"]
+    );
     assert_eq!(payload["catalog_published"], false);
     assert_eq!(payload["catalog_changed"], false);
     assert_eq!(payload["reconnect_required"], false);

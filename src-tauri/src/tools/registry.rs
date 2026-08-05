@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 24;
+pub const CATALOG_VERSION: u32 = 25;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -1008,6 +1008,18 @@ pub fn output_schema(name: &str) -> Value {
                     "catalog_changed": { "type": "boolean" },
                     "reconnect_required": { "type": "boolean" },
                     "catalog_version": { "type": "integer", "minimum": 1 },
+                    "build_identity": {
+                        "type": "object",
+                        "properties": {
+                            "git_sha": { "type": "string", "minLength": 1 },
+                            "git_dirty": { "type": "boolean" },
+                            "build_workspace": { "type": "string", "minLength": 1 },
+                            "catalog_version": { "type": "integer", "minimum": 1 },
+                            "package_version": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["git_sha", "git_dirty", "build_workspace", "catalog_version", "package_version"],
+                        "additionalProperties": false
+                    },
                     "catalog_bytes": { "type": "integer", "minimum": 0 },
                     "catalog_estimated_tokens": { "type": "integer", "minimum": 0 },
                     "local_tool_count": { "type": "integer", "minimum": 0 },
@@ -1064,6 +1076,7 @@ pub fn output_schema(name: &str) -> Value {
                 "catalog_changed",
                 "reconnect_required",
                 "catalog_version",
+                "build_identity",
                 "catalog_bytes",
                 "catalog_estimated_tokens",
                 "local_tool_count",

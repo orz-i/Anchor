@@ -21,6 +21,20 @@ pub(crate) fn requested_patch_timeout_ms(args: &Value) -> u64 {
         .clamp(MIN_PATCH_TIMEOUT_MS, MAX_PATCH_TIMEOUT_MS)
 }
 
+fn post_validation_recovery_suggestion(ctx: &ToolContext) -> Value {
+    if ctx.is_published_tool("patch_check") == Some(true) {
+        json!({
+            "tool": "patch_check",
+            "message": "修正失败文件后重新运行 patch_check；验证发生在事务写盘前。"
+        })
+    } else {
+        json!({
+            "tool": "read_file",
+            "message": "使用 read_file 查看当前内容，修正语法后以 apply_patch dry_run=true 重试。"
+        })
+    }
+}
+
 struct PatchExecution<'a> {
     cancellation: &'a CancellationToken,
     started: Instant,
@@ -166,59 +180,98 @@ fn apply_patch_with_execution(
     let mut summaries = Vec::new();
     let mut hunk_matches = Vec::new();
     let mut staged: HashMap<String, Option<String>> = HashMap::new();
+    let mut grouped = Vec::<Vec<&FilePatch>>::new();
+    let mut group_indexes = HashMap::<&str, usize>::new();
+    for file_patch in &file_patches {
+        if let Some(index) = group_indexes.get(file_patch.path.as_str()).copied() {
+            grouped[index].push(file_patch);
+        } else {
+            group_indexes.insert(file_patch.path.as_str(), grouped.len());
+            grouped.push(vec![file_patch]);
+        }
+    }
 
-    for (file_index, fp) in file_patches.iter().enumerate() {
+    for (file_index, sections) in grouped.iter().enumerate() {
         execution.checkpoint(&format!("prepare_file_{}", file_index + 1))?;
-        ws.reject_unsafe_text(&fp.path)?;
-        let resolved = if fp.is_new_file {
-            ws.resolve_for_write(&fp.path)?
+        let first = sections[0];
+        ws.reject_unsafe_text(&first.path)?;
+        let resolved = if first.is_new_file {
+            ws.resolve_for_write(&first.path)?
         } else {
-            ws.resolve_existing(&fp.path)?
+            ws.resolve_existing(&first.path)?
         };
-        ws.reject_write_symlink(&fp.path)?;
+        ws.reject_write_symlink(&first.path)?;
 
-        let original = if fp.is_new_file {
-            // An Add File envelope is replacement content even when an earlier
-            // Delete File for the same path exists in this transaction.
-            String::new()
-        } else if resolved.existed {
-            fs::read_to_string(&resolved.path)
-                .map_err(|_| WorkspaceError::not_found(format!("File not found: {}", fp.path)))?
-        } else if fp.is_new_file || fp.is_deleted {
-            String::new()
+        let initial = if resolved.existed {
+            Some(fs::read_to_string(&resolved.path).map_err(|_| {
+                WorkspaceError::not_found(format!("File not found: {}", first.path))
+            })?)
         } else {
-            return Err(patch_failed(format!("File not found: {}", fp.path)));
+            None
         };
+        let mut current = initial.clone();
         execution.checkpoint(&format!("read_file_{}", file_index + 1))?;
 
-        if fp.is_deleted {
-            staged.insert(resolved.display.clone(), None);
-            affected.push(json!({ "path": resolved.display, "operation": "delete" }));
-            summaries.push(format!("D {}", resolved.display));
-            continue;
+        for (section_index, fp) in sections.iter().enumerate() {
+            execution.checkpoint(&format!(
+                "apply_file_{}_section_{}",
+                file_index + 1,
+                section_index + 1
+            ))?;
+            if fp.is_deleted {
+                current = None;
+                continue;
+            }
+            let base = if fp.is_new_file {
+                // Add File is replacement content, including Delete -> Add in
+                // the same transaction.
+                String::new()
+            } else {
+                current.clone().ok_or_else(|| {
+                    patch_failed(format!(
+                        "File {} was deleted earlier in this patch; use Add File before updating it again.",
+                        fp.path
+                    ))
+                })?
+            };
+            let (updated, matches) = apply_hunks(
+                &resolved.display,
+                &base,
+                &fp.hunks,
+                diagnostic_mode,
+                execution,
+            )?;
+            hunk_matches.extend(matches);
+            current = Some(updated);
         }
-        let (updated, matches) = apply_hunks(
-            &resolved.display,
-            &original,
-            &fp.hunks,
-            diagnostic_mode,
-            execution,
-        )?;
-        hunk_matches.extend(matches);
-        let op = if resolved.existed { "update" } else { "add" };
-        staged.insert(resolved.display.clone(), Some(updated));
+
+        let op = match (&initial, &current) {
+            (Some(_), None) => "delete",
+            (None, Some(_)) => "add",
+            (Some(_), Some(_)) => "update",
+            (None, None) => continue,
+        };
+        staged.insert(resolved.display.clone(), current);
         affected.push(json!({ "path": resolved.display, "operation": op }));
         summaries.push(format!(
             "{} {}",
-            if op == "add" { "A" } else { "M" },
+            match op {
+                "add" => "A",
+                "delete" => "D",
+                _ => "M",
+            },
             resolved.display
         ));
+    }
+
+    if staged.is_empty() {
+        return Err(patch_failed("No files were modified."));
     }
 
     let files_created = affected_paths(&affected, "add");
     let files_modified = affected_paths(&affected, "update");
     let files_deleted = affected_paths(&affected, "delete");
-    let post_validation = validate_staged_post_images(&staged, validation_mode, execution)?;
+    let post_validation = validate_staged_post_images(ctx, &staged, validation_mode, execution)?;
     execution.checkpoint("pre_commit")?;
 
     if !dry_run {
@@ -349,6 +402,7 @@ fn validation_snippet(content: &str, line: usize) -> String {
 }
 
 fn validate_staged_post_images(
+    ctx: &ToolContext,
     staged: &HashMap<String, Option<String>>,
     mode: &str,
     execution: &PatchExecution<'_>,
@@ -396,25 +450,36 @@ fn validate_staged_post_images(
                     )
                 }),
             "rs" | "ts" | "tsx" | "js" | "jsx" | "svelte" => {
-                validate_balanced_structure(content, extension == "rs")
-                    .map(|_| {
-                        json!({
-                            "path": path,
-                            "validator": "balanced_structure",
-                            "status": "passed"
-                        })
-                    })
-                    .map_err(|error| {
+                let advisory = match validate_balanced_structure(content, extension == "rs") {
+                    Ok(()) => json!({
+                        "path": path,
+                        "validator": "balanced_structure_advisory",
+                        "status": "advisory",
+                        "balanced": true,
+                        "authoritative": false,
+                        "suggestion": "Run the language compiler, formatter, or parser as a verification command."
+                    }),
+                    Err(error) => {
                         let (line, column) = balanced_error_position(content, &error);
-                        validation_failure(
+                        let mut diagnostic = validation_failure(
                             &path,
-                            "balanced_structure",
+                            "balanced_structure_advisory",
                             error,
                             line,
                             column,
                             content,
-                        )
-                    })
+                        );
+                        diagnostic["status"] = Value::String("warning".into());
+                        diagnostic["balanced"] = Value::Bool(false);
+                        diagnostic["authoritative"] = Value::Bool(false);
+                        diagnostic["suggestion"] = Value::String(
+                            "This heuristic does not block the transaction; run the language compiler, formatter, or parser before committing."
+                                .into(),
+                        );
+                        diagnostic
+                    }
+                };
+                Ok(advisory)
             }
             _ => {
                 results.push(json!({
@@ -445,7 +510,7 @@ fn validate_staged_post_images(
                 "failure_kind": "target_file_syntax",
                 "post_validation": results,
                 "workspace_modified": false,
-                "suggestion": "修正失败文件的 patch 后重新运行 patch_check；验证发生在事务写盘前。"
+                "suggestion": post_validation_recovery_suggestion(ctx)
             }),
         });
     }
@@ -459,7 +524,7 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
     let mut raw_string_hashes = None::<usize>;
     let mut escaped = false;
     let mut line_comment = false;
-    let mut block_comment = false;
+    let mut block_comment_depth = 0usize;
     let mut index = 0usize;
     while index < chars.len() {
         let ch = chars[index];
@@ -480,9 +545,12 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
             index += 1;
             continue;
         }
-        if block_comment {
-            if ch == '*' && next == Some('/') {
-                block_comment = false;
+        if block_comment_depth > 0 {
+            if ch == '/' && next == Some('*') {
+                block_comment_depth += 1;
+                index += 2;
+            } else if ch == '*' && next == Some('/') {
+                block_comment_depth -= 1;
                 index += 2;
             } else {
                 index += 1;
@@ -513,7 +581,7 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
             continue;
         }
         if ch == '/' && next == Some('*') {
-            block_comment = true;
+            block_comment_depth = 1;
             index += 2;
             continue;
         }
@@ -562,7 +630,7 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
     if raw_string_hashes.is_some() {
         return Err("unterminated Rust raw string".into());
     }
-    if block_comment {
+    if block_comment_depth > 0 {
         return Err("unterminated block comment".into());
     }
     if let Some((opened, opened_at)) = stack.pop() {
@@ -1297,6 +1365,66 @@ mod tests {
     }
 
     #[test]
+    fn repeated_update_sections_apply_against_the_staged_post_image() {
+        let (_workspace, _harness, context) = context_with_file();
+        let result = apply_patch(
+            &context,
+            &json!({
+                "patch": "*** Begin Patch\n*** Update File: main.rs\n@@\n-old\n+middle\n*** Update File: main.rs\n@@\n-middle\n+final\n*** End Patch\n"
+            }),
+        )
+        .expect("sequential repeated file sections");
+
+        assert_eq!(result["affected_files"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["files_modified"], json!(["main.rs"]));
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "final\n"
+        );
+    }
+
+    #[test]
+    fn add_then_delete_with_no_net_file_is_rejected_as_no_change() {
+        let (_workspace, _harness, context) = context_with_file();
+        let error = apply_patch(
+            &context,
+            &json!({
+                "patch": "*** Begin Patch\n*** Add File: transient.txt\n+temporary\n*** Delete File: transient.txt\n*** End Patch\n"
+            }),
+        )
+        .expect_err("net empty patch");
+        assert_eq!(error.to_error_value()["code"], "PATCH_FAILED");
+        assert!(!context.workspace.root().join("transient.txt").exists());
+    }
+
+    #[test]
+    fn source_structure_checks_are_explicitly_non_authoritative_advisories() {
+        let (_workspace, _harness, context) = context_with_file();
+        let result = apply_patch(
+            &context,
+            &json!({
+                "dry_run": true,
+                "patch": "*** Begin Patch\n*** Add File: valid-regex.js\n+export const openBrace = /\\{/;\n*** Add File: invalid-template.js\n+export const broken = `${({]}`;\n*** End Patch\n"
+            }),
+        )
+        .expect("source advisories do not block the transaction");
+
+        let validation = result["post_validation"].as_array().expect("validation");
+        assert_eq!(validation.len(), 2);
+        assert!(validation.iter().all(|entry| {
+            entry["validator"] == "balanced_structure_advisory"
+                && entry["authoritative"] == false
+                && matches!(entry["status"].as_str(), Some("advisory" | "warning"))
+        }));
+        assert!(!context.workspace.root().join("valid-regex.js").exists());
+        assert!(!context
+            .workspace
+            .root()
+            .join("invalid-template.js")
+            .exists());
+    }
+
+    #[test]
     fn cancelled_patch_returns_terminal_error_without_modifying_workspace() {
         let (_workspace, _harness, context) = context_with_file();
         let cancellation = CancellationToken::default();
@@ -1503,6 +1631,29 @@ mod tests {
         assert!(validate_balanced_structure("export const broken = {", false).is_err());
         assert!(
             validate_balanced_structure("fn broken() { let value = r#\"missing; }", true).is_err()
+        );
+        validate_balanced_structure(
+            "fn nested() { /* outer /* inner */ still outer */ let value = 1; }",
+            true,
+        )
+        .expect("nested Rust block comments are balanced");
+    }
+
+    #[test]
+    fn post_validation_recovery_only_names_a_published_tool() {
+        let (_workspace, _harness, context) = context_with_file();
+        assert_eq!(
+            post_validation_recovery_suggestion(&context)["tool"],
+            "read_file"
+        );
+
+        let catalog =
+            crate::tools::catalog::build_effective_catalog_from_parts("advanced", true, Vec::new())
+                .expect("advanced catalog");
+        let _ = context.publish_catalog(catalog);
+        assert_eq!(
+            post_validation_recovery_suggestion(&context)["tool"],
+            "patch_check"
         );
     }
 

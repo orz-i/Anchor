@@ -93,6 +93,23 @@ pub fn call(
     Ok(tool_ok(value))
 }
 
+fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
+    let mut command = Command::new("git");
+    crate::platform::hide_std_console(&mut command);
+    let Ok(output) = command.arg("-C").arg(root).args(args).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn cleanup_closed_task_worktree(ctx: &ToolContext, task_id: &str) -> Result<Value, WorkspaceError> {
     let task = ctx.harness.task(task_id).map_err(map_error)?;
     let Some(worktree) = task.git_worktree.as_ref() else {
@@ -1780,64 +1797,107 @@ fn change_summary(
     } else {
         all_changes
     };
-    let commits = selected_changes
-        .iter()
-        .map(|change| {
-            json!({
-                "change_id": change.id,
-                "commit_sha": change.commit_sha,
-                "created_at": change.created_at,
-                "committed_files": change.committed_files,
-                "verification_ids": change.verification_ids
-            })
-        })
-        .collect::<Vec<_>>();
-    let commit_sha = selected_changes
-        .last()
-        .and_then(|change| change.commit_sha.clone())
-        .or_else(|| requested_change_id.map(str::to_string))
-        .or_else(|| {
-            task.expected_state
-                .head
-                .clone()
-                .filter(|head| task.baseline.head.as_ref() != Some(head))
-        });
-    let mut committed_file_set = BTreeSet::new();
-    for change in &selected_changes {
-        committed_file_set.extend(change.committed_files.iter().cloned());
-    }
-    if committed_file_set.is_empty() {
-        if let Some(commit) = commit_sha.as_deref() {
-            committed_file_set.extend(git_paths(
+    let fallback_commit_shas = if selected_changes.is_empty() {
+        if let Some(change_id) = requested_change_id {
+            git_lines(
                 ctx.workspace.root(),
                 &[
-                    "diff-tree",
-                    "--no-commit-id",
-                    "--name-only",
-                    "-r",
-                    "-z",
-                    commit,
+                    "rev-parse",
+                    "--verify",
+                    format!("{change_id}^{{commit}}").as_str(),
                 ],
-            ));
+            )
+        } else {
+            match (
+                task.baseline.head.as_deref(),
+                task.expected_state.head.as_deref(),
+            ) {
+                (Some(start), Some(end)) if start != end => {
+                    let range = format!("{start}..{end}");
+                    git_lines(
+                        ctx.workspace.root(),
+                        &["rev-list", "--reverse", range.as_str()],
+                    )
+                }
+                _ => Vec::new(),
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let commits = if selected_changes.is_empty() {
+        fallback_commit_shas
+            .iter()
+            .map(|commit| {
+                let files = git_paths(
+                    ctx.workspace.root(),
+                    &[
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        "-z",
+                        commit,
+                    ],
+                );
+                json!({
+                    "change_id": commit,
+                    "commit_sha": commit,
+                    "created_at": null,
+                    "committed_files": files,
+                    "verification_ids": [],
+                    "source": "git_commit_range_fallback"
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        selected_changes
+            .iter()
+            .map(|change| {
+                json!({
+                    "change_id": change.id,
+                    "commit_sha": change.commit_sha,
+                    "created_at": change.created_at,
+                    "committed_files": change.committed_files,
+                    "verification_ids": change.verification_ids,
+                    "source": "harness_change_set"
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let commit_sha = commits
+        .last()
+        .and_then(|commit| commit.get("commit_sha"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| requested_change_id.map(str::to_string));
+    let mut committed_file_set = BTreeSet::new();
+    for commit in &commits {
+        if let Some(files) = commit.get("committed_files").and_then(Value::as_array) {
+            committed_file_set.extend(files.iter().filter_map(Value::as_str).map(str::to_string));
         }
     }
     let committed_files = committed_file_set.into_iter().collect::<Vec<_>>();
-    let files_by_commit = selected_changes
+    let files_by_commit = commits
         .iter()
-        .map(|change| {
+        .map(|commit| {
             json!({
-                "commit_sha": change.commit_sha,
-                "change_id": change.id,
-                "files": change.committed_files
+                "commit_sha": commit.get("commit_sha"),
+                "change_id": commit.get("change_id"),
+                "files": commit.get("committed_files")
             })
         })
         .collect::<Vec<_>>();
-    let first_commit = selected_changes
+    let first_commit = commits
         .first()
-        .and_then(|change| change.commit_sha.clone());
-    let last_commit = selected_changes
+        .and_then(|commit| commit.get("commit_sha"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let last_commit = commits
         .last()
-        .and_then(|change| change.commit_sha.clone());
+        .and_then(|commit| commit.get("commit_sha"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let end_head = task
         .expected_state
         .head
@@ -1926,7 +1986,7 @@ fn change_summary(
         "verification_summary": verification_summary,
         "verification_status": verification_status(&verifications),
         "risks": [],
-        "rollback_capability": if selected_changes.is_empty() { "not_available" } else { "git_commit_range" },
+        "rollback_capability": if commits.is_empty() { "not_available" } else { "git_commit_range" },
         "baseline": baseline_view(&task),
         "counts": counts,
         "truncated": false,
@@ -2364,8 +2424,8 @@ fn is_git_ignored(root: &Path, path: &str) -> bool {
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "-q", "--", path])
-        .status()
-        .map(|status| status.success())
+        .output()
+        .map(|output| output.status.success())
         .unwrap_or(false)
 }
 

@@ -1810,7 +1810,7 @@ mod tests {
 
     use super::{
         attach_browser_workspace_artifacts, await_local_tool_worker_with_limits,
-        browser_build_matches, browser_current_build, effective_catalog_error,
+        browser_build_matches, browser_current_build, browser_os_path, effective_catalog_error,
         extract_browser_json_payload, finalize_browser_workspace_artifacts, handle_request,
         handle_tools_call, initialize_result, prepare_browser_workspace_arguments, tool_arguments,
         tools_list_result,
@@ -1824,6 +1824,13 @@ mod tests {
                 .expect("tool context"),
         );
         (workspace, harness, state)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_paths_remove_the_windows_verbatim_prefix_for_downstream_tools() {
+        let normalized = browser_os_path(std::path::Path::new(r"\\?\D:\anchor\artifact.png"));
+        assert_eq!(normalized, r"D:\anchor\artifact.png");
     }
 
     #[tokio::test]

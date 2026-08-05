@@ -1780,6 +1780,102 @@ fn change_summary_aggregates_every_task_commit_and_file() {
 }
 
 #[test]
+fn ordinary_git_commit_is_persisted_as_a_task_change_set() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "baseline\n").expect("baseline");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("context");
+    let task = ctx
+        .harness
+        .start_task("ordinary commit summary")
+        .expect("task");
+    let patched = call_tool(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: feature.txt\n+feature\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(patched["ok"], true, "{patched}");
+
+    let staged = call_tool(&ctx, "git_stage", &json!({"paths": ["feature.txt"]}));
+    assert_eq!(staged["ok"], true, "{staged}");
+    let committed = call_tool(
+        &ctx,
+        "git_commit",
+        &json!({"message": "test: ordinary task commit"}),
+    );
+    assert_eq!(committed["ok"], true, "{committed}");
+
+    let summary = call_tool(&ctx, "change_summary", &json!({"task_id": task.id}));
+    assert_eq!(summary["commit_count"], 1, "{summary}");
+    assert_eq!(summary["commits"][0]["commit_sha"], committed["commit_sha"]);
+    assert_eq!(summary["committed_files"], json!(["feature.txt"]));
+    assert_eq!(summary["rollback_capability"], "git_commit_range");
+}
+
+#[test]
+fn change_summary_reconstructs_missing_change_sets_from_the_git_range() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "baseline\n").expect("baseline");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("context");
+    let task = ctx.harness.start_task("range fallback").expect("task");
+
+    for (path, content, message) in [
+        ("first.txt", "first\n", "first external commit"),
+        ("second.txt", "second\n", "second external commit"),
+    ] {
+        fs::write(workspace.join(path), content).expect("commit file");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["add", path])
+            .output()
+            .expect("git add");
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["commit", "--no-gpg-sign", "--no-verify", "-m", message])
+            .output()
+            .expect("git commit");
+        assert!(output.status.success());
+    }
+    ctx.harness
+        .refresh_expected_state_for_operation(&task.id, None)
+        .expect("refresh expected state");
+
+    let summary = call_tool(&ctx, "change_summary", &json!({"task_id": task.id}));
+    assert_eq!(summary["commit_count"], 2, "{summary}");
+    assert_eq!(
+        summary["committed_files"],
+        json!(["first.txt", "second.txt"])
+    );
+    assert_eq!(summary["commits"][0]["source"], "git_commit_range_fallback");
+    assert_eq!(summary["commits"][1]["source"], "git_commit_range_fallback");
+    assert_eq!(summary["rollback_capability"], "git_commit_range");
+
+    let missing = call_tool(
+        &ctx,
+        "change_summary",
+        &json!({
+            "task_id": task.id,
+            "change_id": "0000000000000000000000000000000000000000"
+        }),
+    );
+    assert_eq!(missing["commit_count"], 0, "{missing}");
+    assert_eq!(missing["commits"], json!([]));
+    assert_eq!(missing["rollback_capability"], "not_available");
+}
+
+#[test]
 fn retained_git_commit_refreshes_expected_head_after_session_exit() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

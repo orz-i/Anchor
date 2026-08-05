@@ -62,6 +62,37 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn persist_git_commit_change_set(ctx: &ToolContext, task_id: &str, output: &Value) {
+    if output.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(commit_sha) = output
+        .get("commit_sha")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let committed_files = output
+        .get("committed_files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let _ = ctx.harness.save_change_set(
+        task_id,
+        commit_sha,
+        committed_files,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+}
+
 fn tasks_share_write_domain(
     left: &crate::harness::model::TaskSession,
     right: &crate::harness::model::TaskSession,
@@ -216,6 +247,62 @@ struct VerificationIdentity<'a> {
     level: &'a str,
 }
 
+fn verification_output_text(output: &Value, key: &str) -> String {
+    match output.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Object(object)) => object
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn explicit_test_count(output: &Value) -> Option<u64> {
+    let text = format!(
+        "{}\n{}",
+        verification_output_text(output, "stdout"),
+        verification_output_text(output, "stderr")
+    );
+    let lower = text.to_ascii_lowercase();
+    let mut counts = Vec::new();
+    for line in lower.lines().map(str::trim) {
+        for prefix in ["running ", "collected ", "# tests "] {
+            let Some(rest) = line.strip_prefix(prefix) else {
+                continue;
+            };
+            if let Some(count) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                counts.push(count);
+            }
+        }
+        if let Some(result) = line.strip_prefix("test result:") {
+            if let Some(passed) = result
+                .split(';')
+                .find_map(|part| part.trim().strip_suffix(" passed"))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
+                counts.push(passed);
+            }
+        }
+    }
+    if counts.iter().any(|count| *count > 0) {
+        return counts.into_iter().max();
+    }
+    if !counts.is_empty()
+        || lower.contains("no tests found")
+        || lower.contains("no test files found")
+        || lower.contains("no tests collected")
+    {
+        return Some(0);
+    }
+    None
+}
+
 fn record_verification_from_output(
     ctx: &ToolContext,
     task_id: &str,
@@ -237,7 +324,7 @@ fn record_verification_from_output(
         }
         return;
     }
-    let Some(passed) = output.get("command_ok").and_then(Value::as_bool) else {
+    let Some(command_passed) = output.get("command_ok").and_then(Value::as_bool) else {
         if let Some(object) = output.as_object_mut() {
             object.insert("verification_skipped".into(), Value::Bool(true));
             object.insert(
@@ -247,6 +334,26 @@ fn record_verification_from_output(
         }
         return;
     };
+    let mut passed = command_passed;
+    let mut supersede_previous_failures = supersede_previous_failures;
+    if command_passed && identity.kind.eq_ignore_ascii_case("test") {
+        if let Some(test_count) = explicit_test_count(output) {
+            if let Some(object) = output.as_object_mut() {
+                object.insert("verification_test_count".into(), json!(test_count));
+            }
+            if test_count == 0 {
+                passed = false;
+                supersede_previous_failures = false;
+                if let Some(object) = output.as_object_mut() {
+                    object.insert("verification_inconclusive".into(), Value::Bool(true));
+                    object.insert(
+                        "verification_failure_reason".into(),
+                        Value::String("no_tests_executed".into()),
+                    );
+                }
+            }
+        }
+    }
     let duration_ms = output.get("duration_ms").and_then(Value::as_u64);
     if let Ok(verification) = ctx.harness.record_verification(
         task_id,
@@ -812,6 +919,9 @@ fn call_tool_impl(
                 .harness
                 .refresh_expected_state_for_operation(task_id, operation_id);
         }
+        if name == "git_commit" && succeeded {
+            persist_git_commit_change_set(ctx, task_id, &output);
+        }
         if name == "exec_command" && command_output_is_terminal(&output) {
             if let (Some(kind), Some(command)) = (
                 effective_args
@@ -1333,13 +1443,21 @@ fn server_info_for_session(
         "workspace_policy_path": ".anchor/command-policy.yml",
         "approval_source": "trusted_runtime_config"
     });
+    let build_identity = json!({
+        "git_sha": env!("ANCHOR_BUILD_GIT_SHA"),
+        "git_dirty": env!("ANCHOR_BUILD_GIT_DIRTY") == "true",
+        "build_workspace": env!("ANCHOR_BUILD_WORKSPACE"),
+        "catalog_version": crate::tools::registry::CATALOG_VERSION,
+        "package_version": env!("CARGO_PKG_VERSION")
+    });
     let connection_layers = json!({
         "plugin": {
             "status": "healthy",
             "server": crate::brand::SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION"),
             "catalog_changed": catalog_changed,
-            "reconnect_required": catalog_changed
+            "reconnect_required": catalog_changed,
+            "build_identity": build_identity.clone()
         },
         "application": {
             "status": "healthy",
@@ -1390,6 +1508,7 @@ fn server_info_for_session(
         "catalog_changed": catalog_changed,
         "reconnect_required": catalog_changed,
         "catalog_version": crate::tools::registry::CATALOG_VERSION,
+        "build_identity": build_identity,
         "catalog_bytes": running_catalog.total_bytes,
         "catalog_estimated_tokens": running_catalog.estimated_tokens,
         "local_tool_count": running_catalog.local_count,
@@ -1568,7 +1687,7 @@ fn set_default_cwd_for_session(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tempfile::tempdir;
 
     use super::{
@@ -1673,6 +1792,110 @@ mod tests {
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
+    }
+
+    #[test]
+    fn zero_test_run_is_inconclusive_and_does_not_supersede_a_real_failure() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("zero tests").expect("task");
+        let previous = ctx
+            .harness
+            .record_verification(
+                &task.id,
+                "test",
+                "cargo test target",
+                Some("target-test"),
+                None,
+                None,
+                Some(101),
+                false,
+                Some(10),
+                None,
+                "blocking",
+                true,
+            )
+            .expect("previous failure");
+        let mut output = json!({
+            "ok": true,
+            "execution_started": true,
+            "command_ok": true,
+            "exit_code": 0,
+            "stdout": "running 0 tests\ntest result: ok. 0 passed; 0 failed\n",
+            "stderr": ""
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "cargo test target -- --exact",
+                verification_key: Some("target-test"),
+                test_file: None,
+                test_name: None,
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["verification_inconclusive"], true);
+        assert_eq!(output["verification_failure_reason"], "no_tests_executed");
+        assert_eq!(output["verification_test_count"], 0);
+        assert_eq!(output["verification"]["passed"], Value::Null);
+        assert_eq!(output["verification"]["status"], "failed");
+        assert_eq!(output["supersedes"], json!([]));
+        let previous = ctx
+            .harness
+            .list_verifications(&task.id)
+            .expect("load verifications")
+            .into_iter()
+            .find(|record| record.id == previous.id)
+            .expect("previous record");
+        assert!(previous.dispositions.is_empty());
+    }
+
+    #[test]
+    fn aggregate_test_output_with_any_executed_test_can_pass() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("aggregate tests").expect("task");
+        let mut output = json!({
+            "ok": true,
+            "execution_started": true,
+            "command_ok": true,
+            "exit_code": 0,
+            "stdout": {
+                "content": "running 0 tests\ntest result: ok. 0 passed\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed\n"
+            },
+            "stderr": {"content": ""}
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "cargo test --all-targets",
+                verification_key: Some("all-targets"),
+                test_file: None,
+                test_name: None,
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["verification_test_count"], 2);
+        assert_eq!(output["verification"]["status"], "passed");
+        assert!(output.get("verification_inconclusive").is_none());
     }
 
     #[test]
