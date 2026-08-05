@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth::{
-    authorization_server_metadata, authorize_get, authorize_post, constant_time_eq_str,
-    external_base_url, protected_resource_metadata, redirect_uri_log_label, register_oauth_runtime,
-    request_origin_allowed, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
-    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm, OAUTH_MAX_BODY_BYTES,
+    authorization_server_metadata, authorize_get, authorize_post, bearer_token,
+    constant_time_eq_str, external_base_url, protected_resource_metadata, redirect_uri_log_label,
+    register_oauth_runtime, request_origin_allowed, token_exchange, verify_bearer_header,
+    verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    OAUTH_MAX_BODY_BYTES,
 };
 use crate::mcp::protocol::{
     requested_protocol_version, require_current_protocol_version, validate_client_message,
@@ -114,6 +115,10 @@ fn bounded_identity(prefix: &str, value: &[u8]) -> String {
     format!("{prefix}:{}", &digest[..16])
 }
 
+fn cursor_identity(prefix: &str, value: &[u8]) -> String {
+    format!("{prefix}:{:x}", Sha256::digest(value))
+}
+
 fn mcp_request_identity(headers: &HeaderMap) -> String {
     if let Some(session_id) = headers
         .get("mcp-session-id")
@@ -126,6 +131,27 @@ fn mcp_request_identity(headers: &HeaderMap) -> String {
         return bounded_identity("authorization", authorization.as_bytes());
     }
     "anonymous".into()
+}
+
+fn mcp_cursor_scope(state: &ListenerState, headers: &HeaderMap) -> Option<String> {
+    let token = bearer_token(headers).ok()?;
+    if state.auth.oauth_enabled() {
+        let oauth = state.oauth.as_ref()?;
+        let issuer_url = resolve_oauth_base(state, headers);
+        let resource_url = resolve_oauth_resource(state, headers);
+        if let Some(principal) = oauth.access_token_principal(token, &issuer_url, &resource_url) {
+            return Some(cursor_identity("oauth-principal", principal.as_bytes()));
+        }
+        // Access tokens issued before principal_id was introduced remain valid until
+        // rotation. Isolate them by token rather than dropping cursor continuity.
+        return oauth
+            .verify_access_token(token, &issuer_url, &resource_url)
+            .then(|| cursor_identity("oauth-token", token.as_bytes()));
+    }
+    state
+        .auth
+        .bearer_enabled()
+        .then(|| cursor_identity("bearer", token.as_bytes()))
 }
 
 fn oauth_client_identity(client_id: &str) -> String {
@@ -595,6 +621,7 @@ async fn mcp_post(
     if let Some(response) = require_mcp_auth(&state, &headers) {
         return response;
     }
+    let cursor_scope = mcp_cursor_scope(&state, &headers);
     if !state
         .mcp_identity_rate_limiter
         .allow(&mcp_request_identity(&headers))
@@ -660,6 +687,9 @@ async fn mcp_post(
             }
         };
         let session_id = state.sessions.create(negotiated, &request_id);
+        state
+            .mcp
+            .bind_cursor_scope_for_session(&session_id, cursor_scope.as_deref());
         cleanup_retired_sessions(&state);
         let cancellation = crate::tools::CancellationToken::default();
         let response = execute_mcp_request(
@@ -686,6 +716,9 @@ async fn mcp_post(
     let Some(session) = session else {
         return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
     };
+    state
+        .mcp
+        .bind_cursor_scope_for_session(session_id, cursor_scope.as_deref());
     let session_version = session.protocol_version;
     let initialized = session.initialized;
     if let Some(version) = protocol_version_from_headers(&headers) {
@@ -1329,8 +1362,8 @@ mod tests {
 
     use super::{
         accepts_streamable_http, basic_auth_password, bind_listener, canvs_authorized,
-        canvs_unauthorized, mcp_delete, mcp_method_not_allowed_response, mcp_post, origin_allowed,
-        resolve_oauth_base, ListenerState,
+        canvs_unauthorized, mcp_cursor_scope, mcp_delete, mcp_method_not_allowed_response,
+        mcp_post, origin_allowed, resolve_oauth_base, ListenerState,
     };
 
     #[test]
@@ -1397,6 +1430,26 @@ mod tests {
             .to_str()
             .unwrap()
             .contains(&state.workspace_id));
+    }
+
+    #[test]
+    fn bearer_cursor_scope_is_stable_and_noauth_does_not_share() {
+        let (_workspace, mut state) = test_listener_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer workspace-secret".parse().unwrap());
+        assert_eq!(mcp_cursor_scope(&state, &headers), None);
+
+        state.auth.auth_type = "bearer".into();
+        state.bearer_token = Some("workspace-secret".into());
+        let first = mcp_cursor_scope(&state, &headers).expect("bearer cursor scope");
+        let second = mcp_cursor_scope(&state, &headers).expect("stable bearer cursor scope");
+        assert_eq!(first, second);
+
+        headers.insert(AUTHORIZATION, "Bearer other-secret".parse().unwrap());
+        assert_ne!(
+            first,
+            mcp_cursor_scope(&state, &headers).expect("isolated bearer cursor scope")
+        );
     }
 
     fn test_listener_state() -> (tempfile::TempDir, ListenerState) {

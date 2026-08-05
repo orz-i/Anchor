@@ -24,6 +24,7 @@ pub struct ToolContext {
     session_default_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     session_task_ids: Arc<Mutex<HashMap<String, String>>>,
     unbound_task_sessions: Arc<Mutex<HashSet<String>>>,
+    session_cursor_scopes: Arc<Mutex<HashMap<String, String>>>,
     command_output_cursors: Arc<Mutex<HashMap<String, (usize, usize)>>>,
     workspace_mutation_lock: Arc<Mutex<()>>,
     pub sessions: Arc<SessionStore>,
@@ -79,6 +80,7 @@ impl ToolContext {
             session_default_cwds: self.session_default_cwds.clone(),
             session_task_ids: self.session_task_ids.clone(),
             unbound_task_sessions: self.unbound_task_sessions.clone(),
+            session_cursor_scopes: self.session_cursor_scopes.clone(),
             command_output_cursors: self.command_output_cursors.clone(),
             workspace_mutation_lock: self.workspace_mutation_lock.clone(),
             sessions: self.sessions.clone(),
@@ -153,6 +155,7 @@ impl ToolContext {
             session_default_cwds: Arc::new(Mutex::new(HashMap::new())),
             session_task_ids: Arc::new(Mutex::new(HashMap::new())),
             unbound_task_sessions: Arc::new(Mutex::new(HashSet::new())),
+            session_cursor_scopes: Arc::new(Mutex::new(HashMap::new())),
             command_output_cursors: Arc::new(Mutex::new(HashMap::new())),
             workspace_mutation_lock: Arc::new(Mutex::new(())),
             sessions: Arc::new(SessionStore::new()),
@@ -243,6 +246,25 @@ impl ToolContext {
             .lock()
             .expect("unbound task session lock")
             .remove(session_id);
+        self.session_cursor_scopes
+            .lock()
+            .expect("session cursor scope lock")
+            .remove(session_id);
+    }
+
+    pub fn bind_cursor_scope_for_session(&self, session_id: &str, scope: Option<&str>) {
+        let mut scopes = self
+            .session_cursor_scopes
+            .lock()
+            .expect("session cursor scope lock");
+        match scope.map(str::trim).filter(|scope| !scope.is_empty()) {
+            Some(scope) => {
+                scopes.insert(session_id.to_string(), scope.to_string());
+            }
+            None => {
+                scopes.remove(session_id);
+            }
+        }
     }
 
     pub fn bind_task_for_session(
@@ -380,10 +402,18 @@ impl ToolContext {
         let transport_key = mcp_session_id
             .map(|session_id| format!("transport:{session_id}\0{command_session_id}"));
         let task_key = task_id.map(|task_id| format!("task:{task_id}\0{command_session_id}"));
+        let principal_key = mcp_session_id.and_then(|session_id| {
+            self.session_cursor_scopes
+                .lock()
+                .expect("session cursor scope lock")
+                .get(session_id)
+                .map(|scope| format!("principal:{scope}\0{command_session_id}"))
+        });
         let (stdout_offset, stderr_offset) = transport_key
             .as_ref()
             .and_then(|key| cursors.get(key))
             .or_else(|| task_key.as_ref().and_then(|key| cursors.get(key)))
+            .or_else(|| principal_key.as_ref().and_then(|key| cursors.get(key)))
             .copied()
             .unwrap_or((0, 0));
         object.insert("stdout_offset".into(), serde_json::json!(stdout_offset));
@@ -426,6 +456,18 @@ impl ToolContext {
         if let Some(task_id) = task_id {
             cursors.insert(
                 format!("task:{task_id}\0{command_session_id}"),
+                (stdout_offset, stderr_offset),
+            );
+        }
+        if let Some(scope) = mcp_session_id.and_then(|session_id| {
+            self.session_cursor_scopes
+                .lock()
+                .expect("session cursor scope lock")
+                .get(session_id)
+                .cloned()
+        }) {
+            cursors.insert(
+                format!("principal:{scope}\0{command_session_id}"),
                 (stdout_offset, stderr_offset),
             );
         }
@@ -488,5 +530,45 @@ mod tests {
         assert_ne!(still_published.digest, advanced.digest);
         assert_eq!(ctx.is_published_tool("stage_commit_status"), Some(false));
         assert_eq!(ctx.is_published_tool("read_file"), Some(true));
+    }
+
+    #[test]
+    fn command_output_cursor_falls_back_to_isolated_authenticated_principal_scope() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness = tempfile::tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let command_session_id = "command-1";
+
+        ctx.bind_cursor_scope_for_session("transport-a1", Some("oauth-client:a"));
+        let args = serde_json::json!({"session_id": command_session_id});
+        ctx.update_command_output_cursor(
+            Some("transport-a1"),
+            None,
+            &args,
+            &serde_json::json!({
+                "stdout": {"next_offset": 17},
+                "stderr": {"next_offset": 3}
+            }),
+        );
+        ctx.clear_session_state("transport-a1");
+
+        ctx.bind_cursor_scope_for_session("transport-a2", Some("oauth-client:a"));
+        let mut same_principal = serde_json::json!({"session_id": command_session_id});
+        ctx.apply_command_output_cursor(Some("transport-a2"), None, &mut same_principal);
+        assert_eq!(same_principal["stdout_offset"], 17);
+        assert_eq!(same_principal["stderr_offset"], 3);
+
+        ctx.bind_cursor_scope_for_session("transport-b1", Some("oauth-client:b"));
+        let mut other_principal = serde_json::json!({"session_id": command_session_id});
+        ctx.apply_command_output_cursor(Some("transport-b1"), None, &mut other_principal);
+        assert_eq!(other_principal["stdout_offset"], 0);
+        assert_eq!(other_principal["stderr_offset"], 0);
+
+        let mut anonymous = serde_json::json!({"session_id": command_session_id});
+        ctx.apply_command_output_cursor(Some("transport-anonymous"), None, &mut anonymous);
+        assert_eq!(anonymous["stdout_offset"], 0);
+        assert_eq!(anonymous["stderr_offset"], 0);
     }
 }

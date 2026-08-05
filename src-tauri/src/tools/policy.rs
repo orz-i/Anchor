@@ -340,8 +340,12 @@ pub fn validate_command_for_workspace(
             "Shell chaining, redirection and expansion are not allowed".into(),
         ));
     }
+    let parts = split_command_line(command).map_err(PolicyError)?;
+    if parts.is_empty() {
+        return Err(PolicyError("Empty command".into()));
+    }
     if workspace.is_some_and(Workspace::strict_read_boundary)
-        && command_contains_external_path(command)
+        && command_parts_contain_external_path(&parts)
     {
         return Err(PolicyError(
             "WORKSPACE_PATH_PROTECTED: Gateway workspace scope 禁止通过子进程访问绝对路径或父目录路径"
@@ -356,7 +360,9 @@ pub fn validate_command_for_workspace(
             "PROTECTED_REPOSITORY_ASSET: 禁止删除或递归清空 .git/.github".into(),
         ));
     }
-    if interpreter_mutation_pattern().is_match(command) && command_contains_external_path(command) {
+    if interpreter_mutation_pattern().is_match(command)
+        && command_parts_contain_external_path(&parts)
+    {
         return Err(PolicyError(
             "WORKSPACE_PATH_PROTECTED: workspace scope 禁止通过子进程写入 Workspace 外部路径"
                 .into(),
@@ -376,12 +382,6 @@ pub fn validate_command_for_workspace(
             "Network-looking commands are blocked in safe permission mode".into(),
         ));
     }
-
-    let parts = split_command_line(command).map_err(PolicyError)?;
-    if parts.is_empty() {
-        return Err(PolicyError("Empty command".into()));
-    }
-
     let executable = parts[0].trim_start_matches("./");
     let base_name = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
     let stem = base_name
@@ -819,15 +819,138 @@ fn interpreter_mutation_pattern() -> &'static regex::Regex {
     })
 }
 
-fn command_contains_external_path(command: &str) -> bool {
-    let normalized = command.replace('\\', "/");
+fn command_parts_contain_external_path(parts: &[String]) -> bool {
+    let inline_source_index = inline_source_argument_index(parts);
+    parts.iter().enumerate().any(|(index, argument)| {
+        if inline_source_index == Some(index) {
+            inline_source_contains_external_path(argument)
+        } else {
+            text_contains_external_path(argument)
+        }
+    })
+}
+
+fn inline_source_argument_index(parts: &[String]) -> Option<usize> {
+    let executable = parts
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    let stem = executable
+        .strip_suffix(".exe")
+        .or_else(|| executable.strip_suffix(".cmd"))
+        .or_else(|| executable.strip_suffix(".bat"))
+        .unwrap_or(&executable);
+    let switches: &[&str] = match stem {
+        "python" | "python3" | "py" => &["-c"],
+        "node" | "deno" | "bun" => &["-e", "--eval"],
+        "powershell" | "pwsh" => &["-command", "-c"],
+        _ => return None,
+    };
+    parts
+        .iter()
+        .position(|part| {
+            switches
+                .iter()
+                .any(|switch| part.eq_ignore_ascii_case(switch))
+        })
+        .and_then(|index| (index + 1 < parts.len()).then_some(index + 1))
+}
+
+fn inline_source_contains_external_path(source: &str) -> bool {
+    let literals = quoted_literal_ranges(source);
+    let mut outside = source.as_bytes().to_vec();
+    for (start, content_start, content_end, end) in literals {
+        outside[start..end].fill(b' ');
+        if text_contains_external_path(&source[content_start..content_end])
+            && !safe_diagnostic_path_literal(source, start, end)
+        {
+            return true;
+        }
+    }
+    text_contains_external_path(&String::from_utf8_lossy(&outside))
+}
+
+fn quoted_literal_ranges(source: &str) -> Vec<(usize, usize, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if !matches!(quote, b'\'' | b'"' | b'`') {
+            index += 1;
+            continue;
+        }
+        let triple = quote != b'`'
+            && index + 2 < bytes.len()
+            && bytes[index + 1] == quote
+            && bytes[index + 2] == quote;
+        let delimiter_len = if triple { 3 } else { 1 };
+        let content_start = index + delimiter_len;
+        let mut cursor = content_start;
+        let mut content_end = bytes.len();
+        let mut end = bytes.len();
+        while cursor < bytes.len() {
+            let closes = if triple {
+                cursor + 2 < bytes.len()
+                    && bytes[cursor] == quote
+                    && bytes[cursor + 1] == quote
+                    && bytes[cursor + 2] == quote
+            } else {
+                bytes[cursor] == quote
+            };
+            if closes {
+                content_end = cursor;
+                end = cursor + delimiter_len;
+                break;
+            }
+            let escaped = bytes[cursor] == b'\\' || (quote != b'`' && bytes[cursor] == b'`');
+            if escaped && cursor + 1 < bytes.len() {
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+        }
+        ranges.push((index, content_start, content_end, end));
+        index = end.max(index + 1);
+    }
+    ranges
+}
+
+fn safe_diagnostic_path_literal(source: &str, start: usize, end: usize) -> bool {
+    let before = source[..start].trim_end().to_ascii_lowercase();
+    let after = source[end..].trim_start().to_ascii_lowercase();
+    let safe_call = [
+        "print(",
+        "console.log(",
+        "write-output",
+        ".startswith(",
+        ".endswith(",
+        ".includes(",
+        ".contains(",
+    ]
+    .iter()
+    .any(|suffix| before.ends_with(suffix));
+    let compared_after = after.starts_with("in ")
+        || after.starts_with("==")
+        || after.starts_with("!=")
+        || after.starts_with("===")
+        || after.starts_with("!==");
+    let compared_before = ["==", "!=", "===", "!=="]
+        .iter()
+        .any(|operator| before.ends_with(operator));
+    safe_call || compared_after || compared_before
+}
+
+fn text_contains_external_path(text: &str) -> bool {
+    let normalized = text.replace('\\', "/");
     let posix_absolute = POSIX_ABSOLUTE_PATH_PATTERN
         .get_or_init(|| regex::Regex::new(r#"(?i)(^|["'\s])(/[^\s"']*)"#).expect("valid regex"))
         .captures_iter(&normalized)
         .filter_map(|captures| captures.get(2).map(|value| value.as_str()))
         .any(|value| !is_windows_command_switch(value));
-    normalized.contains("../")
-        || normalized.contains("..\\")
+    normalized == ".."
+        || normalized.contains("../")
         || posix_absolute
         || WINDOWS_ABSOLUTE_PATH_PATTERN
             .get_or_init(|| regex::Regex::new(r"(?i)\b[A-Z]:/").expect("valid regex"))
@@ -928,6 +1051,41 @@ mod tests {
             Some(&workspace),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn strict_workspace_distinguishes_inline_path_literals_from_file_access() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let workspace = Workspace::new(dir.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(true);
+        let policy = PolicySettings::default();
+
+        for command in [
+            "python -c \"from pathlib import Path; cwd=Path.cwd(); print('/.anchor/worktrees/', cwd)\"",
+            "python -c \"print('/tmp/diagnostic-only')\"",
+            "node -e \"console.log('/tmp/diagnostic-only')\"",
+            "powershell -NoProfile -Command \"Write-Output '/tmp/diagnostic-only'\"",
+        ] {
+            validate_command_for_workspace(&json!({"cmd": command}), &policy, Some(&workspace))
+                .unwrap_or_else(|error| panic!("literal-only source should be allowed: {error}"));
+        }
+
+        for command in [
+            "python -c \"print(open('/tmp/secret').read())\"",
+            "python -c \"from pathlib import Path; print(Path('/tmp/secret').read_text())\"",
+            "python -c \"reader=open; print(reader('/tmp/secret').read())\"",
+            "python -c \"target='/tmp/secret'; print(target)\"",
+            "powershell -NoProfile -Command \"Get-Content '/tmp/secret'\"",
+            "cat /tmp/secret",
+            "python /tmp/script.py",
+            "/usr/bin/python -c \"print('external executable')\"",
+        ] {
+            let error =
+                validate_command_for_workspace(&json!({"cmd": command}), &policy, Some(&workspace))
+                    .expect_err("real external file access must remain blocked");
+            assert!(error.0.contains("WORKSPACE_PATH_PROTECTED"), "{error}");
+        }
     }
 
     #[test]

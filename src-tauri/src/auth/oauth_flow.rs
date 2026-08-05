@@ -236,13 +236,14 @@ pub fn parse_redirect_uris(raw: &str) -> Result<Vec<String>, String> {
 struct PendingCode {
     code_challenge: String,
     client_id: String,
+    principal_id: String,
     redirect_uri: String,
     expires_at: u64,
     issuer_url: String,
     resource_url: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TokenClaims {
     iss: String,
     aud: String,
@@ -253,6 +254,8 @@ struct TokenClaims {
     token_kind: String,
     #[serde(default)]
     client_id: String,
+    #[serde(default)]
+    principal_id: String,
     #[serde(default)]
     jti: String,
 }
@@ -412,7 +415,12 @@ impl OAuthRuntime {
         }
     }
 
-    pub fn verify_access_token(&self, token: &str, issuer_url: &str, resource_url: &str) -> bool {
+    fn decode_access_token(
+        &self,
+        token: &str,
+        issuer_url: &str,
+        resource_url: &str,
+    ) -> Option<TokenClaims> {
         let issuer_url = issuer_url.trim_end_matches('/');
         let resource_url = resource_url.trim_end_matches('/');
         let mut validation = Validation::new(Algorithm::HS256);
@@ -423,8 +431,29 @@ impl OAuthRuntime {
             &DecodingKey::from_secret(self.token_secret.as_bytes()),
             &validation,
         )
-        .map(|decoded| decoded.claims.token_kind == "access")
-        .unwrap_or(false)
+        .ok()
+        .map(|decoded| decoded.claims)
+        .filter(|claims| claims.token_kind == "access")
+    }
+
+    pub fn verify_access_token(&self, token: &str, issuer_url: &str, resource_url: &str) -> bool {
+        self.decode_access_token(token, issuer_url, resource_url)
+            .is_some()
+    }
+
+    pub fn access_token_principal(
+        &self,
+        token: &str,
+        issuer_url: &str,
+        resource_url: &str,
+    ) -> Option<String> {
+        self.decode_access_token(token, issuer_url, resource_url)
+            .and_then(|claims| {
+                let client_id = claims.client_id.trim();
+                let principal_id = claims.principal_id.trim();
+                (!client_id.is_empty() && !principal_id.is_empty())
+                    .then(|| format!("{client_id}\0{principal_id}"))
+            })
     }
 }
 
@@ -662,6 +691,7 @@ pub fn authorize_post(
             PendingCode {
                 code_challenge: form.code_challenge.clone(),
                 client_id: form.client_id.clone(),
+                principal_id: uuid::Uuid::new_v4().to_string(),
                 redirect_uri: form.redirect_uri.clone(),
                 expires_at: now + OAUTH_CODE_TTL_SECONDS,
                 issuer_url: issuer_url.clone(),
@@ -774,6 +804,7 @@ fn exchange_authorization_code(
         &code_data.resource_url,
         &oauth.token_secret,
         &form.client_id,
+        &code_data.principal_id,
     ) {
         Ok(tokens) => token_success(tokens),
         Err(_) => token_error("server_error", "Failed to issue access token"),
@@ -806,7 +837,18 @@ fn refresh_access_token(
         return token_error("invalid_scope", "refresh scope cannot be expanded");
     }
 
-    let tokens = match create_token_pair(issuer, resource, &oauth.token_secret, &form.client_id) {
+    let principal_id = if claims.principal_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        claims.principal_id.clone()
+    };
+    let tokens = match create_token_pair(
+        issuer,
+        resource,
+        &oauth.token_secret,
+        &form.client_id,
+        &principal_id,
+    ) {
         Ok(tokens) => tokens,
         Err(_) => return token_error("server_error", "Failed to rotate refresh token"),
     };
@@ -836,6 +878,7 @@ fn create_token_pair(
     resource_url: &str,
     token_secret: &str,
     client_id: &str,
+    principal_id: &str,
 ) -> Result<TokenPair, ()> {
     Ok(TokenPair {
         access_token: create_token(
@@ -843,6 +886,7 @@ fn create_token_pair(
             resource_url,
             token_secret,
             client_id,
+            principal_id,
             "access",
             OAUTH_TOKEN_TTL_SECONDS,
         )?,
@@ -851,6 +895,7 @@ fn create_token_pair(
             resource_url,
             token_secret,
             client_id,
+            principal_id,
             "refresh",
             OAUTH_REFRESH_TOKEN_TTL_SECONDS,
         )?,
@@ -862,6 +907,7 @@ fn create_token(
     resource_url: &str,
     token_secret: &str,
     client_id: &str,
+    principal_id: &str,
     token_kind: &str,
     ttl: i64,
 ) -> Result<String, ()> {
@@ -874,6 +920,7 @@ fn create_token(
         scope: "mcp".into(),
         token_kind: token_kind.into(),
         client_id: client_id.into(),
+        principal_id: principal_id.into(),
         jti: uuid::Uuid::new_v4().to_string(),
     };
     encode(
@@ -1081,6 +1128,10 @@ mod tests {
         let access_token = issued["access_token"].as_str().expect("access token");
         let refresh_token = issued["refresh_token"].as_str().expect("refresh token");
         assert!(oauth.verify_access_token(access_token, "https://lb.example.com", resource_url));
+        let principal = oauth
+            .access_token_principal(access_token, "https://lb.example.com", resource_url)
+            .expect("access token principal");
+        assert!(principal.starts_with("chatgpt-client-test\0"));
         assert!(!oauth.verify_access_token(
             access_token,
             "https://lb.example.com/w/workspace-b",
@@ -1104,6 +1155,16 @@ mod tests {
         assert_eq!(refreshed_response.status(), StatusCode::OK);
         let refreshed = response_json(refreshed_response).await;
         assert_ne!(refreshed["refresh_token"], issued["refresh_token"]);
+        assert_eq!(
+            oauth.access_token_principal(
+                refreshed["access_token"]
+                    .as_str()
+                    .expect("refreshed access token"),
+                "https://lb.example.com",
+                resource_url,
+            ),
+            Some(principal)
+        );
 
         let replay = token_exchange(
             &oauth,

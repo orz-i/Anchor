@@ -120,6 +120,64 @@ fn wait_command_maintains_the_output_cursor_for_each_caller_session() {
 }
 
 #[test]
+fn wait_command_cursor_survives_stateless_transport_for_the_same_principal_only() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let first_caller = "standalone-principal-transport-a";
+    let second_caller = "standalone-principal-transport-b";
+    let other_caller = "standalone-other-principal";
+    ctx.bind_cursor_scope_for_session(first_caller, Some("oauth-client:principal-a"));
+
+    let started = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('principal-cursor-line', flush=True)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+        first_caller,
+    );
+    let started = assert_ok(&started);
+    let command_session = started["session_id"].as_str().expect("command session");
+
+    let first = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 5_000}),
+        first_caller,
+    );
+    let first = assert_ok(&first);
+    assert!(first["stdout"]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("principal-cursor-line")));
+    ctx.clear_session_state(first_caller);
+
+    ctx.bind_cursor_scope_for_session(second_caller, Some("oauth-client:principal-a"));
+    let second = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+        second_caller,
+    );
+    let second = assert_ok(&second);
+    assert_eq!(second["stdout"]["content"], "");
+
+    ctx.bind_cursor_scope_for_session(other_caller, Some("oauth-client:principal-b"));
+    let isolated = call_tool_for_session(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+        other_caller,
+    );
+    let isolated = assert_ok(&isolated);
+    assert!(isolated["stdout"]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("principal-cursor-line")));
+}
+
+#[test]
 fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
