@@ -86,6 +86,11 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - **职责**: MCP 运行时生命周期状态机（Stopped → Starting → Running → Stopping → Error）
 - **实现**: `src-tauri/src/runtime/`
 
+### control/ 与 daemon.rs
+- **职责**: CLI/GUI 共用的控制状态、版本化本地 IPC、协议协商、daemon 状态文件与进程生命周期
+- **传输**: Unix Domain Socket；Windows Named Pipe 抽象
+- **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退
+
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport
 - **实现**: `src-tauri/src/mcp/` 与 `src-tauri/src/tools/`

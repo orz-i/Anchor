@@ -1,11 +1,19 @@
-use serde::Serialize;
+mod ipc;
+pub mod protocol;
+
+use serde::{Deserialize, Serialize};
 
 use crate::daemon::{self, DaemonInspection};
 use crate::error::AppResult;
 use crate::platform::platform;
 use crate::workspace::WorkspaceProfile;
 
-#[derive(Debug, Clone, Serialize)]
+pub use ipc::{
+    endpoint, ping as ipc_ping, workspace_status_via_daemon_or_local, ControlClientError,
+    ControlServer, LocalControlEndpoint,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortStatus {
     pub service: String,
@@ -16,7 +24,7 @@ pub struct PortStatus {
     pub endpoint: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceControlStatus {
     pub id: String,

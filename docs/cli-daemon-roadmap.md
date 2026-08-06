@@ -80,6 +80,20 @@ Anchor 的长期运行架构调整为：
 - daemon 持有唯一的 `RuntimeSupervisor`、Tunnel Supervisor 和 Gateway；
 - 增加 stale socket、PID 复用、重复 daemon 和协议不兼容测试。
 
+阶段 1 按两个子阶段实施：
+
+1. **协议与只读接入**：先提供版本化 `ping`、`version`、`workspace_status`，CLI 与 GUI 的状态读取优先访问 daemon；仅在端点不存在、拒绝连接或超时时回退到本地只读探测。协议损坏、请求 ID 不匹配和版本不兼容不得静默回退。
+2. **完整运行控制**：再迁移事件流、日志、启停、重载和 shutdown，并移除 CLI/GUI 的第二套运行编排。
+
+当前已完成第一个子阶段的基础：
+
+- 协议版本为 `1`，请求和响应都包含 `protocolVersion` 与 `requestId`；
+- 单连接单请求，使用最大 64 KiB 的换行分隔 JSON 帧；
+- Unix daemon 在私有运行目录创建权限为 `0600` 的 UDS；其父目录保持 `0700`；
+- Windows 客户端使用按用户和配置域派生名称的 Named Pipe 地址。Windows daemon 服务端将在服务生命周期实现时启用，并必须配置当前用户专属 ACL；
+- daemon readiness 同时要求所选端口归属正确 PID 且 `ping` 成功；
+- `workspace_status` 请求必须与端点所属 Workspace ID 一致。
+
 ### 阶段 2：CLI 能力闭环
 
 - CLI 所有运行命令改为调用 daemon，而不是本地构造 RuntimeSupervisor；

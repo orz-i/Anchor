@@ -11,6 +11,8 @@
 
 两种模式都读取同一个 WorkspaceProfile；一个 workspace 仍只对应一个 profile。
 
+Linux 后台 daemon 还提供版本化本地控制端点。CLI 与桌面端读取控制状态时会优先通过该端点查询；只有端点明确不可用时才执行本地只读探测。协议错误或版本不兼容会直接报告，避免把损坏或过期 daemon 隐藏为“正常离线状态”。
+
 Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT 连接运维](workspace-cli.md)。
 
 ## 快速开始
@@ -153,6 +155,13 @@ Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优�
 ```
 
 正常退出会移除 PID 和状态文件；锁文件保留并复用。崩溃留下的状态会在下一次 `start/stop` 时识别为 stale 并安全重建或清理。
+
+每工作区还使用一个控制端点：
+
+- Unix：`<runtime-dir>/<profile-id>.sock`，父目录 `0700`、socket `0600`；
+- Windows：`\\.\pipe\anchor-<user-config-scope>-<profile-id>`。当前版本只提供客户端地址与协议抽象，Windows daemon 服务端将在 Windows Service 生命周期落地时启用。
+
+控制协议当前支持 `ping`、`version` 和 `workspace_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
 
 ## 与 systemd 的关系
 

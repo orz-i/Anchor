@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
@@ -51,7 +53,7 @@ impl ServiceSelection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonState {
     pub schema_version: u32,
@@ -174,7 +176,7 @@ fn set_private_dir_permissions(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonInspection {
     pub supported: bool,
@@ -192,6 +194,7 @@ struct DaemonPaths {
     lock: PathBuf,
     pid: PathBuf,
     state: PathBuf,
+    control: PathBuf,
 }
 
 pub struct DaemonGuard {
@@ -209,6 +212,7 @@ impl Drop for DaemonGuard {
         if remove_pid {
             let _ = fs::remove_file(&self.paths.pid);
             let _ = fs::remove_file(&self.paths.state);
+            let _ = fs::remove_file(&self.paths.control);
         }
         let _ = FileExt::unlock(&self.lock_file);
     }
@@ -220,6 +224,31 @@ pub fn supported() -> bool {
 
 pub fn daemon_log_path(profile_id: &str) -> PathBuf {
     log_dir_for_profile(profile_id).join(DAEMON_LOG_FILE)
+}
+
+#[cfg(unix)]
+pub(crate) fn control_socket_path(profile_id: &str) -> AppResult<PathBuf> {
+    Ok(daemon_paths(profile_id)?.control)
+}
+
+#[cfg(windows)]
+pub(crate) fn control_pipe_name(profile_id: &str) -> AppResult<String> {
+    let config_dir = crate::platform::app_config_dir_override()
+        .map(Ok)
+        .unwrap_or_else(|| platform().app_config_dir())?;
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown-user".into());
+    let digest = Sha256::digest(format!("{user}\0{}", config_dir.display()).as_bytes());
+    let scope = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        r"\\.\pipe\{}-{scope}-{}",
+        crate::brand::SERVER_NAME,
+        sanitize_id(profile_id)
+    ))
 }
 
 pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
@@ -453,7 +482,15 @@ pub async fn wait_ready(
                 )));
             }
             if inspection.running && selected_ports_owned_by(profile, service, state.pid)? {
-                return Ok(state);
+                match crate::control::ipc_ping(&profile.id).await {
+                    Ok(()) => return Ok(state),
+                    Err(error) if error.is_unavailable() => {}
+                    Err(error) => {
+                        return Err(AppError::Message(format!(
+                            "daemon control endpoint failed readiness check: {error}"
+                        )))
+                    }
+                }
             }
             if !platform().is_process_alive(state.pid) {
                 return Err(AppError::Message(format!(
@@ -569,11 +606,12 @@ fn daemon_paths_in(dir: PathBuf, profile_id: &str) -> DaemonPaths {
         lock: dir.join(format!("{safe}.lock")),
         pid: dir.join(format!("{safe}.pid")),
         state: dir.join(format!("{safe}.json")),
+        control: dir.join(format!("{safe}.sock")),
         dir,
     }
 }
 
-fn runtime_dir() -> AppResult<PathBuf> {
+pub(crate) fn runtime_dir() -> AppResult<PathBuf> {
     let config_dir = crate::platform::app_config_dir_override();
     #[cfg(unix)]
     {
@@ -616,7 +654,7 @@ fn read_state(path: &Path) -> AppResult<Option<DaemonState>> {
 }
 
 fn cleanup_stale_files(paths: &DaemonPaths) -> AppResult<()> {
-    for path in [&paths.pid, &paths.state] {
+    for path in [&paths.pid, &paths.state, &paths.control] {
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -772,6 +810,20 @@ mod tests {
         let runtime = select_runtime_dir(Some(temp.path().to_path_buf()), None, 1000);
 
         assert_eq!(runtime, temp.path().join("run"));
+    }
+
+    #[test]
+    fn daemon_paths_include_a_sanitized_control_socket() {
+        let paths = daemon_paths_in(PathBuf::from("/tmp/anchor"), "../unsafe workspace");
+
+        assert_eq!(
+            paths.control,
+            PathBuf::from("/tmp/anchor/___unsafe_workspace.sock")
+        );
+        assert_eq!(
+            paths.pid,
+            PathBuf::from("/tmp/anchor/___unsafe_workspace.pid")
+        );
     }
 
     #[test]

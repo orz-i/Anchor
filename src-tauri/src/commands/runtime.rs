@@ -490,12 +490,12 @@ pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<
 }
 
 #[tauri::command]
-pub fn get_workspace_control_status(
+pub async fn get_workspace_control_status(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<WorkspaceControlStatus> {
     let profile = profile_by_id(&state, &id)?;
-    control::workspace_status(&profile)
+    control::workspace_status_via_daemon_or_local(&profile).await
 }
 
 #[tauri::command]

@@ -765,13 +765,15 @@ async fn run_daemon(selector: &str, service: ServiceSelection, tunnel: bool) -> 
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
     let _guard = daemon::acquire(&profile, service, tunnel)?;
+    let control_server = control::ControlServer::start(profile.clone())?;
     crate::tunnel::append_profile_log(
         &profile.id,
         "daemon.log",
         &format!(
-            "[daemon] started pid={} service={} tunnel={tunnel}",
+            "[daemon] started pid={} service={} tunnel={tunnel} control={:?}",
             std::process::id(),
-            service.as_str()
+            service.as_str(),
+            control_server.endpoint()
         ),
     );
     let result = serve_workspace(&profile.id, service, tunnel, false, false).await;
@@ -981,7 +983,7 @@ async fn show_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {
-        let statuses = workspace_statuses(options.workspace.as_deref())?;
+        let statuses = workspace_statuses(options.workspace.as_deref()).await?;
         let single_workspace = options.workspace.is_some();
         if as_json && options.watch && single_workspace {
             print_json_line(&statuses[0])?;
@@ -1012,14 +1014,22 @@ async fn show_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
     }
 }
 
-fn workspace_statuses(selector: Option<&str>) -> AppResult<Vec<WorkspaceControlStatus>> {
+async fn workspace_statuses(selector: Option<&str>) -> AppResult<Vec<WorkspaceControlStatus>> {
     let store = DataStore::load()?;
     match selector {
         Some(selector) => {
             let profile = resolve_workspace(store.list(), selector)?;
-            Ok(vec![control::workspace_status(profile)?])
+            Ok(vec![
+                control::workspace_status_via_daemon_or_local(profile).await?,
+            ])
         }
-        None => control::workspace_statuses(store.list()),
+        None => {
+            let mut statuses = Vec::with_capacity(store.list().len());
+            for profile in store.list() {
+                statuses.push(control::workspace_status_via_daemon_or_local(profile).await?);
+            }
+            Ok(statuses)
+        }
     }
 }
 
