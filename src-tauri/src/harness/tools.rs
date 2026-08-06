@@ -2073,14 +2073,21 @@ fn completion_gate_value(
             next_actions.insert(step);
         }
     }
-    if policy.require_ready_to_close && task.phase != TaskPhase::ReadyToClose {
+    let task_already_completed = task.status == TaskStatus::Completed;
+    if policy.require_ready_to_close
+        && task.phase != TaskPhase::ReadyToClose
+        && !task_already_completed
+    {
         missing.push(json!({
             "code": "ready_to_close_phase_missing",
             "phase": task.phase
         }));
         next_actions.insert("update_task".into());
     }
-    if policy.require_complete_work_session && !completion_via_work_session {
+    if policy.require_complete_work_session
+        && !completion_via_work_session
+        && !task_already_completed
+    {
         missing.push(json!({
             "code": "complete_work_session_required"
         }));

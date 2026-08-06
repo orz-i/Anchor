@@ -2969,6 +2969,24 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
     assert_eq!(closed["work_session"]["closed"], true);
     assert_eq!(closed["work_session"]["status"], "completed");
     assert_eq!(closed["task"]["phase"], "completed");
+
+    let completed_gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
+    assert_eq!(completed_gate["ok"], true);
+    assert_eq!(completed_gate["ready"], true);
+    assert_eq!(completed_gate["completion_gate"]["ready"], true);
+    assert!(completed_gate["completion_gate"]["missing"]
+        .as_array()
+        .expect("completed task missing list")
+        .is_empty());
+    assert!(completed_gate["completion_gate"]["next_actions"]
+        .as_array()
+        .expect("completed task next actions")
+        .is_empty());
+
+    let completed_context = call_tool(&ctx, "task_context", &json!({"task_id": task_id}));
+    assert_eq!(completed_context["ok"], true);
+    assert_eq!(completed_context["task"]["status"], "completed");
+    assert_eq!(completed_context["completion_gate"]["ready"], true);
 }
 
 #[test]
