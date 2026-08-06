@@ -82,6 +82,35 @@ stdio 下游 MCP 首次连接最多尝试三次。已经成功加载过工具目
 
 服务只恢复连接，不自动重复原工具调用。客户端应根据工具是否只读、是否幂等决定是否重新提交。
 
+## 任务级工具失败恢复
+
+当活动 Harness Task 中的 Patch、命令、Git 写入或 staged commit 工具失败时，Anchor 会保存结构化 `recovery`：
+
+```text
+failed_step
+step_fingerprint
+failure_type
+error_code
+related_verification_id
+workspace_mutated
+rollback_status
+recommended_recovery
+resume_target
+status
+```
+
+这不会盲目重放工具。恢复策略是：
+
+1. 明确失败发生在哪个步骤，以及工作区是否已修改；
+2. 返回安全恢复动作和原任务/Slice 恢复目标；
+3. completion gate 在 recovery 仍为 open 时拒绝任务完成；
+4. 原步骤后续成功时自动把 recovery 标记为 resolved；
+5. 若失败 verification 被审计为 expected_failure、diagnostic_only、superseded、waived 或 passed，只解除与该 verification 精确绑定的 recovery，不影响无关失败。
+
+因此，模型或客户端在恢复后从失败点继续，不需要重做已经完成的 Slice，也不能把工具错误误当成业务完成。
+
+`step_fingerprint` 默认来自稳定化后的实际命令或工具参数。调用方在需要修正命令、Patch 内容或环境后仍把它视为同一逻辑步骤时，可提供 `recovery_key`；verification 和 staged commit 也可复用各自的稳定 key。无关的同名工具成功不会解除 recovery，后续不同失败也不会覆盖首个开放恢复点。
+
 ## 桌面后台连接
 
 Workspace 页面会周期读取 MCP 和 Actions 状态：

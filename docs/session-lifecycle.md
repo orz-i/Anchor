@@ -143,7 +143,58 @@ latest_handoff_truncated
 
 完整归档仍保存在 workspace 中；响应裁剪只影响本次上下文注入，不修改历史文件。
 
-## 4. 验证与恢复
+## 4. Harness Work Session 与任务闭环
+
+`begin_work_session` 将持久 History Session 与 Harness Task 绑定。任务可以同时保存：
+
+- `phase`：planning、implementing、verifying、deploying、browser_review、cleanup、ready_to_close 等工程阶段；
+- `contract`：不可违反的约束、必需 verification 和 completion policy；
+- `slices`：独立文件范围、验收检查、状态和提交证据；
+- `working_set`：主要源码、测试、本地化文件和只读参考文件；
+- `recovery`：失败步骤、失败类型、是否修改工作区、回滚状态、恢复动作和恢复目标。
+
+Phase 使用显式状态机。普通 `update_task` 不能从 planning 直接跳到 ready_to_close；需要按实际工程阶段推进。系统内部的 Slice 和任务完成流程可以执行对应的受控状态迁移。
+
+### 完成门禁
+
+`task_gate_status` 一次返回全部缺失条件，而不是只报告第一个错误。门禁可覆盖：
+
+```text
+运行中或未消费的命令结果
+未提交或无法归属的业务文件
+结构化 verification 失败或缺失
+Task Contract 指定的 verification
+未清空的 pending steps
+未完成的 Slice 或缺失的 Slice commit
+Slice acceptance checks
+未解除的 recovery
+尚未进入 ready_to_close
+必须使用 complete_work_session 的严格关闭策略
+```
+
+`no_early_stop=true` 会强制启用待办清空、全部 Slice 完成、无开放恢复、ready_to_close、严格工作会话关闭和禁止未验证完成。调用方不能通过同时传入宽松 completion policy 绕过该约束。
+
+### Slice 生命周期
+
+```text
+start_slice
+update_slice
+complete_slice
+```
+
+`complete_slice` 是唯一可把 Slice 标记为 completed 的工具。它会检查声明的 acceptance checks、blocker 和可选 commit 要求；失败时 Slice 状态保持不变，并返回所有缺失证据。
+
+### 严格关闭
+
+`finish_task` 保留兼容入口，但始终经过统一 completion gate。需要最终 History checkpoint 和完整验收的任务应设置 `require_complete_work_session=true`，并通过：
+
+```text
+complete_work_session
+```
+
+完成。该路径固定要求 verification 通过、将 Session 标记为 completed，并使用可恢复 outbox 原子衔接 Task 关闭与 History checkpoint。
+
+## 5. 验证与恢复
 
 `history_session_validate` 返回：
 
@@ -155,7 +206,7 @@ latest_handoff_truncated
 
 未知历史状态不会被静默当作 completed。验证会给出警告；下次按相同 key bootstrap 时会重新激活为 active。
 
-## 5. 兼容与演进
+## 6. 兼容与演进
 
 当前实现遵循已发布的 Streamable HTTP Session 模型，同时把业务状态放在显式工具参数和持久文件中。未来协议若进一步弱化传输 Session，命令 Session 与历史 Session 不需要随传输标识迁移：
 
