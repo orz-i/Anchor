@@ -371,6 +371,8 @@ pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, Workspa
 
     Ok(finalize_execution_result(json!({
         "session_id": session_id,
+        "command": snapshot["command"],
+        "resolved_cwd": snapshot["resolved_cwd"],
         "state": state,
         "status": snapshot["status"],
         "termination_reason": termination_reason,

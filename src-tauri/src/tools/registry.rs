@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 28;
+pub const CATALOG_VERSION: u32 = 30;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -1742,6 +1742,8 @@ pub fn output_schema(name: &str) -> Value {
         "wait_command" => success_output_schema(
             json!({
                 "session_id": { "type": "string", "minLength": 1 },
+                "command": { "type": "string", "minLength": 1 },
+                "resolved_cwd": { "type": "string", "minLength": 1 },
                 "state": { "type": "string", "enum": ["running", "completed", "failed", "cancelled"] },
                 "status": { "type": "string", "minLength": 1 },
                 "termination_reason": { "type": "string", "minLength": 1 },
@@ -1773,6 +1775,8 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &[
                 "session_id",
+                "command",
+                "resolved_cwd",
                 "state",
                 "status",
                 "termination_reason",
@@ -2773,7 +2777,7 @@ pub fn input_schema(name: &str) -> Value {
                 "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
-                "pause_current_and_start": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Anchor always enforces a single writable task per workspace." },
+                "pause_current_and_start": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Starting a task preserves peer task lifecycle states and only selects the new task as the shared-workspace default writer." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },

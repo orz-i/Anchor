@@ -391,7 +391,7 @@ fn resume_task(
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel_tasks_preserved": parallel,
+        "parallel_tasks_preserved": true,
         "workspace_mode": task_workspace_mode(&task),
         "writer_mode": if parallel { "isolated_worktree" } else { "single_shared_writer" },
         "git_worktree": task.git_worktree
@@ -547,7 +547,7 @@ fn switch_task(
     Ok(json!({
         "task": task_view(&task),
         "session_task_id": task.id,
-        "parallel_tasks_preserved": parallel,
+        "parallel_tasks_preserved": true,
         "workspace_mode": task_workspace_mode(&task),
         "writer_mode": if parallel { "isolated_worktree" } else { "single_shared_writer" },
         "git_worktree": task.git_worktree,
@@ -1651,12 +1651,10 @@ fn start_task_for_workspace_mode(
         .and_then(Value::as_str)
         .unwrap_or("shared");
     match mode {
-        "shared" => {
-            ensure_writer_handoff_available(ctx, None, None)?;
-            ctx.harness
-                .start_task_with_handoff(objective, true)
-                .map_err(map_error)
-        }
+        "shared" => ctx
+            .harness
+            .start_task_with_handoff(objective, true)
+            .map_err(map_error),
         "worktree" => {
             let task_id = Uuid::new_v4().simple().to_string();
             let branch = args.get("worktree_branch").and_then(Value::as_str);

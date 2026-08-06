@@ -32,6 +32,86 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
+fn successful_retained_retry_resolves_superseded_wait_recovery() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "retained 重试恢复"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("任务 ID");
+
+    let failed_start = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "import time,sys; time.sleep(0.2); sys.exit(1)"],
+            "verification_kind": "test",
+            "verification_key": "retained-retry",
+            "yield_time_ms": 1
+        }),
+    );
+    assert_eq!(failed_start["execution_status"], "running");
+    let failed = call_tool(
+        &ctx,
+        "wait_command",
+        &json!({
+            "session_id": failed_start["session_id"],
+            "timeout_ms": 30000
+        }),
+    );
+    assert_eq!(failed["command_ok"], false);
+    assert_eq!(failed["task_recovery"]["status"], "open");
+    let failed_verification_id = failed["verification_id"]
+        .as_str()
+        .expect("failed verification id")
+        .to_string();
+
+    let passed_start = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "import time; time.sleep(0.2)"],
+            "verification_kind": "test",
+            "verification_key": "retained-retry",
+            "yield_time_ms": 1
+        }),
+    );
+    assert_eq!(passed_start["execution_status"], "running");
+    let passed = call_tool(
+        &ctx,
+        "wait_command",
+        &json!({
+            "session_id": passed_start["session_id"],
+            "timeout_ms": 30000
+        }),
+    );
+    assert_eq!(passed["command_ok"], true, "{passed}");
+    assert!(passed["supersedes"]
+        .as_array()
+        .expect("supersedes")
+        .iter()
+        .any(|id| id == &failed_verification_id));
+    assert_eq!(passed["task_recovery"]["status"], "resolved");
+    assert_eq!(
+        passed["task_recovery"]["resolved_by_superseding_verification"],
+        passed["verification_id"]
+    );
+
+    let gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
+    assert!(!gate["completion_gate"]["missing"]
+        .as_array()
+        .expect("completion missing")
+        .iter()
+        .any(|item| item["code"] == "recovery_open"));
+}
+
+#[test]
 fn configured_contract_and_slice_plan_cannot_be_relaxed_or_replaced() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -478,9 +558,10 @@ fn begin_work_session_can_handoff_and_switch_between_tasks() {
     assert_ne!(second_id, first_id);
     assert_eq!(
         ctx.harness.task(&first_id).unwrap().status,
-        anchor_lib::harness::TaskStatus::Paused
+        anchor_lib::harness::TaskStatus::Active
     );
     assert_eq!(second["harness"]["task_id"], second_id);
+    assert_eq!(second["harness"]["active_task_count"], 2);
 
     let switched = call_tool_for_session(
         &ctx,
@@ -493,13 +574,14 @@ fn begin_work_session_can_handoff_and_switch_between_tasks() {
     assert_eq!(switched["task"]["status"], "active");
     assert_eq!(
         ctx.harness.task(&second_id).unwrap().status,
-        anchor_lib::harness::TaskStatus::Paused
+        anchor_lib::harness::TaskStatus::Active
     );
-    assert_eq!(switched["harness"]["active_task_count"], 1);
+    assert_eq!(switched["harness"]["default_task_id"], first_id);
+    assert_eq!(switched["harness"]["active_task_count"], 2);
 }
 
 #[test]
-fn sessions_keep_distinct_tasks_and_transfer_the_single_writer_lease() {
+fn shared_tasks_remain_active_and_serialize_workspace_writes() {
     use std::sync::{Arc, Barrier};
 
     let temp = tempfile::tempdir().expect("创建临时目录");
@@ -543,11 +625,11 @@ fn sessions_keep_distinct_tasks_and_transfer_the_single_writer_lease() {
     );
     assert_eq!(first_status["task_id"], first_id);
     assert_eq!(second_status["task_id"], second_id);
-    assert_eq!(first_status["active_task_count"], 1);
-    assert_eq!(second_status["active_task_count"], 1);
+    assert_eq!(first_status["active_task_count"], 2);
+    assert_eq!(second_status["active_task_count"], 2);
     assert_eq!(
         ctx.harness.task(&first_id).unwrap().status,
-        anchor_lib::harness::TaskStatus::Paused
+        anchor_lib::harness::TaskStatus::Active
     );
     assert_eq!(
         ctx.harness.task(&second_id).unwrap().status,
@@ -616,9 +698,9 @@ fn sessions_keep_distinct_tasks_and_transfer_the_single_writer_lease() {
     );
     assert_eq!(first_after["baseline_matches"], true);
     assert_eq!(second_after["baseline_matches"], true);
-    assert_eq!(first_after["active_task_count"], 1);
-    assert_eq!(second_after["active_task_count"], 1);
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 1);
+    assert_eq!(first_after["active_task_count"], 2);
+    assert_eq!(second_after["active_task_count"], 2);
+    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
 
     let first_operations = call_tool(
         ctx.as_ref(),
@@ -657,7 +739,7 @@ fn unique_active_writer_is_rebound_but_ambiguous_paused_tasks_fail_closed() {
     );
     assert_eq!(first["ok"], true);
     assert_eq!(second["ok"], true);
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 1);
+    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
 
     let rebound = call_tool_for_session(
         &ctx,
@@ -670,13 +752,20 @@ fn unique_active_writer_is_rebound_but_ambiguous_paused_tasks_fail_closed() {
     assert_eq!(rebound["ok"], true, "{rebound}");
     assert!(workspace.join("rebound.txt").exists());
 
-    let paused = call_tool_for_session(
+    let paused_second = call_tool_for_session(
         &ctx,
         "pause_task",
         &json!({"task_id": second["task"]["id"]}),
         "binding-session-b",
     );
-    assert_eq!(paused["ok"], true, "{paused}");
+    assert_eq!(paused_second["ok"], true, "{paused_second}");
+    let paused_first = call_tool_for_session(
+        &ctx,
+        "pause_task",
+        &json!({"task_id": first["task"]["id"]}),
+        "binding-session-a",
+    );
+    assert_eq!(paused_first["ok"], true, "{paused_first}");
     let rejected = call_tool_for_session(
         &ctx,
         "apply_patch",
@@ -691,7 +780,7 @@ fn unique_active_writer_is_rebound_but_ambiguous_paused_tasks_fail_closed() {
 }
 
 #[test]
-fn running_command_blocks_writer_lease_transfer_to_another_task() {
+fn running_command_allows_peer_task_creation_but_blocks_peer_writes() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -720,14 +809,24 @@ fn running_command_blocks_writer_lease_transfer_to_another_task() {
     assert_eq!(command["status"], "running", "{command}");
     let command_session_id = command["session_id"].as_str().expect("command session");
 
-    let rejected = call_tool_for_session(
+    let second = call_tool_for_session(
         &ctx,
         "start_task",
         &json!({"objective": "竞争写租约的任务"}),
         "writer-busy-session-b",
     );
-    assert_eq!(rejected["ok"], false, "{rejected}");
-    assert_eq!(rejected["error"]["code"], "WORKSPACE_WRITER_BUSY");
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
+    let blocked_write = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: peer-after-command.txt\n+peer\n*** End Patch\n"
+        }),
+        "writer-busy-session-b",
+    );
+    assert_eq!(blocked_write["ok"], false, "{blocked_write}");
+    assert_eq!(blocked_write["error"]["code"], "WORKSPACE_WRITER_BUSY");
 
     let killed = call_tool_for_session(
         &ctx,
@@ -739,14 +838,17 @@ fn running_command_blocks_writer_lease_transfer_to_another_task() {
     assert_eq!(killed["killed"], true, "{killed}");
     assert_eq!(killed["execution_status"], "killed", "{killed}");
 
-    let second = call_tool_for_session(
+    let resumed_write = call_tool_for_session(
         &ctx,
-        "start_task",
-        &json!({"objective": "竞争写租约的任务"}),
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: peer-after-command.txt\n+peer\n*** End Patch\n"
+        }),
         "writer-busy-session-b",
     );
-    assert_eq!(second["ok"], true, "{second}");
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 1);
+    assert_eq!(resumed_write["ok"], true, "{resumed_write}");
+    assert!(ctx.workspace.root().join("peer-after-command.txt").exists());
+    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
 }
 
 #[test]
@@ -1662,7 +1764,7 @@ fn reconnected_transport_recovers_task_by_history_session_not_workspace_default(
         "transport-a-reconnected",
     );
     assert_eq!(renewed_status["task_id"], second_id);
-    assert_eq!(renewed_status["active_task_count"], 1);
+    assert_eq!(renewed_status["active_task_count"], 2);
     assert_eq!(renewed_status["writable"], true);
 
     let reconnected = call_tool_for_session(
@@ -1675,10 +1777,10 @@ fn reconnected_transport_recovers_task_by_history_session_not_workspace_default(
     assert_eq!(reconnected["task"]["id"], first_id);
     assert_eq!(reconnected["work_session"]["task_created"], false);
     assert_eq!(reconnected["harness"]["task_id"], first_id);
-    assert_eq!(reconnected["harness"]["active_task_count"], 1);
+    assert_eq!(reconnected["harness"]["active_task_count"], 2);
     assert_eq!(
         ctx.harness.task(second_id).unwrap().status,
-        anchor_lib::harness::TaskStatus::Paused
+        anchor_lib::harness::TaskStatus::Active
     );
 }
 
@@ -3134,7 +3236,7 @@ fn failed_tool_opens_recovery_and_same_step_success_resolves_it() {
 }
 
 #[test]
-fn catalog_v28_exposes_task_governance_tools_and_schemas() {
+fn catalog_v30_exposes_task_governance_tools_and_schemas() {
     let tools = anchor_lib::tools::list_tools_for_profile("advanced");
     let names = tools
         .iter()

@@ -45,7 +45,7 @@ fn 任务创建会捕获基线并在重启后恢复() {
 }
 
 #[test]
-fn 同一工作区只保留一个可写任务且仍拒绝非法迁移() {
+fn 同一工作区保留多个进行中任务与唯一默认路由且仍拒绝非法迁移() {
     let (_temp, workspace, harness_root) = fixture();
     let harness = Harness::new(workspace, harness_root).expect("创建 Harness");
     let first = harness.start_task("第一个任务").expect("启动任务");
@@ -55,9 +55,17 @@ fn 同一工作区只保留一个可写任务且仍拒绝非法迁移() {
     assert_eq!(second.status, TaskStatus::Active);
     assert_eq!(
         harness.task(&first.id).expect("第一个任务").status,
-        TaskStatus::Paused
+        TaskStatus::Active
     );
-    assert_eq!(harness.active_tasks().expect("活动任务").len(), 1);
+    assert_eq!(harness.active_tasks().expect("活动任务").len(), 2);
+    assert_eq!(
+        harness
+            .current_task()
+            .expect("读取默认任务")
+            .expect("默认任务")
+            .id,
+        second.id
+    );
 
     let invalid = harness
         .transition(&second.id, TaskStatus::Completed)
@@ -68,9 +76,17 @@ fn 同一工作区只保留一个可写任务且仍拒绝非法迁移() {
     assert_eq!(resumed.status, TaskStatus::Active);
     assert_eq!(
         harness.task(&second.id).expect("第二个任务").status,
-        TaskStatus::Paused
+        TaskStatus::Active
     );
-    assert_eq!(harness.active_tasks().expect("活动任务").len(), 1);
+    assert_eq!(harness.active_tasks().expect("活动任务").len(), 2);
+    assert_eq!(
+        harness
+            .current_task()
+            .expect("读取切换后的默认任务")
+            .expect("切换后的默认任务")
+            .id,
+        first.id
+    );
 }
 
 #[test]

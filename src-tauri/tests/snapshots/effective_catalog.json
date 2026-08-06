@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 28,
+    "catalog_version": 30,
     "names": [
       "accept_current_baseline",
       "accept_latest_baseline",
@@ -77,7 +77,7 @@
     "tool_count": 71
   },
   "core": {
-    "catalog_version": 28,
+    "catalog_version": 30,
     "names": [
       "accept_latest_baseline",
       "apply_patch",
@@ -127,7 +127,7 @@
     "tool_count": 44
   },
   "read-only": {
-    "catalog_version": 28,
+    "catalog_version": 30,
     "names": [
       "browser_build_info",
       "check_exec_environment",

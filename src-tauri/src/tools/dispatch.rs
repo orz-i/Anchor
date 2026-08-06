@@ -582,6 +582,34 @@ fn record_verification_from_output(
         identity.level,
         supersede_previous_failures,
     ) {
+        let resolved_by_verification_id = verification.id.clone();
+        let task_recovery = if verification.passed && !verification.supersedes.is_empty() {
+            let matching_step = ctx.harness.task(task_id).ok().and_then(|task| {
+                task.recovery.as_ref().and_then(|recovery| {
+                    (recovery.status == crate::harness::model::TaskRecoveryStatus::Open
+                        && recovery
+                            .related_verification_id
+                            .as_ref()
+                            .is_some_and(|related| {
+                                verification.supersedes.iter().any(|id| id == related)
+                            }))
+                    .then(|| {
+                        (
+                            recovery.failed_step.clone(),
+                            recovery.step_fingerprint.clone(),
+                        )
+                    })
+                })
+            });
+            matching_step.and_then(|(step, fingerprint)| {
+                ctx.harness
+                    .resolve_recovery_for_step(task_id, &step, fingerprint.as_deref())
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
         let effective_disposition = verification
             .dispositions
             .last()
@@ -629,6 +657,16 @@ fn record_verification_from_output(
                     "supersedes": verification.supersedes
                 }),
             );
+            if let Some(recovery) = task_recovery {
+                object.insert(
+                    "task_recovery".into(),
+                    json!({
+                        "status": "resolved",
+                        "recovery": recovery,
+                        "resolved_by_superseding_verification": resolved_by_verification_id
+                    }),
+                );
+            }
         }
     }
 }

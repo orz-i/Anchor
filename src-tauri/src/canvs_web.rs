@@ -14,7 +14,7 @@ pub fn task_list_page(workspace_name: &str, list: &CanvsTaskList) -> String {
     page(
         &format!("{} · Canvs", escape_html(workspace_name)),
         &format!(
-            "<header class='hero'><div><p class='kicker'>Anchor Canvs</p><h1>{}</h1><p class='subtitle'>当前任务与历史任务按更新时间倒序排列。每个入口只读取当前工作区的 Harness 数据。</p></div><div class='hero-meta'><span>{} 个任务</span><time data-time='{}'>{}</time></div></header><main class='cards'>{cards}</main>",
+            "<header class='hero'><div><p class='kicker'>Anchor Canvs</p><h1>{}</h1><p class='subtitle'>当前任务（可多项）与历史任务按更新时间倒序排列；默认任务单独标记。每个入口只读取当前工作区的 Harness 数据。</p></div><div class='hero-meta'><span>{} 个任务</span><time data-time='{}'>{}</time></div></header><main class='cards'>{cards}</main>",
             escape_html(workspace_name),
             list.tasks.len(),
             escape_attr(&list.refreshed_at),

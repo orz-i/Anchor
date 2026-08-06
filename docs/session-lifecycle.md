@@ -155,6 +155,20 @@ latest_handoff_truncated
 
 Phase 使用显式状态机。普通 `update_task` 不能从 planning 直接跳到 ready_to_close；需要按实际工程阶段推进。系统内部的 Slice 和任务完成流程可以执行对应的受控状态迁移。
 
+### 同一工作区的多任务
+
+任务生命周期状态与共享工作树的默认路由相互独立：
+
+- 新建或切换任务只更新工作区的默认任务，不会把其他 active/verifying 任务改成 paused；
+- 只有显式 `pause_task` 才会将任务生命周期改为 paused；
+- 已绑定 MCP 会话始终继续路由到自己的任务；新连接默认跟随工作区当前选中的任务；
+- shared 模式的文件、命令和 Git 写操作通过工作区写锁串行执行；同一写域中已有运行命令时，其他任务仍可创建和读取，但写操作返回 `WORKSPACE_WRITER_BUSY`；
+- 一次 shared 写入完成后，Anchor 同步同一写域内所有可继续任务的 expected baseline，避免下一任务把已归因变更误判为外部漂移；
+- worktree 模式的任务使用独立目录、分支和命令租约，可同时保持 active 并独立写入。
+- History bootstrap 保留所有 active/verifying Task 绑定的 History Session；仅显式暂停/终止任务或未绑定活动任务的旧会话会被回收为 paused。
+
+`active_task_ids` 表示仍在推进的任务集合；`default_task_id`/`active_task_id` 只表示无显式绑定时的默认路由目标，不再代表唯一 active 任务。
+
 ### 完成门禁
 
 `task_gate_status` 一次返回全部缺失条件，而不是只报告第一个错误。门禁可覆盖：

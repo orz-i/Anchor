@@ -114,14 +114,6 @@ fn validate_contract_update(current: &TaskContract, next: &TaskContract) -> Harn
     Ok(())
 }
 
-fn same_requested_write_domain(task: &TaskSession, worktree: Option<&TaskGitWorktree>) -> bool {
-    match (task.git_worktree.as_ref(), worktree) {
-        (None, None) => true,
-        (Some(existing), Some(requested)) => existing.path == requested.path,
-        _ => false,
-    }
-}
-
 fn tool_activity_resumes_paused_task(tool: &str) -> bool {
     !matches!(
         tool,
@@ -344,50 +336,47 @@ impl Harness {
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut target = self.task(task_id)?;
-                if !matches!(target.status, TaskStatus::Active | TaskStatus::Paused) {
+                if !matches!(
+                    target.status,
+                    TaskStatus::Active | TaskStatus::Paused | TaskStatus::Verifying
+                ) {
                     return Err(HarnessError::new(
                         "TASK_SWITCH_BLOCKED",
                         format!("任务 {} 当前状态 {:?} 不允许切换", target.id, target.status),
                     ));
                 }
-                let mut paused_task_ids = Vec::new();
-                for mut peer in self.store.list_tasks(&self.workspace_id)? {
-                    if peer.id == target.id
-                        || !matches!(peer.status, TaskStatus::Active | TaskStatus::Verifying)
-                        || !same_write_domain(&peer, &target)
-                    {
-                        continue;
-                    }
-                    peer.status = TaskStatus::Paused;
-                    peer.updated_at = timestamp();
-                    transaction.save_task(&peer)?;
-                    transaction.append_event(&harness_event(
-                        &self.workspace_id,
-                        &peer.id,
-                        "task_paused_for_writer_handoff",
-                        Some("switch_task"),
-                        json!({"next_writer_task_id": target.id.clone()}),
-                        json!({"ok": true, "status": "paused"}),
-                    ))?;
-                    paused_task_ids.push(peer.id);
-                }
+                let previous_writer_task_id = self
+                    .store
+                    .load_workspace_state(&self.workspace_id)?
+                    .and_then(|state| state.active_task_id)
+                    .filter(|current| current != &target.id);
+                let selected_at = timestamp();
                 if target.status == TaskStatus::Paused {
                     target.status = TaskStatus::Active;
-                    target.updated_at = timestamp();
+                    target.updated_at = selected_at.clone();
                     transaction.save_task(&target)?;
                 }
                 transaction.save_workspace_state(&self.workspace_state(
                     Some(&target.id),
                     HarnessSessionStatus::Active,
-                    &target.updated_at,
+                    &selected_at,
                 )?)?;
                 transaction.append_event(&harness_event(
                     &self.workspace_id,
                     &target.id,
                     "task_selected",
                     Some("switch_task"),
-                    json!({"single_writer": true, "paused_task_ids": paused_task_ids}),
-                    json!({"ok": true, "status": "active", "single_writer": true}),
+                    json!({
+                        "single_writer": true,
+                        "previous_writer_task_id": previous_writer_task_id,
+                        "active_tasks_preserved": true
+                    }),
+                    json!({
+                        "ok": true,
+                        "status": target.status,
+                        "single_writer": true,
+                        "active_tasks_preserved": true
+                    }),
                 ))?;
                 Ok(target)
             })
@@ -427,27 +416,11 @@ impl Harness {
                 if task.status != TaskStatus::Paused {
                     return Ok(task);
                 }
-                let mut paused_task_ids = Vec::new();
-                for mut peer in self.store.list_tasks(&self.workspace_id)? {
-                    if peer.id == task.id
-                        || !matches!(peer.status, TaskStatus::Active | TaskStatus::Verifying)
-                        || !same_write_domain(&peer, &task)
-                    {
-                        continue;
-                    }
-                    peer.status = TaskStatus::Paused;
-                    peer.updated_at = timestamp();
-                    transaction.save_task(&peer)?;
-                    transaction.append_event(&harness_event(
-                        &self.workspace_id,
-                        &peer.id,
-                        "task_paused_for_writer_handoff",
-                        Some(tool),
-                        json!({"next_writer_task_id": task.id.clone()}),
-                        json!({"ok": true, "status": "paused"}),
-                    ))?;
-                    paused_task_ids.push(peer.id);
-                }
+                let previous_writer_task_id = self
+                    .store
+                    .load_workspace_state(&self.workspace_id)?
+                    .and_then(|state| state.active_task_id)
+                    .filter(|current| current != &task.id);
                 task.status = TaskStatus::Active;
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
@@ -467,7 +440,8 @@ impl Harness {
                         "tool": tool,
                         "mcp_session_id": mcp_session_id,
                         "single_writer": true,
-                        "paused_task_ids": paused_task_ids,
+                        "previous_writer_task_id": previous_writer_task_id,
+                        "active_tasks_preserved": true,
                     }),
                     json!({
                         "ok": true,
@@ -618,26 +592,10 @@ impl Harness {
         let captured = capture_baseline_snapshot(&baseline_root);
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
-                let mut paused_task_ids = Vec::new();
-                for mut task in self.store.list_tasks(&self.workspace_id)? {
-                    if !matches!(task.status, TaskStatus::Active | TaskStatus::Verifying)
-                        || !same_requested_write_domain(&task, git_worktree.as_ref())
-                    {
-                        continue;
-                    }
-                    task.status = TaskStatus::Paused;
-                    task.updated_at = timestamp();
-                    transaction.save_task(&task)?;
-                    transaction.append_event(&harness_event(
-                        &self.workspace_id,
-                        &task.id,
-                        "task_paused_for_writer_handoff",
-                        Some("start_task"),
-                        json!({"next_objective": objective.trim()}),
-                        json!({"ok": true, "status": "paused"}),
-                    ))?;
-                    paused_task_ids.push(task.id);
-                }
+                let previous_writer_task_id = self
+                    .store
+                    .load_workspace_state(&self.workspace_id)?
+                    .and_then(|state| state.active_task_id);
                 let baseline = captured.baseline.clone();
                 let now = timestamp();
                 let task = TaskSession {
@@ -678,13 +636,15 @@ impl Harness {
                     None,
                     json!({
                         "single_writer": true,
-                        "paused_task_ids": paused_task_ids,
+                        "previous_writer_task_id": previous_writer_task_id,
+                        "active_tasks_preserved": true,
                         "workspace_mode": if task.git_worktree.is_some() { "worktree" } else { "shared" },
                         "worktree": task.git_worktree
                     }),
                     json!({
                         "ok": true,
                         "single_writer": true,
+                        "active_tasks_preserved": true,
                         "workspace_mode": if task.git_worktree.is_some() { "worktree" } else { "shared" }
                     }),
                 ))?;

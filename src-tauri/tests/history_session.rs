@@ -591,7 +591,7 @@ fn bootstrap_keeps_only_the_current_history_session_active() {
 }
 
 #[test]
-fn bootstrap_preserves_the_active_writer_history_and_pauses_the_previous_writer_history() {
+fn bootstrap_preserves_histories_bound_to_all_active_tasks_and_reclaims_inactive_sessions() {
     let (workspace, _harness, ctx) = test_context();
     let first = invoke(
         &ctx,
@@ -642,7 +642,7 @@ fn bootstrap_preserves_the_active_writer_history_and_pauses_the_previous_writer_
 
     assert_eq!(
         ctx.harness.task(&first_task.id).expect("first task").status,
-        anchor_lib::harness::TaskStatus::Paused
+        anchor_lib::harness::TaskStatus::Active
     );
     assert_eq!(
         ctx.harness
@@ -657,16 +657,42 @@ fn bootstrap_preserves_the_active_writer_history_and_pauses_the_previous_writer_
         json!({"session_key": "parallel-history-three"}),
     );
     let third = assert_ok(&third);
-    assert_eq!(third["paused_previous_sessions"], json!([1]));
+    assert_eq!(third["paused_previous_sessions"], json!([]));
     assert!(
         fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
-            .expect("paused first history")
-            .contains("**Status:** paused")
+            .expect("preserved first history")
+            .contains("**Status:** active")
     );
     assert!(
         fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
             .expect("preserved second history")
             .contains("**Status:** active")
+    );
+
+    ctx.harness
+        .transition(&first_task.id, anchor_lib::harness::TaskStatus::Paused)
+        .expect("explicitly pause first task");
+    let fourth = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "parallel-history-four"}),
+    );
+    let fourth = assert_ok(&fourth);
+    assert_eq!(fourth["paused_previous_sessions"], json!([1, 3]));
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/1.md"))
+            .expect("paused first history after explicit task pause")
+            .contains("**Status:** paused")
+    );
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/2.md"))
+            .expect("second active task history remains active")
+            .contains("**Status:** active")
+    );
+    assert!(
+        fs::read_to_string(workspace.path().join("docs/history-session/3.md"))
+            .expect("unbound third history paused")
+            .contains("**Status:** paused")
     );
 }
 
