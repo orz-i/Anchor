@@ -155,7 +155,14 @@
     <span class="text-xs text-[var(--text-muted)]">隧道类型</span>
     <select
       class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
-      bind:value={draft.type}
+      value={draft.type}
+      onchange={(event) => {
+        const nextType = event.currentTarget.value;
+        if (nextType !== draft.type) {
+          draft.type = nextType;
+          draft.public_url = "";
+        }
+      }}
     >
       <option value="none">未配置</option>
       <option value="frp">FRP</option>
@@ -220,7 +227,8 @@
         bind:value={draft.frp_subdomain}
       />
       <p class="text-[11px] text-[var(--text-muted)]">
-        每个工作区使用独立子域名；保存后若隧道已连接会自动重启 frpc。
+        每个工作区使用独立子域名；保存后若隧道已连接会自动重启 frpc。控制服务器为 IP 或专用控制域名时，
+        还必须在下方填写实际公网 URL。
       </p>
     </label>
 
@@ -315,6 +323,12 @@
       placeholder="https://..."
       bind:value={draft.public_url}
     />
+    {#if showFrp}
+      <p class="text-[11px] text-[var(--text-muted)]">
+        例如 https://my-mcp.taoyan.icu。该地址与 FRP 控制服务器地址相互独立；使用 Cloudflare 橙云时，
+        控制连接应使用服务器 IP 或 DNS-only 专用域名。
+      </p>
+    {/if}
   </label>
 
   <div class="flex justify-end gap-2 pt-1">

@@ -88,8 +88,8 @@
     <p class="page-kicker">全局设置</p>
     <h2 class="page-title">FRP 配置</h2>
     <p class="mt-2 max-w-2xl text-sm text-[var(--text-muted)]">
-      在此配置 FRP 服务器、端口与 Token。各工作区只需选择配置并填写自己的子域名；修改子域名后保存会自动更新
-      frpc 配置并重启隧道。
+      在此配置 FRP 控制服务器、端口与 Token。各工作区选择配置后填写子域名和实际公网 URL；控制服务器可以是
+      IP 或 DNS-only 专用域名，不必与公网根域名相同。
     </p>
   </header>
 
@@ -113,11 +113,11 @@
           />
         </label>
         <label class="grid gap-1">
-          <span class="text-xs text-[var(--text-muted)]">服务器域名</span>
+          <span class="text-xs text-[var(--text-muted)]">控制服务器地址</span>
           <input
             type="text"
             class="tx-input tx-mono"
-            placeholder="frp.example.com"
+            placeholder="43.157.17.95 或 frps-control.example.com"
             bind:value={server}
           />
         </label>

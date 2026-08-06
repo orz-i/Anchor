@@ -37,6 +37,7 @@ pub(crate) struct FrpServerConfig {
     pub server_addr: String,
     pub server_port: u16,
     pub token: Option<String>,
+    pub public_url: String,
     pub proxy: FrpProxyConfig,
 }
 
@@ -46,6 +47,10 @@ pub fn frp_public_url(
     settings: &AppSettings,
 ) -> String {
     let config = frp_server_config(profile, kind, settings, None);
+    let explicit = config.public_url.trim().trim_end_matches('/');
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
     if config.server_addr.is_empty() || config.proxy.subdomain.trim().is_empty() {
         return String::new();
     }
@@ -63,16 +68,18 @@ pub fn frp_server_config(
     token_override: Option<String>,
 ) -> FrpServerConfig {
     let proxy = frp_proxy_config(profile, kind);
-    let (profile_id, server_addr, server_port) = match kind {
+    let (profile_id, server_addr, server_port, public_url) = match kind {
         TunnelServiceKind::Mcp => (
             profile.tunnel.frp_profile_id.as_str(),
             profile.tunnel.frp_server.clone(),
             profile.tunnel.frp_server_port,
+            profile.tunnel.public_url.clone(),
         ),
         TunnelServiceKind::Actions => (
             profile.actions.frp_profile_id.as_str(),
             profile.actions.frp_server.clone(),
             profile.actions.frp_server_port,
+            profile.actions.public_url.clone(),
         ),
     };
 
@@ -89,6 +96,7 @@ pub fn frp_server_config(
         server_addr,
         server_port,
         token,
+        public_url,
         proxy,
     }
 }
@@ -408,6 +416,21 @@ mod tests {
         let after = frp_server_config(&renamed, TunnelServiceKind::Mcp, &settings, None);
 
         assert_eq!(before.proxy.proxy_name, after.proxy.proxy_name);
+    }
+
+    #[test]
+    fn frp_public_url_prefers_explicit_url_over_control_server() {
+        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
+        profile.tunnel.tunnel_type = "frp".into();
+        profile.tunnel.frp_server = "43.157.17.95".into();
+        profile.tunnel.frp_server_port = 17001;
+        profile.tunnel.frp_subdomain = "anchor".into();
+        profile.tunnel.public_url = "https://anchor.taoyan.icu/".into();
+
+        assert_eq!(
+            frp_public_url(&profile, TunnelServiceKind::Mcp, &AppSettings::default()),
+            "https://anchor.taoyan.icu"
+        );
     }
 
     #[test]

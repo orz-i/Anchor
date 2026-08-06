@@ -227,6 +227,8 @@ export function frpPublicUrl(
   if (tunnelType !== "frp" || !frpSubdomain) {
     return publicUrl.replace(/\/$/, "");
   }
+  const explicit = publicUrl.replace(/\/$/, "");
+  if (explicit) return explicit;
   const server =
     profiles.find((profile) => profile.id === frpProfileId)?.server ?? frpServer;
   if (!server) return publicUrl.replace(/\/$/, "");

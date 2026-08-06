@@ -415,6 +415,10 @@ fn computed_public_url(
     settings: &AppSettings,
 ) -> String {
     if tunnel_type == "frp" {
+        let explicit = public_url.trim().trim_end_matches('/');
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
         let server = settings
             .find_frp_profile(frp_profile_id)
             .map(|profile| profile.server.as_str())
@@ -429,6 +433,7 @@ fn computed_public_url(
 #[cfg(test)]
 mod tests {
     use super::{ActionsConfig, RuntimeConfig, TunnelConfig, WorkspaceProfile};
+    use crate::settings::AppSettings;
 
     #[test]
     fn workspace_defaults_to_stable_cloudflare_named_tunnels() {
@@ -455,6 +460,20 @@ mod tests {
 
         assert_eq!(tunnel.tunnel_type, "frp");
         assert_eq!(tunnel.cloudflare_mode, "named");
+    }
+
+    #[test]
+    fn explicit_frp_public_url_is_not_replaced_by_the_control_address() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        profile.tunnel.tunnel_type = "frp".into();
+        profile.tunnel.frp_server = "43.157.17.95".into();
+        profile.tunnel.frp_subdomain = "anchor".into();
+        profile.tunnel.public_url = "https://anchor.taoyan.icu/".into();
+
+        assert_eq!(
+            profile.effective_public_url_with(&AppSettings::default()),
+            "https://anchor.taoyan.icu"
+        );
     }
 
     #[test]

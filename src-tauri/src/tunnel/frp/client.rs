@@ -382,6 +382,18 @@ fn validate_frp_config(config: &FrpServerConfig) -> AppResult<()> {
     if config.server_port == 0 {
         return Err(AppError::Message("FRP 服务器端口无效。".into()));
     }
+    if config.public_url.trim().is_empty()
+        && config
+            .server_addr
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+    {
+        return Err(AppError::Message(
+            "FRP 控制服务器使用 IP 地址时，必须填写实际公网 URL（例如 https://子域.根域名）；控制地址不能直接用于生成域名。"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -739,8 +751,9 @@ fn frp_release_asset() -> AppResult<(&'static str, &'static str)> {
 mod tests {
     use super::{
         aggregate_uses_proxy, managed_frpc_config_path, managed_frpc_pid_path,
-        successful_proxy_names,
+        successful_proxy_names, validate_frp_config,
     };
+    use crate::tunnel::frp::{FrpProxyConfig, FrpServerConfig};
     use crate::tunnel::TunnelServiceKind;
     use crate::workspace::WorkspaceProfile;
 
@@ -798,5 +811,26 @@ mod tests {
 
         assert!(normalized.ends_with("frpc/___unsafe_workspace/frpc.pid"));
         assert!(!normalized.contains("/../"));
+    }
+
+    #[test]
+    fn ip_control_server_requires_an_explicit_public_url() {
+        let mut config = FrpServerConfig {
+            server_addr: "43.157.17.95".into(),
+            server_port: 17001,
+            token: Some("secret".into()),
+            public_url: String::new(),
+            proxy: FrpProxyConfig {
+                proxy_name: "probe".into(),
+                local_port: 28766,
+                subdomain: "anchor".into(),
+            },
+        };
+
+        let error = validate_frp_config(&config).expect_err("IP control requires public URL");
+        assert!(error.to_string().contains("实际公网 URL"));
+
+        config.public_url = "https://anchor.taoyan.icu".into();
+        validate_frp_config(&config).expect("explicit public URL is valid");
     }
 }
