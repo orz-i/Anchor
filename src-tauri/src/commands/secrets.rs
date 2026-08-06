@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tauri::{Manager, State};
 
 use crate::app_state::AppState;
@@ -165,10 +167,10 @@ fn schedule_running_services_restart(
     key: String,
     shared: bool,
 ) {
-    crate::async_runtime::spawn_blocking(move || {
+    crate::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
         for profile in &profiles {
-            restart_running_services(state.inner(), profile, &key, shared);
+            restart_running_services(state.inner(), profile, &key, shared).await;
         }
     });
 }
@@ -177,17 +179,60 @@ fn schedule_running_services_restart(
 ///
 /// 密钥命令是桌面端和设置页共用的入口，因此重启必须放在后端统一处理。
 /// 前端不再额外调用 restart_*，避免同一次密钥变更触发两次停止/启动竞态。
-fn restart_running_services(
+async fn restart_running_services(
     state: &AppState,
     profile: &crate::workspace::WorkspaceProfile,
     key: &str,
     shared: bool,
 ) {
+    let mcp_relevant = MCP_SHARED_KEYS.contains(&key) && profile.auth.use_shared_secrets == shared;
+    let actions_relevant =
+        ACTIONS_SHARED_KEYS.contains(&key) && profile.actions.use_shared_secrets == shared;
+    match crate::daemon::inspect(profile) {
+        Ok(inspection) if inspection.running => {
+            let Some(daemon_state) = inspection.state else {
+                return;
+            };
+            let service = if mcp_relevant && daemon_state.service.includes_mcp() {
+                Some(crate::workspace::resources::WorkspaceService::Mcp)
+            } else if actions_relevant && daemon_state.service.includes_actions() {
+                Some(crate::workspace::resources::WorkspaceService::Actions)
+            } else {
+                None
+            };
+            if let Some(service) = service {
+                if let Err(error) = crate::control::restart_daemon_service(
+                    profile,
+                    service,
+                    daemon_state.tunnel,
+                    Duration::from_secs(15),
+                    true,
+                )
+                .await
+                {
+                    eprintln!(
+                        "daemon restart after secret regeneration failed for {}: {error}",
+                        profile.id
+                    );
+                }
+            }
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "daemon inspection after secret regeneration failed for {}: {error}",
+                profile.id
+            );
+            return;
+        }
+    }
+
+    // Compatibility-only cleanup path for an older desktop session that still
+    // owns process-local listeners. New GUI lifecycle commands never create
+    // these entries.
     let result = state.with_runtime(|runtime| {
-        if MCP_SHARED_KEYS.contains(&key)
-            && profile.auth.use_shared_secrets == shared
-            && runtime.is_running(&profile.id, crate::runtime::ServiceKind::Mcp)
-        {
+        if mcp_relevant && runtime.is_running(&profile.id, crate::runtime::ServiceKind::Mcp) {
             if let Err(error) = runtime.restart_mcp(profile) {
                 eprintln!(
                     "MCP restart after secret regeneration failed for {}: {error}",
@@ -196,9 +241,7 @@ fn restart_running_services(
             }
         }
 
-        if ACTIONS_SHARED_KEYS.contains(&key)
-            && profile.actions.use_shared_secrets == shared
-            && runtime.is_running(&profile.id, crate::runtime::ServiceKind::Actions)
+        if actions_relevant && runtime.is_running(&profile.id, crate::runtime::ServiceKind::Actions)
         {
             if let Err(error) = runtime.restart_actions(profile) {
                 eprintln!(

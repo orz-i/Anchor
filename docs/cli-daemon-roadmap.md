@@ -97,7 +97,16 @@ Anchor 的长期运行架构调整为：
 - `stop` 和 `restart` 必须先由目标 daemon 通过 IPC 接受并协调优雅退出；IPC 不可用时不得回退到客户端直接进程控制；
 - `start` 在 daemon 不存在时仍是引导命令；若状态显示 daemon 已运行，则必须先通过 IPC `ping` 验证控制面。
 
-尚未完成：事件订阅、配置重载、Gateway/Tunnel 写控制、Windows Named Pipe 服务端和 GUI 启停迁移。
+GUI 工作区控制迁移现状：
+
+- Workspace 的 MCP/Actions 状态、启动、停止和重启已改为 daemon 控制客户端；GUI 不再为这些命令创建进程内 `RuntimeSupervisor` listener；
+- MCP 与 Actions 的独立开关映射为 daemon 的 `mcp`、`actions` 或 `all` 服务选择；调整其中一个服务时可能需要协调重启整个 Workspace daemon；
+- GUI 日志在 daemon 运行时强制使用有界 IPC，daemon 停止时才允许使用同一套有界本地读取器查看历史日志；
+- Workspace 删除和密钥再生成会先通过 daemon 控制面停止或重启目标进程；
+- 进程内 `RuntimeSupervisor` 仅保留给尚未迁移的 Gateway、Tunnel 和旧会话兼容路径；主 Workspace 控制失败时不得进入该兼容路径；
+- daemon 管理的 MCP 运行期间禁止启用进程内 Gateway，避免形成两个运行权威。
+
+尚未完成：事件订阅、细粒度配置重载、Gateway/Tunnel 写控制、Windows Named Pipe 服务端，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -116,6 +125,8 @@ Anchor 的长期运行架构调整为：
 3. 启停、重载、隧道和 Gateway 操作改为 daemon 接口；
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
+
+当前已完成第 1 项、日志读取以及 Workspace 级启停/重启。事件流、Gateway/Tunnel 和细粒度 reload 仍按上述顺序继续迁移。
 
 ### 阶段 4：运行与升级治理
 

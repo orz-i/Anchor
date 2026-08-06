@@ -65,11 +65,7 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
-    pub fn mcp_status(&self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        let settings = AppSettings::load()?;
-        Ok(self.mcp_status_with_settings(profile, &settings))
-    }
-
+    #[cfg(test)]
     fn mcp_status_with_settings(
         &self,
         profile: &WorkspaceProfile,
@@ -80,11 +76,6 @@ impl RuntimeSupervisor {
             status.activity = Some(mcp::activity_snapshot(&profile.id));
         }
         status
-    }
-
-    pub fn actions_status(&self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        let settings = AppSettings::load()?;
-        Ok(self.status_with_settings(profile, ServiceKind::Actions, &settings))
     }
 
     pub fn start_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
@@ -111,14 +102,6 @@ impl RuntimeSupervisor {
                 .map(|entry| &entry.phase),
             Some(RuntimePhase::Running)
         )
-    }
-
-    pub fn refresh_mcp(&mut self, profile: &WorkspaceProfile) {
-        let _ = self.maintain(profile, ServiceKind::Mcp);
-    }
-
-    pub fn refresh_actions(&mut self, profile: &WorkspaceProfile) {
-        let _ = self.maintain(profile, ServiceKind::Actions);
     }
 
     pub fn maintain_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
@@ -189,11 +172,7 @@ impl RuntimeSupervisor {
         self.entries.remove(&(workspace_id.to_string(), kind));
     }
 
-    fn status(
-        &self,
-        profile: &WorkspaceProfile,
-        kind: ServiceKind,
-    ) -> AppResult<RuntimeStatusDto> {
+    fn status(&self, profile: &WorkspaceProfile, kind: ServiceKind) -> AppResult<RuntimeStatusDto> {
         let settings = AppSettings::load()?;
         Ok(self.status_with_settings(profile, kind, &settings))
     }

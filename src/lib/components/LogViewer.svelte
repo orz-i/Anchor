@@ -80,7 +80,7 @@
   <div class="flex items-start justify-between gap-3">
     <div>
       <h3 class="font-semibold">{heading}</h3>
-      <p class="mt-1 text-sm text-[var(--text-muted)]">最近 8KB 尾部输出</p>
+      <p class="mt-1 text-sm text-[var(--text-muted)]">Daemon 有界日志快照（最多 8KB）</p>
     </div>
     <div class="flex shrink-0 items-center gap-3">
       <label class="inline-flex items-center gap-2 text-xs text-[var(--text-secondary)]">

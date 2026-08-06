@@ -1,5 +1,5 @@
 mod ipc;
-#[cfg(any(unix, test))]
+mod lifecycle;
 mod logs;
 pub mod protocol;
 
@@ -8,13 +8,18 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::{self, DaemonInspection};
 use crate::error::AppResult;
 use crate::platform::platform;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::{McpActivityDto, WorkspaceProfile};
 
 pub use ipc::{
     control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_logs,
     workspace_status_via_daemon_or_local, ControlClientError, ControlServer, DaemonControlCommand,
     DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
 };
+pub use lifecycle::{
+    desired_service_selection, ensure_daemon_running, reconcile_daemon,
+    request_daemon_exit_and_wait, restart_daemon_service, set_daemon_service, DaemonLaunchSpec,
+};
+pub use logs::read_log_batch;
 pub use protocol::{ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlOperation};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +42,8 @@ pub struct WorkspaceControlStatus {
     pub daemon: DaemonInspection,
     pub mcp: PortStatus,
     pub actions: PortStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_activity: Option<McpActivityDto>,
 }
 
 pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceControlStatus> {
@@ -64,6 +71,7 @@ pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceContro
             profile.actions_local_base_url(),
             daemon_pid,
         )?,
+        mcp_activity: None,
     })
 }
 

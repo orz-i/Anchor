@@ -25,17 +25,6 @@ where
     }
 }
 
-pub fn spawn_blocking<F, R>(function: F) -> JoinHandle<R>
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.spawn_blocking(function),
-        Err(_) => fallback_runtime().spawn_blocking(function),
-    }
-}
-
 pub fn block_on<F>(future: F) -> F::Output
 where
     F: Future + Send,
@@ -46,14 +35,12 @@ where
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| handle.block_on(future))
             }
-            tokio::runtime::RuntimeFlavor::CurrentThread => {
-                std::thread::scope(|scope| {
-                    scope
-                        .spawn(|| fallback_runtime().block_on(future))
-                        .join()
-                        .expect("fallback async runtime worker panicked")
-                })
-            }
+            tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| fallback_runtime().block_on(future))
+                    .join()
+                    .expect("fallback async runtime worker panicked")
+            }),
             _ => panic!("unsupported Tokio runtime flavor"),
         },
         Err(_) => fallback_runtime().block_on(future),

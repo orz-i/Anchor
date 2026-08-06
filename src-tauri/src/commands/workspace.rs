@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tauri::State;
 
 use crate::app_state::{teardown_workspace, AppState};
 use crate::auth::{update_oauth_redirect_policy, validate_redirect_policy};
+use crate::daemon;
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
 use crate::runtime::ServiceKind;
@@ -110,12 +112,25 @@ mod tests {
 
 #[tauri::command]
 pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -> AppResult<()> {
-    let (mcp_running, actions_running) = state.with_runtime(|runtime| {
+    let daemon_inspection = daemon::inspect(&profile)?;
+    let daemon_state = daemon_inspection
+        .running
+        .then_some(daemon_inspection.state)
+        .flatten();
+    let (legacy_mcp_running, legacy_actions_running) = state.with_runtime(|runtime| {
         Ok((
             runtime.is_running(&profile.id, ServiceKind::Mcp),
             runtime.is_running(&profile.id, ServiceKind::Actions),
         ))
     })?;
+    let mcp_running = daemon_state
+        .as_ref()
+        .is_some_and(|state| state.service.includes_mcp())
+        || legacy_mcp_running;
+    let actions_running = daemon_state
+        .as_ref()
+        .is_some_and(|state| state.service.includes_actions())
+        || legacy_actions_running;
     let profile_id = profile.id.clone();
     let mcp_redirect_uris = profile.auth.oauth_redirect_uris.clone();
     let mcp_redirect_hosts = profile.auth.oauth_redirect_hosts.clone();
@@ -235,7 +250,7 @@ pub fn open_workspace_directory(path: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
     state.with_settings(|store| {
         crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &id)
     })?;
@@ -245,7 +260,14 @@ pub fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()>
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })?;
-    crate::async_runtime::block_on(drop_tunnel_workspace(&id))?;
+    crate::control::request_daemon_exit_and_wait(
+        &profile,
+        crate::control::ControlOperation::Shutdown,
+        Duration::from_secs(15),
+        true,
+    )
+    .await?;
+    drop_tunnel_workspace(&id).await?;
     state.with_runtime(|runtime| {
         runtime.drop_workspace(&profile);
         Ok(())

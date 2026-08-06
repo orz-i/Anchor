@@ -398,64 +398,34 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         ));
     }
 
-    let inspection = daemon::inspect(&profile)?;
-    if inspection.running {
-        control::ipc_ping(&profile.id).await.map_err(|error| {
-            AppError::Message(format!(
-                "daemon 状态显示正在运行，但控制端点不可用：{error}；拒绝对运行中的 daemon 使用本地写回退"
-            ))
-        })?;
-        let state = inspection.state.expect("running daemon state");
-        if state.service == service && state.tunnel == tunnel {
-            return print_daemon_result(
-                "already_running",
-                &profile,
-                Some(state.pid),
-                service,
-                tunnel,
-                as_json,
-            );
-        }
-        return Err(AppError::Message(format!(
-            "daemon 已运行（service={}, tunnel={}）；请使用 restart 修改运行参数",
-            state.service.as_str(),
-            state.tunnel
-        )));
+    let already_running = daemon::inspect(&profile)?.running;
+    if !already_running {
+        ensure_selected_ports_available(&profile, service)?;
     }
-    ensure_selected_ports_available(&profile, service)?;
-    let child_pid = daemon::spawn(&profile, service, tunnel)?;
-    match daemon::wait_ready(
+    let state = control::ensure_daemon_running(
         &profile,
-        service,
-        child_pid,
+        control::DaemonLaunchSpec { service, tunnel },
         Duration::from_secs(options.wait_seconds),
     )
-    .await
-    {
-        Ok(state) => print_daemon_result(
-            "started",
-            &profile,
-            Some(state.pid),
-            service,
-            tunnel,
-            as_json,
-        ),
-        Err(error) => {
-            let cleanup_error = daemon::terminate_spawned(&profile, child_pid).await.err();
-            Err(AppError::Message(format!(
-                "daemon 子进程 PID {child_pid} 未就绪：{error}{}",
-                cleanup_error
-                    .map(|cleanup| format!("；清理失败：{cleanup}"))
-                    .unwrap_or_default()
-            )))
-        }
-    }
+    .await?;
+    print_daemon_result(
+        if already_running {
+            "already_running"
+        } else {
+            "started"
+        },
+        &profile,
+        Some(state.pid),
+        service,
+        tunnel,
+        as_json,
+    )
 }
 
 async fn stop_daemon(options: StopOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
-    let stopped = request_daemon_exit_and_wait(
+    let stopped = control::request_daemon_exit_and_wait(
         &profile,
         control::ControlOperation::Shutdown,
         Duration::from_secs(options.timeout_seconds),
@@ -888,7 +858,7 @@ async fn restart_daemon(mut options: RunOptions, as_json: bool) -> AppResult<()>
     if options.tunnel.is_none() {
         options.tunnel = current.as_ref().map(|state| state.tunnel);
     }
-    let _ = request_daemon_exit_and_wait(
+    let _ = control::request_daemon_exit_and_wait(
         &profile,
         control::ControlOperation::Restart,
         Duration::from_secs(10),
@@ -896,53 +866,6 @@ async fn restart_daemon(mut options: RunOptions, as_json: bool) -> AppResult<()>
     )
     .await?;
     start_daemon(options, as_json).await
-}
-
-pub(super) async fn request_daemon_exit_and_wait(
-    profile: &WorkspaceProfile,
-    operation: control::ControlOperation,
-    timeout: Duration,
-    force: bool,
-) -> AppResult<Option<u32>> {
-    let inspection = daemon::inspect(profile)?;
-    if inspection.ambiguous {
-        return Err(AppError::Message(inspection.detail));
-    }
-    let Some(state) = inspection.state else {
-        if inspection.stale {
-            daemon::cleanup(profile)?;
-        }
-        return Ok(None);
-    };
-    if !inspection.running {
-        daemon::cleanup(profile)?;
-        return Ok(None);
-    }
-    if !inspection.pid_matches {
-        return Err(AppError::Message(format!(
-            "PID {} 不属于当前 workspace daemon，拒绝发送控制请求",
-            state.pid
-        )));
-    }
-    let accepted_pid = control::request_daemon_exit(&profile.id, operation)
-        .await
-        .map_err(|error| {
-            AppError::Message(format!(
-                "daemon 未接受 {} 请求：{error}；写操作不会回退到本地进程控制",
-                match operation {
-                    control::ControlOperation::Shutdown => "shutdown",
-                    control::ControlOperation::Restart => "restart",
-                }
-            ))
-        })?;
-    if accepted_pid != state.pid {
-        return Err(AppError::Message(format!(
-            "daemon 控制响应 PID 不匹配：状态文件为 {}，响应为 {accepted_pid}",
-            state.pid
-        )));
-    }
-    daemon::wait_for_controlled_exit(profile, state.pid, timeout, force).await?;
-    Ok(Some(state.pid))
 }
 
 async fn run_daemon(selector: &str, service: ServiceSelection, tunnel: bool) -> AppResult<()> {

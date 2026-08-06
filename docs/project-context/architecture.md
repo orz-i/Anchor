@@ -69,7 +69,7 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 | 维度 | 当前实现 |
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
-| 进程管理 | RuntimeSupervisor + 显式状态机 + 自有子进程 |
+| 进程管理 | Workspace daemon 为主；RuntimeSupervisor 仅保留 Gateway/Tunnel 与旧会话兼容路径 |
 | UI | Tauri 2 + SvelteKit 设计系统 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | 桌面安装包与独立 `anchor` CLI |
@@ -89,7 +89,8 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 ### control/ 与 daemon.rs
 - **职责**: CLI/GUI 共用的控制状态、版本化本地 IPC、协议协商、daemon 状态文件与进程生命周期
 - **传输**: Unix Domain Socket；Windows Named Pipe 抽象
-- **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退
+- **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
+- **GUI 接入**: Workspace 状态、日志、启停、重启、删除和密钥应用均通过共享 daemon 客户端；Gateway/Tunnel 尚处兼容迁移阶段
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport

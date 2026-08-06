@@ -8,22 +8,18 @@ use crate::control::{self, WorkspaceControlStatus};
 use crate::error::{AppError, AppResult};
 
 use crate::runtime::{
-    await_listener_shutdown, port_busy_message, try_reclaim_previous_macos_app_port,
-    update_public_url, wait_for_port_free, ServiceKind,
+    port_busy_message, try_reclaim_previous_macos_app_port, update_public_url, wait_for_port_free,
 };
 
 use crate::mcp::gateway::{self, McpGatewayStatus};
 
 use crate::platform::platform;
 
-use crate::tunnel::{
-    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime,
-    supervisor as tunnel_supervisor, sync_managed_runtime_routes, TunnelServiceKind,
-};
+use crate::tunnel::{maybe_start_for_runtime, reconcile_mcp_gateway, TunnelServiceKind};
 
 use crate::settings::{AppSettings, McpGatewayConfig};
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
-use crate::workspace::RuntimeStatusDto;
+use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto};
 
 fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::WorkspaceProfile> {
     state.with_workspaces(|store| {
@@ -32,166 +28,6 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TunnelContinuitySnapshot {
-    running: bool,
-    public_url: String,
-    pid: Option<u32>,
-}
-
-impl TunnelContinuitySnapshot {
-    fn from_direct(status: crate::tunnel::TunnelStatus) -> Self {
-        Self {
-            running: status.state == "running",
-            public_url: normalize_public_url(&status.public_url),
-            pid: status.tunnel_pid,
-        }
-    }
-
-    fn from_gateway(status: McpGatewayStatus) -> Self {
-        Self {
-            running: status.state == "running",
-            public_url: normalize_public_url(&status.public_base_url),
-            pid: None,
-        }
-    }
-}
-
-fn normalize_public_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
-}
-
-fn tunnel_continuity_preserved(
-    before: &TunnelContinuitySnapshot,
-    after: &TunnelContinuitySnapshot,
-) -> bool {
-    if !before.running {
-        return true;
-    }
-    after.running
-        && before.public_url == after.public_url
-        && (before.pid.is_none() || before.pid == after.pid)
-}
-
-async fn tunnel_continuity_snapshot(
-    state: &AppState,
-    profile: &crate::workspace::WorkspaceProfile,
-    kind: TunnelServiceKind,
-) -> AppResult<TunnelContinuitySnapshot> {
-    let settings = state.with_settings(|store| Ok(store.settings()))?;
-    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
-        return Ok(TunnelContinuitySnapshot::from_gateway(
-            gateway::status(&settings.mcp_gateway).await,
-        ));
-    }
-    let guard = tunnel_supervisor().lock().await;
-    Ok(TunnelContinuitySnapshot::from_direct(
-        guard.status(profile, kind, &settings),
-    ))
-}
-
-async fn restart_listener_preserving_tunnel(
-    state: &AppState,
-    profile: &crate::workspace::WorkspaceProfile,
-    kind: ServiceKind,
-) -> AppResult<RuntimeStatusDto> {
-    let tunnel_kind = match kind {
-        ServiceKind::Mcp => TunnelServiceKind::Mcp,
-        ServiceKind::Actions => TunnelServiceKind::Actions,
-    };
-    let before = tunnel_continuity_snapshot(state, profile, tunnel_kind).await?;
-    let status = state.with_runtime(|runtime| match kind {
-        ServiceKind::Mcp => runtime.restart_mcp(profile),
-        ServiceKind::Actions => runtime.restart_actions(profile),
-    })?;
-    let after = tunnel_continuity_snapshot(state, profile, tunnel_kind).await?;
-    let tunnel_preserved = tunnel_continuity_preserved(&before, &after);
-
-    if status.state != "running" {
-        let tunnel_detail = if tunnel_preserved {
-            "隧道仍按原公网地址保留"
-        } else {
-            "同时检测到隧道连续性异常"
-        };
-        let message = format!(
-            "{} listener 重载后状态为 {}：{}。{}，本地服务尚未恢复，请修正配置后再次重载。",
-            match kind {
-                ServiceKind::Mcp => "MCP",
-                ServiceKind::Actions => "Actions",
-            },
-            status.state,
-            status.local_message,
-            tunnel_detail,
-        );
-        crate::tunnel::append_profile_log(
-            &profile.id,
-            match kind {
-                ServiceKind::Mcp => "stderr.log",
-                ServiceKind::Actions => "actions-stderr.log",
-            },
-            &format!(
-                "[reload] listener_restarted=false tunnel_preserved={tunnel_preserved} {message}"
-            ),
-        );
-        return Err(AppError::Message(message));
-    }
-
-    if !tunnel_preserved {
-        let message = format!(
-            "{} listener 已重启，但隧道连续性校验失败：重载前 URL={} PID={:?}，重载后 URL={} PID={:?}。请保持当前服务运行并检查隧道日志；不要重新注册 ChatGPT 插件，除非公网地址确实发生变化。",
-            match kind {
-                ServiceKind::Mcp => "MCP",
-                ServiceKind::Actions => "Actions",
-            },
-            before.public_url,
-            before.pid,
-            after.public_url,
-            after.pid,
-        );
-        crate::tunnel::append_profile_log(
-            &profile.id,
-            match kind {
-                ServiceKind::Mcp => "stderr.log",
-                ServiceKind::Actions => "actions-stderr.log",
-            },
-            &format!("[reload] tunnel_preserved=false {message}"),
-        );
-        return Err(AppError::Message(message));
-    }
-
-    crate::tunnel::append_profile_log(
-        &profile.id,
-        match kind {
-            ServiceKind::Mcp => "stdout.log",
-            ServiceKind::Actions => "actions-stdout.log",
-        },
-        &format!(
-            "[reload] service={} listener_restarted=true tunnel_preserved=true public_url={} tunnel_pid={:?}",
-            match kind {
-                ServiceKind::Mcp => "mcp",
-                ServiceKind::Actions => "actions",
-            },
-            after.public_url,
-            after.pid,
-        ),
-    );
-    Ok(status)
-}
-
-async fn rollback_started_mcp_runtime(
-    state: &AppState,
-    profile: &crate::workspace::WorkspaceProfile,
-) -> AppResult<()> {
-    let handle =
-        state.with_runtime(|runtime| Ok(runtime.begin_stop(&profile.id, ServiceKind::Mcp)))?;
-    await_listener_shutdown(handle, profile.runtime.local_port).await;
-    state.with_runtime(|runtime| {
-        runtime.finish_stop(&profile.id, ServiceKind::Mcp);
-        Ok(())
-    })?;
-    sync_tunnel_routes_from_runtime(state).await
 }
 
 #[tauri::command]
@@ -225,6 +61,242 @@ fn restart_active_mcp_listeners(
     Ok(())
 }
 
+const DESKTOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn selection_includes(
+    selection: crate::daemon::ServiceSelection,
+    service: WorkspaceService,
+) -> bool {
+    match service {
+        WorkspaceService::Mcp => selection.includes_mcp(),
+        WorkspaceService::Actions => selection.includes_actions(),
+    }
+}
+
+fn empty_recovery(enabled: bool, last_error: String) -> RuntimeRecoveryDto {
+    RuntimeRecoveryDto {
+        enabled,
+        attempt: 0,
+        max_attempts: 0,
+        retry_in_ms: None,
+        recovered_count: 0,
+        last_error,
+    }
+}
+
+fn runtime_status_from_control(
+    profile: &crate::workspace::WorkspaceProfile,
+    settings: &AppSettings,
+    status: &WorkspaceControlStatus,
+    service: WorkspaceService,
+) -> RuntimeStatusDto {
+    let (port, local_endpoint, public_endpoint, public_message, label) = match service {
+        WorkspaceService::Mcp => (
+            &status.mcp,
+            profile.local_endpoint(),
+            profile.public_endpoint_with(settings),
+            profile.mcp_external_base_url_with(settings),
+            "MCP",
+        ),
+        WorkspaceService::Actions => (
+            &status.actions,
+            profile.actions_local_base_url(),
+            profile.actions_openapi_url_with(settings),
+            profile.actions_effective_public_url_with(settings),
+            "Actions",
+        ),
+    };
+    let daemon_pid = status
+        .daemon
+        .state
+        .as_ref()
+        .filter(|_| status.daemon.running)
+        .map(|state| state.pid);
+    let selected = status
+        .daemon
+        .state
+        .as_ref()
+        .filter(|_| status.daemon.running)
+        .is_some_and(|state| selection_includes(state.service, service));
+
+    let (state, pid, local_message, recovery) =
+        if status.daemon.ambiguous || (status.daemon.stale && status.daemon.state.is_some()) {
+            (
+                "error",
+                daemon_pid,
+                status.daemon.detail.clone(),
+                empty_recovery(false, status.daemon.detail.clone()),
+            )
+        } else if selected && port.owner == "daemon" {
+            (
+                "running",
+                daemon_pid,
+                format!("{label} 由 daemon 监听 127.0.0.1:{}", port.port),
+                empty_recovery(false, String::new()),
+            )
+        } else if port.owner == "external" {
+            let message = format!(
+                "{label} 端口 {} 由外部 PID {} 占用，GUI 不会接管该进程",
+                port.port,
+                port.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+            (
+                "error",
+                port.pid,
+                message.clone(),
+                empty_recovery(false, message),
+            )
+        } else if selected && status.daemon.running {
+            let message = format!(
+                "{label} daemon 正在运行，但端口 {} 暂未监听；等待 daemon 自动恢复",
+                port.port
+            );
+            (
+                "recovering",
+                daemon_pid,
+                message.clone(),
+                empty_recovery(true, message),
+            )
+        } else if !status.daemon.supported {
+            (
+                "stopped",
+                None,
+                format!("未启动；{}", status.daemon.detail),
+                empty_recovery(false, String::new()),
+            )
+        } else {
+            (
+                "stopped",
+                None,
+                "未启动".into(),
+                empty_recovery(false, String::new()),
+            )
+        };
+
+    RuntimeStatusDto {
+        state: state.into(),
+        pid,
+        local_message,
+        public_message: if public_message.is_empty() {
+            "未配置公网访问".into()
+        } else {
+            public_message
+        },
+        local_endpoint,
+        public_endpoint,
+        recovery,
+        activity: match service {
+            WorkspaceService::Mcp => status.mcp_activity.clone(),
+            WorkspaceService::Actions => None,
+        },
+    }
+}
+
+async fn daemon_runtime_status(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    let status = control::workspace_status_via_daemon_or_local(profile).await?;
+    Ok(runtime_status_from_control(
+        profile, &settings, &status, service,
+    ))
+}
+
+fn ensure_daemon_gateway_compatible(
+    state: &AppState,
+    desired: Option<crate::daemon::ServiceSelection>,
+) -> AppResult<()> {
+    let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
+    if gateway_enabled && desired.is_some_and(crate::daemon::ServiceSelection::includes_mcp) {
+        return Err(AppError::Message(
+            "MCP Gateway 模式尚未迁移到统一 daemon 控制面；请先关闭 Gateway，或使用 CLI `anchor gateway serve`。GUI 不会回退到进程内 RuntimeSupervisor。"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn start_desktop_service(
+    state: &AppState,
+    id: &str,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    validate_start_resources(state, id, service)?;
+    let profile = profile_by_id(state, id)?;
+    let inspection = crate::daemon::inspect(&profile)?;
+    let current = inspection
+        .state
+        .as_ref()
+        .filter(|_| inspection.running)
+        .map(|state| state.service);
+    let desired = control::desired_service_selection(current, service, true);
+    ensure_daemon_gateway_compatible(state, desired)?;
+    if !current.is_some_and(|selection| selection_includes(selection, service)) {
+        match service {
+            WorkspaceService::Mcp => {
+                ensure_port_available(profile.runtime.local_port, "本地 MCP").await?
+            }
+            WorkspaceService::Actions => {
+                ensure_port_available(profile.actions.local_port, "本地 Actions").await?
+            }
+        }
+    }
+    control::set_daemon_service(&profile, service, true, true, DESKTOP_DAEMON_TIMEOUT, true)
+        .await?;
+    daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
+}
+
+async fn stop_desktop_service(
+    state: &AppState,
+    id: &str,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    let profile = profile_by_id(state, id)?;
+    control::set_daemon_service(
+        &profile,
+        service,
+        false,
+        false,
+        DESKTOP_DAEMON_TIMEOUT,
+        true,
+    )
+    .await?;
+    daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
+}
+
+async fn restart_desktop_service(
+    state: &AppState,
+    id: &str,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    validate_start_resources(state, id, service)?;
+    let profile = profile_by_id(state, id)?;
+    let inspection = crate::daemon::inspect(&profile)?;
+    let current = inspection
+        .state
+        .as_ref()
+        .filter(|_| inspection.running)
+        .map(|state| state.service);
+    let desired = control::desired_service_selection(current, service, true);
+    ensure_daemon_gateway_compatible(state, desired)?;
+    if !current.is_some_and(|selection| selection_includes(selection, service)) {
+        match service {
+            WorkspaceService::Mcp => {
+                ensure_port_available(profile.runtime.local_port, "本地 MCP").await?
+            }
+            WorkspaceService::Actions => {
+                ensure_port_available(profile.actions.local_port, "本地 Actions").await?
+            }
+        }
+    }
+    control::restart_daemon_service(&profile, service, true, DESKTOP_DAEMON_TIMEOUT, true).await?;
+    daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
+}
+
 #[tauri::command]
 pub async fn set_mcp_gateway(
     state: State<'_, AppState>,
@@ -232,6 +304,22 @@ pub async fn set_mcp_gateway(
 ) -> AppResult<McpGatewayStatus> {
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    if config.enabled {
+        for profile in &profiles {
+            let inspection = crate::daemon::inspect(profile)?;
+            if inspection
+                .state
+                .as_ref()
+                .filter(|_| inspection.running)
+                .is_some_and(|state| state.service.includes_mcp())
+            {
+                return Err(AppError::Message(format!(
+                    "Workspace {} 的 MCP 正由 daemon 管理。Gateway 写控制尚未迁移到 daemon；请先停止该 Workspace，再配置 Gateway。GUI 不会启动第二套进程内 listener。",
+                    profile.name
+                )));
+            }
+        }
+    }
     let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
     let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
     let listener_policy_changed = previous.enabled != config.enabled;
@@ -409,11 +497,6 @@ fn persist_tunnel_url(
     Ok(())
 }
 
-async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {
-    let active_keys = state.with_runtime(|runtime| Ok(runtime.active_tunnel_service_keys()))?;
-    sync_managed_runtime_routes(active_keys).await
-}
-
 #[allow(clippy::collapsible_if)]
 async fn ensure_port_available(port: u16, service_label: &str) -> AppResult<()> {
     let Some(pid) = platform().find_pid_listening_on_port(port)? else {
@@ -444,49 +527,7 @@ async fn ensure_port_available(port: u16, service_label: &str) -> AppResult<()> 
 #[tauri::command]
 
 pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Mcp)?;
-    let profile = profile_by_id(&state, &id)?;
-
-    ensure_port_available(profile.runtime.local_port, "本地 MCP").await?;
-
-    state.with_runtime(|runtime| runtime.start_mcp(&profile))?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-
-    let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
-    if gateway_enabled {
-        if let Err(error) = reconcile_gateway_state(&state).await {
-            let rollback = rollback_started_mcp_runtime(&state, &profile).await;
-            return match rollback {
-                Ok(()) => Err(AppError::Message(format!(
-                    "MCP Gateway 启动失败，已回滚工作区 listener：{error}"
-                ))),
-                Err(rollback_error) => Err(AppError::Message(format!(
-                    "MCP Gateway 启动失败：{error}；回滚工作区 listener 也失败：{rollback_error}"
-                ))),
-            };
-        }
-    } else {
-        match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
-            Ok(Some(url)) => {
-                persist_tunnel_url(&state, &id, TunnelServiceKind::Mcp, &url)?;
-            }
-
-            Ok(None) => {}
-
-            Err(error) => {
-                eprintln!("mcp tunnel auto-start failed for {id}: {error}");
-            }
-        }
-    }
-
-    let profile = profile_by_id(&state, &id)?;
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    state.with_runtime(|runtime| {
-        runtime.refresh_mcp(&profile);
-        runtime.mcp_status(&profile)
-    })
+    start_desktop_service(&state, &id, WorkspaceService::Mcp).await
 }
 
 #[tauri::command]
@@ -501,37 +542,17 @@ pub async fn get_workspace_control_status(
 #[tauri::command]
 
 pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-
-    let port = profile.runtime.local_port;
-
-    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(&id, ServiceKind::Mcp)))?;
-
-    await_listener_shutdown(handle, port).await;
-
-    state.with_runtime(|runtime| {
-        runtime.finish_stop(&id, ServiceKind::Mcp);
-        Ok(())
-    })?;
-    let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
-    if gateway_enabled {
-        reconcile_gateway_state(&state).await?;
-    } else {
-        stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
-    }
-    sync_tunnel_routes_from_runtime(&state).await?;
-    state.with_runtime(|runtime| runtime.mcp_status(&profile))
+    stop_desktop_service(&state, &id, WorkspaceService::Mcp).await
 }
 
 #[tauri::command]
 
-pub fn get_runtime_status(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+pub async fn get_runtime_status(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(&state, &id)?;
-
-    state.with_runtime(|runtime| {
-        runtime.refresh_mcp(&profile);
-        runtime.mcp_status(&profile)
-    })
+    daemon_runtime_status(&state, &profile, WorkspaceService::Mcp).await
 }
 
 #[tauri::command]
@@ -541,34 +562,7 @@ pub async fn start_actions_runtime(
 
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Actions)?;
-    let profile = profile_by_id(&state, &id)?;
-
-    ensure_port_available(profile.actions.local_port, "本地 Actions").await?;
-
-    state.with_runtime(|runtime| runtime.start_actions(&profile))?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-
-    match maybe_start_for_runtime(&profile, TunnelServiceKind::Actions).await {
-        Ok(Some(url)) => {
-            persist_tunnel_url(&state, &id, TunnelServiceKind::Actions, &url)?;
-        }
-
-        Ok(None) => {}
-
-        Err(error) => {
-            eprintln!("actions tunnel auto-start failed for {id}: {error}");
-        }
-    }
-
-    let profile = profile_by_id(&state, &id)?;
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    state.with_runtime(|runtime| {
-        runtime.refresh_actions(&profile);
-        runtime.actions_status(&profile)
-    })
+    start_desktop_service(&state, &id, WorkspaceService::Actions).await
 }
 
 #[tauri::command]
@@ -578,36 +572,18 @@ pub async fn stop_actions_runtime(
 
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-
-    let port = profile.actions.local_port;
-
-    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(&id, ServiceKind::Actions)))?;
-
-    await_listener_shutdown(handle, port).await;
-
-    state.with_runtime(|runtime| {
-        runtime.finish_stop(&id, ServiceKind::Actions);
-        Ok(())
-    })?;
-    stop_for_runtime(&profile, TunnelServiceKind::Actions).await?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-    state.with_runtime(|runtime| runtime.actions_status(&profile))
+    stop_desktop_service(&state, &id, WorkspaceService::Actions).await
 }
 
 #[tauri::command]
 
-pub fn get_actions_runtime_status(
+pub async fn get_actions_runtime_status(
     state: State<'_, AppState>,
 
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(&state, &id)?;
-
-    state.with_runtime(|runtime| {
-        runtime.refresh_actions(&profile);
-        runtime.actions_status(&profile)
-    })
+    daemon_runtime_status(&state, &profile, WorkspaceService::Actions).await
 }
 
 #[tauri::command]
@@ -615,9 +591,7 @@ pub async fn restart_runtime(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Mcp)?;
-    let profile = profile_by_id(&state, &id)?;
-    restart_listener_preserving_tunnel(&state, &profile, ServiceKind::Mcp).await
+    restart_desktop_service(&state, &id, WorkspaceService::Mcp).await
 }
 
 #[tauri::command]
@@ -625,57 +599,125 @@ pub async fn restart_actions_runtime(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    validate_start_resources(&state, &id, WorkspaceService::Actions)?;
-    let profile = profile_by_id(&state, &id)?;
-    restart_listener_preserving_tunnel(&state, &profile, ServiceKind::Actions).await
+    restart_desktop_service(&state, &id, WorkspaceService::Actions).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{tunnel_continuity_preserved, TunnelContinuitySnapshot};
+    use super::*;
+    use crate::daemon::{DaemonInspection, DaemonState, ServiceSelection};
+    use crate::settings::AppSettings;
+    use crate::workspace::WorkspaceProfile;
 
-    fn snapshot(running: bool, url: &str, pid: Option<u32>) -> TunnelContinuitySnapshot {
-        TunnelContinuitySnapshot {
-            running,
-            public_url: url.into(),
-            pid,
-        }
+    #[test]
+    fn daemon_status_maps_each_service_without_process_local_runtime_state() {
+        let profile = WorkspaceProfile::new(".".into(), Some("desktop-status".into()));
+        let daemon_state = DaemonState {
+            schema_version: 1,
+            workspace_id: profile.id.clone(),
+            workspace_name: profile.name.clone(),
+            workspace_path: profile.path.clone(),
+            pid: 42,
+            started_at_unix: 1,
+            service: ServiceSelection::Mcp,
+            tunnel: true,
+            log_path: "daemon.log".into(),
+            version: "test".into(),
+        };
+        let status = WorkspaceControlStatus {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            path: profile.path.clone(),
+            daemon: DaemonInspection {
+                supported: true,
+                running: true,
+                stale: false,
+                ambiguous: false,
+                pid_matches: true,
+                state: Some(daemon_state),
+                detail: "running".into(),
+            },
+            mcp: control::PortStatus {
+                service: "mcp".into(),
+                port: profile.runtime.local_port,
+                listening: true,
+                pid: Some(42),
+                owner: "daemon".into(),
+                endpoint: profile.local_endpoint(),
+            },
+            actions: control::PortStatus {
+                service: "actions".into(),
+                port: profile.actions.local_port,
+                listening: false,
+                pid: None,
+                owner: "none".into(),
+                endpoint: profile.actions_local_base_url(),
+            },
+            mcp_activity: None,
+        };
+
+        let mcp = runtime_status_from_control(
+            &profile,
+            &AppSettings::default(),
+            &status,
+            WorkspaceService::Mcp,
+        );
+        let actions = runtime_status_from_control(
+            &profile,
+            &AppSettings::default(),
+            &status,
+            WorkspaceService::Actions,
+        );
+
+        assert_eq!(mcp.state, "running");
+        assert_eq!(mcp.pid, Some(42));
+        assert_eq!(actions.state, "stopped");
     }
 
     #[test]
-    fn stopped_tunnel_does_not_block_listener_reload() {
-        assert!(tunnel_continuity_preserved(
-            &snapshot(false, "", None),
-            &snapshot(false, "", None),
-        ));
-    }
+    fn external_port_is_reported_as_error_instead_of_being_adopted() {
+        let profile = WorkspaceProfile::new(".".into(), Some("external-port".into()));
+        let status = WorkspaceControlStatus {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            path: profile.path.clone(),
+            daemon: DaemonInspection {
+                supported: true,
+                running: false,
+                stale: false,
+                ambiguous: false,
+                pid_matches: false,
+                state: None,
+                detail: "stopped".into(),
+            },
+            mcp: control::PortStatus {
+                service: "mcp".into(),
+                port: profile.runtime.local_port,
+                listening: true,
+                pid: Some(99),
+                owner: "external".into(),
+                endpoint: profile.local_endpoint(),
+            },
+            actions: control::PortStatus {
+                service: "actions".into(),
+                port: profile.actions.local_port,
+                listening: false,
+                pid: None,
+                owner: "none".into(),
+                endpoint: profile.actions_local_base_url(),
+            },
+            mcp_activity: None,
+        };
 
-    #[test]
-    fn running_tunnel_requires_same_url_and_process() {
-        let before = snapshot(true, "https://stable.example.com", Some(42));
-        assert!(tunnel_continuity_preserved(
-            &before,
-            &snapshot(true, "https://stable.example.com", Some(42)),
-        ));
-        assert!(!tunnel_continuity_preserved(
-            &before,
-            &snapshot(true, "https://changed.example.com", Some(42)),
-        ));
-        assert!(!tunnel_continuity_preserved(
-            &before,
-            &snapshot(true, "https://stable.example.com", Some(43)),
-        ));
-        assert!(!tunnel_continuity_preserved(
-            &before,
-            &snapshot(false, "https://stable.example.com", None),
-        ));
-    }
+        let runtime = runtime_status_from_control(
+            &profile,
+            &AppSettings::default(),
+            &status,
+            WorkspaceService::Mcp,
+        );
 
-    #[test]
-    fn gateway_continuity_uses_stable_public_url_without_pid() {
-        assert!(tunnel_continuity_preserved(
-            &snapshot(true, "https://gateway.example.com", None),
-            &snapshot(true, "https://gateway.example.com", None),
-        ));
+        assert_eq!(runtime.state, "error");
+        assert_eq!(runtime.pid, Some(99));
+        assert!(runtime.local_message.contains("不会接管"));
     }
 }

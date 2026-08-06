@@ -173,6 +173,17 @@ CLI 生命周期语义：
 
 运行中 daemon 的 `logs` 和 `logs --follow` 通过 IPC 获取有界日志快照和增量游标。单次响应日志内容最多 8 KiB，避免日志内容突破控制帧上限。daemon 已停止时，CLI 仍允许直接读取已有历史日志文件。
 
+GUI Workspace 控制使用同一生命周期客户端：
+
+- MCP/Actions 状态来自 `workspace_status`，包括 daemon PID、端口所有权和 MCP 活跃度；
+- 启动、停止、重启和 Workspace 删除不再创建或接管进程内 listener；
+- MCP/Actions 独立开关会重新计算目标 daemon 服务选择，必要时协调重启整个 Workspace daemon；
+- 运行中日志必须走 daemon IPC；控制端点失败时不会回退为 GUI 直接读取正在写入的日志文件；
+- 密钥再生成会通过 IPC 重启真正使用该密钥的 daemon；
+- 当前 Gateway/Tunnel 仍是桌面兼容路径。daemon 管理的 MCP 运行时，GUI 拒绝启用进程内 Gateway，防止形成第二套运行权威。
+
+Windows 仍只有 Named Pipe 客户端和地址抽象。服务端与当前用户 ACL 未完成前，GUI 会显示 daemon 不受支持，写操作直接失败，不会落回进程内 Runtime。
+
 ## 与 systemd 的关系
 
 内置 daemon 解决的是“命令退出后继续运行”和日常人工运维，不负责开机自启或进程崩溃后的操作系统级拉起。

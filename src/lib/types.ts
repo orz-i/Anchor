@@ -189,6 +189,7 @@ export interface WorkspaceControlStatus {
   daemon: DaemonInspection;
   mcp: WorkspacePortStatus;
   actions: WorkspacePortStatus;
+  mcpActivity?: McpActivity | null;
 }
 
 export type McpActivityState =

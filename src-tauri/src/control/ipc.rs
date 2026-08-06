@@ -502,12 +502,23 @@ fn handle_request(
                 return handled(response);
             }
             match workspace_status(profile) {
-                Ok(status) => handled(ControlResponse::success(
-                    request_id,
-                    ControlResult::WorkspaceStatus {
-                        status: Box::new(status),
-                    },
-                )),
+                Ok(mut status) => {
+                    if status
+                        .daemon
+                        .state
+                        .as_ref()
+                        .filter(|_| status.daemon.running)
+                        .is_some_and(|state| state.service.includes_mcp())
+                    {
+                        status.mcp_activity = Some(crate::mcp::activity_snapshot(&profile.id));
+                    }
+                    handled(ControlResponse::success(
+                        request_id,
+                        ControlResult::WorkspaceStatus {
+                            status: Box::new(status),
+                        },
+                    ))
+                }
                 Err(error) => handled(ControlResponse::error(
                     request_id,
                     ERROR_INTERNAL,
