@@ -203,6 +203,9 @@ fn track_task_recovery(
             .get("affected_files")
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty());
+    if tool == "wait_command" && error_code == Some("SESSION_NOT_FOUND") && !workspace_mutated {
+        return;
+    }
     let rollback_status = if workspace_mutated {
         "required"
     } else {
@@ -2222,5 +2225,30 @@ mod tests {
             ctx.harness.status().expect("status").baseline_matches,
             Some(true)
         );
+    }
+
+    #[test]
+    fn missing_wait_session_without_workspace_mutation_does_not_open_task_recovery() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx
+            .harness
+            .start_task("missing retained session")
+            .expect("task");
+
+        let result = call_tool_with_cancellation(
+            &ctx,
+            "wait_command",
+            &json!({"session_id": "missing-session"}),
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["code"], "SESSION_NOT_FOUND", "{result}");
+        assert!(result.get("task_recovery").is_none(), "{result}");
+        assert!(ctx.harness.task(&task.id).expect("task").recovery.is_none());
     }
 }
