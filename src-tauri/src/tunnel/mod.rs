@@ -32,5 +32,5 @@ pub fn frp_snippet(
     kind: TunnelServiceKind,
 ) -> crate::error::AppResult<String> {
     let settings = AppSettings::load()?;
-    Ok(frp::frp_snippet(profile, kind, &settings))
+    frp::frp_snippet(profile, kind, &settings)
 }

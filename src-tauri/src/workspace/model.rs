@@ -24,6 +24,12 @@ pub struct TunnelConfig {
     pub frp_subdomain: String,
     pub frp_profile_id: String,
     pub frp_server_port: u16,
+    #[serde(default = "default_frp_proxy_type")]
+    pub frp_proxy_type: String,
+    #[serde(default)]
+    pub frp_cert_path: String,
+    #[serde(default)]
+    pub frp_key_path: String,
     pub cloudflare_mode: String,
     /// When true, apply global proxy from Settings → General when starting the tunnel.
     pub use_proxy: bool,
@@ -77,6 +83,12 @@ pub struct ActionsConfig {
     pub frp_subdomain: String,
     pub frp_profile_id: String,
     pub frp_server_port: u16,
+    #[serde(default = "default_frp_proxy_type")]
+    pub frp_proxy_type: String,
+    #[serde(default)]
+    pub frp_cert_path: String,
+    #[serde(default)]
+    pub frp_key_path: String,
     pub cloudflare_mode: String,
     pub use_proxy: bool,
     pub local_port: u16,
@@ -156,6 +168,10 @@ fn default_frp_server_port() -> u16 {
     7000
 }
 
+fn default_frp_proxy_type() -> String {
+    "http".to_string()
+}
+
 fn default_actions_auth_type() -> String {
     "api_key".to_string()
 }
@@ -232,6 +248,9 @@ impl Default for TunnelConfig {
             frp_subdomain: String::new(),
             frp_profile_id: String::new(),
             frp_server_port: default_frp_server_port(),
+            frp_proxy_type: default_frp_proxy_type(),
+            frp_cert_path: String::new(),
+            frp_key_path: String::new(),
             cloudflare_mode: default_new_cloudflare_mode(),
             use_proxy: default_use_proxy(),
         }
@@ -280,6 +299,9 @@ impl Default for ActionsConfig {
             frp_subdomain: String::new(),
             frp_profile_id: String::new(),
             frp_server_port: default_frp_server_port(),
+            frp_proxy_type: default_frp_proxy_type(),
+            frp_cert_path: String::new(),
+            frp_key_path: String::new(),
             cloudflare_mode: default_new_cloudflare_mode(),
             use_proxy: default_use_proxy(),
             local_port: default_actions_port(),
@@ -460,6 +482,31 @@ mod tests {
 
         assert_eq!(tunnel.tunnel_type, "frp");
         assert_eq!(tunnel.cloudflare_mode, "named");
+    }
+
+    #[test]
+    fn legacy_tunnel_configs_default_to_http_without_certificate_paths() {
+        let mut tunnel = serde_json::to_value(TunnelConfig::default()).expect("tunnel config");
+        let object = tunnel.as_object_mut().expect("tunnel object");
+        object.remove("frp_proxy_type");
+        object.remove("frp_cert_path");
+        object.remove("frp_key_path");
+
+        let tunnel: TunnelConfig = serde_json::from_value(tunnel).expect("legacy tunnel");
+        assert_eq!(tunnel.frp_proxy_type, "http");
+        assert!(tunnel.frp_cert_path.is_empty());
+        assert!(tunnel.frp_key_path.is_empty());
+
+        let mut actions = serde_json::to_value(ActionsConfig::default()).expect("actions config");
+        let object = actions.as_object_mut().expect("actions object");
+        object.remove("frp_proxy_type");
+        object.remove("frp_cert_path");
+        object.remove("frp_key_path");
+
+        let actions: ActionsConfig = serde_json::from_value(actions).expect("legacy actions");
+        assert_eq!(actions.frp_proxy_type, "http");
+        assert!(actions.frp_cert_path.is_empty());
+        assert!(actions.frp_key_path.is_empty());
     }
 
     #[test]

@@ -40,7 +40,7 @@ FRPS 服务端控制链路和 HTTP vhost 端口均可达；当前无法使用首
 
 Cloudflare 橙云 DNS 记录只适合代理 HTTP/HTTPS。FRP 控制连接 `17001` 必须使用服务器 IP，或单独建立 DNS-only 控制域名；不能让 frpc 连接橙云 wildcard 域名的 `17001`。
 
-Anchor 当前创建的是 FRP `http` proxy，实际由 FRPS 的 `vhostHttpPort = 80` 接收。Cloudflare 的 Full / Full (Strict) 模式会让外部 HTTPS 请求连接源站 443，但 FRPS 443 只会路由已注册的 FRP `https` proxy，而 Anchor 本地服务不是 HTTPS。因此：
+Anchor 当前创建的是 FRP `http` proxy，实际由 FRPS 的 `vhostHTTPPort = 80` 接收。Cloudflare 的 Full / Full (Strict) 模式会让外部 HTTPS 请求连接源站 443，但 FRPS 443 只会路由已注册的 FRP `https` proxy，而 Anchor 本地服务不是 HTTPS。因此：
 
 - 临时验证可对目标 hostname 使用 Cloudflare Configuration Rule，将 SSL 模式设为 Flexible，使 Cloudflare 到源站走 HTTP 80；不要无必要地对整个 zone 改为 Flexible。
 - 更严格的长期方案需要一个真正支持源站 TLS 的反向代理/HTTPS FRP 路由，再使用 Full (Strict)。

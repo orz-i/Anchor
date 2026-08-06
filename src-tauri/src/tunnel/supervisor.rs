@@ -546,7 +546,7 @@ impl TunnelSupervisor {
             .iter()
             .map(|(profile, kind)| (profile, *kind))
             .collect();
-        let expected = frp::build_frpc_toml_for_route_refs(&route_refs, settings);
+        let expected = frp::build_frpc_toml_for_route_refs(&route_refs, settings)?;
 
         let process_alive = self.frpc.get(workspace_id).is_some_and(|process| {
             process

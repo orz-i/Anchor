@@ -12,6 +12,9 @@
     frp_subdomain: string;
     frp_profile_id: string;
     frp_server_port: number;
+    frp_proxy_type: string;
+    frp_cert_path: string;
+    frp_key_path: string;
     cloudflare_mode: string;
     use_proxy: boolean;
   }
@@ -37,6 +40,9 @@
     frp_subdomain: "",
     frp_profile_id: "",
     frp_server_port: 7000,
+    frp_proxy_type: "http",
+    frp_cert_path: "",
+    frp_key_path: "",
     cloudflare_mode: "named",
     use_proxy: true,
   });
@@ -70,6 +76,9 @@
       draft.frp_subdomain !== config.frp_subdomain ||
       draft.frp_profile_id !== config.frp_profile_id ||
       draft.frp_server_port !== config.frp_server_port ||
+      draft.frp_proxy_type !== config.frp_proxy_type ||
+      draft.frp_cert_path !== config.frp_cert_path ||
+      draft.frp_key_path !== config.frp_key_path ||
       draft.cloudflare_mode !== config.cloudflare_mode ||
       draft.use_proxy !== config.use_proxy ||
       tokenPending,
@@ -231,6 +240,44 @@
         还必须在下方填写实际公网 URL。
       </p>
     </label>
+
+    <label class="grid gap-1">
+      <span class="text-xs text-[var(--text-muted)]">公网协议</span>
+      <select
+        class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm"
+        bind:value={draft.frp_proxy_type}
+      >
+        <option value="http">HTTP（FRPS vhostHTTPPort）</option>
+        <option value="https2http">HTTPS → 本地 HTTP（FRPS vhostHTTPSPort）</option>
+      </select>
+      <p class="text-[11px] text-[var(--text-muted)]">
+        HTTPS → HTTP 使用 frpc 的 https2http 插件在本机终止 TLS，适合本地服务仅监听 HTTP 的 MCP 与 Actions。
+      </p>
+    </label>
+
+    {#if draft.frp_proxy_type === "https2http"}
+      <label class="grid gap-1">
+        <span class="text-xs text-[var(--text-muted)]">证书路径</span>
+        <input
+          type="text"
+          class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
+          placeholder=".anchor/cert/taoyan.icu.pem（留空自动发现）"
+          bind:value={draft.frp_cert_path}
+        />
+      </label>
+      <label class="grid gap-1">
+        <span class="text-xs text-[var(--text-muted)]">私钥路径</span>
+        <input
+          type="text"
+          class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 font-mono text-sm"
+          placeholder=".anchor/cert/taoyan.icu.key（留空自动发现）"
+          bind:value={draft.frp_key_path}
+        />
+        <p class="text-[11px] text-[var(--text-muted)]">
+          路径必须位于当前工作区内。两项留空时，Anchor 会从 .anchor/cert 中选择唯一的同名证书与 .key 文件；私钥内容不会写入配置数据库。
+        </p>
+      </label>
+    {/if}
 
     {#if !useGlobalProfile}
       <button

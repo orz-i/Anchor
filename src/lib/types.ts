@@ -16,6 +16,9 @@ export interface TunnelConfig {
   frp_subdomain: string;
   frp_profile_id?: string;
   frp_server_port?: number;
+  frp_proxy_type?: string;
+  frp_cert_path?: string;
+  frp_key_path?: string;
   cloudflare_mode: string;
   use_proxy?: boolean;
 }
@@ -108,6 +111,9 @@ export interface ActionsConfig {
   frp_subdomain: string;
   frp_profile_id?: string;
   frp_server_port?: number;
+  frp_proxy_type?: string;
+  frp_cert_path?: string;
+  frp_key_path?: string;
   cloudflare_mode: string;
   use_proxy?: boolean;
   local_port: number;

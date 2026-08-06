@@ -1,8 +1,10 @@
 mod client;
 
+use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
 use crate::workspace::WorkspaceProfile;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use super::TunnelServiceKind;
 
@@ -15,24 +17,30 @@ pub use client::{resolve_frpc, spawn_frpc};
 
 const FRP_VERSION: &str = "0.61.2";
 pub(crate) const VERSION: &str = FRP_VERSION;
+const FRP_PROXY_HTTP: &str = "http";
+const FRP_PROXY_HTTPS2HTTP: &str = "https2http";
 
 pub fn frp_snippet(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
     settings: &AppSettings,
-) -> String {
-    let config = frp_server_config(profile, kind, settings, None);
-    build_proxy_snippet(&config.proxy)
+) -> AppResult<String> {
+    let config = prepare_frp_server_config(frp_server_config(profile, kind, settings, None))?;
+    Ok(build_proxy_snippet(&config.proxy))
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrpProxyConfig {
     pub proxy_name: String,
     pub local_port: u16,
     pub subdomain: String,
+    pub proxy_type: String,
+    pub cert_path: String,
+    pub key_path: String,
+    pub workspace_root: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrpServerConfig {
     pub server_addr: String,
     pub server_port: u16,
@@ -161,13 +169,13 @@ pub(crate) fn build_frpc_toml_for_routes(configs: &[FrpServerConfig]) -> String 
     };
 
     let mut lines = vec![
-        format!("serverAddr = \"{}\"", first.server_addr.trim()),
+        format!("serverAddr = {}", toml_string(first.server_addr.trim())),
         format!("serverPort = {}", first.server_port),
         String::new(),
     ];
     if let Some(token) = first.token.as_ref().filter(|t| !t.trim().is_empty()) {
         lines.push("auth.method = \"token\"".to_string());
-        lines.push(format!("auth.token = \"{}\"", token.trim()));
+        lines.push(format!("auth.token = {}", toml_string(token.trim())));
         lines.push(String::new());
     }
 
@@ -193,12 +201,203 @@ pub(crate) fn build_frpc_toml_for_routes(configs: &[FrpServerConfig]) -> String 
 pub(crate) fn build_frpc_toml_for_route_refs(
     routes: &[(&WorkspaceProfile, TunnelServiceKind)],
     settings: &AppSettings,
-) -> String {
+) -> AppResult<String> {
     let configs: Vec<FrpServerConfig> = routes
         .iter()
-        .map(|(profile, kind)| frp_server_config(profile, *kind, settings, None))
-        .collect();
-    build_frpc_toml_for_routes(&configs)
+        .map(|(profile, kind)| {
+            prepare_frp_server_config(frp_server_config(profile, *kind, settings, None))
+        })
+        .collect::<AppResult<_>>()?;
+    Ok(build_frpc_toml_for_routes(&configs))
+}
+
+pub(crate) fn prepare_frp_server_config(mut config: FrpServerConfig) -> AppResult<FrpServerConfig> {
+    let mode = config.proxy.proxy_type.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        FRP_PROXY_HTTP => {
+            config.proxy.proxy_type = FRP_PROXY_HTTP.to_string();
+            config.proxy.cert_path.clear();
+            config.proxy.key_path.clear();
+        }
+        FRP_PROXY_HTTPS2HTTP => {
+            let (cert_path, key_path) = resolve_https2http_certificates(&config.proxy)?;
+            config.proxy.proxy_type = FRP_PROXY_HTTPS2HTTP.to_string();
+            config.proxy.cert_path = cert_path;
+            config.proxy.key_path = key_path;
+        }
+        _ => {
+            return Err(AppError::Message(
+                "FRP 代理模式无效，仅支持 http 或 https2http。".into(),
+            ));
+        }
+    }
+    Ok(config)
+}
+
+fn resolve_https2http_certificates(proxy: &FrpProxyConfig) -> AppResult<(String, String)> {
+    let root = PathBuf::from(proxy.workspace_root.trim());
+    if root.as_os_str().is_empty() {
+        return Err(AppError::Message(
+            "工作区路径为空，无法解析 FRP 证书。".into(),
+        ));
+    }
+    let canonical_root = root.canonicalize().map_err(|error| {
+        AppError::Message(format!("无法解析工作区路径 {}：{error}", root.display()))
+    })?;
+
+    let cert_input = proxy.cert_path.trim();
+    let key_input = proxy.key_path.trim();
+    let (cert, key) = match (cert_input.is_empty(), key_input.is_empty()) {
+        (false, false) => (
+            resolve_workspace_certificate(&canonical_root, cert_input, "证书")?,
+            resolve_workspace_certificate(&canonical_root, key_input, "私钥")?,
+        ),
+        (false, true) => {
+            let cert = resolve_workspace_certificate(&canonical_root, cert_input, "证书")?;
+            let key = cert.with_extension("key");
+            (
+                cert,
+                resolve_workspace_certificate_path(&canonical_root, &key, "私钥")?,
+            )
+        }
+        (true, false) => {
+            let key = resolve_workspace_certificate(&canonical_root, key_input, "私钥")?;
+            let cert = find_certificate_for_key(&canonical_root, &key)?;
+            (cert, key)
+        }
+        (true, true) => discover_certificate_pair(&canonical_root)?,
+    };
+
+    Ok((frp_path_string(&cert), frp_path_string(&key)))
+}
+
+fn frp_path_string(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    value.into_owned()
+}
+
+fn resolve_workspace_certificate(root: &Path, input: &str, label: &str) -> AppResult<PathBuf> {
+    let path = PathBuf::from(input);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    resolve_workspace_certificate_path(root, &candidate, label)
+}
+
+fn resolve_workspace_certificate_path(
+    root: &Path,
+    candidate: &Path,
+    label: &str,
+) -> AppResult<PathBuf> {
+    let link_metadata = std::fs::symlink_metadata(candidate).map_err(|error| {
+        AppError::Message(format!(
+            "FRP {label}文件不存在 {}：{error}",
+            candidate.display()
+        ))
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(AppError::Message(format!(
+            "FRP {label}文件不能是符号链接：{}",
+            candidate.display()
+        )));
+    }
+    if !link_metadata.is_file() || link_metadata.len() == 0 {
+        return Err(AppError::Message(format!(
+            "FRP {label}必须是非空普通文件：{}",
+            candidate.display()
+        )));
+    }
+    let canonical = candidate.canonicalize().map_err(|error| {
+        AppError::Message(format!(
+            "无法解析 FRP {label}路径 {}：{error}",
+            candidate.display()
+        ))
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(AppError::Message(format!(
+            "FRP {label}必须位于工作区内：{}",
+            candidate.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn discover_certificate_pair(root: &Path) -> AppResult<(PathBuf, PathBuf)> {
+    let cert_dir = root.join(".anchor").join("cert");
+    let entries = std::fs::read_dir(&cert_dir).map_err(|error| {
+        AppError::Message(format!(
+            "未找到 FRP 证书目录 {}：{error}",
+            cert_dir.display()
+        ))
+    })?;
+    let mut pairs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_certificate_extension(&path) {
+            continue;
+        }
+        let key = path.with_extension("key");
+        if key.is_file() {
+            pairs.push((path, key));
+        }
+    }
+    if pairs.len() != 1 {
+        return Err(AppError::Message(if pairs.is_empty() {
+            format!(
+                "FRP HTTPS 模式需要在 {} 中放置同名证书和 .key 私钥，或显式填写路径。",
+                cert_dir.display()
+            )
+        } else {
+            format!(
+                "FRP 证书目录 {} 中存在多个证书对，请显式选择证书和私钥路径。",
+                cert_dir.display()
+            )
+        }));
+    }
+    let (cert, key) = pairs.remove(0);
+    Ok((
+        resolve_workspace_certificate_path(root, &cert, "证书")?,
+        resolve_workspace_certificate_path(root, &key, "私钥")?,
+    ))
+}
+
+fn find_certificate_for_key(root: &Path, key: &Path) -> AppResult<PathBuf> {
+    for extension in ["pem", "crt", "cer"] {
+        let cert = key.with_extension(extension);
+        if cert.is_file() {
+            return resolve_workspace_certificate_path(root, &cert, "证书");
+        }
+    }
+    Err(AppError::Message(format!(
+        "未找到与私钥同名的 .pem/.crt/.cer 证书：{}",
+        key.display()
+    )))
+}
+
+fn is_certificate_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "pem" | "crt" | "cer"
+            )
+        })
+}
+
+fn toml_string(value: &str) -> String {
+    format!("{value:?}")
 }
 
 fn frp_proxy_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> FrpProxyConfig {
@@ -208,23 +407,50 @@ fn frp_proxy_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> FrpP
             proxy_name: format!("{prefix}-mcp"),
             local_port: profile.runtime.local_port,
             subdomain: profile.tunnel.frp_subdomain.clone(),
+            proxy_type: profile.tunnel.frp_proxy_type.clone(),
+            cert_path: profile.tunnel.frp_cert_path.clone(),
+            key_path: profile.tunnel.frp_key_path.clone(),
+            workspace_root: profile.path.clone(),
         },
         TunnelServiceKind::Actions => FrpProxyConfig {
             proxy_name: format!("{prefix}-actions"),
             local_port: profile.actions.local_port,
             subdomain: profile.actions.frp_subdomain.clone(),
+            proxy_type: profile.actions.frp_proxy_type.clone(),
+            cert_path: profile.actions.frp_cert_path.clone(),
+            key_path: profile.actions.frp_key_path.clone(),
+            workspace_root: profile.path.clone(),
         },
     }
 }
 
 fn build_proxy_snippet(proxy: &FrpProxyConfig) -> String {
+    if proxy.proxy_type == FRP_PROXY_HTTPS2HTTP {
+        return [
+            "[[proxies]]".to_string(),
+            format!("name = {}", toml_string(&proxy.proxy_name)),
+            "type = \"https\"".to_string(),
+            format!("subdomain = {}", toml_string(proxy.subdomain.trim())),
+            String::new(),
+            "[proxies.plugin]".to_string(),
+            "type = \"https2http\"".to_string(),
+            format!(
+                "localAddr = {}",
+                toml_string(&format!("127.0.0.1:{}", proxy.local_port))
+            ),
+            format!("crtPath = {}", toml_string(&proxy.cert_path)),
+            format!("keyPath = {}", toml_string(&proxy.key_path)),
+        ]
+        .join("\n");
+    }
+
     [
         "[[proxies]]".to_string(),
-        format!("name = \"{}\"", proxy.proxy_name),
+        format!("name = {}", toml_string(&proxy.proxy_name)),
         "type = \"http\"".to_string(),
         "localIP = \"127.0.0.1\"".to_string(),
         format!("localPort = {}", proxy.local_port),
-        format!("subdomain = \"{}\"", proxy.subdomain.trim()),
+        format!("subdomain = {}", toml_string(proxy.subdomain.trim())),
     ]
     .join("\n")
 }
@@ -264,13 +490,82 @@ mod tests {
         };
         profile.tunnel.frp_profile_id = "p1".into();
 
-        let snippet = frp_snippet(&profile, TunnelServiceKind::Mcp, &settings);
+        let snippet =
+            frp_snippet(&profile, TunnelServiceKind::Mcp, &settings).expect("build FRP snippet");
         let proxy_name = frp_server_config(&profile, TunnelServiceKind::Mcp, &settings, None)
             .proxy
             .proxy_name;
         assert!(snippet.contains(&format!("name = \"{proxy_name}\"")));
         assert!(snippet.contains("localPort = 28766"));
         assert!(snippet.contains("subdomain = \"demo-mcp\""));
+    }
+
+    #[test]
+    fn https2http_auto_discovers_workspace_certificate_pair() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cert_dir = temp.path().join(".anchor/cert");
+        std::fs::create_dir_all(&cert_dir).expect("cert dir");
+        std::fs::write(cert_dir.join("demo.pem"), "certificate").expect("certificate");
+        std::fs::write(cert_dir.join("demo.key"), "private-key").expect("private key");
+
+        let mut profile = WorkspaceProfile::new(
+            temp.path().to_string_lossy().into_owned(),
+            Some("Demo".into()),
+        );
+        profile.tunnel.frp_server = "frp.example.com".into();
+        profile.tunnel.frp_subdomain = "demo".into();
+        profile.tunnel.public_url = "https://demo.frp.example.com".into();
+        profile.tunnel.frp_proxy_type = "https2http".into();
+
+        let config = prepare_frp_server_config(frp_server_config(
+            &profile,
+            TunnelServiceKind::Mcp,
+            &AppSettings::default(),
+            None,
+        ))
+        .expect("prepare HTTPS config");
+        let toml = build_frpc_toml_for_routes(std::slice::from_ref(&config));
+
+        assert_eq!(config.proxy.proxy_type, "https2http");
+        assert!(config.proxy.cert_path.ends_with("demo.pem"));
+        assert!(config.proxy.key_path.ends_with("demo.key"));
+        assert!(toml.contains("type = \"https\""));
+        assert!(toml.contains("subdomain = \"demo\""));
+        assert!(toml.contains("[proxies.plugin]"));
+        assert!(toml.contains("type = \"https2http\""));
+        assert!(toml.contains("localAddr = \"127.0.0.1:28766\""));
+        assert!(toml.contains("crtPath = "));
+        assert!(toml.contains("keyPath = "));
+        assert!(!toml.contains("localIP = "));
+    }
+
+    #[test]
+    fn https2http_rejects_certificate_paths_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let cert = outside.path().join("outside.pem");
+        let key = outside.path().join("outside.key");
+        std::fs::write(&cert, "certificate").expect("certificate");
+        std::fs::write(&key, "private-key").expect("private key");
+
+        let mut profile = WorkspaceProfile::new(
+            workspace.path().to_string_lossy().into_owned(),
+            Some("Demo".into()),
+        );
+        profile.tunnel.frp_server = "frp.example.com".into();
+        profile.tunnel.frp_subdomain = "demo".into();
+        profile.tunnel.frp_proxy_type = "https2http".into();
+        profile.tunnel.frp_cert_path = cert.to_string_lossy().into_owned();
+        profile.tunnel.frp_key_path = key.to_string_lossy().into_owned();
+
+        let error = prepare_frp_server_config(frp_server_config(
+            &profile,
+            TunnelServiceKind::Mcp,
+            &AppSettings::default(),
+            None,
+        ))
+        .expect_err("outside certificate must fail");
+        assert!(error.to_string().contains("必须位于工作区内"));
     }
 
     #[test]

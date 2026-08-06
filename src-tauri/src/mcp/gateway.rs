@@ -76,6 +76,9 @@ pub fn tunnel_identity_signature(
         "frpSubdomain": owner.tunnel.frp_subdomain,
         "frpProfileId": owner.tunnel.frp_profile_id,
         "frpServerPort": owner.tunnel.frp_server_port,
+        "frpProxyType": owner.tunnel.frp_proxy_type,
+        "frpCertPath": owner.tunnel.frp_cert_path,
+        "frpKeyPath": owner.tunnel.frp_key_path,
         "cloudflareMode": owner.tunnel.cloudflare_mode,
         "publicUrl": public_url,
         "useProxy": owner.tunnel.use_proxy,
@@ -159,6 +162,9 @@ pub fn owner_tunnel_identity_changed(
         || current.tunnel.frp_subdomain != next.tunnel.frp_subdomain
         || current.tunnel.frp_profile_id != next.tunnel.frp_profile_id
         || current.tunnel.frp_server_port != next.tunnel.frp_server_port
+        || current.tunnel.frp_proxy_type != next.tunnel.frp_proxy_type
+        || current.tunnel.frp_cert_path != next.tunnel.frp_cert_path
+        || current.tunnel.frp_key_path != next.tunnel.frp_key_path
         || current.tunnel.cloudflare_mode != next.tunnel.cloudflare_mode
         || current.tunnel.use_proxy != next.tunnel.use_proxy
 }

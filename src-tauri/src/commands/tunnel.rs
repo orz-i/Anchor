@@ -8,6 +8,33 @@ use crate::tunnel::{
 };
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
 
+async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppResult<()> {
+    let base = public_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(AppError::Message("隧道未返回公网 URL。".into()));
+    }
+    let endpoint = match kind {
+        TunnelServiceKind::Mcp => format!("{base}/mcp"),
+        TunnelServiceKind::Actions => format!("{base}/openapi.json"),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .map_err(|error| AppError::Message(format!("创建公网探测客户端失败：{error}")))?;
+    let mut last_error = String::new();
+    for attempt in 0..5 {
+        match client.get(&endpoint).send().await {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+    }
+    Err(AppError::Message(format!(
+        "frpc 已建立代理，但公网地址仍不可访问：{last_error}。若使用 FRP HTTPS→HTTP，请确认服务端字段为 vhostHTTPSPort。"
+    )))
+}
+
 fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::WorkspaceProfile> {
     state.with_workspaces(|store| {
         store
@@ -17,16 +44,12 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
     })
 }
 
-fn ensure_not_gateway_managed(
-    state: &AppState,
-    kind: TunnelServiceKind,
-) -> AppResult<()> {
+fn ensure_not_gateway_managed(state: &AppState, kind: TunnelServiceKind) -> AppResult<()> {
     if kind == TunnelServiceKind::Mcp
         && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
     {
         return Err(AppError::Message(
-            "MCP 隧道当前由单一 Gateway 管理；请在“设置 → 通用 → 单一 MCP Gateway”中操作。"
-                .into(),
+            "MCP 隧道当前由单一 Gateway 管理；请在“设置 → 通用 → 单一 MCP Gateway”中操作。".into(),
         ));
     }
     Ok(())
@@ -106,6 +129,9 @@ fn restore_tunnel_config(
                 current.actions.frp_subdomain = restored.actions.frp_subdomain.clone();
                 current.actions.frp_profile_id = restored.actions.frp_profile_id.clone();
                 current.actions.frp_server_port = restored.actions.frp_server_port;
+                current.actions.frp_proxy_type = restored.actions.frp_proxy_type.clone();
+                current.actions.frp_cert_path = restored.actions.frp_cert_path.clone();
+                current.actions.frp_key_path = restored.actions.frp_key_path.clone();
                 current.actions.cloudflare_mode = restored.actions.cloudflare_mode.clone();
                 current.actions.use_proxy = restored.actions.use_proxy;
             }
@@ -124,6 +150,9 @@ fn mcp_tunnel_matches(
         && left.tunnel.frp_subdomain == right.tunnel.frp_subdomain
         && left.tunnel.frp_profile_id == right.tunnel.frp_profile_id
         && left.tunnel.frp_server_port == right.tunnel.frp_server_port
+        && left.tunnel.frp_proxy_type == right.tunnel.frp_proxy_type
+        && left.tunnel.frp_cert_path == right.tunnel.frp_cert_path
+        && left.tunnel.frp_key_path == right.tunnel.frp_key_path
         && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
         && left.tunnel.use_proxy == right.tunnel.use_proxy
 }
@@ -138,6 +167,9 @@ fn actions_tunnel_matches(
         && left.actions.frp_subdomain == right.actions.frp_subdomain
         && left.actions.frp_profile_id == right.actions.frp_profile_id
         && left.actions.frp_server_port == right.actions.frp_server_port
+        && left.actions.frp_proxy_type == right.actions.frp_proxy_type
+        && left.actions.frp_cert_path == right.actions.frp_cert_path
+        && left.actions.frp_key_path == right.actions.frp_key_path
         && left.actions.cloudflare_mode == right.actions.cloudflare_mode
         && left.actions.use_proxy == right.actions.use_proxy
 }
@@ -346,6 +378,14 @@ pub async fn test_tunnel(
 
     let public_url = status.public_url.clone();
     let keep_tunnel = runtime_running;
+
+    if let Err(error) = probe_public_tunnel(&public_url, kind).await {
+        if !keep_tunnel {
+            let mut guard = supervisor().lock().await;
+            let _ = guard.stop(&profile, kind, &settings).await;
+        }
+        return Err(error);
+    }
 
     if keep_tunnel {
         persist_public_url(&state, &id, kind, &public_url)?;

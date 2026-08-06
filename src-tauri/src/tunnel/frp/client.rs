@@ -15,7 +15,8 @@ use crate::tunnel::TunnelServiceKind;
 use crate::workspace::WorkspaceProfile;
 
 use super::{
-    build_frpc_toml_for_routes, frp_server_config, FrpServerConfig, VERSION as FRP_VERSION,
+    build_frpc_toml_for_routes, frp_server_config, prepare_frp_server_config, FrpServerConfig,
+    VERSION as FRP_VERSION,
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -284,8 +285,10 @@ pub async fn spawn_frpc(
 
     let configs: Vec<FrpServerConfig> = routes
         .iter()
-        .map(|(profile, kind)| frp_server_config(profile, *kind, settings, None))
-        .collect();
+        .map(|(profile, kind)| {
+            prepare_frp_server_config(frp_server_config(profile, *kind, settings, None))
+        })
+        .collect::<AppResult<_>>()?;
     for config in &configs {
         validate_frp_config(config)?;
     }
@@ -381,6 +384,26 @@ fn validate_frp_config(config: &FrpServerConfig) -> AppResult<()> {
     }
     if config.server_port == 0 {
         return Err(AppError::Message("FRP 服务器端口无效。".into()));
+    }
+    match config.proxy.proxy_type.as_str() {
+        "http" => {}
+        "https2http" => {
+            if config.proxy.cert_path.trim().is_empty() || config.proxy.key_path.trim().is_empty() {
+                return Err(AppError::Message(
+                    "FRP HTTPS→HTTP 模式需要有效的证书和私钥路径。".into(),
+                ));
+            }
+            if !config.public_url.trim().starts_with("https://") {
+                return Err(AppError::Message(
+                    "FRP HTTPS→HTTP 模式需要填写以 https:// 开头的实际公网 URL。".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(AppError::Message(
+                "FRP 代理模式无效，仅支持 http 或 https2http。".into(),
+            ));
+        }
     }
     if config.public_url.trim().is_empty()
         && config
@@ -824,6 +847,10 @@ mod tests {
                 proxy_name: "probe".into(),
                 local_port: 28766,
                 subdomain: "anchor".into(),
+                proxy_type: "http".into(),
+                cert_path: String::new(),
+                key_path: String::new(),
+                workspace_root: "C:/workspace/demo".into(),
             },
         };
 
@@ -832,5 +859,30 @@ mod tests {
 
         config.public_url = "https://anchor.taoyan.icu".into();
         validate_frp_config(&config).expect("explicit public URL is valid");
+    }
+
+    #[test]
+    fn https2http_requires_an_https_public_url() {
+        let mut config = FrpServerConfig {
+            server_addr: "frp.example.com".into(),
+            server_port: 7000,
+            token: None,
+            public_url: "http://demo.example.com".into(),
+            proxy: FrpProxyConfig {
+                proxy_name: "probe".into(),
+                local_port: 28766,
+                subdomain: "demo".into(),
+                proxy_type: "https2http".into(),
+                cert_path: "C:/workspace/demo/.anchor/cert/demo.pem".into(),
+                key_path: "C:/workspace/demo/.anchor/cert/demo.key".into(),
+                workspace_root: "C:/workspace/demo".into(),
+            },
+        };
+
+        let error = validate_frp_config(&config).expect_err("HTTP URL must fail");
+        assert!(error.to_string().contains("https://"));
+
+        config.public_url = "https://demo.example.com".into();
+        validate_frp_config(&config).expect("HTTPS URL is valid");
     }
 }
