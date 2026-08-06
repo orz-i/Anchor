@@ -83,16 +83,21 @@ Anchor 的长期运行架构调整为：
 阶段 1 按两个子阶段实施：
 
 1. **协议与只读接入**：先提供版本化 `ping`、`version`、`workspace_status`，CLI 与 GUI 的状态读取优先访问 daemon；仅在端点不存在、拒绝连接或超时时回退到本地只读探测。协议损坏、请求 ID 不匹配和版本不兼容不得静默回退。
-2. **完整运行控制**：再迁移事件流、日志、启停、重载和 shutdown，并移除 CLI/GUI 的第二套运行编排。
+2. **完整运行控制**：迁移事件流、日志、启停、重载和 shutdown，并移除 CLI/GUI 的第二套运行编排。
 
-当前已完成第一个子阶段的基础：
+当前已完成只读接入和生命周期写控制的基础：
 
-- 协议版本为 `1`，请求和响应都包含 `protocolVersion` 与 `requestId`；
+- 协议版本为 `2`，请求和响应都包含 `protocolVersion` 与 `requestId`；
 - 单连接单请求，使用最大 64 KiB 的换行分隔 JSON 帧；
 - Unix daemon 在私有运行目录创建权限为 `0600` 的 UDS；其父目录保持 `0700`；
 - Windows 客户端使用按用户和配置域派生名称的 Named Pipe 地址。Windows daemon 服务端将在服务生命周期实现时启用，并必须配置当前用户专属 ACL；
 - daemon readiness 同时要求所选端口归属正确 PID 且 `ping` 成功；
-- `workspace_status` 请求必须与端点所属 Workspace ID 一致。
+- `workspace_status`、`logs`、`shutdown` 和 `prepare_restart` 请求必须与端点所属 Workspace ID 一致；
+- 运行中 daemon 的日志读取使用有界游标 IPC，单响应日志内容预算为 8 KiB；daemon 已停止时仍可离线读取历史日志；
+- `stop` 和 `restart` 必须先由目标 daemon 通过 IPC 接受并协调优雅退出；IPC 不可用时不得回退到客户端直接进程控制；
+- `start` 在 daemon 不存在时仍是引导命令；若状态显示 daemon 已运行，则必须先通过 IPC `ping` 验证控制面。
+
+尚未完成：事件订阅、配置重载、Gateway/Tunnel 写控制、Windows Named Pipe 服务端和 GUI 启停迁移。
 
 ### 阶段 2：CLI 能力闭环
 

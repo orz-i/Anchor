@@ -161,7 +161,17 @@ Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优�
 - Unix：`<runtime-dir>/<profile-id>.sock`，父目录 `0700`、socket `0600`；
 - Windows：`\\.\pipe\anchor-<user-config-scope>-<profile-id>`。当前版本只提供客户端地址与协议抽象，Windows daemon 服务端将在 Windows Service 生命周期落地时启用。
 
-控制协议当前支持 `ping`、`version` 和 `workspace_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
+控制协议当前版本为 `2`，支持 `ping`、`version`、`workspace_status`、`logs`、`shutdown` 和 `prepare_restart`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
+
+CLI 生命周期语义：
+
+- `start` 在 daemon 不存在时负责创建后台进程；若状态显示 daemon 已运行，必须先通过 IPC `ping` 验证目标控制面；
+- `stop` 先发送 `shutdown`，由目标 daemon 完成 Runtime、Tunnel 和监听器清理后退出；
+- `restart` 先发送 `prepare_restart`，等待原 PID 退出后再执行一次新的 `start` 引导；
+- IPC 不可用、协议版本不兼容或响应 PID 不匹配时，写命令直接失败，不会回退到客户端直接发送信号或启动第二套运行时；
+- `--force` 只在 daemon 已接受 IPC 退出请求但超过等待时间后生效，并再次验证 PID 仍属于目标 Workspace。
+
+运行中 daemon 的 `logs` 和 `logs --follow` 通过 IPC 获取有界日志快照和增量游标。单次响应日志内容最多 8 KiB，避免日志内容突破控制帧上限。daemon 已停止时，CLI 仍允许直接读取已有历史日志文件。
 
 ## 与 systemd 的关系
 

@@ -171,7 +171,13 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
 
     let inspection = super::daemon::inspect(&profile)?;
     if inspection.running {
-        super::daemon::stop(&profile, Duration::from_secs(options.timeout_seconds), true).await?;
+        super::request_daemon_exit_and_wait(
+            &profile,
+            crate::control::ControlOperation::Shutdown,
+            Duration::from_secs(options.timeout_seconds),
+            true,
+        )
+        .await?;
     } else if inspection.ambiguous {
         return Err(AppError::Message(inspection.detail));
     }

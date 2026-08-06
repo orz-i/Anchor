@@ -541,32 +541,56 @@ pub async fn stop(
         )));
     }
     signal(state.pid, SIGTERM_VALUE)?;
+    wait_for_controlled_exit(profile, state.pid, timeout, force).await?;
+    Ok(Some(state.pid))
+}
+
+pub async fn wait_for_controlled_exit(
+    profile: &WorkspaceProfile,
+    pid: u32,
+    timeout: Duration,
+    force: bool,
+) -> AppResult<()> {
+    ensure_linux()?;
     let deadline = tokio::time::Instant::now() + timeout;
-    while platform().is_process_alive(state.pid) && tokio::time::Instant::now() < deadline {
+    while platform().is_process_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if platform().is_process_alive(state.pid) {
+    if platform().is_process_alive(pid) {
         if !force {
             return Err(AppError::Message(format!(
                 "daemon 在 {} 秒内未停止；可使用 --force",
                 timeout.as_secs()
             )));
         }
-        platform().terminate_process_tree(state.pid)?;
+        if !process_matches_daemon(pid, &profile.id) {
+            return Err(AppError::Message(format!(
+                "PID {pid} 不再属于当前 workspace daemon，拒绝强制终止"
+            )));
+        }
+        platform().terminate_process_tree(pid)?;
         let force_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while platform().is_process_alive(state.pid) && tokio::time::Instant::now() < force_deadline
-        {
+        while platform().is_process_alive(pid) && tokio::time::Instant::now() < force_deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if platform().is_process_alive(state.pid) {
+        if platform().is_process_alive(pid) {
             return Err(AppError::Message(format!(
-                "强制停止 daemon 失败，PID {} 仍然存活",
-                state.pid
+                "强制停止 daemon 失败，PID {pid} 仍然存活"
             )));
         }
     }
-    cleanup(profile)?;
-    Ok(Some(state.pid))
+    cleanup_after_pid_exit(profile, pid)
+}
+
+fn cleanup_after_pid_exit(profile: &WorkspaceProfile, exited_pid: u32) -> AppResult<()> {
+    let paths = daemon_paths(&profile.id)?;
+    if read_state(&paths.state)?
+        .as_ref()
+        .is_some_and(|state| state.pid != exited_pid)
+    {
+        return Ok(());
+    }
+    cleanup_stale_files(&paths)
 }
 
 pub fn cleanup(profile: &WorkspaceProfile) -> AppResult<()> {

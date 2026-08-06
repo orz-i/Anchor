@@ -35,6 +35,15 @@ struct CliTunnelRetry {
     next_attempt: tokio::time::Instant,
 }
 
+async fn next_daemon_control_command(
+    receiver: &mut Option<control::DaemonControlReceiver>,
+) -> Option<control::DaemonControlCommand> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn path_or_parent_writable(path: &Path) -> bool {
     let mut current = Some(path);
     while let Some(candidate) = current {
@@ -391,6 +400,11 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
 
     let inspection = daemon::inspect(&profile)?;
     if inspection.running {
+        control::ipc_ping(&profile.id).await.map_err(|error| {
+            AppError::Message(format!(
+                "daemon 状态显示正在运行，但控制端点不可用：{error}；拒绝对运行中的 daemon 使用本地写回退"
+            ))
+        })?;
         let state = inspection.state.expect("running daemon state");
         if state.service == service && state.tunnel == tunnel {
             return print_daemon_result(
@@ -441,8 +455,9 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
 async fn stop_daemon(options: StopOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
-    let stopped = daemon::stop(
+    let stopped = request_daemon_exit_and_wait(
         &profile,
+        control::ControlOperation::Shutdown,
         Duration::from_secs(options.timeout_seconds),
         options.force,
     )
@@ -472,6 +487,9 @@ struct CliLogChunk {
 async fn show_logs(options: LogsOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    if daemon::inspect(&profile)?.running {
+        return show_logs_via_daemon(&profile, options, as_json).await;
+    }
     let files = selected_log_files(&profile, options.service);
     if !options.follow {
         let mut chunks = Vec::new();
@@ -502,6 +520,119 @@ async fn show_logs(options: LogsOptions, as_json: bool) -> AppResult<()> {
     }
 
     follow_logs(files, options.lines, as_json).await
+}
+
+async fn show_logs_via_daemon(
+    profile: &WorkspaceProfile,
+    options: LogsOptions,
+    as_json: bool,
+) -> AppResult<()> {
+    let selection = match options.service {
+        LogSelection::Daemon => control::ControlLogSelection::Daemon,
+        LogSelection::Mcp => control::ControlLogSelection::Mcp,
+        LogSelection::Actions => control::ControlLogSelection::Actions,
+        LogSelection::All => control::ControlLogSelection::All,
+    };
+    let tail_lines = u32::try_from(options.lines).unwrap_or(u32::MAX);
+    let initial = control::request_logs(profile, selection, tail_lines, Vec::new())
+        .await
+        .map_err(|error| {
+            AppError::Message(format!(
+                "daemon 日志控制请求失败：{error}；运行中的 daemon 不会回退到直接文件轮询"
+            ))
+        })?;
+
+    if !options.follow {
+        let chunks = initial
+            .into_iter()
+            .filter(|chunk| chunk.exists)
+            .map(|chunk| CliLogChunk {
+                name: chunk.name,
+                path: chunk.path,
+                content: chunk.content,
+            })
+            .collect::<Vec<_>>();
+        if as_json {
+            print_json(&chunks)?;
+        } else if chunks.is_empty() {
+            println!("暂无日志：{}", log_dir_for_profile(&profile.id).display());
+        } else {
+            for chunk in chunks {
+                println!("==> {} <==", chunk.path);
+                print!("{}", chunk.content);
+                if !chunk.content.ends_with('\n') {
+                    println!();
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let mut cursors = Vec::new();
+    emit_control_log_chunks(&initial, "log_snapshot", as_json)?;
+    replace_log_cursors(&mut cursors, &initial);
+
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    loop {
+        tokio::select! {
+            result = &mut shutdown_signal => return result,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                let chunks = control::request_logs(profile, selection, 0, cursors.clone())
+                    .await
+                    .map_err(|error| AppError::Message(format!(
+                        "daemon 日志跟随中断：{error}"
+                    )))?;
+                emit_control_log_chunks(&chunks, "log_append", as_json)?;
+                replace_log_cursors(&mut cursors, &chunks);
+            }
+        }
+    }
+}
+
+fn emit_control_log_chunks(
+    chunks: &[control::ControlLogChunk],
+    event: &str,
+    as_json: bool,
+) -> AppResult<()> {
+    for chunk in chunks
+        .iter()
+        .filter(|chunk| chunk.exists && !chunk.content.is_empty())
+    {
+        if as_json {
+            print_json_line(&json!({
+                "event": event,
+                "name": chunk.name,
+                "path": chunk.path,
+                "content": chunk.content,
+                "nextOffset": chunk.next_offset,
+                "truncated": chunk.truncated
+            }))?;
+        } else {
+            if event == "log_snapshot" {
+                println!("==> {} <==", chunk.path);
+            }
+            print!("{}", chunk.content);
+            if event == "log_snapshot" && !chunk.content.ends_with('\n') {
+                println!();
+            }
+            std::io::stdout().flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_log_cursors(
+    cursors: &mut Vec<control::ControlLogCursor>,
+    chunks: &[control::ControlLogChunk],
+) {
+    *cursors = chunks
+        .iter()
+        .map(|chunk| control::ControlLogCursor {
+            name: chunk.name.clone(),
+            offset: chunk.next_offset,
+        })
+        .collect();
 }
 
 async fn follow_logs(files: Vec<(String, PathBuf)>, lines: usize, as_json: bool) -> AppResult<()> {
@@ -757,15 +888,69 @@ async fn restart_daemon(mut options: RunOptions, as_json: bool) -> AppResult<()>
     if options.tunnel.is_none() {
         options.tunnel = current.as_ref().map(|state| state.tunnel);
     }
-    let _ = daemon::stop(&profile, Duration::from_secs(10), true).await?;
+    let _ = request_daemon_exit_and_wait(
+        &profile,
+        control::ControlOperation::Restart,
+        Duration::from_secs(10),
+        true,
+    )
+    .await?;
     start_daemon(options, as_json).await
+}
+
+pub(super) async fn request_daemon_exit_and_wait(
+    profile: &WorkspaceProfile,
+    operation: control::ControlOperation,
+    timeout: Duration,
+    force: bool,
+) -> AppResult<Option<u32>> {
+    let inspection = daemon::inspect(profile)?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    let Some(state) = inspection.state else {
+        if inspection.stale {
+            daemon::cleanup(profile)?;
+        }
+        return Ok(None);
+    };
+    if !inspection.running {
+        daemon::cleanup(profile)?;
+        return Ok(None);
+    }
+    if !inspection.pid_matches {
+        return Err(AppError::Message(format!(
+            "PID {} 不属于当前 workspace daemon，拒绝发送控制请求",
+            state.pid
+        )));
+    }
+    let accepted_pid = control::request_daemon_exit(&profile.id, operation)
+        .await
+        .map_err(|error| {
+            AppError::Message(format!(
+                "daemon 未接受 {} 请求：{error}；写操作不会回退到本地进程控制",
+                match operation {
+                    control::ControlOperation::Shutdown => "shutdown",
+                    control::ControlOperation::Restart => "restart",
+                }
+            ))
+        })?;
+    if accepted_pid != state.pid {
+        return Err(AppError::Message(format!(
+            "daemon 控制响应 PID 不匹配：状态文件为 {}，响应为 {accepted_pid}",
+            state.pid
+        )));
+    }
+    daemon::wait_for_controlled_exit(profile, state.pid, timeout, force).await?;
+    Ok(Some(state.pid))
 }
 
 async fn run_daemon(selector: &str, service: ServiceSelection, tunnel: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
     let _guard = daemon::acquire(&profile, service, tunnel)?;
-    let control_server = control::ControlServer::start(profile.clone())?;
+    let (control_sender, control_receiver) = control::control_channel();
+    let control_server = control::ControlServer::start(profile.clone(), control_sender)?;
     crate::tunnel::append_profile_log(
         &profile.id,
         "daemon.log",
@@ -776,7 +961,15 @@ async fn run_daemon(selector: &str, service: ServiceSelection, tunnel: bool) -> 
             control_server.endpoint()
         ),
     );
-    let result = serve_workspace(&profile.id, service, tunnel, false, false).await;
+    let result = serve_workspace(
+        &profile.id,
+        service,
+        tunnel,
+        false,
+        false,
+        Some(control_receiver),
+    )
+    .await;
     if let Err(error) = &result {
         crate::tunnel::append_profile_log(
             &profile.id,
@@ -906,7 +1099,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             workspace,
             service,
             tunnel,
-        } => serve_workspace(&workspace, service, tunnel, cli.json, true)
+        } => serve_workspace(&workspace, service, tunnel, cli.json, true, None)
             .await
             .map(|_| 0),
         Command::Start(options) => start_daemon(options, cli.json).await.map(|_| 0),
@@ -1058,6 +1251,7 @@ async fn serve_workspace(
     with_tunnel: bool,
     as_json: bool,
     foreground: bool,
+    mut control_commands: Option<control::DaemonControlReceiver>,
 ) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
@@ -1181,6 +1375,23 @@ async fn serve_workspace(
             signal = &mut shutdown_signal => {
                 if let Err(error) = signal {
                     terminal_error = Some(error);
+                }
+                break;
+            }
+            command = next_daemon_control_command(&mut control_commands) => {
+                match command {
+                    Some(control::DaemonControlCommand::Shutdown { operation }) => {
+                        crate::tunnel::append_profile_log(
+                            &profile.id,
+                            "daemon.log",
+                            &format!("[control] accepted {operation:?}; beginning graceful shutdown"),
+                        );
+                    }
+                    None => {
+                        terminal_error = Some(AppError::Message(
+                            "daemon control command channel closed unexpectedly".into(),
+                        ));
+                    }
                 }
                 break;
             }

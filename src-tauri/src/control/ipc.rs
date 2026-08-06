@@ -11,13 +11,78 @@ use crate::error::{AppError, AppResult};
 use crate::workspace::WorkspaceProfile;
 
 #[cfg(any(unix, test))]
-use super::protocol::{validate_protocol_version, ERROR_INTERNAL, ERROR_WORKSPACE_MISMATCH};
+use super::logs::read_log_batch;
+#[cfg(any(unix, test))]
 use super::protocol::{
-    ControlMethod, ControlRequest, ControlResponse, ControlResult, MAX_CONTROL_FRAME_BYTES,
+    validate_protocol_version, ERROR_CONTROL_COMMAND_UNAVAILABLE, ERROR_INTERNAL,
+    ERROR_LOG_READ_FAILED, ERROR_WORKSPACE_MISMATCH,
+};
+use super::protocol::{
+    ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod, ControlOperation,
+    ControlRequest, ControlResponse, ControlResult, MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonControlCommand {
+    Shutdown { operation: ControlOperation },
+}
+
+pub async fn request_logs(
+    profile: &WorkspaceProfile,
+    selection: ControlLogSelection,
+    tail_lines: u32,
+    cursors: Vec<ControlLogCursor>,
+) -> Result<Vec<ControlLogChunk>, ControlClientError> {
+    match request(
+        &profile.id,
+        ControlMethod::Logs {
+            workspace_id: profile.id.clone(),
+            selection,
+            tail_lines,
+            cursors,
+        },
+    )
+    .await?
+    {
+        ControlResult::Logs { chunks } => Ok(chunks),
+        other => Err(ControlClientError::Protocol(format!(
+            "daemon returned unexpected logs result: {other:?}"
+        ))),
+    }
+}
+
+pub async fn request_daemon_exit(
+    profile_id: &str,
+    operation: ControlOperation,
+) -> Result<u32, ControlClientError> {
+    let method = match operation {
+        ControlOperation::Shutdown => ControlMethod::Shutdown {
+            workspace_id: profile_id.to_string(),
+        },
+        ControlOperation::Restart => ControlMethod::PrepareRestart {
+            workspace_id: profile_id.to_string(),
+        },
+    };
+    match request(profile_id, method).await? {
+        ControlResult::Accepted {
+            operation: accepted,
+            daemon_pid,
+        } if accepted == operation => Ok(daemon_pid),
+        other => Err(ControlClientError::Protocol(format!(
+            "daemon returned unexpected lifecycle result: {other:?}"
+        ))),
+    }
+}
+
+pub type DaemonControlSender = tokio::sync::mpsc::UnboundedSender<DaemonControlCommand>;
+pub type DaemonControlReceiver = tokio::sync::mpsc::UnboundedReceiver<DaemonControlCommand>;
+
+pub fn control_channel() -> (DaemonControlSender, DaemonControlReceiver) {
+    tokio::sync::mpsc::unbounded_channel()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", content = "address", rename_all = "snake_case")]
@@ -302,7 +367,10 @@ pub struct ControlServer {
 
 impl ControlServer {
     #[cfg(unix)]
-    pub fn start(profile: WorkspaceProfile) -> AppResult<Self> {
+    pub fn start(
+        profile: WorkspaceProfile,
+        command_sender: DaemonControlSender,
+    ) -> AppResult<Self> {
         use std::os::unix::fs::PermissionsExt;
 
         let endpoint = endpoint(&profile.id)?;
@@ -337,8 +405,9 @@ impl ControlServer {
                     }
                 };
                 let profile = task_profile.clone();
+                let command_sender = command_sender.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, &profile).await {
+                    if let Err(error) = handle_connection(stream, &profile, &command_sender).await {
                         crate::tunnel::append_profile_log(
                             &profile.id,
                             "daemon.log",
@@ -352,7 +421,10 @@ impl ControlServer {
     }
 
     #[cfg(not(unix))]
-    pub fn start(_profile: WorkspaceProfile) -> AppResult<Self> {
+    pub fn start(
+        _profile: WorkspaceProfile,
+        _command_sender: DaemonControlSender,
+    ) -> AppResult<Self> {
         Err(AppError::Message(
             "daemon control server is not enabled on this platform yet".into(),
         ))
@@ -373,60 +445,167 @@ impl Drop for ControlServer {
 }
 
 #[cfg(any(unix, test))]
-async fn handle_connection<S>(mut stream: S, profile: &WorkspaceProfile) -> AppResult<()>
+async fn handle_connection<S>(
+    mut stream: S,
+    profile: &WorkspaceProfile,
+    command_sender: &DaemonControlSender,
+) -> AppResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request: ControlRequest = read_json_frame(&mut stream)
         .await
         .map_err(|error| AppError::Message(format!("invalid control request: {error:?}")))?;
-    let response = handle_request(request, profile);
-    write_json_frame(&mut stream, &response).await?;
+    let handled = handle_request(request, profile, !command_sender.is_closed());
+    write_json_frame(&mut stream, &handled.response).await?;
     stream.shutdown().await?;
+    if let Some(command) = handled.command {
+        command_sender.send(command).map_err(|_| {
+            AppError::Message("daemon control command receiver is unavailable".into())
+        })?;
+    }
     Ok(())
 }
 
 #[cfg(any(unix, test))]
-fn handle_request(request: ControlRequest, profile: &WorkspaceProfile) -> ControlResponse {
+struct HandledRequest {
+    response: ControlResponse,
+    command: Option<DaemonControlCommand>,
+}
+
+#[cfg(any(unix, test))]
+fn handle_request(
+    request: ControlRequest,
+    profile: &WorkspaceProfile,
+    command_available: bool,
+) -> HandledRequest {
     if let Err(response) = validate_protocol_version(&request) {
-        return *response;
+        return handled(*response);
     }
     let request_id = request.request_id;
     match request.method {
-        ControlMethod::Ping => ControlResponse::success(
+        ControlMethod::Ping => handled(ControlResponse::success(
             request_id,
             ControlResult::Pong {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
             },
-        ),
-        ControlMethod::Version => ControlResponse::success(
+        )),
+        ControlMethod::Version => handled(ControlResponse::success(
             request_id,
             ControlResult::Version {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: super::protocol::CONTROL_PROTOCOL_VERSION,
             },
-        ),
+        )),
         ControlMethod::WorkspaceStatus { workspace_id } => {
-            if workspace_id != profile.id {
-                return ControlResponse::error(
-                    request_id,
-                    ERROR_WORKSPACE_MISMATCH,
-                    format!(
-                        "control endpoint belongs to workspace {}, not {workspace_id}",
-                        profile.id
-                    ),
-                );
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
             }
             match workspace_status(profile) {
-                Ok(status) => ControlResponse::success(
+                Ok(status) => handled(ControlResponse::success(
                     request_id,
                     ControlResult::WorkspaceStatus {
                         status: Box::new(status),
                     },
-                ),
-                Err(error) => ControlResponse::error(request_id, ERROR_INTERNAL, error.to_string()),
+                )),
+                Err(error) => handled(ControlResponse::error(
+                    request_id,
+                    ERROR_INTERNAL,
+                    error.to_string(),
+                )),
             }
         }
+        ControlMethod::Logs {
+            workspace_id,
+            selection,
+            tail_lines,
+            cursors,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            match read_log_batch(profile, selection, tail_lines, &cursors) {
+                Ok(chunks) => handled(ControlResponse::success(
+                    request_id,
+                    ControlResult::Logs { chunks },
+                )),
+                Err(error) => handled(ControlResponse::error(
+                    request_id,
+                    ERROR_LOG_READ_FAILED,
+                    error.to_string(),
+                )),
+            }
+        }
+        ControlMethod::Shutdown { workspace_id } => lifecycle_request(
+            request_id,
+            profile,
+            workspace_id,
+            ControlOperation::Shutdown,
+            command_available,
+        ),
+        ControlMethod::PrepareRestart { workspace_id } => lifecycle_request(
+            request_id,
+            profile,
+            workspace_id,
+            ControlOperation::Restart,
+            command_available,
+        ),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn lifecycle_request(
+    request_id: String,
+    profile: &WorkspaceProfile,
+    workspace_id: String,
+    operation: ControlOperation,
+    command_available: bool,
+) -> HandledRequest {
+    if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+        return handled(response);
+    }
+    if !command_available {
+        return handled(ControlResponse::error(
+            request_id,
+            ERROR_CONTROL_COMMAND_UNAVAILABLE,
+            "daemon lifecycle command receiver is unavailable",
+        ));
+    }
+    HandledRequest {
+        response: ControlResponse::success(
+            request_id,
+            ControlResult::Accepted {
+                operation,
+                daemon_pid: std::process::id(),
+            },
+        ),
+        command: Some(DaemonControlCommand::Shutdown { operation }),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn workspace_mismatch(
+    request_id: &str,
+    profile: &WorkspaceProfile,
+    workspace_id: &str,
+) -> Option<ControlResponse> {
+    (workspace_id != profile.id).then(|| {
+        ControlResponse::error(
+            request_id.to_string(),
+            ERROR_WORKSPACE_MISMATCH,
+            format!(
+                "control endpoint belongs to workspace {}, not {workspace_id}",
+                profile.id
+            ),
+        )
+    })
+}
+
+#[cfg(any(unix, test))]
+fn handled(response: ControlResponse) -> HandledRequest {
+    HandledRequest {
+        response,
+        command: None,
     }
 }
 
@@ -469,8 +648,10 @@ mod tests {
         let expected_id = profile.id.clone();
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let server_profile = profile.clone();
-        let server_task =
-            tokio::spawn(async move { handle_connection(server, &server_profile).await });
+        let (command_sender, _command_receiver) = control_channel();
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &server_profile, &command_sender).await
+        });
         let request = ControlRequest {
             protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
             request_id: "status-request".into(),
@@ -519,7 +700,7 @@ mod tests {
             },
         };
 
-        let response = handle_request(request, &profile);
+        let response = handle_request(request, &profile, true).response;
 
         assert!(!response.ok);
         assert_eq!(
@@ -538,7 +719,9 @@ mod tests {
                 method: ControlMethod::Version,
             },
             &profile,
-        );
+            true,
+        )
+        .response;
 
         assert!(response.ok);
         assert_eq!(response.request_id, "version-request");
@@ -549,5 +732,81 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_response_is_flushed_before_command_delivery() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-shutdown".into()));
+        let workspace_id = profile.id.clone();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (command_sender, mut command_receiver) = control_channel();
+        let server_profile = profile.clone();
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &server_profile, &command_sender).await
+        });
+        let request = ControlRequest {
+            protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+            request_id: "shutdown-request".into(),
+            method: ControlMethod::Shutdown {
+                workspace_id: workspace_id.clone(),
+            },
+        };
+
+        write_json_frame(&mut client, &request)
+            .await
+            .expect("write shutdown request");
+        let response: ControlResponse = read_json_frame(&mut client).await.expect("read response");
+        assert!(response.ok);
+        assert!(matches!(
+            response.result,
+            Some(ControlResult::Accepted {
+                operation: ControlOperation::Shutdown,
+                ..
+            })
+        ));
+        server_task
+            .await
+            .expect("server task")
+            .expect("serve shutdown request");
+        assert_eq!(
+            command_receiver.recv().await,
+            Some(DaemonControlCommand::Shutdown {
+                operation: ControlOperation::Shutdown
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_request_fails_closed_without_a_command_receiver() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-no-command".into()));
+        let handled = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "restart-request".into(),
+                method: ControlMethod::PrepareRestart {
+                    workspace_id: profile.id.clone(),
+                },
+            },
+            &profile,
+            false,
+        );
+
+        assert!(!handled.response.ok);
+        assert!(handled.command.is_none());
+        assert_eq!(
+            handled.response.error.expect("command error").code,
+            super::super::protocol::ERROR_CONTROL_COMMAND_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_write_request_never_falls_back() {
+        let profile_id = format!("missing-write-{}", uuid::Uuid::new_v4());
+
+        let error = request_daemon_exit(&profile_id, ControlOperation::Shutdown)
+            .await
+            .expect_err("missing daemon must fail");
+
+        assert!(error.is_unavailable());
     }
 }

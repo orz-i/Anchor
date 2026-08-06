@@ -1,4 +1,6 @@
 mod ipc;
+#[cfg(any(unix, test))]
+mod logs;
 pub mod protocol;
 
 use serde::{Deserialize, Serialize};
@@ -9,9 +11,11 @@ use crate::platform::platform;
 use crate::workspace::WorkspaceProfile;
 
 pub use ipc::{
-    endpoint, ping as ipc_ping, workspace_status_via_daemon_or_local, ControlClientError,
-    ControlServer, LocalControlEndpoint,
+    control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_logs,
+    workspace_status_via_daemon_or_local, ControlClientError, ControlServer, DaemonControlCommand,
+    DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
 };
+pub use protocol::{ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlOperation};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

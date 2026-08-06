@@ -2,11 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use super::WorkspaceControlStatus;
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
 pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+pub const ERROR_CONTROL_COMMAND_UNAVAILABLE: &str = "control_command_unavailable";
+pub const ERROR_LOG_READ_FAILED: &str = "log_read_failed";
 pub const ERROR_INTERNAL: &str = "internal_error";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +39,56 @@ pub enum ControlMethod {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
     },
+    Logs {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        selection: ControlLogSelection,
+        #[serde(rename = "tailLines")]
+        tail_lines: u32,
+        cursors: Vec<ControlLogCursor>,
+    },
+    Shutdown {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+    },
+    PrepareRestart {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlLogSelection {
+    Daemon,
+    Mcp,
+    Actions,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlLogCursor {
+    pub name: String,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlLogChunk {
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    pub next_offset: u64,
+    pub exists: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlOperation {
+    Shutdown,
+    Restart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +140,13 @@ pub enum ControlResult {
     },
     WorkspaceStatus {
         status: Box<WorkspaceControlStatus>,
+    },
+    Logs {
+        chunks: Vec<ControlLogChunk>,
+    },
+    Accepted {
+        operation: ControlOperation,
+        daemon_pid: u32,
     },
 }
 
@@ -155,5 +214,40 @@ mod tests {
             response.error.expect("protocol error").code,
             ERROR_PROTOCOL_VERSION_UNSUPPORTED
         );
+    }
+
+    #[test]
+    fn write_and_log_methods_keep_stable_json_shapes() {
+        let request = ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-3".into(),
+            method: ControlMethod::Logs {
+                workspace_id: "workspace-1".into(),
+                selection: ControlLogSelection::All,
+                tail_lines: 50,
+                cursors: vec![ControlLogCursor {
+                    name: "daemon".into(),
+                    offset: 12,
+                }],
+            },
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize logs request");
+
+        assert_eq!(value["method"], "logs");
+        assert_eq!(value["workspaceId"], "workspace-1");
+        assert_eq!(value["selection"], "all");
+        assert_eq!(value["tailLines"], 50);
+        assert_eq!(value["cursors"][0]["name"], "daemon");
+
+        let restart = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-4".into(),
+            method: ControlMethod::PrepareRestart {
+                workspace_id: "workspace-1".into(),
+            },
+        })
+        .expect("serialize restart request");
+        assert_eq!(restart["method"], "prepare_restart");
     }
 }
