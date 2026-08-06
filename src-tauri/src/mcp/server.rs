@@ -52,6 +52,22 @@ const BROWSER_BUILD_PROBE_JS: &str = r#"async () => {
     const file = url.split(/[?#]/, 1)[0].split('/').pop() || '';
     return [...file.matchAll(/(?:^|[._-])([a-f0-9]{7,64})(?=[._-]|$)/ig)].map((match) => match[1]);
   }))].slice(0, 64);
+  const assetManifest = [...new Set(assetUrls.map((url) => {
+    try {
+      const parsed = new URL(url, location.href);
+      return `${parsed.pathname}${parsed.search}`;
+    } catch {
+      return url;
+    }
+  }))].sort().slice(0, 200);
+  let assetFingerprint = null;
+  if (assetManifest.length && globalThis.crypto?.subtle && globalThis.TextEncoder) {
+    const bytes = new TextEncoder().encode(assetManifest.join('\n'));
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    assetFingerprint = [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+  }
   const registrations = 'serviceWorker' in navigator
     ? await navigator.serviceWorker.getRegistrations()
     : [];
@@ -63,7 +79,9 @@ const BROWSER_BUILD_PROBE_JS: &str = r#"async () => {
     build_hash: buildHash,
     git_commit: gitCommit,
     app_version: appVersion,
+    asset_fingerprint: assetFingerprint,
     asset_hashes: assetHashes,
+    asset_manifest: assetManifest,
     asset_urls: assetUrls,
     service_workers: registrations.map((registration) => ({
       scope: registration.scope,
@@ -1684,7 +1702,12 @@ fn parse_json_object_from_text(text: &str) -> Option<Value> {
 }
 
 fn browser_current_build(build_info: &Value) -> Option<String> {
-    for key in ["build_hash", "git_commit", "app_version"] {
+    for key in [
+        "build_hash",
+        "git_commit",
+        "app_version",
+        "asset_fingerprint",
+    ] {
         if let Some(value) = build_info
             .get(key)
             .and_then(Value::as_str)
@@ -1706,11 +1729,16 @@ fn browser_build_matches(build_info: &Value, expected: &str) -> bool {
     if expected.is_empty() {
         return false;
     }
-    let mut candidates = ["build_hash", "git_commit", "app_version"]
-        .iter()
-        .filter_map(|key| build_info.get(key).and_then(Value::as_str))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let mut candidates = [
+        "build_hash",
+        "git_commit",
+        "app_version",
+        "asset_fingerprint",
+    ]
+    .iter()
+    .filter_map(|key| build_info.get(key).and_then(Value::as_str))
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     candidates.extend(
         build_info
             .get("asset_hashes")
@@ -1947,12 +1975,29 @@ mod tests {
     fn browser_build_matching_accepts_safe_commit_prefixes_only() {
         let build = json!({
             "git_commit": "abcdef1234567890",
+            "asset_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "asset_hashes": ["chunk-fedcba987654"]
         });
         assert!(browser_build_matches(&build, "abcdef1"));
+        assert!(browser_build_matches(&build, "0123456"));
         assert!(browser_build_matches(&build, "chunk-fedcba987654"));
         assert!(!browser_build_matches(&build, "abc"));
         assert!(!browser_build_matches(&build, "1234567"));
+    }
+
+    #[test]
+    fn browser_current_build_falls_back_to_asset_fingerprint() {
+        let build = json!({
+            "build_hash": null,
+            "git_commit": null,
+            "app_version": null,
+            "asset_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "asset_hashes": []
+        });
+        assert_eq!(
+            browser_current_build(&build).as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
     }
 
     #[test]

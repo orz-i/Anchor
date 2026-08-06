@@ -32,6 +32,312 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
+fn configured_contract_and_slice_plan_cannot_be_relaxed_or_replaced() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "不可放宽的任务契约",
+            "contract": {
+                "no_early_stop": true,
+                "constraints": ["保留既有约束"],
+                "required_verifications": [
+                    {"id": "required-check", "verification_key": "required-check"}
+                ]
+            },
+            "slices": [
+                {"id": "S-fixed", "title": "固定 Slice", "status": "planned"}
+            ]
+        }),
+    );
+    assert_eq!(started["ok"], true);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let relaxed = call_tool(
+        &ctx,
+        "update_task",
+        &json!({
+            "task_id": task_id,
+            "contract": {
+                "no_early_stop": false,
+                "constraints": [],
+                "required_verifications": [],
+                "completion_policy": {}
+            }
+        }),
+    );
+    assert_eq!(relaxed["ok"], false);
+    assert_eq!(
+        relaxed["error"]["code"],
+        "TASK_CONTRACT_RELAXATION_REJECTED"
+    );
+
+    let replaced = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "slices": []}),
+    );
+    assert_eq!(replaced["ok"], false);
+    assert_eq!(replaced["error"]["code"], "TASK_SLICE_UPDATE_TOOL_REQUIRED");
+
+    let task = ctx.harness.task(task_id).expect("task");
+    assert!(task.contract.no_early_stop);
+    assert_eq!(task.slices.len(), 1);
+    assert_eq!(task.slices[0].id, "S-fixed");
+}
+
+#[test]
+fn slice_state_machine_and_verification_time_prevent_stale_acceptance() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "拒绝旧验证满足新 Slice"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let stale = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('stale-pass')"],
+            "verification_kind": "test",
+            "verification_key": "slice-fresh-check",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(stale["command_ok"], true);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    let slice = call_tool(
+        &ctx,
+        "start_slice",
+        &json!({
+            "task_id": task_id,
+            "slice_id": "S-fresh",
+            "title": "需要新验证",
+            "acceptance_checks": [
+                {"id": "fresh", "verification_key": "slice-fresh-check"}
+            ]
+        }),
+    );
+    assert_eq!(slice["ok"], true);
+
+    let skipped = call_tool(
+        &ctx,
+        "update_slice",
+        &json!({"task_id": task_id, "slice_id": "S-fresh", "status": "planned"}),
+    );
+    assert_eq!(skipped["ok"], false);
+    assert_eq!(skipped["error"]["code"], "SLICE_STATUS_TRANSITION_INVALID");
+
+    let verifying = call_tool(
+        &ctx,
+        "update_slice",
+        &json!({"task_id": task_id, "slice_id": "S-fresh", "status": "verifying"}),
+    );
+    assert_eq!(verifying["ok"], true);
+    let blocked = call_tool(
+        &ctx,
+        "complete_slice",
+        &json!({"task_id": task_id, "slice_id": "S-fresh"}),
+    );
+    assert_eq!(blocked["ok"], false);
+    assert!(blocked["missing"].as_array().is_some_and(|items| items
+        .iter()
+        .any(|item| item["code"] == "slice_acceptance_missing")));
+
+    let fresh = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('fresh-pass')"],
+            "verification_kind": "test",
+            "verification_key": "slice-fresh-check",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(fresh["command_ok"], true);
+    let completed = call_tool(
+        &ctx,
+        "complete_slice",
+        &json!({"task_id": task_id, "slice_id": "S-fresh"}),
+    );
+    assert_eq!(completed["ok"], true);
+    assert_eq!(completed["slice"]["status"], "completed");
+}
+
+#[test]
+fn policy_rejection_is_recoverable_with_a_stable_logical_step_key() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "策略拒绝后修正原步骤"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let rejected = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"print('one')\" && python -c \"print('two')\"",
+            "recovery_key": "policy-step-1",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error"]["code"], "POLICY_REJECTED");
+    assert_eq!(rejected["task_recovery"]["status"], "open");
+    assert_eq!(
+        rejected["task_recovery"]["recovery"]["workspace_mutated"],
+        false
+    );
+
+    let corrected = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('corrected')"],
+            "recovery_key": "policy-step-1",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(corrected["command_ok"], true);
+    assert_eq!(corrected["task_recovery"]["status"], "resolved");
+    assert_eq!(
+        corrected["task_recovery"]["recovery"]["resolved_by_step"],
+        "exec_command"
+    );
+    assert_eq!(
+        ctx.harness
+            .task(task_id)
+            .unwrap()
+            .recovery
+            .as_ref()
+            .unwrap()
+            .status,
+        anchor_lib::harness::TaskRecoveryStatus::Resolved
+    );
+}
+
+#[test]
+fn task_phase_state_machine_rejects_skipped_engineering_stages() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "任务阶段状态机", "phase": "planning"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let skipped = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "phase": "ready_to_close"}),
+    );
+    assert_eq!(skipped["ok"], false);
+    assert_eq!(skipped["error"]["code"], "TASK_PHASE_TRANSITION_INVALID");
+    assert_eq!(
+        ctx.harness.task(task_id).unwrap().phase,
+        anchor_lib::harness::TaskPhase::Planning
+    );
+
+    let implementing = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "phase": "implementing"}),
+    );
+    assert_eq!(implementing["ok"], true);
+    let verifying = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "phase": "verifying"}),
+    );
+    assert_eq!(verifying["ok"], true);
+    let ready = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "phase": "ready_to_close"}),
+    );
+    assert_eq!(ready["ok"], true);
+    assert_eq!(ready["task"]["phase"], "ready_to_close");
+
+    let forged_complete = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "phase": "completed"}),
+    );
+    assert_eq!(forged_complete["ok"], false);
+    assert_eq!(forged_complete["error"]["code"], "INVALID_TOOL_ARGUMENTS");
+    let state_error = ctx
+        .harness
+        .configure_task(
+            task_id,
+            Some(anchor_lib::harness::TaskPhase::Completed),
+            None,
+            None,
+            None,
+        )
+        .expect_err("state layer must reject forged completion");
+    assert_eq!(state_error.code(), "TASK_COMPLETION_TOOL_REQUIRED");
+}
+
+#[test]
+fn no_early_stop_forces_strict_completion_policy() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "禁止提前结束",
+            "contract": {
+                "no_early_stop": true,
+                "completion_policy": {
+                    "require_pending_steps_empty": false,
+                    "require_all_slices_completed": false,
+                    "require_no_open_recovery": false,
+                    "require_ready_to_close": false,
+                    "require_complete_work_session": false,
+                    "disallow_unverified_completion": false
+                }
+            }
+        }),
+    );
+    assert_eq!(started["ok"], true);
+    let policy = &started["task"]["contract"]["completion_policy"];
+    for key in [
+        "require_pending_steps_empty",
+        "require_all_slices_completed",
+        "require_no_open_recovery",
+        "require_ready_to_close",
+        "require_complete_work_session",
+        "disallow_unverified_completion",
+    ] {
+        assert_eq!(policy[key], true, "no_early_stop 未强制启用 {key}");
+    }
+}
+
+#[test]
 fn begin_work_session_binds_history_and_task_idempotently() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -2474,4 +2780,365 @@ fn 工具清单包含项目状态和任务上下文能力() {
         assert!(names.contains(&expected), "缺少工具 {expected}");
     }
     assert!(!names.contains(&"undo_last_patch"));
+}
+
+#[test]
+fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "contract\n").expect("写入文件");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "严格任务契约",
+            "session_key": "strict-task-contract",
+            "workspace_root": workspace.to_string_lossy(),
+            "phase": "planning",
+            "pending_steps": ["final review"],
+            "contract": {
+                "no_early_stop": true,
+                "constraints": ["每个 Slice 必须通过声明的验收检查"],
+                "required_verifications": [
+                    {"id": "final-lint", "verification_key": "final-lint"}
+                ],
+                "completion_policy": {
+                    "require_pending_steps_empty": true,
+                    "require_all_slices_completed": true,
+                    "require_slice_commits": true,
+                    "require_no_open_recovery": true,
+                    "require_ready_to_close": true,
+                    "require_complete_work_session": true,
+                    "disallow_unverified_completion": true
+                }
+            },
+            "slices": [
+                {
+                    "id": "S1",
+                    "title": "实现任务闭环",
+                    "status": "planned",
+                    "acceptance_checks": [
+                        {"id": "slice-test", "verification_key": "slice-test"}
+                    ]
+                }
+            ],
+            "working_set": {
+                "primary": ["src-tauri/src/harness/tools.rs"],
+                "tests": ["src-tauri/tests/harness_tool_contract.rs"]
+            }
+        }),
+    );
+    assert_eq!(started["ok"], true);
+    let task_id = started["work_session"]["task_id"]
+        .as_str()
+        .expect("task id");
+    assert_eq!(started["task"]["contract"]["no_early_stop"], true);
+    assert_eq!(started["task"]["slices"][0]["id"], "S1");
+    assert_eq!(
+        started["task"]["working_set"]["primary"][0],
+        "src-tauri/src/harness/tools.rs"
+    );
+
+    let initial_gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
+    assert_eq!(initial_gate["ok"], true);
+    assert_eq!(initial_gate["ready"], false);
+    let initial_codes = initial_gate["completion_gate"]["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value["code"].as_str())
+        .collect::<Vec<_>>();
+    for code in [
+        "pending_steps_remaining",
+        "slices_incomplete",
+        "ready_to_close_phase_missing",
+        "complete_work_session_required",
+        "required_verification_missing",
+        "slice_acceptance_missing",
+    ] {
+        assert!(
+            initial_codes.contains(&code),
+            "completion gate missing {code}"
+        );
+    }
+
+    let early_finish = call_tool(
+        &ctx,
+        "finish_task",
+        &json!({"task_id": task_id, "allow_unverified": true}),
+    );
+    assert_eq!(early_finish["ok"], false);
+    assert_eq!(early_finish["error"]["code"], "TASK_VERIFICATION_MISSING");
+    assert_eq!(early_finish["completion_gate"]["ready"], false);
+
+    let implementing = call_tool(
+        &ctx,
+        "update_slice",
+        &json!({"task_id": task_id, "slice_id": "S1", "status": "in_progress"}),
+    );
+    assert_eq!(implementing["ok"], true);
+    assert_eq!(implementing["slice"]["status"], "in_progress");
+    let verifying = call_tool(
+        &ctx,
+        "update_slice",
+        &json!({"task_id": task_id, "slice_id": "S1", "status": "verifying"}),
+    );
+    assert_eq!(verifying["ok"], true);
+    assert_eq!(verifying["slice"]["status"], "verifying");
+
+    let slice_test = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('slice-ok')"],
+            "verification_kind": "test",
+            "verification_key": "slice-test",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(slice_test["command_ok"], true);
+    let completed_slice = call_tool(
+        &ctx,
+        "complete_slice",
+        &json!({"task_id": task_id, "slice_id": "S1", "commit_sha": "slice-commit-1"}),
+    );
+    assert_eq!(completed_slice["ok"], true);
+    assert_eq!(completed_slice["completed"], true);
+    assert_eq!(completed_slice["slice"]["status"], "completed");
+
+    let final_lint = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('lint-ok')"],
+            "verification_kind": "lint",
+            "verification_key": "final-lint",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(final_lint["command_ok"], true);
+    let updated = call_tool(
+        &ctx,
+        "update_task",
+        &json!({
+            "task_id": task_id,
+            "pending_steps": [],
+            "phase": "ready_to_close"
+        }),
+    );
+    assert_eq!(updated["task"]["phase"], "ready_to_close");
+
+    let direct_finish = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
+    assert_eq!(direct_finish["ok"], false);
+    assert_eq!(
+        direct_finish["error"]["code"],
+        "TASK_COMPLETE_WORK_SESSION_REQUIRED"
+    );
+    let direct_close = call_tool(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "session_status": "completed",
+            "summary": "不得绕过严格入口"
+        }),
+    );
+    assert_eq!(direct_close["ok"], false);
+    assert_eq!(
+        direct_close["finish"]["error"]["code"],
+        "TASK_COMPLETE_WORK_SESSION_REQUIRED"
+    );
+    let closed = call_tool(
+        &ctx,
+        "complete_work_session",
+        &json!({
+            "task_id": task_id,
+            "summary": "严格契约全部通过",
+            "checkpoint": {
+                "findings": ["task contract completion gate passed"],
+                "tests": ["slice-test", "final-lint"]
+            }
+        }),
+    );
+    assert_eq!(closed["ok"], true);
+    assert_eq!(closed["work_session"]["closed"], true);
+    assert_eq!(closed["work_session"]["status"], "completed");
+    assert_eq!(closed["task"]["phase"], "completed");
+}
+
+#[test]
+fn slice_completion_gate_reports_missing_acceptance_without_changing_slice_state() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "Slice completion gate",
+            "contract": {"completion_policy": {"require_slice_commits": true}}
+        }),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let slice = call_tool(
+        &ctx,
+        "start_slice",
+        &json!({
+            "task_id": task_id,
+            "slice_id": "S-gated",
+            "title": "受门禁保护的 Slice",
+            "acceptance_checks": [
+                {"id": "focused-e2e", "verification_key": "focused-e2e"}
+            ]
+        }),
+    );
+    assert_eq!(slice["ok"], true);
+
+    let blocked = call_tool(
+        &ctx,
+        "complete_slice",
+        &json!({"task_id": task_id, "slice_id": "S-gated"}),
+    );
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["error"]["code"], "SLICE_COMPLETION_GATE_FAILED");
+    assert_eq!(blocked["task"]["slices"][0]["status"], "in_progress");
+    let missing_codes = blocked["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(missing_codes.contains(&"slice_acceptance_missing"));
+    assert!(missing_codes.contains(&"slice_commit_missing"));
+}
+
+#[test]
+fn failed_tool_opens_recovery_and_same_step_success_resolves_it() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "工具失败恢复到原步骤"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let script = "import pathlib,sys; p=pathlib.Path('recovery.flag'); existed=p.exists(); p.write_text('ready'); sys.exit(0 if existed else 1)";
+
+    let failed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", script],
+            "verification_kind": "test",
+            "verification_key": "recovery-retry",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(failed["command_ok"], false);
+    assert_eq!(failed["task_recovery"]["status"], "open");
+    assert_eq!(
+        failed["task_recovery"]["recovery"]["failed_step"],
+        "exec_command"
+    );
+    assert_eq!(
+        failed["task_recovery"]["recovery"]["workspace_mutated"],
+        true
+    );
+
+    let blocked = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
+    let has_recovery = blocked["completion_gate"]["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["code"] == "recovery_open");
+    assert!(has_recovery);
+
+    let unrelated = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('unrelated-success')"],
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(unrelated["command_ok"], true);
+    assert!(unrelated.get("task_recovery").is_none());
+    assert_eq!(
+        ctx.harness
+            .task(task_id)
+            .unwrap()
+            .recovery
+            .as_ref()
+            .unwrap()
+            .status,
+        anchor_lib::harness::TaskRecoveryStatus::Open
+    );
+
+    let passed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", script],
+            "verification_kind": "test",
+            "verification_key": "recovery-retry",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(passed["command_ok"], true);
+    assert_eq!(passed["task_recovery"]["status"], "resolved");
+    assert_eq!(
+        passed["task_recovery"]["recovery"]["resolved_by_step"],
+        "exec_command"
+    );
+    assert!(passed["supersedes"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
+
+    let recovered = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
+    let still_open = recovered["completion_gate"]["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["code"] == "recovery_open");
+    assert!(!still_open);
+    assert_eq!(recovered["task"]["recovery"]["status"], "resolved");
+}
+
+#[test]
+fn catalog_v28_exposes_task_governance_tools_and_schemas() {
+    let tools = anchor_lib::tools::list_tools_for_profile("advanced");
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "complete_work_session",
+        "task_gate_status",
+        "start_slice",
+        "update_slice",
+        "complete_slice",
+    ] {
+        assert!(names.contains(&expected), "缺少工具 {expected}");
+    }
+    let begin = tools
+        .iter()
+        .find(|tool| tool["name"] == "begin_work_session")
+        .expect("begin_work_session schema");
+    for property in ["contract", "phase", "slices", "working_set"] {
+        assert!(
+            begin["inputSchema"]["properties"].get(property).is_some(),
+            "begin_work_session 缺少 {property} schema"
+        );
+    }
 }

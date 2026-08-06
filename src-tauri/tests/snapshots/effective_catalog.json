@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 27,
+    "catalog_version": 28,
     "names": [
       "accept_current_baseline",
       "accept_latest_baseline",
@@ -12,6 +12,8 @@
       "check_exec_environment",
       "close_work_session",
       "command_cost_explain",
+      "complete_slice",
+      "complete_work_session",
       "exec_command",
       "exec_health_check",
       "export_work_session",
@@ -59,9 +61,12 @@
       "set_default_cwd",
       "stage_commit",
       "stage_commit_status",
+      "start_slice",
       "start_task",
       "switch_task",
       "task_context",
+      "task_gate_status",
+      "update_slice",
       "update_task",
       "update_verification_disposition",
       "view_image",
@@ -69,10 +74,10 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 66
+    "tool_count": 71
   },
   "core": {
-    "catalog_version": 27,
+    "catalog_version": 28,
     "names": [
       "accept_latest_baseline",
       "apply_patch",
@@ -122,7 +127,7 @@
     "tool_count": 44
   },
   "read-only": {
-    "catalog_version": 27,
+    "catalog_version": 28,
     "names": [
       "browser_build_info",
       "check_exec_environment",

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::context::ToolContext;
@@ -60,6 +61,218 @@ fn policy_tool_err(err: PolicyError) -> Value {
             "alternatives": alternatives
         }),
     })
+}
+
+fn task_recovery_trackable(tool: &str) -> bool {
+    matches!(
+        tool,
+        "apply_patch"
+            | "exec_command"
+            | "wait_command"
+            | "write_stdin"
+            | "kill_session"
+            | "remove_path"
+            | "git_stage"
+            | "git_commit"
+            | "git_restore"
+            | "git_reset"
+            | "git_revert"
+            | "git_clean"
+            | "git_worktree_create"
+            | "git_worktree_remove"
+            | "git_worktree_prune"
+            | "stage_commit"
+            | "wait_stage_commit"
+    )
+}
+
+fn recovery_step_identity(tool: &str, args: &Value, output: &Value) -> (String, String) {
+    let step = if tool == "wait_command" && output.get("command").and_then(Value::as_str).is_some()
+    {
+        "exec_command"
+    } else {
+        tool
+    };
+    let stable_key = args
+        .get("recovery_key")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("verification_key").and_then(Value::as_str))
+        .or_else(|| args.get("idempotency_key").and_then(Value::as_str));
+    let material = if let Some(stable_key) = stable_key {
+        json!({"step": step, "stable_key": stable_key})
+    } else if let Some(command) = output.get("command").and_then(Value::as_str) {
+        json!({
+            "step": step,
+            "command": command,
+            "resolved_cwd": output.get("resolved_cwd")
+        })
+    } else {
+        let mut stable_args = args.clone();
+        if let Some(object) = stable_args.as_object_mut() {
+            for volatile in [
+                "reason",
+                "timeout_ms",
+                "yield_time_ms",
+                "max_output_bytes",
+                "include_diagnostics",
+                "verification_kind",
+                "verification_level",
+                "verification_key",
+                "test_file",
+                "test_name",
+                "supersede_previous_failures",
+            ] {
+                object.remove(volatile);
+            }
+        }
+        json!({"step": step, "arguments": stable_args})
+    };
+    let encoded = serde_json::to_vec(&material).unwrap_or_default();
+    let fingerprint = format!("{:x}", Sha256::digest(encoded));
+    (step.to_string(), fingerprint)
+}
+
+fn track_task_recovery(
+    ctx: &ToolContext,
+    task_id: Option<&str>,
+    tool: &str,
+    args: &Value,
+    output: &mut Value,
+) {
+    let Some(task_id) = task_id else { return };
+    if !task_recovery_trackable(tool) {
+        return;
+    }
+    if tool == "apply_patch"
+        && args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return;
+    }
+    let (recovery_step, step_fingerprint) = recovery_step_identity(tool, args, output);
+    let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
+    if succeeded {
+        if let Ok(Some(recovery)) =
+            ctx.harness
+                .resolve_recovery_for_step(task_id, &recovery_step, Some(&step_fingerprint))
+        {
+            if let Some(object) = output.as_object_mut() {
+                object.insert(
+                    "task_recovery".into(),
+                    json!({
+                        "status": "resolved",
+                        "recovery": recovery,
+                        "resume_target_restored": true
+                    }),
+                );
+            }
+        }
+        return;
+    }
+
+    let error = output.get("error");
+    let error_code = error
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str);
+    let verification_id = output
+        .get("verification_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            output
+                .pointer("/verification/verification_id")
+                .and_then(Value::as_str)
+        });
+    let category = error
+        .and_then(|value| value.get("category"))
+        .and_then(Value::as_str)
+        .unwrap_or("tooling_failure");
+    let failure_type = match category {
+        "policy" | "permission" => "tooling_failure",
+        "runtime" if tool == "exec_command" || tool == "wait_command" => "command_failure",
+        "runtime" => "environment_failure",
+        "validation" => "tooling_failure",
+        other => other,
+    };
+    let workspace_mutated = output
+        .get("mutation_attributed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || output
+            .get("affected_files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| !files.is_empty());
+    let rollback_status = if workspace_mutated {
+        "required"
+    } else {
+        "not_required"
+    };
+    let mut recommendations = Vec::<String>::new();
+    if let Some(actions) = output.get("next_actions").and_then(Value::as_array) {
+        recommendations.extend(actions.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    if let Some(recovery_tool) = error
+        .and_then(|value| value.pointer("/details/recovery_tool"))
+        .and_then(Value::as_str)
+    {
+        recommendations.push(recovery_tool.to_string());
+    }
+    for value in [
+        error
+            .and_then(|value| value.pointer("/details/suggestion"))
+            .and_then(Value::as_str),
+        output.get("suggestion").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        recommendations.push(value.to_string());
+    }
+    recommendations.sort();
+    recommendations.dedup();
+    recommendations.truncate(16);
+    let resume_target = ctx
+        .harness
+        .task(task_id)
+        .ok()
+        .and_then(|task| {
+            task.current_slice_id.or_else(|| {
+                serde_json::to_value(task.phase)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+            })
+        })
+        .unwrap_or_else(|| "task".into());
+    if let Ok(recovery) = ctx.harness.record_recovery(
+        task_id,
+        &recovery_step,
+        Some(&step_fingerprint),
+        failure_type,
+        error_code,
+        verification_id,
+        workspace_mutated,
+        rollback_status,
+        recommendations,
+        &resume_target,
+    ) {
+        if let Some(object) = output.as_object_mut() {
+            let additional_failure_preserved = recovery.failed_step != recovery_step
+                || recovery.step_fingerprint.as_deref() != Some(step_fingerprint.as_str());
+            let retry_original_step = recovery.failed_step.clone();
+            let preserved_step_fingerprint = recovery.step_fingerprint.clone();
+            object.insert(
+                "task_recovery".into(),
+                json!({
+                    "status": "open",
+                    "recovery": recovery,
+                    "retry_original_step": retry_original_step,
+                    "step_fingerprint": preserved_step_fingerprint,
+                    "additional_failure_preserved": additional_failure_preserved
+                }),
+            );
+        }
+    }
 }
 
 fn persist_git_commit_change_set(ctx: &ToolContext, task_id: &str, output: &Value) {
@@ -586,7 +799,16 @@ fn call_tool_impl(
     if name == "exec_command" {
         if let Err(error) = exec::normalize_exec_arguments(&mut effective_args) {
             let output = tool_err(error);
-            return normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+            let mut output =
+                normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+            track_task_recovery(
+                ctx,
+                initial_task.as_ref().map(|task| task.id.as_str()),
+                name,
+                &effective_args,
+                &mut output,
+            );
+            return output;
         }
     }
     if name == "wait_command" {
@@ -597,7 +819,17 @@ fn call_tool_impl(
         );
     }
     if let Some(error) = skill_script_permission_error(ctx, name, &effective_args) {
-        return tool_err(error);
+        let output = tool_err(error);
+        let mut output =
+            normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+        track_task_recovery(
+            ctx,
+            initial_task.as_ref().map(|task| task.id.as_str()),
+            name,
+            &effective_args,
+            &mut output,
+        );
+        return output;
     }
     if let Err(e) = validate_tool_arguments_for_workspace(
         name,
@@ -606,7 +838,16 @@ fn call_tool_impl(
         Some(&ctx.workspace),
     ) {
         let output = policy_tool_err(e);
-        return normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+        let mut output =
+            normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+        track_task_recovery(
+            ctx,
+            initial_task.as_ref().map(|task| task.id.as_str()),
+            name,
+            &effective_args,
+            &mut output,
+        );
+        return output;
     }
     let mut selected_task = initial_task;
     if name != "begin_work_session" {
@@ -713,6 +954,7 @@ fn call_tool_impl(
             .map(str::to_string)
             .or(requested_task_id)
             .or_else(|| active_task.as_ref().map(|task| task.id.clone()));
+        track_task_recovery(ctx, result_task_id.as_deref(), name, args, &mut output);
         if let Some(operation) = operation {
             if let Some(object) = output.as_object_mut() {
                 object.insert("operation_id".into(), Value::String(operation.id.clone()));
@@ -1024,6 +1266,15 @@ fn call_tool_impl(
             }
         }
     }
+    track_task_recovery(
+        ctx,
+        task_id
+            .as_deref()
+            .or_else(|| active_task.as_ref().map(|task| task.id.as_str())),
+        name,
+        &effective_args,
+        &mut output,
+    );
     if let Some(operation) = operation {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
         let _ = ctx.harness.record_operation(

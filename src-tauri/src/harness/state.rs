@@ -14,8 +14,9 @@ use super::model::{
     BaselineEntry, BaselineObject, CapabilityStatus, ChangeSet, ExpectedWorkspaceState,
     FileChangeRecord, HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord,
     ProjectBaseline, ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt,
-    TaskGitWorktree, TaskSession, TaskStatus, VerificationDispositionRecord, VerificationRecord,
-    WorkSessionCloseOutbox, WorkspaceHarnessState, SCHEMA_VERSION,
+    TaskContract, TaskGitWorktree, TaskPhase, TaskRecoveryState, TaskRecoveryStatus, TaskSession,
+    TaskSlice, TaskSliceStatus, TaskStatus, TaskWorkingSet, VerificationDispositionRecord,
+    VerificationRecord, WorkSessionCloseOutbox, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{baseline_object_id, HarnessError, HarnessResult, HarnessStore};
 
@@ -32,6 +33,85 @@ fn same_write_domain(left: &TaskSession, right: &TaskSession) -> bool {
         (Some(left), Some(right)) => left.path == right.path,
         _ => false,
     }
+}
+
+fn validate_contract_update(current: &TaskContract, next: &TaskContract) -> HarnessResult<()> {
+    if current == &TaskContract::default() {
+        return Ok(());
+    }
+    if current.no_early_stop && !next.no_early_stop {
+        return Err(HarnessError::new(
+            "TASK_CONTRACT_RELAXATION_REJECTED",
+            "no_early_stop cannot be disabled after it has been enabled",
+        ));
+    }
+    if current
+        .constraints
+        .iter()
+        .any(|constraint| !next.constraints.contains(constraint))
+    {
+        return Err(HarnessError::new(
+            "TASK_CONTRACT_RELAXATION_REJECTED",
+            "Existing task constraints cannot be removed",
+        ));
+    }
+    for requirement in &current.required_verifications {
+        let preserved = next
+            .required_verifications
+            .iter()
+            .find(|candidate| candidate.id == requirement.id)
+            == Some(requirement);
+        if !preserved {
+            return Err(HarnessError::new(
+                "TASK_CONTRACT_RELAXATION_REJECTED",
+                format!(
+                    "Required verification cannot be removed or changed: {}",
+                    requirement.id
+                ),
+            ));
+        }
+    }
+    let current_policy = &current.completion_policy;
+    let next_policy = &next.completion_policy;
+    let relaxed = [
+        (
+            current_policy.require_pending_steps_empty,
+            next_policy.require_pending_steps_empty,
+        ),
+        (
+            current_policy.require_all_slices_completed,
+            next_policy.require_all_slices_completed,
+        ),
+        (
+            current_policy.require_slice_commits,
+            next_policy.require_slice_commits,
+        ),
+        (
+            current_policy.require_no_open_recovery,
+            next_policy.require_no_open_recovery,
+        ),
+        (
+            current_policy.require_ready_to_close,
+            next_policy.require_ready_to_close,
+        ),
+        (
+            current_policy.require_complete_work_session,
+            next_policy.require_complete_work_session,
+        ),
+        (
+            current_policy.disallow_unverified_completion,
+            next_policy.disallow_unverified_completion,
+        ),
+    ]
+    .into_iter()
+    .any(|(was_required, remains_required)| was_required && !remains_required);
+    if relaxed {
+        return Err(HarnessError::new(
+            "TASK_CONTRACT_RELAXATION_REJECTED",
+            "Completion policy requirements cannot be disabled after configuration",
+        ));
+    }
+    Ok(())
 }
 
 fn same_requested_write_domain(task: &TaskSession, worktree: Option<&TaskGitWorktree>) -> bool {
@@ -65,6 +145,8 @@ fn tool_activity_resumes_paused_task(tool: &str) -> bool {
             | "switch_task"
             | "finish_task"
             | "close_work_session"
+            | "complete_work_session"
+            | "task_gate_status"
             | "start_task"
             | "stage_commit_status"
     )
@@ -564,6 +646,12 @@ impl Harness {
                     workspace_id: self.workspace_id.clone(),
                     objective: objective.trim().to_string(),
                     status: TaskStatus::Active,
+                    phase: TaskPhase::Planning,
+                    contract: TaskContract::default(),
+                    slices: Vec::new(),
+                    current_slice_id: None,
+                    working_set: TaskWorkingSet::default(),
+                    recovery: None,
                     expected_state: expected_state_from_baseline(&baseline, None),
                     baseline,
                     completed_steps: Vec::new(),
@@ -897,6 +985,7 @@ impl Harness {
                 } else {
                     TaskStatus::CompletedUnverified
                 };
+                task.phase = TaskPhase::Completed;
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
                 let default_task_id = self
@@ -1047,6 +1136,408 @@ impl Harness {
                     json!({"ok": true}),
                 ))?;
                 Ok(task)
+            })
+    }
+
+    pub fn configure_task(
+        &self,
+        task_id: &str,
+        phase: Option<TaskPhase>,
+        contract: Option<TaskContract>,
+        slices: Option<Vec<TaskSlice>>,
+        working_set: Option<TaskWorkingSet>,
+    ) -> HarnessResult<TaskSession> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能更新任务契约",
+                    ));
+                }
+                if let Some(value) = phase {
+                    if value == TaskPhase::Completed {
+                        return Err(HarnessError::new(
+                            "TASK_COMPLETION_TOOL_REQUIRED",
+                            "Task phase completed can only be set by the task completion transaction",
+                        ));
+                    }
+                    if !task.phase.can_transition_to(value) {
+                        return Err(HarnessError::new(
+                            "TASK_PHASE_TRANSITION_INVALID",
+                            format!(
+                                "Task phase cannot transition from {:?} to {:?}",
+                                task.phase, value
+                            ),
+                        ));
+                    }
+                    task.phase = value;
+                }
+                if let Some(value) = contract {
+                    validate_contract_update(&task.contract, &value)?;
+                    task.contract = value;
+                }
+                if let Some(value) = slices {
+                    if !task.slices.is_empty() {
+                        return Err(HarnessError::new(
+                            "TASK_SLICE_UPDATE_TOOL_REQUIRED",
+                            "Existing Slices must be changed through start_slice, update_slice, or complete_slice",
+                        ));
+                    }
+                    if value
+                        .iter()
+                        .any(|slice| slice.status == TaskSliceStatus::Completed)
+                    {
+                        return Err(HarnessError::new(
+                            "SLICE_COMPLETION_TOOL_REQUIRED",
+                            "A configured Slice cannot start as completed",
+                        ));
+                    }
+                    task.current_slice_id = value
+                        .iter()
+                        .find(|slice| {
+                            matches!(
+                                slice.status,
+                                TaskSliceStatus::InProgress | TaskSliceStatus::Verifying
+                            )
+                        })
+                        .map(|slice| slice.id.clone());
+                    task.slices = value;
+                }
+                if let Some(value) = working_set {
+                    task.working_set = value;
+                }
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_contract_updated",
+                    Some("update_task"),
+                    json!({
+                        "phase": task.phase,
+                        "contract": task.contract.clone(),
+                        "slice_count": task.slices.len(),
+                        "working_set": task.working_set.clone()
+                    }),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
+    }
+
+    pub fn start_slice(&self, task_id: &str, mut slice: TaskSlice) -> HarnessResult<TaskSession> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能开始 Slice",
+                    ));
+                }
+                if task.slices.iter().any(|existing| existing.id == slice.id) {
+                    return Err(HarnessError::new(
+                        "SLICE_ALREADY_EXISTS",
+                        format!("Slice already exists: {}", slice.id),
+                    ));
+                }
+                for existing in &mut task.slices {
+                    if matches!(
+                        existing.status,
+                        TaskSliceStatus::InProgress | TaskSliceStatus::Verifying
+                    ) {
+                        existing.status = TaskSliceStatus::Paused;
+                        existing.updated_at = timestamp();
+                    }
+                }
+                slice.status = TaskSliceStatus::InProgress;
+                slice.updated_at = timestamp();
+                task.current_slice_id = Some(slice.id.clone());
+                task.phase = TaskPhase::Implementing;
+                task.slices.push(slice.clone());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "slice_started",
+                    Some("start_slice"),
+                    json!({"slice": slice}),
+                    json!({"ok": true, "current_slice_id": task.current_slice_id.clone()}),
+                ))?;
+                Ok(task)
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_slice(
+        &self,
+        task_id: &str,
+        slice_id: &str,
+        status: Option<TaskSliceStatus>,
+        title: Option<String>,
+        files: Option<Vec<String>>,
+        acceptance_checks: Option<Vec<super::model::VerificationRequirement>>,
+        commit_sha: Option<Option<String>>,
+        blocker: Option<Option<String>>,
+    ) -> HarnessResult<TaskSession> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                let slice = task
+                    .slices
+                    .iter_mut()
+                    .find(|slice| slice.id == slice_id)
+                    .ok_or_else(|| {
+                        HarnessError::new("SLICE_NOT_FOUND", format!("Slice not found: {slice_id}"))
+                    })?;
+                if status == Some(TaskSliceStatus::Completed) {
+                    return Err(HarnessError::new(
+                        "SLICE_COMPLETION_TOOL_REQUIRED",
+                        "Use complete_slice so Slice acceptance checks cannot be bypassed",
+                    ));
+                }
+                if let Some(value) = status {
+                    if !slice.status.can_transition_to(value) {
+                        return Err(HarnessError::new(
+                            "SLICE_STATUS_TRANSITION_INVALID",
+                            format!(
+                                "Slice status cannot transition from {:?} to {:?}",
+                                slice.status, value
+                            ),
+                        ));
+                    }
+                    slice.status = value;
+                }
+                if let Some(value) = title {
+                    slice.title = value;
+                }
+                if let Some(value) = files {
+                    slice.files = value;
+                }
+                if let Some(value) = acceptance_checks {
+                    slice.acceptance_checks = value;
+                }
+                if let Some(value) = commit_sha {
+                    slice.commit_sha = value;
+                }
+                if let Some(value) = blocker {
+                    slice.blocker = value;
+                }
+                slice.updated_at = timestamp();
+                if matches!(
+                    slice.status,
+                    TaskSliceStatus::InProgress | TaskSliceStatus::Verifying
+                ) {
+                    task.current_slice_id = Some(slice.id.clone());
+                }
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "slice_updated",
+                    Some("update_slice"),
+                    json!({"slice_id": slice_id}),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
+    }
+
+    pub fn complete_slice(
+        &self,
+        task_id: &str,
+        slice_id: &str,
+        commit_sha: Option<String>,
+    ) -> HarnessResult<TaskSession> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                let completed_commit_sha = {
+                    let slice = task
+                        .slices
+                        .iter_mut()
+                        .find(|slice| slice.id == slice_id)
+                        .ok_or_else(|| {
+                            HarnessError::new(
+                                "SLICE_NOT_FOUND",
+                                format!("Slice not found: {slice_id}"),
+                            )
+                        })?;
+                    if slice.status != TaskSliceStatus::Verifying {
+                        return Err(HarnessError::new(
+                            "SLICE_NOT_VERIFYING",
+                            "Slice must enter verifying before completion",
+                        ));
+                    }
+                    slice.status = TaskSliceStatus::Completed;
+                    slice.blocker = None;
+                    if commit_sha.is_some() {
+                        slice.commit_sha = commit_sha;
+                    }
+                    slice.updated_at = timestamp();
+                    slice.commit_sha.clone()
+                };
+                task.current_slice_id = None;
+                task.phase = if task
+                    .slices
+                    .iter()
+                    .all(|slice| slice.status == TaskSliceStatus::Completed)
+                {
+                    TaskPhase::Verifying
+                } else {
+                    TaskPhase::Implementing
+                };
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "slice_completed",
+                    Some("complete_slice"),
+                    json!({"slice_id": slice_id, "commit_sha": completed_commit_sha}),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_recovery(
+        &self,
+        task_id: &str,
+        failed_step: &str,
+        step_fingerprint: Option<&str>,
+        failure_type: &str,
+        error_code: Option<&str>,
+        related_verification_id: Option<&str>,
+        workspace_mutated: bool,
+        rollback_status: &str,
+        recommended_recovery: Vec<String>,
+        resume_target: &str,
+    ) -> HarnessResult<TaskRecoveryState> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能记录恢复状态",
+                    ));
+                }
+                if let Some(mut existing) = task
+                    .recovery
+                    .clone()
+                    .filter(|recovery| recovery.status == TaskRecoveryStatus::Open)
+                {
+                    let same_step = existing.failed_step == failed_step
+                        && existing.step_fingerprint.as_deref() == step_fingerprint;
+                    if same_step {
+                        existing.failure_type = failure_type.to_string();
+                        existing.error_code = error_code.map(str::to_string);
+                        existing.related_verification_id =
+                            related_verification_id.map(str::to_string);
+                        existing.workspace_mutated |= workspace_mutated;
+                        existing.rollback_status = rollback_status.to_string();
+                        existing.recommended_recovery = recommended_recovery;
+                        existing.resume_target = resume_target.to_string();
+                        existing.updated_at = timestamp();
+                        task.recovery = Some(existing.clone());
+                        task.updated_at = timestamp();
+                        transaction.save_task(&task)?;
+                        transaction.append_event(&harness_event(
+                            &self.workspace_id,
+                            task_id,
+                            "task_recovery_reobserved",
+                            Some(failed_step),
+                            json!({"recovery_id": existing.id}),
+                            json!({"ok": true}),
+                        ))?;
+                    } else {
+                        transaction.append_event(&harness_event(
+                            &self.workspace_id,
+                            task_id,
+                            "task_recovery_additional_failure",
+                            Some(failed_step),
+                            json!({
+                                "failure_type": failure_type,
+                                "error_code": error_code,
+                                "step_fingerprint": step_fingerprint,
+                                "preserved_recovery_id": existing.id
+                            }),
+                            json!({"ok": false, "recovery_preserved": true}),
+                        ))?;
+                    }
+                    return Ok(existing);
+                }
+                let now = timestamp();
+                let recovery = TaskRecoveryState {
+                    id: Uuid::new_v4().simple().to_string(),
+                    failed_step: failed_step.to_string(),
+                    step_fingerprint: step_fingerprint.map(str::to_string),
+                    failure_type: failure_type.to_string(),
+                    error_code: error_code.map(str::to_string),
+                    related_verification_id: related_verification_id.map(str::to_string),
+                    workspace_mutated,
+                    rollback_status: rollback_status.to_string(),
+                    recommended_recovery,
+                    resume_target: resume_target.to_string(),
+                    status: TaskRecoveryStatus::Open,
+                    resolved_by_step: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                task.recovery = Some(recovery.clone());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_recovery_opened",
+                    Some(failed_step),
+                    json!({"failure_type": failure_type, "error_code": error_code}),
+                    json!({"ok": true, "recovery_id": recovery.id}),
+                ))?;
+                Ok(recovery)
+            })
+    }
+
+    pub fn resolve_recovery_for_step(
+        &self,
+        task_id: &str,
+        succeeded_step: &str,
+        step_fingerprint: Option<&str>,
+    ) -> HarnessResult<Option<TaskRecoveryState>> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                let Some(mut recovery) = task.recovery.clone() else {
+                    return Ok(None);
+                };
+                if recovery.status != TaskRecoveryStatus::Open
+                    || recovery.failed_step != succeeded_step
+                    || recovery.step_fingerprint.as_deref() != step_fingerprint
+                {
+                    return Ok(None);
+                }
+                recovery.status = TaskRecoveryStatus::Resolved;
+                recovery.resolved_by_step = Some(succeeded_step.to_string());
+                recovery.updated_at = timestamp();
+                task.recovery = Some(recovery.clone());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_recovery_resolved",
+                    Some(succeeded_step),
+                    json!({"recovery_id": recovery.id}),
+                    json!({"ok": true}),
+                ))?;
+                Ok(Some(recovery))
             })
     }
 

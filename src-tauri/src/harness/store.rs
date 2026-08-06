@@ -1026,7 +1026,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::harness::model::{ProjectBaseline, TaskStatus};
+    use crate::harness::model::{
+        ProjectBaseline, TaskContract, TaskPhase, TaskStatus, TaskWorkingSet,
+    };
 
     #[test]
     fn journal_skips_corruption_and_reports_health() {
@@ -1095,6 +1097,12 @@ mod tests {
             workspace_id: "workspace".into(),
             objective: "legacy task".into(),
             status: TaskStatus::Active,
+            phase: TaskPhase::Unspecified,
+            contract: TaskContract::default(),
+            slices: Vec::new(),
+            current_slice_id: None,
+            working_set: TaskWorkingSet::default(),
+            recovery: None,
             baseline: ProjectBaseline {
                 schema_version: SCHEMA_VERSION,
                 branch: None,

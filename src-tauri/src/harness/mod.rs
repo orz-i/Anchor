@@ -6,6 +6,10 @@ pub mod tools;
 #[cfg(test)]
 mod tools_tests;
 
-pub use model::{ProjectState, TaskSession, TaskStatus};
+pub use model::{
+    ProjectState, TaskCompletionPolicy, TaskContract, TaskPhase, TaskRecoveryState,
+    TaskRecoveryStatus, TaskSession, TaskSlice, TaskSliceStatus, TaskStatus, TaskWorkingSet,
+    VerificationRequirement,
+};
 pub use state::Harness;
 pub use store::{HarnessError, HarnessResult, HarnessStore};

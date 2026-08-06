@@ -202,6 +202,109 @@ fn finish_task_success_matches_published_output_schema() {
 }
 
 #[test]
+fn task_governance_successes_match_published_output_schemas() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "start_task",
+        json!({"objective": "task governance output schema"}),
+    );
+    assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let slice = invoke(
+        &ctx,
+        "start_slice",
+        json!({
+            "task_id": task_id,
+            "slice_id": "schema-slice",
+            "title": "schema slice",
+            "acceptance_checks": [
+                {"id": "schema-check", "verification_key": "schema-check"}
+            ]
+        }),
+    );
+    assert_ok(&slice);
+    assert_matches_output_schema("start_slice", &slice);
+
+    let verifying = invoke(
+        &ctx,
+        "update_slice",
+        json!({"task_id": task_id, "slice_id": "schema-slice", "status": "verifying"}),
+    );
+    assert_ok(&verifying);
+    assert_matches_output_schema("update_slice", &verifying);
+
+    let gate = invoke(&ctx, "task_gate_status", json!({"task_id": task_id}));
+    assert_ok(&gate);
+    assert_eq!(gate["ready"], false);
+    assert_matches_output_schema("task_gate_status", &gate);
+
+    let verified = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('schema-check')"],
+            "verification_kind": "test",
+            "verification_key": "schema-check",
+            "yield_time_ms": 30_000
+        }),
+    );
+    assert_ok(&verified);
+    let completed = invoke(
+        &ctx,
+        "complete_slice",
+        json!({"task_id": task_id, "slice_id": "schema-slice"}),
+    );
+    assert_ok(&completed);
+    assert_matches_output_schema("complete_slice", &completed);
+}
+
+#[test]
+fn complete_work_session_success_matches_published_output_schema() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "begin_work_session",
+        json!({
+            "objective": "complete work session output schema",
+            "session_key": "complete-work-session-output-schema",
+            "workspace_root": fx.root.to_string_lossy()
+        }),
+    );
+    assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let verified = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('verified')"],
+            "verification_kind": "test",
+            "verification_key": "complete-work-session-schema",
+            "yield_time_ms": 30_000
+        }),
+    );
+    assert_ok(&verified);
+
+    let completed = invoke(
+        &ctx,
+        "complete_work_session",
+        json!({
+            "task_id": task_id,
+            "summary": "output schema complete",
+            "checkpoint": {"tests": ["complete_work_session output schema"]}
+        }),
+    );
+    assert_ok(&completed);
+    assert_eq!(completed["work_session"]["closed"], true);
+    assert_matches_output_schema("complete_work_session", &completed);
+}
+
+#[test]
 fn retained_session_tools_match_published_output_schemas() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 27;
+pub const CATALOG_VERSION: u32 = 28;
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
@@ -47,6 +47,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "close_work_session",
         "Close work session",
         "[anchor-core] Validate and close the bound Harness Task, then persist the matching History Session checkpoint as a recoverable workflow. Closure is rejected while retained commands are running or their terminal results are unconsumed.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "complete_work_session",
+        "Complete work session",
+        "[anchor-core] Enforce the full persisted task contract, require verified evidence, close the Harness Task, and save the final History checkpoint. This strict completion path cannot bypass verification.",
         false,
         false,
         false,
@@ -206,7 +214,39 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "update_task",
         "Update task",
-        "Update task steps and durable progress.",
+        "Update durable task steps, phase, contract, Slice plan, and working set.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "task_gate_status",
+        "Task completion gate",
+        "Return every currently missing completion condition, including commands, Git state, required verifications, pending steps, Slices, recovery, and strict close policy.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "start_slice",
+        "Start task Slice",
+        "Start a first-class task Slice with declared files and acceptance checks.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "update_slice",
+        "Update task Slice",
+        "Update a Slice without bypassing its completion gate.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "complete_slice",
+        "Complete task Slice",
+        "Complete a Slice only after its acceptance checks and optional commit requirement pass.",
         false,
         false,
         false,
@@ -609,9 +649,11 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 
 pub const ALLOWED_TOOLS: &[&str] = &[
     "harness_status",
+    "task_gate_status",
     "operation_log",
     "begin_work_session",
     "close_work_session",
+    "complete_work_session",
     "update_verification_disposition",
     "accept_current_baseline",
     "accept_latest_baseline",
@@ -665,6 +707,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "stage_commit_status",
     "wait_stage_commit",
     "update_task",
+    "start_slice",
+    "update_slice",
+    "complete_slice",
     "pause_task",
     "resume_task",
     "switch_task",
@@ -678,6 +723,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 
 pub const MUTATING_TOOLS: &[&str] = &[
     "begin_work_session",
+    "complete_work_session",
     "browser_wait_for_build",
     "close_work_session",
     "update_verification_disposition",
@@ -706,6 +752,9 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "stage_commit",
     "wait_stage_commit",
     "update_task",
+    "start_slice",
+    "update_slice",
+    "complete_slice",
     "pause_task",
     "resume_task",
     "switch_task",
@@ -715,6 +764,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
 
 pub const READ_ONLY_TOOLS: &[&str] = &[
     "harness_status",
+    "task_gate_status",
     "operation_log",
     "stage_commit_status",
     "server_info",
@@ -823,6 +873,131 @@ fn merge_schema_properties(chunks: Vec<Value>) -> Value {
         );
     }
     Value::Object(properties)
+}
+
+fn verification_requirement_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "description": { "type": "string", "maxLength": 2000, "default": "" },
+            "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "verification_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "test_file": { "type": "string", "minLength": 1, "maxLength": 2000 },
+            "test_name": { "type": "string", "minLength": 1, "maxLength": 1000 }
+        },
+        "required": ["id"],
+        "anyOf": [
+            { "required": ["kind"] },
+            { "required": ["verification_key"] },
+            { "required": ["test_file"] },
+            { "required": ["test_name"] }
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn task_completion_policy_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "require_pending_steps_empty": { "type": "boolean", "default": false },
+            "require_all_slices_completed": { "type": "boolean", "default": true },
+            "require_slice_commits": { "type": "boolean", "default": false },
+            "require_no_open_recovery": { "type": "boolean", "default": true },
+            "require_ready_to_close": { "type": "boolean", "default": false },
+            "require_complete_work_session": { "type": "boolean", "default": false },
+            "disallow_unverified_completion": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_contract_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "no_early_stop": { "type": "boolean", "default": false },
+            "constraints": {
+                "type": "array",
+                "maxItems": 64,
+                "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+            },
+            "required_verifications": {
+                "type": "array",
+                "maxItems": 64,
+                "items": verification_requirement_input_schema()
+            },
+            "completion_policy": task_completion_policy_input_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_slice_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "status": {
+                "type": "string",
+                "enum": ["planned", "in_progress", "verifying", "blocked", "paused"],
+                "default": "planned"
+            },
+            "files": {
+                "type": "array",
+                "maxItems": 256,
+                "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+            },
+            "acceptance_checks": {
+                "type": "array",
+                "maxItems": 64,
+                "items": verification_requirement_input_schema()
+            },
+            "commit_sha": { "type": ["string", "null"], "maxLength": 128 },
+            "blocker": { "type": ["string", "null"], "maxLength": 2000 }
+        },
+        "required": ["id", "title"],
+        "additionalProperties": false
+    })
+}
+
+fn task_working_set_input_schema() -> Value {
+    let paths = json!({
+        "type": "array",
+        "maxItems": 256,
+        "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "primary": paths.clone(),
+            "tests": paths.clone(),
+            "locales": paths.clone(),
+            "reference_only": paths
+        },
+        "additionalProperties": false
+    })
+}
+
+fn task_configuration_input_properties() -> Value {
+    json!({
+        "phase": {
+            "type": "string",
+            "enum": [
+                "unspecified", "planning", "implementing", "verifying", "deploying",
+                "browser_review", "cleanup", "ready_to_close", "blocked", "paused"
+            ]
+        },
+        "contract": task_contract_input_schema(),
+        "slices": {
+            "type": "array",
+            "maxItems": 64,
+            "items": task_slice_input_schema()
+        },
+        "working_set": task_working_set_input_schema()
+    })
 }
 
 fn history_bootstrap_output_properties() -> Value {
@@ -2039,7 +2214,7 @@ pub fn output_schema(name: &str) -> Value {
                 "reconnect_required",
             ],
         ),
-        "close_work_session" => json!({
+        "close_work_session" | "complete_work_session" => json!({
             "type": "object",
             "properties": {
                 "ok": { "type": "boolean" },
@@ -2081,6 +2256,61 @@ pub fn output_schema(name: &str) -> Value {
                 "effective_disposition",
             ],
         ),
+        "task_gate_status" => success_output_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1 },
+                "ready": { "type": "boolean" },
+                "completion_gate": { "type": "object" },
+                "task": { "type": "object" },
+                "verification": { "type": "array", "items": { "type": "object" } },
+                "verification_summary": { "type": "object" }
+            }),
+            &[
+                "task_id",
+                "ready",
+                "completion_gate",
+                "task",
+                "verification",
+                "verification_summary",
+            ],
+        ),
+        "start_slice" | "update_slice" => success_output_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1 },
+                "slice": { "type": ["object", "null"] },
+                "task": { "type": "object" },
+                "progress_event": { "type": "object" }
+            }),
+            &["task_id", "slice", "task", "progress_event"],
+        ),
+        "complete_slice" => json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "completed": { "type": "boolean" },
+                "task_id": { "type": "string", "minLength": 1 },
+                "slice_id": { "type": "string", "minLength": 1 },
+                "slice": { "type": ["object", "null"] },
+                "acceptance": { "type": "array", "items": { "type": "object" } },
+                "missing": { "type": "array", "items": { "type": "object" } },
+                "next_actions": { "type": "array", "items": { "type": "string" } },
+                "task": { "type": "object" },
+                "progress_event": { "type": "object" },
+                "error": error_output_schema()
+            },
+            "required": ["ok", "completed", "task_id", "slice_id", "task"],
+            "allOf": [
+                {
+                    "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+                    "then": { "properties": { "completed": { "const": true } }, "required": ["slice", "acceptance", "progress_event"] }
+                },
+                {
+                    "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+                    "then": { "properties": { "completed": { "const": false } }, "required": ["missing", "acceptance", "next_actions", "error"] }
+                }
+            ],
+            "additionalProperties": true
+        }),
         "stage_commit" | "stage_commit_status" | "wait_stage_commit" => success_output_schema(
             json!({
                 "workflow_id": { "type": "string", "minLength": 1 },
@@ -2141,6 +2371,7 @@ pub fn output_schema(name: &str) -> Value {
                 "next_stage_started": { "type": "boolean", "const": false },
                 "reason": { "type": "string" },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
+                "completion_gate": { "type": "object" },
                 "error": error_output_schema(),
                 "blocking_verifications": { "type": "array", "items": { "type": "object" } },
                 "working_tree_files": { "type": "array", "items": { "type": "string" } },
@@ -2535,8 +2766,10 @@ pub fn input_schema(name: &str) -> Value {
         }),
         "begin_work_session" => json!({
             "type": "object",
-            "properties": {
+            "properties": merge_schema_properties(vec![json!({
                 "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
+                "completed_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
+                "pending_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
@@ -2547,7 +2780,7 @@ pub fn input_schema(name: &str) -> Value {
                 "worktree_remove_on_close": { "type": "boolean", "default": false },
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "workspace_root": { "type": "string", "minLength": 1 }
-            },
+            }), task_configuration_input_properties()]),
             "required": ["objective"],
             "additionalProperties": false
         }),
@@ -2558,6 +2791,16 @@ pub fn input_schema(name: &str) -> Value {
                 "summary": { "type": "string", "maxLength": 8000 },
                 "allow_unverified": { "type": "boolean", "default": false },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"], "default": "paused" },
+                "checkpoint": { "type": "object", "additionalProperties": true }
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        "complete_work_session" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "summary": { "type": "string", "maxLength": 8000 },
                 "checkpoint": { "type": "object", "additionalProperties": true }
             },
             "required": ["task_id"],
@@ -2586,14 +2829,16 @@ pub fn input_schema(name: &str) -> Value {
         }),
         "start_task" => json!({
             "type": "object",
-            "properties": {
+            "properties": merge_schema_properties(vec![json!({
                 "objective": { "type": "string", "minLength": 1 },
+                "completed_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
+                "pending_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "pause_current": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Shared-checkout tasks transfer the shared writer lease; worktree tasks use independent write domains." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared" },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
                 "worktree_remove_on_close": { "type": "boolean", "default": false }
-            },
+            }), task_configuration_input_properties()]),
             "required": ["objective"],
             "additionalProperties": false
         }),
@@ -2610,12 +2855,56 @@ pub fn input_schema(name: &str) -> Value {
         }),
         "update_task" => json!({
             "type": "object",
-            "properties": {
+            "properties": merge_schema_properties(vec![json!({
                 "task_id": { "type": "string", "minLength": 1 },
                 "completed_steps": { "type": "array", "items": { "type": "string" } },
                 "pending_steps": { "type": "array", "items": { "type": "string" } }
-            },
+            }), task_configuration_input_properties()]),
             "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        "task_gate_status" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+        }),
+        "start_slice" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "slice_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "files": { "type": "array", "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 2000 } },
+                "acceptance_checks": { "type": "array", "maxItems": 64, "items": verification_requirement_input_schema() }
+            },
+            "required": ["task_id", "slice_id", "title"],
+            "additionalProperties": false
+        }),
+        "update_slice" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "slice_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "status": { "type": "string", "enum": ["planned", "in_progress", "verifying", "blocked", "paused"] },
+                "title": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "files": { "type": "array", "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 2000 } },
+                "acceptance_checks": { "type": "array", "maxItems": 64, "items": verification_requirement_input_schema() },
+                "commit_sha": { "type": ["string", "null"], "maxLength": 128 },
+                "blocker": { "type": ["string", "null"], "maxLength": 2000 }
+            },
+            "required": ["task_id", "slice_id"],
+            "additionalProperties": false
+        }),
+        "complete_slice" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "slice_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "commit_sha": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required": ["task_id", "slice_id"],
             "additionalProperties": false
         }),
         "pause_task" | "resume_task" | "switch_task" => json!({
@@ -2732,6 +3021,7 @@ pub fn input_schema(name: &str) -> Value {
                 "mode": { "type": "string", "enum": ["exact", "fuzzy"], "default": "exact" },
                 "validation_mode": { "type": "string", "enum": ["none", "syntax"], "default": "syntax" },
                 "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 20000 },
+                "recovery_key": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Stable identity for retrying the same logical Patch after correcting its content." },
                 "reason": { "type": "string", "default": "" }
             },
             "required": ["patch"],
@@ -2829,6 +3119,12 @@ pub fn input_schema(name: &str) -> Value {
                     "type": "boolean",
                     "default": true,
                     "description": "When a verification passes, supersede active failures matching verification_key, test_file/test_name, or the same verification kind for legacy callers."
+                },
+                "recovery_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Stable identity for retrying the same logical command after correcting arguments or environment."
                 },
                 "filesystem_scope": { "type": "string", "enum": ["workspace"], "default": "workspace" },
                 "include_diagnostics": { "type": "boolean", "default": false, "description": "Include cost policy, execution boundary, and sandbox diagnostics in the response." },

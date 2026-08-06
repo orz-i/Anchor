@@ -12,6 +12,249 @@ pub struct CapabilityStatus {
     pub recoverable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    #[default]
+    Unspecified,
+    Planning,
+    Implementing,
+    Verifying,
+    Deploying,
+    BrowserReview,
+    Cleanup,
+    ReadyToClose,
+    Completed,
+    Blocked,
+    Paused,
+}
+
+impl TaskPhase {
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Unspecified => next != Self::Completed,
+            Self::Planning => matches!(
+                next,
+                Self::Implementing | Self::Verifying | Self::Blocked | Self::Paused
+            ),
+            Self::Implementing => matches!(
+                next,
+                Self::Verifying | Self::Deploying | Self::Blocked | Self::Paused
+            ),
+            Self::Verifying => matches!(
+                next,
+                Self::Implementing
+                    | Self::Deploying
+                    | Self::BrowserReview
+                    | Self::Cleanup
+                    | Self::ReadyToClose
+                    | Self::Blocked
+                    | Self::Paused
+            ),
+            Self::Deploying => matches!(
+                next,
+                Self::Verifying
+                    | Self::BrowserReview
+                    | Self::Cleanup
+                    | Self::Blocked
+                    | Self::Paused
+            ),
+            Self::BrowserReview => matches!(
+                next,
+                Self::Implementing
+                    | Self::Verifying
+                    | Self::Cleanup
+                    | Self::ReadyToClose
+                    | Self::Blocked
+                    | Self::Paused
+            ),
+            Self::Cleanup => matches!(
+                next,
+                Self::Implementing
+                    | Self::Verifying
+                    | Self::ReadyToClose
+                    | Self::Blocked
+                    | Self::Paused
+            ),
+            Self::ReadyToClose => matches!(
+                next,
+                Self::Implementing
+                    | Self::Verifying
+                    | Self::Blocked
+                    | Self::Paused
+                    | Self::Completed
+            ),
+            Self::Blocked => matches!(
+                next,
+                Self::Planning
+                    | Self::Implementing
+                    | Self::Verifying
+                    | Self::Deploying
+                    | Self::BrowserReview
+                    | Self::Cleanup
+                    | Self::Paused
+            ),
+            Self::Paused => !matches!(next, Self::Completed | Self::Unspecified),
+            Self::Completed => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskCompletionPolicy {
+    #[serde(default)]
+    pub require_pending_steps_empty: bool,
+    #[serde(default = "default_true")]
+    pub require_all_slices_completed: bool,
+    #[serde(default)]
+    pub require_slice_commits: bool,
+    #[serde(default = "default_true")]
+    pub require_no_open_recovery: bool,
+    #[serde(default)]
+    pub require_ready_to_close: bool,
+    #[serde(default)]
+    pub require_complete_work_session: bool,
+    #[serde(default)]
+    pub disallow_unverified_completion: bool,
+}
+
+impl Default for TaskCompletionPolicy {
+    fn default() -> Self {
+        Self {
+            require_pending_steps_empty: false,
+            require_all_slices_completed: true,
+            require_slice_commits: false,
+            require_no_open_recovery: true,
+            require_ready_to_close: false,
+            require_complete_work_session: false,
+            disallow_unverified_completion: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VerificationRequirement {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub verification_key: Option<String>,
+    #[serde(default)]
+    pub test_file: Option<String>,
+    #[serde(default)]
+    pub test_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskContract {
+    #[serde(default)]
+    pub no_early_stop: bool,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub required_verifications: Vec<VerificationRequirement>,
+    #[serde(default)]
+    pub completion_policy: TaskCompletionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSliceStatus {
+    #[default]
+    Planned,
+    InProgress,
+    Verifying,
+    Blocked,
+    Paused,
+    Completed,
+}
+
+impl TaskSliceStatus {
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Planned => matches!(next, Self::InProgress | Self::Blocked | Self::Paused),
+            Self::InProgress => matches!(next, Self::Verifying | Self::Blocked | Self::Paused),
+            Self::Verifying => matches!(next, Self::InProgress | Self::Blocked | Self::Paused),
+            Self::Blocked => matches!(next, Self::InProgress | Self::Paused),
+            Self::Paused => matches!(next, Self::InProgress | Self::Blocked),
+            Self::Completed => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSlice {
+    pub id: String,
+    pub title: String,
+    pub status: TaskSliceStatus,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub acceptance_checks: Vec<VerificationRequirement>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub blocker: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskWorkingSet {
+    #[serde(default)]
+    pub primary: Vec<String>,
+    #[serde(default)]
+    pub tests: Vec<String>,
+    #[serde(default)]
+    pub locales: Vec<String>,
+    #[serde(default)]
+    pub reference_only: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRecoveryStatus {
+    #[default]
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRecoveryState {
+    pub id: String,
+    pub failed_step: String,
+    #[serde(default)]
+    pub step_fingerprint: Option<String>,
+    pub failure_type: String,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub related_verification_id: Option<String>,
+    pub workspace_mutated: bool,
+    pub rollback_status: String,
+    #[serde(default)]
+    pub recommended_recovery: Vec<String>,
+    pub resume_target: String,
+    pub status: TaskRecoveryStatus,
+    #[serde(default)]
+    pub resolved_by_step: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceIdentity {
     pub schema_version: u32,
@@ -237,6 +480,18 @@ pub struct TaskSession {
     pub workspace_id: String,
     pub objective: String,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub phase: TaskPhase,
+    #[serde(default)]
+    pub contract: TaskContract,
+    #[serde(default)]
+    pub slices: Vec<TaskSlice>,
+    #[serde(default)]
+    pub current_slice_id: Option<String>,
+    #[serde(default)]
+    pub working_set: TaskWorkingSet,
+    #[serde(default)]
+    pub recovery: Option<TaskRecoveryState>,
     pub baseline: ProjectBaseline,
     pub expected_state: ExpectedWorkspaceState,
     #[serde(default)]

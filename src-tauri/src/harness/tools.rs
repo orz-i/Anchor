@@ -12,8 +12,10 @@ use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 use crate::tools::{CancellationToken, ToolContext};
 
 use super::model::{
-    HarnessEvent, HarnessSessionStatus, OperationRecord, TaskSession, TaskStatus,
-    VerificationRecord, WorkSessionCloseOutbox, WorkSessionClosePhase, SCHEMA_VERSION,
+    HarnessEvent, HarnessSessionStatus, OperationRecord, TaskContract, TaskPhase,
+    TaskRecoveryStatus, TaskSession, TaskSlice, TaskSliceStatus, TaskStatus, TaskWorkingSet,
+    VerificationRecord, VerificationRequirement, WorkSessionCloseOutbox, WorkSessionClosePhase,
+    SCHEMA_VERSION,
 };
 use super::store::HarnessError;
 
@@ -26,6 +28,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "operation_log",
     "begin_work_session",
     "close_work_session",
+    "complete_work_session",
     "update_verification_disposition",
     "project_state",
     "start_task",
@@ -36,6 +39,10 @@ pub const TOOL_NAMES: &[&str] = &[
     "stage_commit_status",
     "wait_stage_commit",
     "update_task",
+    "task_gate_status",
+    "start_slice",
+    "update_slice",
+    "complete_slice",
     "pause_task",
     "resume_task",
     "switch_task",
@@ -53,7 +60,9 @@ pub fn call(
     cancellation: &CancellationToken,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
-    let recovered_outboxes = if name == "close_work_session" || !ctx.is_primary_workspace() {
+    let recovered_outboxes = if matches!(name, "close_work_session" | "complete_work_session")
+        || !ctx.is_primary_workspace()
+    {
         Vec::new()
     } else {
         recover_close_outboxes(ctx)?
@@ -63,6 +72,7 @@ pub fn call(
         "operation_log" => operation_log(ctx, args),
         "begin_work_session" => begin_work_session(ctx, args, session_id),
         "close_work_session" => close_work_session(ctx, args),
+        "complete_work_session" => complete_work_session(ctx, args),
         "update_verification_disposition" => update_verification_disposition(ctx, args),
         "project_state" => project_state(ctx, args, session_id),
         "start_task" => start_task(ctx, args, session_id),
@@ -73,6 +83,10 @@ pub fn call(
         "stage_commit_status" => super::stage_commit::status(ctx, args),
         "wait_stage_commit" => super::stage_commit::wait(ctx, args, cancellation),
         "update_task" => update_task(ctx, args),
+        "task_gate_status" => task_gate_status(ctx, args, session_id),
+        "start_slice" => start_slice(ctx, args),
+        "update_slice" => update_slice(ctx, args),
+        "complete_slice" => complete_slice(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
         "resume_task" => resume_task(ctx, args, session_id),
         "switch_task" => switch_task(ctx, args, session_id),
@@ -448,6 +462,19 @@ fn operation_failure_diagnostics(operations: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn verification_at_or_after(record: &VerificationRecord, not_before: Option<&str>) -> bool {
+    let Some(not_before) = not_before else {
+        return true;
+    };
+    match (
+        record.created_at.parse::<u128>(),
+        not_before.parse::<u128>(),
+    ) {
+        (Ok(record_time), Ok(minimum_time)) => record_time >= minimum_time,
+        _ => false,
+    }
+}
+
 struct FailureDiagnosticGroup {
     codes: BTreeSet<String>,
     tools: BTreeSet<String>,
@@ -701,11 +728,34 @@ fn update_verification_disposition(
         .harness
         .update_verification_disposition(task_id, verification_id, disposition, reason, source)
         .map_err(map_error)?;
+    let task_recovery = if disposition != "active_failure" {
+        let task = ctx.harness.task(task_id).map_err(map_error)?;
+        let matching_step = task.recovery.as_ref().and_then(|recovery| {
+            (recovery.status == TaskRecoveryStatus::Open
+                && recovery.related_verification_id.as_deref() == Some(verification_id))
+            .then(|| {
+                (
+                    recovery.failed_step.clone(),
+                    recovery.step_fingerprint.clone(),
+                )
+            })
+        });
+        if let Some((step, fingerprint)) = matching_step {
+            ctx.harness
+                .resolve_recovery_for_step(task_id, &step, fingerprint.as_deref())
+                .map_err(map_error)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let records = ctx.harness.list_verifications(task_id).map_err(map_error)?;
     Ok(json!({
         "verification": verification_view(&verification),
         "verification_status": verification_status(&records),
         "effective_disposition": effective_disposition(&verification),
+        "task_recovery": task_recovery,
         "task_id": task_id
     }))
 }
@@ -721,6 +771,9 @@ fn begin_work_session(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
+    let configuration = parse_task_configuration(args)?;
+    let completed_steps = string_list(args.get("completed_steps"))?;
+    let pending_steps = string_list(args.get("pending_steps"))?;
     let history = crate::tools::history::bootstrap(ctx, args)?;
     let session_key = history
         .get("session_key")
@@ -778,10 +831,28 @@ fn begin_work_session(
             None,
         ),
     };
-    let task = ctx
+    let mut task = ctx
         .harness
         .bind_history_session(&task.id, session_key, current_path)
         .map_err(map_error)?;
+    if task_created && !configuration.is_empty() {
+        task = ctx
+            .harness
+            .configure_task(
+                &task.id,
+                configuration.phase,
+                configuration.contract,
+                configuration.slices,
+                configuration.working_set,
+            )
+            .map_err(map_error)?;
+    }
+    if task_created && (completed_steps.is_some() || pending_steps.is_some()) {
+        task = ctx
+            .harness
+            .update_steps(&task.id, completed_steps, pending_steps)
+            .map_err(map_error)?;
+    }
     ctx.bind_task_for_session(mcp_session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     let scoped = ctx
@@ -826,6 +897,41 @@ fn compact_history_view(history: &Value) -> Value {
         "persistence": history.get("persistence").cloned().unwrap_or(Value::Null),
         "warnings": history.get("warnings").cloned().unwrap_or_else(|| json!([]))
     })
+}
+
+fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    if let Some(mut outbox) = ctx.harness.load_close_outbox(task_id).map_err(map_error)? {
+        if outbox.phase == WorkSessionClosePhase::Prepared {
+            let mut strict = args.clone();
+            strict["task_id"] = Value::String(task_id.to_string());
+            strict["allow_unverified"] = Value::Bool(false);
+            strict["session_status"] = Value::String("completed".into());
+            strict["_completion_via_work_session"] = Value::Bool(true);
+            outbox.finish_args = strict;
+            outbox.session_status = HarnessSessionStatus::Completed;
+            if let Some(checkpoint) = args.get("checkpoint").and_then(Value::as_object) {
+                if let Some(target) = outbox.checkpoint_args.as_object_mut() {
+                    for (key, value) in checkpoint {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            if let Some(summary) = args.get("summary").and_then(Value::as_str) {
+                outbox.checkpoint_args["notes"] = Value::String(summary.to_string());
+            }
+            outbox.checkpoint_args["session_status"] = Value::String("completed".into());
+            outbox.last_error = None;
+            outbox.updated_at = harness_timestamp();
+            ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+        }
+        return resume_close_outbox(ctx, outbox, true);
+    }
+    let mut strict = args.clone();
+    strict["allow_unverified"] = Value::Bool(false);
+    strict["session_status"] = Value::String("completed".into());
+    strict["_completion_via_work_session"] = Value::Bool(true);
+    close_work_session(ctx, &strict)
 }
 
 fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -1500,7 +1606,28 @@ fn start_task(
         .get("objective")
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
-    let task = start_task_for_workspace_mode(ctx, objective, args)?;
+    let configuration = parse_task_configuration(args)?;
+    let completed_steps = string_list(args.get("completed_steps"))?;
+    let pending_steps = string_list(args.get("pending_steps"))?;
+    let mut task = start_task_for_workspace_mode(ctx, objective, args)?;
+    if !configuration.is_empty() {
+        task = ctx
+            .harness
+            .configure_task(
+                &task.id,
+                configuration.phase,
+                configuration.contract,
+                configuration.slices,
+                configuration.working_set,
+            )
+            .map_err(map_error)?;
+    }
+    if completed_steps.is_some() || pending_steps.is_some() {
+        task = ctx
+            .harness
+            .update_steps(&task.id, completed_steps, pending_steps)
+            .map_err(map_error)?;
+    }
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     Ok(json!({
@@ -1603,11 +1730,464 @@ fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     let task_id = task_id(args)?;
     let completed_steps = string_list(args.get("completed_steps"))?;
     let pending_steps = string_list(args.get("pending_steps"))?;
+    let configuration = parse_task_configuration(args)?;
+    let mut task = if completed_steps.is_some() || pending_steps.is_some() {
+        ctx.harness
+            .update_steps(task_id, completed_steps, pending_steps)
+            .map_err(map_error)?
+    } else {
+        ctx.harness.task(task_id).map_err(map_error)?
+    };
+    if !configuration.is_empty() {
+        task = ctx
+            .harness
+            .configure_task(
+                task_id,
+                configuration.phase,
+                configuration.contract,
+                configuration.slices,
+                configuration.working_set,
+            )
+            .map_err(map_error)?;
+    }
+    Ok(json!({"task": task_view(&task)}))
+}
+
+fn task_gate_status(
+    ctx: &ToolContext,
+    args: &Value,
+    session_id: Option<&str>,
+) -> Result<Value, WorkspaceError> {
+    let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
+        ctx.harness.task(task_id).map_err(map_error)?
+    } else {
+        ctx.task_for_session(session_id)
+            .ok_or_else(|| tool_error("TASK_STATE_REQUIRED", "当前会话未绑定任务"))?
+    };
+    let verifications = ctx
+        .harness
+        .list_verifications(&task.id)
+        .map_err(map_error)?;
+    let completion_gate = completion_gate_value(ctx, &task, &verifications, false, false);
+    Ok(json!({
+        "task_id": task.id,
+        "ready": completion_gate["ready"],
+        "completion_gate": completion_gate,
+        "task": task_view(&task),
+        "verification": verification_views(&verifications, "effective"),
+        "verification_summary": verification_presentation_summary(&verifications)
+    }))
+}
+
+fn start_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let now = harness_timestamp();
+    let slice = parse_task_slice(
+        &json!({
+            "id": args.get("slice_id").cloned().unwrap_or(Value::Null),
+            "title": args.get("title").cloned().unwrap_or(Value::Null),
+            "status": "in_progress",
+            "files": args.get("files").cloned().unwrap_or_else(|| json!([])),
+            "acceptance_checks": args
+                .get("acceptance_checks")
+                .cloned()
+                .unwrap_or_else(|| json!([]))
+        }),
+        TaskSliceStatus::InProgress,
+        &now,
+    )?;
+    let slice_id = slice.id.clone();
+    let task = ctx.harness.start_slice(task_id, slice).map_err(map_error)?;
+    let slice = task
+        .slices
+        .iter()
+        .find(|slice| slice.id == slice_id)
+        .cloned();
+    Ok(json!({
+        "task_id": task_id,
+        "slice": slice,
+        "task": task_view(&task),
+        "progress_event": {
+            "slice": slice_id,
+            "from": "planned",
+            "to": "in_progress"
+        }
+    }))
+}
+
+fn update_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let slice_id = required_bounded_string(args.get("slice_id"), "slice_id", 128)?;
+    let status = args
+        .get("status")
+        .map(parse_slice_status_value)
+        .transpose()?;
+    let title = args
+        .get("title")
+        .map(|value| required_bounded_string(Some(value), "title", 500))
+        .transpose()?;
+    let files = parse_string_array(args.get("files"), 256, 2_000, "files")?;
+    let acceptance_checks = parse_requirements_value(args.get("acceptance_checks"))?;
+    let commit_sha = args
+        .get("commit_sha")
+        .map(|value| optional_bounded_string(Some(value), "commit_sha", 128))
+        .transpose()?;
+    let blocker = args
+        .get("blocker")
+        .map(|value| optional_bounded_string(Some(value), "blocker", 2_000))
+        .transpose()?;
     let task = ctx
         .harness
-        .update_steps(task_id, completed_steps, pending_steps)
+        .update_slice(
+            task_id,
+            &slice_id,
+            status,
+            title,
+            files,
+            acceptance_checks,
+            commit_sha,
+            blocker,
+        )
         .map_err(map_error)?;
-    Ok(json!({"task": task_view(&task)}))
+    let slice = task
+        .slices
+        .iter()
+        .find(|slice| slice.id == slice_id)
+        .cloned();
+    Ok(json!({
+        "task_id": task_id,
+        "slice": slice,
+        "task": task_view(&task),
+        "progress_event": {
+            "slice": slice_id,
+            "to": status
+        }
+    }))
+}
+
+fn complete_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let slice_id = required_bounded_string(args.get("slice_id"), "slice_id", 128)?;
+    let commit_sha = optional_bounded_string(args.get("commit_sha"), "commit_sha", 128)?;
+    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let slice = task_before
+        .slices
+        .iter()
+        .find(|slice| slice.id == slice_id)
+        .ok_or_else(|| tool_error("SLICE_NOT_FOUND", format!("Slice not found: {slice_id}")))?;
+    let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    let effective_commit = commit_sha.clone().or_else(|| slice.commit_sha.clone());
+    let mut missing = Vec::new();
+    if slice.status != TaskSliceStatus::Verifying {
+        missing.push(json!({
+            "code": "slice_not_verifying",
+            "slice_id": slice_id,
+            "status": slice.status
+        }));
+    }
+    if let Some(blocker) = slice
+        .blocker
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        missing.push(json!({
+            "code": "slice_blocked",
+            "slice_id": slice_id,
+            "blocker": blocker
+        }));
+    }
+    let acceptance = requirement_outcomes(
+        &slice.acceptance_checks,
+        &verifications,
+        Some(&slice.created_at),
+    );
+    for outcome in &acceptance {
+        if outcome.get("satisfied") != Some(&Value::Bool(true)) {
+            missing.push(json!({
+                "code": "slice_acceptance_missing",
+                "slice_id": slice_id,
+                "requirement": outcome
+            }));
+        }
+    }
+    if task_before.contract.completion_policy.require_slice_commits && effective_commit.is_none() {
+        missing.push(json!({
+            "code": "slice_commit_missing",
+            "slice_id": slice_id
+        }));
+    }
+    if !missing.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "completed": false,
+            "task_id": task_id,
+            "slice_id": slice_id,
+            "missing": missing,
+            "acceptance": acceptance,
+            "next_actions": ["exec_command", "update_slice", "complete_slice"],
+            "error": {
+                "code": "SLICE_COMPLETION_GATE_FAILED",
+                "message": "Slice acceptance gate is not satisfied.",
+                "category": "validation",
+                "retryable": true,
+                "details": {"slice_id": slice_id}
+            },
+            "task": task_view(&task_before)
+        }));
+    }
+    let task = ctx
+        .harness
+        .complete_slice(task_id, &slice_id, effective_commit)
+        .map_err(map_error)?;
+    let completed_slice = task
+        .slices
+        .iter()
+        .find(|slice| slice.id == slice_id)
+        .cloned();
+    Ok(json!({
+        "completed": true,
+        "task_id": task_id,
+        "slice_id": slice_id,
+        "slice": completed_slice,
+        "acceptance": acceptance,
+        "task": task_view(&task),
+        "progress_event": {
+            "slice": slice_id,
+            "from": "verifying",
+            "to": "completed",
+            "evidence": {"commit": completed_slice.as_ref().and_then(|slice| slice.commit_sha.clone())}
+        }
+    }))
+}
+
+fn completion_gate_value(
+    ctx: &ToolContext,
+    task: &TaskSession,
+    verifications: &[VerificationRecord],
+    allow_unverified: bool,
+    completion_via_work_session: bool,
+) -> Value {
+    let (running_sessions, unobserved_terminal_sessions) =
+        ctx.sessions.pending_for_task(&task.id, 2_048);
+    let mut working_tree_files = git_working_tree_files(ctx.workspace.root());
+    working_tree_files.retain(|path| !is_runtime_artifact(path));
+    let (task_working_tree_files, peer_working_tree_files, unattributed_working_tree_files) =
+        classify_working_tree_ownership(ctx, &task.id, &working_tree_files);
+    let mut blocking_working_tree_files = task_working_tree_files.clone();
+    blocking_working_tree_files.extend(unattributed_working_tree_files.clone());
+    blocking_working_tree_files.sort();
+    blocking_working_tree_files.dedup();
+
+    let mut missing = Vec::<Value>::new();
+    let mut next_actions = BTreeSet::<String>::new();
+    if !running_sessions.is_empty() || !unobserved_terminal_sessions.is_empty() {
+        missing.push(json!({
+            "code": "command_results_pending",
+            "running_sessions": running_sessions,
+            "unobserved_terminal_sessions": unobserved_terminal_sessions
+        }));
+        next_actions.extend(
+            ["list_command_sessions", "wait_command", "kill_session"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    if !blocking_working_tree_files.is_empty() {
+        missing.push(json!({
+            "code": "worktree_not_clean",
+            "files": blocking_working_tree_files
+        }));
+        next_actions.extend(
+            ["git_status", "stage_commit"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+
+    let verification_status = verification_status(verifications);
+    let policy = &task.contract.completion_policy;
+    let generic_verification_required = !allow_unverified || policy.disallow_unverified_completion;
+    if generic_verification_required && !verification_status_is_accepted(verification_status) {
+        missing.push(json!({
+            "code": if verification_status == "missing" { "verification_missing" } else { "verification_failed" },
+            "verification_status": verification_status,
+            "blocking_verifications": blocking_verification_views(verifications)
+        }));
+        next_actions.insert("exec_command".into());
+    }
+
+    if policy.require_pending_steps_empty && !task.pending_steps.is_empty() {
+        missing.push(json!({
+            "code": "pending_steps_remaining",
+            "pending_steps": bounded_strings(&task.pending_steps, 64, 1_000)
+        }));
+        next_actions.insert("update_task".into());
+    }
+    let incomplete_slices = task
+        .slices
+        .iter()
+        .filter(|slice| slice.status != TaskSliceStatus::Completed)
+        .map(|slice| json!({"id": slice.id, "title": slice.title, "status": slice.status}))
+        .collect::<Vec<_>>();
+    if policy.require_all_slices_completed && !incomplete_slices.is_empty() {
+        missing.push(json!({
+            "code": "slices_incomplete",
+            "slices": incomplete_slices
+        }));
+        next_actions.extend(
+            ["start_slice", "update_slice", "complete_slice"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    let missing_slice_commits = task
+        .slices
+        .iter()
+        .filter(|slice| {
+            slice.status == TaskSliceStatus::Completed && slice.commit_sha.as_deref().is_none()
+        })
+        .map(|slice| slice.id.clone())
+        .collect::<Vec<_>>();
+    if policy.require_slice_commits && !missing_slice_commits.is_empty() {
+        missing.push(json!({
+            "code": "slice_commits_missing",
+            "slice_ids": missing_slice_commits
+        }));
+        next_actions.insert("update_slice".into());
+    }
+    if policy.require_no_open_recovery
+        && task
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.status == TaskRecoveryStatus::Open)
+    {
+        missing.push(json!({
+            "code": "recovery_open",
+            "recovery": task.recovery
+        }));
+        if let Some(step) = task
+            .recovery
+            .as_ref()
+            .map(|recovery| recovery.failed_step.clone())
+        {
+            next_actions.insert(step);
+        }
+    }
+    if policy.require_ready_to_close && task.phase != TaskPhase::ReadyToClose {
+        missing.push(json!({
+            "code": "ready_to_close_phase_missing",
+            "phase": task.phase
+        }));
+        next_actions.insert("update_task".into());
+    }
+    if policy.require_complete_work_session && !completion_via_work_session {
+        missing.push(json!({
+            "code": "complete_work_session_required"
+        }));
+        next_actions.insert("complete_work_session".into());
+    }
+
+    let required_verifications = requirement_outcomes(
+        &task.contract.required_verifications,
+        verifications,
+        Some(&task.created_at),
+    );
+    for outcome in &required_verifications {
+        if outcome.get("satisfied") != Some(&Value::Bool(true)) {
+            missing.push(json!({
+                "code": "required_verification_missing",
+                "requirement": outcome
+            }));
+            next_actions.insert("exec_command".into());
+        }
+    }
+    let mut slice_acceptance = Vec::new();
+    for slice in &task.slices {
+        let outcomes = requirement_outcomes(
+            &slice.acceptance_checks,
+            verifications,
+            Some(&slice.created_at),
+        );
+        for outcome in &outcomes {
+            if outcome.get("satisfied") != Some(&Value::Bool(true)) {
+                missing.push(json!({
+                    "code": "slice_acceptance_missing",
+                    "slice_id": slice.id,
+                    "requirement": outcome
+                }));
+                next_actions.insert("exec_command".into());
+            }
+        }
+        slice_acceptance.push(json!({
+            "slice_id": slice.id,
+            "checks": outcomes
+        }));
+    }
+
+    json!({
+        "ready": missing.is_empty(),
+        "task_id": task.id,
+        "phase": task.phase,
+        "no_early_stop": task.contract.no_early_stop,
+        "completion_policy": task.contract.completion_policy,
+        "missing": missing,
+        "next_actions": next_actions.into_iter().collect::<Vec<_>>(),
+        "verification_status": verification_status,
+        "required_verifications": required_verifications,
+        "slice_acceptance": slice_acceptance,
+        "pending_steps": bounded_strings(&task.pending_steps, 64, 1_000),
+        "running_sessions": running_sessions,
+        "unobserved_terminal_sessions": unobserved_terminal_sessions,
+        "working_tree_files": blocking_working_tree_files,
+        "task_working_tree_files": task_working_tree_files,
+        "unattributed_working_tree_files": unattributed_working_tree_files,
+        "peer_working_tree_files": peer_working_tree_files,
+        "recovery": task.recovery
+    })
+}
+
+fn requirement_outcomes(
+    requirements: &[VerificationRequirement],
+    verifications: &[VerificationRecord],
+    not_before: Option<&str>,
+) -> Vec<Value> {
+    let effective = effective_verifications(verifications);
+    requirements
+        .iter()
+        .map(|requirement| {
+            let matched = effective.iter().copied().find(|record| {
+                verification_at_or_after(record, not_before)
+                    && requirement
+                        .kind
+                        .as_deref()
+                        .is_none_or(|value| record.kind == value)
+                    && requirement
+                        .verification_key
+                        .as_deref()
+                        .is_none_or(|value| record.verification_key.as_deref() == Some(value))
+                    && requirement
+                        .test_file
+                        .as_deref()
+                        .is_none_or(|value| record.test_file.as_deref() == Some(value))
+                    && requirement
+                        .test_name
+                        .as_deref()
+                        .is_none_or(|value| record.test_name.as_deref() == Some(value))
+                    && effective_disposition(record) != "active_failure"
+            });
+            json!({
+                "id": requirement.id,
+                "description": requirement.description,
+                "kind": requirement.kind,
+                "verification_key": requirement.verification_key,
+                "test_file": requirement.test_file,
+                "test_name": requirement.test_name,
+                "satisfied": matched.is_some(),
+                "matched_verification_id": matched.map(|record| record.id.clone()),
+                "matched_disposition": matched.map(effective_disposition)
+            })
+        })
+        .collect()
 }
 
 fn transition(
@@ -1624,87 +2204,78 @@ fn transition(
 
 fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
-    let (running_sessions, unobserved_terminal_sessions) =
-        ctx.sessions.pending_for_task(task_id, 2_048);
-    if !running_sessions.is_empty() || !unobserved_terminal_sessions.is_empty() {
-        let task = ctx.harness.task(task_id).map_err(map_error)?;
-        return Ok(json!({
-            "ok": false,
-            "task_status": task.status,
-            "closed": false,
-            "session_status": "active",
-            "next_stage_started": false,
-            "reason": "当前任务仍有运行中或终态尚未消费的 retained command；必须先读取最终结果或显式终止后才能关闭任务。",
-            "error": {
-                "code": "TASK_COMMAND_RESULTS_PENDING",
-                "message": "Retained command results must be consumed before task completion.",
-                "category": "validation",
-                "retryable": true,
-                "details": {
-                    "running_sessions": running_sessions,
-                    "unobserved_terminal_sessions": unobserved_terminal_sessions,
-                    "suggestion": "调用 list_command_sessions 定位会话；对每个会话使用 wait_command 获取终态，或使用 kill_session 终止后消费结果。"
-                }
-            },
-            "running_sessions": running_sessions,
-            "unobserved_terminal_sessions": unobserved_terminal_sessions,
-            "next_actions": ["list_command_sessions", "wait_command", "kill_session", "finish_task"],
-            "task": task_view(&task)
-        }));
-    }
-    ctx.harness.check_baseline(task_id).map_err(map_error)?;
     let allow_unverified = args
         .get("allow_unverified")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let completion_via_work_session = args
+        .get("_completion_via_work_session")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
     let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
     let verification_status = verification_status(&verifications);
-    let mut working_tree_files = git_working_tree_files(ctx.workspace.root());
-    working_tree_files.retain(|path| !is_runtime_artifact(path));
-    let (task_working_tree_files, peer_working_tree_files, unattributed_working_tree_files) =
-        classify_working_tree_ownership(ctx, task_id, &working_tree_files);
-    let mut blocking_working_tree_files = task_working_tree_files.clone();
-    blocking_working_tree_files.extend(unattributed_working_tree_files.clone());
-    blocking_working_tree_files.sort();
-    blocking_working_tree_files.dedup();
-    if !blocking_working_tree_files.is_empty() {
-        let task = ctx.harness.mark_verifying(task_id).map_err(map_error)?;
-        return Ok(json!({
-            "ok": false,
-            "task_status": "verifying",
-            "verification_status": verification_status,
-            "closed": false,
-            "session_status": "active",
-            "next_stage_started": false,
-            "reason": "当前任务仍拥有未提交或无法归属的业务文件；提交或还原这些改动后才能关闭任务。",
-            "error": {
-                "code": "TASK_WORKTREE_NOT_CLEAN",
-                "message": "Workspace contains uncommitted business files.",
-                "category": "validation",
-                "retryable": true,
-                "details": {
-                    "working_tree_files": blocking_working_tree_files,
-                    "task_working_tree_files": task_working_tree_files,
-                    "unattributed_working_tree_files": unattributed_working_tree_files,
-                    "peer_working_tree_files": peer_working_tree_files
-                }
-            },
-            "working_tree_files": blocking_working_tree_files,
-            "task_working_tree_files": task_working_tree_files,
-            "unattributed_working_tree_files": unattributed_working_tree_files,
-            "peer_working_tree_files": peer_working_tree_files,
-            "next_actions": ["git_status", "stage_commit", "finish_task"],
-            "task": task_view(&task),
-            "verification": verification_views(&verifications, "effective"),
-            "verification_summary": verification_presentation_summary(&verifications)
-        }));
+    let completion_gate = completion_gate_value(
+        ctx,
+        &task_before,
+        &verifications,
+        allow_unverified,
+        completion_via_work_session,
+    );
+    let command_results_pending = completion_gate["missing"]
+        .as_array()
+        .is_some_and(|missing| {
+            missing
+                .iter()
+                .any(|item| item["code"] == "command_results_pending")
+        });
+    if !command_results_pending {
+        ctx.harness.check_baseline(task_id).map_err(map_error)?;
     }
-    if !allow_unverified && !verification_status_is_accepted(verification_status) {
+    if completion_gate["ready"] != Value::Bool(true) {
         let task = ctx.harness.mark_verifying(task_id).map_err(map_error)?;
-        let reason = if verification_status == "missing" {
-            "任务缺少结构化验证证据；请使用 exec_command.verification_kind 或 stage_commit.required_checks 运行验证。"
+        let missing_codes = completion_gate["missing"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("code").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let (code, reason, message) = if missing_codes.contains(&"command_results_pending") {
+            (
+                "TASK_COMMAND_RESULTS_PENDING",
+                "当前任务仍有运行中或终态尚未消费的 retained command；必须先读取最终结果或显式终止后才能关闭任务。",
+                "Retained command results must be consumed before task completion.",
+            )
+        } else if missing_codes.contains(&"worktree_not_clean") {
+            (
+                "TASK_WORKTREE_NOT_CLEAN",
+                "当前任务仍拥有未提交或无法归属的业务文件；提交或还原这些改动后才能关闭任务。",
+                "Workspace contains uncommitted business files.",
+            )
+        } else if missing_codes.contains(&"verification_missing") {
+            (
+                "TASK_VERIFICATION_MISSING",
+                "任务缺少结构化验证证据；请使用 exec_command.verification_kind 或 stage_commit.required_checks 运行验证。",
+                "Structured verification evidence is missing.",
+            )
+        } else if missing_codes.contains(&"verification_failed") {
+            (
+                "TASK_VERIFICATION_FAILED",
+                "至少一项结构化验证失败；修复后重新运行验证并再次调用 finish_task。",
+                "At least one structured verification is still failing.",
+            )
+        } else if missing_codes.contains(&"complete_work_session_required") {
+            (
+                "TASK_COMPLETE_WORK_SESSION_REQUIRED",
+                "任务契约要求通过 complete_work_session 完成最终检查点和会话关闭。",
+                "The task contract requires complete_work_session.",
+            )
         } else {
-            "至少一项结构化验证失败；修复后重新运行验证并再次调用 finish_task。"
+            (
+                "TASK_COMPLETION_GATE_FAILED",
+                "任务完成门禁未通过；必须处理所有缺失验收项后才能声明完成。",
+                "The task completion gate is not satisfied.",
+            )
         };
         return Ok(json!({
             "ok": false,
@@ -1715,17 +2286,24 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "next_stage_started": false,
             "reason": reason,
             "error": {
-                "code": if verification_status == "missing" { "TASK_VERIFICATION_MISSING" } else { "TASK_VERIFICATION_FAILED" },
-                "message": reason,
+                "code": code,
+                "message": message,
                 "category": "validation",
                 "retryable": true,
                 "details": {
                     "blocking_verifications": blocking_verification_views(&verifications),
-                    "suggestion": "Run a later successful verification with verification_key/test_file/test_name, or update the blocking record disposition with an audited reason."
+                    "completion_gate": completion_gate
                 }
             },
             "blocking_verifications": blocking_verification_views(&verifications),
-            "next_actions": ["exec_command", "change_summary", "finish_task"],
+            "working_tree_files": completion_gate["working_tree_files"],
+            "task_working_tree_files": completion_gate["task_working_tree_files"],
+            "unattributed_working_tree_files": completion_gate["unattributed_working_tree_files"],
+            "peer_working_tree_files": completion_gate["peer_working_tree_files"],
+            "running_sessions": completion_gate["running_sessions"],
+            "unobserved_terminal_sessions": completion_gate["unobserved_terminal_sessions"],
+            "next_actions": completion_gate["next_actions"],
+            "completion_gate": completion_gate,
             "task": task_view(&task),
             "verification": verification_views(&verifications, "effective"),
             "verification_summary": verification_presentation_summary(&verifications)
@@ -1755,6 +2333,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         "session_status": workspace_session_status,
         "requested_session_status": session_status,
         "next_stage_started": false,
+        "completion_gate": completion_gate,
         "task": task_view(&task),
         "worktree_cleanup": worktree_cleanup,
         "change_summary": change_summary,
@@ -1791,6 +2370,11 @@ fn task_context(
         .harness
         .list_events(&task.id, 0, 200)
         .map_err(map_error)?;
+    let verifications = ctx
+        .harness
+        .list_verifications(&task.id)
+        .map_err(map_error)?;
+    let completion_gate = completion_gate_value(ctx, &task, &verifications, false, false);
     let mut bounded_events = Vec::new();
     for event in events.iter() {
         let candidate = compact_event(event);
@@ -1808,6 +2392,9 @@ fn task_context(
     let truncated = bounded_events.len() < events.len();
     Ok(json!({
         "task": task_view(&task),
+        "completion_gate": completion_gate,
+        "verification": verification_views(&verifications, "effective"),
+        "verification_summary": verification_presentation_summary(&verifications),
         "events": bounded_events,
         "truncated": truncated,
         "next_cursor": if truncated { Some(bounded_events.len()) } else { None },
@@ -2099,6 +2686,12 @@ fn task_view(task: &TaskSession) -> Value {
         "workspace_id": task.workspace_id,
         "objective": bounded_text(&task.objective, 4_000),
         "status": task.status,
+        "phase": task.phase,
+        "contract": task.contract,
+        "slices": task.slices,
+        "current_slice_id": task.current_slice_id,
+        "working_set": task.working_set,
+        "recovery": task.recovery,
         "baseline": baseline_view(task),
         "expected_state": task.expected_state,
         "completed_steps": bounded_strings(&task.completed_steps, 64, 1_000),
@@ -2528,6 +3121,327 @@ fn string_list(value: Option<&Value>) -> Result<Option<Vec<String>>, WorkspaceEr
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(list))
+}
+
+#[derive(Default)]
+struct TaskConfiguration {
+    phase: Option<TaskPhase>,
+    contract: Option<TaskContract>,
+    slices: Option<Vec<TaskSlice>>,
+    working_set: Option<TaskWorkingSet>,
+}
+
+impl TaskConfiguration {
+    fn is_empty(&self) -> bool {
+        self.phase.is_none()
+            && self.contract.is_none()
+            && self.slices.is_none()
+            && self.working_set.is_none()
+    }
+}
+
+fn parse_task_configuration(args: &Value) -> Result<TaskConfiguration, WorkspaceError> {
+    Ok(TaskConfiguration {
+        phase: parse_task_phase(args.get("phase"))?,
+        contract: parse_task_contract(args.get("contract"))?,
+        slices: parse_task_slices(args.get("slices"))?,
+        working_set: parse_working_set(args.get("working_set"))?,
+    })
+}
+
+fn parse_task_phase(value: Option<&Value>) -> Result<Option<TaskPhase>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "phase 必须是字符串"))?;
+    let phase = match raw {
+        "unspecified" => TaskPhase::Unspecified,
+        "planning" => TaskPhase::Planning,
+        "implementing" => TaskPhase::Implementing,
+        "verifying" => TaskPhase::Verifying,
+        "deploying" => TaskPhase::Deploying,
+        "browser_review" => TaskPhase::BrowserReview,
+        "cleanup" => TaskPhase::Cleanup,
+        "ready_to_close" => TaskPhase::ReadyToClose,
+        "completed" => TaskPhase::Completed,
+        "blocked" => TaskPhase::Blocked,
+        "paused" => TaskPhase::Paused,
+        _ => return Err(tool_error("INVALID_ARGUMENT", "unsupported task phase")),
+    };
+    Ok(Some(phase))
+}
+
+fn parse_task_contract(value: Option<&Value>) -> Result<Option<TaskContract>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    let mut contract: TaskContract = serde_json::from_value(value.clone())
+        .map_err(|error| tool_error("INVALID_ARGUMENT", format!("invalid contract: {error}")))?;
+    if contract.no_early_stop {
+        contract.completion_policy.require_pending_steps_empty = true;
+        contract.completion_policy.require_all_slices_completed = true;
+        contract.completion_policy.require_no_open_recovery = true;
+        contract.completion_policy.require_ready_to_close = true;
+        contract.completion_policy.require_complete_work_session = true;
+        contract.completion_policy.disallow_unverified_completion = true;
+    }
+    validate_string_values(&contract.constraints, 64, 2_000, "contract constraints")?;
+    validate_requirements(
+        &contract.required_verifications,
+        "contract required_verifications",
+    )?;
+    Ok(Some(contract))
+}
+
+fn parse_working_set(value: Option<&Value>) -> Result<Option<TaskWorkingSet>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    let working_set: TaskWorkingSet = serde_json::from_value(value.clone())
+        .map_err(|error| tool_error("INVALID_ARGUMENT", format!("invalid working_set: {error}")))?;
+    validate_string_values(&working_set.primary, 256, 2_000, "working_set.primary")?;
+    validate_string_values(&working_set.tests, 256, 2_000, "working_set.tests")?;
+    validate_string_values(&working_set.locales, 256, 2_000, "working_set.locales")?;
+    validate_string_values(
+        &working_set.reference_only,
+        256,
+        2_000,
+        "working_set.reference_only",
+    )?;
+    Ok(Some(working_set))
+}
+
+fn parse_task_slices(value: Option<&Value>) -> Result<Option<Vec<TaskSlice>>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    let values = value
+        .as_array()
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "slices 必须是数组"))?;
+    if values.len() > 64 {
+        return Err(tool_error("INVALID_ARGUMENT", "slices 最多 64 项"));
+    }
+    let now = harness_timestamp();
+    let mut slices = Vec::with_capacity(values.len());
+    let mut ids = HashSet::new();
+    for value in values {
+        let slice = parse_task_slice(value, TaskSliceStatus::Planned, &now)?;
+        if slice.status == TaskSliceStatus::Completed {
+            return Err(tool_error(
+                "SLICE_COMPLETION_TOOL_REQUIRED",
+                "A configured Slice cannot start as completed",
+            ));
+        }
+        if !ids.insert(slice.id.clone()) {
+            return Err(tool_error("INVALID_ARGUMENT", "slice id 必须唯一"));
+        }
+        slices.push(slice);
+    }
+    Ok(Some(slices))
+}
+
+fn parse_task_slice(
+    value: &Value,
+    default_status: TaskSliceStatus,
+    now: &str,
+) -> Result<TaskSlice, WorkspaceError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "slice 必须是对象"))?;
+    let id = required_bounded_string(object.get("id"), "slice.id", 128)?;
+    let title = required_bounded_string(object.get("title"), "slice.title", 500)?;
+    let status = object
+        .get("status")
+        .map(parse_slice_status_value)
+        .transpose()?
+        .unwrap_or(default_status);
+    let files =
+        parse_string_array(object.get("files"), 256, 2_000, "slice.files")?.unwrap_or_default();
+    let acceptance_checks =
+        parse_requirements_value(object.get("acceptance_checks"))?.unwrap_or_default();
+    let commit_sha = optional_bounded_string(object.get("commit_sha"), "slice.commit_sha", 128)?;
+    let blocker = optional_bounded_string(object.get("blocker"), "slice.blocker", 2_000)?;
+    Ok(TaskSlice {
+        id,
+        title,
+        status,
+        files,
+        acceptance_checks,
+        commit_sha,
+        blocker,
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+    })
+}
+
+fn parse_slice_status_value(value: &Value) -> Result<TaskSliceStatus, WorkspaceError> {
+    match value.as_str() {
+        Some("planned") => Ok(TaskSliceStatus::Planned),
+        Some("in_progress") => Ok(TaskSliceStatus::InProgress),
+        Some("verifying") => Ok(TaskSliceStatus::Verifying),
+        Some("blocked") => Ok(TaskSliceStatus::Blocked),
+        Some("paused") => Ok(TaskSliceStatus::Paused),
+        Some("completed") => Ok(TaskSliceStatus::Completed),
+        _ => Err(tool_error("INVALID_ARGUMENT", "unsupported slice status")),
+    }
+}
+
+fn parse_requirements_value(
+    value: Option<&Value>,
+) -> Result<Option<Vec<VerificationRequirement>>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    let requirements: Vec<VerificationRequirement> = serde_json::from_value(value.clone())
+        .map_err(|error| {
+            tool_error(
+                "INVALID_ARGUMENT",
+                format!("invalid verification requirements: {error}"),
+            )
+        })?;
+    validate_requirements(&requirements, "verification requirements")?;
+    Ok(Some(requirements))
+}
+
+fn validate_requirements(
+    requirements: &[VerificationRequirement],
+    subject: &str,
+) -> Result<(), WorkspaceError> {
+    if requirements.len() > 64 {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            format!("{subject} 最多 64 项"),
+        ));
+    }
+    let mut ids = HashSet::new();
+    for requirement in requirements {
+        if requirement.id.trim().is_empty() || requirement.id.len() > 128 {
+            return Err(tool_error(
+                "INVALID_ARGUMENT",
+                format!("{subject} 的 id 必须为 1-128 字符"),
+            ));
+        }
+        if !ids.insert(requirement.id.clone()) {
+            return Err(tool_error(
+                "INVALID_ARGUMENT",
+                format!("{subject} 的 id 必须唯一"),
+            ));
+        }
+        if requirement.kind.is_none()
+            && requirement.verification_key.is_none()
+            && requirement.test_file.is_none()
+            && requirement.test_name.is_none()
+        {
+            return Err(tool_error(
+                "INVALID_ARGUMENT",
+                format!("{subject} 每项至少提供 kind、verification_key、test_file 或 test_name"),
+            ));
+        }
+        for (name, value, max) in [
+            ("description", requirement.description.as_str(), 2_000usize),
+            ("kind", requirement.kind.as_deref().unwrap_or(""), 128),
+            (
+                "verification_key",
+                requirement.verification_key.as_deref().unwrap_or(""),
+                256,
+            ),
+            (
+                "test_file",
+                requirement.test_file.as_deref().unwrap_or(""),
+                2_000,
+            ),
+            (
+                "test_name",
+                requirement.test_name.as_deref().unwrap_or(""),
+                1_000,
+            ),
+        ] {
+            if value.len() > max {
+                return Err(tool_error(
+                    "INVALID_ARGUMENT",
+                    format!("{subject}.{name} 超过长度上限"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_string_array(
+    value: Option<&Value>,
+    max_items: usize,
+    max_len: usize,
+    subject: &str,
+) -> Result<Option<Vec<String>>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    let values = value
+        .as_array()
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", format!("{subject} 必须是字符串数组")))?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                tool_error("INVALID_ARGUMENT", format!("{subject} 必须是字符串数组"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_string_values(&values, max_items, max_len, subject)?;
+    Ok(Some(values))
+}
+
+fn validate_string_values(
+    values: &[String],
+    max_items: usize,
+    max_len: usize,
+    subject: &str,
+) -> Result<(), WorkspaceError> {
+    if values.len() > max_items {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            format!("{subject} 最多 {max_items} 项"),
+        ));
+    }
+    if values
+        .iter()
+        .any(|value| value.trim().is_empty() || value.len() > max_len)
+    {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            format!("{subject} 包含空值或超长值"),
+        ));
+    }
+    Ok(())
+}
+
+fn required_bounded_string(
+    value: Option<&Value>,
+    subject: &str,
+    max_len: usize,
+) -> Result<String, WorkspaceError> {
+    let value = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", format!("{subject} 是必填项")))?;
+    if value.len() > max_len {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            format!("{subject} 超过长度上限"),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_bounded_string(
+    value: Option<&Value>,
+    subject: &str,
+    max_len: usize,
+) -> Result<Option<String>, WorkspaceError> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value
+        .as_str()
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", format!("{subject} 必须是字符串或 null")))?;
+    if value.len() > max_len {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            format!("{subject} 超过长度上限"),
+        ));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn map_error(error: HarnessError) -> WorkspaceError {

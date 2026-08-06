@@ -433,7 +433,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(48))
             .expect("advanced plus browser catalog");
 
-        assert_eq!(catalog.local_count, 66);
+        assert_eq!(catalog.local_count, crate::tools::registry::P0_TOOLS.len());
         assert_eq!(catalog.proxy_count, 48);
         let first_page_names = catalog.tools[..64]
             .iter()
@@ -507,7 +507,10 @@ mod tests {
             diagnostic["details"]["reason"],
             "chatgpt_catalog_budget_exceeded"
         );
-        assert_eq!(diagnostic["details"]["local_tool_count"], 66);
+        assert_eq!(
+            diagnostic["details"]["local_tool_count"],
+            crate::tools::registry::P0_TOOLS.len()
+        );
         assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
         assert!(diagnostic["details"]["suggestions"]
             .as_array()
