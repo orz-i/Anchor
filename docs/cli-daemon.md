@@ -1,4 +1,6 @@
-# Linux CLI Daemon 与运维命令
+# CLI Daemon 与运维命令
+
+长期控制面演进方案见 [CLI、Daemon 与 GUI 控制面演进路线](cli-daemon-roadmap.md)。当前后台 daemon 仍只支持 Linux，但 daemon 状态模型已经提升为 CLI 与桌面端共享的库层能力。
 
 `anchor` 提供两种运行方式：
 
@@ -22,6 +24,9 @@ anchor start PROFILE_ID --service all --tunnel
 
 # 查看 daemon、PID 与端口所有权
 anchor status PROFILE_ID
+
+# 查看全部工作区
+anchor status
 
 # 持续观察状态
 anchor status PROFILE_ID --watch
@@ -86,7 +91,7 @@ anchor restart <workspace> [--service ...] [--tunnel|--no-tunnel]
 ### `status`
 
 ```bash
-anchor status <workspace> [--watch] [--interval SECONDS]
+anchor status [<workspace>|--all] [--watch] [--interval SECONDS]
 ```
 
 输出同时包含：
@@ -98,6 +103,8 @@ anchor status <workspace> [--watch] [--interval SECONDS]
   - `daemon`：由当前 CLI daemon 监听；
   - `external`：由 GUI 或其他进程监听；
   - `none`：未监听。
+
+不指定 workspace 或显式使用 `--all` 时，CLI 会输出全部 WorkspaceProfile 的控制面状态。非 watch JSON 模式返回数组；watch JSON 模式输出带 `status_snapshot` 事件名的 NDJSON。
 
 `--json --watch` 使用一行一个 JSON 对象的 NDJSON 格式，适合脚本持续消费。
 

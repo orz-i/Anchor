@@ -17,16 +17,15 @@ pub use health::run_health_checks;
 pub use logs::read_workspace_logs;
 pub use runtime::{
     get_actions_runtime_status, get_mcp_gateway, get_mcp_gateway_status, get_runtime_status,
-    restart_actions_runtime, restart_runtime, set_mcp_gateway, start_actions_runtime,
-    start_runtime, stop_actions_runtime, stop_runtime,
+    get_workspace_control_status, restart_actions_runtime, restart_runtime, set_mcp_gateway,
+    start_actions_runtime, start_runtime, stop_actions_runtime, stop_runtime,
 };
 pub use secrets::{
-    get_shared_secret, get_workspace_secret, regenerate_shared_secret,
-    regenerate_workspace_secret, set_shared_secret, set_workspace_secret,
+    get_shared_secret, get_workspace_secret, regenerate_shared_secret, regenerate_workspace_secret,
+    set_shared_secret, set_workspace_secret,
 };
 pub use software::{
-    get_download_config, install_software, list_software, set_download_config,
-    uninstall_software,
+    get_download_config, install_software, list_software, set_download_config, uninstall_software,
 };
 pub use tunnel::{get_frp_snippet, restart_tunnel, start_tunnel, stop_tunnel, test_tunnel};
 pub use workspace::{

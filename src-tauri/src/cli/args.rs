@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+pub use crate::daemon::ServiceSelection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliArgs {
@@ -320,18 +320,27 @@ fn parse_stop(args: &mut VecDeque<String>) -> Result<StopOptions, String> {
 }
 
 fn parse_status(args: &mut VecDeque<String>) -> Result<StatusOptions, String> {
-    let workspace = pop_value(args, "status")?;
+    let mut workspace = None;
+    let mut all = false;
     let mut watch = false;
     let mut interval_seconds = 2;
     while let Some(option) = args.pop_front() {
         match option.as_str() {
+            "--all" => all = true,
             "--watch" => watch = true,
             "--interval" => interval_seconds = parse_u64(args, "--interval", 1, 60)?,
-            other => return Err(format!("status 不支持参数：{other}")),
+            other if other.starts_with('-') => {
+                return Err(format!("status 不支持参数：{other}"));
+            }
+            other if workspace.is_none() => workspace = Some(other.to_string()),
+            other => return Err(format!("status 不支持多余参数：{other}")),
         }
     }
+    if all && workspace.is_some() {
+        return Err("status 不能同时指定 workspace 和 --all".into());
+    }
     Ok(StatusOptions {
-        workspace,
+        workspace: if all { None } else { workspace },
         watch,
         interval_seconds,
     })
@@ -386,25 +395,6 @@ fn parse_u64(
     Ok(value)
 }
 
-impl ServiceSelection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Mcp => "mcp",
-            Self::Actions => "actions",
-            Self::All => "all",
-        }
-    }
-
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "mcp" => Ok(Self::Mcp),
-            "actions" => Ok(Self::Actions),
-            "all" => Ok(Self::All),
-            _ => Err(format!("无效服务类型：{value}；可选值为 mcp、actions、all")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOptions {
     pub workspace: String,
@@ -422,7 +412,7 @@ pub struct StopOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusOptions {
-    pub workspace: String,
+    pub workspace: Option<String>,
     pub watch: bool,
     pub interval_seconds: u64,
 }
@@ -485,24 +475,6 @@ pub enum Command {
         service: ServiceSelection,
         tunnel: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceSelection {
-    Mcp,
-    Actions,
-    All,
-}
-
-impl ServiceSelection {
-    pub fn includes_mcp(self) -> bool {
-        matches!(self, Self::Mcp | Self::All)
-    }
-
-    pub fn includes_actions(self) -> bool {
-        matches!(self, Self::Actions | Self::All)
-    }
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
@@ -601,7 +573,7 @@ pub fn usage() -> &'static str {
 用法：\n\
   anchor [--config-dir PATH] [--json] list\n\
   anchor [--config-dir PATH] [--json] show <workspace>\n\
-  anchor [--config-dir PATH] [--json] status <workspace> [--watch]\n\
+  anchor [--config-dir PATH] [--json] status [<workspace>|--all] [--watch]\n\
   anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|actions|all] [--tunnel]\n\n\
   anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
@@ -611,7 +583,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
-serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
 
 pub fn gateway_usage() -> &'static str {
@@ -760,6 +732,48 @@ mod tests {
                 force: true,
             })
         );
+    }
+
+    #[test]
+    fn status_supports_one_workspace_or_all_workspaces() {
+        let one =
+            parse(strings(&["status", "workspace-a", "--watch"])).expect("single workspace status");
+        assert_eq!(
+            one.command,
+            Command::Status(StatusOptions {
+                workspace: Some("workspace-a".into()),
+                watch: true,
+                interval_seconds: 2,
+            })
+        );
+
+        let all =
+            parse(strings(&["status", "--all", "--interval", "5"])).expect("all workspace status");
+        assert_eq!(
+            all.command,
+            Command::Status(StatusOptions {
+                workspace: None,
+                watch: false,
+                interval_seconds: 5,
+            })
+        );
+
+        let implicit_all = parse(strings(&["status"])).expect("implicit all workspace status");
+        assert_eq!(
+            implicit_all.command,
+            Command::Status(StatusOptions {
+                workspace: None,
+                watch: false,
+                interval_seconds: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn status_rejects_workspace_and_all_together() {
+        let error = parse(strings(&["status", "workspace-a", "--all"]))
+            .expect_err("ambiguous status selection");
+        assert!(error.contains("不能同时"));
     }
 
     #[test]

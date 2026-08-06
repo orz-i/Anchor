@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { invokeRead } from "$lib/api/invoke";
-import type { RuntimeStatus, SkillInspection, WorkspaceProfile } from "$lib/types";
+import type {
+  RuntimeStatus,
+  SkillInspection,
+  WorkspaceControlStatus,
+  WorkspaceProfile,
+} from "$lib/types";
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
@@ -43,6 +48,10 @@ export async function stopRuntime(id: string): Promise<RuntimeStatus> {
 
 export async function getRuntimeStatus(id: string): Promise<RuntimeStatus> {
   return invokeRead<RuntimeStatus>("get_runtime_status", { id });
+}
+
+export async function getWorkspaceControlStatus(id: string): Promise<WorkspaceControlStatus> {
+  return invokeRead<WorkspaceControlStatus>("get_workspace_control_status", { id });
 }
 
 export async function startActionsRuntime(id: string): Promise<RuntimeStatus> {

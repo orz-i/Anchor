@@ -1,0 +1,97 @@
+use serde::Serialize;
+
+use crate::daemon::{self, DaemonInspection};
+use crate::error::AppResult;
+use crate::platform::platform;
+use crate::workspace::WorkspaceProfile;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortStatus {
+    pub service: String,
+    pub port: u16,
+    pub listening: bool,
+    pub pid: Option<u32>,
+    pub owner: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceControlStatus {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub daemon: DaemonInspection,
+    pub mcp: PortStatus,
+    pub actions: PortStatus,
+}
+
+pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceControlStatus> {
+    let daemon = daemon::inspect(profile)?;
+    let daemon_pid = daemon
+        .state
+        .as_ref()
+        .filter(|_| daemon.running)
+        .map(|state| state.pid);
+
+    Ok(WorkspaceControlStatus {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        path: profile.path.clone(),
+        daemon,
+        mcp: port_status(
+            "mcp",
+            profile.runtime.local_port,
+            profile.local_endpoint(),
+            daemon_pid,
+        )?,
+        actions: port_status(
+            "actions",
+            profile.actions.local_port,
+            profile.actions_local_base_url(),
+            daemon_pid,
+        )?,
+    })
+}
+
+pub fn workspace_statuses(profiles: &[WorkspaceProfile]) -> AppResult<Vec<WorkspaceControlStatus>> {
+    profiles.iter().map(workspace_status).collect()
+}
+
+fn port_status(
+    service: &str,
+    port: u16,
+    endpoint: String,
+    daemon_pid: Option<u32>,
+) -> AppResult<PortStatus> {
+    let pid = platform().find_pid_listening_on_port(port)?;
+    Ok(PortStatus {
+        service: service.to_string(),
+        port,
+        listening: pid.is_some(),
+        pid,
+        owner: port_owner(pid, daemon_pid).to_string(),
+        endpoint,
+    })
+}
+
+fn port_owner(pid: Option<u32>, daemon_pid: Option<u32>) -> &'static str {
+    match pid {
+        Some(pid) if Some(pid) == daemon_pid => "daemon",
+        Some(_) => "external",
+        None => "none",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::port_owner;
+
+    #[test]
+    fn port_ownership_distinguishes_daemon_external_and_stopped() {
+        assert_eq!(port_owner(Some(7), Some(7)), "daemon");
+        assert_eq!(port_owner(Some(8), Some(7)), "external");
+        assert_eq!(port_owner(None, Some(7)), "none");
+    }
+}

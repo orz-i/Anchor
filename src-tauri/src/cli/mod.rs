@@ -1,5 +1,4 @@
 mod args;
-mod daemon;
 mod workspace;
 
 use std::fs::File;
@@ -10,6 +9,8 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::control::{self, WorkspaceControlStatus};
+use crate::daemon;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::logging::{profile_log_files, ProfileLogService};
@@ -43,14 +44,6 @@ fn path_or_parent_writable(path: &Path) -> bool {
         current = candidate.parent();
     }
     false
-}
-
-fn port_owner(pid: Option<u32>, daemon_pid: Option<u32>) -> &'static str {
-    match pid {
-        Some(pid) if Some(pid) == daemon_pid => "daemon",
-        Some(_) => "external",
-        None => "none",
-    }
 }
 
 async fn execute_gateway(command: GatewayCommand, as_json: bool) -> AppResult<i32> {
@@ -984,35 +977,30 @@ fn show_workspace(selector: &str, as_json: bool) -> AppResult<()> {
     Ok(())
 }
 
-#[derive(Serialize)]
-struct PortStatus {
-    service: &'static str,
-    port: u16,
-    listening: bool,
-    pid: Option<u32>,
-    owner: String,
-    endpoint: String,
-}
-
-#[derive(Serialize)]
-struct WorkspaceStatus {
-    id: String,
-    name: String,
-    path: String,
-    daemon: daemon::DaemonInspection,
-    mcp: PortStatus,
-    actions: PortStatus,
-}
-
 async fn show_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {
-        let status = workspace_status(&options.workspace)?;
-        if as_json && options.watch {
-            print_json_line(&status)?;
+        let statuses = workspace_statuses(options.workspace.as_deref())?;
+        let single_workspace = options.workspace.is_some();
+        if as_json && options.watch && single_workspace {
+            print_json_line(&statuses[0])?;
+        } else if as_json && options.watch {
+            print_json_line(&json!({
+                "event": "status_snapshot",
+                "workspaces": statuses
+            }))?;
+        } else if as_json && single_workspace {
+            print_json(&statuses[0])?;
+        } else if as_json {
+            print_json(&statuses)?;
         } else {
-            print_workspace_status(&status, as_json)?;
+            for (index, status) in statuses.iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                print_workspace_status(status);
+            }
         }
         if !options.watch {
             return Ok(());
@@ -1024,68 +1012,25 @@ async fn show_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
     }
 }
 
-fn workspace_status(selector: &str) -> AppResult<WorkspaceStatus> {
+fn workspace_statuses(selector: Option<&str>) -> AppResult<Vec<WorkspaceControlStatus>> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), selector)?.clone();
-    let daemon = daemon::inspect(&profile)?;
-    let daemon_pid = daemon
-        .state
-        .as_ref()
-        .filter(|_| daemon.running)
-        .map(|state| state.pid);
-    let status = WorkspaceStatus {
-        id: profile.id.clone(),
-        name: profile.name.clone(),
-        path: profile.path.clone(),
-        daemon,
-        mcp: port_status(
-            "mcp",
-            profile.runtime.local_port,
-            profile.local_endpoint(),
-            daemon_pid,
-        )?,
-        actions: port_status(
-            "actions",
-            profile.actions.local_port,
-            profile.actions_local_base_url(),
-            daemon_pid,
-        )?,
-    };
-
-    Ok(status)
-}
-
-fn print_workspace_status(status: &WorkspaceStatus, as_json: bool) -> AppResult<()> {
-    if as_json {
-        print_json(&status)?;
-    } else {
-        println!("{} ({})", status.name, status.id);
-        println!("daemon\t{}", status.daemon.detail);
-        print_port_status(&status.mcp);
-        print_port_status(&status.actions);
+    match selector {
+        Some(selector) => {
+            let profile = resolve_workspace(store.list(), selector)?;
+            Ok(vec![control::workspace_status(profile)?])
+        }
+        None => control::workspace_statuses(store.list()),
     }
-    Ok(())
 }
 
-fn port_status(
-    service: &'static str,
-    port: u16,
-    endpoint: String,
-    daemon_pid: Option<u32>,
-) -> AppResult<PortStatus> {
-    let pid = platform().find_pid_listening_on_port(port)?;
-    let owner = port_owner(pid, daemon_pid);
-    Ok(PortStatus {
-        service,
-        port,
-        listening: pid.is_some(),
-        pid,
-        owner: owner.into(),
-        endpoint,
-    })
+fn print_workspace_status(status: &WorkspaceControlStatus) {
+    println!("{} ({})", status.name, status.id);
+    println!("daemon\t{}", status.daemon.detail);
+    print_port_status(&status.mcp);
+    print_port_status(&status.actions);
 }
 
-fn print_port_status(status: &PortStatus) {
+fn print_port_status(status: &control::PortStatus) {
     if let Some(pid) = status.pid {
         println!(
             "{}\tlistening\t{}\tpid={}",
@@ -1545,13 +1490,6 @@ mod tests {
     }
 
     #[test]
-    fn port_owner_distinguishes_daemon_external_and_empty_ports() {
-        assert_eq!(port_owner(Some(42), Some(42)), "daemon");
-        assert_eq!(port_owner(Some(84), Some(42)), "external");
-        assert_eq!(port_owner(None, Some(42)), "none");
-    }
-
-    #[test]
     fn log_tail_returns_only_requested_lines() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("daemon.log");
@@ -1609,5 +1547,4 @@ mod tests {
 
         assert!(error.to_string().contains("名称不唯一"));
     }
-
 }

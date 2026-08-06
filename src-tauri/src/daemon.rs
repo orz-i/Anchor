@@ -12,11 +12,44 @@ use crate::platform::platform;
 use crate::tunnel::log_dir_for_profile;
 use crate::workspace::WorkspaceProfile;
 
-use super::args::ServiceSelection;
-
 const STATE_SCHEMA_VERSION: u32 = 1;
 const DAEMON_LOG_FILE: &str = "daemon.log";
 const SIGTERM_VALUE: i32 = 15;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceSelection {
+    Mcp,
+    Actions,
+    All,
+}
+
+impl ServiceSelection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Actions => "actions",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "mcp" => Ok(Self::Mcp),
+            "actions" => Ok(Self::Actions),
+            "all" => Ok(Self::All),
+            _ => Err(format!("无效服务类型：{value}；可选值为 mcp、actions、all")),
+        }
+    }
+
+    pub fn includes_mcp(self) -> bool {
+        matches!(self, Self::Mcp | Self::All)
+    }
+
+    pub fn includes_actions(self) -> bool {
+        matches!(self, Self::Actions | Self::All)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -150,6 +150,47 @@ export interface RuntimeStatus {
   activity?: McpActivity | null;
 }
 
+export interface DaemonState {
+  schemaVersion: number;
+  workspaceId: string;
+  workspaceName: string;
+  workspacePath: string;
+  pid: number;
+  startedAtUnix: number;
+  service: "mcp" | "actions" | "all";
+  tunnel: boolean;
+  logPath: string;
+  version: string;
+}
+
+export interface DaemonInspection {
+  supported: boolean;
+  running: boolean;
+  stale: boolean;
+  ambiguous: boolean;
+  pidMatches: boolean;
+  state: DaemonState | null;
+  detail: string;
+}
+
+export interface WorkspacePortStatus {
+  service: string;
+  port: number;
+  listening: boolean;
+  pid: number | null;
+  owner: "daemon" | "external" | "none";
+  endpoint: string;
+}
+
+export interface WorkspaceControlStatus {
+  id: string;
+  name: string;
+  path: string;
+  daemon: DaemonInspection;
+  mcp: WorkspacePortStatus;
+  actions: WorkspacePortStatus;
+}
+
 export type McpActivityState =
   | "unknown"
   | "idle"

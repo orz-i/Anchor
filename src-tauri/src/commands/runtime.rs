@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::app_state::AppState;
 
+use crate::control::{self, WorkspaceControlStatus};
 use crate::error::{AppError, AppResult};
 
 use crate::runtime::{
@@ -486,6 +487,15 @@ pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<
         runtime.refresh_mcp(&profile);
         runtime.mcp_status(&profile)
     })
+}
+
+#[tauri::command]
+pub fn get_workspace_control_status(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<WorkspaceControlStatus> {
+    let profile = profile_by_id(&state, &id)?;
+    control::workspace_status(&profile)
 }
 
 #[tauri::command]

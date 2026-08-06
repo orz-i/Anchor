@@ -47,10 +47,13 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 │  UI Layer (Svelte)                      │
 │  Workspace 卡片 / 配置 / 日志 / 健康检查  │
 ├─────────────────────────────────────────┤
-│  Tauri Commands (IPC)                   │
-│  前端 ↔ Rust 后端通信                    │
+│  GUI 配置壳 / CLI                        │
+│  配置、展示、脚本化运维                   │
 ├─────────────────────────────────────────┤
-│  App Orchestrator (Rust)                │
+│  Shared Control Plane                   │
+│  版本化状态模型与控制客户端               │
+├─────────────────────────────────────────┤
+│  Anchor Daemon / App Orchestrator       │
 │  Workspace Store / Runtime State Machine│
 ├─────────────────────────────────────────┤
 │  MCP Core (内嵌, Rust)                  │
@@ -70,6 +73,8 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 | UI | Tauri 2 + SvelteKit 设计系统 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | 桌面安装包与独立 `anchor` CLI |
+
+目标方向是让 daemon 成为运行时、Gateway 和 Tunnel 的唯一权威，CLI 提供完整运维能力，GUI 逐步收缩为配置与状态壳。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
 
 ## 核心模块
 
