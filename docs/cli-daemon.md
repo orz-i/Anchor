@@ -161,7 +161,11 @@ Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优�
 - Unix：`<runtime-dir>/<profile-id>.sock`，父目录 `0700`、socket `0600`；
 - Windows：`\\.\pipe\anchor-<user-config-scope>-<profile-id>`。当前版本只提供客户端地址与协议抽象，Windows daemon 服务端将在 Windows Service 生命周期落地时启用。
 
-控制协议当前版本为 `2`，支持 `ping`、`version`、`workspace_status`、`logs`、`shutdown` 和 `prepare_restart`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
+控制协议当前版本为 `3`，支持 `ping`、`version`、`workspace_status`、`logs`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
+
+Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|actions|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|actions|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
+
+Tunnel 写控制是异步操作：daemon 先返回 `OperationAccepted` 并完整关闭本次响应帧，然后主循环才执行 Tunnel Supervisor 的 start/stop/restart；客户端使用 `operation_status` 查询 `pending/running/succeeded/failed`。这保证协议响应不会被正在执行的 tunnel 替换操作截断。FRP restart 继续使用 supervisor 的原子 route replacement，失败时保留旧线路；非 FRP restart 失败时也尝试恢复上一线路和持久配置。
 
 CLI 生命周期语义：
 
@@ -180,7 +184,9 @@ GUI Workspace 控制使用同一生命周期客户端：
 - MCP/Actions 独立开关会重新计算目标 daemon 服务选择，必要时协调重启整个 Workspace daemon；
 - 运行中日志必须走 daemon IPC；控制端点失败时不会回退为 GUI 直接读取正在写入的日志文件；
 - 密钥再生成会通过 IPC 重启真正使用该密钥的 daemon；
-- 当前 Gateway/Tunnel 仍是桌面兼容路径。daemon 管理的 MCP 运行时，GUI 拒绝启用进程内 Gateway，防止形成第二套运行权威。
+- MCP/Actions Tunnel 的状态、启动、停止、重载和测试均通过 Workspace daemon；daemon 运行时失败不会回退到 GUI 进程自己的 Tunnel Supervisor；
+- 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，GUI 优先使用该值；
+- Gateway 不归属于任何 Workspace daemon。GUI 只保存 Gateway 配置；共享 Gateway listener/tunnel 的运行目前由独立 `anchor gateway serve <workspace ...>` 控制域负责。若旧桌面进程仍持有兼容 Gateway listener，则配置热改会 fail-closed，避免 listener 与配置分叉。
 
 Windows 仍只有 Named Pipe 客户端和地址抽象。服务端与当前用户 ACL 未完成前，GUI 会显示 daemon 不受支持，写操作直接失败，不会落回进程内 Runtime。
 

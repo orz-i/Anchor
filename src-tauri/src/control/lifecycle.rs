@@ -10,7 +10,15 @@ use super::{ipc_ping, request_daemon_exit, ControlOperation};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonLaunchSpec {
     pub service: ServiceSelection,
-    pub tunnel: bool,
+    pub tunnels: Option<ServiceSelection>,
+}
+
+pub fn desired_tunnel_selection(
+    current: Option<ServiceSelection>,
+    service: WorkspaceService,
+    enabled: bool,
+) -> Option<ServiceSelection> {
+    desired_service_selection(current, service, enabled)
 }
 
 pub fn desired_service_selection(
@@ -65,19 +73,24 @@ pub async fn ensure_daemon_running(
                 "daemon 状态显示正在运行，但控制端点不可用：{error}；拒绝使用本地写回退"
             ))
         })?;
-        if state.service == spec.service && state.tunnel == spec.tunnel {
+        if state.service == spec.service && state.managed_tunnels() == spec.tunnels {
             return Ok(state);
         }
         return Err(AppError::Message(format!(
-            "daemon 已运行（service={}, tunnel={}），目标配置为 service={}, tunnel={}；请先通过控制面协调重启",
+            "daemon 已运行（service={}, tunnels={}），目标配置为 service={}, tunnels={}；请先通过控制面协调重启",
             state.service.as_str(),
-            state.tunnel,
+            state
+                .managed_tunnels()
+                .map(ServiceSelection::as_str)
+                .unwrap_or("none"),
             spec.service.as_str(),
-            spec.tunnel
+            spec.tunnels
+                .map(ServiceSelection::as_str)
+                .unwrap_or("none")
         )));
     }
 
-    let child_pid = daemon::spawn(profile, spec.service, spec.tunnel)?;
+    let child_pid = daemon::spawn_with_tunnels(profile, spec.service, spec.tunnels)?;
     match daemon::wait_ready(profile, spec.service, child_pid, timeout).await {
         Ok(state) => Ok(state),
         Err(error) => {
@@ -159,7 +172,7 @@ pub async fn reconcile_daemon(
             .await
             .map(Some),
         (Some(state), Some(spec))
-            if state.service == spec.service && state.tunnel == spec.tunnel =>
+            if state.service == spec.service && state.managed_tunnels() == spec.tunnels =>
         {
             ipc_ping(&profile.id).await.map_err(|error| {
                 AppError::Message(format!(
@@ -196,23 +209,22 @@ pub async fn set_daemon_service(
         return Err(AppError::Message(inspection.detail));
     }
     let current = running_state(&inspection);
+    let current_tunnels = current.as_ref().and_then(DaemonState::managed_tunnels);
     let desired_service = desired_service_selection(
         current.as_ref().map(|state| state.service),
         service,
         enabled,
     );
+    let desired_tunnels = if enabled && tunnel_on_start {
+        desired_tunnel_selection(current_tunnels, service, true)
+    } else if !enabled {
+        desired_tunnel_selection(current_tunnels, service, false)
+    } else {
+        current_tunnels
+    };
     let desired = desired_service.map(|service| DaemonLaunchSpec {
         service,
-        tunnel: current
-            .as_ref()
-            .map(|state| {
-                if enabled {
-                    state.tunnel || tunnel_on_start
-                } else {
-                    state.tunnel
-                }
-            })
-            .unwrap_or(tunnel_on_start),
+        tunnels: desired_tunnels,
     });
     reconcile_daemon(profile, desired, timeout, force).await
 }
@@ -234,16 +246,23 @@ pub async fn restart_daemon_service(
             .expect("enabling a service always yields a daemon selection");
     let spec = DaemonLaunchSpec {
         service: desired_service,
-        tunnel: current
+        tunnels: current
             .as_ref()
-            .map(|state| state.tunnel || tunnel_on_start)
-            .unwrap_or(tunnel_on_start),
+            .and_then(DaemonState::managed_tunnels)
+            .or_else(|| tunnel_on_start.then_some(desired_service)),
     };
 
     if current.is_some() {
         request_daemon_exit_and_wait(profile, ControlOperation::Restart, timeout, force).await?;
     }
     ensure_daemon_running(profile, spec, timeout).await
+}
+
+pub fn service_is_selected(selection: ServiceSelection, service: WorkspaceService) -> bool {
+    match service {
+        WorkspaceService::Mcp => selection.includes_mcp(),
+        WorkspaceService::Actions => selection.includes_actions(),
+    }
 }
 
 fn running_state(inspection: &DaemonInspection) -> Option<DaemonState> {
@@ -293,6 +312,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tunnel_transition_matrix_preserves_independent_toggles() {
+        assert_eq!(
+            desired_tunnel_selection(None, WorkspaceService::Mcp, true),
+            Some(ServiceSelection::Mcp)
+        );
+        assert_eq!(
+            desired_tunnel_selection(Some(ServiceSelection::Mcp), WorkspaceService::Actions, true,),
+            Some(ServiceSelection::All)
+        );
+        assert_eq!(
+            desired_tunnel_selection(Some(ServiceSelection::All), WorkspaceService::Mcp, false,),
+            Some(ServiceSelection::Actions)
+        );
+        assert_eq!(
+            desired_tunnel_selection(
+                Some(ServiceSelection::Actions),
+                WorkspaceService::Actions,
+                false,
+            ),
+            None
+        );
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn unsupported_platform_start_fails_closed_without_local_runtime_fallback() {
@@ -302,7 +345,7 @@ mod tests {
             &profile,
             DaemonLaunchSpec {
                 service: ServiceSelection::Mcp,
-                tunnel: false,
+                tunnels: None,
             },
             Duration::from_millis(50),
         )

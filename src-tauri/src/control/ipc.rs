@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -8,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::daemon;
 use crate::error::{AppError, AppResult};
+use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 use crate::workspace::WorkspaceProfile;
 
 #[cfg(any(unix, test))]
@@ -15,19 +18,217 @@ use super::logs::read_log_batch;
 #[cfg(any(unix, test))]
 use super::protocol::{
     validate_protocol_version, ERROR_CONTROL_COMMAND_UNAVAILABLE, ERROR_INTERNAL,
-    ERROR_LOG_READ_FAILED, ERROR_WORKSPACE_MISMATCH,
+    ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND, ERROR_WORKSPACE_MISMATCH,
 };
 use super::protocol::{
-    ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod, ControlOperation,
-    ControlRequest, ControlResponse, ControlResult, MAX_CONTROL_FRAME_BYTES,
+    ControlAsyncOperation, ControlAsyncState, ControlError, ControlLogChunk, ControlLogCursor,
+    ControlLogSelection, ControlMethod, ControlOperation, ControlRequest, ControlResponse,
+    ControlResult, ControlTunnelAction, MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+const CONTROL_OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(any(unix, test))]
+const MAX_CONTROL_OPERATIONS: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonControlCommand {
-    Shutdown { operation: ControlOperation },
+    Shutdown {
+        operation: ControlOperation,
+    },
+    Tunnel {
+        operation_id: String,
+        service: TunnelServiceKind,
+        action: ControlTunnelAction,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct StoredControlOperation {
+    #[cfg(any(unix, test))]
+    workspace_id: String,
+    operation: ControlAsyncOperation,
+}
+
+fn operation_store() -> &'static Mutex<HashMap<String, StoredControlOperation>> {
+    static STORE: OnceLock<Mutex<HashMap<String, StoredControlOperation>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(any(unix, test))]
+fn create_control_operation(workspace_id: &str) -> Option<String> {
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let mut operations = operation_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if operations.len() >= MAX_CONTROL_OPERATIONS {
+        let completed = operations
+            .iter()
+            .find(|(_, stored)| {
+                matches!(
+                    stored.operation.state,
+                    ControlAsyncState::Succeeded | ControlAsyncState::Failed
+                )
+            })
+            .map(|(operation_id, _)| operation_id.clone());
+        let completed = completed?;
+        operations.remove(&completed);
+    }
+    operations.insert(
+        operation_id.clone(),
+        StoredControlOperation {
+            workspace_id: workspace_id.to_string(),
+            operation: ControlAsyncOperation {
+                operation_id: operation_id.clone(),
+                state: ControlAsyncState::Pending,
+                tunnel_status: None,
+                error: None,
+            },
+        },
+    );
+    Some(operation_id)
+}
+
+#[cfg(any(unix, test))]
+fn control_operation(workspace_id: &str, operation_id: &str) -> Option<ControlAsyncOperation> {
+    operation_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(operation_id)
+        .filter(|stored| stored.workspace_id == workspace_id)
+        .map(|stored| stored.operation.clone())
+}
+
+pub(crate) fn mark_control_operation_running(operation_id: &str) {
+    if let Some(stored) = operation_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(operation_id)
+    {
+        stored.operation.state = ControlAsyncState::Running;
+        stored.operation.error = None;
+    }
+}
+
+pub async fn request_tunnel_operation(
+    profile: &WorkspaceProfile,
+    service: TunnelServiceKind,
+    action: ControlTunnelAction,
+    timeout: Duration,
+) -> Result<TunnelStatus, ControlClientError> {
+    let inspection = daemon::inspect(profile).map_err(|error| {
+        ControlClientError::Protocol(format!(
+            "cannot inspect daemon before tunnel write: {error}"
+        ))
+    })?;
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            ControlClientError::Protocol(
+                "workspace daemon is not running; tunnel writes require the daemon control plane"
+                    .into(),
+            )
+        })?;
+    let (operation_id, daemon_pid) = match request(
+        &profile.id,
+        ControlMethod::TunnelControl {
+            workspace_id: profile.id.clone(),
+            service,
+            action,
+        },
+    )
+    .await?
+    {
+        ControlResult::OperationAccepted {
+            operation_id,
+            daemon_pid,
+        } => (operation_id, daemon_pid),
+        other => {
+            return Err(ControlClientError::Protocol(format!(
+                "daemon returned unexpected tunnel operation result: {other:?}"
+            )))
+        }
+    };
+    if daemon_pid != state.pid {
+        return Err(ControlClientError::Protocol(format!(
+            "daemon tunnel operation PID mismatch: status file={}, response={daemon_pid}",
+            state.pid
+        )));
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let operation = match request(
+            &profile.id,
+            ControlMethod::OperationStatus {
+                workspace_id: profile.id.clone(),
+                operation_id: operation_id.clone(),
+            },
+        )
+        .await?
+        {
+            ControlResult::OperationStatus { operation } => operation,
+            other => {
+                return Err(ControlClientError::Protocol(format!(
+                    "daemon returned unexpected operation status result: {other:?}"
+                )))
+            }
+        };
+        match operation.state {
+            ControlAsyncState::Succeeded => {
+                return operation.tunnel_status.ok_or_else(|| {
+                    ControlClientError::Protocol(
+                        "successful tunnel operation omitted tunnel status".into(),
+                    )
+                })
+            }
+            ControlAsyncState::Failed => {
+                let error = operation.error.ok_or_else(|| {
+                    ControlClientError::Protocol(
+                        "failed tunnel operation omitted error details".into(),
+                    )
+                })?;
+                return Err(ControlClientError::Remote {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            ControlAsyncState::Pending | ControlAsyncState::Running => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ControlClientError::Remote {
+                code: "operation_timeout".into(),
+                message: format!("tunnel operation {operation_id} did not finish before timeout"),
+            });
+        }
+        tokio::time::sleep(CONTROL_OPERATION_POLL_INTERVAL).await;
+    }
+}
+
+pub(crate) fn finish_tunnel_operation(operation_id: &str, result: AppResult<TunnelStatus>) {
+    let mut operations = operation_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(stored) = operations.get_mut(operation_id) else {
+        return;
+    };
+    match result {
+        Ok(status) => {
+            stored.operation.state = ControlAsyncState::Succeeded;
+            stored.operation.tunnel_status = Some(status);
+            stored.operation.error = None;
+        }
+        Err(error) => {
+            stored.operation.state = ControlAsyncState::Failed;
+            stored.operation.tunnel_status = None;
+            stored.operation.error = Some(ControlError {
+                code: super::protocol::ERROR_OPERATION_FAILED.to_string(),
+                message: error.to_string(),
+            });
+        }
+    }
 }
 
 pub async fn request_logs(
@@ -456,13 +657,21 @@ where
     let request: ControlRequest = read_json_frame(&mut stream)
         .await
         .map_err(|error| AppError::Message(format!("invalid control request: {error:?}")))?;
-    let handled = handle_request(request, profile, !command_sender.is_closed());
+    let handled = handle_request(request, profile, !command_sender.is_closed()).await;
     write_json_frame(&mut stream, &handled.response).await?;
     stream.shutdown().await?;
     if let Some(command) = handled.command {
-        command_sender.send(command).map_err(|_| {
-            AppError::Message("daemon control command receiver is unavailable".into())
-        })?;
+        let operation_id = match &command {
+            DaemonControlCommand::Tunnel { operation_id, .. } => Some(operation_id.clone()),
+            DaemonControlCommand::Shutdown { .. } => None,
+        };
+        if command_sender.send(command).is_err() {
+            let error = AppError::Message("daemon control command receiver is unavailable".into());
+            if let Some(operation_id) = operation_id {
+                finish_tunnel_operation(&operation_id, Err(AppError::Message(error.to_string())));
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -474,7 +683,7 @@ struct HandledRequest {
 }
 
 #[cfg(any(unix, test))]
-fn handle_request(
+async fn handle_request(
     request: ControlRequest,
     profile: &WorkspaceProfile,
     command_available: bool,
@@ -512,6 +721,27 @@ fn handle_request(
                     {
                         status.mcp_activity = Some(crate::mcp::activity_snapshot(&profile.id));
                     }
+                    let settings = match crate::settings::AppSettings::load() {
+                        Ok(settings) => settings,
+                        Err(error) => {
+                            return handled(ControlResponse::error(
+                                request_id,
+                                ERROR_INTERNAL,
+                                error.to_string(),
+                            ));
+                        }
+                    };
+                    let tunnels = crate::tunnel::supervisor().lock().await;
+                    status.mcp_tunnel = Some(tunnels.status(
+                        profile,
+                        crate::tunnel::TunnelServiceKind::Mcp,
+                        &settings,
+                    ));
+                    status.actions_tunnel = Some(tunnels.status(
+                        profile,
+                        crate::tunnel::TunnelServiceKind::Actions,
+                        &settings,
+                    ));
                     handled(ControlResponse::success(
                         request_id,
                         ControlResult::WorkspaceStatus {
@@ -561,6 +791,64 @@ fn handle_request(
             ControlOperation::Restart,
             command_available,
         ),
+        ControlMethod::TunnelControl {
+            workspace_id,
+            service,
+            action,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            if !command_available {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    "daemon tunnel command receiver is unavailable",
+                ));
+            }
+            let Some(operation_id) = create_control_operation(&profile.id) else {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    format!(
+                        "daemon already has {MAX_CONTROL_OPERATIONS} active control operations"
+                    ),
+                ));
+            };
+            HandledRequest {
+                response: ControlResponse::success(
+                    request_id,
+                    ControlResult::OperationAccepted {
+                        operation_id: operation_id.clone(),
+                        daemon_pid: std::process::id(),
+                    },
+                ),
+                command: Some(DaemonControlCommand::Tunnel {
+                    operation_id,
+                    service,
+                    action,
+                }),
+            }
+        }
+        ControlMethod::OperationStatus {
+            workspace_id,
+            operation_id,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            match control_operation(&profile.id, &operation_id) {
+                Some(operation) => handled(ControlResponse::success(
+                    request_id,
+                    ControlResult::OperationStatus { operation },
+                )),
+                None => handled(ControlResponse::error(
+                    request_id,
+                    ERROR_OPERATION_NOT_FOUND,
+                    format!("unknown control operation: {operation_id}"),
+                )),
+            }
+        }
     }
 }
 
@@ -700,8 +988,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn request_handler_rejects_cross_workspace_access() {
+    #[tokio::test]
+    async fn request_handler_rejects_cross_workspace_access() {
         let profile = WorkspaceProfile::new(".".into(), Some("ipc-owner".into()));
         let request = ControlRequest {
             protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
@@ -711,7 +999,7 @@ mod tests {
             },
         };
 
-        let response = handle_request(request, &profile, true).response;
+        let response = handle_request(request, &profile, true).await.response;
 
         assert!(!response.ok);
         assert_eq!(
@@ -720,8 +1008,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_handler_reports_protocol_and_daemon_versions() {
+    #[tokio::test]
+    async fn request_handler_reports_protocol_and_daemon_versions() {
         let profile = WorkspaceProfile::new(".".into(), Some("ipc-version".into()));
         let response = handle_request(
             ControlRequest {
@@ -732,6 +1020,7 @@ mod tests {
             &profile,
             true,
         )
+        .await
         .response;
 
         assert!(response.ok);
@@ -787,8 +1076,110 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lifecycle_request_fails_closed_without_a_command_receiver() {
+    #[tokio::test]
+    async fn tunnel_response_is_flushed_before_execution_and_operation_tracks_completion() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-tunnel".into()));
+        let workspace_id = profile.id.clone();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (command_sender, mut command_receiver) = control_channel();
+        let server_profile = profile.clone();
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &server_profile, &command_sender).await
+        });
+        let request = ControlRequest {
+            protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+            request_id: "tunnel-request".into(),
+            method: ControlMethod::TunnelControl {
+                workspace_id: workspace_id.clone(),
+                service: TunnelServiceKind::Mcp,
+                action: ControlTunnelAction::Restart,
+            },
+        };
+
+        write_json_frame(&mut client, &request)
+            .await
+            .expect("write tunnel request");
+        let response: ControlResponse = read_json_frame(&mut client).await.expect("read response");
+        let operation_id = match response.result.expect("accepted result") {
+            ControlResult::OperationAccepted {
+                operation_id,
+                daemon_pid,
+            } => {
+                assert_eq!(daemon_pid, std::process::id());
+                operation_id
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        server_task
+            .await
+            .expect("server task")
+            .expect("serve tunnel request");
+        assert_eq!(
+            command_receiver.recv().await,
+            Some(DaemonControlCommand::Tunnel {
+                operation_id: operation_id.clone(),
+                service: TunnelServiceKind::Mcp,
+                action: ControlTunnelAction::Restart,
+            })
+        );
+
+        mark_control_operation_running(&operation_id);
+        let running = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "operation-running".into(),
+                method: ControlMethod::OperationStatus {
+                    workspace_id: workspace_id.clone(),
+                    operation_id: operation_id.clone(),
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        assert!(matches!(
+            running.result,
+            Some(ControlResult::OperationStatus {
+                operation: ControlAsyncOperation {
+                    state: ControlAsyncState::Running,
+                    ..
+                }
+            })
+        ));
+
+        let expected_status = TunnelStatus {
+            state: "running".into(),
+            public_url: "https://stable.example.com".into(),
+            tunnel_pid: Some(42),
+        };
+        finish_tunnel_operation(&operation_id, Ok(expected_status.clone()));
+        let completed = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "operation-completed".into(),
+                method: ControlMethod::OperationStatus {
+                    workspace_id,
+                    operation_id,
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        match completed.result.expect("operation result") {
+            ControlResult::OperationStatus { operation } => {
+                assert_eq!(operation.state, ControlAsyncState::Succeeded);
+                assert_eq!(operation.tunnel_status, Some(expected_status));
+                assert!(operation.error.is_none());
+            }
+            other => panic!("unexpected operation response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_request_fails_closed_without_a_command_receiver() {
         let profile = WorkspaceProfile::new(".".into(), Some("ipc-no-command".into()));
         let handled = handle_request(
             ControlRequest {
@@ -800,7 +1191,8 @@ mod tests {
             },
             &profile,
             false,
-        );
+        )
+        .await;
 
         assert!(!handled.response.ok);
         assert!(handled.command.is_none());
@@ -819,5 +1211,21 @@ mod tests {
             .expect_err("missing daemon must fail");
 
         assert!(error.is_unavailable());
+    }
+
+    #[tokio::test]
+    async fn tunnel_write_without_daemon_never_falls_back() {
+        let profile = WorkspaceProfile::new(".".into(), Some("missing-tunnel-daemon".into()));
+
+        let error = request_tunnel_operation(
+            &profile,
+            TunnelServiceKind::Mcp,
+            ControlTunnelAction::Start,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("tunnel write must require a running daemon");
+
+        assert!(error.to_string().contains("daemon is not running"));
     }
 }

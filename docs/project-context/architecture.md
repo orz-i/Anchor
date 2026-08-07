@@ -69,12 +69,12 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 | 维度 | 当前实现 |
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
-| 进程管理 | Workspace daemon 为主；RuntimeSupervisor 仅保留 Gateway/Tunnel 与旧会话兼容路径 |
+| 进程管理 | Workspace daemon 管理 listener + Workspace Tunnel；RuntimeSupervisor 仅保留旧 Gateway/旧会话兼容路径 |
 | UI | Tauri 2 + SvelteKit 设计系统 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | 桌面安装包与独立 `anchor` CLI |
 
-目标方向是让 daemon 成为运行时、Gateway 和 Tunnel 的唯一权威，CLI 提供完整运维能力，GUI 逐步收缩为配置与状态壳。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
+目标方向是按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力，GUI 逐步收缩为配置与状态壳。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
 
 ## 核心模块
 
@@ -87,17 +87,23 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - **实现**: `src-tauri/src/runtime/`
 
 ### control/ 与 daemon.rs
-- **职责**: CLI/GUI 共用的控制状态、版本化本地 IPC、协议协商、daemon 状态文件与进程生命周期
+- **职责**: CLI/GUI 共用的控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期与 Workspace Tunnel 异步写操作
 - **传输**: Unix Domain Socket；Windows Named Pipe 抽象
 - **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
-- **GUI 接入**: Workspace 状态、日志、启停、重启、删除和密钥应用均通过共享 daemon 客户端；Gateway/Tunnel 尚处兼容迁移阶段
+- **GUI 接入**: Workspace 状态、日志、启停、重启、Tunnel、删除和密钥应用均通过共享 daemon 客户端；Tunnel 写请求先 accepted 再异步执行，GUI 不持有第二套 Tunnel Supervisor 权威
+
+### Gateway 控制域
+- **职责**: 多 Workspace 共享 MCP Gateway listener、路由集合和唯一公网 Gateway tunnel
+- **当前运行入口**: `anchor gateway serve <workspace ...>`；该进程独立于任何单一 Workspace daemon
+- **GUI 边界**: GUI 仅校验并持久化 Gateway 配置，不再创建共享 listener 或 tunnel；旧桌面兼容 Gateway 若仍在运行，配置热改 fail-closed
+- **后续**: 将 `gateway serve` 升级为可安装的专用 Gateway service/daemon，并提供独立状态/控制 IPC
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport
 - **实现**: `src-tauri/src/mcp/` 与 `src-tauri/src/tools/`
 
 ### tunnel/
-- **职责**: FRP 配置生成、Cloudflare 隧道进程监督
+- **职责**: FRP 配置生成、Cloudflare 隧道进程监督；Workspace live supervisor 由对应 daemon 持有
 - **实现**: `src-tauri/src/tunnel/`
 
 ## 入口文件

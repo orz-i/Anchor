@@ -590,9 +590,6 @@
       await load();
       if (workspaceId !== targetWorkspaceId) return;
     }
-    if (!options?.skipServicePrompt) {
-      await reloadConfiguredService("mcp");
-    }
   }
 
   async function saveActionsTunnel(config: TunnelFormConfig, options?: SaveTunnelOptions) {
@@ -627,9 +624,6 @@
     if (!options?.skipTunnelRestart && !options?.skipServicePrompt) {
       await load();
       if (workspaceId !== targetWorkspaceId) return;
-    }
-    if (!options?.skipServicePrompt) {
-      await reloadConfiguredService("actions");
     }
   }
 

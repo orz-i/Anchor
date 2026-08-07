@@ -227,6 +227,8 @@
           <span class="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs">
             {gatewayStatus.state === "running"
               ? `运行中 · ${gatewayStatus.routeCount} 条路由`
+              : gatewayStatus.state === "configured"
+                ? "已配置 · 独立控制"
               : gatewayStatus.state === "error"
                 ? "错误"
                 : "已停止"}
@@ -327,6 +329,13 @@
         {#if gatewayStatus?.error}
           <p class="rounded-md border border-red-500/30 bg-red-500/5 p-2 text-xs text-red-600">
             {gatewayStatus.error}
+          </p>
+        {/if}
+
+        {#if gatewayStatus?.state === "configured"}
+          <p class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2 text-xs text-[var(--text-muted)]">
+            Gateway 配置已保存。桌面 GUI 不再创建共享 listener 或隧道；运行请使用
+            <code>anchor gateway serve &lt;workspace ...&gt;</code>，后续可切换到专用 Gateway service。
           </p>
         {/if}
 

@@ -7,15 +7,11 @@ use crate::app_state::AppState;
 use crate::control::{self, WorkspaceControlStatus};
 use crate::error::{AppError, AppResult};
 
-use crate::runtime::{
-    port_busy_message, try_reclaim_previous_macos_app_port, update_public_url, wait_for_port_free,
-};
+use crate::runtime::{port_busy_message, try_reclaim_previous_macos_app_port, wait_for_port_free};
 
 use crate::mcp::gateway::{self, McpGatewayStatus};
 
 use crate::platform::platform;
-
-use crate::tunnel::{maybe_start_for_runtime, reconcile_mcp_gateway, TunnelServiceKind};
 
 use crate::settings::{AppSettings, McpGatewayConfig};
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
@@ -30,35 +26,34 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
     })
 }
 
+fn tunnel_configured_for_service(
+    profile: &crate::workspace::WorkspaceProfile,
+    service: WorkspaceService,
+) -> bool {
+    match service {
+        WorkspaceService::Mcp => profile.tunnel.tunnel_type != "none",
+        WorkspaceService::Actions => profile.actions.tunnel_type != "none",
+    }
+}
+
 #[tauri::command]
 pub fn get_mcp_gateway(state: State<'_, AppState>) -> AppResult<McpGatewayConfig> {
     state.with_settings(|store| Ok(store.settings().mcp_gateway))
 }
 
+async fn gateway_control_domain_status(config: &McpGatewayConfig) -> McpGatewayStatus {
+    let mut status = gateway::status(config).await;
+    if config.enabled && status.state != "running" {
+        status.state = "configured".into();
+        status.error.clear();
+    }
+    status
+}
+
 #[tauri::command]
 pub async fn get_mcp_gateway_status(state: State<'_, AppState>) -> AppResult<McpGatewayStatus> {
     let config = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
-    Ok(gateway::status(&config).await)
-}
-
-fn restart_active_mcp_listeners(
-    state: &AppState,
-    profiles: &[crate::workspace::WorkspaceProfile],
-    active: &std::collections::HashSet<String>,
-) -> AppResult<()> {
-    for profile in profiles
-        .iter()
-        .filter(|profile| active.contains(&profile.id))
-    {
-        let status = state.with_runtime(|runtime| runtime.restart_mcp(profile))?;
-        if status.state != "running" {
-            return Err(AppError::Message(format!(
-                "重启工作区“{}”的 MCP listener 后状态为 {}：{}",
-                profile.name, status.state, status.local_message
-            )));
-        }
-    }
-    Ok(())
+    Ok(gateway_control_domain_status(&config).await)
 }
 
 const DESKTOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,21 +85,44 @@ fn runtime_status_from_control(
     status: &WorkspaceControlStatus,
     service: WorkspaceService,
 ) -> RuntimeStatusDto {
+    let active_tunnel_url = match service {
+        WorkspaceService::Mcp => status.mcp_tunnel.as_ref(),
+        WorkspaceService::Actions => status.actions_tunnel.as_ref(),
+    }
+    .filter(|tunnel| tunnel.state == "running")
+    .map(|tunnel| tunnel.public_url.trim().trim_end_matches('/'))
+    .filter(|url| !url.is_empty());
     let (port, local_endpoint, public_endpoint, public_message, label) = match service {
-        WorkspaceService::Mcp => (
-            &status.mcp,
-            profile.local_endpoint(),
-            profile.public_endpoint_with(settings),
-            profile.mcp_external_base_url_with(settings),
-            "MCP",
-        ),
-        WorkspaceService::Actions => (
-            &status.actions,
-            profile.actions_local_base_url(),
-            profile.actions_openapi_url_with(settings),
-            profile.actions_effective_public_url_with(settings),
-            "Actions",
-        ),
+        WorkspaceService::Mcp => {
+            let fallback_base = profile.mcp_external_base_url_with(settings);
+            let public_base = active_tunnel_url.unwrap_or(fallback_base.as_str());
+            (
+                &status.mcp,
+                profile.local_endpoint(),
+                if public_base.is_empty() {
+                    String::new()
+                } else {
+                    format!("{public_base}/mcp")
+                },
+                public_base.to_string(),
+                "MCP",
+            )
+        }
+        WorkspaceService::Actions => {
+            let fallback_base = profile.actions_effective_public_url_with(settings);
+            let public_base = active_tunnel_url.unwrap_or(fallback_base.as_str());
+            (
+                &status.actions,
+                profile.actions_local_base_url(),
+                if public_base.is_empty() {
+                    String::new()
+                } else {
+                    format!("{public_base}/openapi.json")
+                },
+                public_base.to_string(),
+                "Actions",
+            )
+        }
     };
     let daemon_pid = status
         .daemon
@@ -245,8 +263,15 @@ async fn start_desktop_service(
             }
         }
     }
-    control::set_daemon_service(&profile, service, true, true, DESKTOP_DAEMON_TIMEOUT, true)
-        .await?;
+    control::set_daemon_service(
+        &profile,
+        service,
+        true,
+        tunnel_configured_for_service(&profile, service),
+        DESKTOP_DAEMON_TIMEOUT,
+        true,
+    )
+    .await?;
     daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
 }
 
@@ -293,7 +318,14 @@ async fn restart_desktop_service(
             }
         }
     }
-    control::restart_daemon_service(&profile, service, true, DESKTOP_DAEMON_TIMEOUT, true).await?;
+    control::restart_daemon_service(
+        &profile,
+        service,
+        tunnel_configured_for_service(&profile, service),
+        DESKTOP_DAEMON_TIMEOUT,
+        true,
+    )
+    .await?;
     daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
 }
 
@@ -304,6 +336,14 @@ pub async fn set_mcp_gateway(
 ) -> AppResult<McpGatewayStatus> {
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
+    let legacy_status = gateway::status(&previous).await;
+    if legacy_status.state == "running" && previous != config {
+        return Err(AppError::Message(
+            "当前桌面进程仍在运行旧版兼容 Gateway。为避免已运行 listener 与新配置分叉，本次热修改已拒绝；请先退出旧桌面运行态，再保存配置。新的 Gateway 运行应由独立 `anchor gateway serve` 控制域负责。"
+                .into(),
+        ));
+    }
     if config.enabled {
         for profile in &profiles {
             let inspection = crate::daemon::inspect(profile)?;
@@ -320,9 +360,6 @@ pub async fn set_mcp_gateway(
             }
         }
     }
-    let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
-    let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
-    let listener_policy_changed = previous.enabled != config.enabled;
     if previous.identity_changed(&config) {
         config.clear_observation();
     } else {
@@ -336,124 +373,7 @@ pub async fn set_mcp_gateway(
         settings.mcp_gateway = config.clone();
         store.update_settings(settings)
     })?;
-
-    let applied = async {
-        if listener_policy_changed {
-            restart_active_mcp_listeners(&state, &profiles, &active)?;
-        }
-        if config.enabled {
-            reconcile_gateway_state(&state).await
-        } else {
-            restore_direct_mcp_exposure(&state).await?;
-            Ok(gateway::status(&config).await)
-        }
-    }
-    .await;
-    if let Err(error) = applied {
-        state.with_settings(|store| {
-            let mut settings = store.settings();
-            settings.mcp_gateway = previous.clone();
-            store.update_settings(settings)
-        })?;
-        let rollback = async {
-            if listener_policy_changed {
-                restart_active_mcp_listeners(&state, &profiles, &active)?;
-            }
-            if previous.enabled {
-                reconcile_gateway_state(&state).await.map(|_| ())
-            } else {
-                restore_direct_mcp_exposure(&state).await
-            }
-        }
-        .await;
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(AppError::Message(format!(
-                "应用 MCP Gateway 配置失败：{error}；恢复上一配置也失败：{rollback_error}"
-            ))),
-        };
-    }
-    applied
-}
-
-fn gateway_context(
-    state: &AppState,
-) -> AppResult<(
-    AppSettings,
-    Vec<crate::workspace::WorkspaceProfile>,
-    std::collections::HashSet<String>,
-)> {
-    let (settings, profiles) =
-        state.with_settings(|store| Ok((store.settings(), store.list().to_vec())))?;
-    let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
-    Ok((settings, profiles, active))
-}
-
-fn persist_gateway_observation(
-    state: &AppState,
-    config: &McpGatewayConfig,
-    profiles: &[crate::workspace::WorkspaceProfile],
-    url: &str,
-) -> AppResult<()> {
-    let normalized = url.trim().trim_end_matches('/');
-    if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
-        return Ok(());
-    }
-    let owner = profiles
-        .iter()
-        .find(|profile| profile.id == config.owner_workspace_id)
-        .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
-    let signature = gateway::tunnel_identity_signature(config, owner)?;
-    let mut candidate = config.clone();
-    candidate.observed_public_url = normalized.to_string();
-    candidate.observed_owner_workspace_id = config.owner_workspace_id.clone();
-    candidate.observed_tunnel_signature = signature.clone();
-    gateway::validate_config(&candidate, profiles)?;
-    state.with_settings(|store| {
-        let mut settings = store.settings();
-        if settings.mcp_gateway.identity_changed(config) {
-            return Ok(());
-        }
-        if settings.mcp_gateway.observed_public_url == normalized
-            && settings.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
-            && settings.mcp_gateway.observed_tunnel_signature == signature
-        {
-            return Ok(());
-        }
-        settings.mcp_gateway.observed_public_url = normalized.to_string();
-        settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
-        settings.mcp_gateway.observed_tunnel_signature = signature;
-        store.update_settings(settings)
-    })
-}
-
-async fn reconcile_gateway_state(state: &AppState) -> AppResult<McpGatewayStatus> {
-    let (settings, profiles, active) = gateway_context(state)?;
-    let mut status = gateway::ensure(&settings.mcp_gateway, &profiles, &active).await?;
-    let public_url = reconcile_mcp_gateway(&settings.mcp_gateway, &profiles, &active).await?;
-    if let Some(public_url) = public_url {
-        persist_gateway_observation(state, &settings.mcp_gateway, &profiles, &public_url)?;
-        status.public_base_url = public_url;
-    }
-    gateway::clear_runtime_error().await;
-    Ok(status)
-}
-
-async fn restore_direct_mcp_exposure(state: &AppState) -> AppResult<()> {
-    let (settings, profiles, active) = gateway_context(state)?;
-    gateway::stop().await?;
-    reconcile_mcp_gateway(&settings.mcp_gateway, &profiles, &active).await?;
-    for profile in profiles
-        .iter()
-        .filter(|profile| active.contains(&profile.id))
-    {
-        if let Some(url) = maybe_start_for_runtime(profile, TunnelServiceKind::Mcp).await? {
-            persist_tunnel_url(state, &profile.id, TunnelServiceKind::Mcp, &url)?;
-        }
-        let current = profile.effective_public_url_with(&settings);
-        update_public_url(&profile.id, "mcp", &current);
-    }
-    Ok(())
+    Ok(gateway_control_domain_status(&config).await)
 }
 
 fn validate_start_resources(
@@ -462,39 +382,6 @@ fn validate_start_resources(
     service: WorkspaceService,
 ) -> AppResult<()> {
     state.with_workspaces(|store| validate_service_start(store.list(), id, service))
-}
-
-fn persist_tunnel_url(
-    state: &AppState,
-    id: &str,
-    kind: TunnelServiceKind,
-    url: &str,
-) -> AppResult<()> {
-    if url.is_empty() {
-        return Ok(());
-    }
-
-    state.with_workspaces(|store| {
-        let Some(mut profile) = store.get(id).cloned() else {
-            return Ok(());
-        };
-
-        match kind {
-            TunnelServiceKind::Mcp => profile.tunnel.public_url = url.to_string(),
-
-            TunnelServiceKind::Actions => profile.actions.public_url = url.to_string(),
-        }
-
-        store.update(profile)?;
-
-        Ok(())
-    })?;
-    let service = match kind {
-        TunnelServiceKind::Mcp => "mcp",
-        TunnelServiceKind::Actions => "actions",
-    };
-    update_public_url(id, service, url);
-    Ok(())
 }
 
 #[allow(clippy::collapsible_if)]
@@ -621,6 +508,7 @@ mod tests {
             started_at_unix: 1,
             service: ServiceSelection::Mcp,
             tunnel: true,
+            tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "daemon.log".into(),
             version: "test".into(),
         };
@@ -654,6 +542,12 @@ mod tests {
                 endpoint: profile.actions_local_base_url(),
             },
             mcp_activity: None,
+            mcp_tunnel: Some(crate::tunnel::TunnelStatus {
+                state: "running".into(),
+                public_url: "https://live-tunnel.example.com".into(),
+                tunnel_pid: Some(77),
+            }),
+            actions_tunnel: None,
         };
 
         let mcp = runtime_status_from_control(
@@ -671,6 +565,7 @@ mod tests {
 
         assert_eq!(mcp.state, "running");
         assert_eq!(mcp.pid, Some(42));
+        assert_eq!(mcp.public_endpoint, "https://live-tunnel.example.com/mcp");
         assert_eq!(actions.state, "stopped");
     }
 
@@ -707,6 +602,8 @@ mod tests {
                 endpoint: profile.actions_local_base_url(),
             },
             mcp_activity: None,
+            mcp_tunnel: None,
+            actions_tunnel: None,
         };
 
         let runtime = runtime_status_from_control(
@@ -719,5 +616,19 @@ mod tests {
         assert_eq!(runtime.state, "error");
         assert_eq!(runtime.pid, Some(99));
         assert!(runtime.local_message.contains("不会接管"));
+    }
+
+    #[tokio::test]
+    async fn enabled_gateway_without_legacy_listener_reports_configured_control_domain() {
+        gateway::stop().await.expect("stop legacy gateway");
+        let config = McpGatewayConfig {
+            enabled: true,
+            ..McpGatewayConfig::default()
+        };
+
+        let status = gateway_control_domain_status(&config).await;
+
+        assert_eq!(status.state, "configured");
+        assert!(status.error.is_empty());
     }
 }

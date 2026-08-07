@@ -1,12 +1,15 @@
+use std::time::Duration;
+
 use tauri::State;
 
 use crate::app_state::AppState;
+use crate::control::{self, DaemonLaunchSpec, WorkspaceControlStatus};
+use crate::daemon;
 use crate::error::{AppError, AppResult};
-use crate::platform::platform;
-use crate::tunnel::{
-    frp_snippet, supervisor, sync_managed_runtime_routes, TunnelServiceKind, TunnelStatus,
-};
+use crate::tunnel::{frp_snippet, TunnelServiceKind, TunnelStatus};
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
+
+const DESKTOP_TUNNEL_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppResult<()> {
     let base = public_url.trim().trim_end_matches('/');
@@ -33,6 +36,16 @@ async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppRe
     Err(AppError::Message(format!(
         "frpc 已建立代理，但公网地址仍不可访问：{last_error}。若使用 FRP HTTPS→HTTP，请确认服务端字段为 vhostHTTPSPort。"
     )))
+}
+
+fn tunnel_configured(
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> bool {
+    match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type != "none",
+        TunnelServiceKind::Actions => profile.actions.tunnel_type != "none",
+    }
 }
 
 fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::WorkspaceProfile> {
@@ -95,89 +108,58 @@ fn persist_public_url(
     Ok(())
 }
 
-async fn sync_tunnel_routes_from_runtime(state: &AppState) -> AppResult<()> {
-    let active_keys = state.with_runtime(|runtime| Ok(runtime.active_tunnel_service_keys()))?;
-    sync_managed_runtime_routes(active_keys).await
+fn workspace_service(kind: TunnelServiceKind) -> WorkspaceService {
+    match kind {
+        TunnelServiceKind::Mcp => WorkspaceService::Mcp,
+        TunnelServiceKind::Actions => WorkspaceService::Actions,
+    }
 }
 
-fn restore_tunnel_config(
-    state: &AppState,
-    id: &str,
+fn configured_tunnel_status(
+    profile: &crate::workspace::WorkspaceProfile,
     kind: TunnelServiceKind,
-    failed: &crate::workspace::WorkspaceProfile,
-    restored: &crate::workspace::WorkspaceProfile,
-) -> AppResult<()> {
-    state.with_workspaces(|store| {
-        let Some(mut current) = store.get(id).cloned() else {
-            return Ok(());
-        };
-        let unchanged_since_failure = match kind {
-            TunnelServiceKind::Mcp => mcp_tunnel_matches(&current, failed),
-            TunnelServiceKind::Actions => actions_tunnel_matches(&current, failed),
-        };
-        if !unchanged_since_failure {
-            return Err(AppError::Message(
-                "检测到更新的隧道配置，已拒绝用旧请求覆盖。".into(),
-            ));
-        }
-        match kind {
-            TunnelServiceKind::Mcp => current.tunnel = restored.tunnel.clone(),
-            TunnelServiceKind::Actions => {
-                current.actions.public_url = restored.actions.public_url.clone();
-                current.actions.tunnel_type = restored.actions.tunnel_type.clone();
-                current.actions.frp_server = restored.actions.frp_server.clone();
-                current.actions.frp_subdomain = restored.actions.frp_subdomain.clone();
-                current.actions.frp_profile_id = restored.actions.frp_profile_id.clone();
-                current.actions.frp_server_port = restored.actions.frp_server_port;
-                current.actions.frp_proxy_type = restored.actions.frp_proxy_type.clone();
-                current.actions.frp_cert_path = restored.actions.frp_cert_path.clone();
-                current.actions.frp_key_path = restored.actions.frp_key_path.clone();
-                current.actions.cloudflare_mode = restored.actions.cloudflare_mode.clone();
-                current.actions.use_proxy = restored.actions.use_proxy;
-            }
-        }
-        store.update(current)
+) -> AppResult<TunnelStatus> {
+    let public_url = match kind {
+        TunnelServiceKind::Mcp => profile.effective_public_url()?,
+        TunnelServiceKind::Actions => profile.actions_effective_public_url()?,
+    };
+    Ok(TunnelStatus {
+        state: "stopped".into(),
+        public_url,
+        tunnel_pid: None,
     })
 }
 
-fn mcp_tunnel_matches(
-    left: &crate::workspace::WorkspaceProfile,
-    right: &crate::workspace::WorkspaceProfile,
-) -> bool {
-    left.tunnel.tunnel_type == right.tunnel.tunnel_type
-        && left.tunnel.public_url == right.tunnel.public_url
-        && left.tunnel.frp_server == right.tunnel.frp_server
-        && left.tunnel.frp_subdomain == right.tunnel.frp_subdomain
-        && left.tunnel.frp_profile_id == right.tunnel.frp_profile_id
-        && left.tunnel.frp_server_port == right.tunnel.frp_server_port
-        && left.tunnel.frp_proxy_type == right.tunnel.frp_proxy_type
-        && left.tunnel.frp_cert_path == right.tunnel.frp_cert_path
-        && left.tunnel.frp_key_path == right.tunnel.frp_key_path
-        && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
-        && left.tunnel.use_proxy == right.tunnel.use_proxy
-}
-
-fn actions_tunnel_matches(
-    left: &crate::workspace::WorkspaceProfile,
-    right: &crate::workspace::WorkspaceProfile,
-) -> bool {
-    left.actions.public_url == right.actions.public_url
-        && left.actions.tunnel_type == right.actions.tunnel_type
-        && left.actions.frp_server == right.actions.frp_server
-        && left.actions.frp_subdomain == right.actions.frp_subdomain
-        && left.actions.frp_profile_id == right.actions.frp_profile_id
-        && left.actions.frp_server_port == right.actions.frp_server_port
-        && left.actions.frp_proxy_type == right.actions.frp_proxy_type
-        && left.actions.frp_cert_path == right.actions.frp_cert_path
-        && left.actions.frp_key_path == right.actions.frp_key_path
-        && left.actions.cloudflare_mode == right.actions.cloudflare_mode
-        && left.actions.use_proxy == right.actions.use_proxy
-}
-
-fn tunnel_type_for(profile: &crate::workspace::WorkspaceProfile, kind: TunnelServiceKind) -> &str {
+fn tunnel_status_from_control(
+    status: WorkspaceControlStatus,
+    kind: TunnelServiceKind,
+) -> Option<TunnelStatus> {
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
-        TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
+        TunnelServiceKind::Mcp => status.mcp_tunnel,
+        TunnelServiceKind::Actions => status.actions_tunnel,
+    }
+}
+
+async fn daemon_tunnel_status(
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<TunnelStatus> {
+    let inspection = daemon::inspect(profile)?;
+    if !inspection.running {
+        return configured_tunnel_status(profile, kind);
+    }
+    let status = control::request_workspace_status(profile)
+        .await
+        .map_err(|error| AppError::Message(format!("读取 daemon 隧道状态失败：{error}")))?;
+    tunnel_status_from_control(status, kind).ok_or_else(|| {
+        AppError::Message("daemon control status omitted tunnel state for protocol v3".into())
+    })
+}
+
+fn daemon_spec(state: &daemon::DaemonState) -> DaemonLaunchSpec {
+    DaemonLaunchSpec {
+        service: state.service,
+        tunnels: state.managed_tunnels(),
     }
 }
 
@@ -213,48 +195,21 @@ pub async fn restart_tunnel(
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-    let settings = state.with_settings(|store| Ok(store.settings()))?;
-
-    let result = {
-        let mut guard = supervisor().lock().await;
-        let was_running = guard.status(&profile, kind, &settings).state == "running";
-        let tunnel_type = tunnel_type_for(&profile, kind);
-        if was_running && tunnel_type == "frp" {
-            // FRP 必须走 supervisor 的原子替换流程。它会暂存当前工作区旧 route，
-            // 新 subdomain 启动成功后才释放旧线路；失败时恢复旧 route。
-            guard
-                .start(&profile, kind, &settings)
-                .await
-                .map_err(|error| (error, guard.route_profile(&id, kind)))
-        } else if was_running {
-            match guard.stop(&profile, kind, &settings).await {
-                Ok(()) => guard
-                    .start(&profile, kind, &settings)
-                    .await
-                    .map_err(|error| (error, None)),
-                Err(error) => Err((error, None)),
-            }
-        } else {
-            Ok(guard.status(&profile, kind, &settings))
-        }
+    if !daemon::inspect(&profile)?.running {
+        return configured_tunnel_status(&profile, kind);
+    }
+    if !tunnel_configured(&profile, kind) {
+        return configured_tunnel_status(&profile, kind);
+    }
+    let current = daemon_tunnel_status(&profile, kind).await?;
+    let action = if current.state == "running" {
+        control::ControlTunnelAction::Restart
+    } else {
+        control::ControlTunnelAction::Start
     };
-
-    let status = match result {
-        Ok(status) => status,
-        Err((error, restored)) => {
-            if let Some(restored) = restored {
-                if let Err(rollback_error) =
-                    restore_tunnel_config(&state, &id, kind, &profile, &restored)
-                {
-                    return Err(AppError::Message(format!(
-                        "FRP 线路已恢复，但配置回滚失败：{error}; rollback: {rollback_error}"
-                    )));
-                }
-            }
-            return Err(error);
-        }
-    };
+    let status = control::request_tunnel_operation(&profile, kind, action, DESKTOP_TUNNEL_TIMEOUT)
+        .await
+        .map_err(|error| AppError::Message(format!("daemon 隧道重载失败：{error}")))?;
 
     persist_public_url(&state, &id, kind, &status.public_url)?;
     Ok(status)
@@ -270,13 +225,14 @@ pub async fn start_tunnel(
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-    let settings = state.with_settings(|store| Ok(store.settings()))?;
-
-    let status = {
-        let mut guard = supervisor().lock().await;
-        guard.start(&profile, kind, &settings).await?
-    };
+    let status = control::request_tunnel_operation(
+        &profile,
+        kind,
+        control::ControlTunnelAction::Start,
+        DESKTOP_TUNNEL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| AppError::Message(format!("daemon 隧道启动失败：{error}")))?;
 
     persist_public_url(&state, &id, kind, &status.public_url)?;
     Ok(status)
@@ -291,10 +247,17 @@ pub async fn stop_tunnel(
     let profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
-    let settings = state.with_settings(|store| Ok(store.settings()))?;
-    let mut guard = supervisor().lock().await;
-    guard.stop(&profile, kind, &settings).await?;
-    Ok(guard.status(&profile, kind, &settings))
+    if !daemon::inspect(&profile)?.running {
+        return configured_tunnel_status(&profile, kind);
+    }
+    control::request_tunnel_operation(
+        &profile,
+        kind,
+        control::ControlTunnelAction::Stop,
+        DESKTOP_TUNNEL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| AppError::Message(format!("daemon 隧道停止失败：{error}")))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -304,17 +267,6 @@ pub struct TunnelTestResult {
     pub public_url: String,
     pub kept_running: bool,
     pub message: String,
-}
-
-fn local_service_listening(
-    profile: &crate::workspace::WorkspaceProfile,
-    kind: TunnelServiceKind,
-) -> AppResult<bool> {
-    let port = match kind {
-        TunnelServiceKind::Mcp => profile.runtime.local_port,
-        TunnelServiceKind::Actions => profile.actions.local_port,
-    };
-    Ok(platform().find_pid_listening_on_port(port)?.is_some())
 }
 
 /// Probe tunnel connectivity without leaving it running unless the local service is already up.
@@ -328,61 +280,77 @@ pub async fn test_tunnel(
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
-    sync_tunnel_routes_from_runtime(&state).await?;
-    let settings = state.with_settings(|store| Ok(store.settings()))?;
-    let runtime_running = local_service_listening(&profile, kind)?;
+    let inspection = daemon::inspect(&profile)?;
+    let previous_state = inspection
+        .state
+        .as_ref()
+        .filter(|_| inspection.running)
+        .cloned();
+    let previous_spec = previous_state.as_ref().map(daemon_spec);
+    let runtime_running = previous_state.as_ref().is_some_and(|daemon_state| {
+        control::service_is_selected(daemon_state.service, workspace_service(kind))
+    });
 
-    let was_tunnel_running = {
-        let guard = supervisor().lock().await;
-        guard.status(&profile, kind, &settings).state == "running"
+    if previous_state.is_none() {
+        let temporary_service = match kind {
+            TunnelServiceKind::Mcp => daemon::ServiceSelection::Mcp,
+            TunnelServiceKind::Actions => daemon::ServiceSelection::Actions,
+        };
+        control::ensure_daemon_running(
+            &profile,
+            DaemonLaunchSpec {
+                service: temporary_service,
+                tunnels: None,
+            },
+            DESKTOP_TUNNEL_TIMEOUT,
+        )
+        .await?;
+    }
+
+    let before = daemon_tunnel_status(&profile, kind).await?;
+    let action = if before.state == "running" {
+        control::ControlTunnelAction::Restart
+    } else {
+        control::ControlTunnelAction::Start
     };
-
-    let result = {
-        let mut guard = supervisor().lock().await;
-        if was_tunnel_running && tunnel_type_for(&profile, kind) == "frp" {
-            guard
-                .start(&profile, kind, &settings)
-                .await
-                .map_err(|error| (error, guard.route_profile(&id, kind)))
-        } else {
-            let stop_result = if was_tunnel_running {
-                guard.stop(&profile, kind, &settings).await
-            } else {
-                Ok(())
-            };
-            match stop_result {
-                Ok(()) => guard
-                    .start(&profile, kind, &settings)
-                    .await
-                    .map_err(|error| (error, None)),
-                Err(error) => Err((error, None)),
-            }
-        }
-    };
-
-    let status = match result {
-        Ok(status) => status,
-        Err((error, restored)) => {
-            if let Some(restored) = restored {
-                if let Err(rollback_error) =
-                    restore_tunnel_config(&state, &id, kind, &profile, &restored)
-                {
-                    return Err(AppError::Message(format!(
-                        "FRP 测试失败且配置回滚失败：{error}; rollback: {rollback_error}"
-                    )));
+    let status =
+        match control::request_tunnel_operation(&profile, kind, action, DESKTOP_TUNNEL_TIMEOUT)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                if previous_state.is_none() {
+                    let _ = control::reconcile_daemon(
+                        &profile,
+                        previous_spec,
+                        DESKTOP_TUNNEL_TIMEOUT,
+                        true,
+                    )
+                    .await;
                 }
+                return Err(AppError::Message(format!(
+                    "daemon 隧道测试启动失败：{error}"
+                )));
             }
-            return Err(error);
-        }
-    };
+        };
 
     let public_url = status.public_url.clone();
     let keep_tunnel = runtime_running;
 
     if let Err(error) = probe_public_tunnel(&public_url, kind).await {
         if !keep_tunnel {
-            let mut guard = supervisor().lock().await;
-            let _ = guard.stop(&profile, kind, &settings).await;
+            let _ = control::request_tunnel_operation(
+                &profile,
+                kind,
+                control::ControlTunnelAction::Stop,
+                DESKTOP_TUNNEL_TIMEOUT,
+            )
+            .await;
+        }
+        if previous_state.is_none() {
+            let _ =
+                control::reconcile_daemon(&profile, previous_spec, DESKTOP_TUNNEL_TIMEOUT, true)
+                    .await;
         }
         return Err(error);
     }
@@ -393,17 +361,20 @@ pub async fn test_tunnel(
             success: !public_url.is_empty() || status.state == "running",
             public_url,
             kept_running: true,
-            message: if runtime_running {
-                "隧道测试成功，已保持连接（服务运行中）。".into()
-            } else {
-                "隧道测试成功，已恢复连接。".into()
-            },
+            message: "隧道测试成功，已保持连接（服务运行中）。".into(),
         });
     }
 
-    {
-        let mut guard = supervisor().lock().await;
-        guard.stop(&profile, kind, &settings).await?;
+    control::request_tunnel_operation(
+        &profile,
+        kind,
+        control::ControlTunnelAction::Stop,
+        DESKTOP_TUNNEL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| AppError::Message(format!("测试后停止 daemon 隧道失败：{error}")))?;
+    if previous_state.is_none() {
+        control::reconcile_daemon(&profile, previous_spec, DESKTOP_TUNNEL_TIMEOUT, true).await?;
     }
 
     let success = !public_url.is_empty();
@@ -419,4 +390,102 @@ pub async fn test_tunnel(
         kept_running: false,
         message,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::PortStatus;
+    use crate::daemon::{DaemonInspection, DaemonState, ServiceSelection};
+
+    fn control_status(profile: &crate::workspace::WorkspaceProfile) -> WorkspaceControlStatus {
+        WorkspaceControlStatus {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            path: profile.path.clone(),
+            daemon: DaemonInspection {
+                supported: true,
+                running: true,
+                stale: false,
+                ambiguous: false,
+                pid_matches: true,
+                state: Some(DaemonState {
+                    schema_version: 1,
+                    workspace_id: profile.id.clone(),
+                    workspace_name: profile.name.clone(),
+                    workspace_path: profile.path.clone(),
+                    pid: 42,
+                    started_at_unix: 1,
+                    service: ServiceSelection::All,
+                    tunnel: true,
+                    tunnel_services: Some(ServiceSelection::Mcp),
+                    log_path: "daemon.log".into(),
+                    version: "test".into(),
+                }),
+                detail: "running".into(),
+            },
+            mcp: PortStatus {
+                service: "mcp".into(),
+                port: profile.runtime.local_port,
+                listening: true,
+                pid: Some(42),
+                owner: "daemon".into(),
+                endpoint: profile.local_endpoint(),
+            },
+            actions: PortStatus {
+                service: "actions".into(),
+                port: profile.actions.local_port,
+                listening: true,
+                pid: Some(42),
+                owner: "daemon".into(),
+                endpoint: profile.actions_local_base_url(),
+            },
+            mcp_activity: None,
+            mcp_tunnel: Some(TunnelStatus {
+                state: "running".into(),
+                public_url: "https://mcp.example.com".into(),
+                tunnel_pid: Some(7),
+            }),
+            actions_tunnel: Some(TunnelStatus {
+                state: "stopped".into(),
+                public_url: "https://actions.example.com".into(),
+                tunnel_pid: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn tunnel_status_is_selected_from_the_daemon_control_snapshot() {
+        let profile =
+            crate::workspace::WorkspaceProfile::new(".".into(), Some("tunnel-status".into()));
+        let status = control_status(&profile);
+
+        assert_eq!(
+            tunnel_status_from_control(status.clone(), TunnelServiceKind::Mcp)
+                .expect("mcp tunnel")
+                .public_url,
+            "https://mcp.example.com"
+        );
+        assert_eq!(
+            tunnel_status_from_control(status, TunnelServiceKind::Actions)
+                .expect("actions tunnel")
+                .state,
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn daemon_spec_preserves_partial_tunnel_ownership() {
+        let profile =
+            crate::workspace::WorkspaceProfile::new(".".into(), Some("tunnel-spec".into()));
+        let state = control_status(&profile).daemon.state.expect("daemon state");
+
+        assert_eq!(
+            daemon_spec(&state),
+            DaemonLaunchSpec {
+                service: ServiceSelection::All,
+                tunnels: Some(ServiceSelection::Mcp),
+            }
+        );
+    }
 }

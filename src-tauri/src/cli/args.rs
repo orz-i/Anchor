@@ -371,11 +371,29 @@ fn parse_logs(args: &mut VecDeque<String>) -> Result<LogsOptions, String> {
 }
 
 fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
-    let options = parse_run_options(args, "daemon-run")?;
+    let workspace = pop_value(args, "daemon-run")?;
+    let mut service = ServiceSelection::Mcp;
+    let mut tunnel_services = None;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--service" => {
+                service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
+            }
+            "--tunnel" => tunnel_services = Some(service),
+            "--no-tunnel" => tunnel_services = None,
+            "--tunnel-service" => {
+                tunnel_services = Some(ServiceSelection::parse(&pop_value(
+                    args,
+                    "--tunnel-service",
+                )?)?);
+            }
+            other => return Err(format!("daemon-run 不支持参数：{other}")),
+        }
+    }
     Ok(Command::DaemonRun {
-        workspace: options.workspace,
-        service: options.service.unwrap_or(ServiceSelection::Mcp),
-        tunnel: options.tunnel.unwrap_or(false),
+        workspace,
+        service,
+        tunnel_services,
     })
 }
 
@@ -473,7 +491,7 @@ pub enum Command {
     DaemonRun {
         workspace: String,
         service: ServiceSelection,
-        tunnel: bool,
+        tunnel_services: Option<ServiceSelection>,
     },
 }
 

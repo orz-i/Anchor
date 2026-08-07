@@ -15,7 +15,7 @@ use crate::runtime::port::{
 use crate::secret::SecretStore;
 use crate::settings::AppSettings;
 use crate::tools::policy::PolicySettings;
-use crate::tunnel::{append_profile_log, TunnelServiceKind};
+use crate::tunnel::append_profile_log;
 use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
 
 const MAX_RECOVERY_ATTEMPTS: u8 = 5;
@@ -115,24 +115,6 @@ impl RuntimeSupervisor {
     pub fn drop_workspace(&mut self, profile: &WorkspaceProfile) {
         self.sync_stop_and_wait(profile, ServiceKind::Mcp);
         self.sync_stop_and_wait(profile, ServiceKind::Actions);
-    }
-
-    pub fn active_tunnel_service_keys(&self) -> HashSet<(String, TunnelServiceKind)> {
-        self.entries
-            .iter()
-            .filter_map(|((workspace_id, kind), entry)| match entry.phase {
-                RuntimePhase::Running | RuntimePhase::Starting | RuntimePhase::Recovering => {
-                    Some((
-                        workspace_id.clone(),
-                        match kind {
-                            ServiceKind::Mcp => TunnelServiceKind::Mcp,
-                            ServiceKind::Actions => TunnelServiceKind::Actions,
-                        },
-                    ))
-                }
-                _ => None,
-            })
-            .collect()
     }
 
     pub fn active_mcp_workspace_ids(&self) -> HashSet<String> {

@@ -159,6 +159,7 @@ export interface DaemonState {
   startedAtUnix: number;
   service: "mcp" | "actions" | "all";
   tunnel: boolean;
+  tunnelServices?: "mcp" | "actions" | "all" | null;
   logPath: string;
   version: string;
 }
@@ -182,6 +183,12 @@ export interface WorkspacePortStatus {
   endpoint: string;
 }
 
+export interface WorkspaceTunnelStatus {
+  state: string;
+  publicUrl: string;
+  tunnelPid: number | null;
+}
+
 export interface WorkspaceControlStatus {
   id: string;
   name: string;
@@ -190,6 +197,8 @@ export interface WorkspaceControlStatus {
   mcp: WorkspacePortStatus;
   actions: WorkspacePortStatus;
   mcpActivity?: McpActivity | null;
+  mcpTunnel?: WorkspaceTunnelStatus | null;
+  actionsTunnel?: WorkspaceTunnelStatus | null;
 }
 
 export type McpActivityState =

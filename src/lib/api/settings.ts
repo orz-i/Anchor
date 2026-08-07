@@ -64,7 +64,7 @@ export interface McpGatewayConfigDto {
 }
 
 export interface McpGatewayStatusDto {
-  state: "stopped" | "running" | "error";
+  state: "stopped" | "configured" | "running" | "error";
   localEndpoint: string;
   publicBaseUrl: string;
   routeCount: number;

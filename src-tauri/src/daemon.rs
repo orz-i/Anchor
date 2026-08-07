@@ -64,8 +64,17 @@ pub struct DaemonState {
     pub started_at_unix: u64,
     pub service: ServiceSelection,
     pub tunnel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_services: Option<ServiceSelection>,
     pub log_path: String,
     pub version: String,
+}
+
+impl DaemonState {
+    pub fn managed_tunnels(&self) -> Option<ServiceSelection> {
+        self.tunnel_services
+            .or_else(|| self.tunnel.then_some(self.service))
+    }
 }
 
 fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonState>> {
@@ -88,7 +97,7 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
                 .filter_map(|part| std::str::from_utf8(part).ok())
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>();
-            let Some((service, tunnel)) = parse_daemon_args(&args, &profile.id) else {
+            let Some((service, tunnel_services)) = parse_daemon_args(&args, &profile.id) else {
                 continue;
             };
             states.push(DaemonState {
@@ -99,7 +108,8 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
                 pid,
                 started_at_unix: 0,
                 service,
-                tunnel,
+                tunnel: tunnel_services.is_some(),
+                tunnel_services,
                 log_path: daemon_log_path(&profile.id).display().to_string(),
                 version: "unknown".into(),
             });
@@ -115,13 +125,16 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn parse_daemon_args(args: &[&str], workspace_id: &str) -> Option<(ServiceSelection, bool)> {
+fn parse_daemon_args(
+    args: &[&str],
+    workspace_id: &str,
+) -> Option<(ServiceSelection, Option<ServiceSelection>)> {
     let daemon_index = args.iter().position(|arg| *arg == "daemon-run")?;
     if args.get(daemon_index + 1).copied()? != workspace_id {
         return None;
     }
     let mut service = ServiceSelection::Mcp;
-    let mut tunnel = false;
+    let mut tunnel_services = None;
     let mut index = daemon_index + 2;
     while index < args.len() {
         match args[index] {
@@ -130,17 +143,22 @@ fn parse_daemon_args(args: &[&str], workspace_id: &str) -> Option<(ServiceSelect
                 index += 2;
             }
             "--tunnel" => {
-                tunnel = true;
+                tunnel_services = Some(service);
                 index += 1;
             }
             "--no-tunnel" => {
-                tunnel = false;
+                tunnel_services = None;
                 index += 1;
+            }
+            "--tunnel-service" => {
+                tunnel_services =
+                    Some(ServiceSelection::parse(args.get(index + 1).copied()?).ok()?);
+                index += 2;
             }
             _ => index += 1,
         }
     }
-    Some((service, tunnel))
+    Some((service, tunnel_services))
 }
 
 pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResult<()> {
@@ -352,10 +370,13 @@ fn running_inspection(state: DaemonState, recovered: bool) -> DaemonInspection {
         ambiguous: false,
         pid_matches: true,
         detail: format!(
-            "daemon 正在运行，PID {}，service={}，tunnel={}{}",
+            "daemon 正在运行，PID {}，service={}，tunnels={}{}",
             state.pid,
             state.service.as_str(),
-            state.tunnel,
+            state
+                .managed_tunnels()
+                .map(ServiceSelection::as_str)
+                .unwrap_or("none"),
             if recovered {
                 "（从 /proc 恢复）"
             } else {
@@ -370,6 +391,14 @@ pub fn acquire(
     profile: &WorkspaceProfile,
     service: ServiceSelection,
     tunnel: bool,
+) -> AppResult<DaemonGuard> {
+    acquire_with_tunnels(profile, service, tunnel.then_some(service))
+}
+
+pub fn acquire_with_tunnels(
+    profile: &WorkspaceProfile,
+    service: ServiceSelection,
+    tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<DaemonGuard> {
     ensure_linux()?;
     let paths = daemon_paths(&profile.id)?;
@@ -392,7 +421,8 @@ pub fn acquire(
         pid,
         started_at_unix: unix_now(),
         service,
-        tunnel,
+        tunnel: tunnel_services.is_some(),
+        tunnel_services,
         log_path: daemon_log_path(&profile.id).display().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
     };
@@ -405,10 +435,41 @@ pub fn acquire(
     })
 }
 
+pub fn update_tunnel_services(
+    profile: &WorkspaceProfile,
+    service: ServiceSelection,
+    tunnel_services: Option<ServiceSelection>,
+) -> AppResult<()> {
+    ensure_linux()?;
+    let paths = daemon_paths(&profile.id)?;
+    let mut state = read_state(&paths.state)?.ok_or_else(|| {
+        AppError::Message("daemon state disappeared while updating tunnel ownership".into())
+    })?;
+    let current_pid = std::process::id();
+    if state.pid != current_pid || state.workspace_id != profile.id {
+        return Err(AppError::Message(format!(
+            "refusing to update daemon state owned by PID {} / workspace {}",
+            state.pid, state.workspace_id
+        )));
+    }
+    state.service = service;
+    state.tunnel = tunnel_services.is_some();
+    state.tunnel_services = tunnel_services;
+    atomic_write_json(&paths.state, &state)
+}
+
 pub fn spawn(
     profile: &WorkspaceProfile,
     service: ServiceSelection,
     tunnel: bool,
+) -> AppResult<u32> {
+    spawn_with_tunnels(profile, service, tunnel.then_some(service))
+}
+
+pub fn spawn_with_tunnels(
+    profile: &WorkspaceProfile,
+    service: ServiceSelection,
+    tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<u32> {
     ensure_linux()?;
     let inspection = inspect(profile)?;
@@ -438,8 +499,13 @@ pub fn spawn(
         .arg("daemon-run")
         .arg(&profile.id)
         .arg("--service")
-        .arg(service.as_str())
-        .arg(if tunnel { "--tunnel" } else { "--no-tunnel" })
+        .arg(service.as_str());
+    if let Some(tunnels) = tunnel_services {
+        command.arg("--tunnel-service").arg(tunnels.as_str());
+    } else {
+        command.arg("--no-tunnel");
+    }
+    command
         .current_dir(&profile.path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -873,6 +939,7 @@ mod tests {
             started_at_unix: 100,
             service: ServiceSelection::All,
             tunnel: true,
+            tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "/tmp/daemon.log".into(),
             version: "1".into(),
         };
@@ -881,6 +948,7 @@ mod tests {
 
         assert_eq!(value["service"], "all");
         assert_eq!(value["tunnel"], true);
+        assert_eq!(value["tunnelServices"], "mcp");
         assert_eq!(value["pid"], 42);
     }
 
@@ -898,7 +966,22 @@ mod tests {
                 ],
                 "workspace",
             ),
-            Some((ServiceSelection::All, true))
+            Some((ServiceSelection::All, Some(ServiceSelection::All)))
+        );
+        assert_eq!(
+            parse_daemon_args(
+                &[
+                    "anchor",
+                    "daemon-run",
+                    "workspace",
+                    "--service",
+                    "all",
+                    "--tunnel-service",
+                    "mcp",
+                ],
+                "workspace",
+            ),
+            Some((ServiceSelection::All, Some(ServiceSelection::Mcp)))
         );
         assert_eq!(
             parse_daemon_args(&["anchor", "daemon-run", "other"], "workspace"),

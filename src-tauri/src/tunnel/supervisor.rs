@@ -13,7 +13,8 @@ use crate::workspace::WorkspaceProfile;
 use super::cloudflare::{self, CloudflareTunnelHandle};
 use super::frp::{self, FrpServerConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TunnelServiceKind {
     Mcp,
     Actions,
@@ -31,7 +32,7 @@ impl TunnelServiceKind {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelStatus {
     pub state: String,
@@ -98,16 +99,6 @@ impl TunnelSupervisor {
             public_url: public_url_for_profile(profile, kind, settings),
             tunnel_pid: None,
         }
-    }
-
-    pub fn route_profile(
-        &self,
-        workspace_id: &str,
-        kind: TunnelServiceKind,
-    ) -> Option<WorkspaceProfile> {
-        self.frp_routes
-            .get(&(workspace_id.to_string(), kind))
-            .map(|route| route.profile.clone())
     }
 
     pub async fn start(
@@ -369,46 +360,6 @@ impl TunnelSupervisor {
             return Ok(());
         }
         self.stop_internal(&profile.id, kind, &settings).await
-    }
-
-    pub fn restore_active_frp_routes(
-        &mut self,
-        profiles: &[WorkspaceProfile],
-        active_runtime_keys: &HashSet<(String, TunnelServiceKind)>,
-        settings: &AppSettings,
-    ) {
-        let mut changed_workspaces = HashSet::new();
-        for profile in profiles {
-            for kind in [TunnelServiceKind::Mcp, TunnelServiceKind::Actions] {
-                let key = (profile.id.clone(), kind);
-                if tunnel_type_for(profile, kind) != "frp" || !active_runtime_keys.contains(&key) {
-                    continue;
-                }
-
-                match self.frp_routes.get_mut(&key) {
-                    Some(route) => {
-                        route.profile = profile.clone();
-                        changed_workspaces.insert(profile.id.clone());
-                    }
-                    None => {
-                        self.frp_routes.insert(
-                            key,
-                            FrpRoute {
-                                profile: profile.clone(),
-                                kind,
-                            },
-                        );
-                        changed_workspaces.insert(profile.id.clone());
-                    }
-                }
-            }
-        }
-
-        changed_workspaces.extend(self.frpc.keys().cloned());
-        for workspace_id in changed_workspaces {
-            let pid = self.frpc.get(&workspace_id).and_then(|process| process.pid);
-            self.sync_frp_sessions_for_workspace(settings, &workspace_id, pid);
-        }
     }
 
     fn validate_frp_route_compatibility(
@@ -936,40 +887,6 @@ mod tests {
         );
 
         assert!(!supervisor.frp_route_matches(&key, &stale, TunnelServiceKind::Mcp, &settings));
-    }
-
-    #[test]
-    fn restore_active_frp_routes_rehydrates_all_listening_workspaces() {
-        let settings = AppSettings::default();
-        let first = frp_profile("first", "gp");
-        let second = frp_profile("second", "lb");
-        let active_runtime_keys = HashSet::from([
-            (first.id.clone(), TunnelServiceKind::Mcp),
-            (second.id.clone(), TunnelServiceKind::Mcp),
-        ]);
-
-        let mut supervisor = TunnelSupervisor::new();
-        supervisor.restore_active_frp_routes(
-            &[first.clone(), second.clone()],
-            &active_runtime_keys,
-            &settings,
-        );
-
-        assert_eq!(supervisor.frp_routes.len(), 2);
-        assert!(supervisor
-            .frp_routes
-            .contains_key(&(first.id.clone(), TunnelServiceKind::Mcp)));
-        assert!(supervisor
-            .frp_routes
-            .contains_key(&(second.id.clone(), TunnelServiceKind::Mcp)));
-        assert_eq!(supervisor.sessions.len(), 2);
-        assert_eq!(
-            supervisor
-                .sessions
-                .get(&(second.id.clone(), TunnelServiceKind::Mcp))
-                .map(|session| session.public_url.as_str()),
-            Some("https://lb.frp.example.com")
-        );
     }
 
     #[test]

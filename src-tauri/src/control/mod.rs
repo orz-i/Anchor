@@ -8,19 +8,25 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::{self, DaemonInspection};
 use crate::error::AppResult;
 use crate::platform::platform;
+use crate::tunnel::TunnelStatus;
 use crate::workspace::{McpActivityDto, WorkspaceProfile};
 
 pub use ipc::{
     control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_logs,
-    workspace_status_via_daemon_or_local, ControlClientError, ControlServer, DaemonControlCommand,
-    DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
+    request_tunnel_operation, request_workspace_status, workspace_status_via_daemon_or_local,
+    ControlClientError, ControlServer, DaemonControlCommand, DaemonControlReceiver,
+    DaemonControlSender, LocalControlEndpoint,
 };
+pub(crate) use ipc::{finish_tunnel_operation, mark_control_operation_running};
 pub use lifecycle::{
-    desired_service_selection, ensure_daemon_running, reconcile_daemon,
-    request_daemon_exit_and_wait, restart_daemon_service, set_daemon_service, DaemonLaunchSpec,
+    desired_service_selection, desired_tunnel_selection, ensure_daemon_running, reconcile_daemon,
+    request_daemon_exit_and_wait, restart_daemon_service, service_is_selected, set_daemon_service,
+    DaemonLaunchSpec,
 };
 pub use logs::read_log_batch;
-pub use protocol::{ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlOperation};
+pub use protocol::{
+    ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlOperation, ControlTunnelAction,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +50,10 @@ pub struct WorkspaceControlStatus {
     pub actions: PortStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_activity: Option<McpActivityDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tunnel: Option<TunnelStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions_tunnel: Option<TunnelStatus>,
 }
 
 pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceControlStatus> {
@@ -72,6 +82,8 @@ pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceContro
             daemon_pid,
         )?,
         mcp_activity: None,
+        mcp_tunnel: None,
+        actions_tunnel: None,
     })
 }
 

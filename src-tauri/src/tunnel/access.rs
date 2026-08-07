@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use tokio::sync::Mutex;
 
-use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::runtime::{current_public_url, update_public_url};
@@ -168,25 +167,6 @@ pub async fn stop_for_runtime(
 pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
     let mut guard = supervisor().lock().await;
     guard.drop_workspace(workspace_id).await
-}
-
-pub async fn sync_managed_runtime_routes(
-    mut active_runtime_keys: HashSet<(String, TunnelServiceKind)>,
-) -> AppResult<()> {
-    let settings = AppSettings::load()?;
-    let mut profiles = DataStore::read_file(|data| Ok(data.profiles.clone()))?;
-    if settings.mcp_gateway.enabled {
-        active_runtime_keys.retain(|(_, kind)| *kind != TunnelServiceKind::Mcp);
-        if let Some(owner) = profiles
-            .iter_mut()
-            .find(|profile| profile.id == settings.mcp_gateway.owner_workspace_id)
-        {
-            owner.runtime.local_port = settings.mcp_gateway.local_port;
-        }
-    }
-    let mut guard = supervisor().lock().await;
-    guard.restore_active_frp_routes(&profiles, &active_runtime_keys, &settings);
-    Ok(())
 }
 
 pub async fn cleanup_orphan_for_runtime(

@@ -1,14 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 use super::WorkspaceControlStatus;
+use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
 pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";
 pub const ERROR_CONTROL_COMMAND_UNAVAILABLE: &str = "control_command_unavailable";
 pub const ERROR_LOG_READ_FAILED: &str = "log_read_failed";
+pub const ERROR_OPERATION_FAILED: &str = "operation_failed";
+pub const ERROR_OPERATION_NOT_FOUND: &str = "operation_not_found";
 pub const ERROR_INTERNAL: &str = "internal_error";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +58,46 @@ pub enum ControlMethod {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
     },
+    TunnelControl {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        service: TunnelServiceKind,
+        action: ControlTunnelAction,
+    },
+    OperationStatus {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        #[serde(rename = "operationId")]
+        operation_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlTunnelAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlAsyncState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlAsyncOperation {
+    pub operation_id: String,
+    pub state: ControlAsyncState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_status: Option<TunnelStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ControlError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +190,13 @@ pub enum ControlResult {
     Accepted {
         operation: ControlOperation,
         daemon_pid: u32,
+    },
+    OperationAccepted {
+        operation_id: String,
+        daemon_pid: u32,
+    },
+    OperationStatus {
+        operation: ControlAsyncOperation,
     },
 }
 
@@ -249,5 +299,32 @@ mod tests {
         })
         .expect("serialize restart request");
         assert_eq!(restart["method"], "prepare_restart");
+
+        let tunnel = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-5".into(),
+            method: ControlMethod::TunnelControl {
+                workspace_id: "workspace-1".into(),
+                service: crate::tunnel::TunnelServiceKind::Actions,
+                action: ControlTunnelAction::Restart,
+            },
+        })
+        .expect("serialize tunnel request");
+        assert_eq!(tunnel["method"], "tunnel_control");
+        assert_eq!(tunnel["workspaceId"], "workspace-1");
+        assert_eq!(tunnel["service"], "actions");
+        assert_eq!(tunnel["action"], "restart");
+
+        let operation = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-6".into(),
+            method: ControlMethod::OperationStatus {
+                workspace_id: "workspace-1".into(),
+                operation_id: "operation-1".into(),
+            },
+        })
+        .expect("serialize operation status request");
+        assert_eq!(operation["method"], "operation_status");
+        assert_eq!(operation["operationId"], "operation-1");
     }
 }

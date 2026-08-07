@@ -11,7 +11,7 @@ use crate::workspace::WorkspaceProfile;
 pub use access::{
     cleanup_orphan_for_runtime, drop_workspace, ensure_for_runtime,
     is_quick_tunnel_url_change_error, maybe_start_for_runtime, reconcile_mcp_gateway,
-    stop_for_runtime, supervisor, sync_managed_runtime_routes,
+    stop_for_runtime, supervisor,
 };
 
 #[allow(unused_imports)]

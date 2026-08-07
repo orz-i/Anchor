@@ -20,7 +20,8 @@ use crate::runtime::{await_listener_shutdown, update_public_url, RuntimeSupervis
 use crate::settings::McpGatewayConfig;
 use crate::tunnel::{
     ensure_for_runtime, is_quick_tunnel_url_change_error, log_dir_for_profile,
-    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime, TunnelServiceKind,
+    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime,
+    supervisor as tunnel_supervisor, TunnelServiceKind, TunnelStatus,
 };
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
@@ -404,7 +405,10 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     }
     let state = control::ensure_daemon_running(
         &profile,
-        control::DaemonLaunchSpec { service, tunnel },
+        control::DaemonLaunchSpec {
+            service,
+            tunnels: tunnel.then_some(service),
+        },
         Duration::from_secs(options.wait_seconds),
     )
     .await?;
@@ -848,46 +852,80 @@ fn doctor_check(name: &str, ok: bool, detail: String, hint: &str) -> DoctorCheck
     }
 }
 
-async fn restart_daemon(mut options: RunOptions, as_json: bool) -> AppResult<()> {
+async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
-    let current = daemon::inspect(&profile)?.state;
-    if options.service.is_none() {
-        options.service = current.as_ref().map(|state| state.service);
+    let inspection = daemon::inspect(&profile)?;
+    let current = inspection.state.as_ref().filter(|_| inspection.running);
+    let service = options
+        .service
+        .or_else(|| current.map(|state| state.service))
+        .unwrap_or(ServiceSelection::Mcp);
+    let tunnels = match options.tunnel {
+        Some(true) => Some(service),
+        Some(false) => None,
+        None => current.and_then(|state| state.managed_tunnels()),
+    };
+    if store.settings().mcp_gateway.enabled && service.includes_mcp() {
+        return Err(AppError::Message(
+            "MCP Gateway 模式不支持每工作区独立 daemon；请使用 `anchor gateway serve <workspace ...>` 并交由 systemd 监督。"
+                .into(),
+        ));
     }
-    if options.tunnel.is_none() {
-        options.tunnel = current.as_ref().map(|state| state.tunnel);
+    if current.is_none() {
+        ensure_selected_ports_available(&profile, service)?;
+    } else {
+        control::request_daemon_exit_and_wait(
+            &profile,
+            control::ControlOperation::Restart,
+            Duration::from_secs(10),
+            true,
+        )
+        .await?;
     }
-    let _ = control::request_daemon_exit_and_wait(
+    let state = control::ensure_daemon_running(
         &profile,
-        control::ControlOperation::Restart,
-        Duration::from_secs(10),
-        true,
+        control::DaemonLaunchSpec { service, tunnels },
+        Duration::from_secs(options.wait_seconds),
     )
     .await?;
-    start_daemon(options, as_json).await
+    print_daemon_result(
+        "started",
+        &profile,
+        Some(state.pid),
+        service,
+        tunnels.is_some(),
+        as_json,
+    )
 }
 
-async fn run_daemon(selector: &str, service: ServiceSelection, tunnel: bool) -> AppResult<()> {
+async fn run_daemon(
+    selector: &str,
+    service: ServiceSelection,
+    tunnel_services: Option<ServiceSelection>,
+) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
-    let _guard = daemon::acquire(&profile, service, tunnel)?;
+    let _guard = daemon::acquire_with_tunnels(&profile, service, tunnel_services)?;
     let (control_sender, control_receiver) = control::control_channel();
     let control_server = control::ControlServer::start(profile.clone(), control_sender)?;
     crate::tunnel::append_profile_log(
         &profile.id,
         "daemon.log",
         &format!(
-            "[daemon] started pid={} service={} tunnel={tunnel} control={:?}",
+            "[daemon] started pid={} service={} tunnels={} control={:?}",
             std::process::id(),
             service.as_str(),
+            tunnel_services
+                .map(ServiceSelection::as_str)
+                .unwrap_or("none"),
             control_server.endpoint()
         ),
     );
     let result = serve_workspace(
         &profile.id,
         service,
-        tunnel,
+        tunnel_services,
         false,
         false,
         Some(control_receiver),
@@ -1022,9 +1060,16 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             workspace,
             service,
             tunnel,
-        } => serve_workspace(&workspace, service, tunnel, cli.json, true, None)
-            .await
-            .map(|_| 0),
+        } => serve_workspace(
+            &workspace,
+            service,
+            tunnel.then_some(service),
+            cli.json,
+            true,
+            None,
+        )
+        .await
+        .map(|_| 0),
         Command::Start(options) => start_daemon(options, cli.json).await.map(|_| 0),
         Command::Stop(options) => stop_daemon(options, cli.json).await.map(|_| 0),
         Command::Restart(options) => restart_daemon(options, cli.json).await.map(|_| 0),
@@ -1037,8 +1082,10 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::DaemonRun {
             workspace,
             service,
-            tunnel,
-        } => run_daemon(&workspace, service, tunnel).await.map(|_| 0),
+            tunnel_services,
+        } => run_daemon(&workspace, service, tunnel_services)
+            .await
+            .map(|_| 0),
     }
 }
 
@@ -1171,13 +1218,13 @@ fn print_port_status(status: &control::PortStatus) {
 async fn serve_workspace(
     selector: &str,
     service: ServiceSelection,
-    with_tunnel: bool,
+    tunnel_services: Option<ServiceSelection>,
     as_json: bool,
     foreground: bool,
     mut control_commands: Option<control::DaemonControlReceiver>,
 ) -> AppResult<()> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), selector)?.clone();
+    let mut profile = resolve_workspace(store.list(), selector)?.clone();
     ensure_workspace_directory(&profile)?;
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
@@ -1201,16 +1248,19 @@ async fn serve_workspace(
             started_services.push(ServiceKind::Actions);
         }
 
-        if with_tunnel {
-            for kind in selected_tunnels(service) {
+        if let Some(tunnel_services) = tunnel_services {
+            for kind in selected_tunnels(tunnel_services) {
                 managed_tunnels.push(kind);
                 match maybe_start_for_runtime(&profile, kind).await {
-                    Ok(Some(url)) if !as_json => {
-                        print_runtime_line(
-                            &format!("{} tunnel\t{url}", tunnel_label(kind)),
-                            foreground,
-                            false,
-                        );
+                    Ok(Some(url)) => {
+                        persist_daemon_tunnel_url(&mut profile, kind, &url)?;
+                        if !as_json {
+                            print_runtime_line(
+                                &format!("{} tunnel\t{url}", tunnel_label(kind)),
+                                foreground,
+                                false,
+                            );
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -1260,7 +1310,8 @@ async fn serve_workspace(
             "event": "ready",
             "workspace": {"id": profile.id, "name": profile.name, "path": profile.path},
             "services": started_services.iter().map(|kind| service_label(*kind)).collect::<Vec<_>>(),
-            "tunnel": with_tunnel
+            "tunnel": tunnel_services.is_some(),
+            "tunnelServices": tunnel_services.map(ServiceSelection::as_str)
         }))?;
     } else {
         print_runtime_line(
@@ -1309,14 +1360,34 @@ async fn serve_workspace(
                             "daemon.log",
                             &format!("[control] accepted {operation:?}; beginning graceful shutdown"),
                         );
+                        break;
+                    }
+                    Some(control::DaemonControlCommand::Tunnel {
+                        operation_id,
+                        service: tunnel_service,
+                        action,
+                    }) => {
+                        control::mark_control_operation_running(&operation_id);
+                        let result = apply_daemon_tunnel_command(
+                            &mut profile,
+                            service,
+                            &mut managed_tunnels,
+                            tunnel_service,
+                            action,
+                        )
+                        .await;
+                        if result.is_ok() {
+                            tunnel_retries.remove(&tunnel_service);
+                        }
+                        control::finish_tunnel_operation(&operation_id, result);
                     }
                     None => {
                         terminal_error = Some(AppError::Message(
                             "daemon control command channel closed unexpectedly".into(),
                         ));
+                        break;
                     }
                 }
-                break;
             }
             _ = maintenance.tick() => {
                 for kind in started_services.iter().copied() {
@@ -1501,6 +1572,221 @@ fn selected_tunnels(service: ServiceSelection) -> Vec<TunnelServiceKind> {
         values.push(TunnelServiceKind::Actions);
     }
     values
+}
+
+fn managed_tunnel_selection(tunnels: &[TunnelServiceKind]) -> Option<ServiceSelection> {
+    match (
+        tunnels.contains(&TunnelServiceKind::Mcp),
+        tunnels.contains(&TunnelServiceKind::Actions),
+    ) {
+        (true, true) => Some(ServiceSelection::All),
+        (true, false) => Some(ServiceSelection::Mcp),
+        (false, true) => Some(ServiceSelection::Actions),
+        (false, false) => None,
+    }
+}
+
+fn tunnel_type_for_profile(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
+    match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
+        TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
+    }
+}
+
+fn tunnel_config_matches(
+    left: &WorkspaceProfile,
+    right: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> bool {
+    match kind {
+        TunnelServiceKind::Mcp => {
+            left.tunnel.tunnel_type == right.tunnel.tunnel_type
+                && left.tunnel.public_url == right.tunnel.public_url
+                && left.tunnel.frp_server == right.tunnel.frp_server
+                && left.tunnel.frp_subdomain == right.tunnel.frp_subdomain
+                && left.tunnel.frp_profile_id == right.tunnel.frp_profile_id
+                && left.tunnel.frp_server_port == right.tunnel.frp_server_port
+                && left.tunnel.frp_proxy_type == right.tunnel.frp_proxy_type
+                && left.tunnel.frp_cert_path == right.tunnel.frp_cert_path
+                && left.tunnel.frp_key_path == right.tunnel.frp_key_path
+                && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
+                && left.tunnel.use_proxy == right.tunnel.use_proxy
+        }
+        TunnelServiceKind::Actions => {
+            left.actions.public_url == right.actions.public_url
+                && left.actions.tunnel_type == right.actions.tunnel_type
+                && left.actions.frp_server == right.actions.frp_server
+                && left.actions.frp_subdomain == right.actions.frp_subdomain
+                && left.actions.frp_profile_id == right.actions.frp_profile_id
+                && left.actions.frp_server_port == right.actions.frp_server_port
+                && left.actions.frp_proxy_type == right.actions.frp_proxy_type
+                && left.actions.frp_cert_path == right.actions.frp_cert_path
+                && left.actions.frp_key_path == right.actions.frp_key_path
+                && left.actions.cloudflare_mode == right.actions.cloudflare_mode
+                && left.actions.use_proxy == right.actions.use_proxy
+        }
+    }
+}
+
+fn restore_daemon_tunnel_config(
+    failed: &WorkspaceProfile,
+    restored: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<()> {
+    let mut store = DataStore::load()?;
+    let Some(mut current) = store.get(&failed.id).cloned() else {
+        return Ok(());
+    };
+    if !tunnel_config_matches(&current, failed, kind) {
+        return Err(AppError::Message(
+            "检测到更新的隧道配置，已拒绝用旧 daemon 配置覆盖。".into(),
+        ));
+    }
+    match kind {
+        TunnelServiceKind::Mcp => current.tunnel = restored.tunnel.clone(),
+        TunnelServiceKind::Actions => {
+            current.actions.public_url = restored.actions.public_url.clone();
+            current.actions.tunnel_type = restored.actions.tunnel_type.clone();
+            current.actions.frp_server = restored.actions.frp_server.clone();
+            current.actions.frp_subdomain = restored.actions.frp_subdomain.clone();
+            current.actions.frp_profile_id = restored.actions.frp_profile_id.clone();
+            current.actions.frp_server_port = restored.actions.frp_server_port;
+            current.actions.frp_proxy_type = restored.actions.frp_proxy_type.clone();
+            current.actions.frp_cert_path = restored.actions.frp_cert_path.clone();
+            current.actions.frp_key_path = restored.actions.frp_key_path.clone();
+            current.actions.cloudflare_mode = restored.actions.cloudflare_mode.clone();
+            current.actions.use_proxy = restored.actions.use_proxy;
+        }
+    }
+    store.update(current)
+}
+
+fn persist_daemon_tunnel_url(
+    profile: &mut WorkspaceProfile,
+    kind: TunnelServiceKind,
+    public_url: &str,
+) -> AppResult<()> {
+    if public_url.is_empty() {
+        return Ok(());
+    }
+    let mut store = DataStore::load()?;
+    let Some(mut current) = store.get(&profile.id).cloned() else {
+        return Ok(());
+    };
+    if !tunnel_config_matches(&current, profile, kind) {
+        return Ok(());
+    }
+    match kind {
+        TunnelServiceKind::Mcp => {
+            current.tunnel.public_url = public_url.to_string();
+            profile.tunnel.public_url = public_url.to_string();
+            update_public_url(&profile.id, "mcp", public_url);
+        }
+        TunnelServiceKind::Actions => {
+            current.actions.public_url = public_url.to_string();
+            profile.actions.public_url = public_url.to_string();
+            update_public_url(&profile.id, "actions", public_url);
+        }
+    }
+    store.update(current)
+}
+
+async fn apply_daemon_tunnel_command(
+    profile: &mut WorkspaceProfile,
+    service_selection: ServiceSelection,
+    managed_tunnels: &mut Vec<TunnelServiceKind>,
+    kind: TunnelServiceKind,
+    action: control::ControlTunnelAction,
+) -> AppResult<TunnelStatus> {
+    let store = DataStore::load()?;
+    let latest = resolve_workspace(store.list(), &profile.id)?.clone();
+    let settings = store.settings();
+    drop(store);
+    if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
+        return Err(AppError::Message(
+            "MCP 隧道已切换到 Gateway 控制域，Workspace daemon 拒绝直接写入".into(),
+        ));
+    }
+
+    let was_managed = managed_tunnels.contains(&kind);
+    let previous = profile.clone();
+    let operation = async {
+        let mut tunnels = tunnel_supervisor().lock().await;
+        match action {
+            control::ControlTunnelAction::Start => {
+                if was_managed {
+                    Ok(tunnels.status(profile, kind, &settings))
+                } else {
+                    tunnels.start(&latest, kind, &settings).await
+                }
+            }
+            control::ControlTunnelAction::Stop => {
+                if was_managed {
+                    tunnels.stop(profile, kind, &settings).await?;
+                }
+                Ok(tunnels.status(&latest, kind, &settings))
+            }
+            control::ControlTunnelAction::Restart => {
+                if !was_managed {
+                    return Ok(tunnels.status(&latest, kind, &settings));
+                }
+                if tunnel_type_for_profile(&latest, kind) == "frp" {
+                    tunnels.start(&latest, kind, &settings).await
+                } else {
+                    tunnels.stop(profile, kind, &settings).await?;
+                    match tunnels.start(&latest, kind, &settings).await {
+                        Ok(status) => Ok(status),
+                        Err(error) => match tunnels.start(&previous, kind, &settings).await {
+                            Ok(_) => Err(error),
+                            Err(rollback_error) => Err(AppError::Message(format!(
+                                "隧道重载失败：{error}；恢复原线路也失败：{rollback_error}"
+                            ))),
+                        },
+                    }
+                }
+            }
+        }
+    }
+    .await;
+
+    let status = match operation {
+        Ok(status) => status,
+        Err(error) => {
+            if action == control::ControlTunnelAction::Restart {
+                if let Err(rollback_error) = restore_daemon_tunnel_config(&latest, &previous, kind)
+                {
+                    return Err(AppError::Message(format!(
+                        "隧道重载失败：{error}；配置回滚也失败：{rollback_error}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    match action {
+        control::ControlTunnelAction::Start if status.state == "running" => {
+            if !managed_tunnels.contains(&kind) {
+                managed_tunnels.push(kind);
+            }
+            *profile = latest;
+        }
+        control::ControlTunnelAction::Stop => {
+            managed_tunnels.retain(|candidate| *candidate != kind);
+            *profile = latest;
+        }
+        control::ControlTunnelAction::Restart if was_managed => {
+            *profile = latest;
+        }
+        _ => {}
+    }
+    persist_daemon_tunnel_url(profile, kind, &status.public_url)?;
+    daemon::update_tunnel_services(
+        profile,
+        service_selection,
+        managed_tunnel_selection(managed_tunnels),
+    )?;
+    Ok(status)
 }
 
 fn ensure_workspace_directory(profile: &WorkspaceProfile) -> AppResult<()> {
