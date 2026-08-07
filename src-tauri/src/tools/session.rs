@@ -440,6 +440,30 @@ impl Default for SessionStore {
 mod tests {
     use super::*;
 
+    fn spawn_test_session() -> ExecSession {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let child = crate::async_runtime::block_on(async {
+            tokio::process::Command::new(rustc)
+                .arg("--version")
+                .spawn()
+                .expect("spawn rustc --version")
+        });
+        ExecSession::new(child)
+    }
+
+    fn wait_until_exited(session: &ExecSession) {
+        crate::async_runtime::block_on(async {
+            for _ in 0..100 {
+                session.refresh_status().await;
+                if session.has_exited() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("test command did not exit");
+        });
+    }
+
     #[test]
     fn execution_result_exposes_unambiguous_failure_contract() {
         let result = finalize_execution_result(json!({
@@ -511,6 +535,74 @@ mod tests {
         let page = page_retained_output(&buffer.data, buffer.total, 0, 10);
         assert_eq!(page.retained_start_offset, 2);
         assert_eq!(page.content, b"cdef");
+    }
+
+    #[test]
+    fn background_terminal_refresh_does_not_extend_retention() {
+        let store = SessionStore::with_limits(4, Duration::from_millis(100));
+        let session = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("insert session"));
+        wait_until_exited(&session);
+        session.mark_terminal_observed();
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(store.list_snapshots(true, 0).len(), 1);
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert!(store.list_snapshots(true, 0).is_empty());
+    }
+
+    #[test]
+    fn unobserved_terminal_session_is_never_pruned_by_retention() {
+        let store = SessionStore::with_limits(4, Duration::ZERO);
+        let session = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("insert session"));
+        wait_until_exited(&session);
+        std::thread::sleep(Duration::from_millis(2));
+
+        let snapshots = store.list_snapshots(true, 0);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0]["result_observed"], false);
+    }
+
+    #[test]
+    fn capacity_prunes_expired_observed_terminal_before_insert() {
+        let store = SessionStore::with_limits(1, Duration::from_millis(100));
+        let first = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("insert first"));
+        wait_until_exited(&first);
+        first.mark_terminal_observed();
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(store.list_snapshots(true, 0).len(), 1);
+        std::thread::sleep(Duration::from_millis(60));
+
+        let second = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("expired slot reclaimed"));
+        wait_until_exited(&second);
+    }
+
+    #[test]
+    fn capacity_never_evicts_unobserved_terminal_result() {
+        let store = SessionStore::with_limits(1, Duration::ZERO);
+        let first = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("insert first"));
+        wait_until_exited(&first);
+        std::thread::sleep(Duration::from_millis(2));
+
+        let rejected = match store.insert(spawn_test_session()) {
+            Err(rejected) => rejected,
+            Ok(session) => {
+                crate::async_runtime::block_on(session.kill_and_wait());
+                panic!("capacity must remain full");
+            }
+        };
+        crate::async_runtime::block_on(rejected.kill_and_wait());
     }
 }
 
@@ -708,6 +800,7 @@ fn prune_terminal_sessions(
 ) {
     sessions.retain(|_, session| {
         !session.has_exited()
+            || !session.terminal_observed()
             || session
                 .last_access_elapsed()
                 .is_some_and(|elapsed| elapsed <= terminal_retention)
@@ -851,8 +944,8 @@ impl ExecSession {
     }
 
     pub fn mark_terminal_observed(&self) {
-        if self.has_exited() {
-            self.terminal_observed.store(true, Ordering::Release);
+        if self.has_exited() && !self.terminal_observed.swap(true, Ordering::AcqRel) {
+            self.touch();
         }
     }
 
@@ -958,6 +1051,9 @@ impl ExecSession {
     }
 
     fn record_exit_status(&self, status: std::process::ExitStatus) {
+        if self.has_exited() {
+            return;
+        }
         *self.exit_code.lock().expect("exit_code lock") = status.code();
         let mut finished_at = self.finished_at.lock().expect("finished_at lock");
         if finished_at.is_none() {

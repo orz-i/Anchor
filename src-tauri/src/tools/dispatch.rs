@@ -203,7 +203,10 @@ fn track_task_recovery(
             .get("affected_files")
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty());
-    if tool == "wait_command" && error_code == Some("SESSION_NOT_FOUND") && !workspace_mutated {
+    if matches!(tool, "wait_command" | "read_output" | "kill_session")
+        && error_code == Some("SESSION_NOT_FOUND")
+        && !workspace_mutated
+    {
         return;
     }
     let rollback_status = if workspace_mutated {
@@ -2228,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_wait_session_without_workspace_mutation_does_not_open_task_recovery() {
+    fn missing_retained_session_reads_without_workspace_mutation_do_not_open_task_recovery() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
         let ctx =
@@ -2239,16 +2242,24 @@ mod tests {
             .start_task("missing retained session")
             .expect("task");
 
-        let result = call_tool_with_cancellation(
-            &ctx,
-            "wait_command",
-            &json!({"session_id": "missing-session"}),
-            &CancellationToken::default(),
-        );
+        for (tool, args) in [
+            ("wait_command", json!({"session_id": "missing-session"})),
+            (
+                "read_output",
+                json!({"output_ref": "session:missing-session:stdout"}),
+            ),
+            ("kill_session", json!({"session_id": "missing-session"})),
+        ] {
+            let result =
+                call_tool_with_cancellation(&ctx, tool, &args, &CancellationToken::default());
 
-        assert_eq!(result["ok"], false, "{result}");
-        assert_eq!(result["error"]["code"], "SESSION_NOT_FOUND", "{result}");
-        assert!(result.get("task_recovery").is_none(), "{result}");
+            assert_eq!(result["ok"], false, "{tool}: {result}");
+            assert_eq!(
+                result["error"]["code"], "SESSION_NOT_FOUND",
+                "{tool}: {result}"
+            );
+            assert!(result.get("task_recovery").is_none(), "{tool}: {result}");
+        }
         assert!(ctx.harness.task(&task.id).expect("task").recovery.is_none());
     }
 }

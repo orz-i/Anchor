@@ -46,7 +46,9 @@ kill_session
 | stdout 环形缓冲区 | 1 MiB |
 | stderr 环形缓冲区 | 1 MiB |
 
-达到 Session 容量时，服务器会终止刚启动但无法登记的子进程，然后返回可重试的 `SESSION_LIMIT_REACHED`，避免产生孤儿进程。
+已结束命令只有在终态通过 `wait_command` / `kill_session` 等路径被明确消费后才进入自动回收计时。后台 `list_command_sessions`、任务完成门禁等只读刷新不会延长这个计时；显式再次读取该 Session 会更新最后访问时间。未消费终态不会因 30 分钟保留期自动删除，避免绕过任务完成前必须消费命令结果的约束。
+
+每次登记新命令前、查询 Session 前和列举 Session 前都会先回收超过保留期的“已结束 + 已消费”记录。达到 64 个 Session 容量且没有可回收记录时，服务器会终止刚启动但无法登记的子进程，然后返回可重试的 `SESSION_LIMIT_REACHED`，避免产生孤儿进程。自然过期后的 `wait_command`、`read_output` 或 `kill_session` 返回 `SESSION_NOT_FOUND`；这属于正常的保留期淘汰，不会为无工作区变更的 Harness Task 创建 Recovery。
 
 ### 输出 Offset
 
