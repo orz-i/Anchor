@@ -86,7 +86,7 @@ pub fn run() {
     if !acquire_single_instance() {
         return;
     }
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(AppState::new().expect("failed to load app state"));
@@ -147,6 +147,19 @@ pub fn run() {
             get_proxy,
             set_proxy,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            crate::async_runtime::block_on(async {
+                let _ = crate::mcp::gateway::stop().await;
+                crate::tunnel::supervisor()
+                    .lock()
+                    .await
+                    .shutdown_all()
+                    .await;
+            });
+        }
+    });
 }

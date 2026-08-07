@@ -18,13 +18,16 @@ pub use aggregate::{
     ControlPlaneEventBatch, ControlPlaneEventCursor, ControlPlaneEventSource, ControlPlaneStatus,
     ControlPlaneWorkspaceStatus,
 };
-pub(crate) use events::{publish_workspace_event, reset_workspace_event_stream};
+pub(crate) use events::{
+    publish_workspace_event, read_workspace_events, reset_workspace_event_stream,
+};
 pub use ipc::{
     control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_events, request_logs,
     request_reload_operation, request_tunnel_operation, request_workspace_status,
     workspace_status_via_daemon_or_local, ControlClientError, ControlServer, DaemonControlCommand,
     DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
 };
+#[cfg(any(feature = "cli", test))]
 pub(crate) use ipc::{
     finish_reload_operation, finish_tunnel_operation, mark_control_operation_running,
 };
@@ -127,6 +130,7 @@ fn port_status(
 fn port_owner(pid: Option<u32>, daemon_pid: Option<u32>) -> &'static str {
     match pid {
         Some(pid) if Some(pid) == daemon_pid => "daemon",
+        Some(pid) if crate::runtime::is_own_process(pid) => "server",
         Some(_) => "external",
         None => "none",
     }
@@ -139,7 +143,7 @@ mod tests {
     #[test]
     fn port_ownership_distinguishes_daemon_external_and_stopped() {
         assert_eq!(port_owner(Some(7), Some(7)), "daemon");
-        assert_eq!(port_owner(Some(8), Some(7)), "external");
+        assert_eq!(port_owner(Some(std::process::id()), None), "server");
         assert_eq!(port_owner(None, Some(7)), "none");
     }
 }

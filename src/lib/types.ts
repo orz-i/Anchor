@@ -179,7 +179,7 @@ export interface WorkspacePortStatus {
   port: number;
   listening: boolean;
   pid: number | null;
-  owner: "daemon" | "external" | "none";
+  owner: "daemon" | "server" | "external" | "none";
   endpoint: string;
 }
 

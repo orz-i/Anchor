@@ -12,6 +12,14 @@ use crate::error::{AppError, AppResult};
 
 use crate::runtime::{port_busy_message, try_reclaim_previous_macos_app_port, wait_for_port_free};
 
+#[cfg(windows)]
+use crate::runtime::{await_listener_shutdown, ServiceKind};
+
+#[cfg(windows)]
+use crate::tunnel::{
+    maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime, TunnelServiceKind,
+};
+
 use crate::gateway_control::{
     self, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor, GatewayOperation,
 };
@@ -31,6 +39,404 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })
+}
+
+#[cfg(windows)]
+fn annotate_server_mode(mut status: RuntimeStatusDto) -> RuntimeStatusDto {
+    if !status.local_message.starts_with("Windows GUI Server 模式") {
+        status.local_message = format!("Windows GUI Server 模式 · {}", status.local_message);
+    }
+    status
+}
+
+#[cfg(windows)]
+fn server_runtime_status(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    state.with_runtime(|runtime| {
+        let status = match service {
+            WorkspaceService::Mcp => runtime.mcp_status(profile),
+            WorkspaceService::Actions => runtime.actions_status(profile),
+        }?;
+        Ok(annotate_server_mode(status))
+    })
+}
+
+#[cfg(windows)]
+fn persist_server_tunnel_url(
+    state: &AppState,
+    id: &str,
+    kind: TunnelServiceKind,
+    public_url: &str,
+) -> AppResult<()> {
+    if public_url.trim().is_empty() {
+        return Ok(());
+    }
+    state.with_workspaces(|store| {
+        let Some(mut profile) = store.get(id).cloned() else {
+            return Ok(());
+        };
+        match kind {
+            TunnelServiceKind::Mcp => profile.tunnel.public_url = public_url.to_string(),
+            TunnelServiceKind::Actions => profile.actions.public_url = public_url.to_string(),
+        }
+        store.update(profile)
+    })
+}
+
+#[cfg(windows)]
+async fn start_server_service(
+    state: &AppState,
+    id: &str,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    validate_start_resources(state, id, service)?;
+    let profile = profile_by_id(state, id)?;
+    let already_running = state.with_runtime(|runtime| {
+        Ok(runtime.is_running(
+            &profile.id,
+            match service {
+                WorkspaceService::Mcp => ServiceKind::Mcp,
+                WorkspaceService::Actions => ServiceKind::Actions,
+            },
+        ))
+    })?;
+    if !already_running {
+        control::reset_workspace_event_stream(&profile.id);
+        control::publish_workspace_event(
+            &profile.id,
+            control::ControlEventKind::ServiceState,
+            Some(match service {
+                WorkspaceService::Mcp => control::ControlService::Mcp,
+                WorkspaceService::Actions => control::ControlService::Actions,
+            }),
+            "starting",
+            "Windows GUI Server service starting",
+        );
+        match service {
+            WorkspaceService::Mcp => {
+                ensure_port_available(profile.runtime.local_port, "本地 MCP").await?
+            }
+            WorkspaceService::Actions => {
+                ensure_port_available(profile.actions.local_port, "本地 Actions").await?
+            }
+        }
+    }
+    state.with_runtime(|runtime| match service {
+        WorkspaceService::Mcp => runtime.start_mcp(&profile).map(|_| ()),
+        WorkspaceService::Actions => runtime.start_actions(&profile).map(|_| ()),
+    })?;
+
+    let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
+    let tunnel_kind = match service {
+        WorkspaceService::Mcp => TunnelServiceKind::Mcp,
+        WorkspaceService::Actions => TunnelServiceKind::Actions,
+    };
+    if service != WorkspaceService::Mcp || !gateway_enabled {
+        if let Some(url) = maybe_start_for_runtime(&profile, tunnel_kind).await? {
+            persist_server_tunnel_url(state, id, tunnel_kind, &url)?;
+        }
+    } else if let Err(error) = reconcile_server_gateway(state).await {
+        let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, ServiceKind::Mcp)))?;
+        await_listener_shutdown(handle, profile.runtime.local_port).await;
+        state.with_runtime(|runtime| {
+            runtime.finish_stop(id, ServiceKind::Mcp);
+            Ok(())
+        })?;
+        return Err(AppError::Message(format!(
+            "Windows GUI Server 模式启动 MCP Gateway 失败，已回滚新启动的 MCP listener：{error}"
+        )));
+    }
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = server_runtime_status(state, &profile_by_id(state, id)?, service)?;
+    control::publish_workspace_event(
+        &profile.id,
+        control::ControlEventKind::ServiceState,
+        Some(match service {
+            WorkspaceService::Mcp => control::ControlService::Mcp,
+            WorkspaceService::Actions => control::ControlService::Actions,
+        }),
+        status.state.clone(),
+        status.local_message.clone(),
+    );
+    Ok(status)
+}
+
+#[cfg(windows)]
+async fn stop_server_service(
+    state: &AppState,
+    id: &str,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    let profile = profile_by_id(state, id)?;
+    let (kind, port) = match service {
+        WorkspaceService::Mcp => (ServiceKind::Mcp, profile.runtime.local_port),
+        WorkspaceService::Actions => (ServiceKind::Actions, profile.actions.local_port),
+    };
+    let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, kind)))?;
+    await_listener_shutdown(handle, port).await;
+    state.with_runtime(|runtime| {
+        runtime.finish_stop(id, kind);
+        Ok(())
+    })?;
+    let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
+    if service != WorkspaceService::Mcp || !gateway_enabled {
+        stop_for_runtime(
+            &profile,
+            match service {
+                WorkspaceService::Mcp => TunnelServiceKind::Mcp,
+                WorkspaceService::Actions => TunnelServiceKind::Actions,
+            },
+        )
+        .await?;
+    } else {
+        reconcile_server_gateway(state).await?;
+    }
+    let status = server_runtime_status(state, &profile, service)?;
+    control::publish_workspace_event(
+        &profile.id,
+        control::ControlEventKind::ServiceState,
+        Some(match service {
+            WorkspaceService::Mcp => control::ControlService::Mcp,
+            WorkspaceService::Actions => control::ControlService::Actions,
+        }),
+        "stopped",
+        "Windows GUI Server service stopped",
+    );
+    Ok(status)
+}
+
+#[cfg(windows)]
+async fn restart_server_service(
+    state: &AppState,
+    id: &str,
+    service: WorkspaceService,
+) -> AppResult<RuntimeStatusDto> {
+    validate_start_resources(state, id, service)?;
+    let profile = profile_by_id(state, id)?;
+    state.with_runtime(|runtime| match service {
+        WorkspaceService::Mcp => runtime.restart_mcp(&profile).map(|_| ()),
+        WorkspaceService::Actions => runtime.restart_actions(&profile).map(|_| ()),
+    })?;
+    if service == WorkspaceService::Mcp
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        reconcile_server_gateway(state).await?;
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = server_runtime_status(state, &profile, service)?;
+    control::publish_workspace_event(
+        &profile.id,
+        control::ControlEventKind::Reload,
+        Some(match service {
+            WorkspaceService::Mcp => control::ControlService::Mcp,
+            WorkspaceService::Actions => control::ControlService::Actions,
+        }),
+        status.state.clone(),
+        "Windows GUI Server listener reloaded",
+    );
+    Ok(status)
+}
+
+#[cfg(windows)]
+fn server_gateway_context(
+    state: &AppState,
+) -> AppResult<(
+    AppSettings,
+    Vec<crate::workspace::WorkspaceProfile>,
+    std::collections::HashSet<String>,
+)> {
+    let (settings, profiles) =
+        state.with_settings(|store| Ok((store.settings(), store.list().to_vec())))?;
+    let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
+    Ok((settings, profiles, active))
+}
+
+#[cfg(windows)]
+fn persist_server_gateway_observation(
+    state: &AppState,
+    config: &McpGatewayConfig,
+    profiles: &[crate::workspace::WorkspaceProfile],
+    url: &str,
+) -> AppResult<()> {
+    let normalized = url.trim().trim_end_matches('/');
+    if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
+        return Ok(());
+    }
+    let owner = profiles
+        .iter()
+        .find(|profile| profile.id == config.owner_workspace_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
+    let signature = gateway::tunnel_identity_signature(config, owner)?;
+    state.with_settings(|store| {
+        let mut settings = store.settings();
+        if settings.mcp_gateway.identity_changed(config) {
+            return Ok(());
+        }
+        settings.mcp_gateway.observed_public_url = normalized.to_string();
+        settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
+        settings.mcp_gateway.observed_tunnel_signature = signature;
+        store.update_settings(settings)
+    })
+}
+
+#[cfg(windows)]
+pub(super) async fn reconcile_server_gateway(state: &AppState) -> AppResult<GatewayControlStatus> {
+    let (settings, profiles, active) = server_gateway_context(state)?;
+    let before = gateway::status(&settings.mcp_gateway).await;
+    let scope = gateway_daemon::config_scope()?;
+    if before.state != "running" {
+        gateway_control::reset_gateway_event_stream(&scope);
+    }
+    let mut runtime = gateway::ensure(&settings.mcp_gateway, &profiles, &active).await?;
+    let public_url = reconcile_mcp_gateway(&settings.mcp_gateway, &profiles, &active).await?;
+    if let Some(public_url) = public_url {
+        persist_server_gateway_observation(state, &settings.mcp_gateway, &profiles, &public_url)?;
+        runtime.public_base_url = public_url;
+    }
+    gateway::clear_runtime_error().await;
+    gateway_daemon::append_log(&format!(
+        "[server] state={} routes={} owner={}",
+        runtime.state, runtime.route_count, runtime.owner_workspace_id
+    ));
+    gateway_control::publish_gateway_event(
+        &scope,
+        gateway_control::GatewayEventKind::GatewayState,
+        if runtime.state == "stopped" && settings.mcp_gateway.enabled {
+            "configured"
+        } else {
+            runtime.state.as_str()
+        },
+        format!("Windows GUI Server Gateway routes={}", runtime.route_count),
+    );
+    let control_state = if runtime.state == "stopped" && settings.mcp_gateway.enabled {
+        "configured".to_string()
+    } else {
+        runtime.state.clone()
+    };
+    Ok(GatewayControlStatus {
+        daemon_supported: false,
+        running: runtime.state == "running",
+        pid: None,
+        state: control_state,
+        local_endpoint: runtime.local_endpoint,
+        public_base_url: runtime.public_base_url,
+        route_count: runtime.route_count,
+        route_workspace_ids: runtime.route_workspace_ids,
+        owner_workspace_id: runtime.owner_workspace_id,
+        error: runtime.error,
+        detail: "Windows GUI Server 模式".into(),
+    })
+}
+
+#[cfg(windows)]
+async fn restore_server_direct_mcp_exposure(state: &AppState) -> AppResult<()> {
+    let (settings, profiles, active) = server_gateway_context(state)?;
+    gateway::stop().await?;
+    reconcile_mcp_gateway(&settings.mcp_gateway, &profiles, &active).await?;
+    for profile in profiles
+        .iter()
+        .filter(|profile| active.contains(&profile.id))
+    {
+        if let Some(url) = maybe_start_for_runtime(profile, TunnelServiceKind::Mcp).await? {
+            persist_server_tunnel_url(state, &profile.id, TunnelServiceKind::Mcp, &url)?;
+        }
+    }
+    gateway_daemon::append_log("[server] Gateway stopped; restored direct MCP exposure");
+    gateway_control::publish_gateway_event(
+        &gateway_daemon::config_scope()?,
+        gateway_control::GatewayEventKind::GatewayState,
+        "stopped",
+        "Windows GUI Server Gateway stopped",
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restart_server_active_mcp_listeners(
+    state: &AppState,
+    profiles: &[crate::workspace::WorkspaceProfile],
+    active: &std::collections::HashSet<String>,
+) -> AppResult<()> {
+    for profile in profiles
+        .iter()
+        .filter(|profile| active.contains(&profile.id))
+    {
+        let status = state.with_runtime(|runtime| runtime.restart_mcp(profile))?;
+        if status.state != "running" {
+            return Err(AppError::Message(format!(
+                "重启工作区“{}”的 MCP Server listener 后状态为 {}：{}",
+                profile.name, status.state, status.local_message
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn set_server_mcp_gateway(
+    state: &AppState,
+    mut config: McpGatewayConfig,
+) -> AppResult<GatewayControlStatus> {
+    config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
+    let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
+    let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
+    let listener_policy_changed = previous.enabled != config.enabled;
+    if previous.identity_changed(&config) {
+        config.clear_observation();
+    } else {
+        config.observed_public_url = previous.observed_public_url.clone();
+        config.observed_owner_workspace_id = previous.observed_owner_workspace_id.clone();
+        config.observed_tunnel_signature = previous.observed_tunnel_signature.clone();
+    }
+    gateway::validate_config(&config, &profiles)?;
+    state.with_settings(|store| {
+        let mut settings = store.settings();
+        settings.mcp_gateway = config.clone();
+        store.update_settings(settings)
+    })?;
+
+    let applied = async {
+        if listener_policy_changed {
+            restart_server_active_mcp_listeners(state, &profiles, &active)?;
+        }
+        if config.enabled {
+            reconcile_server_gateway(state).await
+        } else {
+            restore_server_direct_mcp_exposure(state).await?;
+            gateway_control::status_via_daemon_or_local().await
+        }
+    }
+    .await;
+    if let Err(error) = applied {
+        state.with_settings(|store| {
+            let mut settings = store.settings();
+            settings.mcp_gateway = previous.clone();
+            store.update_settings(settings)
+        })?;
+        let rollback = async {
+            if listener_policy_changed {
+                restart_server_active_mcp_listeners(state, &profiles, &active)?;
+            }
+            if previous.enabled {
+                reconcile_server_gateway(state).await.map(|_| ())
+            } else {
+                restore_server_direct_mcp_exposure(state).await
+            }
+        }
+        .await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(AppError::Message(format!(
+                "应用 Windows GUI Server Gateway 配置失败：{error}；恢复上一配置也失败：{rollback_error}"
+            ))),
+        };
+    }
+    applied
 }
 
 fn tunnel_configured_for_service(
@@ -76,6 +482,13 @@ pub async fn get_gateway_control_events(
     cursor: Option<GatewayEventCursor>,
     wait_ms: u32,
 ) -> AppResult<Option<GatewayEventBatch>> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        let scope = gateway_daemon::config_scope()?;
+        return Ok(Some(
+            gateway_control::read_gateway_events(&scope, cursor.as_ref(), 32, wait_ms).await,
+        ));
+    }
     map_gateway_events(gateway_control::request_events(cursor, 32, wait_ms).await)
 }
 
@@ -90,6 +503,10 @@ fn map_gateway_events(
 }
 
 const DESKTOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(super) fn desktop_server_mode() -> bool {
+    cfg!(target_os = "windows") && !crate::daemon::supported()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayConfigWriteAction {
@@ -219,6 +636,16 @@ fn runtime_status_from_control(
                 "running",
                 daemon_pid,
                 format!("{label} 由 daemon 监听 127.0.0.1:{}", port.port),
+                empty_recovery(false, String::new()),
+            )
+        } else if port.owner == "server" {
+            (
+                "running",
+                port.pid,
+                format!(
+                    "{label} 由 Windows GUI Server 模式监听 127.0.0.1:{}",
+                    port.port
+                ),
                 empty_recovery(false, String::new()),
             )
         } else if port.owner == "external" {
@@ -403,6 +830,10 @@ pub async fn set_mcp_gateway(
     state: State<'_, AppState>,
     mut config: McpGatewayConfig,
 ) -> AppResult<GatewayControlStatus> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return set_server_mcp_gateway(&state, config).await;
+    }
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
     let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
@@ -501,6 +932,10 @@ async fn ensure_port_available(port: u16, service_label: &str) -> AppResult<()> 
 #[tauri::command]
 
 pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return start_server_service(&state, &id, WorkspaceService::Mcp).await;
+    }
     start_desktop_service(&state, &id, WorkspaceService::Mcp).await
 }
 
@@ -521,6 +956,12 @@ pub async fn get_workspace_control_events(
     wait_ms: u32,
 ) -> AppResult<Option<control::ControlEventBatch>> {
     let profile = profile_by_id(&state, &id)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return Ok(Some(
+            control::read_workspace_events(&profile.id, cursor.as_ref(), 32, wait_ms).await,
+        ));
+    }
     map_control_events(control::request_events(&profile, cursor, 64, wait_ms).await)
 }
 
@@ -537,6 +978,10 @@ fn map_control_events(
 #[tauri::command]
 
 pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return stop_server_service(&state, &id, WorkspaceService::Mcp).await;
+    }
     stop_desktop_service(&state, &id, WorkspaceService::Mcp).await
 }
 
@@ -547,6 +992,10 @@ pub async fn get_runtime_status(
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(&state, &id)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return server_runtime_status(&state, &profile, WorkspaceService::Mcp);
+    }
     daemon_runtime_status(&state, &profile, WorkspaceService::Mcp).await
 }
 
@@ -557,6 +1006,10 @@ pub async fn start_actions_runtime(
 
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return start_server_service(&state, &id, WorkspaceService::Actions).await;
+    }
     start_desktop_service(&state, &id, WorkspaceService::Actions).await
 }
 
@@ -567,6 +1020,10 @@ pub async fn stop_actions_runtime(
 
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return stop_server_service(&state, &id, WorkspaceService::Actions).await;
+    }
     stop_desktop_service(&state, &id, WorkspaceService::Actions).await
 }
 
@@ -578,6 +1035,10 @@ pub async fn get_actions_runtime_status(
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(&state, &id)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return server_runtime_status(&state, &profile, WorkspaceService::Actions);
+    }
     daemon_runtime_status(&state, &profile, WorkspaceService::Actions).await
 }
 
@@ -586,6 +1047,10 @@ pub async fn restart_runtime(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return restart_server_service(&state, &id, WorkspaceService::Mcp).await;
+    }
     restart_desktop_service(&state, &id, WorkspaceService::Mcp).await
 }
 
@@ -594,6 +1059,10 @@ pub async fn restart_actions_runtime(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return restart_server_service(&state, &id, WorkspaceService::Actions).await;
+    }
     restart_desktop_service(&state, &id, WorkspaceService::Actions).await
 }
 
@@ -812,5 +1281,61 @@ mod tests {
         assert_eq!(runtime.state, "error");
         assert_eq!(runtime.pid, Some(99));
         assert!(runtime.local_message.contains("不会接管"));
+    }
+
+    #[test]
+    fn process_local_server_port_is_reported_as_running_without_daemon() {
+        let profile = WorkspaceProfile::new(".".into(), Some("server-port".into()));
+        let status = WorkspaceControlStatus {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            path: profile.path.clone(),
+            daemon: DaemonInspection {
+                supported: false,
+                running: false,
+                stale: false,
+                ambiguous: false,
+                pid_matches: false,
+                state: None,
+                detail: "daemon 目前仅支持 Linux".into(),
+            },
+            mcp: control::PortStatus {
+                service: "mcp".into(),
+                port: profile.runtime.local_port,
+                listening: true,
+                pid: Some(std::process::id()),
+                owner: "server".into(),
+                endpoint: profile.local_endpoint(),
+            },
+            actions: control::PortStatus {
+                service: "actions".into(),
+                port: profile.actions.local_port,
+                listening: false,
+                pid: None,
+                owner: "none".into(),
+                endpoint: profile.actions_local_base_url(),
+            },
+            mcp_activity: None,
+            mcp_tunnel: None,
+            actions_tunnel: None,
+        };
+
+        let runtime = runtime_status_from_control(
+            &profile,
+            &AppSettings::default(),
+            &status,
+            WorkspaceService::Mcp,
+        );
+
+        assert_eq!(runtime.state, "running");
+        assert_eq!(runtime.pid, Some(std::process::id()));
+        assert!(runtime.local_message.contains("Windows GUI Server 模式"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_desktop_automatically_selects_server_mode_while_daemon_is_unsupported() {
+        assert!(!crate::daemon::supported());
+        assert!(desktop_server_mode());
     }
 }

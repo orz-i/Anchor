@@ -310,7 +310,9 @@ anchor events --control-plane --follow --wait 15
 
 桌面全局 layout 使用一次 `get_control_plane_status` 代替原先每个 Workspace 的 MCP/Actions 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
 
-Windows 仍只有 Workspace/Gateway Named Pipe 客户端和地址抽象。服务端与当前用户 ACL 未完成前，GUI 会显示后台 daemon 不受支持，写操作直接失败，不会落回进程内 Runtime/Gateway。
+Windows 仍只有 Workspace/Gateway Named Pipe 客户端和地址抽象，后台 daemon 服务端与当前用户 ACL 尚未完成。为了避免桌面版在此过渡期不可用，**Windows GUI 会自动进入进程内 Server 模式**：Workspace MCP/Actions、Workspace Tunnel、Gateway listener/routes/shared tunnel 由当前 Anchor 桌面进程作为唯一运行权威管理；GUI 会明确显示 Server 模式，无需额外开关。关闭桌面应用时会停止 process-local Gateway 并清理受管 tunnel 子进程。CLI 的后台 `start/stop/restart`/Gateway daemon 命令仍不会伪装为 Windows daemon 可用。
+
+Windows GUI Server 模式继续复用与 daemon 相同的有界 Workspace/Gateway event journal 和状态模型；本进程监听端口标记为 `owner=server`，避免被聚合状态误判为外部进程。该兼容模式只在 Windows daemon 不受支持时自动选择，不会在 Linux 与现有 daemon 同时成为第二套运行权威。
 
 ## 与 systemd 的关系
 
@@ -355,7 +357,7 @@ anchor --json events --control-plane
 
 ## 安全边界
 
-- Workspace/Gateway 后台 daemon 目前仅支持 Linux；Windows/macOS 可使用前台 `serve`，GUI 不会伪装后台 daemon 可用；
+- Workspace/Gateway 后台 daemon 目前仅支持 Linux；Windows GUI 自动使用进程内 Server 模式，CLI 仍可显式使用前台 `serve`/`gateway serve` 做调试或外部监督；GUI 不会伪装后台 daemon 可用；
 - PID 所有权校验失败时拒绝发送信号；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
 - 端口被 GUI 或外部进程占用时拒绝启动；

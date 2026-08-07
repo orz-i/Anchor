@@ -1,14 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(any(unix, test))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 
-use super::protocol::{GatewayEvent, GatewayEventKind};
-#[cfg(any(unix, test))]
-use super::protocol::{GatewayEventBatch, GatewayEventCursor};
+use super::protocol::{GatewayEvent, GatewayEventBatch, GatewayEventCursor, GatewayEventKind};
 
 const MAX_RETAINED_EVENTS: usize = 256;
 pub const MAX_GATEWAY_EVENT_BATCH: u32 = 32;
@@ -89,7 +86,6 @@ pub fn publish_gateway_event(
     notify.notify_waiters();
 }
 
-#[cfg(any(unix, test))]
 pub async fn read_gateway_events(
     config_scope: &str,
     cursor: Option<&GatewayEventCursor>,
@@ -109,7 +105,6 @@ pub async fn read_gateway_events(
     snapshot_events(config_scope, cursor, limit)
 }
 
-#[cfg(any(unix, test))]
 fn event_notify(config_scope: &str) -> Arc<Notify> {
     let mut streams = streams()
         .lock()
@@ -122,7 +117,6 @@ fn event_notify(config_scope: &str) -> Arc<Notify> {
     )
 }
 
-#[cfg(any(unix, test))]
 fn snapshot_events(
     config_scope: &str,
     cursor: Option<&GatewayEventCursor>,

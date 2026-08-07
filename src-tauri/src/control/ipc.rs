@@ -1,7 +1,9 @@
+#[cfg(any(feature = "cli", test))]
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+#[cfg(any(feature = "cli", test))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -18,13 +20,15 @@ use super::events::read_workspace_events;
 use super::events::{MAX_EVENT_BATCH, MAX_EVENT_WAIT_MS};
 #[cfg(any(unix, test))]
 use super::logs::read_log_batch;
+#[cfg(any(feature = "cli", test))]
+use super::protocol::ControlError;
 #[cfg(any(unix, test))]
 use super::protocol::{
     validate_protocol_version, ERROR_CONTROL_COMMAND_UNAVAILABLE, ERROR_INTERNAL,
     ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND, ERROR_WORKSPACE_MISMATCH,
 };
 use super::protocol::{
-    ControlAsyncOperation, ControlAsyncState, ControlError, ControlEventBatch, ControlEventCursor,
+    ControlAsyncOperation, ControlAsyncState, ControlEventBatch, ControlEventCursor,
     ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod, ControlOperation,
     ControlRequest, ControlResponse, ControlResult, ControlService, ControlTunnelAction,
     MAX_CONTROL_FRAME_BYTES,
@@ -91,6 +95,7 @@ async fn wait_for_operation(
     }
 }
 
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn finish_reload_operation(operation_id: &str, result: AppResult<()>) {
     let mut operations = operation_store()
         .lock()
@@ -218,12 +223,14 @@ pub async fn request_events(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(any(feature = "cli", test))]
 struct StoredControlOperation {
     #[cfg(any(unix, test))]
     workspace_id: String,
     operation: ControlAsyncOperation,
 }
 
+#[cfg(any(feature = "cli", test))]
 fn operation_store() -> &'static Mutex<HashMap<String, StoredControlOperation>> {
     static STORE: OnceLock<Mutex<HashMap<String, StoredControlOperation>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -273,6 +280,7 @@ fn control_operation(workspace_id: &str, operation_id: &str) -> Option<ControlAs
         .map(|stored| stored.operation.clone())
 }
 
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn mark_control_operation_running(operation_id: &str) {
     if let Some(stored) = operation_store()
         .lock()
@@ -380,6 +388,7 @@ pub async fn request_tunnel_operation(
     }
 }
 
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn finish_tunnel_operation(operation_id: &str, result: AppResult<TunnelStatus>) {
     let mut operations = operation_store()
         .lock()

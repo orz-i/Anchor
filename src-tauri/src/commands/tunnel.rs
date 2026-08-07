@@ -9,6 +9,11 @@ use crate::error::{AppError, AppResult};
 use crate::tunnel::{frp_snippet, TunnelServiceKind, TunnelStatus};
 use crate::workspace::resources::{validate_service_start, WorkspaceService};
 
+#[cfg(windows)]
+use crate::platform::platform;
+#[cfg(windows)]
+use crate::tunnel::supervisor;
+
 const DESKTOP_TUNNEL_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppResult<()> {
@@ -36,6 +41,80 @@ async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppRe
     Err(AppError::Message(format!(
         "frpc 已建立代理，但公网地址仍不可访问：{last_error}。若使用 FRP HTTPS→HTTP，请确认服务端字段为 vhostHTTPSPort。"
     )))
+}
+
+#[cfg(windows)]
+fn desktop_server_mode() -> bool {
+    !daemon::supported()
+}
+
+#[cfg(windows)]
+async fn server_start_tunnel(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<TunnelStatus> {
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    let status = supervisor()
+        .lock()
+        .await
+        .start(profile, kind, &settings)
+        .await?;
+    persist_public_url(state, &profile.id, kind, &status.public_url)?;
+    Ok(status)
+}
+
+#[cfg(windows)]
+async fn server_stop_tunnel(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<TunnelStatus> {
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    let mut guard = supervisor().lock().await;
+    guard.stop(profile, kind, &settings).await?;
+    Ok(guard.status(profile, kind, &settings))
+}
+
+#[cfg(windows)]
+async fn server_restart_tunnel(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<TunnelStatus> {
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    let mut guard = supervisor().lock().await;
+    let current = guard.status(profile, kind, &settings);
+    if current.state != "running" {
+        return Ok(current);
+    }
+    let tunnel_type = match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
+        TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
+    };
+    let status = if tunnel_type == "frp" {
+        // TunnelSupervisor::start performs FRP route replacement atomically and
+        // restores the old route if the new configuration fails.
+        guard.start(profile, kind, &settings).await?
+    } else {
+        guard.stop(profile, kind, &settings).await?;
+        guard.start(profile, kind, &settings).await?
+    };
+    drop(guard);
+    persist_public_url(state, &profile.id, kind, &status.public_url)?;
+    Ok(status)
+}
+
+#[cfg(windows)]
+fn local_service_listening(
+    profile: &crate::workspace::WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<bool> {
+    let port = match kind {
+        TunnelServiceKind::Mcp => profile.runtime.local_port,
+        TunnelServiceKind::Actions => profile.actions.local_port,
+    };
+    Ok(platform().find_pid_listening_on_port(port)?.is_some())
 }
 
 fn tunnel_configured(
@@ -195,6 +274,10 @@ pub async fn restart_tunnel(
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return server_restart_tunnel(&state, &profile, kind).await;
+    }
     if !daemon::inspect(&profile)?.running {
         return configured_tunnel_status(&profile, kind);
     }
@@ -225,6 +308,10 @@ pub async fn start_tunnel(
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return server_start_tunnel(&state, &profile, kind).await;
+    }
     let status = control::request_tunnel_operation(
         &profile,
         kind,
@@ -247,6 +334,10 @@ pub async fn stop_tunnel(
     let profile = profile_by_id(&state, &id)?;
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        return server_stop_tunnel(&state, &profile, kind).await;
+    }
     if !daemon::inspect(&profile)?.running {
         return configured_tunnel_status(&profile, kind);
     }
@@ -280,6 +371,33 @@ pub async fn test_tunnel(
     let kind = TunnelServiceKind::parse(&service)?;
     ensure_not_gateway_managed(&state, kind)?;
     validate_tunnel_start_resources(&state, &id, kind)?;
+    #[cfg(windows)]
+    if desktop_server_mode() {
+        let runtime_running = local_service_listening(&profile, kind)?;
+        let status = server_start_tunnel(&state, &profile, kind).await?;
+        let public_url = status.public_url.clone();
+        if let Err(error) = probe_public_tunnel(&public_url, kind).await {
+            if !runtime_running {
+                let _ = server_stop_tunnel(&state, &profile, kind).await;
+            }
+            return Err(error);
+        }
+        if runtime_running {
+            return Ok(TunnelTestResult {
+                success: !public_url.is_empty() || status.state == "running",
+                public_url,
+                kept_running: true,
+                message: "隧道测试成功，已保持连接（Windows GUI Server 服务运行中）。".into(),
+            });
+        }
+        server_stop_tunnel(&state, &profile, kind).await?;
+        return Ok(TunnelTestResult {
+            success: !public_url.is_empty(),
+            public_url,
+            kept_running: false,
+            message: "隧道配置验证通过。本地服务未运行，测试连接已自动断开。".into(),
+        });
+    }
     let inspection = daemon::inspect(&profile)?;
     let previous_state = inspection
         .state

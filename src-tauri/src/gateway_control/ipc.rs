@@ -1,7 +1,9 @@
+#[cfg(any(feature = "cli", test))]
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+#[cfg(any(feature = "cli", test))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -11,7 +13,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::gateway_daemon;
-#[cfg(any(unix, test))]
 use crate::mcp::gateway;
 use crate::settings::McpGatewayConfig;
 
@@ -24,11 +25,13 @@ use super::protocol::{
     validate_protocol_version, ERROR_CONFIG_SCOPE_MISMATCH, ERROR_CONTROL_COMMAND_UNAVAILABLE,
     ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND,
 };
+#[cfg(any(feature = "cli", test))]
+use super::protocol::{GatewayAsyncOperation, GatewayControlError, ERROR_OPERATION_FAILED};
 use super::protocol::{
-    GatewayAsyncOperation, GatewayAsyncState, GatewayControlError, GatewayControlStatus,
-    GatewayEventBatch, GatewayEventCursor, GatewayLogChunk, GatewayLogCursor, GatewayMethod,
-    GatewayOperation, GatewayRequest, GatewayResponse, GatewayResult, ERROR_OPERATION_FAILED,
-    GATEWAY_CONTROL_PROTOCOL_VERSION, MAX_GATEWAY_CONTROL_FRAME_BYTES,
+    GatewayAsyncState, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor,
+    GatewayLogChunk, GatewayLogCursor, GatewayMethod, GatewayOperation, GatewayRequest,
+    GatewayResponse, GatewayResult, GATEWAY_CONTROL_PROTOCOL_VERSION,
+    MAX_GATEWAY_CONTROL_FRAME_BYTES,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
@@ -209,12 +212,14 @@ impl fmt::Display for GatewayControlClientError {
 impl std::error::Error for GatewayControlClientError {}
 
 #[derive(Debug, Clone)]
+#[cfg(any(feature = "cli", test))]
 struct StoredOperation {
     #[cfg(any(unix, test))]
     config_scope: String,
     operation: GatewayAsyncOperation,
 }
 
+#[cfg(any(feature = "cli", test))]
 fn operation_store() -> &'static Mutex<HashMap<String, StoredOperation>> {
     static STORE: OnceLock<Mutex<HashMap<String, StoredOperation>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -262,6 +267,7 @@ fn operation(config_scope: &str, operation_id: &str) -> Option<GatewayAsyncOpera
         .map(|stored| stored.operation.clone())
 }
 
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn mark_operation_running(operation_id: &str) {
     if let Some(stored) = operation_store()
         .lock()
@@ -273,6 +279,7 @@ pub(crate) fn mark_operation_running(operation_id: &str) {
     }
 }
 
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn finish_reload_operation(operation_id: &str, result: AppResult<()>) {
     let mut operations = operation_store()
         .lock()
@@ -316,7 +323,7 @@ pub async fn request_status() -> Result<GatewayControlStatus, GatewayControlClie
 pub async fn status_via_daemon_or_local() -> AppResult<GatewayControlStatus> {
     match request_status().await {
         Ok(status) => Ok(status),
-        Err(error) if error.is_unavailable() => local_status(),
+        Err(error) if error.is_unavailable() => local_status().await,
         Err(error) => Err(AppError::Message(error.to_string())),
     }
 }
@@ -418,10 +425,36 @@ pub async fn request_apply_config(
     wait_for_operation(&operation_id, timeout).await
 }
 
-fn local_status() -> AppResult<GatewayControlStatus> {
+async fn local_status() -> AppResult<GatewayControlStatus> {
     let store = DataStore::load()?;
     let config = store.settings().mcp_gateway;
     let inspection = gateway_daemon::inspect()?;
+    if !inspection.supported && cfg!(target_os = "windows") {
+        let runtime = gateway::status(&config).await;
+        let running = runtime.state == "running";
+        let state = if runtime.state == "error" {
+            "error"
+        } else if running {
+            "running"
+        } else if config.enabled {
+            "configured"
+        } else {
+            "stopped"
+        };
+        return Ok(GatewayControlStatus {
+            daemon_supported: false,
+            running,
+            pid: None,
+            state: state.into(),
+            local_endpoint: runtime.local_endpoint,
+            public_base_url: runtime.public_base_url,
+            route_count: runtime.route_count,
+            route_workspace_ids: runtime.route_workspace_ids,
+            owner_workspace_id: runtime.owner_workspace_id,
+            error: runtime.error,
+            detail: "Windows GUI 自动使用前台 Server 模式；关闭 Anchor 桌面应用即停止 Gateway。后台 daemon/Named Pipe server 尚未实现。".into(),
+        });
+    }
     let route_workspace_ids = if inspection.running {
         inspection
             .state

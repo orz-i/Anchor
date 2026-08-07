@@ -77,6 +77,44 @@ impl TunnelSupervisor {
         }
     }
 
+    /// Best-effort shutdown for desktop process exit.
+    ///
+    /// Normal start/stop paths retain transactional rollback semantics. Process
+    /// exit is different: no route should survive the owning GUI process, so
+    /// every child is terminated and in-memory ownership is cleared even if a
+    /// later cleanup step reports an error.
+    pub async fn shutdown_all(&mut self) {
+        let workspace_ids = self
+            .frp_routes
+            .keys()
+            .map(|(workspace_id, _)| workspace_id.clone())
+            .chain(self.frpc.keys().cloned())
+            .collect::<HashSet<_>>();
+
+        self.frp_routes.clear();
+
+        for (_, mut session) in self.sessions.drain() {
+            if let Some(child) = session.child.take() {
+                let _ = cloudflare::stop_child(child, session.pid).await;
+            } else if let Some(pid) = session.pid {
+                let _ = platform().terminate_process_tree(pid);
+            }
+        }
+
+        for (workspace_id, process) in self.frpc.drain() {
+            let pid = process.pid;
+            let _ = cloudflare::stop_child(process.child, pid).await;
+            frp::clear_managed_frpc_pid(&workspace_id);
+        }
+
+        // Also recover a recorded managed frpc whose in-memory Child was lost
+        // before exit. PID/image validation inside this helper prevents killing
+        // unrelated user processes.
+        for workspace_id in workspace_ids {
+            let _ = frp::stop_recorded_frpc_instance(&workspace_id).await;
+        }
+    }
+
     pub fn status(
         &self,
         profile: &WorkspaceProfile,

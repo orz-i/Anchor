@@ -26,7 +26,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 1. daemon 原先位于 CLI 私有模块，桌面端无法复用其状态模型；
 2. GUI 历史上直接编排 listener、tunnel 和 Gateway，形成第二个运行权威；主路径现已迁移到对应 daemon 控制客户端；
 3. CLI、GUI 分别组装部分状态，存在语义漂移风险；
-4. 后台 daemon 服务端目前仍仅支持 Linux；Workspace 和 Gateway 均已有独立版本化本地控制协议，Windows 服务端/ACL 尚未落地；
+4. 后台 daemon 服务端目前仍仅支持 Linux；Workspace 和 Gateway 均已有独立版本化本地控制协议，Windows 服务端/ACL 尚未落地；Windows GUI 在过渡期自动使用单一 process-local Server 模式保持完整可用性；
 5. 配置写入、运行应用和进程监督尚未形成清晰的单写者边界。
 
 ## 目标分层
@@ -126,11 +126,11 @@ GUI 工作区控制迁移现状：
 - MCP/Actions tunnel 状态、启动、停止、重载和测试已迁入 Workspace daemon；GUI 保存 tunnel 配置不再追加一次整 daemon 重启；
 - Workspace 页面已从固定 5 秒双 runtime 轮询迁移为 daemon event-first 长轮询；只有 endpoint unavailable 才进入 polling fallback，协议/远端错误不会静默降级，fallback 会继续探测并自动恢复事件模式；
 - MCP/Actions 配置保存和密钥应用在服务已运行时改用单服务 daemon reload，不再默认重启整个 Workspace daemon；
-- GUI 进程内 `RuntimeSupervisor` / Tunnel Supervisor 仅保留给旧会话和旧 Gateway 兼容运行态；主 Workspace/Tunnel 控制失败时不得进入该兼容路径；
+- GUI 进程内 `RuntimeSupervisor` / Tunnel Supervisor 在 daemon 支持的平台只保留旧兼容路径；在 Windows daemon 服务端尚未实现期间，它们构成显式、自动选择的 GUI Server 模式唯一运行权威，不能与 daemon 同时启用；
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
 - 若旧桌面进程仍持有兼容 Gateway listener，GUI 仍拒绝热改 Gateway 配置，防止旧进程与新 daemon 控制域同时成为运行权威。
 
-尚未完成：无需 listener 重建的真正字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Windows Named Pipe 服务端与当前用户 ACL、系统服务安装入口，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
+尚未完成：无需 listener 重建的真正字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Windows Named Pipe 服务端与当前用户 ACL、系统服务安装入口，以及 Windows daemon 完成后删除 GUI Server 兼容 `RuntimeSupervisor`。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -150,7 +150,7 @@ GUI 工作区控制迁移现状：
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
 
-当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply/logs/events 控制面；全局 layout 已使用跨控制域 aggregate status/events。下一步继续推进字段级 hot reload、系统服务安装、Windows server/ACL 和最终兼容 RuntimeSupervisor 删除。
+当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply/logs/events 控制面；全局 layout 已使用跨控制域 aggregate status/events。Windows GUI 已补上自动 process-local Server 兼容模式，避免 Named Pipe daemon 服务端完成前桌面不可用。下一步继续推进字段级 hot reload、系统服务安装、Windows Named Pipe server/ACL，并在该后台控制面可用后删除 Windows GUI Server 兼容 RuntimeSupervisor。
 
 ### 阶段 4：运行与升级治理
 

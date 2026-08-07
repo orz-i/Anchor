@@ -19,6 +19,7 @@
   import type { ControlPlaneEventCursor, ControlPlaneStatus, RuntimeState } from "$lib/types";
 
   let { children } = $props();
+  let processLocalServerMode = false;
 
   function applyControlPlaneStatus(status: ControlPlaneStatus) {
     const mcpStates: Record<string, RuntimeState> = {};
@@ -29,6 +30,7 @@
     }
     mcpRuntimeStates.set(mcpStates);
     actionsRuntimeStates.set(actionsStates);
+    processLocalServerMode = status.gateway.detail.includes("Windows GUI") && !status.gateway.daemonSupported;
   }
 
   async function refreshControlPlaneStates() {
@@ -53,11 +55,15 @@
     let lastFault = "";
     while (!isCancelled()) {
       try {
-        const batch = await getControlPlaneEvents(cursor, 15_000);
+        const batch = await getControlPlaneEvents(cursor, processLocalServerMode ? 2_000 : 15_000);
         if (isCancelled()) return;
         cursor = batch.nextCursor;
         lastFault = "";
         if (batch.events.length > 0 || batch.resetSources.length > 0) {
+          await refreshControlPlaneStates();
+        } else if (processLocalServerMode) {
+          // Windows GUI Server mode has no daemon event endpoint. Refresh one
+          // aggregate snapshot instead of reintroducing N×service polling.
           await refreshControlPlaneStates();
         } else {
           // Empty long-poll timeouts only check for externally added/removed profiles;

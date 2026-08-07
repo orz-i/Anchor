@@ -45,6 +45,7 @@ pub struct McpGatewayStatus {
     pub local_endpoint: String,
     pub public_base_url: String,
     pub route_count: usize,
+    pub route_workspace_ids: Vec<String>,
     pub owner_workspace_id: String,
     pub error: String,
 }
@@ -176,6 +177,7 @@ impl McpGatewayStatus {
             local_endpoint: format!("http://127.0.0.1:{}", config.local_port),
             public_base_url: config.effective_public_url(),
             route_count: 0,
+            route_workspace_ids: Vec::new(),
             owner_workspace_id: config.owner_workspace_id.clone(),
             error: String::new(),
         }
@@ -339,19 +341,21 @@ pub async fn ensure(
         }
     }
 
-    let route_count = supervisor
+    let routes = supervisor
         .runtime
         .as_ref()
         .map(|runtime| runtime.routes.clone())
-        .expect("gateway runtime just initialized")
-        .read()
-        .await
-        .len();
+        .expect("gateway runtime just initialized");
+    let routes = routes.read().await;
+    let route_count = routes.len();
+    let mut route_workspace_ids = routes.keys().cloned().collect::<Vec<_>>();
+    route_workspace_ids.sort();
     Ok(McpGatewayStatus {
         state: "running".into(),
         local_endpoint: format!("http://127.0.0.1:{}", config.local_port),
         public_base_url: config.effective_public_url(),
         route_count,
+        route_workspace_ids,
         owner_workspace_id: config.owner_workspace_id.clone(),
         error: String::new(),
     })
@@ -371,7 +375,10 @@ pub async fn status(config: &McpGatewayConfig) -> McpGatewayStatus {
     };
     let local_endpoint = format!("http://127.0.0.1:{}", runtime.port);
     let routes = runtime.routes.clone();
-    let route_count = routes.read().await.len();
+    let routes = routes.read().await;
+    let route_count = routes.len();
+    let mut route_workspace_ids = routes.keys().cloned().collect::<Vec<_>>();
+    route_workspace_ids.sort();
     let runtime_error = runtime.server_error.read().await.clone();
     let error = if !runtime_error.is_empty() {
         runtime_error
@@ -389,6 +396,7 @@ pub async fn status(config: &McpGatewayConfig) -> McpGatewayStatus {
         local_endpoint,
         public_base_url: config.effective_public_url(),
         route_count,
+        route_workspace_ids,
         owner_workspace_id: config.owner_workspace_id.clone(),
         error,
     }

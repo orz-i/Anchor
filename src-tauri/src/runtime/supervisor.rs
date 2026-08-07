@@ -86,6 +86,18 @@ impl RuntimeSupervisor {
         self.start(profile, ServiceKind::Actions)
     }
 
+    pub fn mcp_status(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+        let mut status = self.maintain(profile, ServiceKind::Mcp)?;
+        if status.state == "running" {
+            status.activity = Some(mcp::activity_snapshot(&profile.id));
+        }
+        Ok(status)
+    }
+
+    pub fn actions_status(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+        self.maintain(profile, ServiceKind::Actions)
+    }
+
     pub fn restart_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.restart(profile, ServiceKind::Mcp)
     }

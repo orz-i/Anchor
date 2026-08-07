@@ -250,7 +250,7 @@
         {:else if gatewayLog?.exists}
           <details class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-3">
             <summary class="cursor-pointer text-xs font-medium">
-              Gateway daemon 日志{gatewayLog.truncated ? " · 已截断" : ""}
+              Gateway {gatewayStatus && !gatewayStatus.daemonSupported ? "Server" : "daemon"} 日志{gatewayLog.truncated ? " · 已截断" : ""}
             </summary>
             <pre class="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all text-xs">{gatewayLog.content || "暂无新日志"}</pre>
           </details>
@@ -279,7 +279,7 @@
         {#if gatewayStatus}
           <span class="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs">
             {gatewayStatus.state === "running"
-              ? `运行中 · ${gatewayStatus.routeCount} 条路由${gatewayStatus.pid ? ` · PID ${gatewayStatus.pid}` : ""}`
+              ? `${gatewayStatus.daemonSupported ? "daemon" : "Server"} 运行中 · ${gatewayStatus.routeCount} 条路由${gatewayStatus.pid ? ` · PID ${gatewayStatus.pid}` : ""}`
               : gatewayStatus.state === "configured"
                 ? gatewayStatus.daemonSupported
                   ? "已配置 · Gateway daemon 未启动"
@@ -387,11 +387,14 @@
           </p>
         {/if}
 
-        {#if gatewayStatus?.state === "configured"}
+        {#if gatewayStatus && !gatewayStatus.daemonSupported}
           <p class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2 text-xs text-[var(--text-muted)]">
-            Gateway 配置已保存。桌面 GUI 不创建共享 listener 或隧道；后台运行请使用
-            <code>anchor gateway start &lt;workspace ...&gt;</code>。<code>gateway serve</code>
-            仅保留给前台调试或外部 supervisor。
+            <strong>Windows GUI Server 模式已自动启用，无需切换入口。</strong>
+            启用 Gateway 后，只要至少一个 Workspace MCP Server 正在运行，Gateway listener、route 与共享隧道就由当前 Anchor 桌面进程统一管理；关闭 Anchor 即停止。后台 daemon/Named Pipe server 尚未实现，因此这里不会提示使用不可用的 <code>gateway start</code>。
+          </p>
+        {:else if gatewayStatus?.state === "configured"}
+          <p class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2 text-xs text-[var(--text-muted)]">
+            Gateway 配置已保存。后台运行由独立 Gateway daemon 控制。
           </p>
         {/if}
 

@@ -1,14 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(any(unix, test))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
 
-use super::protocol::{ControlEvent, ControlEventKind, ControlService};
-#[cfg(any(unix, test))]
-use super::protocol::{ControlEventBatch, ControlEventCursor};
+use super::protocol::{
+    ControlEvent, ControlEventBatch, ControlEventCursor, ControlEventKind, ControlService,
+};
 
 const MAX_RETAINED_EVENTS: usize = 256;
 pub const MAX_EVENT_BATCH: u32 = 32;
@@ -119,7 +118,6 @@ pub fn publish_workspace_event(
     notify.notify_waiters();
 }
 
-#[cfg(any(unix, test))]
 pub async fn read_workspace_events(
     workspace_id: &str,
     cursor: Option<&ControlEventCursor>,
@@ -141,7 +139,6 @@ pub async fn read_workspace_events(
     snapshot_events(workspace_id, cursor, limit)
 }
 
-#[cfg(any(unix, test))]
 fn event_notify(workspace_id: &str) -> Arc<Notify> {
     let mut streams = streams()
         .lock()
@@ -154,7 +151,6 @@ fn event_notify(workspace_id: &str) -> Arc<Notify> {
     )
 }
 
-#[cfg(any(unix, test))]
 fn snapshot_events(
     workspace_id: &str,
     cursor: Option<&ControlEventCursor>,

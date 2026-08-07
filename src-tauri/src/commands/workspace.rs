@@ -131,13 +131,27 @@ pub async fn update_workspace(
     if gateway_inspection.ambiguous {
         return Err(AppError::Message(gateway_inspection.detail));
     }
-    let gateway_route_running = gateway_inspection.running
+    #[cfg(windows)]
+    let server_gateway_status = if super::runtime::desktop_server_mode() {
+        Some(crate::mcp::gateway::status(&previous_settings.mcp_gateway).await)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let server_gateway_status: Option<crate::mcp::gateway::McpGatewayStatus> = None;
+    let gateway_route_running = (gateway_inspection.running
         && gateway_inspection
             .state
             .as_ref()
-            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id));
-    let gateway_owner_running = gateway_inspection.running
-        && previous_settings.mcp_gateway.owner_workspace_id == profile.id;
+            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id)))
+        || server_gateway_status.as_ref().is_some_and(|status| {
+            status.state == "running" && status.route_workspace_ids.contains(&profile.id)
+        });
+    let gateway_owner_running = (gateway_inspection.running
+        && previous_settings.mcp_gateway.owner_workspace_id == profile.id)
+        || server_gateway_status.as_ref().is_some_and(|status| {
+            status.state == "running" && status.owner_workspace_id == profile.id
+        });
     let gateway_profile_live = gateway_route_running || gateway_owner_running;
     let mcp_running = daemon_state
         .as_ref()
@@ -229,6 +243,29 @@ pub async fn update_workspace(
         );
     }
     if gateway_profile_live {
+        #[cfg(windows)]
+        if super::runtime::desktop_server_mode() {
+            if let Err(error) = super::runtime::reconcile_server_gateway(&state).await {
+                let restore = state.with_workspaces(|store| {
+                    store.update(previous_profile.clone())?;
+                    store.update_settings(previous_settings.clone())
+                });
+                return match restore {
+                    Ok(()) => match super::runtime::reconcile_server_gateway(&state).await {
+                        Ok(_) => Err(AppError::Message(format!(
+                            "Windows GUI Server Gateway 未能应用 Workspace 配置，已恢复旧配置与旧运行态：{error}"
+                        ))),
+                        Err(reconcile_error) => Err(AppError::Message(format!(
+                            "Windows GUI Server Gateway 未能应用 Workspace 配置：{error}；已恢复磁盘配置，但再次恢复旧运行态失败：{reconcile_error}"
+                        ))),
+                    },
+                    Err(restore_error) => Err(AppError::Message(format!(
+                        "Windows GUI Server Gateway 未能应用 Workspace 配置：{error}；恢复旧 Workspace 配置也失败：{restore_error}"
+                    ))),
+                };
+            }
+            return Ok(());
+        }
         if let Err(error) =
             crate::gateway_control::request_reload(std::time::Duration::from_secs(20)).await
         {
@@ -316,6 +353,17 @@ pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResu
             "该 Workspace 正由 Gateway daemon 提供路由。请先执行 `anchor gateway stop`，再删除 Workspace；GUI 不会在后台静默改写 Gateway route 集合。"
                 .into(),
         ));
+    }
+    #[cfg(windows)]
+    if super::runtime::desktop_server_mode() {
+        let gateway = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
+        let status = crate::mcp::gateway::status(&gateway).await;
+        if status.state == "running" && status.route_workspace_ids.contains(&id) {
+            return Err(AppError::Message(
+                "该 Workspace 正由 Windows GUI Server Gateway 提供路由。请先在 Workspace 页面停止 MCP 服务，再删除 Workspace。"
+                    .into(),
+            ));
+        }
     }
     let profile = state.with_workspaces(|store| {
         store

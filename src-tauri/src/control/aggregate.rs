@@ -77,7 +77,10 @@ pub fn workspace_service_state(
         if gateway.state == "error" {
             return "error";
         }
-        if status.mcp.listening && status.mcp.pid == gateway.pid && gateway.pid.is_some() {
+        if status.mcp.listening
+            && ((status.mcp.pid == gateway.pid && gateway.pid.is_some())
+                || (!gateway.daemon_supported && status.mcp.owner == "server"))
+        {
             return "running";
         }
         if status.mcp.listening {
@@ -108,7 +111,7 @@ pub fn workspace_service_state(
     };
     if status.daemon.ambiguous || (status.daemon.stale && status.daemon.state.is_some()) {
         "error"
-    } else if selected && port.owner == "daemon" {
+    } else if (selected && port.owner == "daemon") || port.owner == "server" {
         "running"
     } else if port.owner == "external" {
         "error"
