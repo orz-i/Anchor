@@ -26,14 +26,138 @@ use crate::tunnel::{
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{
-    CliArgs, Command, GatewayCommand, GatewayConfigureOptions, LogSelection, LogsOptions,
-    RunOptions, ServiceSelection, StatusOptions, StopOptions,
+    CliArgs, Command, EventsOptions, GatewayCommand, GatewayConfigureOptions, LogSelection,
+    LogsOptions, ReloadOptions, RunOptions, ServiceSelection, StatusOptions, StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct CliTunnelRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
+}
+
+async fn reload_daemon_config(options: ReloadOptions, as_json: bool) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    let inspection = daemon::inspect(&profile)?;
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            AppError::Message("workspace daemon 未运行，reload 只能应用到当前活动服务".into())
+        })?;
+    let requested = match options.service {
+        ServiceSelection::Mcp => vec![control::ControlService::Mcp],
+        ServiceSelection::Actions => vec![control::ControlService::Actions],
+        ServiceSelection::All => vec![
+            control::ControlService::Mcp,
+            control::ControlService::Actions,
+        ],
+    };
+    if requested.iter().any(|service| match service {
+        control::ControlService::Mcp => !state.service.includes_mcp(),
+        control::ControlService::Actions => !state.service.includes_actions(),
+    }) {
+        return Err(AppError::Message(format!(
+            "daemon 当前 service={}，不能 reload 未运行的目标服务；请先启动该服务或只选择活动服务",
+            state.service.as_str()
+        )));
+    }
+    let mut reloaded = Vec::new();
+    for service in requested {
+        control::request_reload_operation(&profile, service, Duration::from_secs(15))
+            .await
+            .map_err(|error| {
+                AppError::Message(format!(
+                    "daemon reload {} 失败：{error}",
+                    match service {
+                        control::ControlService::Mcp => "mcp",
+                        control::ControlService::Actions => "actions",
+                    }
+                ))
+            })?;
+        reloaded.push(match service {
+            control::ControlService::Mcp => "mcp",
+            control::ControlService::Actions => "actions",
+        });
+    }
+    if as_json {
+        print_json(&json!({
+            "event": "reloaded",
+            "workspaceId": profile.id,
+            "services": reloaded
+        }))?;
+    } else {
+        println!(
+            "workspace {} 已通过 daemon reload：{}",
+            profile.name,
+            reloaded.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn show_events(options: EventsOptions, as_json: bool) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    drop(store);
+    let mut cursor = None;
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    loop {
+        let wait_ms = if options.follow {
+            u32::try_from(options.wait_seconds.saturating_mul(1_000)).unwrap_or(25_000)
+        } else {
+            0
+        };
+        let request = control::request_events(&profile, cursor.clone(), 64, wait_ms);
+        let batch = if options.follow {
+            tokio::select! {
+                result = &mut shutdown_signal => return result,
+                result = request => result.map_err(|error| AppError::Message(error.to_string()))?,
+            }
+        } else {
+            request
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?
+        };
+        cursor = Some(batch.next_cursor.clone());
+        if as_json {
+            if options.follow {
+                for event in &batch.events {
+                    print_json_line(event)?;
+                }
+                if batch.reset {
+                    print_json_line(&json!({
+                        "kind": "cursor_reset",
+                        "cursor": batch.next_cursor
+                    }))?;
+                }
+            } else {
+                print_json(&batch)?;
+            }
+        } else {
+            if batch.reset {
+                eprintln!("event cursor 已重置到当前 daemon stream");
+            }
+            for event in &batch.events {
+                println!(
+                    "{}\t{:?}\t{}\t{}\t{}",
+                    event.sequence,
+                    event.kind,
+                    event
+                        .service
+                        .map(|service| format!("{service:?}").to_lowercase())
+                        .unwrap_or_else(|| "daemon".into()),
+                    event.state,
+                    event.message
+                );
+            }
+        }
+        if !options.follow {
+            return Ok(());
+        }
+    }
 }
 
 async fn next_daemon_control_command(
@@ -1074,6 +1198,8 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Stop(options) => stop_daemon(options, cli.json).await.map(|_| 0),
         Command::Restart(options) => restart_daemon(options, cli.json).await.map(|_| 0),
         Command::Logs(options) => show_logs(options, cli.json).await.map(|_| 0),
+        Command::Events(options) => show_events(options, cli.json).await.map(|_| 0),
+        Command::Reload(options) => reload_daemon_config(options, cli.json).await.map(|_| 0),
         Command::Doctor { workspace } => {
             doctor_workspace(&workspace, cli.json).map(|healthy| if healthy { 0 } else { 1 })
         }
@@ -1225,6 +1351,7 @@ async fn serve_workspace(
 ) -> AppResult<()> {
     let store = DataStore::load()?;
     let mut profile = resolve_workspace(store.list(), selector)?.clone();
+    control::reset_workspace_event_stream(&profile.id);
     ensure_workspace_directory(&profile)?;
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
@@ -1336,6 +1463,19 @@ async fn serve_workspace(
             print_runtime_line("daemon 运行中，等待 SIGTERM/SIGINT 停止。", false, false);
         }
     }
+    control::publish_workspace_event(
+        &profile.id,
+        control::ControlEventKind::DaemonReady,
+        None,
+        "running",
+        format!(
+            "daemon ready with service={} tunnels={}",
+            service.as_str(),
+            tunnel_services
+                .map(ServiceSelection::as_str)
+                .unwrap_or("none")
+        ),
+    );
 
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(2));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1355,6 +1495,13 @@ async fn serve_workspace(
             command = next_daemon_control_command(&mut control_commands) => {
                 match command {
                     Some(control::DaemonControlCommand::Shutdown { operation }) => {
+                        control::publish_workspace_event(
+                            &profile.id,
+                            control::ControlEventKind::DaemonStopping,
+                            None,
+                            "stopping",
+                            format!("accepted {operation:?}"),
+                        );
                         crate::tunnel::append_profile_log(
                             &profile.id,
                             "daemon.log",
@@ -1379,7 +1526,54 @@ async fn serve_workspace(
                         if result.is_ok() {
                             tunnel_retries.remove(&tunnel_service);
                         }
+                        match &result {
+                            Ok(status) => control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::TunnelState,
+                                Some(control_service_for_tunnel(tunnel_service)),
+                                status.state.clone(),
+                                status.public_url.clone(),
+                            ),
+                            Err(error) => control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::TunnelState,
+                                Some(control_service_for_tunnel(tunnel_service)),
+                                "error",
+                                error.to_string(),
+                            ),
+                        }
                         control::finish_tunnel_operation(&operation_id, result);
+                    }
+                    Some(control::DaemonControlCommand::Reload {
+                        operation_id,
+                        service: reload_service,
+                    }) => {
+                        control::mark_control_operation_running(&operation_id);
+                        let result = apply_daemon_reload_command(
+                            &mut profile,
+                            service,
+                            &managed_tunnels,
+                            &mut runtime,
+                            reload_service,
+                        )
+                        .await;
+                        match &result {
+                            Ok(()) => control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::Reload,
+                                Some(reload_service),
+                                "succeeded",
+                                "service configuration reloaded",
+                            ),
+                            Err(error) => control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::Reload,
+                                Some(reload_service),
+                                "failed",
+                                error.to_string(),
+                            ),
+                        }
+                        control::finish_reload_operation(&operation_id, result);
                     }
                     None => {
                         terminal_error = Some(AppError::Message(
@@ -1404,6 +1598,13 @@ async fn serve_workspace(
                     };
                     let previous = last_states.insert(kind, status.state.clone());
                     if previous.as_deref() != Some(status.state.as_str()) {
+                        control::publish_workspace_event(
+                            &profile.id,
+                            control::ControlEventKind::ServiceState,
+                            Some(control_service_for_runtime(kind)),
+                            status.state.clone(),
+                            status.local_message.clone(),
+                        );
                         if as_json {
                             print_json(&json!({
                                 "event": "service_state",
@@ -1444,6 +1645,13 @@ async fn serve_workspace(
                     match ensure_for_runtime(&profile, kind).await {
                         Ok(_) => {
                             if let Some(previous) = tunnel_retries.remove(&kind) {
+                                control::publish_workspace_event(
+                                    &profile.id,
+                                    control::ControlEventKind::TunnelState,
+                                    Some(control_service_for_tunnel(kind)),
+                                    "running",
+                                    format!("reconnected after {} attempts", previous.attempts),
+                                );
                                 if as_json {
                                     print_json(&json!({
                                         "event": "tunnel_reconnected",
@@ -1476,6 +1684,13 @@ async fn serve_workspace(
                                     attempts,
                                     next_attempt: tokio::time::Instant::now() + delay,
                                 },
+                            );
+                            control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::TunnelState,
+                                Some(control_service_for_tunnel(kind)),
+                                "recovering",
+                                error.to_string(),
                             );
                             if as_json {
                                 print_json(&json!({
@@ -1787,6 +2002,93 @@ async fn apply_daemon_tunnel_command(
         managed_tunnel_selection(managed_tunnels),
     )?;
     Ok(status)
+}
+
+async fn apply_daemon_reload_command(
+    profile: &mut WorkspaceProfile,
+    service_selection: ServiceSelection,
+    managed_tunnels: &[TunnelServiceKind],
+    runtime: &mut RuntimeSupervisor,
+    service: control::ControlService,
+) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let latest = resolve_workspace(store.list(), &profile.id)?.clone();
+    drop(store);
+    ensure_workspace_directory(&latest)?;
+
+    let kind = match service {
+        control::ControlService::Mcp => ServiceKind::Mcp,
+        control::ControlService::Actions => ServiceKind::Actions,
+    };
+    let selected = match service {
+        control::ControlService::Mcp => service_selection.includes_mcp(),
+        control::ControlService::Actions => service_selection.includes_actions(),
+    };
+    if !selected {
+        return Err(AppError::Message(format!(
+            "daemon 当前未运行 {}，不能对未活动服务执行 reload",
+            service_label(kind)
+        )));
+    }
+    let previous = profile.clone();
+
+    let handle = runtime.begin_stop(&profile.id, kind);
+    await_listener_shutdown(handle, port_for(&previous, kind)).await;
+    runtime.finish_stop(&profile.id, kind);
+
+    let reload_result = match kind {
+        ServiceKind::Mcp => runtime
+            .start_mcp(&latest)
+            .and_then(|status| ensure_running(status, "MCP")),
+        ServiceKind::Actions => runtime
+            .start_actions(&latest)
+            .and_then(|status| ensure_running(status, "Actions")),
+    };
+    if let Err(error) = reload_result {
+        let handle = runtime.begin_stop(&profile.id, kind);
+        await_listener_shutdown(handle, port_for(&latest, kind)).await;
+        runtime.finish_stop(&profile.id, kind);
+        let rollback = match kind {
+            ServiceKind::Mcp => runtime
+                .start_mcp(&previous)
+                .and_then(|status| ensure_running(status, "MCP")),
+            ServiceKind::Actions => runtime
+                .start_actions(&previous)
+                .and_then(|status| ensure_running(status, "Actions")),
+        };
+        return match rollback {
+            Ok(()) => Err(AppError::Message(format!(
+                "{} 配置 reload 失败，已恢复旧 listener：{error}",
+                service_label(kind)
+            ))),
+            Err(rollback_error) => Err(AppError::Message(format!(
+                "{} 配置 reload 失败：{error}；恢复旧 listener 也失败：{rollback_error}",
+                service_label(kind)
+            ))),
+        };
+    }
+
+    *profile = latest;
+    daemon::update_tunnel_services(
+        profile,
+        service_selection,
+        managed_tunnel_selection(managed_tunnels),
+    )?;
+    Ok(())
+}
+
+fn control_service_for_runtime(kind: ServiceKind) -> control::ControlService {
+    match kind {
+        ServiceKind::Mcp => control::ControlService::Mcp,
+        ServiceKind::Actions => control::ControlService::Actions,
+    }
+}
+
+fn control_service_for_tunnel(kind: TunnelServiceKind) -> control::ControlService {
+    match kind {
+        TunnelServiceKind::Mcp => control::ControlService::Mcp,
+        TunnelServiceKind::Actions => control::ControlService::Actions,
+    }
 }
 
 fn ensure_workspace_directory(profile: &WorkspaceProfile) -> AppResult<()> {

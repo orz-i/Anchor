@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { invokeRead } from "$lib/api/invoke";
 import type {
+  ControlEventBatch,
+  ControlEventCursor,
   RuntimeStatus,
   SkillInspection,
   WorkspaceControlStatus,
@@ -52,6 +54,18 @@ export async function getRuntimeStatus(id: string): Promise<RuntimeStatus> {
 
 export async function getWorkspaceControlStatus(id: string): Promise<WorkspaceControlStatus> {
   return invokeRead<WorkspaceControlStatus>("get_workspace_control_status", { id });
+}
+
+export async function getWorkspaceControlEvents(
+  id: string,
+  cursor: ControlEventCursor | null,
+  waitMs = 15_000,
+): Promise<ControlEventBatch | null> {
+  return invokeRead<ControlEventBatch | null>("get_workspace_control_events", {
+    id,
+    cursor,
+    waitMs,
+  });
 }
 
 export async function startActionsRuntime(id: string): Promise<RuntimeStatus> {

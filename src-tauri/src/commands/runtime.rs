@@ -427,6 +427,27 @@ pub async fn get_workspace_control_status(
 }
 
 #[tauri::command]
+pub async fn get_workspace_control_events(
+    state: State<'_, AppState>,
+    id: String,
+    cursor: Option<control::ControlEventCursor>,
+    wait_ms: u32,
+) -> AppResult<Option<control::ControlEventBatch>> {
+    let profile = profile_by_id(&state, &id)?;
+    map_control_events(control::request_events(&profile, cursor, 64, wait_ms).await)
+}
+
+fn map_control_events(
+    result: Result<control::ControlEventBatch, control::ControlClientError>,
+) -> AppResult<Option<control::ControlEventBatch>> {
+    match result {
+        Ok(batch) => Ok(Some(batch)),
+        Err(error) if error.is_unavailable() => Ok(None),
+        Err(error) => Err(AppError::Message(error.to_string())),
+    }
+}
+
+#[tauri::command]
 
 pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<RuntimeStatusDto> {
     stop_desktop_service(&state, &id, WorkspaceService::Mcp).await
@@ -495,6 +516,21 @@ mod tests {
     use crate::daemon::{DaemonInspection, DaemonState, ServiceSelection};
     use crate::settings::AppSettings;
     use crate::workspace::WorkspaceProfile;
+
+    #[test]
+    fn event_monitor_only_falls_back_when_daemon_endpoint_is_unavailable() {
+        let unavailable = map_control_events(Err(control::ControlClientError::Unavailable(
+            "not running".into(),
+        )))
+        .expect("unavailable endpoint should permit polling fallback");
+        assert!(unavailable.is_none());
+
+        let protocol = map_control_events(Err(control::ControlClientError::Protocol(
+            "version mismatch".into(),
+        )))
+        .expect_err("protocol errors must not silently fall back");
+        assert!(protocol.to_string().contains("version mismatch"));
+    }
 
     #[test]
     fn daemon_status_maps_each_service_without_process_local_runtime_state() {

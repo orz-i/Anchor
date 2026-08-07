@@ -14,6 +14,9 @@ use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 use crate::workspace::WorkspaceProfile;
 
 #[cfg(any(unix, test))]
+use super::events::read_workspace_events;
+use super::events::{MAX_EVENT_BATCH, MAX_EVENT_WAIT_MS};
+#[cfg(any(unix, test))]
 use super::logs::read_log_batch;
 #[cfg(any(unix, test))]
 use super::protocol::{
@@ -21,9 +24,10 @@ use super::protocol::{
     ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND, ERROR_WORKSPACE_MISMATCH,
 };
 use super::protocol::{
-    ControlAsyncOperation, ControlAsyncState, ControlError, ControlLogChunk, ControlLogCursor,
-    ControlLogSelection, ControlMethod, ControlOperation, ControlRequest, ControlResponse,
-    ControlResult, ControlTunnelAction, MAX_CONTROL_FRAME_BYTES,
+    ControlAsyncOperation, ControlAsyncState, ControlError, ControlEventBatch, ControlEventCursor,
+    ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod, ControlOperation,
+    ControlRequest, ControlResponse, ControlResult, ControlService, ControlTunnelAction,
+    MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
@@ -42,6 +46,175 @@ pub enum DaemonControlCommand {
         service: TunnelServiceKind,
         action: ControlTunnelAction,
     },
+    Reload {
+        operation_id: String,
+        service: ControlService,
+    },
+}
+
+async fn wait_for_operation(
+    profile: &WorkspaceProfile,
+    operation_id: &str,
+    timeout: Duration,
+) -> Result<ControlAsyncOperation, ControlClientError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let operation = match request(
+            &profile.id,
+            ControlMethod::OperationStatus {
+                workspace_id: profile.id.clone(),
+                operation_id: operation_id.to_string(),
+            },
+        )
+        .await?
+        {
+            ControlResult::OperationStatus { operation } => operation,
+            other => {
+                return Err(ControlClientError::Protocol(format!(
+                    "daemon returned unexpected operation status result: {other:?}"
+                )))
+            }
+        };
+        if matches!(
+            operation.state,
+            ControlAsyncState::Succeeded | ControlAsyncState::Failed
+        ) {
+            return Ok(operation);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ControlClientError::Remote {
+                code: "operation_timeout".into(),
+                message: format!("control operation {operation_id} did not finish before timeout"),
+            });
+        }
+        tokio::time::sleep(CONTROL_OPERATION_POLL_INTERVAL).await;
+    }
+}
+
+pub(crate) fn finish_reload_operation(operation_id: &str, result: AppResult<()>) {
+    let mut operations = operation_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(stored) = operations.get_mut(operation_id) else {
+        return;
+    };
+    match result {
+        Ok(()) => {
+            stored.operation.state = ControlAsyncState::Succeeded;
+            stored.operation.tunnel_status = None;
+            stored.operation.error = None;
+        }
+        Err(error) => {
+            stored.operation.state = ControlAsyncState::Failed;
+            stored.operation.tunnel_status = None;
+            stored.operation.error = Some(ControlError {
+                code: super::protocol::ERROR_OPERATION_FAILED.to_string(),
+                message: error.to_string(),
+            });
+        }
+    }
+}
+
+pub async fn request_reload_operation(
+    profile: &WorkspaceProfile,
+    service: ControlService,
+    timeout: Duration,
+) -> Result<(), ControlClientError> {
+    let inspection = daemon::inspect(profile).map_err(|error| {
+        ControlClientError::Protocol(format!("cannot inspect daemon before reload: {error}"))
+    })?;
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            ControlClientError::Protocol(
+                "workspace daemon is not running; reload requires the daemon control plane".into(),
+            )
+        })?;
+    let selected = match service {
+        ControlService::Mcp => state.service.includes_mcp(),
+        ControlService::Actions => state.service.includes_actions(),
+    };
+    if !selected {
+        return Err(ControlClientError::Protocol(format!(
+            "daemon is not currently running the requested {} service; reload only applies to active services",
+            match service {
+                ControlService::Mcp => "mcp",
+                ControlService::Actions => "actions",
+            }
+        )));
+    }
+    let (operation_id, daemon_pid) = match request(
+        &profile.id,
+        ControlMethod::Reload {
+            workspace_id: profile.id.clone(),
+            service,
+        },
+    )
+    .await?
+    {
+        ControlResult::OperationAccepted {
+            operation_id,
+            daemon_pid,
+        } => (operation_id, daemon_pid),
+        other => {
+            return Err(ControlClientError::Protocol(format!(
+                "daemon returned unexpected reload result: {other:?}"
+            )))
+        }
+    };
+    if daemon_pid != state.pid {
+        return Err(ControlClientError::Protocol(format!(
+            "daemon reload PID mismatch: status file={}, response={daemon_pid}",
+            state.pid
+        )));
+    }
+
+    let operation = wait_for_operation(profile, &operation_id, timeout).await?;
+    match operation.state {
+        ControlAsyncState::Succeeded => Ok(()),
+        ControlAsyncState::Failed => {
+            let error = operation.error.ok_or_else(|| {
+                ControlClientError::Protocol("failed reload omitted error details".into())
+            })?;
+            Err(ControlClientError::Remote {
+                code: error.code,
+                message: error.message,
+            })
+        }
+        ControlAsyncState::Pending | ControlAsyncState::Running => {
+            Err(ControlClientError::Protocol(
+                "reload operation wait returned before reaching a terminal state".into(),
+            ))
+        }
+    }
+}
+
+pub async fn request_events(
+    profile: &WorkspaceProfile,
+    cursor: Option<ControlEventCursor>,
+    limit: u32,
+    wait_ms: u32,
+) -> Result<ControlEventBatch, ControlClientError> {
+    let wait_ms = wait_ms.min(MAX_EVENT_WAIT_MS);
+    let timeout = Duration::from_millis(u64::from(wait_ms).saturating_add(1_000));
+    match request_with_timeout(
+        &profile.id,
+        ControlMethod::Events {
+            workspace_id: profile.id.clone(),
+            cursor,
+            limit: limit.clamp(1, MAX_EVENT_BATCH),
+            wait_ms,
+        },
+        timeout,
+    )
+    .await?
+    {
+        ControlResult::Events { batch } => Ok(batch),
+        other => Err(ControlClientError::Protocol(format!(
+            "daemon returned unexpected events result: {other:?}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -378,19 +551,26 @@ async fn request(
     profile_id: &str,
     method: ControlMethod,
 ) -> Result<ControlResult, ControlClientError> {
+    request_with_timeout(profile_id, method, CONTROL_REQUEST_TIMEOUT).await
+}
+
+async fn request_with_timeout(
+    profile_id: &str,
+    method: ControlMethod,
+    timeout: Duration,
+) -> Result<ControlResult, ControlClientError> {
     let endpoint = endpoint(profile_id).map_err(|error| {
         ControlClientError::Protocol(format!("cannot resolve daemon control endpoint: {error}"))
     })?;
     let request = ControlRequest::new(method);
     let request_id = request.request_id.clone();
-    let response = tokio::time::timeout(
-        CONTROL_REQUEST_TIMEOUT,
-        exchange_with_endpoint(&endpoint, &request),
-    )
-    .await
-    .map_err(|_| {
-        ControlClientError::Unavailable(format!("daemon control endpoint timed out: {endpoint:?}"))
-    })??;
+    let response = tokio::time::timeout(timeout, exchange_with_endpoint(&endpoint, &request))
+        .await
+        .map_err(|_| {
+            ControlClientError::Unavailable(format!(
+                "daemon control endpoint timed out: {endpoint:?}"
+            ))
+        })??;
 
     if response.protocol_version != super::protocol::CONTROL_PROTOCOL_VERSION {
         return Err(ControlClientError::Protocol(format!(
@@ -661,14 +841,31 @@ where
     write_json_frame(&mut stream, &handled.response).await?;
     stream.shutdown().await?;
     if let Some(command) = handled.command {
-        let operation_id = match &command {
-            DaemonControlCommand::Tunnel { operation_id, .. } => Some(operation_id.clone()),
+        enum AsyncCommandKind {
+            Tunnel(String),
+            Reload(String),
+        }
+        let async_command = match &command {
+            DaemonControlCommand::Tunnel { operation_id, .. } => {
+                Some(AsyncCommandKind::Tunnel(operation_id.clone()))
+            }
+            DaemonControlCommand::Reload { operation_id, .. } => {
+                Some(AsyncCommandKind::Reload(operation_id.clone()))
+            }
             DaemonControlCommand::Shutdown { .. } => None,
         };
         if command_sender.send(command).is_err() {
             let error = AppError::Message("daemon control command receiver is unavailable".into());
-            if let Some(operation_id) = operation_id {
-                finish_tunnel_operation(&operation_id, Err(AppError::Message(error.to_string())));
+            match async_command {
+                Some(AsyncCommandKind::Tunnel(operation_id)) => finish_tunnel_operation(
+                    &operation_id,
+                    Err(AppError::Message(error.to_string())),
+                ),
+                Some(AsyncCommandKind::Reload(operation_id)) => finish_reload_operation(
+                    &operation_id,
+                    Err(AppError::Message(error.to_string())),
+                ),
+                None => {}
             }
             return Err(error);
         }
@@ -847,6 +1044,58 @@ async fn handle_request(
                     ERROR_OPERATION_NOT_FOUND,
                     format!("unknown control operation: {operation_id}"),
                 )),
+            }
+        }
+        ControlMethod::Events {
+            workspace_id,
+            cursor,
+            limit,
+            wait_ms,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            let batch = read_workspace_events(&profile.id, cursor.as_ref(), limit, wait_ms).await;
+            handled(ControlResponse::success(
+                request_id,
+                ControlResult::Events { batch },
+            ))
+        }
+        ControlMethod::Reload {
+            workspace_id,
+            service,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            if !command_available {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    "daemon reload command receiver is unavailable",
+                ));
+            }
+            let Some(operation_id) = create_control_operation(&profile.id) else {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    format!(
+                        "daemon already has {MAX_CONTROL_OPERATIONS} active control operations"
+                    ),
+                ));
+            };
+            HandledRequest {
+                response: ControlResponse::success(
+                    request_id,
+                    ControlResult::OperationAccepted {
+                        operation_id: operation_id.clone(),
+                        daemon_pid: std::process::id(),
+                    },
+                ),
+                command: Some(DaemonControlCommand::Reload {
+                    operation_id,
+                    service,
+                }),
             }
         }
     }
@@ -1175,6 +1424,164 @@ mod tests {
                 assert!(operation.error.is_none());
             }
             other => panic!("unexpected operation response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_response_is_flushed_before_execution_and_operation_tracks_completion() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-reload".into()));
+        let workspace_id = profile.id.clone();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (command_sender, mut command_receiver) = control_channel();
+        let server_profile = profile.clone();
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &server_profile, &command_sender).await
+        });
+        let request = ControlRequest {
+            protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+            request_id: "reload-request".into(),
+            method: ControlMethod::Reload {
+                workspace_id: workspace_id.clone(),
+                service: ControlService::Mcp,
+            },
+        };
+
+        write_json_frame(&mut client, &request)
+            .await
+            .expect("write reload request");
+        let response: ControlResponse = read_json_frame(&mut client).await.expect("read response");
+        let operation_id = match response.result.expect("accepted result") {
+            ControlResult::OperationAccepted {
+                operation_id,
+                daemon_pid,
+            } => {
+                assert_eq!(daemon_pid, std::process::id());
+                operation_id
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        server_task
+            .await
+            .expect("server task")
+            .expect("serve reload request");
+        assert_eq!(
+            command_receiver.recv().await,
+            Some(DaemonControlCommand::Reload {
+                operation_id: operation_id.clone(),
+                service: ControlService::Mcp,
+            })
+        );
+
+        mark_control_operation_running(&operation_id);
+        finish_reload_operation(&operation_id, Ok(()));
+        let completed = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "reload-completed".into(),
+                method: ControlMethod::OperationStatus {
+                    workspace_id,
+                    operation_id,
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        match completed.result.expect("operation result") {
+            ControlResult::OperationStatus { operation } => {
+                assert_eq!(operation.state, ControlAsyncState::Succeeded);
+                assert!(operation.tunnel_status.is_none());
+                assert!(operation.error.is_none());
+            }
+            other => panic!("unexpected operation response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_requests_resume_from_cursor_and_report_stream_reset() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-events".into()));
+        super::super::reset_workspace_event_stream(&profile.id);
+        super::super::publish_workspace_event(
+            &profile.id,
+            super::super::protocol::ControlEventKind::DaemonReady,
+            None,
+            "running",
+            "ready",
+        );
+        let first = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "events-first".into(),
+                method: ControlMethod::Events {
+                    workspace_id: profile.id.clone(),
+                    cursor: None,
+                    limit: 8,
+                    wait_ms: 0,
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        let first_batch = match first.result.expect("events result") {
+            ControlResult::Events { batch } => batch,
+            other => panic!("unexpected event response: {other:?}"),
+        };
+        assert_eq!(first_batch.events.len(), 1);
+        assert!(!first_batch.reset);
+
+        super::super::publish_workspace_event(
+            &profile.id,
+            super::super::protocol::ControlEventKind::McpActivity,
+            Some(ControlService::Mcp),
+            "active",
+            "tool started",
+        );
+        let resumed = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "events-resumed".into(),
+                method: ControlMethod::Events {
+                    workspace_id: profile.id.clone(),
+                    cursor: Some(first_batch.next_cursor.clone()),
+                    limit: 8,
+                    wait_ms: 0,
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        let resumed_batch = match resumed.result.expect("events result") {
+            ControlResult::Events { batch } => batch,
+            other => panic!("unexpected event response: {other:?}"),
+        };
+        assert_eq!(resumed_batch.events.len(), 1);
+        assert_eq!(resumed_batch.events[0].sequence, 2);
+
+        super::super::reset_workspace_event_stream(&profile.id);
+        let reset = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "events-reset".into(),
+                method: ControlMethod::Events {
+                    workspace_id: profile.id.clone(),
+                    cursor: Some(resumed_batch.next_cursor),
+                    limit: 8,
+                    wait_ms: 0,
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        match reset.result.expect("events result") {
+            ControlResult::Events { batch } => assert!(batch.reset),
+            other => panic!("unexpected event response: {other:?}"),
         }
     }
 

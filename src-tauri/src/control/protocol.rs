@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::WorkspaceControlStatus;
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 3;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 4;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
@@ -70,6 +70,65 @@ pub enum ControlMethod {
         #[serde(rename = "operationId")]
         operation_id: String,
     },
+    Events {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor: Option<ControlEventCursor>,
+        limit: u32,
+        #[serde(rename = "waitMs")]
+        wait_ms: u32,
+    },
+    Reload {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        service: ControlService,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlService {
+    Mcp,
+    Actions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlEventKind {
+    DaemonReady,
+    DaemonStopping,
+    ServiceState,
+    TunnelState,
+    McpActivity,
+    Reload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlEventCursor {
+    pub stream_id: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlEvent {
+    pub sequence: u64,
+    pub emitted_at_unix_ms: u64,
+    pub kind: ControlEventKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<ControlService>,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlEventBatch {
+    pub events: Vec<ControlEvent>,
+    pub next_cursor: ControlEventCursor,
+    pub reset: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +256,9 @@ pub enum ControlResult {
     },
     OperationStatus {
         operation: ControlAsyncOperation,
+    },
+    Events {
+        batch: ControlEventBatch,
     },
 }
 
@@ -326,5 +388,36 @@ mod tests {
         .expect("serialize operation status request");
         assert_eq!(operation["method"], "operation_status");
         assert_eq!(operation["operationId"], "operation-1");
+
+        let events = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-7".into(),
+            method: ControlMethod::Events {
+                workspace_id: "workspace-1".into(),
+                cursor: Some(ControlEventCursor {
+                    stream_id: "stream-1".into(),
+                    sequence: 9,
+                }),
+                limit: 32,
+                wait_ms: 15_000,
+            },
+        })
+        .expect("serialize event request");
+        assert_eq!(events["method"], "events");
+        assert_eq!(events["cursor"]["streamId"], "stream-1");
+        assert_eq!(events["cursor"]["sequence"], 9);
+        assert_eq!(events["waitMs"], 15_000);
+
+        let reload = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-8".into(),
+            method: ControlMethod::Reload {
+                workspace_id: "workspace-1".into(),
+                service: ControlService::Mcp,
+            },
+        })
+        .expect("serialize reload request");
+        assert_eq!(reload["method"], "reload");
+        assert_eq!(reload["service"], "mcp");
     }
 }

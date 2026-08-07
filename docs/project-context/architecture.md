@@ -87,10 +87,12 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - **实现**: `src-tauri/src/runtime/`
 
 ### control/ 与 daemon.rs
-- **职责**: CLI/GUI 共用的控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期与 Workspace Tunnel 异步写操作
+- **职责**: CLI/GUI 共用的控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal 与单服务配置 reload
 - **传输**: Unix Domain Socket；Windows Named Pipe 抽象
 - **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
-- **GUI 接入**: Workspace 状态、日志、启停、重启、Tunnel、删除和密钥应用均通过共享 daemon 客户端；Tunnel 写请求先 accepted 再异步执行，GUI 不持有第二套 Tunnel Supervisor 权威
+- **协议**: 当前 v4；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel 写请求使用 accepted → operation status 异步状态机
+- **GUI 接入**: Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；endpoint unavailable 才允许状态轮询 fallback，协议错误 fail-closed
+- **配置应用**: 已运行服务使用 daemon 内单 listener reload；daemon PID、另一 listener 与 Tunnel ownership 不因普通配置应用而重启，新 listener 失败时尝试恢复旧 listener
 
 ### Gateway 控制域
 - **职责**: 多 Workspace 共享 MCP Gateway listener、路由集合和唯一公网 Gateway tunnel

@@ -51,9 +51,19 @@ struct ActivityState {
     completed_requests: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct McpActivityTracker {
     inner: Arc<Mutex<ActivityState>>,
+    workspace_id: Arc<String>,
+}
+
+impl Default for McpActivityTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ActivityState::default())),
+            workspace_id: Arc::new(String::new()),
+        }
+    }
 }
 
 pub(crate) struct McpActivityRequestGuard {
@@ -83,7 +93,10 @@ fn registry() -> &'static Mutex<HashMap<String, Weak<Mutex<ActivityState>>>> {
 }
 
 pub(crate) fn register_activity(workspace_id: &str) -> McpActivityTracker {
-    let tracker = McpActivityTracker::default();
+    let tracker = McpActivityTracker {
+        inner: Arc::new(Mutex::new(ActivityState::default())),
+        workspace_id: Arc::new(workspace_id.to_string()),
+    };
     registry()
         .lock()
         .expect("MCP activity registry lock")
@@ -104,7 +117,13 @@ pub(crate) fn activity_snapshot(workspace_id: &str) -> McpActivityDto {
         }
     };
     inner
-        .map(|inner| McpActivityTracker { inner }.snapshot())
+        .map(|inner| {
+            McpActivityTracker {
+                inner,
+                workspace_id: Arc::new(workspace_id.to_string()),
+            }
+            .snapshot()
+        })
         .unwrap_or_else(unknown_snapshot)
 }
 
@@ -139,6 +158,17 @@ impl McpActivityTracker {
                 tool: _tool.to_string(),
             },
         );
+        let in_flight = state.in_flight.len();
+        drop(state);
+        if !self.workspace_id.is_empty() {
+            crate::control::publish_workspace_event(
+                self.workspace_id.as_str(),
+                crate::control::ControlEventKind::McpActivity,
+                Some(crate::control::ControlService::Mcp),
+                "active",
+                format!("{in_flight} tracked MCP request(s) in flight"),
+            );
+        }
         Some(McpActivityRequestGuard {
             tracker: self.clone(),
             key: Some(key),
@@ -159,6 +189,21 @@ impl McpActivityTracker {
         }
         #[cfg(not(any(unix, test)))]
         let _ = (removed, completed);
+        let in_flight = state.in_flight.len();
+        drop(state);
+        if removed && !self.workspace_id.is_empty() {
+            crate::control::publish_workspace_event(
+                self.workspace_id.as_str(),
+                crate::control::ControlEventKind::McpActivity,
+                Some(crate::control::ControlService::Mcp),
+                if in_flight == 0 { "recent" } else { "active" },
+                if completed {
+                    "MCP request completed".to_string()
+                } else {
+                    "MCP request cancelled or connection dropped".to_string()
+                },
+            );
+        }
     }
 
     pub(crate) fn cancel_session(&self, session_id: &str) {

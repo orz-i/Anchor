@@ -10,6 +10,36 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+fn parse_events(args: &mut VecDeque<String>) -> Result<EventsOptions, String> {
+    let workspace = pop_value(args, "events")?;
+    let mut follow = false;
+    let mut wait_seconds = 15;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--follow" | "-f" => follow = true,
+            "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 25)?,
+            other => return Err(format!("events 不支持参数：{other}")),
+        }
+    }
+    Ok(EventsOptions {
+        workspace,
+        follow,
+        wait_seconds,
+    })
+}
+
+fn parse_reload(args: &mut VecDeque<String>) -> Result<ReloadOptions, String> {
+    let workspace = pop_value(args, "reload")?;
+    let mut service = ServiceSelection::Mcp;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--service" => service = ServiceSelection::parse(&pop_value(args, "--service")?)?,
+            other => return Err(format!("reload 不支持参数：{other}")),
+        }
+    }
+    Ok(ReloadOptions { workspace, service })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfigureOptions {
     pub enabled: Option<bool>,
@@ -466,6 +496,19 @@ pub struct LogsOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsOptions {
+    pub workspace: String,
+    pub follow: bool,
+    pub wait_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadOptions {
+    pub workspace: String,
+    pub service: ServiceSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
@@ -483,6 +526,8 @@ pub enum Command {
     Stop(StopOptions),
     Restart(RunOptions),
     Logs(LogsOptions),
+    Events(EventsOptions),
+    Reload(ReloadOptions),
     Doctor {
         workspace: String,
     },
@@ -532,6 +577,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("stop") => Command::Stop(parse_stop(&mut args)?),
         Some("restart") => Command::Restart(parse_run_options(&mut args, "restart")?),
         Some("logs") => Command::Logs(parse_logs(&mut args)?),
+        Some("events") => Command::Events(parse_events(&mut args)?),
+        Some("reload") => Command::Reload(parse_reload(&mut args)?),
         Some("doctor") => {
             let workspace = pop_value(&mut args, "doctor")?;
             ensure_empty(&args, "doctor")?;
@@ -597,6 +644,8 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
   anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
+  anchor [--config-dir PATH] [--json] events <workspace> [-f] [--wait SECONDS]\n\
+  anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
@@ -748,6 +797,33 @@ mod tests {
                 workspace: "workspace-a".into(),
                 timeout_seconds: 15,
                 force: true,
+            })
+        );
+
+        let events = parse(strings(&[
+            "events",
+            "workspace-a",
+            "--follow",
+            "--wait",
+            "20",
+        ]))
+        .expect("events parse");
+        assert_eq!(
+            events.command,
+            Command::Events(EventsOptions {
+                workspace: "workspace-a".into(),
+                follow: true,
+                wait_seconds: 20,
+            })
+        );
+
+        let reload = parse(strings(&["reload", "workspace-a", "--service", "actions"]))
+            .expect("reload parse");
+        assert_eq!(
+            reload.command,
+            Command::Reload(ReloadOptions {
+                workspace: "workspace-a".into(),
+                service: ServiceSelection::Actions,
             })
         );
     }

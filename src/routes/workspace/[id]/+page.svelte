@@ -28,6 +28,7 @@
     deleteWorkspace,
     getActionsRuntimeStatus,
     getRuntimeStatus,
+    getWorkspaceControlEvents,
     listWorkspaces,
     startActionsRuntime,
     startRuntime,
@@ -55,6 +56,7 @@
     mcpLocalEndpoint,
     type AuthConfig,
     type ActionsAuthDraft,
+    type ControlEventCursor,
     type McpActivity,
     type RuntimeRecovery,
     type RuntimeStatus,
@@ -99,6 +101,9 @@
   let lastBackendSuccess = $state<number | null>(null);
   let statusPolling = $state(false);
   let statusPollTimer: number | null = null;
+  let daemonEventCursor: ControlEventCursor | null = null;
+  let daemonEventGeneration = 0;
+  let daemonEventMode: "unknown" | "events" | "polling" | "fault" = "unknown";
 
   let activeService = $state<ServiceTab>("mcp");
   let canvsTaskStatus = $state<CanvsTaskStatus | null>(null);
@@ -285,6 +290,7 @@
   }
 
   function scheduleStatusPoll(id: string, delay = nextStatusPollDelay()) {
+    if (daemonEventMode !== "polling") return;
     if (statusPollTimer !== null) window.clearTimeout(statusPollTimer);
     statusPollTimer = window.setTimeout(() => {
       statusPollTimer = null;
@@ -333,7 +339,52 @@
       }
     } finally {
       statusPolling = false;
-      if (id === workspaceId) scheduleStatusPoll(id);
+      if (id === workspaceId && daemonEventMode === "polling") startDaemonEventMonitor(id);
+    }
+  }
+
+  function startDaemonEventMonitor(id: string) {
+    const generation = ++daemonEventGeneration;
+    daemonEventCursor = null;
+    daemonEventMode = "unknown";
+    if (statusPollTimer !== null) {
+      window.clearTimeout(statusPollTimer);
+      statusPollTimer = null;
+    }
+    void monitorDaemonEvents(id, generation);
+  }
+
+  async function monitorDaemonEvents(id: string, generation: number) {
+    while (generation === daemonEventGeneration && id === workspaceId) {
+      if (document.hidden) {
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        continue;
+      }
+      try {
+        const batch = await getWorkspaceControlEvents(id, daemonEventCursor, 15_000);
+        if (generation !== daemonEventGeneration || id !== workspaceId) return;
+        if (batch === null) {
+          daemonEventMode = "polling";
+          scheduleStatusPoll(id, nextStatusPollDelay());
+          return;
+        }
+        daemonEventMode = "events";
+        daemonEventCursor = batch.nextCursor;
+        if (batch.reset || batch.events.length > 0) {
+          await pollRuntimeStatus(id);
+        }
+      } catch (error) {
+        if (generation !== daemonEventGeneration || id !== workspaceId) return;
+        daemonEventMode = "fault";
+        backendFailures += 1;
+        backendConnection = backendFailures >= 3 ? "offline" : "recovering";
+        showToast(error instanceof Error ? error.message : String(error), {
+          title: "daemon 事件通道异常",
+          kind: "error",
+          duration: 8000,
+        });
+        return;
+      }
     }
   }
 
@@ -358,6 +409,7 @@
       loadGeneration += 1;
       const previousFailures = backendFailures;
       backendFailures += 1;
+      daemonEventMode = "polling";
       backendConnection = backendFailures >= 3 ? "offline" : "recovering";
       if (previousFailures === 0 || backendFailures === 3) {
         showToast(error instanceof Error ? error.message : String(error), {
@@ -368,13 +420,20 @@
       }
     } finally {
       statusPolling = false;
-      if (id === workspaceId) scheduleStatusPoll(id, nextStatusPollDelay());
+      if (id === workspaceId) {
+        if (profile) startDaemonEventMonitor(id);
+        else scheduleStatusPoll(id, nextStatusPollDelay());
+      }
     }
   }
 
   function retryBackendNow() {
     const id = workspaceId;
     if (!id) return;
+    if (daemonEventMode === "fault" && profile) {
+      startDaemonEventMonitor(id);
+      return;
+    }
     if (profile) {
       void pollRuntimeStatus(id);
     } else {
@@ -474,6 +533,7 @@
             notifyStartFailure(label, runtime);
           }
         }
+        startDaemonEventMonitor(id);
       }
     } finally {
       if (isMcp) mcpBusy = false;
@@ -781,6 +841,9 @@
     const id = workspaceId;
     if (!id) return;
     profile = null;
+    daemonEventGeneration += 1;
+    daemonEventCursor = null;
+    daemonEventMode = "polling";
     backendFailures = 0;
     backendConnection = "checking";
     // initializeWorkspace reads and writes reactive connection state before its
@@ -798,6 +861,8 @@
 
     return () => {
       loadGeneration += 1;
+      daemonEventGeneration += 1;
+      daemonEventCursor = null;
       if (statusPollTimer !== null) {
         window.clearTimeout(statusPollTimer);
         statusPollTimer = null;

@@ -452,6 +452,8 @@ pub fn update_tunnel_services(
             state.pid, state.workspace_id
         )));
     }
+    state.workspace_name = profile.name.clone();
+    state.workspace_path = profile.path.clone();
     state.service = service;
     state.tunnel = tunnel_services.is_some();
     state.tunnel_services = tunnel_services;

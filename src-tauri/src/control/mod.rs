@@ -1,3 +1,4 @@
+mod events;
 mod ipc;
 mod lifecycle;
 mod logs;
@@ -11,13 +12,16 @@ use crate::platform::platform;
 use crate::tunnel::TunnelStatus;
 use crate::workspace::{McpActivityDto, WorkspaceProfile};
 
+pub(crate) use events::{publish_workspace_event, reset_workspace_event_stream};
 pub use ipc::{
-    control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_logs,
-    request_tunnel_operation, request_workspace_status, workspace_status_via_daemon_or_local,
-    ControlClientError, ControlServer, DaemonControlCommand, DaemonControlReceiver,
-    DaemonControlSender, LocalControlEndpoint,
+    control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_events, request_logs,
+    request_reload_operation, request_tunnel_operation, request_workspace_status,
+    workspace_status_via_daemon_or_local, ControlClientError, ControlServer, DaemonControlCommand,
+    DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
 };
-pub(crate) use ipc::{finish_tunnel_operation, mark_control_operation_running};
+pub(crate) use ipc::{
+    finish_reload_operation, finish_tunnel_operation, mark_control_operation_running,
+};
 pub use lifecycle::{
     desired_service_selection, desired_tunnel_selection, ensure_daemon_running, reconcile_daemon,
     request_daemon_exit_and_wait, restart_daemon_service, service_is_selected, set_daemon_service,
@@ -25,7 +29,8 @@ pub use lifecycle::{
 };
 pub use logs::read_log_batch;
 pub use protocol::{
-    ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlOperation, ControlTunnelAction,
+    ControlEvent, ControlEventBatch, ControlEventCursor, ControlEventKind, ControlLogChunk,
+    ControlLogCursor, ControlLogSelection, ControlOperation, ControlService, ControlTunnelAction,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

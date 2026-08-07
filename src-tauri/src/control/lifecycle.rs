@@ -5,7 +5,9 @@ use crate::error::{AppError, AppResult};
 use crate::workspace::resources::WorkspaceService;
 use crate::workspace::WorkspaceProfile;
 
-use super::{ipc_ping, request_daemon_exit, ControlOperation};
+use super::{
+    ipc_ping, request_daemon_exit, request_reload_operation, ControlOperation, ControlService,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonLaunchSpec {
@@ -241,6 +243,33 @@ pub async fn restart_daemon_service(
         return Err(AppError::Message(inspection.detail));
     }
     let current = running_state(&inspection);
+    if current
+        .as_ref()
+        .is_some_and(|state| service_is_selected(state.service, service))
+    {
+        let control_service = match service {
+            WorkspaceService::Mcp => ControlService::Mcp,
+            WorkspaceService::Actions => ControlService::Actions,
+        };
+        request_reload_operation(profile, control_service, timeout)
+            .await
+            .map_err(|error| {
+                AppError::Message(format!(
+                    "daemon 未能 reload {}：{error}；写操作不会回退到本地 RuntimeSupervisor",
+                    service.label()
+                ))
+            })?;
+        let refreshed = daemon::inspect(profile)?;
+        return refreshed
+            .state
+            .filter(|_| refreshed.running && refreshed.pid_matches)
+            .ok_or_else(|| {
+                AppError::Message(format!(
+                    "{} reload 完成后 daemon 状态不可用",
+                    service.label()
+                ))
+            });
+    }
     let desired_service =
         desired_service_selection(current.as_ref().map(|state| state.service), service, true)
             .expect("enabling a service always yields a daemon selection");

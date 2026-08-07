@@ -85,19 +85,22 @@ Anchor 的长期运行架构调整为：
 1. **协议与只读接入**：先提供版本化 `ping`、`version`、`workspace_status`，CLI 与 GUI 的状态读取优先访问 daemon；仅在端点不存在、拒绝连接或超时时回退到本地只读探测。协议损坏、请求 ID 不匹配和版本不兼容不得静默回退。
 2. **完整运行控制**：迁移事件流、日志、启停、重载和 shutdown，并移除 CLI/GUI 的第二套运行编排。
 
-当前已完成只读接入和生命周期写控制的基础：
+当前已完成只读接入、生命周期/Tunnel 写控制、事件消费和单服务配置 reload 的基础：
 
-- 协议版本为 `3`，请求和响应都包含 `protocolVersion` 与 `requestId`；
+- 协议版本为 `4`，请求和响应都包含 `protocolVersion` 与 `requestId`；
 - 单连接单请求，使用最大 64 KiB 的换行分隔 JSON 帧；
 - Unix daemon 在私有运行目录创建权限为 `0600` 的 UDS；其父目录保持 `0700`；
 - Windows 客户端使用按用户和配置域派生名称的 Named Pipe 地址。Windows daemon 服务端将在服务生命周期实现时启用，并必须配置当前用户专属 ACL；
 - daemon readiness 同时要求所选端口归属正确 PID 且 `ping` 成功；
-- `workspace_status`、`logs`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status` 请求必须与端点所属 Workspace ID 一致；
+- `workspace_status`、`logs`、`events`、`reload`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status` 请求必须与端点所属 Workspace ID 一致；
 - 运行中 daemon 的日志读取使用有界游标 IPC，单响应日志内容预算为 8 KiB；daemon 已停止时仍可离线读取历史日志；
 - `stop` 和 `restart` 必须先由目标 daemon 通过 IPC 接受并协调优雅退出；IPC 不可用时不得回退到客户端直接进程控制；
 - `start` 在 daemon 不存在时仍是引导命令；若状态显示 daemon 已运行，则必须先通过 IPC `ping` 验证控制面。
 - daemon 状态同时保存 `tunnelServices=mcp|actions|all`，MCP/Actions listener 与 tunnel ownership 可独立组合；公开 CLI `--tunnel` 仍保持“为所选服务启用隧道”的兼容语义；
 - tunnel 写操作采用 `accepted → pending/running → succeeded/failed` 的异步操作模型：初始响应完整写回后，daemon 才在自身 Tunnel Supervisor 内执行 start/stop/restart；FRP 重载继续使用原子 route replacement，失败时恢复旧线路和旧配置。
+- daemon 事件使用进程内有界 journal：每 Workspace 最多保留 256 条，单批最多 32 条，游标为 `streamId + sequence`；长轮询最长 25 秒，daemon 重启或游标越过 retained window 时显式返回 reset；
+- `reload` 复用异步 operation 模型，运行中的目标服务只重建该 listener，Workspace daemon、另一 listener 和 Tunnel ownership 保持不变；新 listener 启动失败时尝试恢复旧 listener；
+- CLI 新增 `anchor events <workspace> [-f]` 与 `anchor reload <workspace> --service ...`，为脚本提供原生事件消费和非整进程配置应用入口。
 
 GUI 工作区控制迁移现状：
 
@@ -106,11 +109,13 @@ GUI 工作区控制迁移现状：
 - GUI 日志在 daemon 运行时强制使用有界 IPC，daemon 停止时才允许使用同一套有界本地读取器查看历史日志；
 - Workspace 删除和密钥再生成会先通过 daemon 控制面停止或重启目标进程；
 - MCP/Actions tunnel 状态、启动、停止、重载和测试已迁入 Workspace daemon；GUI 保存 tunnel 配置不再追加一次整 daemon 重启；
+- Workspace 页面已从固定 5 秒双 runtime 轮询迁移为 daemon event-first 长轮询；只有 endpoint unavailable 才进入 polling fallback，协议/远端错误不会静默降级，fallback 会继续探测并自动恢复事件模式；
+- MCP/Actions 配置保存和密钥应用在服务已运行时改用单服务 daemon reload，不再默认重启整个 Workspace daemon；
 - GUI 进程内 `RuntimeSupervisor` / Tunnel Supervisor 仅保留给旧会话和旧 Gateway 兼容运行态；主 Workspace/Tunnel 控制失败时不得进入该兼容路径；
 - Gateway 已明确为独立全局控制域。GUI `set_mcp_gateway` 只校验并持久化配置，不再创建共享 listener 或 Gateway tunnel；实际运行使用 `anchor gateway serve <workspace ...>`，后续再升级为专用 Gateway service/daemon；
 - 若旧桌面进程仍持有兼容 Gateway listener，GUI 拒绝热改 Gateway 配置，防止已运行 listener 与持久配置分叉；daemon 管理的 MCP 运行期间也禁止启用 Gateway 配置，避免形成两个运行权威。
 
-尚未完成：事件订阅、非 Tunnel 的细粒度配置 reload、专用 Gateway service/daemon 与其状态 IPC、Windows Named Pipe 服务端，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
+尚未完成：把更多 CLI watch/全局状态聚合切到事件驱动、无需 listener 重建的真正字段级 hot reload、专用 Gateway service/daemon 与其状态 IPC、Windows Named Pipe 服务端，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -130,7 +135,7 @@ GUI 工作区控制迁移现状：
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
 
-当前已完成第 1 项、日志读取、Workspace 级启停/重启和 Workspace Tunnel 写控制；Gateway 已从 GUI 运行编排中拆出并成为独立控制域。事件流、专用 Gateway service 和其余细粒度 reload 继续迁移。
+当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出并成为独立控制域。下一步继续推进专用 Gateway service、字段级 hot reload、跨 Workspace 事件聚合和最终兼容 RuntimeSupervisor 删除。
 
 ### 阶段 4：运行与升级治理
 

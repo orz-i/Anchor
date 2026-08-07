@@ -201,6 +201,35 @@ export interface WorkspaceControlStatus {
   actionsTunnel?: WorkspaceTunnelStatus | null;
 }
 
+export type ControlService = "mcp" | "actions";
+export type ControlEventKind =
+  | "daemon_ready"
+  | "daemon_stopping"
+  | "service_state"
+  | "tunnel_state"
+  | "mcp_activity"
+  | "reload";
+
+export interface ControlEventCursor {
+  streamId: string;
+  sequence: number;
+}
+
+export interface ControlEvent {
+  sequence: number;
+  emittedAtUnixMs: number;
+  kind: ControlEventKind;
+  service?: ControlService | null;
+  state: string;
+  message: string;
+}
+
+export interface ControlEventBatch {
+  events: ControlEvent[];
+  nextCursor: ControlEventCursor;
+  reset: boolean;
+}
+
 export type McpActivityState =
   | "unknown"
   | "idle"
