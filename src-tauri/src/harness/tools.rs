@@ -1115,29 +1115,39 @@ fn resume_close_outbox(
             }
             Err(error) => {
                 outbox.phase = WorkSessionClosePhase::CheckpointPending;
+                let cause = error.to_error_value();
                 outbox.last_error = Some(json!({
                     "phase": "history_checkpoint",
-                    "cause": error.to_error_value()
+                    "cause": cause.clone()
                 }));
                 outbox.updated_at = harness_timestamp();
                 ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
                 if propagate_checkpoint_error {
-                    return Err(WorkspaceError::ToolDetails {
-                        code: "WORK_SESSION_CHECKPOINT_PENDING",
-                        message: error.message(),
-                        category: "runtime",
-                        retryable: true,
-                        details: json!({
-                            "phase": "history_checkpoint",
-                            "task_closed": true,
-                            "task_id": outbox.task_id,
-                            "session_key": outbox.history_session_key,
-                            "expected_path": outbox.history_session_path,
-                            "outbox": close_outbox_view(&outbox),
-                            "suggestion": "Checkpoint intent is durable and will be retried automatically on the next Harness call.",
-                            "cause": error.to_error_value()
-                        }),
-                    });
+                    return Ok(json!({
+                        "ok": false,
+                        "closed": false,
+                        "phase": "history_checkpoint",
+                        "finish": finish,
+                        "checkpoint": null,
+                        "retryable": true,
+                        "error": {
+                            "code": "WORK_SESSION_CHECKPOINT_PENDING",
+                            "message": error.message(),
+                            "category": "runtime",
+                            "retryable": true,
+                            "details": {
+                                "phase": "history_checkpoint",
+                                "task_closed": true,
+                                "task_id": outbox.task_id,
+                                "session_key": outbox.history_session_key,
+                                "expected_path": outbox.history_session_path,
+                                "outbox": close_outbox_view(&outbox),
+                                "suggestion": "Checkpoint intent is durable and will be retried automatically on the next Harness call.",
+                                "cause": cause
+                            }
+                        },
+                        "outbox": close_outbox_view(&outbox)
+                    }));
                 }
             }
         }

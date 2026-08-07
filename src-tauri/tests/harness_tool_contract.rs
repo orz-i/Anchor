@@ -32,6 +32,136 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
+fn complete_work_session_checkpoints_before_removed_worktree_becomes_unavailable() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "strict cleanup worktree\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let caller = "strict-worktree-cleanup-session";
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "严格关闭后清理隔离目录",
+            "session_key": "strict-worktree-cleanup-history",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": true
+        }),
+        caller,
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let worktree_path = std::path::PathBuf::from(
+        started["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+
+    let verified = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "git status --porcelain=v1",
+            "verification_kind": "test",
+            "verification_key": "strict-worktree-close",
+            "verification_level": "blocking"
+        }),
+        caller,
+    );
+    assert_eq!(verified["ok"], true, "{verified}");
+
+    let closed = call_tool_for_session(
+        &ctx,
+        "complete_work_session",
+        &json!({
+            "task_id": task_id,
+            "summary": "strict worktree cleanup test"
+        }),
+        caller,
+    );
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert_eq!(closed["work_session"]["closed"], true, "{closed}");
+    assert_eq!(closed["checkpoint"]["ok"], true, "{closed}");
+    assert!(!worktree_path.exists());
+
+    let operations = call_tool_for_session(
+        &ctx,
+        "operation_log",
+        &json!({"task_id": task_id, "limit": 20}),
+        caller,
+    );
+    assert_eq!(operations["ok"], true, "{operations}");
+    assert_eq!(operations["filters"]["task_id"], task_id);
+}
+
+#[test]
+fn complete_work_session_checkpoint_failure_keeps_schema_compliant_retry_state() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "checkpoint pending\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/docs/history-session/\n").expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let caller = "checkpoint-pending-session";
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "验证 checkpoint pending 输出契约",
+            "session_key": "checkpoint-pending-history",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+        caller,
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let verified = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "git status --porcelain=v1",
+            "verification_kind": "test",
+            "verification_key": "checkpoint-pending-close",
+            "verification_level": "blocking"
+        }),
+        caller,
+    );
+    assert_eq!(verified["ok"], true, "{verified}");
+
+    let missing_root = temp.path().join("missing-workspace-root");
+    let pending = call_tool_for_session(
+        &ctx,
+        "complete_work_session",
+        &json!({
+            "task_id": task_id,
+            "summary": "force checkpoint pending",
+            "checkpoint": {
+                "workspace_root": missing_root.to_string_lossy()
+            }
+        }),
+        caller,
+    );
+    assert_eq!(pending["ok"], false, "{pending}");
+    assert_eq!(pending["closed"], false, "{pending}");
+    assert_eq!(pending["phase"], "history_checkpoint", "{pending}");
+    assert_eq!(
+        pending["error"]["code"], "WORK_SESSION_CHECKPOINT_PENDING",
+        "{pending}"
+    );
+    assert_eq!(pending["error"]["details"]["task_closed"], true);
+    assert_eq!(pending["outbox"]["phase"], "checkpoint_pending");
+}
+
+#[test]
 fn successful_retained_retry_resolves_superseded_wait_recovery() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -3259,6 +3389,20 @@ fn catalog_v30_exposes_task_governance_tools_and_schemas() {
         assert!(
             begin["inputSchema"]["properties"].get(property).is_some(),
             "begin_work_session 缺少 {property} schema"
+        );
+    }
+    let verification_branches = begin["inputSchema"]["properties"]["contract"]["properties"]
+        ["required_verifications"]["items"]["anyOf"]
+        .as_array()
+        .expect("verification requirement anyOf");
+    assert_eq!(verification_branches.len(), 4);
+    for branch in verification_branches {
+        let required = branch["required"]
+            .as_array()
+            .expect("verification requirement branch required");
+        assert!(
+            required.iter().any(|value| value == "id"),
+            "verification requirement 分支必须显式要求 id: {branch}"
         );
     }
 }

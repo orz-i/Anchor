@@ -1591,6 +1591,8 @@ fn tool_uses_task_worktree(name: &str) -> bool {
         name,
         "begin_work_session"
             | "close_work_session"
+            | "complete_work_session"
+            | "operation_log"
             | "start_task"
             | "switch_task"
             | "resume_task"

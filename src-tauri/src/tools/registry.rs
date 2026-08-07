@@ -886,12 +886,11 @@ fn verification_requirement_input_schema() -> Value {
             "test_file": { "type": "string", "minLength": 1, "maxLength": 2000 },
             "test_name": { "type": "string", "minLength": 1, "maxLength": 1000 }
         },
-        "required": ["id"],
         "anyOf": [
-            { "required": ["kind"] },
-            { "required": ["verification_key"] },
-            { "required": ["test_file"] },
-            { "required": ["test_name"] }
+            { "required": ["id", "kind"] },
+            { "required": ["id", "verification_key"] },
+            { "required": ["id", "test_file"] },
+            { "required": ["id", "test_name"] }
         ],
         "additionalProperties": false
     })
