@@ -71,17 +71,42 @@ pub struct InFlightRequests {
 }
 
 pub enum InFlightReservation {
-    Inserted(CancellationToken),
+    Inserted(InFlightRequestGuard),
     Duplicate,
     SessionLimit,
     InvalidRequestId,
 }
 
+pub struct InFlightRequestGuard {
+    requests: InFlightRequests,
+    key: Option<String>,
+    token: CancellationToken,
+}
+
+impl InFlightRequestGuard {
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    #[cfg(test)]
+    fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.requests.remove_key(&key);
+        }
+    }
+}
+
 impl InFlightRequests {
     #[cfg(test)]
-    pub fn insert(&self, session_id: &str, request_id: &Value) -> Option<CancellationToken> {
+    pub fn insert(&self, session_id: &str, request_id: &Value) -> Option<InFlightRequestGuard> {
         match self.insert_with_session_limit(session_id, request_id, usize::MAX) {
-            InFlightReservation::Inserted(token) => Some(token),
+            InFlightReservation::Inserted(request) => Some(request),
             _ => None,
         }
     }
@@ -100,12 +125,21 @@ impl InFlightRequests {
             return InFlightReservation::Duplicate;
         }
         let prefix = format!("{session_id}:");
-        if requests.keys().filter(|key| key.starts_with(&prefix)).count() >= max_in_flight.max(1) {
+        if requests
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count()
+            >= max_in_flight.max(1)
+        {
             return InFlightReservation::SessionLimit;
         }
         let token = CancellationToken::default();
-        requests.insert(key, token.clone());
-        InFlightReservation::Inserted(token)
+        requests.insert(key.clone(), token.clone());
+        InFlightReservation::Inserted(InFlightRequestGuard {
+            requests: self.clone(),
+            key: Some(key),
+            token,
+        })
     }
 
     pub fn cancel(&self, session_id: &str, request_id: &Value) -> bool {
@@ -126,13 +160,11 @@ impl InFlightRequests {
         }
     }
 
-    pub fn remove(&self, session_id: &str, request_id: &Value) {
-        if let Some(key) = request_key(session_id, request_id) {
-            self.inner
-                .lock()
-                .expect("MCP in-flight request lock")
-                .remove(&key);
-        }
+    fn remove_key(&self, key: &str) {
+        self.inner
+            .lock()
+            .expect("MCP in-flight request lock")
+            .remove(key);
     }
 
     pub fn cancel_session(&self, session_id: &str) {
@@ -668,33 +700,54 @@ mod tests {
     fn in_flight_registry_cancels_matching_request() {
         let requests = InFlightRequests::default();
         let id = json!(7);
-        let token = requests.insert("session", &id).expect("insert");
-        assert!(!token.is_cancelled());
+        let request = requests.insert("session", &id).expect("insert");
+        assert!(!request.is_cancelled());
         assert!(requests.cancel("session", &id));
-        assert!(token.is_cancelled());
-        requests.remove("session", &id);
+        assert!(request.is_cancelled());
+        drop(request);
         assert!(!requests.cancel("session", &id));
+    }
+
+    #[test]
+    fn in_flight_registry_releases_slot_when_request_guard_is_dropped() {
+        let requests = InFlightRequests::default();
+        let first = match requests.insert_with_session_limit("session", &json!(1), 1) {
+            InFlightReservation::Inserted(request) => request,
+            _ => panic!("first request should be inserted"),
+        };
+        assert!(matches!(
+            requests.insert_with_session_limit("session", &json!(2), 1),
+            InFlightReservation::SessionLimit
+        ));
+
+        drop(first);
+
+        assert!(matches!(
+            requests.insert_with_session_limit("session", &json!(2), 1),
+            InFlightReservation::Inserted(_)
+        ));
     }
 
     #[test]
     fn in_flight_registry_enforces_per_session_limit() {
         let requests = InFlightRequests::default();
-        assert!(matches!(
-            requests.insert_with_session_limit("session", &json!(1), 2),
-            InFlightReservation::Inserted(_)
-        ));
-        assert!(matches!(
-            requests.insert_with_session_limit("session", &json!(2), 2),
-            InFlightReservation::Inserted(_)
-        ));
+        let first = match requests.insert_with_session_limit("session", &json!(1), 2) {
+            InFlightReservation::Inserted(request) => request,
+            _ => panic!("first request should be inserted"),
+        };
+        let second = match requests.insert_with_session_limit("session", &json!(2), 2) {
+            InFlightReservation::Inserted(request) => request,
+            _ => panic!("second request should be inserted"),
+        };
         assert!(matches!(
             requests.insert_with_session_limit("session", &json!(3), 2),
             InFlightReservation::SessionLimit
         ));
-        assert!(matches!(
-            requests.insert_with_session_limit("other", &json!(1), 2),
-            InFlightReservation::Inserted(_)
-        ));
+        let other = match requests.insert_with_session_limit("other", &json!(1), 2) {
+            InFlightReservation::Inserted(request) => request,
+            _ => panic!("other session request should be inserted"),
+        };
+        drop((first, second, other));
     }
 
     #[test]

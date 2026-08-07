@@ -68,7 +68,7 @@
       case "recent":
         return "刚刚活跃";
       case "suspected_stalled":
-        return "疑似卡住";
+        return "疑似异常";
       case "idle":
         return "空闲";
       default:

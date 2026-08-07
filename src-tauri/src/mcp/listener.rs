@@ -827,12 +827,12 @@ async fn mcp_post(
     }
     cleanup_retired_sessions(&state);
 
-    let cancellation = match state.in_flight.insert_with_session_limit(
+    let in_flight_request = match state.in_flight.insert_with_session_limit(
         session_id,
         &request_id,
         MCP_MAX_CONCURRENT_REQUESTS_PER_SESSION,
     ) {
-        InFlightReservation::Inserted(cancellation) => cancellation,
+        InFlightReservation::Inserted(request) => request,
         InFlightReservation::Duplicate => {
             return jsonrpc_error_response(
                 StatusCode::OK,
@@ -873,11 +873,10 @@ async fn mcp_post(
         &request_id,
         &method,
         &session_version,
-        &cancellation,
+        in_flight_request.cancellation(),
         session_id,
     )
     .await;
-    state.in_flight.remove(session_id, &request_id);
     state.sessions.touch(session_id);
     cleanup_retired_sessions(&state);
     response
@@ -922,7 +921,7 @@ async fn execute_mcp_request(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    state
+    let activity_request = state
         .activity
         .request_started(session_id, request_id, method, &tool_name);
     append_profile_log(
@@ -979,7 +978,9 @@ async fn execute_mcp_request(
     if method == "tools/list" {
         log_tools_list_catalog(&state.workspace_id, &response);
     }
-    state.activity.request_finished(session_id, request_id);
+    if let Some(activity_request) = activity_request {
+        activity_request.complete();
+    }
     if tool_name == "exec_command" || tool_name == "exec_health_check" {
         let structured = response
             .get("result")

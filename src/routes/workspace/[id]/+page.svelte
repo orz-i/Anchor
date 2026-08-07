@@ -248,8 +248,8 @@
     }
     if (previousActivity !== "suspected_stalled" && mcpActivity?.state === "suspected_stalled") {
       const seconds = Math.max(1, Math.floor((mcpActivity.oldestInFlightMs ?? 0) / 1_000));
-      showToast(`最早的 MCP 调用已持续 ${seconds} 秒，请检查上游对话是否卡住`, {
-        title: "上游调用疑似卡住",
+      showToast(`最早的 MCP 调用已持续 ${seconds} 秒，已超过正常请求窗口，请检查连接或工具执行状态`, {
+        title: "MCP 调用疑似异常",
         kind: "warning",
         duration: 10_000,
       });

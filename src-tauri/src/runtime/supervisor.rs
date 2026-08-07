@@ -936,12 +936,21 @@ mod tests {
             .expect("activity");
         assert_eq!(idle.state, "idle");
 
-        tracker.request_started("session", &json!(1), "tools/call", "read_file");
+        let request = tracker
+            .request_started("session", &json!(1), "tools/call", "read_file")
+            .expect("tracked request");
         let active = supervisor
             .mcp_status_with_settings(&profile, &settings)
             .activity
             .expect("activity");
         assert_eq!(active.state, "active");
         assert_eq!(active.current_tool, "read_file");
+
+        drop(request);
+        let recent = supervisor
+            .mcp_status_with_settings(&profile, &settings)
+            .activity
+            .expect("activity");
+        assert_eq!(recent.state, "recent");
     }
 }

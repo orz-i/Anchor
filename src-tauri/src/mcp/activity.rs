@@ -13,7 +13,10 @@ use crate::workspace::McpActivityDto;
 #[cfg(any(unix, test))]
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(15);
 #[cfg(any(unix, test))]
-const SUSPECTED_STALL_AFTER: Duration = Duration::from_secs(60);
+// wait_command can legitimately hold one MCP request for up to 60 seconds, while the
+// listener itself has a 90-second hard request timeout. Only warn beyond both normal
+// windows so a healthy long poll is not reported as stalled.
+const SUSPECTED_STALL_AFTER: Duration = Duration::from_secs(120);
 
 #[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +54,27 @@ struct ActivityState {
 #[derive(Clone, Default)]
 pub(crate) struct McpActivityTracker {
     inner: Arc<Mutex<ActivityState>>,
+}
+
+pub(crate) struct McpActivityRequestGuard {
+    tracker: McpActivityTracker,
+    key: Option<String>,
+}
+
+impl McpActivityRequestGuard {
+    pub(crate) fn complete(mut self) {
+        if let Some(key) = self.key.take() {
+            self.tracker.finish_request(&key, true);
+        }
+    }
+}
+
+impl Drop for McpActivityRequestGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.tracker.finish_request(&key, false);
+        }
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Weak<Mutex<ActivityState>>>> {
@@ -91,13 +115,11 @@ impl McpActivityTracker {
         request_id: &Value,
         method: &str,
         _tool: &str,
-    ) {
+    ) -> Option<McpActivityRequestGuard> {
         if !tracks_conversation_activity(method) {
-            return;
+            return None;
         }
-        let Some(key) = request_key(session_id, request_id) else {
-            return;
-        };
+        let key = request_key(session_id, request_id)?;
         let mut state = self.inner.lock().expect("MCP activity lock");
         #[cfg(any(unix, test))]
         let point = {
@@ -106,7 +128,7 @@ impl McpActivityTracker {
             point
         };
         state.in_flight.insert(
-            key,
+            key.clone(),
             ActiveCall {
                 session_id: session_id.to_string(),
                 #[cfg(any(unix, test))]
@@ -117,23 +139,26 @@ impl McpActivityTracker {
                 tool: _tool.to_string(),
             },
         );
+        Some(McpActivityRequestGuard {
+            tracker: self.clone(),
+            key: Some(key),
+        })
     }
 
-    pub(crate) fn request_finished(&self, session_id: &str, request_id: &Value) {
-        let Some(key) = request_key(session_id, request_id) else {
-            return;
-        };
+    fn finish_request(&self, key: &str, completed: bool) {
         let mut state = self.inner.lock().expect("MCP activity lock");
-        let removed = state.in_flight.remove(&key).is_some();
+        let removed = state.in_flight.remove(key).is_some();
         #[cfg(any(unix, test))]
         if removed {
             let point = activity_point();
             state.last_activity = Some(point);
-            state.last_completed_at = Some(point.wall_clock);
-            state.completed_requests = state.completed_requests.saturating_add(1);
+            if completed {
+                state.last_completed_at = Some(point.wall_clock);
+                state.completed_requests = state.completed_requests.saturating_add(1);
+            }
         }
         #[cfg(not(any(unix, test)))]
-        let _ = removed;
+        let _ = (removed, completed);
     }
 
     pub(crate) fn cancel_session(&self, session_id: &str) {
@@ -176,7 +201,7 @@ impl McpActivityTracker {
                 let seconds = oldest_age.unwrap_or_default().as_secs();
                 (
                     "suspected_stalled",
-                    format!("最早的 MCP 调用已持续 {seconds} 秒，可能卡住"),
+                    format!("最早的 MCP 调用已持续 {seconds} 秒，超过正常请求窗口，可能异常"),
                 )
             } else if !state.in_flight.is_empty() {
                 (
@@ -262,7 +287,9 @@ mod tests {
         let tracker = McpActivityTracker::default();
         assert_eq!(tracker.snapshot().state, "idle");
 
-        tracker.request_started("session", &json!(1), "tools/call", "read_file");
+        let request = tracker
+            .request_started("session", &json!(1), "tools/call", "read_file")
+            .expect("tracked request");
         let active =
             tracker.snapshot_with_thresholds(Duration::from_secs(15), Duration::from_secs(60));
         assert_eq!(active.state, "active");
@@ -272,7 +299,7 @@ mod tests {
         let stalled = tracker.snapshot_with_thresholds(Duration::from_secs(15), Duration::ZERO);
         assert_eq!(stalled.state, "suspected_stalled");
 
-        tracker.request_finished("session", &json!(1));
+        request.complete();
         let recent = tracker.snapshot();
         assert_eq!(recent.state, "recent");
         assert_eq!(recent.in_flight_requests, 0);
@@ -280,11 +307,28 @@ mod tests {
     }
 
     #[test]
+    fn dropped_request_guard_clears_in_flight_without_counting_completion() {
+        let tracker = McpActivityTracker::default();
+        {
+            let _request = tracker
+                .request_started("session", &json!(1), "tools/call", "wait_command")
+                .expect("tracked request");
+            assert_eq!(tracker.snapshot().in_flight_requests, 1);
+        }
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.in_flight_requests, 0);
+        assert_eq!(snapshot.completed_requests, 0);
+        assert_eq!(snapshot.state, "recent");
+    }
+
+    #[test]
     fn protocol_and_catalog_requests_do_not_keep_conversation_activity_alive() {
         let tracker = McpActivityTracker::default();
         for (id, method) in [(1, "ping"), (2, "initialize"), (3, "tools/list")] {
-            tracker.request_started("session", &json!(id), method, "");
-            tracker.request_finished("session", &json!(id));
+            assert!(tracker
+                .request_started("session", &json!(id), method, "")
+                .is_none());
         }
 
         let snapshot = tracker.snapshot();
