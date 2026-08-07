@@ -112,6 +112,10 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 - 运行中配置修改由 Gateway daemon 先切换运行态、更新 daemon state，再持久化；失败会停止新运行态并尝试恢复旧 listener/routes/tunnel；禁用配置采用 daemon shutdown → 确认退出 → 持久化 disabled；
 - Gateway route/owner 对应的 Workspace 配置保存会触发 Gateway daemon reload；reload 失败时 GUI 恢复旧 Workspace/settings 并重新对齐旧运行态；活动 route Workspace 在 daemon 停止前禁止删除/注销；
 - GUI Gateway 状态和 route 列表直接来自 Gateway daemon 状态，不再逐 Workspace 轮询来猜测 route；桌面配置缓存每次操作前从磁盘刷新，避免覆盖 daemon 的异步 observation 写入。
+- Gateway protocol v1 已以 additive methods 增加有界 `logs` 与 `events`：日志正文单响应最多 8 KiB；事件 journal 保留 256 条、单批 32 条、最长 25 秒 long-poll，并使用 `streamId + sequence` 可恢复游标；
+- CLI 新增 `gateway logs/events`；运行中日志和事件不允许在 protocol/remote 错误时回退到本地文件或状态 polling，只有 daemon 明确停止时可离线读取历史日志；
+- 新增纯只读 `ControlPlaneStatus` / `ControlPlaneEventBatch` 聚合层，以独立 Gateway cursor + 每 Workspace cursor 组合各控制域；聚合 truncation 不推进未返回事件的 source cursor；
+- CLI 新增 `status --control-plane` 与 `events --control-plane`；GUI 全局 layout 已从 N×2 runtime 请求切换为单 aggregate snapshot + aggregate event-first 唤醒；Gateway 设置页也改为 Gateway event-first，并显示有界 daemon log 尾部。
 
 GUI 工作区控制迁移现状：
 
@@ -126,7 +130,7 @@ GUI 工作区控制迁移现状：
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
 - 若旧桌面进程仍持有兼容 Gateway listener，GUI 仍拒绝热改 Gateway 配置，防止旧进程与新 daemon 控制域同时成为运行权威。
 
-尚未完成：把更多 CLI watch/全局状态聚合切到事件驱动、无需 listener 重建的真正字段级 hot reload、Gateway 事件/日志流、Windows Named Pipe 服务端与当前用户 ACL、系统服务安装入口，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
+尚未完成：无需 listener 重建的真正字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Windows Named Pipe 服务端与当前用户 ACL、系统服务安装入口，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -146,7 +150,7 @@ GUI 工作区控制迁移现状：
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
 
-当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply 控制面。下一步继续推进 Gateway 事件/日志、字段级 hot reload、跨控制域状态聚合、系统服务安装和最终兼容 RuntimeSupervisor 删除。
+当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply/logs/events 控制面；全局 layout 已使用跨控制域 aggregate status/events。下一步继续推进字段级 hot reload、系统服务安装、Windows server/ACL 和最终兼容 RuntimeSupervisor 删除。
 
 ### 阶段 4：运行与升级治理
 

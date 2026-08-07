@@ -11,8 +11,12 @@
     type McpGatewayStatusDto,
     type ProxyConfigDto,
   } from "$lib/api/settings";
-  import { listWorkspaces } from "$lib/api/workspaces";
-  import type { WorkspaceProfile } from "$lib/types";
+  import {
+    getGatewayControlEvents,
+    listWorkspaces,
+    readGatewayLogs,
+  } from "$lib/api/workspaces";
+  import type { GatewayEventCursor, GatewayLogChunk, WorkspaceProfile } from "$lib/types";
 
   let proxy = $state<ProxyConfigDto>({ mode: "none", url: "" });
   let changed = $state(false);
@@ -32,6 +36,9 @@
   let gatewayChanged = $state(false);
   let gatewaySaving = $state(false);
   let gatewayRefreshing = false;
+  let gatewayEventFault = $state("");
+  let gatewayLog = $state<GatewayLogChunk | null>(null);
+  let gatewayLogError = $state("");
 
   async function refreshGatewayRuntimeStatus() {
     if (gatewayRefreshing) return;
@@ -47,10 +54,53 @@
       if (!gatewayChanged && !gatewaySaving) {
         gateway = nextGateway;
       }
-    } catch {
-      // Background polling is best-effort; explicit refresh/save still reports errors.
     } finally {
       gatewayRefreshing = false;
+    }
+  }
+
+  async function refreshGatewayLog() {
+    try {
+      gatewayLog = await readGatewayLogs(80);
+      gatewayLogError = "";
+    } catch (error) {
+      gatewayLogError = String(error);
+    }
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function observeGateway(isCancelled: () => boolean) {
+    let cursor: GatewayEventCursor | null = null;
+    while (!isCancelled()) {
+      try {
+        const batch = await getGatewayControlEvents(cursor, 15_000);
+        if (isCancelled()) return;
+        if (batch === null) {
+          // Endpoint unavailable is the only read-only fallback: refresh the
+          // offline/configured status, then probe the event endpoint again.
+          cursor = null;
+          gatewayEventFault = "";
+          await refreshGatewayRuntimeStatus();
+          await refreshGatewayLog();
+          await delay(2_000);
+          continue;
+        }
+        cursor = batch.nextCursor;
+        gatewayEventFault = "";
+        if (batch.events.length > 0 || batch.reset) {
+          await refreshGatewayRuntimeStatus();
+          await refreshGatewayLog();
+        }
+      } catch (error) {
+        if (isCancelled()) return;
+        gatewayEventFault = String(error);
+        // Protocol/remote errors stay explicit. Retry the same event endpoint;
+        // do not silently downgrade to status polling.
+        await delay(3_000);
+      }
     }
   }
 
@@ -69,6 +119,7 @@
       workspaces = nextWorkspaces;
       changed = false;
       gatewayChanged = false;
+      await refreshGatewayLog();
     } catch (e) {
       await message(String(e), { title: "加载失败", kind: "error" });
     }
@@ -101,6 +152,7 @@
       gatewayStatus = await setMcpGateway(gateway);
       gateway = await getMcpGateway();
       gatewayChanged = false;
+      await refreshGatewayLog();
       await message("MCP Gateway 设置已保存。", {
         title: "已保存",
         kind: "info",
@@ -129,11 +181,14 @@
   }
 
   onMount(() => {
-    void refresh();
-    const timer = window.setInterval(() => {
-      void refreshGatewayRuntimeStatus();
-    }, 2_000);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    void (async () => {
+      await refresh();
+      if (!cancelled) void observeGateway(() => cancelled);
+    })();
+    return () => {
+      cancelled = true;
+    };
   });
 </script>
 
@@ -180,6 +235,25 @@
               支持 HTTP/HTTPS/SOCKS 代理，如 http://127.0.0.1:7890
             </span>
           </label>
+        {/if}
+
+        {#if gatewayEventFault}
+          <p class="rounded-md border border-red-500/30 bg-red-500/5 p-2 text-xs text-red-600">
+            Gateway 事件控制异常：{gatewayEventFault}
+          </p>
+        {/if}
+
+        {#if gatewayLogError}
+          <p class="rounded-md border border-red-500/30 bg-red-500/5 p-2 text-xs text-red-600">
+            Gateway 日志读取异常：{gatewayLogError}
+          </p>
+        {:else if gatewayLog?.exists}
+          <details class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-3">
+            <summary class="cursor-pointer text-xs font-medium">
+              Gateway daemon 日志{gatewayLog.truncated ? " · 已截断" : ""}
+            </summary>
+            <pre class="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all text-xs">{gatewayLog.content || "暂无新日志"}</pre>
+          </details>
         {/if}
 
         <div class="flex justify-end pt-1">

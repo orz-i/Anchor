@@ -1,8 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { invokeRead } from "$lib/api/invoke";
 import type {
+  ControlPlaneEventBatch,
+  ControlPlaneEventCursor,
+  ControlPlaneStatus,
   ControlEventBatch,
   ControlEventCursor,
+  GatewayEventBatch,
+  GatewayEventCursor,
+  GatewayLogChunk,
   RuntimeStatus,
   SkillInspection,
   WorkspaceControlStatus,
@@ -11,6 +17,34 @@ import type {
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
+}
+
+export async function getControlPlaneStatus(): Promise<ControlPlaneStatus> {
+  return invokeRead<ControlPlaneStatus>("get_control_plane_status");
+}
+
+export async function getControlPlaneEvents(
+  cursor: ControlPlaneEventCursor | null,
+  waitMs = 15_000,
+): Promise<ControlPlaneEventBatch> {
+  return invokeRead<ControlPlaneEventBatch>("get_control_plane_events", {
+    cursor,
+    waitMs,
+  });
+}
+
+export async function getGatewayControlEvents(
+  cursor: GatewayEventCursor | null,
+  waitMs = 15_000,
+): Promise<GatewayEventBatch | null> {
+  return invokeRead<GatewayEventBatch | null>("get_gateway_control_events", {
+    cursor,
+    waitMs,
+  });
+}
+
+export async function readGatewayLogs(lines = 100): Promise<GatewayLogChunk> {
+  return invokeRead<GatewayLogChunk>("read_gateway_logs", { lines });
 }
 
 export async function createWorkspace(

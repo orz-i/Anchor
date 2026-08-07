@@ -9,40 +9,86 @@
   import WorkspaceNavItem from "$lib/components/WorkspaceNavItem.svelte";
   import {
     createWorkspace,
-    getActionsRuntimeStatus,
-    getRuntimeStatus,
+    getControlPlaneEvents,
+    getControlPlaneStatus,
     listWorkspaces,
   } from "$lib/api/workspaces";
   import { getLastWorkspaceId } from "$lib/api/settings";
   import { actionsRuntimeStates, mcpRuntimeStates, workspaces } from "$lib/stores/app";
   import { showToast } from "$lib/stores/toast";
-  import type { RuntimeState } from "$lib/types";
+  import type { ControlPlaneEventCursor, ControlPlaneStatus, RuntimeState } from "$lib/types";
 
   let { children } = $props();
 
-  async function refreshWorkspaces() {
-    const items = await listWorkspaces();
-    workspaces.set(items);
-
+  function applyControlPlaneStatus(status: ControlPlaneStatus) {
     const mcpStates: Record<string, RuntimeState> = {};
     const actionsStates: Record<string, RuntimeState> = {};
-    await Promise.all(
-      items.map(async (item) => {
-        try {
-          const [mcp, actions] = await Promise.all([
-            getRuntimeStatus(item.id),
-            getActionsRuntimeStatus(item.id),
-          ]);
-          mcpStates[item.id] = mcp.state;
-          actionsStates[item.id] = actions.state;
-        } catch {
-          mcpStates[item.id] = "stopped";
-          actionsStates[item.id] = "stopped";
-        }
-      }),
-    );
+    for (const item of status.workspaces) {
+      mcpStates[item.id] = item.mcpState;
+      actionsStates[item.id] = item.actionsState;
+    }
     mcpRuntimeStates.set(mcpStates);
     actionsRuntimeStates.set(actionsStates);
+  }
+
+  async function refreshControlPlaneStates() {
+    applyControlPlaneStatus(await getControlPlaneStatus());
+  }
+
+  async function refreshWorkspaces() {
+    const [items, status] = await Promise.all([
+      listWorkspaces(),
+      getControlPlaneStatus(),
+    ]);
+    workspaces.set(items);
+    applyControlPlaneStatus(status);
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function observeControlPlane(isCancelled: () => boolean) {
+    let cursor: ControlPlaneEventCursor | null = null;
+    let lastFault = "";
+    while (!isCancelled()) {
+      try {
+        const batch = await getControlPlaneEvents(cursor, 15_000);
+        if (isCancelled()) return;
+        cursor = batch.nextCursor;
+        lastFault = "";
+        if (batch.events.length > 0 || batch.resetSources.length > 0) {
+          await refreshControlPlaneStates();
+        } else {
+          // Empty long-poll timeouts only check for externally added/removed profiles;
+          // runtime state remains event-driven and never falls back to N×service polling.
+          const items = await listWorkspaces();
+          if (isCancelled()) return;
+          const currentIds = new Set($workspaces.map((item) => item.id));
+          if (
+            items.length !== currentIds.size ||
+            items.some((item) => !currentIds.has(item.id))
+          ) {
+            workspaces.set(items);
+            await refreshControlPlaneStates();
+          }
+        }
+      } catch (error) {
+        if (isCancelled()) return;
+        const detail = String(error);
+        if (detail !== lastFault) {
+          lastFault = detail;
+          showToast(detail, {
+            title: "控制面事件异常",
+            kind: "error",
+            duration: 8000,
+          });
+        }
+        // Protocol/remote errors stay explicit. Retry the event endpoint itself;
+        // do not downgrade to legacy per-service status polling.
+        await delay(3_000);
+      }
+    }
   }
 
   async function addWorkspace() {
@@ -81,17 +127,33 @@
     goto("/settings/keys");
   }
 
-  onMount(async () => {
-    await refreshWorkspaces();
-    const path = $page.url.pathname;
-    if (path === "/") {
-      const lastId = await getLastWorkspaceId();
-      if (lastId && $workspaces.some((item) => item.id === lastId)) {
-        goto(`/workspace/${lastId}`);
-      } else if ($workspaces.length > 0) {
-        goto(`/workspace/${$workspaces[0].id}`);
+  onMount(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        await refreshWorkspaces();
+        if (cancelled) return;
+        const path = $page.url.pathname;
+        if (path === "/") {
+          const lastId = await getLastWorkspaceId();
+          if (lastId && $workspaces.some((item) => item.id === lastId)) {
+            goto(`/workspace/${lastId}`);
+          } else if ($workspaces.length > 0) {
+            goto(`/workspace/${$workspaces[0].id}`);
+          }
+        }
+      } catch (error) {
+        showToast(String(error), {
+          title: "加载控制面失败",
+          kind: "error",
+          duration: 8000,
+        });
       }
-    }
+      if (!cancelled) void observeControlPlane(() => cancelled);
+    })();
+    return () => {
+      cancelled = true;
+    };
   });
 </script>
 

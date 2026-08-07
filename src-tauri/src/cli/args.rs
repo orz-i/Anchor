@@ -10,6 +10,18 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayLogsOptions {
+    pub lines: usize,
+    pub follow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayEventsOptions {
+    pub follow: bool,
+    pub wait_seconds: u64,
+}
+
 fn parse_gateway_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
     let config_scope = pop_value(args, "gateway-daemon-run")?;
     let mut workspaces = Vec::new();
@@ -29,7 +41,10 @@ fn parse_gateway_daemon_run(args: &mut VecDeque<String>) -> Result<Command, Stri
 }
 
 fn parse_events(args: &mut VecDeque<String>) -> Result<EventsOptions, String> {
-    let workspace = pop_value(args, "events")?;
+    let target = match pop_value(args, "events")?.as_str() {
+        "--control-plane" => EventsTarget::ControlPlane,
+        workspace => EventsTarget::Workspace(workspace.to_string()),
+    };
     let mut follow = false;
     let mut wait_seconds = 15;
     while let Some(option) = args.pop_front() {
@@ -40,7 +55,7 @@ fn parse_events(args: &mut VecDeque<String>) -> Result<EventsOptions, String> {
         }
     }
     Ok(EventsOptions {
-        workspace,
+        target,
         follow,
         wait_seconds,
     })
@@ -88,6 +103,8 @@ pub enum GatewayCommand {
     Stop(GatewayStopOptions),
     Restart(GatewayStopOptions),
     Reload,
+    Logs(GatewayLogsOptions),
+    Events(GatewayEventsOptions),
 }
 
 fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, String> {
@@ -174,6 +191,33 @@ fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, 
         Some("reload") => {
             ensure_empty(args, "gateway reload")?;
             Ok(GatewayCommand::Reload)
+        }
+        Some("logs") => {
+            let mut lines = 100usize;
+            let mut follow = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--lines" => lines = parse_u64(args, "--lines", 1, 10_000)? as usize,
+                    "--follow" | "-f" => follow = true,
+                    other => return Err(format!("gateway logs 不支持参数：{other}")),
+                }
+            }
+            Ok(GatewayCommand::Logs(GatewayLogsOptions { lines, follow }))
+        }
+        Some("events") => {
+            let mut follow = false;
+            let mut wait_seconds = 15;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--follow" | "-f" => follow = true,
+                    "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 25)?,
+                    other => return Err(format!("gateway events 不支持参数：{other}")),
+                }
+            }
+            Ok(GatewayCommand::Events(GatewayEventsOptions {
+                follow,
+                wait_seconds,
+            }))
         }
         Some(other) => Err(format!("未知 gateway 命令：{other}\n\n{}", gateway_usage())),
         None => Err(format!("gateway 缺少子命令\n\n{}", gateway_usage())),
@@ -442,11 +486,13 @@ fn parse_stop(args: &mut VecDeque<String>) -> Result<StopOptions, String> {
 fn parse_status(args: &mut VecDeque<String>) -> Result<StatusOptions, String> {
     let mut workspace = None;
     let mut all = false;
+    let mut control_plane = false;
     let mut watch = false;
     let mut interval_seconds = 2;
     while let Some(option) = args.pop_front() {
         match option.as_str() {
             "--all" => all = true,
+            "--control-plane" => control_plane = true,
             "--watch" => watch = true,
             "--interval" => interval_seconds = parse_u64(args, "--interval", 1, 60)?,
             other if other.starts_with('-') => {
@@ -459,10 +505,18 @@ fn parse_status(args: &mut VecDeque<String>) -> Result<StatusOptions, String> {
     if all && workspace.is_some() {
         return Err("status 不能同时指定 workspace 和 --all".into());
     }
+    if control_plane && (all || workspace.is_some()) {
+        return Err("status --control-plane 不能同时指定 workspace 或 --all".into());
+    }
     Ok(StatusOptions {
-        workspace: if all { None } else { workspace },
+        workspace: if all || control_plane {
+            None
+        } else {
+            workspace
+        },
         watch,
         interval_seconds,
+        control_plane,
     })
 }
 
@@ -553,6 +607,7 @@ pub struct StatusOptions {
     pub workspace: Option<String>,
     pub watch: bool,
     pub interval_seconds: u64,
+    pub control_plane: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,8 +641,14 @@ pub struct LogsOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventsTarget {
+    Workspace(String),
+    ControlPlane,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventsOptions {
-    pub workspace: String,
+    pub target: EventsTarget,
     pub follow: bool,
     pub wait_seconds: u64,
 }
@@ -733,13 +794,13 @@ pub fn usage() -> &'static str {
 用法：\n\
   anchor [--config-dir PATH] [--json] list\n\
   anchor [--config-dir PATH] [--json] show <workspace>\n\
-  anchor [--config-dir PATH] [--json] status [<workspace>|--all] [--watch]\n\
+  anchor [--config-dir PATH] [--json] status [<workspace>|--all|--control-plane] [--watch]\n\
   anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|actions|all] [--tunnel]\n\n\
   anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
   anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
-  anchor [--config-dir PATH] [--json] events <workspace> [-f] [--wait SECONDS]\n\
+  anchor [--config-dir PATH] [--json] events <workspace|--control-plane> [-f] [--wait SECONDS]\n\
   anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
@@ -757,6 +818,8 @@ pub fn gateway_usage() -> &'static str {
   anchor gateway stop [--timeout SECONDS] [--force]\n\
   anchor gateway restart [--timeout SECONDS] [--force]\n\
   anchor gateway reload\n\
+  anchor gateway logs [--lines N] [--follow|-f]\n\
+  anchor gateway events [--follow|-f] [--wait SECONDS]\n\
   anchor gateway serve <workspace> [workspace ...]\n\n\
 gateway start/stop/restart 管理独立全局 Gateway daemon；gateway serve 保留为前台调试/外部 supervisor 模式。"
 }
@@ -903,6 +966,26 @@ mod tests {
         let reload = parse(strings(&["gateway", "reload"])).expect("gateway reload");
         assert_eq!(reload.command, Command::Gateway(GatewayCommand::Reload));
 
+        let logs = parse(strings(&["gateway", "logs", "--lines", "250", "--follow"]))
+            .expect("gateway logs");
+        assert_eq!(
+            logs.command,
+            Command::Gateway(GatewayCommand::Logs(GatewayLogsOptions {
+                lines: 250,
+                follow: true,
+            }))
+        );
+
+        let events = parse(strings(&["gateway", "events", "--follow", "--wait", "20"]))
+            .expect("gateway events");
+        assert_eq!(
+            events.command,
+            Command::Gateway(GatewayCommand::Events(GatewayEventsOptions {
+                follow: true,
+                wait_seconds: 20,
+            }))
+        );
+
         let child = parse(strings(&[
             "gateway-daemon-run",
             "scope-a",
@@ -969,9 +1052,26 @@ mod tests {
         assert_eq!(
             events.command,
             Command::Events(EventsOptions {
-                workspace: "workspace-a".into(),
+                target: EventsTarget::Workspace("workspace-a".into()),
                 follow: true,
                 wait_seconds: 20,
+            })
+        );
+
+        let control_plane_events = parse(strings(&[
+            "events",
+            "--control-plane",
+            "--follow",
+            "--wait",
+            "10",
+        ]))
+        .expect("control plane events parse");
+        assert_eq!(
+            control_plane_events.command,
+            Command::Events(EventsOptions {
+                target: EventsTarget::ControlPlane,
+                follow: true,
+                wait_seconds: 10,
             })
         );
 
@@ -996,6 +1096,7 @@ mod tests {
                 workspace: Some("workspace-a".into()),
                 watch: true,
                 interval_seconds: 2,
+                control_plane: false,
             })
         );
 
@@ -1007,6 +1108,7 @@ mod tests {
                 workspace: None,
                 watch: false,
                 interval_seconds: 5,
+                control_plane: false,
             })
         );
 
@@ -1017,6 +1119,19 @@ mod tests {
                 workspace: None,
                 watch: false,
                 interval_seconds: 2,
+                control_plane: false,
+            })
+        );
+
+        let control_plane = parse(strings(&["status", "--control-plane", "--watch"]))
+            .expect("control plane status");
+        assert_eq!(
+            control_plane.command,
+            Command::Status(StatusOptions {
+                workspace: None,
+                watch: true,
+                interval_seconds: 2,
+                control_plane: true,
             })
         );
     }

@@ -4,12 +4,17 @@ use std::time::Duration;
 
 use crate::app_state::AppState;
 
-use crate::control::{self, WorkspaceControlStatus};
+use crate::control::{
+    self, ControlPlaneEventBatch, ControlPlaneEventCursor, ControlPlaneStatus,
+    WorkspaceControlStatus,
+};
 use crate::error::{AppError, AppResult};
 
 use crate::runtime::{port_busy_message, try_reclaim_previous_macos_app_port, wait_for_port_free};
 
-use crate::gateway_control::{self, GatewayControlStatus, GatewayOperation};
+use crate::gateway_control::{
+    self, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor, GatewayOperation,
+};
 use crate::gateway_daemon::{self, GatewayDaemonInspection};
 use crate::mcp::gateway;
 
@@ -48,6 +53,40 @@ pub async fn get_mcp_gateway_status(
     _state: State<'_, AppState>,
 ) -> AppResult<GatewayControlStatus> {
     gateway_control::status_via_daemon_or_local().await
+}
+
+#[tauri::command]
+pub async fn get_control_plane_status(state: State<'_, AppState>) -> AppResult<ControlPlaneStatus> {
+    let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    control::control_plane_status(&profiles).await
+}
+
+#[tauri::command]
+pub async fn get_control_plane_events(
+    state: State<'_, AppState>,
+    cursor: Option<ControlPlaneEventCursor>,
+    wait_ms: u32,
+) -> AppResult<ControlPlaneEventBatch> {
+    let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    control::control_plane_events(&profiles, cursor, 64, wait_ms).await
+}
+
+#[tauri::command]
+pub async fn get_gateway_control_events(
+    cursor: Option<GatewayEventCursor>,
+    wait_ms: u32,
+) -> AppResult<Option<GatewayEventBatch>> {
+    map_gateway_events(gateway_control::request_events(cursor, 32, wait_ms).await)
+}
+
+fn map_gateway_events(
+    result: Result<GatewayEventBatch, gateway_control::GatewayControlClientError>,
+) -> AppResult<Option<GatewayEventBatch>> {
+    match result {
+        Ok(batch) => Ok(Some(batch)),
+        Err(error) if error.is_unavailable() => Ok(None),
+        Err(error) => Err(AppError::Message(error.to_string())),
+    }
 }
 
 const DESKTOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
@@ -616,6 +655,26 @@ mod tests {
         assert!(gateway_config_write_action(&ambiguous, true).is_err());
         let wrong_owner = gateway_inspection(true, false, false);
         assert!(gateway_config_write_action(&wrong_owner, true).is_err());
+    }
+
+    #[test]
+    fn gateway_event_monitor_only_falls_back_when_endpoint_is_unavailable() {
+        let unavailable = map_gateway_events(Err(
+            gateway_control::GatewayControlClientError::Unavailable("not running".into()),
+        ))
+        .expect("unavailable endpoint is a controlled read fallback");
+        assert!(unavailable.is_none());
+
+        let protocol = map_gateway_events(Err(
+            gateway_control::GatewayControlClientError::Protocol("bad version".into()),
+        ));
+        assert!(protocol.is_err());
+
+        let remote = map_gateway_events(Err(gateway_control::GatewayControlClientError::Remote {
+            code: "unsupported".into(),
+            message: "old gateway daemon".into(),
+        }));
+        assert!(remote.is_err());
     }
 
     #[test]

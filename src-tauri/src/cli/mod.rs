@@ -28,15 +28,99 @@ use crate::tunnel::{
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{
-    CliArgs, Command, EventsOptions, GatewayCommand, GatewayConfigureOptions, GatewayStartOptions,
-    GatewayStopOptions, LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceSelection,
-    StatusOptions, StopOptions,
+    CliArgs, Command, EventsOptions, EventsTarget, GatewayCommand, GatewayConfigureOptions,
+    GatewayEventsOptions, GatewayLogsOptions, GatewayStartOptions, GatewayStopOptions,
+    LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceSelection, StatusOptions,
+    StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct CliTunnelRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
+}
+
+async fn show_control_plane_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    let mut event_cursor = None;
+    loop {
+        let store = DataStore::load()?;
+        let profiles = store.list().to_vec();
+        drop(store);
+        let workspace_ids = profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let status = control::control_plane_status(&profiles).await?;
+        if as_json && options.watch {
+            print_json_line(&json!({
+                "event": "control_plane_status_snapshot",
+                "controlPlane": status
+            }))?;
+        } else if as_json {
+            print_json(&status)?;
+        } else {
+            print_control_plane_status(&status);
+        }
+        if !options.watch {
+            return Ok(());
+        }
+        let wait_ms = u32::try_from(options.interval_seconds.saturating_mul(1_000))
+            .unwrap_or(25_000)
+            .min(25_000);
+        let wait = control::control_plane_events(&profiles, event_cursor.clone(), 64, wait_ms);
+        let batch = tokio::select! {
+            result = &mut shutdown_signal => return result,
+            result = wait => result?,
+        };
+        event_cursor = Some(batch.next_cursor);
+
+        if batch.events.is_empty() && batch.reset_sources.is_empty() {
+            let latest_store = DataStore::load()?;
+            let latest_ids = latest_store
+                .list()
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>();
+            if latest_ids == workspace_ids {
+                continue;
+            }
+        }
+    }
+}
+
+fn print_control_plane_status(status: &control::ControlPlaneStatus) {
+    println!(
+        "Gateway\t{}\troutes={}{}",
+        status.gateway.state,
+        status.gateway.route_count,
+        status
+            .gateway
+            .pid
+            .map(|pid| format!("\tpid={pid}"))
+            .unwrap_or_default()
+    );
+    for workspace in &status.workspaces {
+        println!(
+            "{} ({})\tMCP={}\tActions={}",
+            workspace.status.name,
+            workspace.status.id,
+            workspace.mcp_state,
+            workspace.actions_state
+        );
+    }
+}
+
+fn publish_gateway_runtime_event(
+    event_scope: Option<&str>,
+    kind: gateway_control::GatewayEventKind,
+    state: impl Into<String>,
+    message: impl Into<String>,
+) {
+    if let Some(scope) = event_scope {
+        gateway_control::publish_gateway_event(scope, kind, state, message);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -344,8 +428,15 @@ async fn run_gateway_daemon(config_scope: &str, workspaces: &[String]) -> AppRes
     let config = store.settings().mcp_gateway;
     drop(store);
     let _guard = gateway_daemon::acquire(&workspace_ids, config.local_port)?;
+    gateway_control::reset_gateway_event_stream(config_scope);
     let (sender, receiver) = gateway_control::control_channel();
     let server = gateway_control::GatewayControlServer::start(sender)?;
+    gateway_control::publish_gateway_event(
+        config_scope,
+        gateway_control::GatewayEventKind::GatewayState,
+        "starting",
+        format!("Gateway daemon PID {} 正在启动", std::process::id()),
+    );
     gateway_daemon::append_log(&format!(
         "[daemon] started pid={} scope={} endpoint={:?} routes={}",
         std::process::id(),
@@ -353,7 +444,22 @@ async fn run_gateway_daemon(config_scope: &str, workspaces: &[String]) -> AppRes
         server.endpoint(),
         workspace_ids.len()
     ));
-    let result = serve_gateway(&workspace_ids, false, false, Some(receiver)).await;
+    let result = serve_gateway(
+        &workspace_ids,
+        false,
+        false,
+        Some(receiver),
+        Some(config_scope),
+    )
+    .await;
+    if let Err(error) = &result {
+        gateway_control::publish_gateway_event(
+            config_scope,
+            gateway_control::GatewayEventKind::GatewayState,
+            "error",
+            error.to_string(),
+        );
+    }
     gateway_daemon::append_log(&format!(
         "[daemon] exiting pid={} result={}",
         std::process::id(),
@@ -427,20 +533,36 @@ async fn reload_daemon_config(options: ReloadOptions, as_json: bool) -> AppResul
 }
 
 async fn show_events(options: EventsOptions, as_json: bool) -> AppResult<()> {
+    match options.target {
+        EventsTarget::Workspace(workspace) => {
+            show_workspace_events(&workspace, options.follow, options.wait_seconds, as_json).await
+        }
+        EventsTarget::ControlPlane => {
+            show_control_plane_events(options.follow, options.wait_seconds, as_json).await
+        }
+    }
+}
+
+async fn show_workspace_events(
+    workspace: &str,
+    follow: bool,
+    wait_seconds: u64,
+    as_json: bool,
+) -> AppResult<()> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    let profile = resolve_workspace(store.list(), workspace)?.clone();
     drop(store);
     let mut cursor = None;
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {
-        let wait_ms = if options.follow {
-            u32::try_from(options.wait_seconds.saturating_mul(1_000)).unwrap_or(25_000)
+        let wait_ms = if follow {
+            u32::try_from(wait_seconds.saturating_mul(1_000)).unwrap_or(25_000)
         } else {
             0
         };
         let request = control::request_events(&profile, cursor.clone(), 64, wait_ms);
-        let batch = if options.follow {
+        let batch = if follow {
             tokio::select! {
                 result = &mut shutdown_signal => return result,
                 result = request => result.map_err(|error| AppError::Message(error.to_string()))?,
@@ -452,7 +574,7 @@ async fn show_events(options: EventsOptions, as_json: bool) -> AppResult<()> {
         };
         cursor = Some(batch.next_cursor.clone());
         if as_json {
-            if options.follow {
+            if follow {
                 for event in &batch.events {
                     print_json_line(event)?;
                 }
@@ -483,7 +605,75 @@ async fn show_events(options: EventsOptions, as_json: bool) -> AppResult<()> {
                 );
             }
         }
-        if !options.follow {
+        if !follow {
+            return Ok(());
+        }
+    }
+}
+
+async fn show_control_plane_events(
+    follow: bool,
+    wait_seconds: u64,
+    as_json: bool,
+) -> AppResult<()> {
+    let mut cursor = None;
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    loop {
+        let store = DataStore::load()?;
+        let profiles = store.list().to_vec();
+        drop(store);
+        let wait_ms = if follow {
+            u32::try_from(wait_seconds.saturating_mul(1_000)).unwrap_or(25_000)
+        } else {
+            0
+        };
+        let request = control::control_plane_events(&profiles, cursor.clone(), 64, wait_ms);
+        let batch = if follow {
+            tokio::select! {
+                result = &mut shutdown_signal => return result,
+                result = request => result?,
+            }
+        } else {
+            request.await?
+        };
+        cursor = Some(batch.next_cursor.clone());
+        if as_json {
+            if follow {
+                for event in &batch.events {
+                    print_json_line(event)?;
+                }
+                if !batch.reset_sources.is_empty() {
+                    print_json_line(&json!({
+                        "kind": "cursor_reset",
+                        "sources": batch.reset_sources,
+                        "cursor": batch.next_cursor
+                    }))?;
+                }
+            } else {
+                print_json(&batch)?;
+            }
+        } else {
+            for source in &batch.reset_sources {
+                eprintln!("control-plane event cursor reset: {source:?}");
+            }
+            for event in &batch.events {
+                match event {
+                    control::ControlPlaneEvent::Gateway { event } => println!(
+                        "gateway\t{}\t{:?}\t{}\t{}",
+                        event.sequence, event.kind, event.state, event.message
+                    ),
+                    control::ControlPlaneEvent::Workspace {
+                        workspace_id,
+                        event,
+                    } => println!(
+                        "workspace:{workspace_id}\t{}\t{:?}\t{}\t{}",
+                        event.sequence, event.kind, event.state, event.message
+                    ),
+                }
+            }
+        }
+        if !follow {
             return Ok(());
         }
     }
@@ -514,15 +704,165 @@ async fn execute_gateway(command: GatewayCommand, as_json: bool) -> AppResult<i3
         GatewayCommand::Show => show_gateway(as_json).map(|_| 0),
         GatewayCommand::Status => show_gateway_status(as_json).await.map(|_| 0),
         GatewayCommand::Configure(options) => configure_gateway(options, as_json).await.map(|_| 0),
-        GatewayCommand::Serve { workspaces } => serve_gateway(&workspaces, as_json, true, None)
-            .await
-            .map(|_| 0),
+        GatewayCommand::Serve { workspaces } => {
+            serve_gateway(&workspaces, as_json, true, None, None)
+                .await
+                .map(|_| 0)
+        }
         GatewayCommand::Start(options) => start_gateway_daemon(options, as_json).await.map(|_| 0),
         GatewayCommand::Stop(options) => stop_gateway_daemon(options, as_json).await.map(|_| 0),
         GatewayCommand::Restart(options) => {
             restart_gateway_daemon(options, as_json).await.map(|_| 0)
         }
         GatewayCommand::Reload => reload_gateway_daemon(as_json).await.map(|_| 0),
+        GatewayCommand::Logs(options) => show_gateway_logs(options, as_json).await.map(|_| 0),
+        GatewayCommand::Events(options) => show_gateway_events(options, as_json).await.map(|_| 0),
+    }
+}
+
+async fn show_gateway_logs(options: GatewayLogsOptions, as_json: bool) -> AppResult<()> {
+    let inspection = gateway_daemon::inspect()?;
+    if options.follow && !inspection.running {
+        return Err(AppError::Message(
+            "Gateway daemon 未运行；历史日志可直接读取，但 --follow 只允许跟随活动 daemon".into(),
+        ));
+    }
+    let tail_lines = u32::try_from(options.lines).unwrap_or(u32::MAX);
+    let initial = if inspection.running {
+        gateway_control::request_logs(tail_lines, None)
+            .await
+            .map_err(|error| {
+                AppError::Message(format!(
+                "Gateway daemon 日志控制请求失败：{error}；运行中的 Gateway 不会回退到直接文件读取"
+            ))
+            })?
+    } else {
+        gateway_control::logs_via_daemon_or_local(tail_lines, None).await?
+    };
+
+    if !options.follow {
+        if as_json {
+            print_json(&initial)?;
+        } else if !initial.exists {
+            println!("暂无 Gateway daemon 日志：{}", initial.path);
+        } else {
+            println!("==> {} <==", initial.path);
+            print!("{}", initial.content);
+            if !initial.content.ends_with('\n') {
+                println!();
+            }
+        }
+        return Ok(());
+    }
+
+    emit_gateway_log_chunk(&initial, "log_snapshot", as_json)?;
+    let mut cursor = gateway_control::GatewayLogCursor {
+        offset: initial.next_offset,
+    };
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    loop {
+        tokio::select! {
+            result = &mut shutdown_signal => return result,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                let chunk = gateway_control::request_logs(0, Some(cursor.clone()))
+                    .await
+                    .map_err(|error| AppError::Message(format!(
+                        "Gateway daemon 日志跟随中断：{error}"
+                    )))?;
+                cursor.offset = chunk.next_offset;
+                emit_gateway_log_chunk(&chunk, "log_append", as_json)?;
+            }
+        }
+    }
+}
+
+fn emit_gateway_log_chunk(
+    chunk: &gateway_control::GatewayLogChunk,
+    event: &str,
+    as_json: bool,
+) -> AppResult<()> {
+    if !chunk.exists || chunk.content.is_empty() {
+        return Ok(());
+    }
+    if as_json {
+        print_json_line(&json!({
+            "event": event,
+            "name": chunk.name,
+            "path": chunk.path,
+            "content": chunk.content,
+            "nextOffset": chunk.next_offset,
+            "truncated": chunk.truncated
+        }))?;
+    } else {
+        if event == "log_snapshot" {
+            println!("==> {} <==", chunk.path);
+        }
+        print!("{}", chunk.content);
+        if event == "log_snapshot" && !chunk.content.ends_with('\n') {
+            println!();
+        }
+        std::io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+async fn show_gateway_events(options: GatewayEventsOptions, as_json: bool) -> AppResult<()> {
+    let inspection = gateway_daemon::inspect()?;
+    if !inspection.running {
+        return Err(AppError::Message(
+            "Gateway daemon 未运行；Gateway events 只存在于活动 daemon 的内存 journal 中".into(),
+        ));
+    }
+    let mut cursor = None;
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    loop {
+        let wait_ms = if options.follow {
+            u32::try_from(options.wait_seconds.saturating_mul(1_000)).unwrap_or(25_000)
+        } else {
+            0
+        };
+        let request = gateway_control::request_events(cursor.clone(), 32, wait_ms);
+        let batch = if options.follow {
+            tokio::select! {
+                result = &mut shutdown_signal => return result,
+                result = request => result.map_err(|error| AppError::Message(error.to_string()))?,
+            }
+        } else {
+            request
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?
+        };
+        cursor = Some(batch.next_cursor.clone());
+        if as_json {
+            if options.follow {
+                for event in &batch.events {
+                    print_json_line(event)?;
+                }
+                if batch.reset {
+                    print_json_line(&json!({
+                        "kind": "cursor_reset",
+                        "cursor": batch.next_cursor
+                    }))?;
+                }
+            } else {
+                print_json(&batch)?;
+            }
+        } else {
+            if batch.reset {
+                eprintln!("Gateway event cursor 已重置到当前 daemon stream");
+            }
+            for event in &batch.events {
+                println!(
+                    "{}\t{:?}\t{}\t{}",
+                    event.sequence, event.kind, event.state, event.message
+                );
+            }
+        }
+        if !options.follow {
+            return Ok(());
+        }
     }
 }
 
@@ -841,6 +1181,7 @@ async fn serve_gateway(
     as_json: bool,
     foreground: bool,
     mut control_commands: Option<gateway_control::GatewayControlReceiver>,
+    event_scope: Option<&str>,
 ) -> AppResult<()> {
     let store = DataStore::load()?;
     let mut all_profiles = store.list().to_vec();
@@ -866,6 +1207,22 @@ async fn serve_gateway(
     let mut runtime = RuntimeSupervisor::default();
     let mut started =
         start_gateway_services(&mut runtime, &selected, &mut config, &all_profiles).await?;
+    publish_gateway_runtime_event(
+        event_scope,
+        gateway_control::GatewayEventKind::DaemonReady,
+        "running",
+        format!(
+            "Gateway daemon 已就绪，routes={} localPort={}",
+            selected.len(),
+            config.local_port
+        ),
+    );
+    publish_gateway_runtime_event(
+        event_scope,
+        gateway_control::GatewayEventKind::RouteState,
+        "active",
+        format!("当前注册 {} 条 Gateway route", selected.len()),
+    );
 
     if as_json {
         print_json(&json!({
@@ -925,6 +1282,20 @@ async fn serve_gateway(
                             &mut all_profiles,
                         )
                         .await;
+                        match &result {
+                            Ok(()) => publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::Reload,
+                                "succeeded",
+                                format!("Gateway reload 完成，routes={}", selected.len()),
+                            ),
+                            Err(error) => publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::Reload,
+                                "failed",
+                                error.to_string(),
+                            ),
+                        }
                         gateway_control::finish_reload_operation(&operation_id, result);
                     }
                     Some(gateway_control::GatewayControlCommand::ApplyConfig {
@@ -941,12 +1312,36 @@ async fn serve_gateway(
                             *next_config,
                         )
                         .await;
+                        match &result {
+                            Ok(()) => publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::ConfigApplied,
+                                "succeeded",
+                                format!(
+                                    "Gateway 配置已应用，localPort={} routes={}",
+                                    config.local_port,
+                                    selected.len()
+                                ),
+                            ),
+                            Err(error) => publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::ConfigApplied,
+                                "failed",
+                                error.to_string(),
+                            ),
+                        }
                         gateway_control::finish_reload_operation(&operation_id, result);
                     }
                     None => {
                         terminal_error = Some(AppError::Message(
                             "Gateway control command channel closed unexpectedly".into(),
                         ));
+                        publish_gateway_runtime_event(
+                            event_scope,
+                            gateway_control::GatewayEventKind::GatewayState,
+                            "error",
+                            "Gateway control command channel closed unexpectedly",
+                        );
                         break;
                     }
                 }
@@ -955,14 +1350,27 @@ async fn serve_gateway(
                 for profile in &selected {
                     match runtime.maintain_mcp(profile) {
                         Ok(status) if status.state == "error" && !status.recovery.enabled => {
-                            terminal_error = Some(AppError::Message(format!(
+                            let error = AppError::Message(format!(
                                 "工作区 {} MCP 自动恢复耗尽：{}",
                                 profile.name, status.local_message
-                            )));
+                            ));
+                            publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::GatewayState,
+                                "error",
+                                error.to_string(),
+                            );
+                            terminal_error = Some(error);
                             break;
                         }
                         Ok(_) => {}
                         Err(error) => {
+                            publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::GatewayState,
+                                "error",
+                                error.to_string(),
+                            );
                             terminal_error = Some(error);
                             break;
                         }
@@ -973,6 +1381,12 @@ async fn serve_gateway(
                 }
                 let active = runtime.active_mcp_workspace_ids();
                 if let Err(error) = gateway::ensure(&config, &all_profiles, &active).await {
+                    publish_gateway_runtime_event(
+                        event_scope,
+                        gateway_control::GatewayEventKind::GatewayState,
+                        "error",
+                        error.to_string(),
+                    );
                     terminal_error = Some(error);
                     break;
                 }
@@ -989,6 +1403,15 @@ async fn serve_gateway(
                             persist_cli_gateway_observation(&mut config, &all_profiles, &url)?;
                         }
                         if let Some(attempts) = recovered_attempts {
+                            publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::TunnelState,
+                                "running",
+                                format!(
+                                    "Gateway 隧道已在第 {attempts} 次重试后恢复：{}",
+                                    config.effective_public_url()
+                                ),
+                            );
                             if as_json {
                                 print_json_line(&json!({
                                     "event": "gateway_tunnel_reconnected",
@@ -1006,6 +1429,12 @@ async fn serve_gateway(
                     }
                     Err(error) if is_quick_tunnel_url_change_error(&error) => {
                         gateway::record_runtime_error(format!("Gateway 隧道维护失败：{error}")).await;
+                        publish_gateway_runtime_event(
+                            event_scope,
+                            gateway_control::GatewayEventKind::TunnelState,
+                            "error",
+                            error.to_string(),
+                        );
                         terminal_error = Some(error);
                         break;
                     }
@@ -1019,6 +1448,15 @@ async fn serve_gateway(
                             attempts,
                             next_attempt: tokio::time::Instant::now() + delay,
                         });
+                        publish_gateway_runtime_event(
+                            event_scope,
+                            gateway_control::GatewayEventKind::TunnelState,
+                            "recovering",
+                            format!(
+                                "Gateway 隧道维护失败，第 {attempts} 次重试将在 {} 秒后进行：{error}",
+                                delay.as_secs()
+                            ),
+                        );
                         if as_json {
                             print_json_line(&json!({
                                 "event": "gateway_tunnel_retry",
@@ -1039,7 +1477,22 @@ async fn serve_gateway(
         }
     }
 
+    publish_gateway_runtime_event(
+        event_scope,
+        gateway_control::GatewayEventKind::DaemonStopping,
+        "stopping",
+        terminal_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "Gateway daemon 正在优雅停止".into()),
+    );
     shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await?;
+    publish_gateway_runtime_event(
+        event_scope,
+        gateway_control::GatewayEventKind::GatewayState,
+        "stopped",
+        "Gateway listener、routes 与 tunnel 已停止",
+    );
     if as_json {
         print_json(&json!({ "event": "gateway_stopped" }))?;
     }
@@ -1889,6 +2342,9 @@ fn show_workspace(selector: &str, as_json: bool) -> AppResult<()> {
 }
 
 async fn show_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
+    if options.control_plane {
+        return show_control_plane_status(options, as_json).await;
+    }
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {

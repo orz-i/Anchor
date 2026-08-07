@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { invokeRead } from "$lib/api/invoke";
+import type { GatewayControlStatus } from "$lib/types";
 
 export interface FrpProfileDto {
   id: string;
@@ -63,19 +64,7 @@ export interface McpGatewayConfigDto {
   observedTunnelSignature: string;
 }
 
-export interface McpGatewayStatusDto {
-  daemonSupported: boolean;
-  running: boolean;
-  pid?: number;
-  state: "stopped" | "configured" | "running" | "error";
-  localEndpoint: string;
-  publicBaseUrl: string;
-  routeCount: number;
-  routeWorkspaceIds: string[];
-  ownerWorkspaceId: string;
-  error: string;
-  detail: string;
-}
+export type McpGatewayStatusDto = GatewayControlStatus;
 
 export async function getMcpGateway(): Promise<McpGatewayConfigDto> {
   return invokeRead<McpGatewayConfigDto>("get_mcp_gateway");

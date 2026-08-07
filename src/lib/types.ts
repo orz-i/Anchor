@@ -230,6 +230,90 @@ export interface ControlEventBatch {
   reset: boolean;
 }
 
+export interface GatewayControlStatus {
+  daemonSupported: boolean;
+  running: boolean;
+  pid?: number | null;
+  state: "stopped" | "configured" | "running" | "error";
+  localEndpoint: string;
+  publicBaseUrl: string;
+  routeCount: number;
+  routeWorkspaceIds: string[];
+  ownerWorkspaceId: string;
+  error: string;
+  detail: string;
+}
+
+export interface GatewayLogCursor {
+  offset: number;
+}
+
+export interface GatewayLogChunk {
+  name: string;
+  path: string;
+  content: string;
+  nextOffset: number;
+  exists: boolean;
+  truncated: boolean;
+}
+
+export type GatewayEventKind =
+  | "daemon_ready"
+  | "daemon_stopping"
+  | "gateway_state"
+  | "route_state"
+  | "tunnel_state"
+  | "reload"
+  | "config_applied";
+
+export interface GatewayEventCursor {
+  streamId: string;
+  sequence: number;
+}
+
+export interface GatewayEvent {
+  sequence: number;
+  emittedAtUnixMs: number;
+  kind: GatewayEventKind;
+  state: string;
+  message: string;
+}
+
+export interface GatewayEventBatch {
+  events: GatewayEvent[];
+  nextCursor: GatewayEventCursor;
+  reset: boolean;
+}
+
+export interface ControlPlaneWorkspaceStatus extends WorkspaceControlStatus {
+  mcpState: RuntimeState;
+  actionsState: RuntimeState;
+}
+
+export interface ControlPlaneStatus {
+  gateway: GatewayControlStatus;
+  workspaces: ControlPlaneWorkspaceStatus[];
+}
+
+export interface ControlPlaneEventCursor {
+  gateway?: GatewayEventCursor | null;
+  workspaces: Record<string, ControlEventCursor>;
+}
+
+export type ControlPlaneEventSource =
+  | { source: "gateway" }
+  | { source: "workspace"; workspaceId: string };
+
+export type ControlPlaneEvent =
+  | { source: "gateway"; event: GatewayEvent }
+  | { source: "workspace"; workspaceId: string; event: ControlEvent };
+
+export interface ControlPlaneEventBatch {
+  events: ControlPlaneEvent[];
+  nextCursor: ControlPlaneEventCursor;
+  resetSources: ControlPlaneEventSource[];
+}
+
 export type McpActivityState =
   | "unknown"
   | "idle"

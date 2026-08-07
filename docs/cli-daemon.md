@@ -62,6 +62,8 @@ anchor gateway start PROFILE_A PROFILE_B
 
 # 查看 / reload / 重启 / 停止 Gateway daemon
 anchor gateway status
+anchor gateway logs --follow
+anchor gateway events --follow
 anchor gateway reload
 anchor gateway restart
 anchor gateway stop
@@ -247,6 +249,8 @@ Gateway 是用户配置域级别的独立控制域，不绑定到任何单一 Wo
 anchor gateway status
 anchor gateway start <workspace> [workspace ...] [--wait SECONDS]
 anchor gateway reload
+anchor gateway logs [--lines N] [--follow]
+anchor gateway events [--follow] [--wait SECONDS]
 anchor gateway restart [--timeout SECONDS] [--force]
 anchor gateway stop [--timeout SECONDS] [--force]
 ```
@@ -264,6 +268,15 @@ gateway.sock
 
 状态文件记录 daemon PID、配置域、route Workspace IDs、Gateway 本地端口和版本。Unix socket 父目录保持 `0700`、socket 为 `0600`。readiness 同时要求 Gateway 本地端口属于目标 PID 且 control `ping` 成功。
 
+Gateway protocol v1 的可观察性方法采用 additive tag 扩展，没有修改已有 v1 请求/响应形状：
+
+- `logs` 只读取 daemon 派生的 `gateway/daemon.log`，客户端不能指定任意路径；初始 tail 最多扫描 1 MiB、最多 5000 行，单响应日志正文预算 8 KiB；cursor 使用字节 offset，文件缩短/轮转时从 0 重新读取；
+- `events` 使用独立的进程内 journal，每个配置域最多保留 256 条事件、单批最多 32 条，游标为 `streamId + sequence`，最长长轮询 25 秒；daemon 重启、游标跨 stream 或越过 retained window 时显式返回 `reset`；
+- 当前 Gateway 事件覆盖 daemon ready/stopping、Gateway/route 状态、tunnel recovery/error、reload 和 config apply 结果；单条 state/message 分别限制为 64/512 字节，保证最坏 JSON 转义后仍小于 64 KiB 控制帧；
+- 新客户端连接只实现旧 v1 方法的 daemon 时，新方法失败会作为明确的 protocol/I/O 能力错误上抛，不会被伪装成“daemon 离线”。
+
+运行中的 `gateway logs` / GUI Gateway 日志必须经过 IPC；只有 Gateway daemon 明确停止且 endpoint 不可用时，才允许使用同一有界读取器查看历史日志。`gateway events` 仅存在于活动 daemon 的内存 journal，不提供文件或 polling 语义回退。
+
 Gateway 写控制遵循 fail-closed：
 
 - `shutdown` / `prepare_restart` 先由 daemon IPC 接受；只有已接受退出请求后，CLI 的 `--force` 才能在超时后终止再次确认归属的 PID；
@@ -275,6 +288,27 @@ Gateway 写控制遵循 fail-closed：
 Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。影响 route/owner 的 Workspace 配置保存会触发 Gateway reload；失败时桌面端恢复旧 Workspace/settings 并再次对齐旧运行态。活动 route 在 Gateway daemon 停止前不能删除或注销。
 
 GUI Gateway 页面直接使用 `routeWorkspaceIds` 展示活动路由，不再逐个轮询 Workspace runtime。桌面 AppState 在每次数据操作前重新加载磁盘配置，避免覆盖 Gateway daemon 在后台写入的 observed public URL。
+
+Gateway 设置页已改为 event-first：活动 daemon 通过 Gateway `events` 唤醒状态与有界日志刷新；只有 endpoint 明确 unavailable 时才以 2 秒间隔读取 configured/stopped 状态并重新探测 event endpoint。协议或远端错误会显示显式 fault，不会静默降级到轮询。
+
+## 跨控制域只读聚合
+
+Workspace daemon 与 Gateway daemon 仍保持独立运行权威。共享 `ControlPlaneStatus` / `ControlPlaneEventBatch` 只在客户端库层并发组合各控制域的只读 IPC 结果，不把 Gateway 状态塞回任何 Workspace daemon。
+
+CLI 提供显式聚合入口：
+
+```bash
+anchor status --control-plane
+anchor status --control-plane --watch
+anchor events --control-plane
+anchor events --control-plane --follow --wait 15
+```
+
+聚合状态为每个 Workspace 返回原始 `WorkspaceControlStatus` 加 canonical `mcpState/actionsState`。当某 Workspace 是活动 Gateway route 时，MCP 只有在监听 PID 与 Gateway daemon PID 匹配时才标记为 running；错误 PID 会标记 error，route 已选但端口暂未监听则为 recovering。这样 GUI 不再把 Gateway daemon 持有的 MCP listener 误判为“外部进程”。
+
+聚合事件保留 Gateway cursor 与每个 Workspace cursor，最多返回 64 个按时间合并的事件；aggregate truncation 只推进实际返回事件对应的 source cursor，避免跨源丢事件。每次底层 long-poll slice 最长 1 秒；所有 endpoint 都 unavailable 时仍遵守该 cadence，避免 idle busy-loop。endpoint unavailable 只表示该 source 本轮没有事件；protocol/remote 错误直接终止聚合请求。
+
+桌面全局 layout 使用一次 `get_control_plane_status` 代替原先每个 Workspace 的 MCP/Actions 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
 
 Windows 仍只有 Workspace/Gateway Named Pipe 客户端和地址抽象。服务端与当前用户 ACL 未完成前，GUI 会显示后台 daemon 不受支持，写操作直接失败，不会落回进程内 Runtime/Gateway。
 
@@ -307,6 +341,10 @@ anchor --json reload PROFILE_ID --service mcp
 anchor --json doctor PROFILE_ID
 anchor --json gateway status
 anchor --json gateway start PROFILE_A PROFILE_B
+anchor --json gateway logs
+anchor --json gateway events
+anchor --json status --control-plane
+anchor --json events --control-plane
 ```
 
 失败时返回非零退出码，并输出：

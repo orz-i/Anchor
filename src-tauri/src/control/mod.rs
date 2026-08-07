@@ -1,3 +1,4 @@
+mod aggregate;
 mod events;
 mod ipc;
 mod lifecycle;
@@ -12,6 +13,11 @@ use crate::platform::platform;
 use crate::tunnel::TunnelStatus;
 use crate::workspace::{McpActivityDto, WorkspaceProfile};
 
+pub use aggregate::{
+    control_plane_events, control_plane_status, workspace_service_state, ControlPlaneEvent,
+    ControlPlaneEventBatch, ControlPlaneEventCursor, ControlPlaneEventSource, ControlPlaneStatus,
+    ControlPlaneWorkspaceStatus,
+};
 pub(crate) use events::{publish_workspace_event, reset_workspace_event_stream};
 pub use ipc::{
     control_channel, endpoint, ping as ipc_ping, request_daemon_exit, request_events, request_logs,

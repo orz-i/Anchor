@@ -16,14 +16,19 @@ use crate::mcp::gateway;
 use crate::settings::McpGatewayConfig;
 
 #[cfg(any(unix, test))]
+use super::events::read_gateway_events;
+use super::events::{MAX_GATEWAY_EVENT_BATCH, MAX_GATEWAY_EVENT_WAIT_MS};
+use super::logs::read_gateway_log;
+#[cfg(any(unix, test))]
 use super::protocol::{
     validate_protocol_version, ERROR_CONFIG_SCOPE_MISMATCH, ERROR_CONTROL_COMMAND_UNAVAILABLE,
-    ERROR_OPERATION_NOT_FOUND,
+    ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND,
 };
 use super::protocol::{
     GatewayAsyncOperation, GatewayAsyncState, GatewayControlError, GatewayControlStatus,
-    GatewayMethod, GatewayOperation, GatewayRequest, GatewayResponse, GatewayResult,
-    ERROR_OPERATION_FAILED, GATEWAY_CONTROL_PROTOCOL_VERSION, MAX_GATEWAY_CONTROL_FRAME_BYTES,
+    GatewayEventBatch, GatewayEventCursor, GatewayLogChunk, GatewayLogCursor, GatewayMethod,
+    GatewayOperation, GatewayRequest, GatewayResponse, GatewayResult, ERROR_OPERATION_FAILED,
+    GATEWAY_CONTROL_PROTOCOL_VERSION, MAX_GATEWAY_CONTROL_FRAME_BYTES,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
@@ -85,6 +90,61 @@ async fn wait_for_operation(
             });
         }
         tokio::time::sleep(OPERATION_POLL_INTERVAL).await;
+    }
+}
+
+pub async fn request_logs(
+    tail_lines: u32,
+    cursor: Option<GatewayLogCursor>,
+) -> Result<GatewayLogChunk, GatewayControlClientError> {
+    match request(GatewayMethod::Logs { tail_lines, cursor }).await? {
+        GatewayResult::Logs { chunk } => Ok(chunk),
+        other => Err(GatewayControlClientError::Protocol(format!(
+            "Gateway daemon returned unexpected logs result: {other:?}"
+        ))),
+    }
+}
+
+pub async fn logs_via_daemon_or_local(
+    tail_lines: u32,
+    cursor: Option<GatewayLogCursor>,
+) -> AppResult<GatewayLogChunk> {
+    match request_logs(tail_lines, cursor.clone()).await {
+        Ok(chunk) => Ok(chunk),
+        Err(error) if error.is_unavailable() => {
+            let inspection = gateway_daemon::inspect()?;
+            if inspection.running {
+                return Err(AppError::Message(format!(
+                    "Gateway daemon 正在运行但日志控制端点不可用：{error}；不会回退到直接读取正在写入的日志文件"
+                )));
+            }
+            read_gateway_log(tail_lines, cursor.as_ref())
+        }
+        Err(error) => Err(AppError::Message(error.to_string())),
+    }
+}
+
+pub async fn request_events(
+    cursor: Option<GatewayEventCursor>,
+    limit: u32,
+    wait_ms: u32,
+) -> Result<GatewayEventBatch, GatewayControlClientError> {
+    let wait_ms = wait_ms.min(MAX_GATEWAY_EVENT_WAIT_MS);
+    let timeout = Duration::from_millis(u64::from(wait_ms).saturating_add(1_000));
+    match request_with_timeout(
+        GatewayMethod::Events {
+            cursor,
+            limit: limit.clamp(1, MAX_GATEWAY_EVENT_BATCH),
+            wait_ms,
+        },
+        timeout,
+    )
+    .await?
+    {
+        GatewayResult::Events { batch } => Ok(batch),
+        other => Err(GatewayControlClientError::Protocol(format!(
+            "Gateway daemon returned unexpected events result: {other:?}"
+        ))),
     }
 }
 
@@ -431,6 +491,13 @@ async fn daemon_status() -> AppResult<GatewayControlStatus> {
 }
 
 async fn request(method: GatewayMethod) -> Result<GatewayResult, GatewayControlClientError> {
+    request_with_timeout(method, REQUEST_TIMEOUT).await
+}
+
+async fn request_with_timeout(
+    method: GatewayMethod,
+    timeout: Duration,
+) -> Result<GatewayResult, GatewayControlClientError> {
     let config_scope = gateway_daemon::config_scope().map_err(|error| {
         GatewayControlClientError::Protocol(format!("cannot resolve Gateway config scope: {error}"))
     })?;
@@ -441,14 +508,13 @@ async fn request(method: GatewayMethod) -> Result<GatewayResult, GatewayControlC
     })?;
     let request = GatewayRequest::new(config_scope, method);
     let request_id = request.request_id.clone();
-    let response =
-        tokio::time::timeout(REQUEST_TIMEOUT, exchange_with_endpoint(&endpoint, &request))
-            .await
-            .map_err(|_| {
-                GatewayControlClientError::Unavailable(format!(
-                    "Gateway control endpoint timed out: {endpoint:?}"
-                ))
-            })??;
+    let response = tokio::time::timeout(timeout, exchange_with_endpoint(&endpoint, &request))
+        .await
+        .map_err(|_| {
+            GatewayControlClientError::Unavailable(format!(
+                "Gateway control endpoint timed out: {endpoint:?}"
+            ))
+        })??;
     if response.protocol_version != GATEWAY_CONTROL_PROTOCOL_VERSION {
         return Err(GatewayControlClientError::Protocol(format!(
             "Gateway daemon responded with protocol version {}; client supports {}",
@@ -784,6 +850,30 @@ async fn handle_request(request: GatewayRequest, command_available: bool) -> Han
                 error.to_string(),
             )),
         },
+        GatewayMethod::Logs { tail_lines, cursor } => {
+            match read_gateway_log(tail_lines, cursor.as_ref()) {
+                Ok(chunk) => handled(GatewayResponse::success(
+                    request_id,
+                    GatewayResult::Logs { chunk },
+                )),
+                Err(error) => handled(GatewayResponse::error(
+                    request_id,
+                    ERROR_LOG_READ_FAILED,
+                    error.to_string(),
+                )),
+            }
+        }
+        GatewayMethod::Events {
+            cursor,
+            limit,
+            wait_ms,
+        } => {
+            let batch = read_gateway_events(&expected_scope, cursor.as_ref(), limit, wait_ms).await;
+            handled(GatewayResponse::success(
+                request_id,
+                GatewayResult::Events { batch },
+            ))
+        }
         GatewayMethod::Shutdown => {
             lifecycle_request(request_id, GatewayOperation::Shutdown, command_available)
         }
@@ -1052,6 +1142,71 @@ mod tests {
                 assert_eq!(*next, config);
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn events_request_is_read_only_and_resumable_through_v1_handler() {
+        let scope = gateway_daemon::config_scope().expect("scope");
+        super::super::events::reset_gateway_event_stream(&scope);
+        super::super::events::publish_gateway_event(
+            &scope,
+            super::super::protocol::GatewayEventKind::DaemonReady,
+            "running",
+            "ready",
+        );
+        let first = handle_request(
+            GatewayRequest {
+                protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+                request_id: "events-first".into(),
+                config_scope: scope.clone(),
+                method: GatewayMethod::Events {
+                    cursor: None,
+                    limit: 8,
+                    wait_ms: 0,
+                },
+            },
+            false,
+        )
+        .await;
+        assert!(first.command.is_none());
+        let first_batch = match first.response.result.expect("events result") {
+            GatewayResult::Events { batch } => batch,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(first_batch.events.len(), 1);
+
+        super::super::events::publish_gateway_event(
+            &scope,
+            super::super::protocol::GatewayEventKind::TunnelState,
+            "recovering",
+            "retry",
+        );
+        let resumed = handle_request(
+            GatewayRequest {
+                protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+                request_id: "events-resumed".into(),
+                config_scope: scope,
+                method: GatewayMethod::Events {
+                    cursor: Some(first_batch.next_cursor),
+                    limit: 8,
+                    wait_ms: 0,
+                },
+            },
+            false,
+        )
+        .await;
+        assert!(resumed.command.is_none());
+        match resumed.response.result.expect("resumed events") {
+            GatewayResult::Events { batch } => {
+                assert_eq!(batch.events.len(), 1);
+                assert_eq!(
+                    batch.events[0].kind,
+                    super::super::protocol::GatewayEventKind::TunnelState
+                );
+                assert_eq!(batch.events[0].sequence, 2);
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 }

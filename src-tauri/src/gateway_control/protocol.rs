@@ -8,6 +8,7 @@ pub const MAX_GATEWAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
 pub const ERROR_CONFIG_SCOPE_MISMATCH: &str = "config_scope_mismatch";
 pub const ERROR_CONTROL_COMMAND_UNAVAILABLE: &str = "control_command_unavailable";
+pub const ERROR_LOG_READ_FAILED: &str = "log_read_failed";
 pub const ERROR_OPERATION_FAILED: &str = "operation_failed";
 pub const ERROR_OPERATION_NOT_FOUND: &str = "operation_not_found";
 
@@ -38,6 +39,19 @@ pub enum GatewayMethod {
     Ping,
     Version,
     Status,
+    Logs {
+        #[serde(rename = "tailLines")]
+        tail_lines: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor: Option<GatewayLogCursor>,
+    },
+    Events {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor: Option<GatewayEventCursor>,
+        limit: u32,
+        #[serde(rename = "waitMs")]
+        wait_ms: u32,
+    },
     Shutdown,
     PrepareRestart,
     Reload,
@@ -101,6 +115,60 @@ pub struct GatewayControlStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GatewayLogCursor {
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayLogChunk {
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    pub next_offset: u64,
+    pub exists: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayEventKind {
+    DaemonReady,
+    DaemonStopping,
+    GatewayState,
+    RouteState,
+    TunnelState,
+    Reload,
+    ConfigApplied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayEventCursor {
+    pub stream_id: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayEvent {
+    pub sequence: u64,
+    pub emitted_at_unix_ms: u64,
+    pub kind: GatewayEventKind,
+    pub state: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayEventBatch {
+    pub events: Vec<GatewayEvent>,
+    pub next_cursor: GatewayEventCursor,
+    pub reset: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GatewayResponse {
     pub protocol_version: u16,
     pub request_id: String,
@@ -148,6 +216,12 @@ pub enum GatewayResult {
     },
     Status {
         status: Box<GatewayControlStatus>,
+    },
+    Logs {
+        chunk: GatewayLogChunk,
+    },
+    Events {
+        batch: GatewayEventBatch,
     },
     Accepted {
         operation: GatewayOperation,
@@ -234,5 +308,44 @@ mod tests {
         assert_eq!(value["configScope"], "scope-1");
         assert_eq!(value["config"]["enabled"], true);
         assert_eq!(value["config"]["localPort"], 31_234);
+    }
+
+    #[test]
+    fn logs_and_events_are_additive_v1_method_tags() {
+        let logs = GatewayRequest {
+            protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+            request_id: "request-logs".into(),
+            config_scope: "scope-1".into(),
+            method: GatewayMethod::Logs {
+                tail_lines: 100,
+                cursor: Some(GatewayLogCursor { offset: 42 }),
+            },
+        };
+        let logs_value = serde_json::to_value(logs).expect("serialize logs request");
+        assert_eq!(logs_value["protocolVersion"], 1);
+        assert_eq!(logs_value["method"], "logs");
+        assert_eq!(logs_value["tailLines"], 100);
+        assert_eq!(logs_value["cursor"]["offset"], 42);
+
+        let events = GatewayRequest {
+            protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+            request_id: "request-events".into(),
+            config_scope: "scope-1".into(),
+            method: GatewayMethod::Events {
+                cursor: Some(GatewayEventCursor {
+                    stream_id: "stream-1".into(),
+                    sequence: 7,
+                }),
+                limit: 16,
+                wait_ms: 5_000,
+            },
+        };
+        let events_value = serde_json::to_value(events).expect("serialize events request");
+        assert_eq!(events_value["protocolVersion"], 1);
+        assert_eq!(events_value["method"], "events");
+        assert_eq!(events_value["cursor"]["streamId"], "stream-1");
+        assert_eq!(events_value["cursor"]["sequence"], 7);
+        assert_eq!(events_value["limit"], 16);
+        assert_eq!(events_value["waitMs"], 5_000);
     }
 }

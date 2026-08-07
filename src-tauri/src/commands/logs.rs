@@ -7,6 +7,7 @@ use crate::app_state::AppState;
 use crate::control::{self, ControlLogChunk, ControlLogSelection};
 use crate::daemon;
 use crate::error::{AppError, AppResult};
+use crate::gateway_control::{self, GatewayLogChunk};
 use crate::workspace::WorkspaceProfile;
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +69,11 @@ pub async fn read_workspace_logs(
         control::read_log_batch(&profile, selection, 5_000, &[])?
     };
     Ok(gui_log_chunks(chunks))
+}
+
+#[tauri::command]
+pub async fn read_gateway_logs(lines: u32) -> AppResult<GatewayLogChunk> {
+    gateway_control::logs_via_daemon_or_local(lines.clamp(1, 5_000), None).await
 }
 
 #[cfg(test)]
