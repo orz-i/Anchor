@@ -2,9 +2,10 @@
 
 ## 目标
 
-Anchor 的长期运行架构调整为：
+Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 
-- `anchor daemon` 是运行时、隧道、Gateway、日志和健康状态的唯一权威；
+- 每个 Workspace daemon 是该 Workspace listener、Tunnel、日志、事件和健康状态的唯一权威；
+- 每个用户配置域最多一个独立 Gateway daemon，负责跨 Workspace Gateway listener、route 集合和唯一公网 Gateway tunnel；
 - `anchor` CLI 是完整、可脚本化的运维与配置客户端；
 - GUI 只负责配置编辑、状态展示和操作确认，不再自行持有业务运行时；
 - CLI 与 GUI 使用同一组版本化控制面模型和命令语义。
@@ -23,9 +24,9 @@ Anchor 的长期运行架构调整为：
 主要架构缺口：
 
 1. daemon 原先位于 CLI 私有模块，桌面端无法复用其状态模型；
-2. GUI 仍直接编排 listener、tunnel 和 Gateway，形成第二个运行权威；
+2. GUI 历史上直接编排 listener、tunnel 和 Gateway，形成第二个运行权威；主路径现已迁移到对应 daemon 控制客户端；
 3. CLI、GUI 分别组装部分状态，存在语义漂移风险；
-4. 后台 daemon 仅支持 Linux，且没有版本化本地控制协议；
+4. 后台 daemon 服务端目前仍仅支持 Linux；Workspace 和 Gateway 均已有独立版本化本地控制协议，Windows 服务端/ACL 尚未落地；
 5. 配置写入、运行应用和进程监督尚未形成清晰的单写者边界。
 
 ## 目标分层
@@ -42,9 +43,9 @@ Anchor 的长期运行架构调整为：
 └──────────────────────┬───────────────────────┘
                        │ 版本化本地 IPC
 ┌──────────────────────▼───────────────────────┐
-│ Anchor Daemon                                │
-│ 配置应用、Runtime、Gateway、Tunnel、日志     │
-│ 健康检查、恢复、事件流、单写者协调           │
+│ Runtime Control Domains                      │
+│ Workspace daemons + global Gateway daemon    │
+│ 配置应用、Runtime、Tunnel、Gateway、事件     │
 └──────────────────────┬───────────────────────┘
                        │ Shared Application Core
 ┌──────────────────────▼───────────────────────┐
@@ -54,7 +55,7 @@ Anchor 的长期运行架构调整为：
 
 ## 不变量
 
-1. **单一运行权威**：同一用户配置域内只能有一个 daemon 负责运行状态。
+1. **按控制域单一运行权威**：每个 Workspace 只有一个 Workspace daemon；每个用户配置域只有一个独立 Gateway daemon。两者不能互相接管运行资源。
 2. **共享语义**：CLI、GUI 不自行推导 daemon、端口或隧道状态。
 3. **版本化协议**：请求、响应、事件和错误码都带协议版本，并支持兼容性检查。
 4. **本地安全边界**：控制接口默认只绑定本地 IPC，使用当前用户权限和受保护凭据。
@@ -102,6 +103,16 @@ Anchor 的长期运行架构调整为：
 - `reload` 复用异步 operation 模型，运行中的目标服务只重建该 listener，Workspace daemon、另一 listener 和 Tunnel ownership 保持不变；新 listener 启动失败时尝试恢复旧 listener；
 - CLI 新增 `anchor events <workspace> [-f]` 与 `anchor reload <workspace> --service ...`，为脚本提供原生事件消费和非整进程配置应用入口。
 
+独立 Gateway 控制域现已具备后台 daemon 基础：
+
+- Gateway control protocol 独立版本为 `1`，与 Workspace protocol v4 分离；每个请求携带 `configScope`，拒绝连接到其他配置域的 daemon；
+- Linux 使用全局 `gateway.lock`、`gateway.pid`、`gateway.json`、`gateway.sock`；状态保存 PID、配置域、所选 route Workspace IDs、Gateway 本地端口和版本；
+- `anchor gateway status/start/stop/restart/reload` 使用专用 Gateway control client；`gateway serve` 继续保留为前台调试/外部 supervisor 入口；
+- `shutdown`、`prepare_restart`、`reload` 和运行中配置应用都禁止本地运行时回退；`reload`/`apply_config` 使用 accepted → operation status 异步模型；
+- 运行中配置修改由 Gateway daemon 先切换运行态、更新 daemon state，再持久化；失败会停止新运行态并尝试恢复旧 listener/routes/tunnel；禁用配置采用 daemon shutdown → 确认退出 → 持久化 disabled；
+- Gateway route/owner 对应的 Workspace 配置保存会触发 Gateway daemon reload；reload 失败时 GUI 恢复旧 Workspace/settings 并重新对齐旧运行态；活动 route Workspace 在 daemon 停止前禁止删除/注销；
+- GUI Gateway 状态和 route 列表直接来自 Gateway daemon 状态，不再逐 Workspace 轮询来猜测 route；桌面配置缓存每次操作前从磁盘刷新，避免覆盖 daemon 的异步 observation 写入。
+
 GUI 工作区控制迁移现状：
 
 - Workspace 的 MCP/Actions 状态、启动、停止和重启已改为 daemon 控制客户端；GUI 不再为这些命令创建进程内 `RuntimeSupervisor` listener；
@@ -112,10 +123,10 @@ GUI 工作区控制迁移现状：
 - Workspace 页面已从固定 5 秒双 runtime 轮询迁移为 daemon event-first 长轮询；只有 endpoint unavailable 才进入 polling fallback，协议/远端错误不会静默降级，fallback 会继续探测并自动恢复事件模式；
 - MCP/Actions 配置保存和密钥应用在服务已运行时改用单服务 daemon reload，不再默认重启整个 Workspace daemon；
 - GUI 进程内 `RuntimeSupervisor` / Tunnel Supervisor 仅保留给旧会话和旧 Gateway 兼容运行态；主 Workspace/Tunnel 控制失败时不得进入该兼容路径；
-- Gateway 已明确为独立全局控制域。GUI `set_mcp_gateway` 只校验并持久化配置，不再创建共享 listener 或 Gateway tunnel；实际运行使用 `anchor gateway serve <workspace ...>`，后续再升级为专用 Gateway service/daemon；
-- 若旧桌面进程仍持有兼容 Gateway listener，GUI 拒绝热改 Gateway 配置，防止已运行 listener 与持久配置分叉；daemon 管理的 MCP 运行期间也禁止启用 Gateway 配置，避免形成两个运行权威。
+- Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
+- 若旧桌面进程仍持有兼容 Gateway listener，GUI 仍拒绝热改 Gateway 配置，防止旧进程与新 daemon 控制域同时成为运行权威。
 
-尚未完成：把更多 CLI watch/全局状态聚合切到事件驱动、无需 listener 重建的真正字段级 hot reload、专用 Gateway service/daemon 与其状态 IPC、Windows Named Pipe 服务端，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
+尚未完成：把更多 CLI watch/全局状态聚合切到事件驱动、无需 listener 重建的真正字段级 hot reload、Gateway 事件/日志流、Windows Named Pipe 服务端与当前用户 ACL、系统服务安装入口，以及最终删除 GUI 兼容 `RuntimeSupervisor`。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -135,7 +146,7 @@ GUI 工作区控制迁移现状：
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
 
-当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出并成为独立控制域。下一步继续推进专用 Gateway service、字段级 hot reload、跨 Workspace 事件聚合和最终兼容 RuntimeSupervisor 删除。
+当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费和单服务 reload；Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply 控制面。下一步继续推进 Gateway 事件/日志、字段级 hot reload、跨控制域状态聚合、系统服务安装和最终兼容 RuntimeSupervisor 删除。
 
 ### 阶段 4：运行与升级治理
 

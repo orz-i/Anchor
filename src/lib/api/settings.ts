@@ -64,12 +64,17 @@ export interface McpGatewayConfigDto {
 }
 
 export interface McpGatewayStatusDto {
+  daemonSupported: boolean;
+  running: boolean;
+  pid?: number;
   state: "stopped" | "configured" | "running" | "error";
   localEndpoint: string;
   publicBaseUrl: string;
   routeCount: number;
+  routeWorkspaceIds: string[];
   ownerWorkspaceId: string;
   error: string;
+  detail: string;
 }
 
 export async function getMcpGateway(): Promise<McpGatewayConfigDto> {

@@ -56,6 +56,15 @@ anchor stop PROFILE_ID
 
 # 检查环境、端口、状态和隧道依赖
 anchor doctor PROFILE_ID
+
+# 启动独立全局 Gateway daemon
+anchor gateway start PROFILE_A PROFILE_B
+
+# 查看 / reload / 重启 / 停止 Gateway daemon
+anchor gateway status
+anchor gateway reload
+anchor gateway restart
+anchor gateway stop
 ```
 
 ## 命令语义
@@ -228,9 +237,46 @@ GUI Workspace 控制使用同一生命周期客户端：
 - 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，GUI 优先使用该值；
 - Workspace 页面状态刷新优先使用 daemon `events` 长轮询，只有控制端点明确不存在时才回退到旧状态轮询；protocol/remote 错误会进入显式 fault 状态，不静默降级；fallback polling 会周期性重新探测事件端点，因此外部 CLI 启动 daemon 后可自动恢复 event-first 模式；
 - 普通 MCP/Actions 配置应用和密钥应用在目标服务已经运行时使用单服务 daemon reload，不再为了一个 listener 的配置变化重启整个 Workspace daemon；
-- Gateway 不归属于任何 Workspace daemon。GUI 只保存 Gateway 配置；共享 Gateway listener/tunnel 的运行目前由独立 `anchor gateway serve <workspace ...>` 控制域负责。若旧桌面进程仍持有兼容 Gateway listener，则配置热改会 fail-closed，避免 listener 与配置分叉。
+- Gateway 不归属于任何 Workspace daemon。GUI 使用独立 Gateway control client 获取状态并应用配置；共享 Gateway listener/tunnel 由独立全局 Gateway daemon 持有。若旧桌面进程仍持有兼容 Gateway listener，则配置热改继续 fail-closed，避免两个控制域同时拥有运行态。
 
-Windows 仍只有 Named Pipe 客户端和地址抽象。服务端与当前用户 ACL 未完成前，GUI 会显示 daemon 不受支持，写操作直接失败，不会落回进程内 Runtime。
+## 独立 Gateway daemon
+
+Gateway 是用户配置域级别的独立控制域，不绑定到任何单一 Workspace daemon。后台入口：
+
+```bash
+anchor gateway status
+anchor gateway start <workspace> [workspace ...] [--wait SECONDS]
+anchor gateway reload
+anchor gateway restart [--timeout SECONDS] [--force]
+anchor gateway stop [--timeout SECONDS] [--force]
+```
+
+`anchor gateway serve <workspace ...>` 仍保留为前台调试、容器或外部 supervisor 入口；内置后台 daemon 与前台 serve 不应同时拥有同一 Gateway 端口。
+
+Gateway daemon 使用独立协议 v1，不复用 Workspace daemon protocol v4。每个请求都包含 `protocolVersion`、`requestId` 和 `configScope`；scope 根据当前应用配置目录派生，用于拒绝错误配置域的 PID/socket。Linux 运行文件位于与 Workspace daemon 相同的私有 runtime 根目录，但使用全局名称：
+
+```text
+gateway.lock
+gateway.pid
+gateway.json
+gateway.sock
+```
+
+状态文件记录 daemon PID、配置域、route Workspace IDs、Gateway 本地端口和版本。Unix socket 父目录保持 `0700`、socket 为 `0600`。readiness 同时要求 Gateway 本地端口属于目标 PID 且 control `ping` 成功。
+
+Gateway 写控制遵循 fail-closed：
+
+- `shutdown` / `prepare_restart` 先由 daemon IPC 接受；只有已接受退出请求后，CLI 的 `--force` 才能在超时后终止再次确认归属的 PID；
+- `reload` 保留当前 route IDs，重新读取持久化 Gateway/Workspace 配置并在 daemon 内重建运行态；失败时尝试恢复旧 listener/routes/tunnel；
+- 运行中 `gateway configure` / GUI `set_mcp_gateway` 使用 `apply_config`：daemon 先应用新运行态并更新 state，成功后才持久化配置；中间失败会停止新运行态并恢复旧运行态；
+- 禁用运行中的 Gateway 不使用 `apply_config`，而是先优雅 shutdown，确认退出后再持久化 disabled；
+- endpoint 不可用、协议不兼容、scope/PID 不匹配时所有写请求直接失败，不会回退为 CLI/GUI 进程内 Gateway 或 Tunnel Supervisor。
+
+Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。影响 route/owner 的 Workspace 配置保存会触发 Gateway reload；失败时桌面端恢复旧 Workspace/settings 并再次对齐旧运行态。活动 route 在 Gateway daemon 停止前不能删除或注销。
+
+GUI Gateway 页面直接使用 `routeWorkspaceIds` 展示活动路由，不再逐个轮询 Workspace runtime。桌面 AppState 在每次数据操作前重新加载磁盘配置，避免覆盖 Gateway daemon 在后台写入的 observed public URL。
+
+Windows 仍只有 Workspace/Gateway Named Pipe 客户端和地址抽象。服务端与当前用户 ACL 未完成前，GUI 会显示后台 daemon 不受支持，写操作直接失败，不会落回进程内 Runtime/Gateway。
 
 ## 与 systemd 的关系
 
@@ -259,6 +305,8 @@ anchor --json logs PROFILE_ID --service daemon
 anchor --json events PROFILE_ID
 anchor --json reload PROFILE_ID --service mcp
 anchor --json doctor PROFILE_ID
+anchor --json gateway status
+anchor --json gateway start PROFILE_A PROFILE_B
 ```
 
 失败时返回非零退出码，并输出：
@@ -269,11 +317,12 @@ anchor --json doctor PROFILE_ID
 
 ## 安全边界
 
-- Daemon 目前仅支持 Linux；Windows/macOS 使用 `serve` 或 GUI；
+- Workspace/Gateway 后台 daemon 目前仅支持 Linux；Windows/macOS 可使用前台 `serve`，GUI 不会伪装后台 daemon 可用；
 - PID 所有权校验失败时拒绝发送信号；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
 - 端口被 GUI 或外部进程占用时拒绝启动；
 - `daemon-run` 是内部命令，不应直接调用；
+- `gateway-daemon-run` 是内部命令，不应直接调用；
 - 状态文件不是远程控制接口，不监听公网端口。
 
 ## 当前验证边界
@@ -286,4 +335,10 @@ anchor status PROFILE_ID
 anchor logs PROFILE_ID --follow
 anchor restart PROFILE_ID
 anchor stop PROFILE_ID
+
+anchor gateway start PROFILE_A PROFILE_B
+anchor gateway status
+anchor gateway reload
+anchor gateway restart
+anchor gateway stop
 ```

@@ -13,6 +13,8 @@ use crate::control::{self, WorkspaceControlStatus};
 use crate::daemon;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
+use crate::gateway_control::{self, GatewayOperation};
+use crate::gateway_daemon;
 use crate::logging::{profile_log_files, ProfileLogService};
 use crate::mcp::gateway;
 use crate::platform::platform;
@@ -26,14 +28,341 @@ use crate::tunnel::{
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{
-    CliArgs, Command, EventsOptions, GatewayCommand, GatewayConfigureOptions, LogSelection,
-    LogsOptions, ReloadOptions, RunOptions, ServiceSelection, StatusOptions, StopOptions,
+    CliArgs, Command, EventsOptions, GatewayCommand, GatewayConfigureOptions, GatewayStartOptions,
+    GatewayStopOptions, LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceSelection,
+    StatusOptions, StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct CliTunnelRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayRuntimeSnapshot {
+    config: McpGatewayConfig,
+    profiles: Vec<WorkspaceProfile>,
+    selected: Vec<WorkspaceProfile>,
+}
+
+async fn apply_gateway_config(
+    runtime: &mut RuntimeSupervisor,
+    started: &mut Vec<WorkspaceProfile>,
+    selected: &mut Vec<WorkspaceProfile>,
+    config: &mut McpGatewayConfig,
+    all_profiles: &mut Vec<WorkspaceProfile>,
+    mut next_config: McpGatewayConfig,
+) -> AppResult<()> {
+    if !next_config.enabled {
+        return Err(AppError::Message(
+            "运行中的 Gateway 不能通过 apply_config 禁用；请先执行 shutdown".into(),
+        ));
+    }
+    let previous = GatewayRuntimeSnapshot {
+        config: config.clone(),
+        profiles: all_profiles.clone(),
+        selected: selected.clone(),
+    };
+    let selected_ids = selected
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+
+    let latest_store = DataStore::load()?;
+    let latest_profiles = latest_store.list().to_vec();
+    drop(latest_store);
+    gateway::validate_config(&next_config, &latest_profiles)?;
+    let mut next_selected = Vec::new();
+    for workspace_id in &selected_ids {
+        let profile = resolve_workspace(&latest_profiles, workspace_id)?.clone();
+        ensure_workspace_directory(&profile)?;
+        next_selected.push(profile);
+    }
+
+    shutdown_gateway_services(runtime, started, config, all_profiles).await?;
+    started.clear();
+    match start_gateway_services(runtime, &next_selected, &mut next_config, &latest_profiles).await
+    {
+        Ok(next_started) => {
+            *started = next_started;
+            *selected = next_selected;
+            *config = next_config;
+            *all_profiles = latest_profiles;
+
+            if let Err(state_error) = gateway_daemon::update_state(&selected_ids, config.local_port)
+            {
+                let cleanup =
+                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                if let Err(cleanup_error) = cleanup {
+                    return Err(AppError::Message(format!(
+                        "Gateway 新运行态已建立但 daemon state 更新失败：{state_error}；清理新运行态也失败：{cleanup_error}"
+                    )));
+                }
+                started.clear();
+                return match restore_gateway_runtime(
+                    runtime,
+                    started,
+                    selected,
+                    config,
+                    all_profiles,
+                    previous.clone(),
+                    &selected_ids,
+                )
+                .await
+                {
+                    Ok(()) => Err(AppError::Message(format!(
+                        "Gateway daemon state 更新失败，已恢复旧运行态：{state_error}"
+                    ))),
+                    Err(rollback_error) => Err(AppError::Message(format!(
+                        "Gateway daemon state 更新失败：{state_error}；恢复旧运行态也失败：{rollback_error}"
+                    ))),
+                };
+            }
+
+            if let Err(persist_error) = gateway_control::persist_config(config) {
+                let cleanup =
+                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                if let Err(cleanup_error) = cleanup {
+                    return Err(AppError::Message(format!(
+                        "Gateway 新运行态已建立但持久化失败：{persist_error}；清理新运行态也失败：{cleanup_error}"
+                    )));
+                }
+                started.clear();
+                return match restore_gateway_runtime(
+                    runtime,
+                    started,
+                    selected,
+                    config,
+                    all_profiles,
+                    previous,
+                    &selected_ids,
+                )
+                .await
+                {
+                    Ok(()) => Err(AppError::Message(format!(
+                        "Gateway 配置持久化失败，已恢复旧运行态：{persist_error}"
+                    ))),
+                    Err(rollback_error) => Err(AppError::Message(format!(
+                        "Gateway 配置持久化失败：{persist_error}；恢复旧运行态也失败：{rollback_error}"
+                    ))),
+                };
+            }
+            Ok(())
+        }
+        Err(error) => {
+            match restore_gateway_runtime(
+                runtime,
+                started,
+                selected,
+                config,
+                all_profiles,
+                previous,
+                &selected_ids,
+            )
+            .await
+            {
+                Ok(()) => Err(AppError::Message(format!(
+                    "Gateway 配置应用失败，已恢复旧运行态：{error}"
+                ))),
+                Err(rollback_error) => Err(AppError::Message(format!(
+                    "Gateway 配置应用失败：{error}；恢复旧运行态也失败：{rollback_error}"
+                ))),
+            }
+        }
+    }
+}
+
+async fn restore_gateway_runtime(
+    runtime: &mut RuntimeSupervisor,
+    started: &mut Vec<WorkspaceProfile>,
+    selected: &mut Vec<WorkspaceProfile>,
+    config: &mut McpGatewayConfig,
+    all_profiles: &mut Vec<WorkspaceProfile>,
+    previous: GatewayRuntimeSnapshot,
+    selected_ids: &[String],
+) -> AppResult<()> {
+    let mut rollback_config = previous.config;
+    let previous_started = start_gateway_services(
+        runtime,
+        &previous.selected,
+        &mut rollback_config,
+        &previous.profiles,
+    )
+    .await?;
+    *started = previous_started;
+    *selected = previous.selected;
+    *config = rollback_config;
+    *all_profiles = previous.profiles;
+    gateway_daemon::update_state(selected_ids, config.local_port)
+}
+
+async fn start_gateway_services(
+    runtime: &mut RuntimeSupervisor,
+    selected: &[WorkspaceProfile],
+    config: &mut McpGatewayConfig,
+    all_profiles: &[WorkspaceProfile],
+) -> AppResult<Vec<WorkspaceProfile>> {
+    ensure_gateway_ports_available(config, selected)?;
+    let mut started = Vec::new();
+    let startup = async {
+        for profile in selected {
+            ensure_running(runtime.start_mcp(profile)?, "MCP")?;
+            started.push(profile.clone());
+        }
+        let active = runtime.active_mcp_workspace_ids();
+        gateway::ensure(config, all_profiles, &active).await?;
+        if let Some(url) = reconcile_mcp_gateway(config, all_profiles, &active).await? {
+            persist_cli_gateway_observation(config, all_profiles, &url)?;
+        }
+        Ok::<(), AppError>(())
+    }
+    .await;
+    if let Err(error) = startup {
+        let cleanup = shutdown_gateway_services(runtime, &started, config, all_profiles).await;
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(AppError::Message(format!(
+                "Gateway 启动失败：{error}；清理已启动服务也失败：{cleanup_error}"
+            ))),
+        };
+    }
+    Ok(started)
+}
+
+async fn apply_gateway_reload(
+    runtime: &mut RuntimeSupervisor,
+    started: &mut Vec<WorkspaceProfile>,
+    selected: &mut Vec<WorkspaceProfile>,
+    config: &mut McpGatewayConfig,
+    all_profiles: &mut Vec<WorkspaceProfile>,
+) -> AppResult<()> {
+    let previous = GatewayRuntimeSnapshot {
+        config: config.clone(),
+        profiles: all_profiles.clone(),
+        selected: selected.clone(),
+    };
+    let selected_ids = selected
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+
+    let store = DataStore::load()?;
+    let latest_profiles = store.list().to_vec();
+    let mut latest_config = store.settings().mcp_gateway;
+    if !latest_config.enabled {
+        return Err(AppError::Message(
+            "Gateway 配置已禁用；请使用 gateway stop 关闭当前 daemon".into(),
+        ));
+    }
+    gateway::validate_config(&latest_config, &latest_profiles)?;
+    let mut latest_selected = Vec::new();
+    for workspace_id in &selected_ids {
+        let profile = resolve_workspace(&latest_profiles, workspace_id)?.clone();
+        ensure_workspace_directory(&profile)?;
+        latest_selected.push(profile);
+    }
+    drop(store);
+
+    shutdown_gateway_services(runtime, started, config, all_profiles).await?;
+    started.clear();
+    match start_gateway_services(
+        runtime,
+        &latest_selected,
+        &mut latest_config,
+        &latest_profiles,
+    )
+    .await
+    {
+        Ok(next_started) => {
+            *started = next_started;
+            *selected = latest_selected;
+            *config = latest_config;
+            *all_profiles = latest_profiles;
+            if let Err(state_error) = gateway_daemon::update_state(&selected_ids, config.local_port)
+            {
+                let cleanup =
+                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                if let Err(cleanup_error) = cleanup {
+                    return Err(AppError::Message(format!(
+                        "Gateway reload 后 daemon state 更新失败：{state_error}；清理新运行态也失败：{cleanup_error}"
+                    )));
+                }
+                started.clear();
+                return match restore_gateway_runtime(
+                    runtime,
+                    started,
+                    selected,
+                    config,
+                    all_profiles,
+                    previous,
+                    &selected_ids,
+                )
+                .await
+                {
+                    Ok(()) => Err(AppError::Message(format!(
+                        "Gateway reload 后 daemon state 更新失败，已恢复旧运行态：{state_error}"
+                    ))),
+                    Err(rollback_error) => Err(AppError::Message(format!(
+                        "Gateway reload 后 daemon state 更新失败：{state_error}；恢复旧运行态也失败：{rollback_error}"
+                    ))),
+                };
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let rollback = restore_gateway_runtime(
+                runtime,
+                started,
+                selected,
+                config,
+                all_profiles,
+                previous,
+                &selected_ids,
+            )
+            .await;
+            match rollback {
+                Ok(()) => Err(AppError::Message(format!(
+                    "Gateway reload 失败，已恢复旧运行态：{error}"
+                ))),
+                Err(rollback_error) => Err(AppError::Message(format!(
+                    "Gateway reload 失败：{error}；恢复旧运行态也失败：{rollback_error}"
+                ))),
+            }
+        }
+    }
+}
+
+async fn run_gateway_daemon(config_scope: &str, workspaces: &[String]) -> AppResult<()> {
+    if config_scope != gateway_daemon::config_scope()? {
+        return Err(AppError::Message(
+            "Gateway daemon child config scope does not match the active config domain".into(),
+        ));
+    }
+    let workspace_ids = resolve_gateway_workspace_ids(workspaces)?;
+    let store = DataStore::load()?;
+    let config = store.settings().mcp_gateway;
+    drop(store);
+    let _guard = gateway_daemon::acquire(&workspace_ids, config.local_port)?;
+    let (sender, receiver) = gateway_control::control_channel();
+    let server = gateway_control::GatewayControlServer::start(sender)?;
+    gateway_daemon::append_log(&format!(
+        "[daemon] started pid={} scope={} endpoint={:?} routes={}",
+        std::process::id(),
+        config_scope,
+        server.endpoint(),
+        workspace_ids.len()
+    ));
+    let result = serve_gateway(&workspace_ids, false, false, Some(receiver)).await;
+    gateway_daemon::append_log(&format!(
+        "[daemon] exiting pid={} result={}",
+        std::process::id(),
+        match &result {
+            Ok(()) => "ok".to_string(),
+            Err(error) => error.to_string(),
+        }
+    ));
+    result
 }
 
 async fn reload_daemon_config(options: ReloadOptions, as_json: bool) -> AppResult<()> {
@@ -183,11 +512,226 @@ fn path_or_parent_writable(path: &Path) -> bool {
 async fn execute_gateway(command: GatewayCommand, as_json: bool) -> AppResult<i32> {
     match command {
         GatewayCommand::Show => show_gateway(as_json).map(|_| 0),
-        GatewayCommand::Configure(options) => configure_gateway(options, as_json).map(|_| 0),
-        GatewayCommand::Serve { workspaces } => {
-            serve_gateway(&workspaces, as_json).await.map(|_| 0)
+        GatewayCommand::Status => show_gateway_status(as_json).await.map(|_| 0),
+        GatewayCommand::Configure(options) => configure_gateway(options, as_json).await.map(|_| 0),
+        GatewayCommand::Serve { workspaces } => serve_gateway(&workspaces, as_json, true, None)
+            .await
+            .map(|_| 0),
+        GatewayCommand::Start(options) => start_gateway_daemon(options, as_json).await.map(|_| 0),
+        GatewayCommand::Stop(options) => stop_gateway_daemon(options, as_json).await.map(|_| 0),
+        GatewayCommand::Restart(options) => {
+            restart_gateway_daemon(options, as_json).await.map(|_| 0)
+        }
+        GatewayCommand::Reload => reload_gateway_daemon(as_json).await.map(|_| 0),
+    }
+}
+
+async fn show_gateway_status(as_json: bool) -> AppResult<()> {
+    let status = gateway_control::status_via_daemon_or_local().await?;
+    if as_json {
+        print_json(&status)?;
+    } else {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    }
+    Ok(())
+}
+
+fn resolve_gateway_workspace_ids(selectors: &[String]) -> AppResult<Vec<String>> {
+    let store = DataStore::load()?;
+    let config = store.settings().mcp_gateway;
+    if !config.enabled {
+        return Err(AppError::Message(
+            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --owner WORKSPACE".into(),
+        ));
+    }
+    gateway::validate_config(&config, store.list())?;
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for selector in selectors {
+        let profile = resolve_workspace(store.list(), selector)?;
+        ensure_workspace_directory(profile)?;
+        if seen.insert(profile.id.clone()) {
+            ids.push(profile.id.clone());
         }
     }
+    if ids.is_empty() {
+        return Err(AppError::Message("Gateway 没有选中的工作区。".into()));
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+async fn start_gateway_daemon(options: GatewayStartOptions, as_json: bool) -> AppResult<()> {
+    if !gateway_daemon::supported() {
+        return Err(AppError::Message(
+            "Gateway daemon 目前仅支持 Linux；请使用 gateway serve 前台模式".into(),
+        ));
+    }
+    let workspace_ids = resolve_gateway_workspace_ids(&options.workspaces)?;
+    let inspection = gateway_daemon::inspect()?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    if inspection.running {
+        gateway_control::ping().await.map_err(|error| {
+            AppError::Message(format!("Gateway daemon 状态存在但 IPC 不可用：{error}"))
+        })?;
+        return Err(AppError::Message("Gateway daemon 已经运行".into()));
+    }
+    let pid = gateway_daemon::spawn(&workspace_ids)?;
+    let state =
+        match gateway_daemon::wait_ready(pid, Duration::from_secs(options.wait_seconds)).await {
+            Ok(state) => state,
+            Err(error) => {
+                let cleanup = gateway_daemon::terminate_spawned(pid).await;
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(AppError::Message(format!(
+                        "Gateway daemon 启动失败：{error}；清理 PID {pid} 也失败：{cleanup_error}"
+                    ))),
+                };
+            }
+        };
+    let status = gateway_control::request_status()
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    if as_json {
+        print_json(&json!({
+            "event": "gateway_started",
+            "pid": state.pid,
+            "status": status
+        }))?;
+    } else {
+        println!(
+            "Gateway daemon 已启动，PID {}，routes={}，端口 {}",
+            state.pid,
+            state.workspace_ids.len(),
+            state.local_port
+        );
+    }
+    Ok(())
+}
+
+async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppResult<()> {
+    if !gateway_daemon::supported() {
+        return Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()));
+    }
+    let inspection = gateway_daemon::inspect()?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    let Some(state) = inspection.state else {
+        gateway_daemon::cleanup()?;
+        if as_json {
+            print_json(&json!({ "event": "gateway_stopped", "alreadyStopped": true }))?;
+        } else {
+            println!("Gateway daemon 未运行。");
+        }
+        return Ok(());
+    };
+    if !inspection.running || !inspection.pid_matches {
+        gateway_daemon::cleanup()?;
+        if as_json {
+            print_json(&json!({ "event": "gateway_stopped", "alreadyStopped": true }))?;
+        } else {
+            println!("Gateway daemon 未运行，已清理过期状态。");
+        }
+        return Ok(());
+    }
+    let accepted_pid = gateway_control::request_exit(GatewayOperation::Shutdown)
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    if accepted_pid != state.pid {
+        return Err(AppError::Message(format!(
+            "Gateway shutdown PID mismatch: state={}, response={accepted_pid}",
+            state.pid
+        )));
+    }
+    gateway_daemon::wait_for_exit(
+        state.pid,
+        Duration::from_secs(options.timeout_seconds),
+        options.force,
+    )
+    .await?;
+    if as_json {
+        print_json(&json!({ "event": "gateway_stopped", "pid": state.pid }))?;
+    } else {
+        println!("Gateway daemon PID {} 已停止。", state.pid);
+    }
+    Ok(())
+}
+
+async fn restart_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppResult<()> {
+    if !gateway_daemon::supported() {
+        return Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()));
+    }
+    let inspection = gateway_daemon::inspect()?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            AppError::Message("Gateway daemon 未运行；请使用 gateway start 指定 routes".into())
+        })?;
+    let workspace_ids = state.workspace_ids.clone();
+    let accepted_pid = gateway_control::request_exit(GatewayOperation::Restart)
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    if accepted_pid != state.pid {
+        return Err(AppError::Message(format!(
+            "Gateway restart PID mismatch: state={}, response={accepted_pid}",
+            state.pid
+        )));
+    }
+    gateway_daemon::wait_for_exit(
+        state.pid,
+        Duration::from_secs(options.timeout_seconds),
+        options.force,
+    )
+    .await?;
+    let pid = gateway_daemon::spawn(&workspace_ids)?;
+    let next =
+        match gateway_daemon::wait_ready(pid, Duration::from_secs(options.timeout_seconds)).await {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = gateway_daemon::terminate_spawned(pid).await;
+                return Err(error);
+            }
+        };
+    if as_json {
+        print_json(&json!({
+            "event": "gateway_restarted",
+            "previousPid": state.pid,
+            "pid": next.pid,
+            "workspaces": workspace_ids
+        }))?;
+    } else {
+        println!("Gateway daemon 已重启：{} -> {}", state.pid, next.pid);
+    }
+    Ok(())
+}
+
+async fn reload_gateway_daemon(as_json: bool) -> AppResult<()> {
+    if !gateway_daemon::supported() {
+        return Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()));
+    }
+    gateway_control::request_reload(Duration::from_secs(20))
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    let status = gateway_control::request_status()
+        .await
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    if as_json {
+        print_json(&json!({ "event": "gateway_reloaded", "status": status }))?;
+    } else {
+        println!(
+            "Gateway daemon 配置已 reload，routes={}。",
+            status.route_count
+        );
+    }
+    Ok(())
 }
 
 fn show_gateway(as_json: bool) -> AppResult<()> {
@@ -216,10 +760,9 @@ fn show_gateway(as_json: bool) -> AppResult<()> {
     Ok(())
 }
 
-fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResult<()> {
-    let mut store = DataStore::load()?;
-    let mut settings = store.settings();
-    let previous = settings.mcp_gateway.clone();
+async fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let previous = store.settings().mcp_gateway;
     let mut config = previous.clone();
     if let Some(enabled) = options.enabled {
         config.enabled = enabled;
@@ -241,20 +784,66 @@ fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResu
         config.observed_tunnel_signature = previous.observed_tunnel_signature;
     }
     gateway::validate_config(&config, store.list())?;
-    settings.mcp_gateway = config.clone();
-    store.update_settings(settings)?;
+    drop(store);
+
+    let inspection = gateway_daemon::inspect()?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    if inspection.running {
+        let state = inspection.state.ok_or_else(|| {
+            AppError::Message("Gateway daemon reports running without state metadata".into())
+        })?;
+        gateway_control::ping()
+            .await
+            .map_err(|error| AppError::Message(format!("Gateway daemon IPC 不可用：{error}")))?;
+        if config.enabled {
+            gateway_control::request_apply_config(config.clone(), Duration::from_secs(20))
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+        } else {
+            let accepted_pid = gateway_control::request_exit(GatewayOperation::Shutdown)
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            if accepted_pid != state.pid {
+                return Err(AppError::Message(format!(
+                    "Gateway disable PID mismatch: state={}, response={accepted_pid}",
+                    state.pid
+                )));
+            }
+            gateway_daemon::wait_for_exit(state.pid, Duration::from_secs(10), false).await?;
+            gateway_control::persist_config(&config)?;
+        }
+    } else {
+        gateway_control::persist_config(&config)?;
+    }
+    let applied_config = DataStore::load()?.settings().mcp_gateway;
     if as_json {
-        print_json(&json!({ "event": "gateway_configured", "config": config }))?;
+        print_json(&json!({ "event": "gateway_configured", "config": applied_config }))?;
     } else {
         println!("MCP Gateway 配置已保存。");
-        println!("{}", serde_json::to_string_pretty(&config)?);
+        println!("{}", serde_json::to_string_pretty(&applied_config)?);
     }
     Ok(())
 }
 
-async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
+async fn next_gateway_control_command(
+    receiver: &mut Option<gateway_control::GatewayControlReceiver>,
+) -> Option<gateway_control::GatewayControlCommand> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn serve_gateway(
+    selectors: &[String],
+    as_json: bool,
+    foreground: bool,
+    mut control_commands: Option<gateway_control::GatewayControlReceiver>,
+) -> AppResult<()> {
     let store = DataStore::load()?;
-    let all_profiles = store.list().to_vec();
+    let mut all_profiles = store.list().to_vec();
     let mut config = store.settings().mcp_gateway;
     if !config.enabled {
         return Err(AppError::Message(
@@ -274,33 +863,9 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
     if selected.is_empty() {
         return Err(AppError::Message("Gateway 没有选中的工作区。".into()));
     }
-    ensure_gateway_ports_available(&config, &selected)?;
-
     let mut runtime = RuntimeSupervisor::default();
-    let mut started = Vec::new();
-    let startup = async {
-        for profile in &selected {
-            ensure_running(runtime.start_mcp(profile)?, "MCP")?;
-            started.push(profile.clone());
-        }
-        let active = runtime.active_mcp_workspace_ids();
-        gateway::ensure(&config, &all_profiles, &active).await?;
-        if let Some(url) = reconcile_mcp_gateway(&config, &all_profiles, &active).await? {
-            persist_cli_gateway_observation(&mut config, &all_profiles, &url)?;
-        }
-        Ok::<(), AppError>(())
-    }
-    .await;
-    if let Err(error) = startup {
-        let cleanup =
-            shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await;
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(AppError::Message(format!(
-                "Gateway 启动失败：{error}；清理已启动服务也失败：{cleanup_error}"
-            ))),
-        };
-    }
+    let mut started =
+        start_gateway_services(&mut runtime, &selected, &mut config, &all_profiles).await?;
 
     if as_json {
         print_json(&json!({
@@ -322,7 +887,9 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
                 gateway::workspace_base_url(&config, &profile.id)?
             );
         }
-        println!("前台运行中，按 Ctrl+C 停止。");
+        if foreground {
+            println!("前台运行中，按 Ctrl+C 停止。");
+        }
     }
 
     let shutdown_signal = wait_for_shutdown_signal();
@@ -339,6 +906,50 @@ async fn serve_gateway(selectors: &[String], as_json: bool) -> AppResult<()> {
                     terminal_error = Some(error);
                 }
                 break;
+            }
+            command = next_gateway_control_command(&mut control_commands) => {
+                match command {
+                    Some(gateway_control::GatewayControlCommand::Shutdown { operation }) => {
+                        gateway_daemon::append_log(&format!(
+                            "[control] accepted {operation:?}; beginning graceful shutdown"
+                        ));
+                        break;
+                    }
+                    Some(gateway_control::GatewayControlCommand::Reload { operation_id }) => {
+                        gateway_control::mark_operation_running(&operation_id);
+                        let result = apply_gateway_reload(
+                            &mut runtime,
+                            &mut started,
+                            &mut selected,
+                            &mut config,
+                            &mut all_profiles,
+                        )
+                        .await;
+                        gateway_control::finish_reload_operation(&operation_id, result);
+                    }
+                    Some(gateway_control::GatewayControlCommand::ApplyConfig {
+                        operation_id,
+                        config: next_config,
+                    }) => {
+                        gateway_control::mark_operation_running(&operation_id);
+                        let result = apply_gateway_config(
+                            &mut runtime,
+                            &mut started,
+                            &mut selected,
+                            &mut config,
+                            &mut all_profiles,
+                            *next_config,
+                        )
+                        .await;
+                        gateway_control::finish_reload_operation(&operation_id, result);
+                    }
+                    None => {
+                        terminal_error = Some(AppError::Message(
+                            "Gateway control command channel closed unexpectedly".into(),
+                        ));
+                        break;
+                    }
+                }
             }
             _ = maintenance.tick() => {
                 for profile in &selected {
@@ -472,21 +1083,21 @@ fn persist_cli_gateway_observation(
     config.observed_owner_workspace_id = config.owner_workspace_id.clone();
     config.observed_tunnel_signature = signature.clone();
     gateway::validate_config(config, profiles)?;
-    let mut store = DataStore::load()?;
-    let mut settings = store.settings();
-    if settings.mcp_gateway.identity_changed(config) {
-        return Ok(());
-    }
-    if settings.mcp_gateway.observed_public_url == normalized
-        && settings.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
-        && settings.mcp_gateway.observed_tunnel_signature == signature
-    {
-        return Ok(());
-    }
-    settings.mcp_gateway.observed_public_url = normalized.to_string();
-    settings.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
-    settings.mcp_gateway.observed_tunnel_signature = signature;
-    store.update_settings(settings)
+    DataStore::update_file(|data| {
+        if data.mcp_gateway.identity_changed(config) {
+            return Ok(());
+        }
+        if data.mcp_gateway.observed_public_url == normalized
+            && data.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
+            && data.mcp_gateway.observed_tunnel_signature == signature
+        {
+            return Ok(());
+        }
+        data.mcp_gateway.observed_public_url = normalized.to_string();
+        data.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
+        data.mcp_gateway.observed_tunnel_signature = signature.clone();
+        Ok(())
+    })
 }
 
 async fn shutdown_gateway_services(
@@ -1141,7 +1752,10 @@ pub fn run() -> i32 {
     }
 
     let as_json = parsed.json;
-    let daemon_mode = matches!(&parsed.command, Command::DaemonRun { .. });
+    let daemon_mode = matches!(
+        &parsed.command,
+        Command::DaemonRun { .. } | Command::GatewayDaemonRun { .. }
+    );
     match crate::async_runtime::block_on(execute(parsed)) {
         Ok(exit_code) => exit_code,
         Err(error) => {
@@ -1205,6 +1819,12 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         }
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
+        Command::GatewayDaemonRun {
+            config_scope,
+            workspaces,
+        } => run_gateway_daemon(&config_scope, &workspaces)
+            .await
+            .map(|_| 0),
         Command::DaemonRun {
             workspace,
             service,
@@ -2278,5 +2898,36 @@ mod tests {
         let error = resolve_workspace(&profiles, "same").expect_err("ambiguous");
 
         assert!(error.to_string().contains("名称不唯一"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn gateway_daemon_writes_fail_closed_on_unsupported_windows_server() {
+        let start = start_gateway_daemon(
+            GatewayStartOptions {
+                workspaces: vec!["workspace".into()],
+                wait_seconds: 1,
+            },
+            false,
+        )
+        .await
+        .expect_err("Windows Gateway daemon start must fail closed");
+        assert!(start.to_string().contains("仅支持 Linux"));
+
+        let stop = stop_gateway_daemon(
+            GatewayStopOptions {
+                timeout_seconds: 1,
+                force: false,
+            },
+            false,
+        )
+        .await
+        .expect_err("Windows Gateway daemon stop must fail closed");
+        assert!(stop.to_string().contains("仅支持 Linux"));
+
+        let reload = reload_gateway_daemon(false)
+            .await
+            .expect_err("Windows Gateway daemon reload must fail closed");
+        assert!(reload.to_string().contains("仅支持 Linux"));
     }
 }

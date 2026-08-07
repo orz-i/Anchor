@@ -20,6 +20,8 @@ pub mod control;
 pub mod daemon;
 mod data;
 mod error;
+pub mod gateway_control;
+pub mod gateway_daemon;
 pub mod harness;
 mod health;
 mod logging;

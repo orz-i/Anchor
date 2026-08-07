@@ -69,7 +69,7 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 | 维度 | 当前实现 |
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
-| 进程管理 | Workspace daemon 管理 listener + Workspace Tunnel；RuntimeSupervisor 仅保留旧 Gateway/旧会话兼容路径 |
+| 进程管理 | Workspace daemon 管理各自 listener + Workspace Tunnel；独立 Gateway daemon 管理全局 Gateway listener/routes/tunnel；RuntimeSupervisor 仅保留旧桌面兼容路径 |
 | UI | Tauri 2 + SvelteKit 设计系统 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | 桌面安装包与独立 `anchor` CLI |
@@ -96,9 +96,14 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 
 ### Gateway 控制域
 - **职责**: 多 Workspace 共享 MCP Gateway listener、路由集合和唯一公网 Gateway tunnel
-- **当前运行入口**: `anchor gateway serve <workspace ...>`；该进程独立于任何单一 Workspace daemon
-- **GUI 边界**: GUI 仅校验并持久化 Gateway 配置，不再创建共享 listener 或 tunnel；旧桌面兼容 Gateway 若仍在运行，配置热改 fail-closed
-- **后续**: 将 `gateway serve` 升级为可安装的专用 Gateway service/daemon，并提供独立状态/控制 IPC
+- **后台运行入口**: `anchor gateway start <workspace ...>`；`status/stop/restart/reload` 使用专用 Gateway control client；`gateway serve` 保留前台调试/外部 supervisor 模式
+- **实现**: `src-tauri/src/gateway_daemon.rs` + `src-tauri/src/gateway_control/`，与 Workspace `daemon.rs` / `control/` 分离
+- **协议**: Gateway protocol v1；请求包含配置域 `configScope`，使用全局 `gateway.sock`/PID/state/lock，reload 与 apply_config 使用 accepted → operation status
+- **配置事务**: 运行中配置由 daemon 先切换运行态、更新 state，再持久化；失败停止新运行态并恢复旧运行态；禁用则先 shutdown 后持久化
+- **GUI 边界**: GUI 状态和 route 列表直接来自 Gateway control status，配置写入调用 daemon；不创建共享 listener/tunnel，不在 IPC 失败时本地回退
+- **Workspace 交互**: route/owner profile 更新触发 Gateway reload；活动 route 禁止删除/注销，避免 live Gateway 指向不存在的 Workspace
+- **跨进程一致性**: AppState 每次数据访问前从磁盘刷新；Gateway observed URL 采用窄字段原子更新，避免后台 daemon 与桌面缓存互相覆盖
+- **平台边界**: Linux 服务端已实现；Windows 仅保留 Named Pipe 客户端/地址抽象，服务端与当前用户 ACL 后续实现
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport

@@ -9,7 +9,9 @@ use crate::error::{AppError, AppResult};
 
 use crate::runtime::{port_busy_message, try_reclaim_previous_macos_app_port, wait_for_port_free};
 
-use crate::mcp::gateway::{self, McpGatewayStatus};
+use crate::gateway_control::{self, GatewayControlStatus, GatewayOperation};
+use crate::gateway_daemon::{self, GatewayDaemonInspection};
+use crate::mcp::gateway;
 
 use crate::platform::platform;
 
@@ -41,22 +43,50 @@ pub fn get_mcp_gateway(state: State<'_, AppState>) -> AppResult<McpGatewayConfig
     state.with_settings(|store| Ok(store.settings().mcp_gateway))
 }
 
-async fn gateway_control_domain_status(config: &McpGatewayConfig) -> McpGatewayStatus {
-    let mut status = gateway::status(config).await;
-    if config.enabled && status.state != "running" {
-        status.state = "configured".into();
-        status.error.clear();
-    }
-    status
-}
-
 #[tauri::command]
-pub async fn get_mcp_gateway_status(state: State<'_, AppState>) -> AppResult<McpGatewayStatus> {
-    let config = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
-    Ok(gateway_control_domain_status(&config).await)
+pub async fn get_mcp_gateway_status(
+    _state: State<'_, AppState>,
+) -> AppResult<GatewayControlStatus> {
+    gateway_control::status_via_daemon_or_local().await
 }
 
 const DESKTOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayConfigWriteAction {
+    PersistLocally,
+    ApplyViaDaemon { pid: u32 },
+    ShutdownThenPersist { pid: u32 },
+}
+
+fn gateway_config_write_action(
+    inspection: &GatewayDaemonInspection,
+    enabled: bool,
+) -> AppResult<GatewayConfigWriteAction> {
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail.clone()));
+    }
+    if !inspection.running {
+        return Ok(GatewayConfigWriteAction::PersistLocally);
+    }
+    if !inspection.pid_matches {
+        return Err(AppError::Message(
+            "Gateway daemon reports running but PID ownership does not match".into(),
+        ));
+    }
+    let pid = inspection
+        .state
+        .as_ref()
+        .map(|state| state.pid)
+        .ok_or_else(|| {
+            AppError::Message("Gateway daemon reports running without state metadata".into())
+        })?;
+    if enabled {
+        Ok(GatewayConfigWriteAction::ApplyViaDaemon { pid })
+    } else {
+        Ok(GatewayConfigWriteAction::ShutdownThenPersist { pid })
+    }
+}
 
 fn selection_includes(
     selection: crate::daemon::ServiceSelection,
@@ -333,32 +363,16 @@ async fn restart_desktop_service(
 pub async fn set_mcp_gateway(
     state: State<'_, AppState>,
     mut config: McpGatewayConfig,
-) -> AppResult<McpGatewayStatus> {
+) -> AppResult<GatewayControlStatus> {
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
     let previous = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
     let legacy_status = gateway::status(&previous).await;
     if legacy_status.state == "running" && previous != config {
         return Err(AppError::Message(
-            "当前桌面进程仍在运行旧版兼容 Gateway。为避免已运行 listener 与新配置分叉，本次热修改已拒绝；请先退出旧桌面运行态，再保存配置。新的 Gateway 运行应由独立 `anchor gateway serve` 控制域负责。"
+            "当前桌面进程仍在运行旧版兼容 Gateway。为避免已运行 listener 与新配置分叉，本次热修改已拒绝；请先退出旧桌面运行态，再保存配置。新的后台 Gateway 运行应由独立 `anchor gateway start` 控制域负责。"
                 .into(),
         ));
-    }
-    if config.enabled {
-        for profile in &profiles {
-            let inspection = crate::daemon::inspect(profile)?;
-            if inspection
-                .state
-                .as_ref()
-                .filter(|_| inspection.running)
-                .is_some_and(|state| state.service.includes_mcp())
-            {
-                return Err(AppError::Message(format!(
-                    "Workspace {} 的 MCP 正由 daemon 管理。Gateway 写控制尚未迁移到 daemon；请先停止该 Workspace，再配置 Gateway。GUI 不会启动第二套进程内 listener。",
-                    profile.name
-                )));
-            }
-        }
     }
     if previous.identity_changed(&config) {
         config.clear_observation();
@@ -368,12 +382,46 @@ pub async fn set_mcp_gateway(
         config.observed_tunnel_signature = previous.observed_tunnel_signature.clone();
     }
     gateway::validate_config(&config, &profiles)?;
-    state.with_settings(|store| {
-        let mut settings = store.settings();
-        settings.mcp_gateway = config.clone();
-        store.update_settings(settings)
-    })?;
-    Ok(gateway_control_domain_status(&config).await)
+
+    let inspection = gateway_daemon::inspect()?;
+    match gateway_config_write_action(&inspection, config.enabled)? {
+        GatewayConfigWriteAction::ApplyViaDaemon { pid } => {
+            gateway_control::ping().await.map_err(|error| {
+                AppError::Message(format!("Gateway daemon IPC 不可用：{error}"))
+            })?;
+            gateway_control::request_apply_config(config, DESKTOP_DAEMON_TIMEOUT)
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            let status = gateway_control::request_status()
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            if status.pid != Some(pid) {
+                return Err(AppError::Message(format!(
+                    "Gateway apply_config PID changed unexpectedly: expected {pid}, status={:?}",
+                    status.pid
+                )));
+            }
+        }
+        GatewayConfigWriteAction::ShutdownThenPersist { pid } => {
+            gateway_control::ping().await.map_err(|error| {
+                AppError::Message(format!("Gateway daemon IPC 不可用：{error}"))
+            })?;
+            let accepted_pid = gateway_control::request_exit(GatewayOperation::Shutdown)
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            if accepted_pid != pid {
+                return Err(AppError::Message(format!(
+                    "Gateway disable PID mismatch: state={}, response={accepted_pid}",
+                    pid
+                )));
+            }
+            gateway_daemon::wait_for_exit(pid, DESKTOP_DAEMON_TIMEOUT, false).await?;
+            gateway_control::persist_config(&config)?;
+        }
+        GatewayConfigWriteAction::PersistLocally => gateway_control::persist_config(&config)?,
+    }
+    state.reload_data_from_disk()?;
+    gateway_control::status_via_daemon_or_local().await
 }
 
 fn validate_start_resources(
@@ -517,6 +565,59 @@ mod tests {
     use crate::settings::AppSettings;
     use crate::workspace::WorkspaceProfile;
 
+    fn gateway_inspection(
+        running: bool,
+        ambiguous: bool,
+        pid_matches: bool,
+    ) -> GatewayDaemonInspection {
+        GatewayDaemonInspection {
+            supported: true,
+            running,
+            stale: false,
+            ambiguous,
+            pid_matches,
+            state: running.then(|| crate::gateway_daemon::GatewayDaemonState {
+                schema_version: 1,
+                config_scope: "scope".into(),
+                pid: 42,
+                started_at_unix: 1,
+                workspace_ids: vec!["workspace".into()],
+                local_port: 28_765,
+                log_path: "gateway.log".into(),
+                version: "test".into(),
+            }),
+            detail: if ambiguous {
+                "ambiguous".into()
+            } else {
+                "ok".into()
+            },
+        }
+    }
+
+    #[test]
+    fn gateway_config_writes_never_fallback_while_daemon_is_running() {
+        let running = gateway_inspection(true, false, true);
+        assert_eq!(
+            gateway_config_write_action(&running, true).expect("enabled action"),
+            GatewayConfigWriteAction::ApplyViaDaemon { pid: 42 }
+        );
+        assert_eq!(
+            gateway_config_write_action(&running, false).expect("disabled action"),
+            GatewayConfigWriteAction::ShutdownThenPersist { pid: 42 }
+        );
+
+        let stopped = gateway_inspection(false, false, false);
+        assert_eq!(
+            gateway_config_write_action(&stopped, true).expect("stopped action"),
+            GatewayConfigWriteAction::PersistLocally
+        );
+
+        let ambiguous = gateway_inspection(false, true, false);
+        assert!(gateway_config_write_action(&ambiguous, true).is_err());
+        let wrong_owner = gateway_inspection(true, false, false);
+        assert!(gateway_config_write_action(&wrong_owner, true).is_err());
+    }
+
     #[test]
     fn event_monitor_only_falls_back_when_daemon_endpoint_is_unavailable() {
         let unavailable = map_control_events(Err(control::ControlClientError::Unavailable(
@@ -652,19 +753,5 @@ mod tests {
         assert_eq!(runtime.state, "error");
         assert_eq!(runtime.pid, Some(99));
         assert!(runtime.local_message.contains("不会接管"));
-    }
-
-    #[tokio::test]
-    async fn enabled_gateway_without_legacy_listener_reports_configured_control_domain() {
-        gateway::stop().await.expect("stop legacy gateway");
-        let config = McpGatewayConfig {
-            enabled: true,
-            ..McpGatewayConfig::default()
-        };
-
-        let status = gateway_control_domain_status(&config).await;
-
-        assert_eq!(status.state, "configured");
-        assert!(status.error.is_empty());
     }
 }

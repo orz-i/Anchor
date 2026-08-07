@@ -169,6 +169,22 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
     crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &profile.id)?;
     drop(store);
 
+    let gateway_inspection = crate::gateway_daemon::inspect()?;
+    if gateway_inspection.ambiguous {
+        return Err(AppError::Message(gateway_inspection.detail));
+    }
+    if gateway_inspection.running
+        && gateway_inspection
+            .state
+            .as_ref()
+            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id))
+    {
+        return Err(AppError::Message(
+            "该 Workspace 正由 Gateway daemon 提供路由。请先执行 `anchor gateway stop`，再注销 Workspace。"
+                .into(),
+        ));
+    }
+
     let inspection = super::daemon::inspect(&profile)?;
     if inspection.running {
         crate::control::request_daemon_exit_and_wait(

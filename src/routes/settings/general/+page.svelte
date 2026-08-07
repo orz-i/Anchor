@@ -11,7 +11,7 @@
     type McpGatewayStatusDto,
     type ProxyConfigDto,
   } from "$lib/api/settings";
-  import { getRuntimeStatus, listWorkspaces } from "$lib/api/workspaces";
+  import { listWorkspaces } from "$lib/api/workspaces";
   import type { WorkspaceProfile } from "$lib/types";
 
   let proxy = $state<ProxyConfigDto>({ mode: "none", url: "" });
@@ -29,26 +29,9 @@
     observedTunnelSignature: "",
   });
   let gatewayStatus = $state<McpGatewayStatusDto | null>(null);
-  let workspaceRuntimeStates = $state<Record<string, string>>({});
   let gatewayChanged = $state(false);
   let gatewaySaving = $state(false);
   let gatewayRefreshing = false;
-
-  async function loadWorkspaceRuntimeStates(
-    profiles: WorkspaceProfile[],
-  ): Promise<Record<string, string>> {
-    return Object.fromEntries(
-      await Promise.all(
-        profiles.map(async (workspace) => {
-          try {
-            return [workspace.id, (await getRuntimeStatus(workspace.id)).state];
-          } catch {
-            return [workspace.id, "stopped"];
-          }
-        }),
-      ),
-    );
-  }
 
   async function refreshGatewayRuntimeStatus() {
     if (gatewayRefreshing) return;
@@ -61,7 +44,6 @@
       ]);
       gatewayStatus = nextStatus;
       workspaces = nextWorkspaces;
-      workspaceRuntimeStates = await loadWorkspaceRuntimeStates(nextWorkspaces);
       if (!gatewayChanged && !gatewaySaving) {
         gateway = nextGateway;
       }
@@ -85,7 +67,6 @@
       gateway = nextGateway;
       gatewayStatus = nextGatewayStatus;
       workspaces = nextWorkspaces;
-      workspaceRuntimeStates = await loadWorkspaceRuntimeStates(nextWorkspaces);
       changed = false;
       gatewayChanged = false;
     } catch (e) {
@@ -144,9 +125,7 @@
   }
 
   function gatewayRouteActive(workspaceId: string): boolean {
-    return ["starting", "running", "recovering"].includes(
-      workspaceRuntimeStates[workspaceId] ?? "stopped",
-    );
+    return gatewayStatus?.routeWorkspaceIds.includes(workspaceId) ?? false;
   }
 
   onMount(() => {
@@ -226,9 +205,11 @@
         {#if gatewayStatus}
           <span class="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs">
             {gatewayStatus.state === "running"
-              ? `运行中 · ${gatewayStatus.routeCount} 条路由`
+              ? `运行中 · ${gatewayStatus.routeCount} 条路由${gatewayStatus.pid ? ` · PID ${gatewayStatus.pid}` : ""}`
               : gatewayStatus.state === "configured"
-                ? "已配置 · 独立控制"
+                ? gatewayStatus.daemonSupported
+                  ? "已配置 · Gateway daemon 未启动"
+                  : "已配置 · 当前平台不支持后台 daemon"
               : gatewayStatus.state === "error"
                 ? "错误"
                 : "已停止"}
@@ -334,8 +315,9 @@
 
         {#if gatewayStatus?.state === "configured"}
           <p class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2 text-xs text-[var(--text-muted)]">
-            Gateway 配置已保存。桌面 GUI 不再创建共享 listener 或隧道；运行请使用
-            <code>anchor gateway serve &lt;workspace ...&gt;</code>，后续可切换到专用 Gateway service。
+            Gateway 配置已保存。桌面 GUI 不创建共享 listener 或隧道；后台运行请使用
+            <code>anchor gateway start &lt;workspace ...&gt;</code>。<code>gateway serve</code>
+            仅保留给前台调试或外部 supervisor。
           </p>
         {/if}
 

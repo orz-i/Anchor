@@ -111,7 +111,10 @@ mod tests {
 }
 
 #[tauri::command]
-pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -> AppResult<()> {
+pub async fn update_workspace(
+    state: State<'_, AppState>,
+    profile: WorkspaceProfile,
+) -> AppResult<()> {
     let daemon_inspection = daemon::inspect(&profile)?;
     let daemon_state = daemon_inspection
         .running
@@ -123,10 +126,24 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
             runtime.is_running(&profile.id, ServiceKind::Actions),
         ))
     })?;
+    let previous_settings = state.with_settings(|store| Ok(store.settings()))?;
+    let gateway_inspection = crate::gateway_daemon::inspect()?;
+    if gateway_inspection.ambiguous {
+        return Err(AppError::Message(gateway_inspection.detail));
+    }
+    let gateway_route_running = gateway_inspection.running
+        && gateway_inspection
+            .state
+            .as_ref()
+            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id));
+    let gateway_owner_running = gateway_inspection.running
+        && previous_settings.mcp_gateway.owner_workspace_id == profile.id;
+    let gateway_profile_live = gateway_route_running || gateway_owner_running;
     let mcp_running = daemon_state
         .as_ref()
         .is_some_and(|state| state.service.includes_mcp())
-        || legacy_mcp_running;
+        || legacy_mcp_running
+        || gateway_route_running;
     let actions_running = daemon_state
         .as_ref()
         .is_some_and(|state| state.service.includes_actions())
@@ -138,45 +155,46 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
     let actions_redirect_hosts = profile.actions.oauth_redirect_hosts.clone();
     let mcp_oauth_enabled = profile.auth.oauth_enabled();
     let actions_oauth_enabled = profile.actions.auth_type == "oauth";
-    let (mcp_callback_changed, actions_callback_changed) = state.with_workspaces(|store| {
-        let current = store
-            .get(&profile.id)
-            .cloned()
-            .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
-        validate_live_port_change(
-            &current,
-            &profile,
-            mcp_running,
-            actions_running,
-            store.settings().mcp_gateway.enabled,
-        )?;
-        validate_workspace_resources_update(store.list(), &current, &profile)?;
-        let gateway = store.settings().mcp_gateway;
-        crate::mcp::gateway::validate_workspace_ports(&gateway, &profile)?;
-        let reset_gateway_observed =
-            crate::mcp::gateway::owner_tunnel_identity_changed(&gateway, &current, &profile);
-        let mcp_callback_changed = current.auth.oauth_redirect_uris
-            != profile.auth.oauth_redirect_uris
-            || current.auth.oauth_redirect_hosts != profile.auth.oauth_redirect_hosts;
-        let actions_callback_changed = current.actions.oauth_redirect_uris
-            != profile.actions.oauth_redirect_uris
-            || current.actions.oauth_redirect_hosts != profile.actions.oauth_redirect_hosts;
-        if mcp_callback_changed {
-            validate_redirect_policy(&mcp_redirect_uris, &mcp_redirect_hosts)
-                .map_err(AppError::Message)?;
-        }
-        if actions_callback_changed {
-            validate_redirect_policy(&actions_redirect_uris, &actions_redirect_hosts)
-                .map_err(AppError::Message)?;
-        }
-        store.update(profile)?;
-        if reset_gateway_observed {
-            let mut settings = store.settings();
-            settings.mcp_gateway.clear_observation();
-            store.update_settings(settings)?;
-        }
-        Ok((mcp_callback_changed, actions_callback_changed))
-    })?;
+    let (previous_profile, mcp_callback_changed, actions_callback_changed) = state
+        .with_workspaces(|store| {
+            let current = store
+                .get(&profile.id)
+                .cloned()
+                .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
+            validate_live_port_change(
+                &current,
+                &profile,
+                mcp_running,
+                actions_running,
+                store.settings().mcp_gateway.enabled,
+            )?;
+            validate_workspace_resources_update(store.list(), &current, &profile)?;
+            let gateway = store.settings().mcp_gateway;
+            crate::mcp::gateway::validate_workspace_ports(&gateway, &profile)?;
+            let reset_gateway_observed =
+                crate::mcp::gateway::owner_tunnel_identity_changed(&gateway, &current, &profile);
+            let mcp_callback_changed = current.auth.oauth_redirect_uris
+                != profile.auth.oauth_redirect_uris
+                || current.auth.oauth_redirect_hosts != profile.auth.oauth_redirect_hosts;
+            let actions_callback_changed = current.actions.oauth_redirect_uris
+                != profile.actions.oauth_redirect_uris
+                || current.actions.oauth_redirect_hosts != profile.actions.oauth_redirect_hosts;
+            if mcp_callback_changed {
+                validate_redirect_policy(&mcp_redirect_uris, &mcp_redirect_hosts)
+                    .map_err(AppError::Message)?;
+            }
+            if actions_callback_changed {
+                validate_redirect_policy(&actions_redirect_uris, &actions_redirect_hosts)
+                    .map_err(AppError::Message)?;
+            }
+            store.update(profile)?;
+            if reset_gateway_observed {
+                let mut settings = store.settings();
+                settings.mcp_gateway.clear_observation();
+                store.update_settings(settings)?;
+            }
+            Ok((current, mcp_callback_changed, actions_callback_changed))
+        })?;
 
     if mcp_callback_changed && mcp_oauth_enabled {
         let hot_updated = update_oauth_redirect_policy(
@@ -209,6 +227,36 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
                 "[oauth] event=callback_policy_saved service=actions runtime_hot_updated={hot_updated}"
             ),
         );
+    }
+    if gateway_profile_live {
+        if let Err(error) =
+            crate::gateway_control::request_reload(std::time::Duration::from_secs(20)).await
+        {
+            let restore = state.with_workspaces(|store| {
+                store.update(previous_profile.clone())?;
+                store.update_settings(previous_settings.clone())
+            });
+            return match restore {
+                Ok(()) => {
+                    let reconcile = crate::gateway_control::request_reload(
+                        std::time::Duration::from_secs(20),
+                    )
+                    .await;
+                    match reconcile {
+                        Ok(()) => Err(AppError::Message(format!(
+                            "Gateway daemon 未能应用 Workspace 配置，已恢复旧配置与旧运行态：{error}"
+                        ))),
+                        Err(reconcile_error) => Err(AppError::Message(format!(
+                            "Gateway daemon 未能应用 Workspace 配置：{error}；已恢复磁盘配置，但再次 reload 旧配置失败：{reconcile_error}"
+                        ))),
+                    }
+                }
+                Err(restore_error) => Err(AppError::Message(format!(
+                    "Gateway daemon 未能应用 Workspace 配置：{error}；恢复旧 Workspace 配置也失败：{restore_error}"
+                ))),
+            };
+        }
+        state.reload_data_from_disk()?;
     }
     Ok(())
 }
@@ -254,6 +302,21 @@ pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResu
     state.with_settings(|store| {
         crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &id)
     })?;
+    let gateway_inspection = crate::gateway_daemon::inspect()?;
+    if gateway_inspection.ambiguous {
+        return Err(AppError::Message(gateway_inspection.detail));
+    }
+    if gateway_inspection.running
+        && gateway_inspection
+            .state
+            .as_ref()
+            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&id))
+    {
+        return Err(AppError::Message(
+            "该 Workspace 正由 Gateway daemon 提供路由。请先执行 `anchor gateway stop`，再删除 Workspace；GUI 不会在后台静默改写 Gateway route 集合。"
+                .into(),
+        ));
+    }
     let profile = state.with_workspaces(|store| {
         store
             .get(&id)

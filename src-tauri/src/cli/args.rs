@@ -10,6 +10,24 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+fn parse_gateway_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
+    let config_scope = pop_value(args, "gateway-daemon-run")?;
+    let mut workspaces = Vec::new();
+    while let Some(workspace) = args.pop_front() {
+        if workspace.starts_with('-') {
+            return Err(format!("gateway-daemon-run 不支持参数：{workspace}"));
+        }
+        workspaces.push(workspace);
+    }
+    if workspaces.is_empty() {
+        return Err("gateway-daemon-run 至少需要一个 workspace".into());
+    }
+    Ok(Command::GatewayDaemonRun {
+        config_scope,
+        workspaces,
+    })
+}
+
 fn parse_events(args: &mut VecDeque<String>) -> Result<EventsOptions, String> {
     let workspace = pop_value(args, "events")?;
     let mut follow = false;
@@ -49,17 +67,38 @@ pub struct GatewayConfigureOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayStartOptions {
+    pub workspaces: Vec<String>,
+    pub wait_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayStopOptions {
+    pub timeout_seconds: u64,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayCommand {
     Show,
+    Status,
     Configure(GatewayConfigureOptions),
     Serve { workspaces: Vec<String> },
+    Start(GatewayStartOptions),
+    Stop(GatewayStopOptions),
+    Restart(GatewayStopOptions),
+    Reload,
 }
 
 fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, String> {
     match args.pop_front().as_deref() {
-        Some("show" | "status") => {
+        Some("show") => {
             ensure_empty(args, "gateway show")?;
             Ok(GatewayCommand::Show)
+        }
+        Some("status") => {
+            ensure_empty(args, "gateway status")?;
+            Ok(GatewayCommand::Status)
         }
         Some("configure" | "config") => {
             let mut enabled = None;
@@ -104,9 +143,60 @@ fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, 
             }
             Ok(GatewayCommand::Serve { workspaces })
         }
+        Some("start") => {
+            let mut workspaces = Vec::new();
+            let mut wait_seconds = 10;
+            while let Some(value) = args.pop_front() {
+                match value.as_str() {
+                    "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 120)?,
+                    _ if value.starts_with('-') => {
+                        return Err(format!("gateway start 不支持参数：{value}"))
+                    }
+                    _ => workspaces.push(value),
+                }
+            }
+            if workspaces.is_empty() {
+                return Err("gateway start 至少需要一个 workspace".into());
+            }
+            Ok(GatewayCommand::Start(GatewayStartOptions {
+                workspaces,
+                wait_seconds,
+            }))
+        }
+        Some("stop") => Ok(GatewayCommand::Stop(parse_gateway_stop_options(
+            args,
+            "gateway stop",
+        )?)),
+        Some("restart") => Ok(GatewayCommand::Restart(parse_gateway_stop_options(
+            args,
+            "gateway restart",
+        )?)),
+        Some("reload") => {
+            ensure_empty(args, "gateway reload")?;
+            Ok(GatewayCommand::Reload)
+        }
         Some(other) => Err(format!("未知 gateway 命令：{other}\n\n{}", gateway_usage())),
         None => Err(format!("gateway 缺少子命令\n\n{}", gateway_usage())),
     }
+}
+
+fn parse_gateway_stop_options(
+    args: &mut VecDeque<String>,
+    command: &str,
+) -> Result<GatewayStopOptions, String> {
+    let mut timeout_seconds = 10;
+    let mut force = false;
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--timeout" => timeout_seconds = parse_u64(args, "--timeout", 1, 120)?,
+            "--force" => force = true,
+            other => return Err(format!("{command} 不支持参数：{other}")),
+        }
+    }
+    Ok(GatewayStopOptions {
+        timeout_seconds,
+        force,
+    })
 }
 
 fn parse_workspace_command(args: &mut VecDeque<String>) -> Result<WorkspaceCommand, String> {
@@ -533,6 +623,10 @@ pub enum Command {
     },
     Workspace(WorkspaceCommand),
     Gateway(GatewayCommand),
+    GatewayDaemonRun {
+        config_scope: String,
+        workspaces: Vec<String>,
+    },
     DaemonRun {
         workspace: String,
         service: ServiceSelection,
@@ -586,6 +680,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         }
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
+        Some("gateway-daemon-run") => parse_gateway_daemon_run(&mut args)?,
         Some("daemon-run") => parse_daemon_run(&mut args)?,
         Some(other) => return Err(format!("未知命令：{other}\n\n{}", usage())),
     };
@@ -656,9 +751,14 @@ workspace 可使用 profile ID、唯一名称或项目路径。\n\
 pub fn gateway_usage() -> &'static str {
     "Gateway 命令：\n\
   anchor gateway show\n\
+  anchor gateway status\n\
   anchor gateway configure [--enable|--disable] [--port PORT] [--owner WORKSPACE] [--public-url URL|--clear-public-url]\n\
+  anchor gateway start <workspace> [workspace ...] [--wait SECONDS]\n\
+  anchor gateway stop [--timeout SECONDS] [--force]\n\
+  anchor gateway restart [--timeout SECONDS] [--force]\n\
+  anchor gateway reload\n\
   anchor gateway serve <workspace> [workspace ...]\n\n\
-gateway serve 在一个前台进程内启动所选工作区的 MCP listener、共享 Gateway 和唯一 MCP 隧道，适合由 systemd 监督。"
+gateway start/stop/restart 管理独立全局 Gateway daemon；gateway serve 保留为前台调试/外部 supervisor 模式。"
 }
 
 pub fn workspace_usage() -> &'static str {
@@ -758,6 +858,64 @@ mod tests {
             Command::Gateway(GatewayCommand::Serve {
                 workspaces: vec!["workspace-a".into(), "workspace-b".into()],
             })
+        );
+
+        let status = parse(strings(&["gateway", "status"])).expect("gateway status");
+        assert_eq!(status.command, Command::Gateway(GatewayCommand::Status));
+
+        let start = parse(strings(&[
+            "gateway",
+            "start",
+            "workspace-a",
+            "workspace-b",
+            "--wait",
+            "30",
+        ]))
+        .expect("gateway start");
+        assert_eq!(
+            start.command,
+            Command::Gateway(GatewayCommand::Start(GatewayStartOptions {
+                workspaces: vec!["workspace-a".into(), "workspace-b".into()],
+                wait_seconds: 30,
+            }))
+        );
+
+        let stop = parse(strings(&["gateway", "stop", "--timeout", "12", "--force"]))
+            .expect("gateway stop");
+        assert_eq!(
+            stop.command,
+            Command::Gateway(GatewayCommand::Stop(GatewayStopOptions {
+                timeout_seconds: 12,
+                force: true,
+            }))
+        );
+
+        let restart =
+            parse(strings(&["gateway", "restart", "--timeout", "9"])).expect("gateway restart");
+        assert_eq!(
+            restart.command,
+            Command::Gateway(GatewayCommand::Restart(GatewayStopOptions {
+                timeout_seconds: 9,
+                force: false,
+            }))
+        );
+
+        let reload = parse(strings(&["gateway", "reload"])).expect("gateway reload");
+        assert_eq!(reload.command, Command::Gateway(GatewayCommand::Reload));
+
+        let child = parse(strings(&[
+            "gateway-daemon-run",
+            "scope-a",
+            "workspace-b",
+            "workspace-a",
+        ]))
+        .expect("gateway daemon child");
+        assert_eq!(
+            child.command,
+            Command::GatewayDaemonRun {
+                config_scope: "scope-a".into(),
+                workspaces: vec!["workspace-b".into(), "workspace-a".into()],
+            }
         );
     }
 
