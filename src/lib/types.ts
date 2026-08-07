@@ -334,6 +334,10 @@ export interface McpActivity {
   completedRequests: number;
   recentWindowMs: number;
   suspectedStallAfterMs: number;
+  lastTransportActivityAt: string | null;
+  lastTransportActivityAgeMs: number | null;
+  lastTransportMethod: string;
+  transportRequests: number;
 }
 
 export interface RuntimeRecovery {

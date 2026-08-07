@@ -1128,6 +1128,7 @@ mod tests {
             git_worktree: None,
             created_at: "0".into(),
             updated_at: "0".into(),
+            last_activity_at: None,
         };
         let task_dir = store.tasks_dir("workspace");
         fs::create_dir_all(&task_dir).expect("task dir");

@@ -393,6 +393,8 @@ pub struct HarnessStatus {
     pub task_id: Option<String>,
     pub task_state: Option<TaskStatus>,
     pub task_updated_at: Option<String>,
+    #[serde(default)]
+    pub task_last_activity_at: Option<String>,
     pub session_status: HarnessSessionStatus,
     pub next_stage_started: bool,
     pub writable: bool,
@@ -508,6 +510,8 @@ pub struct TaskSession {
     pub git_worktree: Option<TaskGitWorktree>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub last_activity_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

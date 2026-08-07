@@ -1,24 +1,18 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-#[cfg(any(unix, test))]
 use std::time::{Duration, Instant, SystemTime};
 
-#[cfg(any(unix, test))]
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 
-#[cfg(any(unix, test))]
 use crate::workspace::McpActivityDto;
 
-#[cfg(any(unix, test))]
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(15);
-#[cfg(any(unix, test))]
 // wait_command can legitimately hold one MCP request for up to 60 seconds, while the
 // listener itself has a 90-second hard request timeout. Only warn beyond both normal
 // windows so a healthy long poll is not reported as stalled.
 const SUSPECTED_STALL_AFTER: Duration = Duration::from_secs(120);
 
-#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy)]
 struct ActivityPoint {
     monotonic: Instant,
@@ -32,23 +26,20 @@ fn tracks_conversation_activity(method: &str) -> bool {
 #[derive(Debug, Clone)]
 struct ActiveCall {
     session_id: String,
-    #[cfg(any(unix, test))]
     started: ActivityPoint,
-    #[cfg(any(unix, test))]
     method: String,
-    #[cfg(any(unix, test))]
     tool: String,
 }
 
 #[derive(Default)]
 struct ActivityState {
     in_flight: HashMap<String, ActiveCall>,
-    #[cfg(any(unix, test))]
     last_activity: Option<ActivityPoint>,
-    #[cfg(any(unix, test))]
     last_completed_at: Option<SystemTime>,
-    #[cfg(any(unix, test))]
     completed_requests: u64,
+    last_transport_activity: Option<ActivityPoint>,
+    last_transport_method: String,
+    transport_requests: u64,
 }
 
 #[derive(Clone)]
@@ -104,7 +95,6 @@ pub(crate) fn register_activity(workspace_id: &str) -> McpActivityTracker {
     tracker
 }
 
-#[cfg(any(unix, test))]
 pub(crate) fn activity_snapshot(workspace_id: &str) -> McpActivityDto {
     let inner = {
         let mut entries = registry().lock().expect("MCP activity registry lock");
@@ -135,12 +125,13 @@ impl McpActivityTracker {
         method: &str,
         _tool: &str,
     ) -> Option<McpActivityRequestGuard> {
-        if !tracks_conversation_activity(method) {
+        let conversation_activity = tracks_conversation_activity(method);
+        self.record_transport_activity(method, !conversation_activity);
+        if !conversation_activity {
             return None;
         }
         let key = request_key(session_id, request_id)?;
         let mut state = self.inner.lock().expect("MCP activity lock");
-        #[cfg(any(unix, test))]
         let point = {
             let point = activity_point();
             state.last_activity = Some(point);
@@ -150,11 +141,8 @@ impl McpActivityTracker {
             key.clone(),
             ActiveCall {
                 session_id: session_id.to_string(),
-                #[cfg(any(unix, test))]
                 started: point,
-                #[cfg(any(unix, test))]
                 method: method.to_string(),
-                #[cfg(any(unix, test))]
                 tool: _tool.to_string(),
             },
         );
@@ -178,17 +166,15 @@ impl McpActivityTracker {
     fn finish_request(&self, key: &str, completed: bool) {
         let mut state = self.inner.lock().expect("MCP activity lock");
         let removed = state.in_flight.remove(key).is_some();
-        #[cfg(any(unix, test))]
         if removed {
             let point = activity_point();
             state.last_activity = Some(point);
+            state.last_transport_activity = Some(point);
             if completed {
                 state.last_completed_at = Some(point.wall_clock);
                 state.completed_requests = state.completed_requests.saturating_add(1);
             }
         }
-        #[cfg(not(any(unix, test)))]
-        let _ = (removed, completed);
         let in_flight = state.in_flight.len();
         drop(state);
         if removed && !self.workspace_id.is_empty() {
@@ -208,23 +194,45 @@ impl McpActivityTracker {
 
     pub(crate) fn cancel_session(&self, session_id: &str) {
         let mut state = self.inner.lock().expect("MCP activity lock");
-        #[cfg(any(unix, test))]
         let before = state.in_flight.len();
         state
             .in_flight
             .retain(|_, call| call.session_id != session_id);
-        #[cfg(any(unix, test))]
         if state.in_flight.len() != before {
-            state.last_activity = Some(activity_point());
+            let point = activity_point();
+            state.last_activity = Some(point);
+            state.last_transport_activity = Some(point);
         }
     }
 
-    #[cfg(any(unix, test))]
+    pub(crate) fn transport_activity(&self, method: &str) {
+        self.record_transport_activity(method, true);
+    }
+
+    fn record_transport_activity(&self, method: &str, publish: bool) {
+        let point = activity_point();
+        let transport_requests = {
+            let mut state = self.inner.lock().expect("MCP activity lock");
+            state.last_transport_activity = Some(point);
+            state.last_transport_method = method.to_string();
+            state.transport_requests = state.transport_requests.saturating_add(1);
+            state.transport_requests
+        };
+        if publish && !self.workspace_id.is_empty() {
+            crate::control::publish_workspace_event(
+                self.workspace_id.as_str(),
+                crate::control::ControlEventKind::McpActivity,
+                Some(crate::control::ControlService::Mcp),
+                "transport",
+                format!("MCP protocol traffic observed ({method}, total {transport_requests})"),
+            );
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> McpActivityDto {
         self.snapshot_with_thresholds(RECENT_ACTIVITY_WINDOW, SUSPECTED_STALL_AFTER)
     }
 
-    #[cfg(any(unix, test))]
     fn snapshot_with_thresholds(
         &self,
         recent_window: Duration,
@@ -240,6 +248,9 @@ impl McpActivityTracker {
         let last_activity_age = state
             .last_activity
             .map(|point| now.saturating_duration_since(point.monotonic));
+        let last_transport_activity_age = state
+            .last_transport_activity
+            .map(|point| now.saturating_duration_since(point.monotonic));
 
         let (activity_state, message) =
             if oldest_age.is_some_and(|age| age >= suspected_stall_after) {
@@ -254,11 +265,14 @@ impl McpActivityTracker {
                     format!("正在处理 {} 个 MCP 调用", state.in_flight.len()),
                 )
             } else if last_activity_age.is_some_and(|age| age <= recent_window) {
-                ("recent", "刚刚完成或收到 MCP 调用".to_string())
+                ("recent", "刚刚完成或收到 MCP 工具调用".to_string())
             } else if state.last_activity.is_some() {
-                ("idle", "当前没有在途 MCP 调用".to_string())
+                (
+                    "idle",
+                    "当前没有在途 MCP 工具调用；这不表示 MCP 服务已断开".to_string(),
+                )
             } else {
-                ("idle", "尚未收到 MCP 调用".to_string())
+                ("idle", "尚未收到 MCP 工具调用".to_string())
             };
 
         McpActivityDto {
@@ -276,11 +290,16 @@ impl McpActivityTracker {
             completed_requests: state.completed_requests,
             recent_window_ms: duration_ms(recent_window),
             suspected_stall_after_ms: duration_ms(suspected_stall_after),
+            last_transport_activity_at: state
+                .last_transport_activity
+                .map(|point| format_system_time(point.wall_clock)),
+            last_transport_activity_age_ms: last_transport_activity_age.map(duration_ms),
+            last_transport_method: state.last_transport_method.clone(),
+            transport_requests: state.transport_requests,
         }
     }
 }
 
-#[cfg(any(unix, test))]
 fn unknown_snapshot() -> McpActivityDto {
     McpActivityDto {
         state: "unknown".into(),
@@ -295,6 +314,10 @@ fn unknown_snapshot() -> McpActivityDto {
         completed_requests: 0,
         recent_window_ms: duration_ms(RECENT_ACTIVITY_WINDOW),
         suspected_stall_after_ms: duration_ms(SUSPECTED_STALL_AFTER),
+        last_transport_activity_at: None,
+        last_transport_activity_age_ms: None,
+        last_transport_method: String::new(),
+        transport_requests: 0,
     }
 }
 
@@ -304,7 +327,6 @@ fn request_key(session_id: &str, request_id: &Value) -> Option<String> {
         .map(|request_id| format!("{session_id}:{request_id}"))
 }
 
-#[cfg(any(unix, test))]
 fn activity_point() -> ActivityPoint {
     ActivityPoint {
         monotonic: Instant::now(),
@@ -312,12 +334,10 @@ fn activity_point() -> ActivityPoint {
     }
 }
 
-#[cfg(any(unix, test))]
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
-#[cfg(any(unix, test))]
 fn format_system_time(time: SystemTime) -> String {
     chrono::DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -379,5 +399,9 @@ mod tests {
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.state, "idle");
         assert_eq!(snapshot.completed_requests, 0);
+        assert_eq!(snapshot.transport_requests, 3);
+        assert_eq!(snapshot.last_transport_method, "tools/list");
+        assert!(snapshot.last_transport_activity_at.is_some());
+        assert!(snapshot.last_transport_activity_age_ms.is_some());
     }
 }

@@ -75,24 +75,29 @@ pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceContro
         .filter(|_| daemon.running)
         .map(|state| state.pid);
 
+    let mcp = port_status(
+        "mcp",
+        profile.runtime.local_port,
+        profile.local_endpoint(),
+        daemon_pid,
+    )?;
+    let mcp_activity = mcp
+        .listening
+        .then(|| crate::mcp::activity_snapshot(&profile.id));
+
     Ok(WorkspaceControlStatus {
         id: profile.id.clone(),
         name: profile.name.clone(),
         path: profile.path.clone(),
         daemon,
-        mcp: port_status(
-            "mcp",
-            profile.runtime.local_port,
-            profile.local_endpoint(),
-            daemon_pid,
-        )?,
+        mcp,
         actions: port_status(
             "actions",
             profile.actions.local_port,
             profile.actions_local_base_url(),
             daemon_pid,
         )?,
-        mcp_activity: None,
+        mcp_activity,
         mcp_tunnel: None,
         actions_tunnel: None,
     })

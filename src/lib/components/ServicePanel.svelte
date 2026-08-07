@@ -70,7 +70,7 @@
       case "suspected_stalled":
         return "疑似异常";
       case "idle":
-        return "空闲";
+        return "工具空闲";
       default:
         return "未知";
     }
@@ -88,6 +88,10 @@
     const seconds = Math.floor(milliseconds / 1_000);
     if (seconds < 60) return `${seconds}s`;
     return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  }
+
+  function activityAgeLabel(milliseconds: number | null): string {
+    return milliseconds === null ? "尚无记录" : `${durationLabel(milliseconds)} 前`;
   }
   const retrySeconds = $derived(
     recovery.retryInMs === null ? null : Math.max(1, Math.ceil(recovery.retryInMs / 1000)),
@@ -193,7 +197,7 @@
     {#if activity}
       <div class="tx-info-block">
         <div class="tx-info-row">
-          <span class="tx-info-label">上游调用</span>
+          <span class="tx-info-label">MCP 工具活动</span>
           <span class="text-sm font-semibold" style={`color: ${activityColor(activity.state)}`}>
             {activityLabel(activity.state)}
           </span>
@@ -201,7 +205,12 @@
         <p class="mt-1.5 text-sm text-[var(--text-secondary)]">{activity.message}</p>
         <p class="mt-1 text-xs text-[var(--text-muted)]">
           在途 {activity.inFlightRequests} · 最久 {durationLabel(activity.oldestInFlightMs)} ·
-          最近活动 {durationLabel(activity.lastActivityAgeMs)} 前
+          最近工具活动 {activityAgeLabel(activity.lastActivityAgeMs)}
+        </p>
+        <p class="mt-1 text-xs text-[var(--text-muted)]">
+          MCP 服务 {running ? "运行中" : recovering ? "恢复中" : "未运行"} · 最近协议活动
+          {activityAgeLabel(activity.lastTransportActivityAgeMs)}
+          {#if activity.lastTransportMethod}· {activity.lastTransportMethod}{/if}
         </p>
         {#if activity.currentTool || activity.currentMethod}
           <p class="tx-mono mt-1 truncate text-xs text-[var(--text-muted)]">
@@ -209,7 +218,8 @@
           </p>
         {/if}
         <p class="mt-1.5 text-xs text-[var(--text-muted)]">
-          仅统计 tools/call、resources/read、prompts/get；模型纯推理或 MCP 外等待无法识别。
+          工具活动仅统计 tools/call、resources/read、prompts/get；协议活动另行统计正常 MCP
+          请求/通知。模型纯推理或 MCP 外等待仍无法识别。
         </p>
       </div>
     {/if}

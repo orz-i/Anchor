@@ -154,7 +154,7 @@ pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> Strin
     let scope_badges = task_scope_badges(task);
     let total_steps = task.completed_steps.len() + task.pending_steps.len();
     let body = format!(
-        "<nav><a href='../../canvs'>← 返回任务列表</a><span>{}</span></nav><header class='detail-hero'><div class='badges'>{scope_badges}<span class='badge {}'>{}</span></div><h1>{}</h1><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><p class='subtitle'>更新于 <time data-time='{}'>{}</time> · 分支 {} · HEAD {}</p></header><main class='detail-grid'><section class='panel wide'><h2>步骤</h2><div class='columns'><div><h3>已完成</h3>{completed}</div><div><h3>待处理</h3>{pending}</div></div></section><section class='panel'><h2>任务基线</h2><dl class='facts'><div><dt>初始 HEAD</dt><dd><code>{}</code></dd></div><div><dt>当前预期 HEAD</dt><dd><code>{}</code></dd></div><div><dt>最新变更</dt><dd><code>{}</code></dd></div><div><dt>最新验证</dt><dd><code>{}</code></dd></div></dl></section><section class='panel'><h2>最近操作</h2>{operations}</section><section class='panel'><h2>有效验证</h2>{verifications}</section><section class='panel'><h2>分段提交</h2>{changes}</section><section class='panel'><h2>任务事件</h2>{events}</section></main>",
+        "<nav><a href='../../canvs'>← 返回任务列表</a><span>{}</span></nav><header class='detail-hero'><div class='badges'>{scope_badges}<span class='badge {}'>{}</span></div><h1>{}</h1><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><p class='subtitle'>最近活动 <time data-time='{}'>{}</time> · 更新于 <time data-time='{}'>{}</time> · 分支 {} · HEAD {}</p></header><main class='detail-grid'><section class='panel wide'><h2>步骤</h2><div class='columns'><div><h3>已完成</h3>{completed}</div><div><h3>待处理</h3>{pending}</div></div></section><section class='panel'><h2>任务基线</h2><dl class='facts'><div><dt>初始 HEAD</dt><dd><code>{}</code></dd></div><div><dt>当前预期 HEAD</dt><dd><code>{}</code></dd></div><div><dt>最新变更</dt><dd><code>{}</code></dd></div><div><dt>最新验证</dt><dd><code>{}</code></dd></div></dl></section><section class='panel'><h2>最近操作</h2>{operations}</section><section class='panel'><h2>有效验证</h2>{verifications}</section><section class='panel'><h2>分段提交</h2>{changes}</section><section class='panel'><h2>任务事件</h2>{events}</section></main>",
         escape_html(workspace_name),
         status_class(&task.status),
         escape_html(&status_label(&task.status)),
@@ -164,6 +164,8 @@ pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> Strin
         task.progress_percent,
         task.completed_steps.len(),
         total_steps,
+        escape_attr(task.last_activity_at.as_deref().unwrap_or(&task.updated_at)),
+        escape_html(task.last_activity_at.as_deref().unwrap_or(&task.updated_at)),
         escape_attr(&task.updated_at),
         escape_html(&task.updated_at),
         escape_html(task.branch.as_deref().unwrap_or("—")),
@@ -208,7 +210,7 @@ fn task_card(task: &CanvsTask) -> String {
     let scope_badges = task_scope_badges(task);
     let total = task.completed_steps.len() + task.pending_steps.len();
     format!(
-        "<a class='task-card' href='./canvs/tasks/{}'><div class='badges'>{scope_badges}<span class='badge {}'>{}</span></div><h2>{}</h2><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><footer><span>更新于 <time data-time='{}'>{}</time></span><span>{} · {}</span></footer></a>",
+        "<a class='task-card' href='./canvs/tasks/{}'><div class='badges'>{scope_badges}<span class='badge {}'>{}</span></div><h2>{}</h2><p class='task-id'>{}</p><div class='progress-line'><div><span style='width:{}%'></span></div><strong>{}%</strong><small>{}/{} 步骤</small></div><footer><span>最近活动 <time data-time='{}'>{}</time></span><span>{} · {}</span></footer></a>",
         escape_attr(&task.id),
         status_class(&task.status),
         escape_html(&status_label(&task.status)),
@@ -218,8 +220,8 @@ fn task_card(task: &CanvsTask) -> String {
         task.progress_percent,
         task.completed_steps.len(),
         total,
-        escape_attr(&task.updated_at),
-        escape_html(&task.updated_at),
+        escape_attr(task.last_activity_at.as_deref().unwrap_or(&task.updated_at)),
+        escape_html(task.last_activity_at.as_deref().unwrap_or(&task.updated_at)),
         escape_html(task.branch.as_deref().unwrap_or("—")),
         escape_html(&short_hash(task.expected_head.as_deref().unwrap_or(""))),
     )
@@ -420,6 +422,7 @@ mod tests {
                     latest_verification_id: None,
                     created_at: "1".into(),
                     updated_at: "2".into(),
+                    last_activity_at: Some("3".into()),
                 }],
                 refreshed_at: "2".into(),
             },

@@ -2708,7 +2708,8 @@ fn task_view(task: &TaskSession) -> Value {
         "workspace_mode": task_workspace_mode(task),
         "git_worktree": task.git_worktree,
         "created_at": task.created_at,
-        "updated_at": task.updated_at
+        "updated_at": task.updated_at,
+        "last_activity_at": task.last_activity_at
     })
 }
 

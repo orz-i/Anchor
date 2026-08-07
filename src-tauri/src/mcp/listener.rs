@@ -744,6 +744,7 @@ async fn mcp_post(
             cleanup_retired_sessions(&state);
             return http_error(StatusCode::NOT_FOUND, "Unknown or expired MCP session");
         }
+        state.activity.transport_activity("response");
         cleanup_retired_sessions(&state);
         return StatusCode::ACCEPTED.into_response();
     }
@@ -770,6 +771,7 @@ async fn mcp_post(
         } else {
             state.sessions.touch(session_id);
         }
+        state.activity.transport_activity(&method);
         cleanup_retired_sessions(&state);
         append_profile_log(
             &state.workspace_id,
@@ -1589,7 +1591,15 @@ mod tests {
         assert_eq!(state.activity.snapshot().state, "idle");
 
         let (_session_id, headers) = initialized_session(&state).await;
-        assert_eq!(state.activity.snapshot().state, "idle");
+        let initialized = state.activity.snapshot();
+        assert_eq!(initialized.state, "idle");
+        assert_eq!(initialized.completed_requests, 0);
+        assert!(initialized.transport_requests >= 2);
+        assert_eq!(
+            initialized.last_transport_method,
+            "notifications/initialized"
+        );
+        assert!(initialized.last_transport_activity_at.is_some());
 
         let response = mcp_post(
             State(state.clone()),
@@ -1607,7 +1617,10 @@ mod tests {
         assert_eq!(snapshot.state, "recent");
         assert_eq!(snapshot.in_flight_requests, 0);
         assert_eq!(snapshot.completed_requests, 1);
+        assert!(snapshot.transport_requests >= 3);
+        assert_eq!(snapshot.last_transport_method, "tools/call");
         assert!(snapshot.last_activity_at.is_some());
+        assert!(snapshot.last_transport_activity_at.is_some());
     }
 
     #[tokio::test]

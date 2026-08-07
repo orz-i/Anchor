@@ -59,6 +59,7 @@ pub struct CanvsTask {
     pub latest_verification_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub last_activity_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,9 +120,9 @@ fn task_list(harness: &Harness) -> HarnessResult<CanvsTaskList> {
     let current_task_id = harness.current_task()?.map(|task| task.id);
     let mut tasks = harness.list_tasks()?;
     tasks.sort_by(|left, right| {
-        timestamp_sort_key(&right.updated_at)
-            .cmp(&timestamp_sort_key(&left.updated_at))
-            .then_with(|| right.updated_at.cmp(&left.updated_at))
+        timestamp_sort_key(task_recency(right))
+            .cmp(&timestamp_sort_key(task_recency(left)))
+            .then_with(|| task_recency(right).cmp(task_recency(left)))
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(CanvsTaskList {
@@ -326,6 +327,18 @@ fn task_view(task: TaskSession, current: bool) -> CanvsTask {
         latest_verification_id: task.latest_verification_id,
         created_at: task.created_at,
         updated_at: task.updated_at,
+        last_activity_at: task.last_activity_at,
+    }
+}
+
+fn task_recency(task: &TaskSession) -> &str {
+    match task.last_activity_at.as_deref() {
+        Some(last_activity_at)
+            if timestamp_sort_key(last_activity_at) >= timestamp_sort_key(&task.updated_at) =>
+        {
+            last_activity_at
+        }
+        _ => task.updated_at.as_str(),
     }
 }
 
@@ -485,14 +498,19 @@ mod tests {
         let parallel = harness.start_task("parallel task").expect("parallel task");
         std::thread::sleep(Duration::from_millis(2));
         let current = harness.start_task("current task").expect("current task");
+        std::thread::sleep(Duration::from_millis(2));
+        harness
+            .resume_task_for_activity(&parallel.id, "read_file", None)
+            .expect("parallel activity");
 
         let list = task_list(&harness).expect("task list");
         assert_eq!(list.tasks.len(), 3);
-        assert_eq!(list.tasks[0].id, current.id);
-        assert!(list.tasks[0].current);
+        assert_eq!(list.tasks[0].id, parallel.id);
+        assert!(!list.tasks[0].current);
         assert!(list.tasks[0].active);
-        assert_eq!(list.tasks[1].id, parallel.id);
-        assert!(!list.tasks[1].current);
+        assert!(list.tasks[0].last_activity_at.is_some());
+        assert_eq!(list.tasks[1].id, current.id);
+        assert!(list.tasks[1].current);
         assert!(list.tasks[1].active);
         assert_eq!(list.tasks[2].id, history.id);
         assert!(!list.tasks[2].current);

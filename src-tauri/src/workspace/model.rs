@@ -135,6 +135,14 @@ pub struct McpActivityDto {
     pub completed_requests: u64,
     pub recent_window_ms: u64,
     pub suspected_stall_after_ms: u64,
+    #[serde(default)]
+    pub last_transport_activity_at: Option<String>,
+    #[serde(default)]
+    pub last_transport_activity_age_ms: Option<u64>,
+    #[serde(default)]
+    pub last_transport_method: String,
+    #[serde(default)]
+    pub transport_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,7 +462,7 @@ fn computed_public_url(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActionsConfig, RuntimeConfig, TunnelConfig, WorkspaceProfile};
+    use super::{ActionsConfig, McpActivityDto, RuntimeConfig, TunnelConfig, WorkspaceProfile};
     use crate::settings::AppSettings;
 
     #[test]
@@ -526,6 +534,31 @@ mod tests {
     #[test]
     fn persisted_runtime_config_rejects_missing_fields() {
         assert!(serde_json::from_value::<RuntimeConfig>(serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn legacy_mcp_activity_payload_defaults_new_transport_fields() {
+        let activity: McpActivityDto = serde_json::from_value(serde_json::json!({
+            "state": "idle",
+            "message": "当前没有在途 MCP 调用",
+            "inFlightRequests": 0,
+            "oldestInFlightMs": null,
+            "lastActivityAt": "2026-08-07T00:00:00.000Z",
+            "lastActivityAgeMs": 30_000,
+            "lastCompletedAt": "2026-08-07T00:00:00.000Z",
+            "currentMethod": "",
+            "currentTool": "",
+            "completedRequests": 3,
+            "recentWindowMs": 15_000,
+            "suspectedStallAfterMs": 120_000
+        }))
+        .expect("legacy MCP activity payload");
+
+        assert_eq!(activity.state, "idle");
+        assert_eq!(activity.transport_requests, 0);
+        assert!(activity.last_transport_activity_at.is_none());
+        assert!(activity.last_transport_activity_age_ms.is_none());
+        assert!(activity.last_transport_method.is_empty());
     }
 
     #[test]

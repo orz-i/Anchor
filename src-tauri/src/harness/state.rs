@@ -407,13 +407,19 @@ impl Harness {
         if !tool_activity_resumes_paused_task(tool) {
             return Ok(current);
         }
-        if current.status != TaskStatus::Paused {
+        if !current.status.is_writable() {
             return Ok(current);
         }
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(&current.id)?;
+                if !task.status.is_writable() {
+                    return Ok(task);
+                }
+                let activity_at = timestamp();
+                task.last_activity_at = Some(activity_at.clone());
                 if task.status != TaskStatus::Paused {
+                    transaction.save_task(&task)?;
                     return Ok(task);
                 }
                 let previous_writer_task_id = self
@@ -422,7 +428,7 @@ impl Harness {
                     .and_then(|state| state.active_task_id)
                     .filter(|current| current != &task.id);
                 task.status = TaskStatus::Active;
-                task.updated_at = timestamp();
+                task.updated_at = activity_at;
                 transaction.save_task(&task)?;
                 transaction.save_workspace_state(&self.workspace_state(
                     Some(task.id.as_str()),
@@ -620,7 +626,8 @@ impl Harness {
                     history_session_path: None,
                     git_worktree: git_worktree.clone(),
                     created_at: now.clone(),
-                    updated_at: now,
+                    updated_at: now.clone(),
+                    last_activity_at: Some(now),
                 };
                 transaction.save_baseline_object(&captured.object)?;
                 transaction.save_task(&task)?;
@@ -1903,40 +1910,48 @@ impl Harness {
                 }
             });
         let expected = task.as_ref().map(expected_state);
-        let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
-            match task.as_ref() {
-                Some(task) => {
-                    let expected = expected_state(task);
-                    let matches = expected.branch == current.branch
-                        && expected.head == current.head
-                        && expected.worktree_fingerprint == current.worktree_fingerprint;
-                    let reason = if matches && active_task_count > 1 {
-                        format!("任务可继续执行；当前有 {active_task_count} 个并行活动任务")
-                    } else if matches {
-                        "任务可继续执行".to_string()
-                    } else {
-                        "工作区基线已变化，写入和执行已暂停".to_string()
-                    };
-                    (
-                        Some(task.id.clone()),
-                        Some(task.status),
-                        Some(task.updated_at.clone()),
-                        matches && task.status.is_writable(),
-                        Some(matches),
-                        reason,
-                    )
-                }
-                None => {
-                    let writable = active_task_count == 0;
-                    let reason = if !writable {
-                        "当前 MCP 会话未绑定 Harness Task；工作区已有活动写任务，必须先绑定该任务"
-                            .to_string()
-                    } else {
-                        "当前没有活动任务，工作区采用无任务模式；修改不会进入任务事件流".to_string()
-                    };
-                    (None, None, None, writable, None, reason)
-                }
-            };
+        let (
+            task_id,
+            task_state,
+            task_updated_at,
+            task_last_activity_at,
+            writable,
+            baseline_matches,
+            reason,
+        ) = match task.as_ref() {
+            Some(task) => {
+                let expected = expected_state(task);
+                let matches = expected.branch == current.branch
+                    && expected.head == current.head
+                    && expected.worktree_fingerprint == current.worktree_fingerprint;
+                let reason = if matches && active_task_count > 1 {
+                    format!("任务可继续执行；当前有 {active_task_count} 个并行活动任务")
+                } else if matches {
+                    "任务可继续执行".to_string()
+                } else {
+                    "工作区基线已变化，写入和执行已暂停".to_string()
+                };
+                (
+                    Some(task.id.clone()),
+                    Some(task.status),
+                    Some(task.updated_at.clone()),
+                    task.last_activity_at.clone(),
+                    matches && task.status.is_writable(),
+                    Some(matches),
+                    reason,
+                )
+            }
+            None => {
+                let writable = active_task_count == 0;
+                let reason = if !writable {
+                    "当前 MCP 会话未绑定 Harness Task；工作区已有活动写任务，必须先绑定该任务"
+                        .to_string()
+                } else {
+                    "当前没有活动任务，工作区采用无任务模式；修改不会进入任务事件流".to_string()
+                };
+                (None, None, None, None, writable, None, reason)
+            }
+        };
 
         let mut capabilities = HashMap::new();
         capabilities.insert(
@@ -2039,6 +2054,7 @@ impl Harness {
             task_id,
             task_state,
             task_updated_at,
+            task_last_activity_at,
             session_status,
             next_stage_started: false,
             writable,
@@ -2351,6 +2367,7 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn git(root: &Path, args: &[&str]) {
@@ -2466,6 +2483,41 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn meaningful_tool_activity_updates_heartbeat_without_mutating_active_task_state() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness root");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness
+            .start_task("activity heartbeat")
+            .expect("start task");
+        let original_updated_at = task.updated_at.clone();
+        let original_activity_at = task.last_activity_at.clone().expect("initial activity");
+
+        std::thread::sleep(Duration::from_millis(2));
+        let active = harness
+            .resume_task_for_activity(&task.id, "read_file", Some("mcp-session"))
+            .expect("record activity");
+
+        assert_eq!(active.status, TaskStatus::Active);
+        assert_eq!(active.updated_at, original_updated_at);
+        assert_ne!(
+            active.last_activity_at.as_deref(),
+            Some(original_activity_at.as_str())
+        );
+        let status = harness.status_for_task(Some(&task.id)).expect("status");
+        assert_eq!(status.task_state, Some(TaskStatus::Active));
+        assert_eq!(
+            status.task_updated_at.as_deref(),
+            Some(original_updated_at.as_str())
+        );
+        assert_eq!(status.task_last_activity_at, active.last_activity_at);
     }
 
     #[test]
