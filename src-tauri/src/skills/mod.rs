@@ -19,6 +19,7 @@ pub const TOOL_NAMES: &[&str] = &[
 const RESOURCE_PAGE_SIZE: usize = 200;
 const MAX_RESOURCE_ENTRIES: usize = 5000;
 const DEFAULT_SKILL_PAGE_BYTES: u64 = 65_536;
+const NATIVE_SKILL_PAGE_SIZE: usize = 5;
 
 #[derive(Debug)]
 struct SkillUriRequest {
@@ -229,6 +230,63 @@ pub fn resources_list(catalog: &SkillCatalog, params: &Value) -> Result<Value, V
     Ok(result)
 }
 
+pub fn native_skills_list(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
+    if !catalog.is_enabled() {
+        return Err(rpc_error(
+            -32602,
+            "Skill service is disabled for this workspace/profile",
+        ));
+    }
+    let offset = params
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(decode_cursor)
+        .transpose()
+        .map_err(|error| rpc_error(-32602, &error))?
+        .unwrap_or(0);
+    let native = catalog.native_catalog();
+    if offset > native.skills.len() {
+        return Err(rpc_error(-32602, "Invalid skills/list cursor"));
+    }
+    let end = (offset + NATIVE_SKILL_PAGE_SIZE).min(native.skills.len());
+    let page = native.skills[offset..end].to_vec();
+    let mut result = json!({ "skills": page });
+    if end < native.skills.len() {
+        result["nextCursor"] = Value::String(encode_cursor(end));
+    }
+    Ok(result)
+}
+
+pub fn native_skill_get(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
+    if !catalog.is_enabled() {
+        return Err(rpc_error(
+            -32602,
+            "Skill service is disabled for this workspace/profile",
+        ));
+    }
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| rpc_error(-32602, "Missing skill uri"))?;
+    if uri.contains('?') || uri.contains('#') {
+        return Err(rpc_error(
+            -32602,
+            "skills/get requires the canonical SKILL.md URI without query or fragment",
+        ));
+    }
+    let request = parse_skill_uri(uri).map_err(|error| rpc_error(-32602, &error))?;
+    if request.path != "SKILL.md" {
+        return Err(rpc_error(-32602, "skills/get URI must point to SKILL.md"));
+    }
+    let skill = catalog
+        .native_catalog()
+        .skills
+        .into_iter()
+        .find(|skill| skill["uri"] == uri)
+        .ok_or_else(|| rpc_error(-32002, "Skill is not exposed by skills/list"))?;
+    Ok(json!({ "skill": skill }))
+}
+
 pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
     if !catalog.is_enabled() {
         return Err(rpc_error(
@@ -378,7 +436,7 @@ fn parse_skill_uri(uri: &str) -> Result<SkillUriRequest, String> {
         path,
         start_line: None,
         end_line: None,
-        max_bytes: DEFAULT_SKILL_PAGE_BYTES,
+        max_bytes: catalog::MAX_SKILL_MD_BYTES,
     };
     let Some(query) = query else {
         return Ok(request);
@@ -491,6 +549,37 @@ mod tests {
     }
 
     #[test]
+    fn native_list_uses_only_standard_fields_and_get_is_limited_to_exposed_skills() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for index in 0..6 {
+            let skill_dir = temp.path().join(format!("skills/skill-{index}"));
+            fs::create_dir_all(&skill_dir).expect("skill dir");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: skill-{index}\ndescription: Native skill {index}.\n---\nUse it.\n"
+                ),
+            )
+            .expect("skill");
+        }
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let listed = native_skills_list(&catalog, &json!({})).expect("native list");
+        let object = listed.as_object().expect("list object");
+        assert_eq!(object.len(), 1);
+        assert!(object.contains_key("skills"));
+        assert_eq!(listed["skills"].as_array().expect("skills").len(), 5);
+
+        let exposed = native_skill_get(&catalog, &json!({"uri": "skill://skill-4/SKILL.md"}))
+            .expect("exposed get");
+        assert_eq!(exposed["skill"]["frontmatter"]["name"], "skill-4");
+
+        let omitted = native_skill_get(&catalog, &json!({"uri": "skill://skill-5/SKILL.md"}))
+            .expect_err("omitted skill must not be gettable");
+        assert_eq!(omitted["code"], -32002);
+    }
+
+    #[test]
     fn direct_tool_lists_exact_readable_resource_manifest() {
         let (_temp, catalog) = catalog_with_skill();
 
@@ -549,6 +638,28 @@ mod tests {
         let second = resource_read(&catalog, &json!({"uri": next_uri})).expect("second page");
         assert!(second["_meta"]["startLine"].as_u64().unwrap() > 1);
         assert_ne!(first["contents"][0]["text"], second["contents"][0]["text"]);
+    }
+
+    #[test]
+    fn canonical_skill_resource_read_returns_full_content_for_native_import() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("skills/native-large");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        let body = "native-import-line\n".repeat(4_000);
+        let raw = format!(
+            "---\nname: native-large\ndescription: Native import large skill.\n---\n{body}"
+        );
+        assert!(raw.len() > DEFAULT_SKILL_PAGE_BYTES as usize);
+        assert!(raw.len() < catalog::MAX_SKILL_MD_BYTES as usize);
+        fs::write(skill_dir.join("SKILL.md"), &raw).expect("skill");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let result = resource_read(&catalog, &json!({"uri": "skill://native-large/SKILL.md"}))
+            .expect("native import read");
+
+        assert_eq!(result["contents"][0]["text"], raw);
+        assert_eq!(result["_meta"]["truncated"], false);
+        assert!(result["_meta"].get("nextUri").is_none());
     }
 
     #[test]

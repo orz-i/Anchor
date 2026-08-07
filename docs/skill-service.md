@@ -1,6 +1,6 @@
 # MCP Agent Skills 服务
 
-Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills，并通过 MCP 工具和资源按需提供给客户端。
+Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills。对支持原生 Skills 的 ChatGPT Plugin，Anchor 按 MCP Skills extension 暴露 Skill；旧的 Skill helper 工具仍保留为兼容调用入口，但不再发布到 `tools/list`，因此不占用 ChatGPT 的工具目录配额。
 
 数据模型保持不变：**一个 workspace 对应一个 WorkspaceProfile**。Skill 服务开关和目录列表保存在该 profile 的 `runtime` 配置中，GUI 与 Linux CLI 启动的 MCP 使用同一份配置。
 
@@ -68,7 +68,7 @@ skills
 /opt/company-skills
 ```
 
-根目录可以直接是单个 Skill，也可以在两层以内包含多个 Skill 子目录。配置顺序代表优先级；同名 Skill 出现多次时保留最先发现的版本，并在扫描预览和 `list_skills` 中返回警告。
+根目录可以直接是单个 Skill，也可以在两层以内包含多个 Skill 子目录。配置顺序代表优先级；同名 Skill 出现多次时保留最先发现的版本，并在扫描预览和兼容 Skill 目录中返回警告。
 
 ## GUI 配置
 
@@ -78,11 +78,38 @@ skills
 2. 每行填写一个 Skill 根目录；
 3. 点击“扫描目录”进行只读预览；
 4. 点击“保存 Skill 服务”；
-5. MCP 已运行时，停止并重新启动 MCP 服务；客户端缓存了工具目录时，重新连接 MCP。
+5. MCP 已运行时，停止并重新启动 MCP 服务；ChatGPT Plugin 中使用 **Scan Tools** 重新扫描并更新 Skill 快照。
 
 “扫描目录”只读取文件，不启动 MCP、Actions、脚本或隧道。
 
-## MCP 工具
+## 原生 MCP Skills extension
+
+Skill 服务启用时，MCP `initialize` 会声明：
+
+```json
+{
+  "capabilities": {
+    "extensions": {
+      "io.modelcontextprotocol/skills": {}
+    }
+  }
+}
+```
+
+Anchor 实现 `skills/list`、`skills/get` 与 `resources/read`：
+
+- `skills/list` 返回 canonical `skill://<name>/SKILL.md` URI、完整 YAML frontmatter 的 JSON 投影，以及 `SKILL.md` 和全部可导入支持文件的资源清单；
+- 每个资源条目包含文件级 `sha256:<64 lowercase hex>` digest；`SKILL.md` 文件摘要与 Anchor 的整包 `SkillSummary.digest` 分开计算；
+- `skills/get` 通过 canonical `SKILL.md` URI 返回与目录相同的完整 Skill manifest；
+- `resources/read` 对 manifest 中的 canonical URI 返回完整文件内容，以便宿主核对 digest。
+
+当前 ChatGPT Plugin 导入边界按 OpenAI 的静态扫描限制收紧：最多暴露 5 个可导入 Skill，每个 Skill 最多 100 个文件、单个支持文件不超过 1 MiB、总资源不超过 5 MiB。OpenAI 还限制一次 Scan Tools 生成的 Skill 归档总量为 8 MiB（含 ZIP 开销），因此 Anchor 进一步使用保守的 7 MiB 原始资源总预算，为归档元数据预留空间。Anchor 自身的 `SKILL.md` 安全上限仍为 128 KiB。存在资源扫描截断、符号链接、未进入受控清单的额外文件、被安全策略排除的文件或不可读取支持文件时，该 Skill 不进入原生导入目录，避免生成不完整快照。
+
+ChatGPT 的 Skill 导入发生在 Plugin **Scan Tools / 提交阶段**。导入的是静态快照，不会在每次对话运行时重新从 Anchor 拉取 Skill；修改 Skill 后需要重新 Scan Tools 并发布/更新插件版本。
+
+## 兼容 Skill helper 工具
+
+以下旧接口继续保留在服务器中，供已经缓存过 schema 的旧客户端显式调用；**它们不再出现在 `tools/list`**。
 
 ### `list_skills`
 
@@ -112,7 +139,7 @@ skills
 
 返回值包含 `startLine`、`endLine`、`totalLines`、`totalBytes`、`returnedBytes`、`truncated` 和 `nextStartLine`。如果 `truncated=true`，使用 `nextStartLine` 继续读取。`max_bytes` 最大为 131072。
 
-推荐工作流是先调用 `list_skills`，仅在任务确实需要时调用 `load_skill`。
+对不支持原生 MCP Skills extension 的旧客户端，推荐工作流仍是先调用 `list_skills`，仅在任务确实需要时调用 `load_skill`。
 
 ### `read_skill_resource`
 
@@ -142,7 +169,7 @@ skill://<skill-name>/scripts/<file>
 skill://<skill-name>/assets/<file>
 ```
 
-读取较大的 `SKILL.md` 时，服务默认最多返回 65536 字节，并在 `_meta.nextUri` 中提供续页 URI，例如：
+canonical `resources/read` 请求（不带查询参数）会一次返回完整 `SKILL.md`，用于原生 Skill 导入的 digest 校验。旧客户端仍可显式使用查询参数分页，例如：
 
 ```text
 skill://code-review/SKILL.md?start_line=401&max_bytes=65536
@@ -162,7 +189,7 @@ skill://code-review/SKILL.md?start_line=401&max_bytes=65536
 }
 ```
 
-Skill 服务关闭时，Skill 工具不会出现在 `tools/list`，MCP 也不会声明 resources capability。
+Skill 服务关闭时，MCP 不声明 Skills extension 或 resources capability。Skill 服务开启时，旧 Skill helper 工具同样不会进入 `tools/list`；原生 Skill 发现不再消耗工具槽位。
 
 ## Linux CLI
 
@@ -190,7 +217,7 @@ Skill 服务不需要额外 CLI 参数。MCP 启动时会读取 profile 中的 `
 
 ## 客户端建议
 
-客户端收到 Skill 能力后应采用渐进式加载：
+支持 MCP Skills extension 的 Plugin 应优先使用原生 Skill 导入。旧客户端若只能使用兼容接口，则采用渐进式加载：
 
 1. 使用 `list_skills` 或 `skill://index.json` 获取名称和描述；
 2. 选择与当前任务匹配的 Skill；

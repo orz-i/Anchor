@@ -76,17 +76,18 @@ pub fn build_effective_catalog(ctx: &ToolContext) -> Result<EffectiveCatalog, Wo
 
 pub fn build_effective_catalog_from_parts(
     tool_profile: &str,
-    skill_service_enabled: bool,
+    _skill_service_enabled: bool,
     mut proxy_tools: Vec<Value>,
 ) -> Result<EffectiveCatalog, WorkspaceError> {
     let mut tools = crate::tools::registry::list_tools_for_profile(tool_profile);
-    if !skill_service_enabled {
-        tools.retain(|tool| {
-            tool.get("name")
-                .and_then(Value::as_str)
-                .is_none_or(|name| !crate::skills::is_skill_tool(name))
-        });
-    }
+    // Agent Skills use the native MCP Skills extension. Keep the legacy helper
+    // handlers callable for clients that already know their schemas, but never
+    // publish them in tools/list where they consume ChatGPT's tool budget.
+    tools.retain(|tool| {
+        tool.get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| !crate::skills::is_skill_tool(name))
+    });
     tools.sort_by(tool_name_order);
     proxy_tools.sort_by(tool_name_order);
     let local_count = tools.len();
@@ -358,7 +359,7 @@ fn catalog_error(code: &'static str, message: impl Into<String>, details: Value)
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use proptest::prelude::*;
     use serde_json::json;
@@ -433,7 +434,10 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(48))
             .expect("advanced plus browser catalog");
 
-        assert_eq!(catalog.local_count, crate::tools::registry::P0_TOOLS.len());
+        assert_eq!(
+            catalog.local_count,
+            crate::tools::registry::P0_TOOLS.len() - crate::skills::TOOL_NAMES.len()
+        );
         assert_eq!(catalog.proxy_count, 48);
         let first_page_names = catalog.tools[..64]
             .iter()
@@ -462,7 +466,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 44);
+        assert_eq!(catalog.local_count, 40);
         assert_eq!(catalog.proxy_count, 48);
         assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
             !tool["name"]
@@ -486,9 +490,9 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 44);
+        assert_eq!(catalog.local_count, 40);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 52);
+        assert_eq!(catalog.tools.len(), 48);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
@@ -509,7 +513,7 @@ mod tests {
         );
         assert_eq!(
             diagnostic["details"]["local_tool_count"],
-            crate::tools::registry::P0_TOOLS.len()
+            crate::tools::registry::P0_TOOLS.len() - crate::skills::TOOL_NAMES.len()
         );
         assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
         assert!(diagnostic["details"]["suggestions"]
@@ -537,6 +541,27 @@ mod tests {
             actual, expected,
             "run with UPDATE_EFFECTIVE_CATALOG_SNAPSHOT=1"
         );
+    }
+
+    #[test]
+    fn native_skill_helpers_never_consume_effective_tool_slots() {
+        for enabled in [true, false] {
+            for profile in ["core", "read-only", "advanced"] {
+                let catalog = build_effective_catalog_from_parts(profile, enabled, Vec::new())
+                    .expect("effective catalog");
+                let names = catalog
+                    .tools
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .collect::<HashSet<_>>();
+                for skill_tool in crate::skills::TOOL_NAMES {
+                    assert!(
+                        !names.contains(skill_tool),
+                        "{skill_tool} leaked into {profile} tools/list with enabled={enabled}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

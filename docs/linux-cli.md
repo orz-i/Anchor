@@ -165,7 +165,7 @@ Linux CLI 启动 MCP 时会读取同一个 WorkspaceProfile 中的 Skill 服务�
 anchor serve PROFILE_ID --service mcp
 ```
 
-确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 将提供 `list_skills`、`load_skill`、`read_skill_resource` 和 `skill://` resources；Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
+确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 将声明原生 `io.modelcontextprotocol/skills` extension，并提供 `skills/list`、`skills/get` 和 `skill://` resources；旧 Skill helper 工具仅保留显式调用兼容且不再发布到 `tools/list`。Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
 
 ## 自动恢复
 

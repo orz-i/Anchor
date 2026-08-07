@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 30,
+    "catalog_version": 31,
     "names": [
       "accept_current_baseline",
       "accept_latest_baseline",
@@ -42,17 +42,13 @@
       "list_command_sessions",
       "list_dir",
       "list_files",
-      "list_skill_resources",
-      "list_skills",
       "list_task_events",
-      "load_skill",
       "operation_log",
       "patch_check",
       "pause_task",
       "project_state",
       "read_file",
       "read_output",
-      "read_skill_resource",
       "refresh_baseline",
       "remove_path",
       "resume_task",
@@ -74,10 +70,10 @@
       "wait_stage_commit",
       "write_stdin"
     ],
-    "tool_count": 71
+    "tool_count": 67
   },
   "core": {
-    "catalog_version": 30,
+    "catalog_version": 31,
     "names": [
       "accept_latest_baseline",
       "apply_patch",
@@ -108,12 +104,8 @@
       "list_command_sessions",
       "list_dir",
       "list_files",
-      "list_skill_resources",
-      "list_skills",
-      "load_skill",
       "read_file",
       "read_output",
-      "read_skill_resource",
       "remove_path",
       "search_text",
       "server_info",
@@ -124,10 +116,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 44
+    "tool_count": 40
   },
   "read-only": {
-    "catalog_version": 30,
+    "catalog_version": 31,
     "names": [
       "browser_build_info",
       "check_exec_environment",
@@ -142,17 +134,13 @@
       "list_command_sessions",
       "list_dir",
       "list_files",
-      "list_skill_resources",
-      "list_skills",
-      "load_skill",
       "read_file",
       "read_output",
-      "read_skill_resource",
       "search_text",
       "server_info",
       "view_image",
       "wait_command"
     ],
-    "tool_count": 23
+    "tool_count": 19
   }
 }

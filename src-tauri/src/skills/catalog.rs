@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -15,6 +16,13 @@ use super::resource::{discover_files, read_resource, ResourceReadRequest, MAX_RE
 const DEFAULT_SKILL_ROOTS: &str = ".agents/skills\n.codex/skills\nskills";
 const MAX_SKILLS: usize = 200;
 pub(super) const MAX_SKILL_MD_BYTES: u64 = 131_072;
+pub(super) const MAX_NATIVE_IMPORT_SKILLS: usize = 5;
+const MAX_NATIVE_IMPORT_FILES: usize = 100;
+const MAX_NATIVE_IMPORT_BYTES: u64 = 5 * 1024 * 1024;
+// OpenAI caps the generated archives for a single Scan Tools pass at 8 MiB,
+// including ZIP overhead. Keep a conservative raw-payload margin so Anchor
+// never advertises a catalog that only fails later during plugin submission.
+const MAX_NATIVE_SCAN_RAW_BYTES: u64 = 7 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillSettings {
@@ -22,10 +30,27 @@ pub struct SkillSettings {
     pub roots: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct NativeSkillEntry {
+    value: Value,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeSkillCatalog {
+    pub skills: Vec<Value>,
+    pub eligible_count: usize,
+    pub omitted_count: usize,
+    pub warnings: Vec<String>,
+}
+
 fn is_full_sha256(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn script_match(record: &SkillRecord, relative: &str, script_path: &Path) -> SkillScriptMatch {
@@ -140,6 +165,8 @@ struct SkillRecord {
     summary: SkillSummary,
     directory: PathBuf,
     raw: String,
+    frontmatter: Value,
+    skill_md_digest: String,
     instructions: String,
     readable_paths: HashSet<String>,
     readable_digests: std::collections::HashMap<String, String>,
@@ -297,6 +324,65 @@ impl SkillCatalog {
             "skills": skills
         }))
         .map_err(|error| format!("Skill index 序列化失败：{error}"))
+    }
+
+    pub fn native_catalog(&self) -> NativeSkillCatalog {
+        let settings = self.settings();
+        let snapshot = self.refresh_snapshot();
+        if !settings.enabled {
+            return NativeSkillCatalog {
+                skills: Vec::new(),
+                eligible_count: 0,
+                omitted_count: 0,
+                warnings: Vec::new(),
+            };
+        }
+
+        let mut eligible = Vec::new();
+        let mut warnings = snapshot.warnings.clone();
+        for record in snapshot.records.values() {
+            match native_entry_with_size(record) {
+                Ok(entry) => eligible.push(entry),
+                Err(error) => warnings.push(format!(
+                    "Skill {} 未进入原生 MCP Skill 导入目录：{error}",
+                    record.summary.name
+                )),
+            }
+        }
+        let eligible_count = eligible.len();
+        let mut exposed = Vec::new();
+        let mut exposed_bytes = 0_u64;
+        let mut scan_budget_omitted = 0_usize;
+        let mut count_omitted = 0_usize;
+        for entry in eligible {
+            if exposed.len() >= MAX_NATIVE_IMPORT_SKILLS {
+                count_omitted += 1;
+                continue;
+            }
+            if exposed_bytes.saturating_add(entry.total_bytes) > MAX_NATIVE_SCAN_RAW_BYTES {
+                scan_budget_omitted += 1;
+                continue;
+            }
+            exposed_bytes = exposed_bytes.saturating_add(entry.total_bytes);
+            exposed.push(entry.value);
+        }
+        let omitted_count = eligible_count.saturating_sub(exposed.len());
+        if count_omitted > 0 {
+            warnings.push(format!(
+                "原生 MCP Skill 导入最多暴露 {MAX_NATIVE_IMPORT_SKILLS} 个 Skill；其余 {count_omitted} 个仅保留在 Anchor 本地 Skill 目录中"
+            ));
+        }
+        if scan_budget_omitted > 0 {
+            warnings.push(format!(
+                "为给 8 MiB Plugin Scan Tools 归档上限预留 ZIP 开销，Anchor 将原生 Skill 原始资源总量限制为 {MAX_NATIVE_SCAN_RAW_BYTES} 字节；有 {scan_budget_omitted} 个 Skill 因扫描总预算未暴露"
+            ));
+        }
+        NativeSkillCatalog {
+            skills: exposed,
+            eligible_count,
+            omitted_count,
+            warnings,
+        }
     }
 
     pub fn read_skill_markdown(
@@ -523,6 +609,7 @@ fn read_skill_record(
     let parsed = parse_skill_markdown(&raw, directory_name)?;
     let discovered = discover_files(&canonical_dir);
     let digest = package_digest(&raw, &discovered.resources, &discovered.scripts);
+    let skill_md_digest = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
     let (source, source_id, relative_path) =
         source_descriptor(workspace_root, configured_root, source_root, &canonical_dir);
     let uri = format!("skill://{}/SKILL.md", parsed.name);
@@ -563,10 +650,112 @@ fn read_skill_record(
         summary,
         directory: canonical_dir,
         raw,
+        frontmatter: parsed.frontmatter,
+        skill_md_digest,
         instructions: parsed.instructions,
         readable_paths: discovered.readable_paths,
         readable_digests: discovered.readable_digests,
         script_paths: discovered.script_paths,
+    })
+}
+
+fn validate_native_manifest_completeness(record: &SkillRecord) -> Result<(), String> {
+    const MAX_NATIVE_WALK_DEPTH: usize = 16;
+    for entry in WalkDir::new(&record.directory)
+        .min_depth(1)
+        .max_depth(MAX_NATIVE_WALK_DEPTH)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = entry.map_err(|error| format!("遍历 Skill 目录失败：{error}"))?;
+        let relative = entry
+            .path()
+            .strip_prefix(&record.directory)
+            .map_err(|_| "Skill 文件路径无法映射到导入根目录".to_string())?;
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "原生导入不接受符号链接：{}",
+                relative.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        if entry.file_type().is_dir() {
+            if entry.depth() == MAX_NATIVE_WALK_DEPTH {
+                return Err(format!(
+                    "Skill 目录深度超过原生导入审计上限 {MAX_NATIVE_WALK_DEPTH}：{}",
+                    relative.to_string_lossy().replace('\\', "/")
+                ));
+            }
+            continue;
+        }
+        if !entry.file_type().is_file() || relative == Path::new("SKILL.md") {
+            continue;
+        }
+        let path = relative.to_string_lossy().replace('\\', "/");
+        if !record.readable_paths.contains(&path) {
+            return Err(format!(
+                "支持文件未进入可校验资源清单或被安全策略排除：{path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn native_entry_with_size(record: &SkillRecord) -> Result<NativeSkillEntry, String> {
+    if record.summary.resource_truncated {
+        return Err("资源清单已截断，无法保证导入快照完整".into());
+    }
+    if !record.summary.warnings.is_empty() {
+        return Err(format!(
+            "资源扫描存在未完整纳入导入快照的文件：{}",
+            record.summary.warnings.join("；")
+        ));
+    }
+    validate_native_manifest_completeness(record)?;
+    let mut supporting = record
+        .summary
+        .resources
+        .iter()
+        .chain(record.summary.scripts.iter())
+        .collect::<Vec<_>>();
+    supporting.sort_by(|left, right| left.path.cmp(&right.path));
+    if supporting.len().saturating_add(1) > MAX_NATIVE_IMPORT_FILES {
+        return Err(format!(
+            "文件数 {} 超过原生导入上限 {MAX_NATIVE_IMPORT_FILES}",
+            supporting.len().saturating_add(1)
+        ));
+    }
+    if supporting
+        .iter()
+        .any(|file| !file.readable || !is_full_sha256(&file.digest))
+    {
+        return Err("存在超过 1 MiB、不可读或缺少完整 SHA-256 的支持文件".into());
+    }
+    let total_bytes =
+        record.raw.len() as u64 + supporting.iter().map(|file| file.size_bytes).sum::<u64>();
+    if total_bytes > MAX_NATIVE_IMPORT_BYTES {
+        return Err(format!(
+            "资源总大小 {total_bytes} 字节超过原生导入上限 {MAX_NATIVE_IMPORT_BYTES}"
+        ));
+    }
+
+    let mut resources = Vec::with_capacity(supporting.len() + 1);
+    resources.push(json!({
+        "uri": record.summary.uri,
+        "digest": record.skill_md_digest
+    }));
+    resources.extend(supporting.into_iter().map(|file| {
+        json!({
+            "uri": super::resource::skill_resource_uri(&record.summary.name, &file.path),
+            "digest": file.digest
+        })
+    }));
+    Ok(NativeSkillEntry {
+        value: json!({
+            "uri": record.summary.uri,
+            "frontmatter": record.frontmatter,
+            "resources": resources
+        }),
+        total_bytes,
     })
 }
 
@@ -742,6 +931,103 @@ mod tests {
         assert_eq!(listed.skills[0].metadata["risk"], "low");
         assert_eq!(listed.skills[0].metadata["category"], "development");
         assert_eq!(listed.skills[0].metadata["user-invocable"], true);
+
+        let native = catalog.native_catalog();
+        assert_eq!(native.skills.len(), 1);
+        assert_eq!(native.skills[0]["frontmatter"]["risk"], "low");
+        assert_eq!(native.skills[0]["frontmatter"]["category"], "development");
+        assert_eq!(native.skills[0]["frontmatter"]["user-invocable"], true);
+    }
+
+    #[test]
+    fn native_catalog_is_bounded_to_chatgpt_import_limits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = temp.path().join("skills");
+        for index in 0..6 {
+            write_skill(
+                &skills,
+                &format!("skill-{index}"),
+                &format!("Skill {index}."),
+            );
+        }
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let native = catalog.native_catalog();
+
+        assert_eq!(native.eligible_count, 6);
+        assert_eq!(native.skills.len(), MAX_NATIVE_IMPORT_SKILLS);
+        assert_eq!(native.omitted_count, 1);
+        assert!(native
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("原生 MCP Skill 导入最多暴露")));
+    }
+
+    #[test]
+    fn native_catalog_omits_skills_with_unreadable_supporting_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = temp.path().join("skills");
+        write_skill(&skills, "oversize", "Oversize resource.");
+        fs::write(
+            skills.join("oversize/references/LARGE.bin"),
+            vec![0_u8; (MAX_RESOURCE_BYTES + 1) as usize],
+        )
+        .expect("large resource");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let native = catalog.native_catalog();
+
+        assert!(native.skills.is_empty());
+        assert!(native
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("未进入原生 MCP Skill 导入目录")));
+    }
+
+    #[test]
+    fn native_catalog_reserves_scan_archive_overhead_across_skills() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = temp.path().join("skills");
+        for name in ["archive-a", "archive-b"] {
+            write_skill(&skills, name, "Large native import payload.");
+            let references = skills.join(name).join("references");
+            for index in 0..4 {
+                fs::write(
+                    references.join(format!("payload-{index}.bin")),
+                    vec![0_u8; 900 * 1024],
+                )
+                .expect("payload");
+            }
+        }
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let native = catalog.native_catalog();
+
+        assert_eq!(native.eligible_count, 2);
+        assert_eq!(native.skills.len(), 1);
+        assert_eq!(native.omitted_count, 1);
+        assert!(native
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("预留 ZIP 开销")));
+    }
+
+    #[test]
+    fn native_catalog_requires_every_supporting_file_to_be_manifested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = temp.path().join("skills");
+        write_skill(&skills, "complete", "Complete manifest.");
+        let extra = skills.join("complete/docs");
+        fs::create_dir_all(&extra).expect("extra dir");
+        fs::write(extra.join("NOTES.md"), "not in Anchor resource manifest\n").expect("extra file");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let native = catalog.native_catalog();
+
+        assert!(native.skills.is_empty());
+        assert!(native.warnings.iter().any(|warning| {
+            warning.contains("支持文件未进入可校验资源清单") && warning.contains("docs/NOTES.md")
+        }));
     }
 
     #[test]

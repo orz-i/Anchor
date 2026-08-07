@@ -196,6 +196,7 @@ struct RawSkillFrontmatter {
 pub struct ParsedSkillMarkdown {
     pub name: String,
     pub description: String,
+    pub frontmatter: Value,
     pub license: Option<String>,
     pub compatibility: Option<String>,
     pub metadata: Value,
@@ -214,6 +215,13 @@ pub fn parse_skill_markdown(
     directory_name: &str,
 ) -> Result<ParsedSkillMarkdown, String> {
     let (frontmatter, instructions) = split_frontmatter(raw)?;
+    let frontmatter_value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter)
+        .map_err(|error| format!("SKILL.md frontmatter 无效：{error}"))?;
+    let frontmatter_json = serde_json::to_value(&frontmatter_value)
+        .map_err(|error| format!("SKILL.md frontmatter 无法转换为 JSON：{error}"))?;
+    if !frontmatter_json.is_object() {
+        return Err("SKILL.md frontmatter 必须是对象".into());
+    }
     let parsed: RawSkillFrontmatter = serde_yaml::from_str(frontmatter)
         .map_err(|error| format!("SKILL.md frontmatter 无效：{error}"))?;
     validate_name(&parsed.name, directory_name)?;
@@ -279,6 +287,7 @@ pub fn parse_skill_markdown(
     Ok(ParsedSkillMarkdown {
         name: parsed.name,
         description,
+        frontmatter: frontmatter_json,
         license: parsed.license.filter(|value| !value.trim().is_empty()),
         compatibility: parsed
             .compatibility
