@@ -818,6 +818,85 @@ fn call_tool_impl(
             return normalize_exec_preflight_result(ctx, name, args, output, "rejected");
         }
     }
+    if crate::tools::registry::is_facade_tool(name) {
+        let operation = args
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(delegated_tool) =
+            crate::tools::registry::facade_tool_for_operation(name, operation)
+        else {
+            let mut output = tool_err(WorkspaceError::ToolDetails {
+                code: "INVALID_FACADE_OPERATION",
+                message: format!("Unsupported {name} operation: {operation}"),
+                category: "validation",
+                retryable: false,
+                details: json!({
+                    "facade": name,
+                    "operation": operation,
+                    "available_operations": crate::tools::registry::facade_operations_for_profile(name, &ctx.tool_profile)
+                }),
+            });
+            if let Some(object) = output.as_object_mut() {
+                object.insert("facade".into(), Value::String(name.to_string()));
+                object.insert("operation".into(), Value::String(operation.to_string()));
+            }
+            return output;
+        };
+        let available_operations =
+            crate::tools::registry::facade_operations_for_profile(name, &ctx.tool_profile);
+        if !available_operations.contains(&operation) {
+            let mut output = tool_err(WorkspaceError::ToolDetails {
+                code: "FACADE_OPERATION_NOT_AVAILABLE_FOR_PROFILE",
+                message: format!(
+                    "{name} operation {operation} is not available in the {} tool profile",
+                    ctx.tool_profile
+                ),
+                category: "permission",
+                retryable: false,
+                details: json!({
+                    "facade": name,
+                    "operation": operation,
+                    "tool_profile": ctx.tool_profile,
+                    "available_operations": available_operations
+                }),
+            });
+            if let Some(object) = output.as_object_mut() {
+                object.insert("facade".into(), Value::String(name.to_string()));
+                object.insert("operation".into(), Value::String(operation.to_string()));
+            }
+            return output;
+        }
+
+        let mut delegated_args = args.clone();
+        delegated_args
+            .as_object_mut()
+            .expect("facade arguments are schema-validated objects")
+            .remove("operation");
+        if let Err(error) =
+            crate::tools::schema::validate_tool_input(delegated_tool, &delegated_args)
+        {
+            let mut output = tool_err(error);
+            if let Some(object) = output.as_object_mut() {
+                object.insert("facade".into(), Value::String(name.to_string()));
+                object.insert("operation".into(), Value::String(operation.to_string()));
+            }
+            return output;
+        }
+        let mut output = call_tool_impl(
+            ctx,
+            delegated_tool,
+            &delegated_args,
+            cancellation,
+            false,
+            session_id,
+        );
+        if let Some(object) = output.as_object_mut() {
+            object.insert("facade".into(), Value::String(name.to_string()));
+            object.insert("operation".into(), Value::String(operation.to_string()));
+        }
+        return output;
+    }
     let initial_task = resolve_task_for_call(ctx, name, args, session_id);
     let scoped_context = if tool_uses_task_worktree(name) {
         match initial_task
@@ -1698,10 +1777,17 @@ fn attach_standalone_metadata(output: &mut Value, recovery_hint: &str) {
 
 fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String> {
     let exposed = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
-    actions
-        .into_iter()
-        .filter(|action| exposed.contains(&action.as_str()))
-        .collect()
+    let mut filtered = Vec::new();
+    for action in actions {
+        if !exposed.contains(&action.as_str()) || crate::skills::is_skill_tool(&action) {
+            continue;
+        }
+        let public = crate::tools::registry::facade_for_legacy_tool(&action).unwrap_or(&action);
+        if exposed.contains(&public) && !filtered.iter().any(|item| item == public) {
+            filtered.push(public.to_string());
+        }
+    }
+    filtered
 }
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
@@ -1836,7 +1922,7 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
     let mut browser_proxy = Vec::new();
     let mut service = Vec::new();
     for tool in tools {
-        let target = if tool.starts_with("git_") {
+        let target = if *tool == "git" || tool.starts_with("git_") {
             &mut git
         } else if matches!(
             *tool,
@@ -1852,7 +1938,10 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
             &mut command
         } else if matches!(
             *tool,
-            "harness_status"
+            "task"
+                | "slice"
+                | "commit_stage"
+                | "harness_status"
                 | "project_state"
                 | "start_task"
                 | "update_task"

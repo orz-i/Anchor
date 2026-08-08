@@ -1,8 +1,190 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 31;
+pub const CATALOG_VERSION: u32 = 32;
+
+pub const LEGACY_GIT_TOOLS: &[&str] = &[
+    "git_status",
+    "git_worktree_list",
+    "git_worktree_create",
+    "git_worktree_remove",
+    "git_worktree_prune",
+    "git_stage",
+    "git_commit",
+    "git_restore",
+    "git_reset",
+    "git_revert",
+    "git_clean",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+];
+
+pub const GIT_OPERATIONS: &[(&str, &str)] = &[
+    ("status", "git_status"),
+    ("worktree_list", "git_worktree_list"),
+    ("worktree_create", "git_worktree_create"),
+    ("worktree_remove", "git_worktree_remove"),
+    ("worktree_prune", "git_worktree_prune"),
+    ("stage", "git_stage"),
+    ("commit", "git_commit"),
+    ("restore", "git_restore"),
+    ("reset", "git_reset"),
+    ("revert", "git_revert"),
+    ("clean", "git_clean"),
+    ("diff", "git_diff"),
+    ("log", "git_log"),
+    ("show", "git_show"),
+    ("blame", "git_blame"),
+];
+
+pub const LEGACY_TASK_TOOLS: &[&str] = &[
+    "harness_status",
+    "operation_log",
+    "update_verification_disposition",
+    "project_state",
+    "start_task",
+    "refresh_baseline",
+    "accept_current_baseline",
+    "accept_latest_baseline",
+    "update_task",
+    "task_gate_status",
+    "pause_task",
+    "resume_task",
+    "switch_task",
+    "finish_task",
+    "task_context",
+    "list_task_events",
+    "change_summary",
+    "export_work_session",
+];
+
+pub const TASK_OPERATIONS: &[(&str, &str)] = &[
+    ("status", "harness_status"),
+    ("operation_log", "operation_log"),
+    (
+        "verification_disposition",
+        "update_verification_disposition",
+    ),
+    ("project_state", "project_state"),
+    ("start", "start_task"),
+    ("refresh_baseline", "refresh_baseline"),
+    ("accept_current_baseline", "accept_current_baseline"),
+    ("accept_latest_baseline", "accept_latest_baseline"),
+    ("update", "update_task"),
+    ("gate_status", "task_gate_status"),
+    ("pause", "pause_task"),
+    ("resume", "resume_task"),
+    ("switch", "switch_task"),
+    ("finish", "finish_task"),
+    ("context", "task_context"),
+    ("events", "list_task_events"),
+    ("change_summary", "change_summary"),
+    ("export", "export_work_session"),
+];
+
+pub const LEGACY_SLICE_TOOLS: &[&str] = &["start_slice", "update_slice", "complete_slice"];
+pub const SLICE_OPERATIONS: &[(&str, &str)] = &[
+    ("start", "start_slice"),
+    ("update", "update_slice"),
+    ("complete", "complete_slice"),
+];
+
+pub const LEGACY_COMMIT_STAGE_TOOLS: &[&str] =
+    &["stage_commit", "stage_commit_status", "wait_stage_commit"];
+pub const COMMIT_STAGE_OPERATIONS: &[(&str, &str)] = &[
+    ("run", "stage_commit"),
+    ("status", "stage_commit_status"),
+    ("wait", "wait_stage_commit"),
+];
+
+fn facade_operations(facade: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    match facade {
+        "git" => Some(GIT_OPERATIONS),
+        "task" => Some(TASK_OPERATIONS),
+        "slice" => Some(SLICE_OPERATIONS),
+        "commit_stage" => Some(COMMIT_STAGE_OPERATIONS),
+        _ => None,
+    }
+}
+
+pub fn is_facade_tool(name: &str) -> bool {
+    facade_operations(name).is_some()
+}
+
+pub fn is_legacy_facade_tool(name: &str) -> bool {
+    LEGACY_GIT_TOOLS.contains(&name)
+        || LEGACY_TASK_TOOLS.contains(&name)
+        || LEGACY_SLICE_TOOLS.contains(&name)
+        || LEGACY_COMMIT_STAGE_TOOLS.contains(&name)
+}
+
+pub fn facade_for_legacy_tool(name: &str) -> Option<&'static str> {
+    if LEGACY_GIT_TOOLS.contains(&name) {
+        Some("git")
+    } else if LEGACY_TASK_TOOLS.contains(&name) {
+        Some("task")
+    } else if LEGACY_SLICE_TOOLS.contains(&name) {
+        Some("slice")
+    } else if LEGACY_COMMIT_STAGE_TOOLS.contains(&name) {
+        Some("commit_stage")
+    } else {
+        None
+    }
+}
+
+pub fn facade_tool_for_operation(facade: &str, operation: &str) -> Option<&'static str> {
+    facade_operations(facade)?
+        .iter()
+        .find_map(|(candidate, tool)| (*candidate == operation).then_some(*tool))
+}
+
+pub fn facade_operations_for_profile(facade: &str, tool_profile: &str) -> Vec<&'static str> {
+    let exposed = exposed_tool_names(tool_profile);
+    facade_operations(facade)
+        .into_iter()
+        .flatten()
+        .filter_map(|(operation, tool)| exposed.contains(tool).then_some(*operation))
+        .collect()
+}
+
+pub fn is_legacy_git_tool(name: &str) -> bool {
+    LEGACY_GIT_TOOLS.contains(&name)
+}
+
+pub fn git_tool_for_operation(operation: &str) -> Option<&'static str> {
+    facade_tool_for_operation("git", operation)
+}
+
+pub fn git_operations_for_profile(tool_profile: &str) -> Vec<&'static str> {
+    facade_operations_for_profile("git", tool_profile)
+}
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
+    (
+        "task",
+        "Task",
+        "[anchor-core anchor-task] Manage and inspect Harness tasks through one domain tool. Set operation to a profile-available task action; operation-specific arguments are validated against the existing Harness contracts.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "slice",
+        "Task slice",
+        "[anchor-task] Manage first-class task Slices through one domain tool. Set operation to start, update, or complete; arguments are validated against the existing Slice contracts.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "commit_stage",
+        "Commit stage workflow",
+        "[anchor-task] Run, inspect, or wait for the durable staged-commit workflow through one domain tool. Set operation to run, status, or wait.",
+        false,
+        true,
+        false,
+    ),
     (
         "harness_status",
         "Harness status",
@@ -444,6 +626,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "git",
+        "Git",
+        "[anchor-core anchor-git] Inspect or mutate Git through one domain tool. Set operation to status, diff, log, show, blame, stage, commit, restore, reset, revert, clean, or a worktree_* operation; operation-specific arguments are validated against the existing Git contracts.",
+        false,
+        true,
+        false,
+    ),
+    (
         "git_status",
         "Git status",
         "[anchor-core anchor-git] Return git working tree status for the workspace.",
@@ -580,6 +770,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser_wait_for_build",
     "begin_work_session",
     "close_work_session",
+    "task",
     "update_verification_disposition",
     "accept_latest_baseline",
     "list_skills",
@@ -606,6 +797,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_command_sessions",
     "kill_session",
     "read_output",
+    "git",
     "git_status",
     "git_worktree_list",
     "git_stage",
@@ -638,6 +830,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "read_output",
     "wait_command",
     "list_command_sessions",
+    "git",
     "git_status",
     "git_worktree_list",
     "git_diff",
@@ -648,6 +841,9 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 pub const ALLOWED_TOOLS: &[&str] = &[
+    "task",
+    "slice",
+    "commit_stage",
     "harness_status",
     "task_gate_status",
     "operation_log",
@@ -685,6 +881,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "list_command_sessions",
     "kill_session",
     "read_output",
+    "git",
     "git_status",
     "git_worktree_list",
     "git_worktree_create",
@@ -722,6 +919,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
 ];
 
 pub const MUTATING_TOOLS: &[&str] = &[
+    "task",
+    "slice",
+    "commit_stage",
     "begin_work_session",
     "complete_work_session",
     "browser_wait_for_build",
@@ -735,6 +935,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "apply_patch",
     "remove_path",
     "exec_command",
+    "git",
     "git_worktree_create",
     "git_worktree_remove",
     "git_worktree_prune",
@@ -1164,6 +1365,22 @@ fn session_snapshot_output_schema() -> Value {
 
 pub fn output_schema(name: &str) -> Value {
     match name {
+        facade if is_facade_tool(facade) => success_output_schema(
+            json!({
+                "operation": {
+                    "type": "string",
+                    "enum": facade_operations(facade)
+                        .into_iter()
+                        .flatten()
+                        .map(|(operation, _)| *operation)
+                        .collect::<Vec<_>>()
+                },
+                "facade": { "type": "string", "const": facade },
+                "status": { "type": "string" },
+                "summary": { "type": "string" }
+            }),
+            &["operation", "facade"],
+        ),
         "server_info" => success_output_schema(
             merge_schema_properties(vec![
                 json!({
@@ -2515,12 +2732,23 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
         .into_iter()
         .filter_map(|name| {
             P0_TOOLS.iter().find(|(n, ..)| *n == name).map(|entry| {
-                let (name, title, description, read_only, destructive, open_world) = *entry;
+                let (name, title, description, mut read_only, mut destructive, mut open_world) =
+                    *entry;
+                let input_schema = if is_facade_tool(name) {
+                    let operations = facade_operations_for_profile(name, tool_profile);
+                    let annotations = facade_annotations_for_profile(name, tool_profile);
+                    read_only = annotations.0;
+                    destructive = annotations.1;
+                    open_world = annotations.2;
+                    facade_input_schema(name, &operations)
+                } else {
+                    input_schema(name)
+                };
                 json!({
                     "name": name,
                     "title": title,
                     "description": description,
-                    "inputSchema": input_schema(name),
+                    "inputSchema": input_schema,
                     "outputSchema": output_schema(name),
                     "annotations": {
                         "title": title,
@@ -2535,8 +2763,98 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
         .collect()
 }
 
+fn facade_annotations_for_profile(facade: &str, tool_profile: &str) -> (bool, bool, bool) {
+    let operations = facade_operations_for_profile(facade, tool_profile);
+    let entries = operations
+        .iter()
+        .filter_map(|operation| facade_tool_for_operation(facade, operation))
+        .filter_map(|tool| P0_TOOLS.iter().find(|(name, ..)| *name == tool))
+        .collect::<Vec<_>>();
+    let read_only = !entries.is_empty() && entries.iter().all(|(_, _, _, value, _, _)| *value);
+    let destructive = entries.iter().any(|(_, _, _, _, value, _)| *value);
+    let open_world = entries.iter().any(|(_, _, _, _, _, value)| *value);
+    (read_only, destructive, open_world)
+}
+
+fn normalized_facade_property_schema(schema: &Value) -> Value {
+    let mut normalized = schema.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object.remove("default");
+        object.remove("description");
+    }
+    normalized
+}
+
+fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut contracts = Vec::new();
+    for operation in operations {
+        let Some(tool) = facade_tool_for_operation(facade, operation) else {
+            continue;
+        };
+        let schema = input_schema(tool);
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        contracts.push(if required.is_empty() {
+            format!("{operation}: no required arguments")
+        } else {
+            format!("{operation}: requires {}", required.join(", "))
+        });
+        if let Some(operation_properties) = schema.get("properties").and_then(Value::as_object) {
+            for (property, property_schema) in operation_properties {
+                if property == "operation" {
+                    continue;
+                }
+                let candidate = normalized_facade_property_schema(property_schema);
+                match properties.get(property) {
+                    None => {
+                        properties.insert(property.clone(), candidate);
+                    }
+                    Some(existing) if existing == &candidate => {}
+                    Some(_) => {
+                        // A shared property name can have operation-specific bounds or shapes.
+                        // Keep the facade permissive here; the delegated canonical schema below
+                        // remains authoritative and rejects invalid operation-specific arguments.
+                        properties.insert(property.clone(), json!({}));
+                    }
+                }
+            }
+        }
+    }
+    properties.insert(
+        "operation".into(),
+        json!({
+            "type": "string",
+            "enum": operations,
+            "description": format!(
+                "Select the {facade} operation. Operation-specific required arguments: {}.",
+                contracts.join("; ")
+            )
+        }),
+    );
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["operation"],
+        "additionalProperties": false
+    })
+}
+
 pub fn input_schema(name: &str) -> Value {
     match name {
+        facade if is_facade_tool(facade) => {
+            let operations = facade_operations(facade)
+                .into_iter()
+                .flatten()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>();
+            facade_input_schema(facade, &operations)
+        }
         "browser_build_info" => json!({
             "type": "object",
             "properties": {},
@@ -3375,7 +3693,7 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
 
     #[test]
-    fn core_catalog_exposes_44_chatgpt_compatible_tools() {
+    fn core_catalog_keeps_legacy_git_routes_plus_the_git_facade() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -3383,8 +3701,10 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 44);
+        assert_eq!(tools.len(), 46);
         assert_eq!(unique.len(), tools.len());
+        assert!(names.contains(&"git"));
+        assert!(names.contains(&"task"));
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"git_worktree_list"));
         assert!(names.contains(&"load_skill"));
@@ -3428,7 +3748,10 @@ mod tests {
 
     #[test]
     fn lazy_schema_tags_expose_a_bounded_core_workflow_bundle() {
-        let tools = list_tools_for_profile("advanced");
+        let tools =
+            crate::tools::catalog::build_effective_catalog_from_parts("advanced", true, Vec::new())
+                .expect("effective advanced catalog")
+                .tools;
         let core = tools
             .iter()
             .filter(|tool| {
@@ -3452,9 +3775,8 @@ mod tests {
             "list_command_sessions",
             "write_stdin",
             "kill_session",
-            "git_status",
-            "git_stage",
-            "git_commit",
+            "git",
+            "task",
         ] {
             assert!(
                 core.contains(required),
@@ -3510,5 +3832,76 @@ mod tests {
         assert!(!names.contains(&"exec_command"));
         assert!(names.contains(&"get_default_cwd"));
         assert!(names.contains(&"read_file"));
+
+        let git = tools
+            .iter()
+            .find(|tool| tool["name"] == "git")
+            .expect("git facade");
+        let operations = git["inputSchema"]["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("git operations");
+        for allowed in ["status", "worktree_list", "diff", "log", "show", "blame"] {
+            assert!(operations.iter().any(|operation| operation == allowed));
+        }
+        for denied in ["stage", "commit", "reset", "clean", "worktree_create"] {
+            assert!(!operations.iter().any(|operation| operation == denied));
+        }
+    }
+
+    #[test]
+    fn facade_schemas_preserve_profile_specific_leaf_permissions() {
+        let core = list_tools_for_profile("core");
+        let task = core
+            .iter()
+            .find(|tool| tool["name"] == "task")
+            .expect("core task facade");
+        let core_task_operations = task["inputSchema"]["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("core task operations");
+        for allowed in [
+            "verification_disposition",
+            "accept_latest_baseline",
+            "switch",
+        ] {
+            assert!(
+                core_task_operations
+                    .iter()
+                    .any(|operation| operation == allowed),
+                "missing core task operation {allowed}"
+            );
+        }
+        for denied in ["status", "start", "finish", "pause", "resume"] {
+            assert!(!core_task_operations
+                .iter()
+                .any(|operation| operation == denied));
+        }
+        assert!(
+            task["inputSchema"]["properties"]["operation"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("switch: requires task_id"))
+        );
+
+        let advanced = list_tools_for_profile("advanced");
+        let advanced_names = advanced
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<HashSet<_>>();
+        assert!(advanced_names.contains("task"));
+        assert!(advanced_names.contains("slice"));
+        assert!(advanced_names.contains("commit_stage"));
+        for facade in ["task", "slice", "commit_stage"] {
+            let tool = advanced
+                .iter()
+                .find(|tool| tool["name"] == facade)
+                .expect("advanced facade");
+            assert!(tool["inputSchema"]["properties"]["operation"]["enum"]
+                .as_array()
+                .is_some_and(|operations| !operations.is_empty()));
+        }
+
+        let read_only = list_tools_for_profile("read-only");
+        assert!(!read_only.iter().any(|tool| tool["name"] == "task"));
+        assert!(!read_only.iter().any(|tool| tool["name"] == "slice"));
+        assert!(!read_only.iter().any(|tool| tool["name"] == "commit_stage"));
     }
 }

@@ -550,7 +550,7 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             category: "validation",
             retryable: true,
             details: json!({
-                "suggestion": "Call git_stage with explicit workspace-relative paths first."
+                "suggestion": "Call git with operation=stage and explicit workspace-relative paths first."
             }),
         });
     }
@@ -745,9 +745,9 @@ pub fn git_revert(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
                 "revision": revision,
                 "commit": commit,
                 "recoverable": true,
-                "recovery_tool": "git_revert",
-                "recovery_args": {"abort": true},
-                "suggestion": "Resolve the conflicts and commit, or call git_revert with abort=true."
+                "recovery_tool": "git",
+                "recovery_args": {"operation": "revert", "abort": true},
+                "suggestion": "Resolve the conflicts and commit, or call git with operation=revert and abort=true."
             }),
         });
     }

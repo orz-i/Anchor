@@ -64,6 +64,120 @@ fn structured_exec_rejects_sensitive_or_process_control_environment() {
 }
 
 #[test]
+fn git_facade_routes_to_existing_git_contracts() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("repo");
+    fs::create_dir_all(&workspace).expect("创建仓库目录");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "测试用户"],
+        vec!["add", "README.md"],
+        vec!["commit", "-q", "-m", "初始化"],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&workspace)
+            .args(args)
+            .output()
+            .expect("执行 git");
+        assert!(output.status.success(), "git 命令失败: {:?}", output);
+    }
+
+    let ctx = ctx_for(&workspace);
+    let status = invoke(&ctx, "git", json!({"operation": "status"}));
+    let status = assert_ok(&status);
+    assert_eq!(status["facade"], "git");
+    assert_eq!(status["operation"], "status");
+    assert_eq!(status["is_repo"], true);
+
+    let log = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "log", "path": ".", "max_count": 3}),
+    );
+    let log = assert_ok(&log);
+    assert_eq!(log["operation"], "log");
+    assert_eq!(log["commits"].as_array().unwrap().len(), 1);
+
+    let invalid_stage = invoke(&ctx, "git", json!({"operation": "stage"}));
+    let invalid_stage = assert_err(&invalid_stage);
+    assert_eq!(invalid_stage["operation"], "stage");
+    assert_eq!(invalid_stage["error"]["code"], "INVALID_TOOL_ARGUMENTS");
+}
+
+#[test]
+fn git_facade_enforces_profile_specific_operations() {
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.tool_profile = "read-only".into();
+
+    let denied = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "reset", "revision": "HEAD", "mode": "mixed"}),
+    );
+    let denied = assert_err(&denied);
+    assert_eq!(denied["facade"], "git");
+    assert_eq!(denied["operation"], "reset");
+    assert_eq!(
+        denied["error"]["code"],
+        "FACADE_OPERATION_NOT_AVAILABLE_FOR_PROFILE"
+    );
+    assert_eq!(denied["error"]["details"]["tool_profile"], "read-only");
+}
+
+#[test]
+fn harness_facades_delegate_to_existing_task_slice_and_commit_stage_contracts() {
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.tool_profile = "advanced".into();
+
+    let status = invoke(&ctx, "task", json!({"operation": "status"}));
+    let status = assert_ok(&status);
+    assert_eq!(status["facade"], "task");
+    assert_eq!(status["operation"], "status");
+
+    let invalid_start = invoke(&ctx, "task", json!({"operation": "start"}));
+    let invalid_start = assert_err(&invalid_start);
+    assert_eq!(invalid_start["error"]["code"], "INVALID_TOOL_ARGUMENTS");
+
+    let started = invoke(
+        &ctx,
+        "task",
+        json!({"operation": "start", "objective": "facade task"}),
+    );
+    let started = assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    assert_eq!(started["facade"], "task");
+    assert_eq!(started["operation"], "start");
+
+    let slice = invoke(
+        &ctx,
+        "slice",
+        json!({
+            "operation": "start",
+            "task_id": task_id,
+            "slice_id": "facade-slice",
+            "title": "Facade slice"
+        }),
+    );
+    let slice = assert_ok(&slice);
+    assert_eq!(slice["facade"], "slice");
+    assert_eq!(slice["operation"], "start");
+    assert_eq!(slice["slice"]["id"], "facade-slice");
+
+    let invalid_commit_stage = invoke(&ctx, "commit_stage", json!({"operation": "run"}));
+    let invalid_commit_stage = assert_err(&invalid_commit_stage);
+    assert_eq!(invalid_commit_stage["facade"], "commit_stage");
+    assert_eq!(invalid_commit_stage["operation"], "run");
+    assert_eq!(
+        invalid_commit_stage["error"]["code"],
+        "INVALID_TOOL_ARGUMENTS"
+    );
+}
+
+#[test]
 fn wait_command_maintains_the_output_cursor_for_each_caller_session() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
@@ -524,7 +638,9 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 44);
+    assert_eq!(names.len(), 46);
+    assert!(names.contains("git"));
+    assert!(names.contains("task"));
     assert!(names.contains("list_skills"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("list_skill_resources"));

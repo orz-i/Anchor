@@ -223,7 +223,10 @@ mod tests {
 
     #[test]
     fn core_openapi_exposes_search_text_as_read_only() {
-        let tools = crate::tools::list_tools_for_profile("core");
+        let tools =
+            crate::tools::catalog::build_effective_catalog_from_parts("core", false, Vec::new())
+                .expect("effective core catalog")
+                .tools;
         let schema = build_openapi(&tools, "https://actions.example.com", "none");
         let operation = &schema["paths"]["/actions/search_text"]["post"];
 
@@ -232,6 +235,18 @@ mod tests {
         assert_eq!(
             operation["requestBody"]["content"]["application/json"]["schema"],
             crate::tools::registry::input_schema("search_text")
+        );
+        assert!(schema["paths"].get("/actions/git").is_some());
+        assert!(schema["paths"].get("/actions/task").is_some());
+        assert!(schema["paths"].get("/actions/git_status").is_none());
+        assert!(schema["paths"].get("/actions/switch_task").is_none());
+        assert_eq!(
+            schema["paths"]["/actions/git"]["post"]["x-openai-isConsequential"],
+            true
+        );
+        assert_eq!(
+            schema["paths"]["/actions/task"]["post"]["x-openai-isConsequential"],
+            true
         );
     }
 }
