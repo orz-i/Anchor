@@ -210,7 +210,7 @@ async fn stop_server_service(
 }
 
 #[cfg(windows)]
-async fn restart_server_service(
+pub(super) async fn restart_server_service(
     state: &AppState,
     id: &str,
     service: WorkspaceService,

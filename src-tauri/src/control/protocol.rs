@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::WorkspaceControlStatus;
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 4;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 5;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
@@ -12,6 +12,7 @@ pub const ERROR_CONTROL_COMMAND_UNAVAILABLE: &str = "control_command_unavailable
 pub const ERROR_LOG_READ_FAILED: &str = "log_read_failed";
 pub const ERROR_OPERATION_FAILED: &str = "operation_failed";
 pub const ERROR_OPERATION_NOT_FOUND: &str = "operation_not_found";
+pub const ERROR_CONFIG_HOT_UPDATE_FAILED: &str = "config_hot_update_failed";
 pub const ERROR_INTERNAL: &str = "internal_error";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +84,15 @@ pub enum ControlMethod {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
         service: ControlService,
+    },
+    UpdateOauthRedirectPolicy {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        service: ControlService,
+        #[serde(rename = "redirectUris")]
+        redirect_uris: String,
+        #[serde(rename = "redirectHosts")]
+        redirect_hosts: String,
     },
 }
 
@@ -260,6 +270,10 @@ pub enum ControlResult {
     Events {
         batch: ControlEventBatch,
     },
+    ConfigHotUpdated {
+        applied: bool,
+        daemon_pid: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,5 +433,22 @@ mod tests {
         .expect("serialize reload request");
         assert_eq!(reload["method"], "reload");
         assert_eq!(reload["service"], "mcp");
+
+        let hot_update = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-9".into(),
+            method: ControlMethod::UpdateOauthRedirectPolicy {
+                workspace_id: "workspace-1".into(),
+                service: ControlService::Actions,
+                redirect_uris: "https://chatgpt.com/callback".into(),
+                redirect_hosts: "*.chatgpt.com".into(),
+            },
+        })
+        .expect("serialize hot update request");
+        assert_eq!(hot_update["method"], "update_oauth_redirect_policy");
+        assert_eq!(hot_update["workspaceId"], "workspace-1");
+        assert_eq!(hot_update["service"], "actions");
+        assert_eq!(hot_update["redirectUris"], "https://chatgpt.com/callback");
+        assert_eq!(hot_update["redirectHosts"], "*.chatgpt.com");
     }
 }

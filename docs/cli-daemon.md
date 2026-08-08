@@ -238,7 +238,9 @@ GUI Workspace 控制使用同一生命周期客户端：
 - MCP/Actions Tunnel 的状态、启动、停止、重载和测试均通过 Workspace daemon；daemon 运行时失败不会回退到 GUI 进程自己的 Tunnel Supervisor；
 - 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，GUI 优先使用该值；
 - Workspace 页面状态刷新优先使用 daemon `events` 长轮询，只有控制端点明确不存在时才回退到旧状态轮询；protocol/remote 错误会进入显式 fault 状态，不静默降级；fallback polling 会周期性重新探测事件端点，因此外部 CLI 启动 daemon 后可自动恢复 event-first 模式；
-- 普通 MCP/Actions 配置应用和密钥应用在目标服务已经运行时使用单服务 daemon reload，不再为了一个 listener 的配置变化重启整个 Workspace daemon；
+- Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；GUI 不再根据 `running` 状态自行调用 restart。名称等纯元数据变化不触发 listener，MCP/Actions 运行参数和认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
+- Workspace control protocol v5 增加 `update_oauth_redirect_policy`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 GUI 进程修改自己的 registry 后伪装 daemon 已热更新；
+- Tunnel 仍保持独立事务语义：保存 tunnel 配置后由 tunnel control 执行 start/stop/restart；Workspace profile 更新本身不会把 tunnel 字段误判为 listener 配置。Gateway 仅在其实际使用的 MCP tunnel/owner 字段变化时 reload，不再因 Workspace 名称等无关配置变化重建；
 - Gateway 不归属于任何 Workspace daemon。GUI 使用独立 Gateway control client 获取状态并应用配置；共享 Gateway listener/tunnel 由独立全局 Gateway daemon 持有。若旧桌面进程仍持有兼容 Gateway listener，则配置热改继续 fail-closed，避免两个控制域同时拥有运行态。
 
 ## 独立 Gateway daemon
@@ -257,7 +259,7 @@ anchor gateway stop [--timeout SECONDS] [--force]
 
 `anchor gateway serve <workspace ...>` 仍保留为前台调试、容器或外部 supervisor 入口；内置后台 daemon 与前台 serve 不应同时拥有同一 Gateway 端口。
 
-Gateway daemon 使用独立协议 v1，不复用 Workspace daemon protocol v4。每个请求都包含 `protocolVersion`、`requestId` 和 `configScope`；scope 根据当前应用配置目录派生，用于拒绝错误配置域的 PID/socket。Linux 运行文件位于与 Workspace daemon 相同的私有 runtime 根目录，但使用全局名称：
+Gateway daemon 使用独立协议 v1，不复用 Workspace daemon protocol v5。每个请求都包含 `protocolVersion`、`requestId` 和 `configScope`；scope 根据当前应用配置目录派生，用于拒绝错误配置域的 PID/socket。Linux 运行文件位于与 Workspace daemon 相同的私有 runtime 根目录，但使用全局名称：
 
 ```text
 gateway.lock
@@ -285,7 +287,7 @@ Gateway 写控制遵循 fail-closed：
 - 禁用运行中的 Gateway 不使用 `apply_config`，而是先优雅 shutdown，确认退出后再持久化 disabled；
 - endpoint 不可用、协议不兼容、scope/PID 不匹配时所有写请求直接失败，不会回退为 CLI/GUI 进程内 Gateway 或 Tunnel Supervisor。
 
-Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。影响 route/owner 的 Workspace 配置保存会触发 Gateway reload；失败时桌面端恢复旧 Workspace/settings 并再次对齐旧运行态。活动 route 在 Gateway daemon 停止前不能删除或注销。
+Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。只有影响 Gateway 所持 MCP tunnel/owner identity 的 Workspace 配置保存才触发 Gateway reload；失败时桌面端恢复旧 Workspace/settings 并再次对齐旧运行态。名称、Actions 或普通 MCP listener 策略变化不会无谓重建 Gateway。活动 route 在 Gateway daemon 停止前不能删除或注销。
 
 GUI Gateway 页面直接使用 `routeWorkspaceIds` 展示活动路由，不再逐个轮询 Workspace runtime。桌面 AppState 在每次数据操作前重新加载磁盘配置，避免覆盖 Gateway daemon 在后台写入的 observed public URL。
 

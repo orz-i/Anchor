@@ -56,6 +56,62 @@ pub enum DaemonControlCommand {
     },
 }
 
+pub async fn request_oauth_redirect_policy_update(
+    profile: &WorkspaceProfile,
+    service: ControlService,
+    redirect_uris: &str,
+    redirect_hosts: &str,
+) -> Result<bool, ControlClientError> {
+    let inspection = daemon::inspect(profile).map_err(|error| {
+        ControlClientError::Protocol(format!(
+            "cannot inspect daemon before OAuth policy update: {error}"
+        ))
+    })?;
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            ControlClientError::Protocol(
+                "workspace daemon is not running; OAuth policy update requires the daemon control plane"
+                    .into(),
+            )
+        })?;
+    let selected = match service {
+        ControlService::Mcp => state.service.includes_mcp(),
+        ControlService::Actions => state.service.includes_actions(),
+    };
+    if !selected {
+        return Ok(false);
+    }
+    match request(
+        &profile.id,
+        ControlMethod::UpdateOauthRedirectPolicy {
+            workspace_id: profile.id.clone(),
+            service,
+            redirect_uris: redirect_uris.to_string(),
+            redirect_hosts: redirect_hosts.to_string(),
+        },
+    )
+    .await?
+    {
+        ControlResult::ConfigHotUpdated {
+            applied,
+            daemon_pid,
+        } => {
+            if daemon_pid != state.pid {
+                return Err(ControlClientError::Protocol(format!(
+                    "daemon OAuth policy update PID mismatch: status file={}, response={daemon_pid}",
+                    state.pid
+                )));
+            }
+            Ok(applied)
+        }
+        other => Err(ControlClientError::Protocol(format!(
+            "daemon returned unexpected OAuth policy update result: {other:?}"
+        ))),
+    }
+}
+
 async fn wait_for_operation(
     profile: &WorkspaceProfile,
     operation_id: &str,
@@ -1107,6 +1163,39 @@ async fn handle_request(
                 }),
             }
         }
+        ControlMethod::UpdateOauthRedirectPolicy {
+            workspace_id,
+            service,
+            redirect_uris,
+            redirect_hosts,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            let service_name = match service {
+                ControlService::Mcp => "mcp",
+                ControlService::Actions => "actions",
+            };
+            match crate::auth::update_oauth_redirect_policy(
+                &profile.id,
+                service_name,
+                &redirect_uris,
+                &redirect_hosts,
+            ) {
+                Ok(applied) => handled(ControlResponse::success(
+                    request_id,
+                    ControlResult::ConfigHotUpdated {
+                        applied,
+                        daemon_pid: std::process::id(),
+                    },
+                )),
+                Err(error) => handled(ControlResponse::error(
+                    request_id,
+                    super::protocol::ERROR_CONFIG_HOT_UPDATE_FAILED,
+                    error,
+                )),
+            }
+        }
     }
 }
 
@@ -1505,6 +1594,80 @@ mod tests {
             }
             other => panic!("unexpected operation response: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn oauth_redirect_policy_hot_update_runs_inside_the_control_owner_process() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-oauth-hot-update".into()));
+        let runtime = std::sync::Arc::new(crate::auth::OAuthRuntime::new(
+            "https://service.example".into(),
+            "client".into(),
+            None,
+            "password".into(),
+            "token-secret".into(),
+        ));
+        crate::auth::register_oauth_runtime(&profile.id, "mcp", &runtime);
+
+        let response = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "oauth-hot-update".into(),
+                method: ControlMethod::UpdateOauthRedirectPolicy {
+                    workspace_id: profile.id.clone(),
+                    service: ControlService::Mcp,
+                    redirect_uris: "https://chatgpt.com/callback/new".into(),
+                    redirect_hosts: "*.chatgpt.com".into(),
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+
+        assert!(response.ok);
+        match response.result.expect("hot update result") {
+            ControlResult::ConfigHotUpdated {
+                applied,
+                daemon_pid,
+            } => {
+                assert!(applied);
+                assert_eq!(daemon_pid, std::process::id());
+            }
+            other => panic!("unexpected hot update response: {other:?}"),
+        }
+        assert!(runtime.redirect_uri_allowed("https://chatgpt.com/callback/new"));
+        assert_eq!(
+            runtime.redirect_uri_status_label("https://oauth.chatgpt.com/callback/dynamic"),
+            "auto_enrollment_allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_redirect_policy_hot_update_reports_unloaded_runtime_without_fallback() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-oauth-no-runtime".into()));
+        let response = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "oauth-hot-update-missing".into(),
+                method: ControlMethod::UpdateOauthRedirectPolicy {
+                    workspace_id: profile.id.clone(),
+                    service: ControlService::Actions,
+                    redirect_uris: "https://chatgpt.com/callback".into(),
+                    redirect_hosts: "chatgpt.com".into(),
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+
+        assert!(response.ok);
+        assert!(matches!(
+            response.result,
+            Some(ControlResult::ConfigHotUpdated { applied: false, .. })
+        ));
     }
 
     #[tokio::test]

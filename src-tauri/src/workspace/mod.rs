@@ -1,3 +1,4 @@
+pub mod config_apply;
 mod model;
 pub mod resources;
 
