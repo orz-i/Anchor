@@ -132,6 +132,12 @@ fn recovery_step_identity(tool: &str, args: &Value, output: &Value) -> (String, 
     (step.to_string(), fingerprint)
 }
 
+fn has_explicit_recovery_identity(args: &Value) -> bool {
+    ["recovery_key", "verification_key", "idempotency_key"]
+        .into_iter()
+        .any(|key| args.get(key).and_then(Value::as_str).is_some())
+}
+
 fn track_task_recovery(
     ctx: &ToolContext,
     task_id: Option<&str>,
@@ -203,6 +209,14 @@ fn track_task_recovery(
             .get("affected_files")
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty());
+    let explicit_retry_identity = has_explicit_recovery_identity(args);
+    let non_mutating_preflight_rejection = !workspace_mutated
+        && !explicit_retry_identity
+        && (output.get("execution_started").and_then(Value::as_bool) == Some(false)
+            || matches!(category, "policy" | "permission"));
+    if non_mutating_preflight_rejection {
+        return;
+    }
     if matches!(tool, "wait_command" | "read_output" | "kill_session")
         && error_code == Some("SESSION_NOT_FOUND")
         && !workspace_mutated
@@ -257,6 +271,7 @@ fn track_task_recovery(
         failure_type,
         error_code,
         verification_id,
+        explicit_retry_identity,
         workspace_mutated,
         rollback_status,
         recommendations,

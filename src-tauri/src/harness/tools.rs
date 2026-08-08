@@ -2067,7 +2067,7 @@ fn completion_gate_value(
         && task
             .recovery
             .as_ref()
-            .is_some_and(|recovery| recovery.status == TaskRecoveryStatus::Open)
+            .is_some_and(|recovery| recovery.blocks_completion())
     {
         missing.push(json!({
             "code": "recovery_open",

@@ -208,6 +208,31 @@ pub struct TaskSlice {
     pub updated_at: String,
 }
 
+impl TaskRecoveryState {
+    pub fn is_nonblocking_legacy_preflight(&self) -> bool {
+        if self.status != TaskRecoveryStatus::Open
+            || self.workspace_mutated
+            || self.explicit_retry_identity
+        {
+            return false;
+        }
+
+        matches!(
+            self.error_code.as_deref(),
+            Some(
+                "POLICY_REJECTED"
+                    | "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
+                    | "PROTECTED_REPOSITORY_ASSET"
+                    | "SESSION_NOT_FOUND"
+            )
+        )
+    }
+
+    pub fn blocks_completion(&self) -> bool {
+        self.status == TaskRecoveryStatus::Open && !self.is_nonblocking_legacy_preflight()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TaskWorkingSet {
     #[serde(default)]
@@ -234,6 +259,8 @@ pub struct TaskRecoveryState {
     pub failed_step: String,
     #[serde(default)]
     pub step_fingerprint: Option<String>,
+    #[serde(default)]
+    pub explicit_retry_identity: bool,
     pub failure_type: String,
     #[serde(default)]
     pub error_code: Option<String>,

@@ -947,6 +947,15 @@ impl Harness {
                         "当前任务已经关闭，不能重复完成",
                     ));
                 }
+                let auto_resolved_recovery_id = task.recovery.as_mut().and_then(|recovery| {
+                    if !recovery.is_nonblocking_legacy_preflight() {
+                        return None;
+                    }
+                    recovery.status = TaskRecoveryStatus::Resolved;
+                    recovery.resolved_by_step = Some("task_completion".into());
+                    recovery.updated_at = timestamp();
+                    Some(recovery.id.clone())
+                });
                 task.status = if verified {
                     TaskStatus::Completed
                 } else {
@@ -955,6 +964,16 @@ impl Harness {
                 task.phase = TaskPhase::Completed;
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
+                if let Some(recovery_id) = auto_resolved_recovery_id {
+                    transaction.append_event(&harness_event(
+                        &self.workspace_id,
+                        task_id,
+                        "task_recovery_auto_resolved",
+                        Some("task_completion"),
+                        json!({"recovery_id": recovery_id, "reason": "nonblocking_preflight"}),
+                        json!({"ok": true}),
+                    ))?;
+                }
                 let default_task_id = self
                     .store
                     .load_workspace_state(&self.workspace_id)?
@@ -1381,6 +1400,7 @@ impl Harness {
         failure_type: &str,
         error_code: Option<&str>,
         related_verification_id: Option<&str>,
+        explicit_retry_identity: bool,
         workspace_mutated: bool,
         rollback_status: &str,
         recommended_recovery: Vec<String>,
@@ -1407,6 +1427,7 @@ impl Harness {
                         existing.error_code = error_code.map(str::to_string);
                         existing.related_verification_id =
                             related_verification_id.map(str::to_string);
+                        existing.explicit_retry_identity |= explicit_retry_identity;
                         existing.workspace_mutated |= workspace_mutated;
                         existing.rollback_status = rollback_status.to_string();
                         existing.recommended_recovery = recommended_recovery;
@@ -1445,6 +1466,7 @@ impl Harness {
                     id: Uuid::new_v4().simple().to_string(),
                     failed_step: failed_step.to_string(),
                     step_fingerprint: step_fingerprint.map(str::to_string),
+                    explicit_retry_identity,
                     failure_type: failure_type.to_string(),
                     error_code: error_code.map(str::to_string),
                     related_verification_id: related_verification_id.map(str::to_string),

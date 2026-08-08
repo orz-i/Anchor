@@ -1,6 +1,8 @@
 use std::fs;
 use std::process::Command;
 
+use anchor_lib::harness::model::HarnessSessionStatus;
+use anchor_lib::harness::TaskRecoveryStatus;
 use anchor_lib::tools::{call_tool, call_tool_for_session, ToolContext};
 use serde_json::{json, Value};
 
@@ -29,6 +31,86 @@ fn initialize_git(root: &std::path::Path) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn policy_rejection_without_stable_identity_does_not_open_task_recovery() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "普通策略预检拒绝不应创建持久恢复"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let rejected = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"print('one')\" && python -c \"print('two')\"",
+            "yield_time_ms": 30000
+        }),
+    );
+
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "POLICY_REJECTED");
+    assert_eq!(rejected["execution_started"], false);
+    assert!(rejected.get("task_recovery").is_none(), "{rejected}");
+    assert!(ctx.harness.task(task_id).unwrap().recovery.is_none());
+}
+
+#[test]
+fn legacy_nonmutating_policy_recovery_is_nonblocking_and_resolves_on_completion() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let task = ctx
+        .harness
+        .start_task("旧版策略预检恢复兼容")
+        .expect("task");
+
+    let recovery = ctx
+        .harness
+        .record_recovery(
+            &task.id,
+            "exec_command",
+            Some("legacy-policy-fingerprint"),
+            "tooling_failure",
+            Some("POLICY_REJECTED"),
+            None,
+            false,
+            false,
+            "not_required",
+            vec!["修正命令参数后重试".into()],
+            "ready_to_close",
+        )
+        .expect("record legacy recovery");
+    assert_eq!(recovery.status, TaskRecoveryStatus::Open);
+    assert!(!recovery.blocks_completion());
+
+    let gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task.id}));
+    assert!(!gate["completion_gate"]["missing"]
+        .as_array()
+        .expect("completion missing")
+        .iter()
+        .any(|item| item["code"] == "recovery_open"));
+
+    let completed = ctx
+        .harness
+        .complete_task(&task.id, true, HarnessSessionStatus::Active)
+        .expect("complete task");
+    let recovery = completed
+        .recovery
+        .expect("resolved recovery retained for audit");
+    assert_eq!(recovery.status, TaskRecoveryStatus::Resolved);
+    assert_eq!(
+        recovery.resolved_by_step.as_deref(),
+        Some("task_completion")
+    );
 }
 
 #[test]
@@ -411,6 +493,10 @@ fn policy_rejection_is_recoverable_with_a_stable_logical_step_key() {
     assert_eq!(rejected["ok"], false);
     assert_eq!(rejected["error"]["code"], "POLICY_REJECTED");
     assert_eq!(rejected["task_recovery"]["status"], "open");
+    assert_eq!(
+        rejected["task_recovery"]["recovery"]["explicit_retry_identity"],
+        true
+    );
     assert_eq!(
         rejected["task_recovery"]["recovery"]["workspace_mutated"],
         false
