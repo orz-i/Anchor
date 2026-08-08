@@ -105,7 +105,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 
 独立 Gateway 控制域现已具备后台 daemon 基础：
 
-- Gateway control protocol 独立版本为 `1`，与 Workspace protocol v5 分离；每个请求携带 `configScope`，拒绝连接到其他配置域的 daemon；
+- Gateway control protocol 独立版本为 `1`，与 Workspace protocol v6 分离；每个请求携带 `configScope`，拒绝连接到其他配置域的 daemon；
 - Linux 使用全局 `gateway.lock`、`gateway.pid`、`gateway.json`、`gateway.sock`；状态保存 PID、配置域、所选 route Workspace IDs、Gateway 本地端口和版本；
 - `anchor gateway status/start/stop/restart/reload` 使用专用 Gateway control client；`gateway serve` 继续保留为前台调试/外部 supervisor 入口；
 - `shutdown`、`prepare_restart`、`reload` 和运行中配置应用都禁止本地运行时回退；`reload`/`apply_config` 使用 accepted → operation status 异步模型；
@@ -126,7 +126,7 @@ GUI 工作区控制迁移现状：
 - MCP/Actions tunnel 状态、启动、停止、重载和测试已迁入 Workspace daemon；GUI 保存 tunnel 配置不再追加一次整 daemon 重启；
 - Workspace 页面已从固定 5 秒双 runtime 轮询迁移为 daemon event-first 长轮询；只有 endpoint unavailable 才进入 polling fallback，协议/远端错误不会静默降级，fallback 会继续探测并自动恢复事件模式；
 - Workspace 配置保存已把差异判断从 GUI 收回 Rust 控制层：纯元数据不 reload，MCP/Actions 运行参数与认证身份只 reload 对应活动 listener；GUI 不再自行读取运行状态后调用 restart；
-- Workspace protocol 升级为 v5，OAuth Callback URI/Host 支持在 daemon 进程内字段级 hot update；runtime 未加载时由控制层 fallback 到单 listener reload，写路径仍 fail-closed；
+- Workspace protocol 升级为 v6：OAuth Callback URI/Host 支持 daemon 进程内字段级 hot update；新增 daemon-owner `apply_config`，由运行权威以当前内存 profile 对比磁盘 desired profile，事务协调 listener/direct tunnel 并回滚失败操作；
 - GUI 进程内 `RuntimeSupervisor` / Tunnel Supervisor 在 daemon 支持的平台只保留旧兼容路径；在 Windows daemon 服务端尚未实现期间，它们构成显式、自动选择的 GUI Server 模式唯一运行权威，不能与 daemon 同时启用；
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
 - 若旧桌面进程仍持有兼容 Gateway listener，GUI 仍拒绝热改 Gateway 配置，防止旧进程与新 daemon 控制域同时成为运行权威。
@@ -136,7 +136,7 @@ GUI 工作区控制迁移现状：
 ### 阶段 2：CLI 能力闭环
 
 - CLI 所有运行命令改为调用 daemon，而不是本地构造 RuntimeSupervisor；
-- 补齐 `config get/set/diff/apply`、`daemon install/uninstall/start/stop/status`；
+- `config get/set/diff/apply` 已完成：set 使用带 base 快照的受保护 staging，diff 输出字段级变化与共享 apply plan，apply 通过 Workspace protocol v6 / Gateway 专用 control 显式应用且不会启动停止态服务；剩余补齐 `daemon install/uninstall/start/stop/status`；
 - 所有命令支持稳定 JSON 输出、错误码和自动化退出码；
 - 增加配置导入导出、备份恢复和只读诊断命令；
 - Linux systemd、macOS launchd、Windows Service 使用同一前台 daemon 入口。
@@ -151,7 +151,7 @@ GUI 工作区控制迁移现状：
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
 
-当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费、配置差异后端 apply plan 和单服务 reload；OAuth Callback 策略已经是首个无需 listener 重建的字段级 hot reload。Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply/logs/events 控制面；全局 layout 已使用跨控制域 aggregate status/events。Windows GUI 已补上自动 process-local Server 兼容模式，避免 Named Pipe daemon 服务端完成前桌面不可用。下一步优先补 CLI `config get/set/diff/apply`、更多字段级 hot reload、系统服务安装和 Windows Named Pipe server/ACL，并在该后台控制面可用后删除 Windows GUI Server 兼容 RuntimeSupervisor。
+当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费、配置差异后端 apply plan、单服务 reload，以及 CLI `config get/set/diff/apply` staging/apply 闭环；OAuth Callback 策略已经是首个无需 listener 重建的字段级 hot reload，Workspace daemon 也可通过 v6 `apply_config` 统一应用磁盘 desired config。Gateway 已从 GUI 运行编排中拆出，并具备独立后台 daemon、状态/生命周期/reload/config-apply/logs/events 控制面；全局 layout 已使用跨控制域 aggregate status/events。Windows GUI 已补上自动 process-local Server 兼容模式，避免 Named Pipe daemon 服务端完成前桌面不可用。下一步优先推进更多字段级 hot reload、系统服务安装和 Windows Named Pipe server/ACL，并在该后台控制面可用后删除 Windows GUI Server 兼容 RuntimeSupervisor。
 
 ### 阶段 4：运行与升级治理
 

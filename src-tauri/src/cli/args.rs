@@ -10,6 +10,132 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+pub fn config_usage() -> &'static str {
+    "Config 命令：\n\
+  anchor config get <workspace> [--pending] [--key PATH]\n\
+  anchor config diff <workspace> [--set PATH=VALUE ...]\n\
+  anchor config set <workspace> --set PATH=VALUE [--set PATH=VALUE ...]\n\
+  anchor config apply <workspace> [--wait SECONDS]\n\n\
+config set 只写入待应用配置，不改变活动配置或运行态；config apply 才会持久化并协调 daemon/Gateway 运行态。PATH 使用序列化字段名，例如 runtime.local_port、auth.oauth_redirect_hosts、tunnel.type。"
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigGetOptions {
+    pub workspace: String,
+    pub pending: bool,
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigAssignment {
+    pub path: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigMutationOptions {
+    pub workspace: String,
+    pub assignments: Vec<ConfigAssignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigApplyOptions {
+    pub workspace: String,
+    pub wait_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCommand {
+    Get(ConfigGetOptions),
+    Diff(ConfigMutationOptions),
+    Set(ConfigMutationOptions),
+    Apply(ConfigApplyOptions),
+}
+
+fn parse_config_assignment(raw: String) -> Result<ConfigAssignment, String> {
+    let Some((path, value)) = raw.split_once('=') else {
+        return Err("--set 必须使用 PATH=VALUE 格式".into());
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("--set 的 PATH 不能为空".into());
+    }
+    Ok(ConfigAssignment {
+        path: path.to_string(),
+        value: value.to_string(),
+    })
+}
+
+fn parse_config_mutation(
+    args: &mut VecDeque<String>,
+    command: &str,
+    require_assignment: bool,
+) -> Result<ConfigMutationOptions, String> {
+    let workspace = pop_value(args, command)?;
+    let mut assignments = Vec::new();
+    while let Some(option) = args.pop_front() {
+        match option.as_str() {
+            "--set" => assignments.push(parse_config_assignment(pop_value(args, "--set")?)?),
+            other => return Err(format!("{command} 不支持参数：{other}")),
+        }
+    }
+    if require_assignment && assignments.is_empty() {
+        return Err(format!("{command} 至少需要一个 --set PATH=VALUE"));
+    }
+    Ok(ConfigMutationOptions {
+        workspace,
+        assignments,
+    })
+}
+
+fn parse_config_command(args: &mut VecDeque<String>) -> Result<ConfigCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("get") => {
+            let workspace = pop_value(args, "config get")?;
+            let mut pending = false;
+            let mut key = None;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--pending" => pending = true,
+                    "--key" => key = Some(pop_value(args, "--key")?),
+                    other => return Err(format!("config get 不支持参数：{other}")),
+                }
+            }
+            Ok(ConfigCommand::Get(ConfigGetOptions {
+                workspace,
+                pending,
+                key,
+            }))
+        }
+        Some("diff") => Ok(ConfigCommand::Diff(parse_config_mutation(
+            args,
+            "config diff",
+            false,
+        )?)),
+        Some("set") => Ok(ConfigCommand::Set(parse_config_mutation(
+            args,
+            "config set",
+            true,
+        )?)),
+        Some("apply") => {
+            let workspace = pop_value(args, "config apply")?;
+            let mut wait_seconds = 30;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 300)?,
+                    other => return Err(format!("config apply 不支持参数：{other}")),
+                }
+            }
+            Ok(ConfigCommand::Apply(ConfigApplyOptions {
+                workspace,
+                wait_seconds,
+            }))
+        }
+        Some(other) => Err(format!("未知 config 命令：{other}\n\n{}", config_usage())),
+        None => Err(config_usage().to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayLogsOptions {
     pub lines: usize,
@@ -682,6 +808,7 @@ pub enum Command {
     Doctor {
         workspace: String,
     },
+    Config(ConfigCommand),
     Workspace(WorkspaceCommand),
     Gateway(GatewayCommand),
     GatewayDaemonRun {
@@ -739,6 +866,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
             ensure_empty(&args, "doctor")?;
             Command::Doctor { workspace }
         }
+        Some("config" | "cfg") => Command::Config(parse_config_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
         Some("gateway-daemon-run") => parse_gateway_daemon_run(&mut args)?,
@@ -803,6 +931,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] events <workspace|--control-plane> [-f] [--wait SECONDS]\n\
   anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
+  anchor [--config-dir PATH] [--json] config <get|diff|set|apply> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
@@ -1206,5 +1335,90 @@ mod tests {
                 timeout_seconds: 10,
             }))
         );
+    }
+
+    #[test]
+    fn parses_config_get_set_diff_and_apply() {
+        let get = parse(strings(&[
+            "config",
+            "get",
+            "project",
+            "--pending",
+            "--key",
+            "runtime.local_port",
+        ]))
+        .expect("config get");
+        assert_eq!(
+            get.command,
+            Command::Config(ConfigCommand::Get(ConfigGetOptions {
+                workspace: "project".into(),
+                pending: true,
+                key: Some("runtime.local_port".into()),
+            }))
+        );
+
+        let set = parse(strings(&[
+            "cfg",
+            "set",
+            "project",
+            "--set",
+            "runtime.local_port=29123",
+            "--set",
+            "auth.oauth_redirect_hosts=*.chatgpt.com",
+        ]))
+        .expect("config set");
+        assert_eq!(
+            set.command,
+            Command::Config(ConfigCommand::Set(ConfigMutationOptions {
+                workspace: "project".into(),
+                assignments: vec![
+                    ConfigAssignment {
+                        path: "runtime.local_port".into(),
+                        value: "29123".into(),
+                    },
+                    ConfigAssignment {
+                        path: "auth.oauth_redirect_hosts".into(),
+                        value: "*.chatgpt.com".into(),
+                    },
+                ],
+            }))
+        );
+
+        let diff = parse(strings(&["config", "diff", "project"]))
+            .expect("config diff without extra patch");
+        assert_eq!(
+            diff.command,
+            Command::Config(ConfigCommand::Diff(ConfigMutationOptions {
+                workspace: "project".into(),
+                assignments: Vec::new(),
+            }))
+        );
+
+        let apply =
+            parse(strings(&["config", "apply", "project", "--wait", "45"])).expect("config apply");
+        assert_eq!(
+            apply.command,
+            Command::Config(ConfigCommand::Apply(ConfigApplyOptions {
+                workspace: "project".into(),
+                wait_seconds: 45,
+            }))
+        );
+    }
+
+    #[test]
+    fn config_set_requires_assignment_and_valid_path_value_shape() {
+        let missing = parse(strings(&["config", "set", "project"]))
+            .expect_err("config set requires assignment");
+        assert!(missing.contains("至少需要一个"));
+
+        let malformed = parse(strings(&[
+            "config",
+            "set",
+            "project",
+            "--set",
+            "runtime.local_port",
+        ]))
+        .expect_err("assignment requires equals");
+        assert!(malformed.contains("PATH=VALUE"));
     }
 }

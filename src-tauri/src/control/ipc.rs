@@ -28,10 +28,10 @@ use super::protocol::{
     ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND, ERROR_WORKSPACE_MISMATCH,
 };
 use super::protocol::{
-    ControlAsyncOperation, ControlAsyncState, ControlEventBatch, ControlEventCursor,
-    ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod, ControlOperation,
-    ControlRequest, ControlResponse, ControlResult, ControlService, ControlTunnelAction,
-    MAX_CONTROL_FRAME_BYTES,
+    ControlAsyncOperation, ControlAsyncState, ControlConfigApplyResult, ControlEventBatch,
+    ControlEventCursor, ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod,
+    ControlOperation, ControlRequest, ControlResponse, ControlResult, ControlService,
+    ControlTunnelAction, MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
@@ -54,6 +54,103 @@ pub enum DaemonControlCommand {
         operation_id: String,
         service: ControlService,
     },
+    ApplyConfig {
+        operation_id: String,
+    },
+}
+
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn finish_config_apply_operation(
+    operation_id: &str,
+    result: AppResult<ControlConfigApplyResult>,
+) {
+    let mut operations = operation_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(stored) = operations.get_mut(operation_id) else {
+        return;
+    };
+    match result {
+        Ok(result) => {
+            stored.operation.state = ControlAsyncState::Succeeded;
+            stored.operation.tunnel_status = None;
+            stored.operation.config_apply = Some(result);
+            stored.operation.error = None;
+        }
+        Err(error) => {
+            stored.operation.state = ControlAsyncState::Failed;
+            stored.operation.tunnel_status = None;
+            stored.operation.config_apply = None;
+            stored.operation.error = Some(ControlError {
+                code: super::protocol::ERROR_OPERATION_FAILED.to_string(),
+                message: error.to_string(),
+            });
+        }
+    }
+}
+
+pub async fn request_apply_config_operation(
+    profile: &WorkspaceProfile,
+    timeout: Duration,
+) -> Result<ControlConfigApplyResult, ControlClientError> {
+    let inspection = daemon::inspect(profile).map_err(|error| {
+        ControlClientError::Protocol(format!(
+            "cannot inspect daemon before config apply: {error}"
+        ))
+    })?;
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            ControlClientError::Protocol(
+                "workspace daemon is not running; config apply requires the daemon control plane"
+                    .into(),
+            )
+        })?;
+    let (operation_id, daemon_pid) = match request(
+        &profile.id,
+        ControlMethod::ApplyConfig {
+            workspace_id: profile.id.clone(),
+        },
+    )
+    .await?
+    {
+        ControlResult::OperationAccepted {
+            operation_id,
+            daemon_pid,
+        } => (operation_id, daemon_pid),
+        other => {
+            return Err(ControlClientError::Protocol(format!(
+                "daemon returned unexpected config apply result: {other:?}"
+            )))
+        }
+    };
+    if daemon_pid != state.pid {
+        return Err(ControlClientError::Protocol(format!(
+            "daemon config apply PID mismatch: status file={}, response={daemon_pid}",
+            state.pid
+        )));
+    }
+    let operation = wait_for_operation(profile, &operation_id, timeout).await?;
+    match operation.state {
+        ControlAsyncState::Succeeded => operation.config_apply.ok_or_else(|| {
+            ControlClientError::Protocol("successful config apply omitted result".into())
+        }),
+        ControlAsyncState::Failed => {
+            let error = operation.error.ok_or_else(|| {
+                ControlClientError::Protocol("failed config apply omitted error details".into())
+            })?;
+            Err(ControlClientError::Remote {
+                code: error.code,
+                message: error.message,
+            })
+        }
+        ControlAsyncState::Pending | ControlAsyncState::Running => {
+            Err(ControlClientError::Protocol(
+                "config apply operation wait returned before reaching terminal state".into(),
+            ))
+        }
+    }
 }
 
 pub async fn request_oauth_redirect_policy_update(
@@ -163,11 +260,13 @@ pub(crate) fn finish_reload_operation(operation_id: &str, result: AppResult<()>)
         Ok(()) => {
             stored.operation.state = ControlAsyncState::Succeeded;
             stored.operation.tunnel_status = None;
+            stored.operation.config_apply = None;
             stored.operation.error = None;
         }
         Err(error) => {
             stored.operation.state = ControlAsyncState::Failed;
             stored.operation.tunnel_status = None;
+            stored.operation.config_apply = None;
             stored.operation.error = Some(ControlError {
                 code: super::protocol::ERROR_OPERATION_FAILED.to_string(),
                 message: error.to_string(),
@@ -319,6 +418,7 @@ fn create_control_operation(workspace_id: &str) -> Option<String> {
                 operation_id: operation_id.clone(),
                 state: ControlAsyncState::Pending,
                 tunnel_status: None,
+                config_apply: None,
                 error: None,
             },
         },
@@ -456,11 +556,13 @@ pub(crate) fn finish_tunnel_operation(operation_id: &str, result: AppResult<Tunn
         Ok(status) => {
             stored.operation.state = ControlAsyncState::Succeeded;
             stored.operation.tunnel_status = Some(status);
+            stored.operation.config_apply = None;
             stored.operation.error = None;
         }
         Err(error) => {
             stored.operation.state = ControlAsyncState::Failed;
             stored.operation.tunnel_status = None;
+            stored.operation.config_apply = None;
             stored.operation.error = Some(ControlError {
                 code: super::protocol::ERROR_OPERATION_FAILED.to_string(),
                 message: error.to_string(),
@@ -909,6 +1011,7 @@ where
         enum AsyncCommandKind {
             Tunnel(String),
             Reload(String),
+            ApplyConfig(String),
         }
         let async_command = match &command {
             DaemonControlCommand::Tunnel { operation_id, .. } => {
@@ -916,6 +1019,9 @@ where
             }
             DaemonControlCommand::Reload { operation_id, .. } => {
                 Some(AsyncCommandKind::Reload(operation_id.clone()))
+            }
+            DaemonControlCommand::ApplyConfig { operation_id } => {
+                Some(AsyncCommandKind::ApplyConfig(operation_id.clone()))
             }
             DaemonControlCommand::Shutdown { .. } => None,
         };
@@ -927,6 +1033,10 @@ where
                     Err(AppError::Message(error.to_string())),
                 ),
                 Some(AsyncCommandKind::Reload(operation_id)) => finish_reload_operation(
+                    &operation_id,
+                    Err(AppError::Message(error.to_string())),
+                ),
+                Some(AsyncCommandKind::ApplyConfig(operation_id)) => finish_config_apply_operation(
                     &operation_id,
                     Err(AppError::Message(error.to_string())),
                 ),
@@ -1161,6 +1271,37 @@ async fn handle_request(
                     operation_id,
                     service,
                 }),
+            }
+        }
+        ControlMethod::ApplyConfig { workspace_id } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            if !command_available {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    "daemon config apply command receiver is unavailable",
+                ));
+            }
+            let Some(operation_id) = create_control_operation(&profile.id) else {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    format!(
+                        "daemon already has {MAX_CONTROL_OPERATIONS} active control operations"
+                    ),
+                ));
+            };
+            HandledRequest {
+                response: ControlResponse::success(
+                    request_id,
+                    ControlResult::OperationAccepted {
+                        operation_id: operation_id.clone(),
+                        daemon_pid: std::process::id(),
+                    },
+                ),
+                command: Some(DaemonControlCommand::ApplyConfig { operation_id }),
             }
         }
         ControlMethod::UpdateOauthRedirectPolicy {
@@ -1589,6 +1730,85 @@ mod tests {
         match completed.result.expect("operation result") {
             ControlResult::OperationStatus { operation } => {
                 assert_eq!(operation.state, ControlAsyncState::Succeeded);
+                assert!(operation.tunnel_status.is_none());
+                assert!(operation.error.is_none());
+            }
+            other => panic!("unexpected operation response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_apply_response_is_flushed_before_execution_and_returns_structured_result() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-config-apply".into()));
+        let workspace_id = profile.id.clone();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (command_sender, mut command_receiver) = control_channel();
+        let server_profile = profile.clone();
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &server_profile, &command_sender).await
+        });
+        let request = ControlRequest {
+            protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+            request_id: "config-apply-request".into(),
+            method: ControlMethod::ApplyConfig {
+                workspace_id: workspace_id.clone(),
+            },
+        };
+
+        write_json_frame(&mut client, &request)
+            .await
+            .expect("write config apply request");
+        let response: ControlResponse = read_json_frame(&mut client).await.expect("read response");
+        let operation_id = match response.result.expect("accepted result") {
+            ControlResult::OperationAccepted {
+                operation_id,
+                daemon_pid,
+            } => {
+                assert_eq!(daemon_pid, std::process::id());
+                operation_id
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        server_task
+            .await
+            .expect("server task")
+            .expect("serve config apply request");
+        assert_eq!(
+            command_receiver.recv().await,
+            Some(DaemonControlCommand::ApplyConfig {
+                operation_id: operation_id.clone(),
+            })
+        );
+
+        mark_control_operation_running(&operation_id);
+        let expected = ControlConfigApplyResult {
+            changed: true,
+            mcp_listener_reloaded: true,
+            actions_listener_reloaded: false,
+            mcp_callback_hot_updated: false,
+            actions_callback_hot_updated: true,
+            mcp_tunnel_reloaded: false,
+            actions_tunnel_reloaded: false,
+        };
+        finish_config_apply_operation(&operation_id, Ok(expected.clone()));
+        let completed = handle_request(
+            ControlRequest {
+                protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                request_id: "config-apply-completed".into(),
+                method: ControlMethod::OperationStatus {
+                    workspace_id,
+                    operation_id,
+                },
+            },
+            &profile,
+            true,
+        )
+        .await
+        .response;
+        match completed.result.expect("operation result") {
+            ControlResult::OperationStatus { operation } => {
+                assert_eq!(operation.state, ControlAsyncState::Succeeded);
+                assert_eq!(operation.config_apply, Some(expected));
                 assert!(operation.tunnel_status.is_none());
                 assert!(operation.error.is_none());
             }

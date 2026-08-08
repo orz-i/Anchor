@@ -1,6 +1,7 @@
 use super::WorkspaceProfile;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceConfigApplyPlan {
     pub mcp_listener_reload: bool,
     pub actions_listener_reload: bool,
@@ -8,6 +9,17 @@ pub struct WorkspaceConfigApplyPlan {
     pub actions_callback_policy_hot_update: bool,
     pub mcp_tunnel_changed: bool,
     pub actions_tunnel_changed: bool,
+}
+
+impl WorkspaceConfigApplyPlan {
+    pub fn has_changes(self) -> bool {
+        self.mcp_listener_reload
+            || self.actions_listener_reload
+            || self.mcp_callback_policy_hot_update
+            || self.actions_callback_policy_hot_update
+            || self.mcp_tunnel_changed
+            || self.actions_tunnel_changed
+    }
 }
 
 pub fn plan_workspace_config_apply(

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::WorkspaceControlStatus;
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 5;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 6;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
@@ -85,6 +85,10 @@ pub enum ControlMethod {
         workspace_id: String,
         service: ControlService,
     },
+    ApplyConfig {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+    },
     UpdateOauthRedirectPolicy {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
@@ -112,6 +116,7 @@ pub enum ControlEventKind {
     TunnelState,
     McpActivity,
     Reload,
+    ConfigApply,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +171,21 @@ pub struct ControlAsyncOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tunnel_status: Option<TunnelStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_apply: Option<ControlConfigApplyResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ControlError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlConfigApplyResult {
+    pub changed: bool,
+    pub mcp_listener_reloaded: bool,
+    pub actions_listener_reloaded: bool,
+    pub mcp_callback_hot_updated: bool,
+    pub actions_callback_hot_updated: bool,
+    pub mcp_tunnel_reloaded: bool,
+    pub actions_tunnel_reloaded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,5 +469,16 @@ mod tests {
         assert_eq!(hot_update["service"], "actions");
         assert_eq!(hot_update["redirectUris"], "https://chatgpt.com/callback");
         assert_eq!(hot_update["redirectHosts"], "*.chatgpt.com");
+
+        let apply = serde_json::to_value(ControlRequest {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            request_id: "request-10".into(),
+            method: ControlMethod::ApplyConfig {
+                workspace_id: "workspace-1".into(),
+            },
+        })
+        .expect("serialize config apply request");
+        assert_eq!(apply["method"], "apply_config");
+        assert_eq!(apply["workspaceId"], "workspace-1");
     }
 }

@@ -1,4 +1,5 @@
 mod args;
+mod config;
 mod workspace;
 
 use std::fs::File;
@@ -25,6 +26,7 @@ use crate::tunnel::{
     maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime,
     supervisor as tunnel_supervisor, TunnelServiceKind, TunnelStatus,
 };
+use crate::workspace::config_apply::plan_workspace_config_apply;
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{
@@ -2270,6 +2272,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Doctor { workspace } => {
             doctor_workspace(&workspace, cli.json).map(|healthy| if healthy { 0 } else { 1 })
         }
+        Command::Config(command) => config::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::GatewayDaemonRun {
@@ -2650,6 +2653,33 @@ async fn serve_workspace(
                             ),
                         }
                         control::finish_reload_operation(&operation_id, result);
+                    }
+                    Some(control::DaemonControlCommand::ApplyConfig { operation_id }) => {
+                        control::mark_control_operation_running(&operation_id);
+                        let result = apply_daemon_config_command(
+                            &mut profile,
+                            service,
+                            &mut managed_tunnels,
+                            &mut runtime,
+                        )
+                        .await;
+                        match &result {
+                            Ok(applied) => control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::ConfigApply,
+                                None,
+                                "succeeded",
+                                format!("workspace config applied changed={}", applied.changed),
+                            ),
+                            Err(error) => control::publish_workspace_event(
+                                &profile.id,
+                                control::ControlEventKind::ConfigApply,
+                                None,
+                                "failed",
+                                error.to_string(),
+                            ),
+                        }
+                        control::finish_config_apply_operation(&operation_id, result);
                     }
                     None => {
                         terminal_error = Some(AppError::Message(
@@ -3151,6 +3181,368 @@ async fn apply_daemon_reload_command(
         managed_tunnel_selection(managed_tunnels),
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedRuntimeConfigChange {
+    None,
+    ListenerReload,
+    CallbackHotUpdate,
+}
+
+async fn reload_runtime_service_to_profile(
+    runtime: &mut RuntimeSupervisor,
+    current: &WorkspaceProfile,
+    target: &WorkspaceProfile,
+    kind: ServiceKind,
+) -> AppResult<()> {
+    let handle = runtime.begin_stop(&current.id, kind);
+    await_listener_shutdown(handle, port_for(current, kind)).await;
+    runtime.finish_stop(&current.id, kind);
+
+    let start_target = match kind {
+        ServiceKind::Mcp => runtime
+            .start_mcp(target)
+            .and_then(|status| ensure_running(status, "MCP")),
+        ServiceKind::Actions => runtime
+            .start_actions(target)
+            .and_then(|status| ensure_running(status, "Actions")),
+    };
+    if let Err(error) = start_target {
+        let handle = runtime.begin_stop(&target.id, kind);
+        await_listener_shutdown(handle, port_for(target, kind)).await;
+        runtime.finish_stop(&target.id, kind);
+        let rollback = match kind {
+            ServiceKind::Mcp => runtime
+                .start_mcp(current)
+                .and_then(|status| ensure_running(status, "MCP")),
+            ServiceKind::Actions => runtime
+                .start_actions(current)
+                .and_then(|status| ensure_running(status, "Actions")),
+        };
+        return match rollback {
+            Ok(()) => Err(AppError::Message(format!(
+                "{} 配置应用失败，已恢复旧 listener：{error}",
+                service_label(kind)
+            ))),
+            Err(rollback_error) => Err(AppError::Message(format!(
+                "{} 配置应用失败：{error}；恢复旧 listener 也失败：{rollback_error}",
+                service_label(kind)
+            ))),
+        };
+    }
+    Ok(())
+}
+
+async fn apply_runtime_config_change(
+    runtime: &mut RuntimeSupervisor,
+    current: &WorkspaceProfile,
+    target: &WorkspaceProfile,
+    service_selection: ServiceSelection,
+    service: control::ControlService,
+    listener_reload: bool,
+    callback_hot_update: bool,
+) -> AppResult<AppliedRuntimeConfigChange> {
+    let (selected, kind, service_name, oauth_enabled, redirect_uris, redirect_hosts) = match service
+    {
+        control::ControlService::Mcp => (
+            service_selection.includes_mcp(),
+            ServiceKind::Mcp,
+            "mcp",
+            target.auth.auth_type == "oauth",
+            target.auth.oauth_redirect_uris.as_str(),
+            target.auth.oauth_redirect_hosts.as_str(),
+        ),
+        control::ControlService::Actions => (
+            service_selection.includes_actions(),
+            ServiceKind::Actions,
+            "actions",
+            target.actions.auth_type == "oauth",
+            target.actions.oauth_redirect_uris.as_str(),
+            target.actions.oauth_redirect_hosts.as_str(),
+        ),
+    };
+    if !selected {
+        return Ok(AppliedRuntimeConfigChange::None);
+    }
+    if listener_reload {
+        reload_runtime_service_to_profile(runtime, current, target, kind).await?;
+        return Ok(AppliedRuntimeConfigChange::ListenerReload);
+    }
+    if callback_hot_update && oauth_enabled {
+        let updated = crate::auth::update_oauth_redirect_policy(
+            &target.id,
+            service_name,
+            redirect_uris,
+            redirect_hosts,
+        )
+        .map_err(AppError::Message)?;
+        if updated {
+            return Ok(AppliedRuntimeConfigChange::CallbackHotUpdate);
+        }
+        reload_runtime_service_to_profile(runtime, current, target, kind).await?;
+        return Ok(AppliedRuntimeConfigChange::ListenerReload);
+    }
+    Ok(AppliedRuntimeConfigChange::None)
+}
+
+async fn rollback_runtime_config_change(
+    runtime: &mut RuntimeSupervisor,
+    current: &WorkspaceProfile,
+    target: &WorkspaceProfile,
+    service: control::ControlService,
+    applied: AppliedRuntimeConfigChange,
+) -> AppResult<()> {
+    match applied {
+        AppliedRuntimeConfigChange::None => Ok(()),
+        AppliedRuntimeConfigChange::ListenerReload => {
+            let kind = match service {
+                control::ControlService::Mcp => ServiceKind::Mcp,
+                control::ControlService::Actions => ServiceKind::Actions,
+            };
+            reload_runtime_service_to_profile(runtime, target, current, kind).await
+        }
+        AppliedRuntimeConfigChange::CallbackHotUpdate => {
+            let (service_name, redirect_uris, redirect_hosts) = match service {
+                control::ControlService::Mcp => (
+                    "mcp",
+                    current.auth.oauth_redirect_uris.as_str(),
+                    current.auth.oauth_redirect_hosts.as_str(),
+                ),
+                control::ControlService::Actions => (
+                    "actions",
+                    current.actions.oauth_redirect_uris.as_str(),
+                    current.actions.oauth_redirect_hosts.as_str(),
+                ),
+            };
+            let updated = crate::auth::update_oauth_redirect_policy(
+                &current.id,
+                service_name,
+                redirect_uris,
+                redirect_hosts,
+            )
+            .map_err(AppError::Message)?;
+            if updated {
+                Ok(())
+            } else {
+                Err(AppError::Message(format!(
+                    "恢复 {service_name} OAuth Callback 策略时活动 runtime 已不存在"
+                )))
+            }
+        }
+    }
+}
+
+async fn reconcile_managed_tunnel_config(
+    current: &WorkspaceProfile,
+    target: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    settings: &crate::settings::AppSettings,
+) -> AppResult<TunnelStatus> {
+    let current_type = tunnel_type_for_profile(current, kind);
+    let target_type = tunnel_type_for_profile(target, kind);
+    let mut tunnels = tunnel_supervisor().lock().await;
+    if target_type == "none" {
+        tunnels.stop(current, kind, settings).await?;
+        return Ok(tunnels.status(target, kind, settings));
+    }
+    if current_type == "frp" && target_type == "frp" {
+        return tunnels.start(target, kind, settings).await;
+    }
+
+    tunnels.stop(current, kind, settings).await?;
+    match tunnels.start(target, kind, settings).await {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            let rollback = if current_type == "none" {
+                Ok(())
+            } else {
+                tunnels.start(current, kind, settings).await.map(|_| ())
+            };
+            match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::Message(format!(
+                    "{} 隧道配置应用失败：{error}；恢复旧线路也失败：{rollback_error}",
+                    tunnel_label(kind)
+                ))),
+            }
+        }
+    }
+}
+
+async fn rollback_managed_tunnel_config(
+    current: &WorkspaceProfile,
+    target: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    settings: &crate::settings::AppSettings,
+) -> AppResult<()> {
+    reconcile_managed_tunnel_config(target, current, kind, settings)
+        .await
+        .map(|_| ())
+}
+
+async fn apply_daemon_config_command(
+    profile: &mut WorkspaceProfile,
+    service_selection: ServiceSelection,
+    managed_tunnels: &mut Vec<TunnelServiceKind>,
+    runtime: &mut RuntimeSupervisor,
+) -> AppResult<control::ControlConfigApplyResult> {
+    let store = DataStore::load()?;
+    let latest = resolve_workspace(store.list(), &profile.id)?.clone();
+    let settings = store.settings();
+    drop(store);
+    ensure_workspace_directory(&latest)?;
+    let previous = profile.clone();
+    let plan = plan_workspace_config_apply(&previous, &latest);
+    let changed = plan.has_changes();
+    if !changed {
+        *profile = latest;
+        daemon::update_tunnel_services(
+            profile,
+            service_selection,
+            managed_tunnel_selection(managed_tunnels),
+        )?;
+        return Ok(control::ControlConfigApplyResult {
+            changed: false,
+            mcp_listener_reloaded: false,
+            actions_listener_reloaded: false,
+            mcp_callback_hot_updated: false,
+            actions_callback_hot_updated: false,
+            mcp_tunnel_reloaded: false,
+            actions_tunnel_reloaded: false,
+        });
+    }
+
+    let mcp_change = apply_runtime_config_change(
+        runtime,
+        &previous,
+        &latest,
+        service_selection,
+        control::ControlService::Mcp,
+        plan.mcp_listener_reload,
+        plan.mcp_callback_policy_hot_update,
+    )
+    .await?;
+    let actions_change = match apply_runtime_config_change(
+        runtime,
+        &previous,
+        &latest,
+        service_selection,
+        control::ControlService::Actions,
+        plan.actions_listener_reload,
+        plan.actions_callback_policy_hot_update,
+    )
+    .await
+    {
+        Ok(change) => change,
+        Err(error) => {
+            let rollback = rollback_runtime_config_change(
+                runtime,
+                &previous,
+                &latest,
+                control::ControlService::Mcp,
+                mcp_change,
+            )
+            .await;
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::Message(format!(
+                    "Actions 配置应用失败：{error}；恢复 MCP 运行态也失败：{rollback_error}"
+                ))),
+            };
+        }
+    };
+
+    let mcp_tunnel_managed =
+        managed_tunnels.contains(&TunnelServiceKind::Mcp) && !settings.mcp_gateway.enabled;
+    let actions_tunnel_managed = managed_tunnels.contains(&TunnelServiceKind::Actions);
+    let mut applied_tunnels = Vec::new();
+    for (kind, should_apply) in [
+        (
+            TunnelServiceKind::Mcp,
+            mcp_tunnel_managed && plan.mcp_tunnel_changed,
+        ),
+        (
+            TunnelServiceKind::Actions,
+            actions_tunnel_managed && plan.actions_tunnel_changed,
+        ),
+    ] {
+        if !should_apply {
+            continue;
+        }
+        match reconcile_managed_tunnel_config(&previous, &latest, kind, &settings).await {
+            Ok(status) => applied_tunnels.push((kind, status)),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                for (applied_kind, _) in applied_tunnels.iter().rev() {
+                    if let Err(rollback_error) =
+                        rollback_managed_tunnel_config(&previous, &latest, *applied_kind, &settings)
+                            .await
+                    {
+                        rollback_errors.push(rollback_error.to_string());
+                    }
+                }
+                if let Err(rollback_error) = rollback_runtime_config_change(
+                    runtime,
+                    &previous,
+                    &latest,
+                    control::ControlService::Actions,
+                    actions_change,
+                )
+                .await
+                {
+                    rollback_errors.push(rollback_error.to_string());
+                }
+                if let Err(rollback_error) = rollback_runtime_config_change(
+                    runtime,
+                    &previous,
+                    &latest,
+                    control::ControlService::Mcp,
+                    mcp_change,
+                )
+                .await
+                {
+                    rollback_errors.push(rollback_error.to_string());
+                }
+                return if rollback_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(AppError::Message(format!(
+                        "隧道配置应用失败：{error}；运行态回滚存在错误：{}",
+                        rollback_errors.join("；")
+                    )))
+                };
+            }
+        }
+    }
+
+    *profile = latest;
+    for (kind, status) in &applied_tunnels {
+        if tunnel_type_for_profile(profile, *kind) == "none" {
+            managed_tunnels.retain(|candidate| *candidate != *kind);
+        }
+        persist_daemon_tunnel_url(profile, *kind, &status.public_url)?;
+    }
+    daemon::update_tunnel_services(
+        profile,
+        service_selection,
+        managed_tunnel_selection(managed_tunnels),
+    )?;
+
+    Ok(control::ControlConfigApplyResult {
+        changed: true,
+        mcp_listener_reloaded: mcp_change == AppliedRuntimeConfigChange::ListenerReload,
+        actions_listener_reloaded: actions_change == AppliedRuntimeConfigChange::ListenerReload,
+        mcp_callback_hot_updated: mcp_change == AppliedRuntimeConfigChange::CallbackHotUpdate,
+        actions_callback_hot_updated: actions_change
+            == AppliedRuntimeConfigChange::CallbackHotUpdate,
+        mcp_tunnel_reloaded: applied_tunnels
+            .iter()
+            .any(|(kind, _)| *kind == TunnelServiceKind::Mcp),
+        actions_tunnel_reloaded: applied_tunnels
+            .iter()
+            .any(|(kind, _)| *kind == TunnelServiceKind::Actions),
+    })
 }
 
 fn control_service_for_runtime(kind: ServiceKind) -> control::ControlService {

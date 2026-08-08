@@ -17,7 +17,7 @@ struct DataFileGuard {
     lock_file: File,
 }
 
-fn validate_workspace_profile(profile: &WorkspaceProfile) -> AppResult<()> {
+pub(crate) fn validate_workspace_profile(profile: &WorkspaceProfile) -> AppResult<()> {
     crate::tools::registry::require_tool_profile(&profile.runtime.tool_profile)
         .map(|_| ())
         .map_err(AppError::Message)
@@ -367,7 +367,8 @@ mod tests {
         };
 
         let error = validate_data(&data).expect_err("invalid profile must fail");
-        assert!(error.to_string().contains("unsupported tool profile `full`"));
+        assert!(error
+            .to_string()
+            .contains("unsupported tool profile `full`"));
     }
-
 }
