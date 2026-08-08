@@ -14,8 +14,9 @@ use crate::platform::platform;
 use crate::tunnel::log_dir_for_profile;
 use crate::workspace::WorkspaceProfile;
 
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 const DAEMON_LOG_FILE: &str = "daemon.log";
+#[cfg(unix)]
 const SIGTERM_VALUE: i32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +25,27 @@ pub enum ServiceSelection {
     Mcp,
     Actions,
     All,
+}
+
+fn process_matches_spawned_daemon(pid: u32, workspace_id: &str) -> bool {
+    if process_matches_daemon(pid, workspace_id) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Startup cleanup is the only path allowed to use the parent image as
+        // a fallback: spawn_with_tunnels always launches current_exe, and the
+        // child may fail before it has persisted DaemonState.
+        let Ok(current) = std::env::current_exe() else {
+            return false;
+        };
+        let Ok(Some(actual)) = platform().process_image_path(pid) else {
+            return false;
+        };
+        normalize_windows_image_path(&current) == normalize_windows_image_path(Path::new(&actual))
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 impl ServiceSelection {
@@ -68,6 +90,7 @@ pub struct DaemonState {
     pub tunnel_services: Option<ServiceSelection>,
     pub log_path: String,
     pub version: String,
+    pub executable_path: String,
 }
 
 impl DaemonState {
@@ -112,6 +135,7 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
                 tunnel_services,
                 log_path: daemon_log_path(&profile.id).display().to_string(),
                 version: "unknown".into(),
+                executable_path: args.first().copied().unwrap_or_default().to_string(),
             });
         }
         states.sort_by_key(|state| state.pid);
@@ -162,17 +186,20 @@ fn parse_daemon_args(
 }
 
 pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResult<()> {
-    ensure_linux()?;
+    ensure_daemon_supported()?;
     if !platform().is_process_alive(pid) {
         cleanup(profile)?;
         return Ok(());
     }
-    if !process_matches_daemon(pid, &profile.id) {
+    if !process_matches_spawned_daemon(pid, &profile.id) {
         return Err(AppError::Message(format!(
             "启动失败后的 PID {pid} 不再匹配当前 workspace daemon，拒绝终止"
         )));
     }
+    #[cfg(unix)]
     signal(pid, SIGTERM_VALUE)?;
+    #[cfg(windows)]
+    platform().terminate_process_tree(pid)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while platform().is_process_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -237,7 +264,7 @@ impl Drop for DaemonGuard {
 }
 
 pub fn supported() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "windows"))
 }
 
 pub fn daemon_log_path(profile_id: &str) -> PathBuf {
@@ -278,7 +305,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
             ambiguous: false,
             pid_matches: false,
             state: None,
-            detail: "daemon 目前仅支持 Linux".into(),
+            detail: "Workspace daemon 当前仅支持 Windows 和 Linux".into(),
         });
     }
     let paths = daemon_paths(&profile.id)?;
@@ -400,7 +427,7 @@ pub fn acquire_with_tunnels(
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<DaemonGuard> {
-    ensure_linux()?;
+    ensure_daemon_supported()?;
     let paths = daemon_paths(&profile.id)?;
     ensure_private_dir(&paths.dir)?;
     let lock_file = open_private_file(&paths.lock, false)?;
@@ -425,6 +452,7 @@ pub fn acquire_with_tunnels(
         tunnel_services,
         log_path: daemon_log_path(&profile.id).display().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
+        executable_path: std::env::current_exe()?.display().to_string(),
     };
     atomic_write_json(&paths.state, &state)?;
     write_private_text(&paths.pid, &format!("{pid}\n"))?;
@@ -440,7 +468,7 @@ pub fn update_tunnel_services(
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<()> {
-    ensure_linux()?;
+    ensure_daemon_supported()?;
     let paths = daemon_paths(&profile.id)?;
     let mut state = read_state(&paths.state)?.ok_or_else(|| {
         AppError::Message("daemon state disappeared while updating tunnel ownership".into())
@@ -473,7 +501,7 @@ pub fn spawn_with_tunnels(
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<u32> {
-    ensure_linux()?;
+    ensure_daemon_supported()?;
     let inspection = inspect(profile)?;
     if inspection.ambiguous {
         return Err(AppError::Message(inspection.detail));
@@ -512,6 +540,9 @@ pub fn spawn_with_tunnels(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+
+    #[cfg(windows)]
+    crate::platform::hide_std_console(&mut command);
 
     #[cfg(unix)]
     {
@@ -587,30 +618,41 @@ pub async fn stop(
     timeout: Duration,
     force: bool,
 ) -> AppResult<Option<u32>> {
-    ensure_linux()?;
-    let inspection = inspect(profile)?;
-    if inspection.ambiguous {
-        return Err(AppError::Message(inspection.detail));
+    ensure_daemon_supported()?;
+    #[cfg(windows)]
+    {
+        let _ = (profile, timeout, force);
+        Err(AppError::Message(
+            "Windows daemon 不允许绕过 Named Pipe 控制面直接停止；请使用 control::request_daemon_exit_and_wait"
+                .into(),
+        ))
     }
-    let Some(state) = inspection.state else {
-        if inspection.stale {
-            cleanup(profile)?;
+    #[cfg(unix)]
+    {
+        let inspection = inspect(profile)?;
+        if inspection.ambiguous {
+            return Err(AppError::Message(inspection.detail));
         }
-        return Ok(None);
-    };
-    if !inspection.running {
-        cleanup(profile)?;
-        return Ok(None);
+        let Some(state) = inspection.state else {
+            if inspection.stale {
+                cleanup(profile)?;
+            }
+            return Ok(None);
+        };
+        if !inspection.running {
+            cleanup(profile)?;
+            return Ok(None);
+        }
+        if !inspection.pid_matches {
+            return Err(AppError::Message(format!(
+                "PID {} 不属于当前 workspace daemon，拒绝停止",
+                state.pid
+            )));
+        }
+        signal(state.pid, SIGTERM_VALUE)?;
+        wait_for_controlled_exit(profile, state.pid, timeout, force).await?;
+        Ok(Some(state.pid))
     }
-    if !inspection.pid_matches {
-        return Err(AppError::Message(format!(
-            "PID {} 不属于当前 workspace daemon，拒绝停止",
-            state.pid
-        )));
-    }
-    signal(state.pid, SIGTERM_VALUE)?;
-    wait_for_controlled_exit(profile, state.pid, timeout, force).await?;
-    Ok(Some(state.pid))
 }
 
 pub async fn wait_for_controlled_exit(
@@ -619,7 +661,7 @@ pub async fn wait_for_controlled_exit(
     timeout: Duration,
     force: bool,
 ) -> AppResult<()> {
-    ensure_linux()?;
+    ensure_daemon_supported()?;
     let deadline = tokio::time::Instant::now() + timeout;
     while platform().is_process_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -712,9 +754,12 @@ pub(crate) fn runtime_dir() -> AppResult<PathBuf> {
             libc::geteuid()
         }));
     }
-    #[cfg(not(unix))]
-    if let Some(path) = config_dir {
-        return Ok(path.join("run"));
+    #[cfg(windows)]
+    {
+        if let Some(path) = config_dir {
+            return Ok(path.join("run"));
+        }
+        return Ok(platform().app_config_dir()?.join("run"));
     }
     #[allow(unreachable_code)]
     Err(AppError::Message("无法确定 daemon 运行目录".into()))
@@ -769,43 +814,71 @@ fn process_matches_daemon(pid: u32, workspace_id: &str) -> bool {
             .collect::<Vec<_>>();
         parse_daemon_args(&args, workspace_id).is_some()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(paths) = daemon_paths(workspace_id) else {
+            return false;
+        };
+        let Ok(Some(state)) = read_state(&paths.state) else {
+            return false;
+        };
+        if state.pid != pid
+            || state.workspace_id != workspace_id
+            || state.schema_version != STATE_SCHEMA_VERSION
+            || state.executable_path.trim().is_empty()
+        {
+            return false;
+        }
+        let Ok(Some(actual)) = platform().process_image_path(pid) else {
+            return false;
+        };
+        normalize_windows_image_path(Path::new(&state.executable_path))
+            == normalize_windows_image_path(Path::new(&actual))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (pid, workspace_id);
         false
     }
 }
 
+#[cfg(unix)]
 fn signal(pid: u32, value: i32) -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as i32, value) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(AppError::Message(format!(
-            "发送信号 {value} 到 PID {pid} 失败：{error}"
-        )));
+    let result = unsafe { libc::kill(pid as i32, value) };
+    if result == 0 {
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, value);
-        Err(AppError::Message("daemon 目前仅支持 Linux".into()))
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Ok(());
     }
+    Err(AppError::Message(format!(
+        "发送信号 {value} 到 PID {pid} 失败：{error}"
+    )))
 }
 
-fn ensure_linux() -> AppResult<()> {
+fn ensure_daemon_supported() -> AppResult<()> {
     if supported() {
         Ok(())
     } else {
         Err(AppError::Message(
-            "daemon 目前仅支持 Linux；请使用 serve 前台模式".into(),
+            "daemon 当前平台尚未支持；请使用 serve 前台模式".into(),
         ))
     }
+}
+
+#[cfg(windows)]
+fn normalize_windows_image_path(path: &Path) -> String {
+    let normalized = fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    normalized
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(&normalized)
+        .to_string()
 }
 
 fn sanitize_id(value: &str) -> String {
@@ -883,8 +956,47 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> AppResult<()> {
     ));
     let payload = format!("{}\n", serde_json::to_string_pretty(value)?);
     write_private_text(&temp, &payload)?;
-    fs::rename(&temp, path)?;
+    replace_file(&temp, path)?;
     Ok(())
+}
+
+fn replace_file(source: &Path, destination: &Path) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(destination.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|error| {
+                AppError::Message(format!("Windows daemon state replacement failed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -944,6 +1056,7 @@ mod tests {
             tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "/tmp/daemon.log".into(),
             version: "1".into(),
+            executable_path: "/usr/local/bin/anchor".into(),
         };
 
         let value = serde_json::to_value(state).expect("serialize state");
@@ -952,6 +1065,25 @@ mod tests {
         assert_eq!(value["tunnel"], true);
         assert_eq!(value["tunnelServices"], "mcp");
         assert_eq!(value["pid"], 42);
+        assert_eq!(value["executablePath"], "/usr/local/bin/anchor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_state_replace_replaces_existing_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("state.tmp");
+        let destination = temp.path().join("state.json");
+        fs::write(&source, "new").expect("source");
+        fs::write(&destination, "old").expect("destination");
+
+        replace_file(&source, &destination).expect("replace");
+
+        assert_eq!(
+            fs::read_to_string(&destination).expect("destination"),
+            "new"
+        );
+        assert!(!source.exists());
     }
 
     #[test]

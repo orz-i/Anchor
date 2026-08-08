@@ -1,6 +1,6 @@
 # CLI Daemon 与运维命令
 
-长期控制面演进方案见 [CLI、Daemon 与 GUI 控制面演进路线](cli-daemon-roadmap.md)。当前后台 daemon 仍只支持 Linux，但 daemon 状态模型已经提升为 CLI 与桌面端共享的库层能力。
+长期控制面演进方案见 [CLI、Daemon 与 GUI 控制面演进路线](cli-daemon-roadmap.md)。Workspace 后台 daemon 当前支持 Windows 与 Linux；Gateway 后台 daemon 仍只支持 Linux。两类控制域共享状态/协议基础，但互不接管运行资源。
 
 `anchor` 提供两种运行方式：
 
@@ -11,7 +11,7 @@
 
 两种模式都读取同一个 WorkspaceProfile；一个 workspace 仍只对应一个 profile。
 
-Linux 后台 daemon 还提供版本化本地控制端点。CLI 与桌面端读取控制状态时会优先通过该端点查询；只有端点明确不可用时才执行本地只读探测。协议错误或版本不兼容会直接报告，避免把损坏或过期 daemon 隐藏为“正常离线状态”。
+Workspace 后台 daemon 提供版本化本地控制端点：Unix 使用 UDS，Windows 使用 Named Pipe。CLI 与桌面端读取控制状态时会优先通过该端点查询；只有端点明确不可用时才执行本地只读探测。协议错误或版本不兼容会直接报告，避免把损坏或过期 daemon 隐藏为“正常离线状态”。
 
 Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT 连接运维](workspace-cli.md)。
 
@@ -96,8 +96,8 @@ anchor stop <workspace> [--timeout SECONDS] [--force]
 ```
 
 - 根据状态文件读取 PID；
-- 读取 `/proc/<pid>/cmdline`，确认该 PID 确实是当前 workspace 的 `daemon-run`；
-- 默认发送 SIGTERM，让 MCP、Actions、下游 MCP 和隧道优雅停止；
+- Linux 通过 `/proc/<pid>/cmdline` 验证目标命令；Windows state v2 记录 daemon `executablePath`，并与目标 PID 的进程镜像路径匹配；
+- 正常 `stop` 始终先通过版本化 IPC 发送 `shutdown`，由 daemon 自己停止 MCP、Actions、下游 MCP 和隧道；Windows 不提供绕过 Named Pipe 的本地 signal/kill 写路径；
 - 超时后只有显式 `--force` 才终止完整子进程树；
 - PID 不匹配时只清理过期状态，不会误杀其他进程；
 - daemon 未运行时返回 already stopped，不视为错误。
@@ -187,13 +187,13 @@ anchor reload <workspace> [--service mcp|actions|all]
 
 ## 运行文件
 
-Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优先级选择：
+Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按平台选择：
 
-1. 使用 `--config-dir` 时：`<config-dir>/run/`；
-2. 设置 `XDG_RUNTIME_DIR` 时：`$XDG_RUNTIME_DIR/anchor/`；
-3. 回退：`/tmp/anchor-<uid>/`。
+1. 使用 `--config-dir` 时，Windows/Linux 都使用 `<config-dir>/run/`；
+2. Linux 设置 `XDG_RUNTIME_DIR` 时使用 `$XDG_RUNTIME_DIR/anchor/`；否则回退 `/tmp/anchor-<uid>/`；
+3. Windows 未指定 `--config-dir` 时使用当前用户 Anchor 配置目录下的 `run/`。
 
-目录权限为 `0700`，状态、PID 和锁文件使用当前用户权限。每个 workspace 使用独立文件名。
+Unix 运行目录权限为 `0700`，状态、PID 和锁文件使用当前用户权限。Windows 同样按当前用户配置域分离，每个 workspace 使用独立文件名；state v2 额外保存实际 daemon executable path，用于 PID 镜像归属校验。
 
 日志继续存放在 profile 日志目录：
 
@@ -206,9 +206,9 @@ Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按以下优�
 每工作区还使用一个控制端点：
 
 - Unix：`<runtime-dir>/<profile-id>.sock`，父目录 `0700`、socket `0600`；
-- Windows：`\\.\pipe\anchor-<user-config-scope>-<profile-id>`。当前版本只提供客户端地址与协议抽象，Windows daemon 服务端将在 Windows Service 生命周期落地时启用。
+- Windows：`\\.\pipe\anchor-<user-config-scope>-<profile-id>`。服务端拒绝远程客户端，并使用受保护 DACL `D:P(A;;GA;;;SY)(A;;GA;;;OW)`，只授予 LocalSystem 与对象 owner 完全控制，不添加 Everyone/Anonymous ACE。
 
-控制协议当前版本为 `4`，支持 `ping`、`version`、`workspace_status`、`logs`、`events`、`reload`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
+Workspace 控制协议当前版本为 `6`，支持 `ping`、`version`、`workspace_status`、`logs`、`events`、`reload`、`apply_config`、`update_oauth_redirect_policy`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
 
 Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|actions|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|actions|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
 
@@ -241,7 +241,7 @@ GUI Workspace 控制使用同一生命周期客户端：
 - Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；GUI 不再根据 `running` 状态自行调用 restart。名称等纯元数据变化不触发 listener，MCP/Actions 运行参数和认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
 - Workspace control protocol v6 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 GUI/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
 - Tunnel 仍保持独立事务语义：保存 tunnel 配置后由 tunnel control 执行 start/stop/restart；Workspace profile 更新本身不会把 tunnel 字段误判为 listener 配置。Gateway 仅在其实际使用的 MCP tunnel/owner 字段变化时 reload，不再因 Workspace 名称等无关配置变化重建；
-- Gateway 不归属于任何 Workspace daemon。GUI 使用独立 Gateway control client 获取状态并应用配置；共享 Gateway listener/tunnel 由独立全局 Gateway daemon 持有。若旧桌面进程仍持有兼容 Gateway listener，则配置热改继续 fail-closed，避免两个控制域同时拥有运行态。
+- Gateway 不归属于任何 Workspace daemon。Linux GUI/CLI 使用独立 Gateway daemon；Windows Gateway daemon 尚未迁移完成，因此只在 **Gateway 控制域** 保留 GUI Server 兼容运行时。该 Gateway 兼容域会读取 Workspace daemon 的 MCP 活动状态并把 route 指向 daemon-owned 本地端口，不会恢复 Workspace 进程内 listener。
 
 ## 独立 Gateway daemon
 
@@ -307,7 +307,7 @@ anchor --json config apply <workspace> [--wait SECONDS]
 - `config diff` 默认比较活动 profile 与当前 pending candidate，也可追加临时 `--set` 预览；输出 field-level changes 和共享 `applyPlan`，不会写磁盘或运行态。
 - `config apply` 才把 pending candidate 提升为活动配置。Workspace daemon 运行时必须通过 protocol v6 `apply_config`；endpoint、协议或 PID 归属错误直接失败，不回退为 CLI 本地 `RuntimeSupervisor`。Gateway route/owner 需要更新时只通过独立 Gateway control reload。
 - 任一运行态应用失败时会恢复旧 Workspace/settings，并对已经成功触及的 Workspace/Gateway 运行态执行受控回滚；pending 文件保留，便于修正后重试。全部成功后才删除 pending。
-- 对已停止的 Workspace，`apply` 只持久化配置，不会隐式启动 listener 或 tunnel。Windows 后台 daemon 尚未实现时，如果相关 GUI Server 端口正在监听，CLI 会 fail-closed，要求先停止服务或由 GUI 当前唯一运行权威应用配置。
+- 对已停止的 Workspace，`apply` 只持久化配置，不会隐式启动 listener 或 tunnel。如果 Workspace daemon 未运行但相关 GUI Server/外部 listener 仍在监听，CLI 会 fail-closed，避免活动运行态继续使用旧配置；应先停止 listener，或先由 Workspace daemon 接管运行态。
 - pending 文件不包含独立 secret store 内容，单文件限制为 2 MiB；Unix staging 目录/文件分别使用 `0700` / `0600` 权限。
 
 Gateway 设置页已改为 event-first：活动 daemon 通过 Gateway `events` 唤醒状态与有界日志刷新；只有 endpoint 明确 unavailable 时才以 2 秒间隔读取 configured/stopped 状态并重新探测 event endpoint。协议或远端错误会显示显式 fault，不会静默降级到轮询。
@@ -331,9 +331,9 @@ anchor events --control-plane --follow --wait 15
 
 桌面全局 layout 使用一次 `get_control_plane_status` 代替原先每个 Workspace 的 MCP/Actions 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
 
-Windows 仍只有 Workspace/Gateway Named Pipe 客户端和地址抽象，后台 daemon 服务端与当前用户 ACL 尚未完成。为了避免桌面版在此过渡期不可用，**Windows GUI 会自动进入进程内 Server 模式**：Workspace MCP/Actions、Workspace Tunnel、Gateway listener/routes/shared tunnel 由当前 Anchor 桌面进程作为唯一运行权威管理；GUI 会明确显示 Server 模式，无需额外开关。关闭桌面应用时会停止 process-local Gateway 并清理受管 tunnel 子进程。CLI 的后台 `start/stop/restart`/Gateway daemon 命令仍不会伪装为 Windows daemon 可用。
+Windows Workspace 已使用真实后台 daemon：GUI 的 MCP/Actions 状态、启停、重启、Workspace Tunnel 和配置应用都走同一 Named Pipe 控制面，Workspace 进程内 `RuntimeSupervisor` 不再是 Windows 主路径。桌面二进制自身支持内部 `daemon-run` 分流，子进程会在进入 Tauri 单实例锁/窗口前直接执行 daemon 主循环，因此安装版 GUI 也能作为 per-user Workspace daemon 的启动镜像。
 
-Windows GUI Server 模式继续复用与 daemon 相同的有界 Workspace/Gateway event journal 和状态模型；本进程监听端口标记为 `owner=server`，避免被聚合状态误判为外部进程。该兼容模式只在 Windows daemon 不受支持时自动选择，不会在 Linux 与现有 daemon 同时成为第二套运行权威。
+Windows Gateway 仍是独立的过渡边界：Gateway daemon 服务端暂未实现，所以只在 Gateway 域保留 process-local GUI Server。该兼容 Gateway 会把已由 Workspace daemon 启动的 MCP workspace 纳入 route 集合；Workspace daemon MCP 启停后只触发 Gateway 域 reconcile，不创建第二个 Workspace listener。后续 Gateway Windows daemon 落地后才能删除这部分剩余兼容运行时。
 
 ## 与 systemd 的关系
 
@@ -378,8 +378,9 @@ anchor --json events --control-plane
 
 ## 安全边界
 
-- Workspace/Gateway 后台 daemon 目前仅支持 Linux；Windows GUI 自动使用进程内 Server 模式，CLI 仍可显式使用前台 `serve`/`gateway serve` 做调试或外部监督；GUI 不会伪装后台 daemon 可用；
-- PID 所有权校验失败时拒绝发送信号；
+- Workspace 后台 daemon 支持 Windows/Linux；Gateway 后台 daemon 当前仍仅支持 Linux。Windows Gateway GUI Server 是 Gateway 域的临时兼容路径，不代表 Gateway daemon 已支持 Windows；
+- Windows Workspace Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；Unix UDS 继续使用私有目录/socket 权限；
+- PID 所有权校验失败时拒绝生命周期写操作；Windows additionally 校验 state v2 `executablePath` 与实际 PID 镜像；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
 - 端口被 GUI 或外部进程占用时拒绝启动；
 - `daemon-run` 是内部命令，不应直接调用；
@@ -388,7 +389,9 @@ anchor --json events --control-plane
 
 ## 当前验证边界
 
-Windows 开发机已完成 headless feature 编译、参数测试和严格 Clippy。当前 Rust 工具链未安装 `x86_64-unknown-linux-gnu` 标准库，因此 Linux 专用 `setsid`、`/proc` PID 校验和真实后台生命周期仍需在 Linux CI 或 Linux 主机执行 smoke：
+Windows 开发机已完成真实 per-user Workspace daemon smoke：Actions-only `start` 经 Named Pipe readiness 返回后台 PID，`status` 确认 state v2 / PID image ownership / `owner=daemon`，`stop` 经 Named Pipe graceful shutdown 清理 state/PID 并释放端口；另有连续 Named Pipe round-trip、protected DACL 和 Windows 原子 state replace 专项测试。
+
+Windows **SCM Service 安装/卸载尚未实现**。当前 `anchor start/stop/restart/status` 管理的是当前用户配置域下的后台 Workspace daemon 子进程，不注册 Windows Service，也不提供开机自启。Gateway Windows daemon 也仍待迁移。Linux 专用 `setsid`、`/proc` PID 校验和 Gateway 后台生命周期仍应在 Linux CI 或 Linux 主机执行 smoke：
 
 ```bash
 anchor start PROFILE_ID

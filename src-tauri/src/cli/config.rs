@@ -188,13 +188,12 @@ async fn apply_config(options: ConfigApplyOptions, as_json: bool) -> AppResult<(
     let plan = plan_workspace_config_apply(&active, &candidate);
     let changes = config_changes(&active, &candidate)?;
     let previous_settings = store.settings();
-    reject_uncoordinated_live_runtime(&active, &plan, &previous_settings)?;
-
     let daemon_inspection = daemon::inspect(&active)?;
     if daemon_inspection.ambiguous {
         return Err(AppError::Message(daemon_inspection.detail));
     }
     let daemon_running = daemon_inspection.running && daemon_inspection.pid_matches;
+    reject_uncoordinated_live_runtime(&active, &plan, &previous_settings, daemon_running)?;
     let gateway_inspection = gateway_daemon::inspect()?;
     if gateway_inspection.ambiguous {
         return Err(AppError::Message(gateway_inspection.detail));
@@ -314,8 +313,9 @@ fn reject_uncoordinated_live_runtime(
     active: &WorkspaceProfile,
     plan: &WorkspaceConfigApplyPlan,
     settings: &crate::settings::AppSettings,
+    daemon_running: bool,
 ) -> AppResult<()> {
-    if daemon::supported() {
+    if daemon_running {
         return Ok(());
     }
     let mcp_runtime_change = plan.mcp_listener_reload
@@ -330,7 +330,7 @@ fn reject_uncoordinated_live_runtime(
             .is_some()
     {
         return Err(AppError::Message(
-            "当前平台后台 Workspace daemon 尚未可用，且 MCP 端口存在活动运行态；CLI config apply 不会接管 GUI Server。请先停止服务，或在 GUI 中应用配置。"
+            "当前 Workspace daemon 未运行，但 MCP 端口存在活动 listener；CLI config apply 不会让活动 GUI Server/外部运行态与磁盘配置分叉。请先停止该 listener，或先启动并由 Workspace daemon 接管。"
                 .into(),
         ));
     }
@@ -340,7 +340,7 @@ fn reject_uncoordinated_live_runtime(
             .is_some()
     {
         return Err(AppError::Message(
-            "当前平台后台 Workspace daemon 尚未可用，且 Actions 端口存在活动运行态；CLI config apply 不会接管 GUI Server。请先停止服务，或在 GUI 中应用配置。"
+            "当前 Workspace daemon 未运行，但 Actions 端口存在活动 listener；CLI config apply 不会让活动 GUI Server/外部运行态与磁盘配置分叉。请先停止该 listener，或先启动并由 Workspace daemon 接管。"
                 .into(),
         ));
     }

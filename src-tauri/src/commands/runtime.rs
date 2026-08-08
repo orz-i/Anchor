@@ -251,8 +251,24 @@ fn server_gateway_context(
 )> {
     let (settings, profiles) =
         state.with_settings(|store| Ok((store.settings(), store.list().to_vec())))?;
-    let active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
+    let mut active = state.with_runtime(|runtime| Ok(runtime.active_mcp_workspace_ids()))?;
+    for profile in &profiles {
+        let inspection = crate::daemon::inspect(profile)?;
+        if daemon_inspection_routes_mcp(&inspection) {
+            active.insert(profile.id.clone());
+        }
+    }
     Ok((settings, profiles, active))
+}
+
+#[cfg(windows)]
+fn daemon_inspection_routes_mcp(inspection: &crate::daemon::DaemonInspection) -> bool {
+    inspection.running
+        && inspection.pid_matches
+        && inspection
+            .state
+            .as_ref()
+            .is_some_and(|daemon_state| daemon_state.service.includes_mcp())
 }
 
 #[cfg(windows)]
@@ -483,7 +499,7 @@ pub async fn get_gateway_control_events(
     wait_ms: u32,
 ) -> AppResult<Option<GatewayEventBatch>> {
     #[cfg(windows)]
-    if desktop_server_mode() {
+    if desktop_gateway_server_mode() {
         let scope = gateway_daemon::config_scope()?;
         return Ok(Some(
             gateway_control::read_gateway_events(&scope, cursor.as_ref(), 32, wait_ms).await,
@@ -506,6 +522,10 @@ const DESKTOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) fn desktop_server_mode() -> bool {
     cfg!(target_os = "windows") && !crate::daemon::supported()
+}
+
+pub(super) fn desktop_gateway_server_mode() -> bool {
+    cfg!(target_os = "windows") && !crate::gateway_daemon::supported()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,6 +746,10 @@ fn ensure_daemon_gateway_compatible(
 ) -> AppResult<()> {
     let gateway_enabled = state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?;
     if gateway_enabled && desired.is_some_and(crate::daemon::ServiceSelection::includes_mcp) {
+        #[cfg(windows)]
+        if desktop_gateway_server_mode() {
+            return Ok(());
+        }
         return Err(AppError::Message(
             "MCP Gateway 模式尚未迁移到统一 daemon 控制面；请先关闭 Gateway，或使用 CLI `anchor gateway serve`。GUI 不会回退到进程内 RuntimeSupervisor。"
                 .into(),
@@ -768,6 +792,13 @@ async fn start_desktop_service(
         true,
     )
     .await?;
+    #[cfg(windows)]
+    if service == WorkspaceService::Mcp
+        && desktop_gateway_server_mode()
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        reconcile_server_gateway(state).await?;
+    }
     daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
 }
 
@@ -786,6 +817,13 @@ async fn stop_desktop_service(
         true,
     )
     .await?;
+    #[cfg(windows)]
+    if service == WorkspaceService::Mcp
+        && desktop_gateway_server_mode()
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        reconcile_server_gateway(state).await?;
+    }
     daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
 }
 
@@ -822,6 +860,13 @@ async fn restart_desktop_service(
         true,
     )
     .await?;
+    #[cfg(windows)]
+    if service == WorkspaceService::Mcp
+        && desktop_gateway_server_mode()
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        reconcile_server_gateway(state).await?;
+    }
     daemon_runtime_status(state, &profile_by_id(state, id)?, service).await
 }
 
@@ -831,7 +876,7 @@ pub async fn set_mcp_gateway(
     mut config: McpGatewayConfig,
 ) -> AppResult<GatewayControlStatus> {
     #[cfg(windows)]
-    if desktop_server_mode() {
+    if desktop_gateway_server_mode() {
         return set_server_mcp_gateway(&state, config).await;
     }
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
@@ -1165,7 +1210,7 @@ mod tests {
     fn daemon_status_maps_each_service_without_process_local_runtime_state() {
         let profile = WorkspaceProfile::new(".".into(), Some("desktop-status".into()));
         let daemon_state = DaemonState {
-            schema_version: 1,
+            schema_version: 2,
             workspace_id: profile.id.clone(),
             workspace_name: profile.name.clone(),
             workspace_path: profile.path.clone(),
@@ -1176,6 +1221,7 @@ mod tests {
             tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "daemon.log".into(),
             version: "test".into(),
+            executable_path: "anchor.exe".into(),
         };
         let status = WorkspaceControlStatus {
             id: profile.id.clone(),
@@ -1214,6 +1260,9 @@ mod tests {
             }),
             actions_tunnel: None,
         };
+
+        #[cfg(windows)]
+        assert!(daemon_inspection_routes_mcp(&status.daemon));
 
         let mcp = runtime_status_from_control(
             &profile,
@@ -1297,7 +1346,7 @@ mod tests {
                 ambiguous: false,
                 pid_matches: false,
                 state: None,
-                detail: "daemon 目前仅支持 Linux".into(),
+                detail: "Workspace daemon 当前仅支持 Windows 和 Linux".into(),
             },
             mcp: control::PortStatus {
                 service: "mcp".into(),
@@ -1334,8 +1383,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_desktop_automatically_selects_server_mode_while_daemon_is_unsupported() {
-        assert!(!crate::daemon::supported());
-        assert!(desktop_server_mode());
+    fn windows_workspace_daemon_and_gateway_fallback_are_independent() {
+        assert!(crate::daemon::supported());
+        assert!(!desktop_server_mode());
+        assert!(!crate::gateway_daemon::supported());
+        assert!(desktop_gateway_server_mode());
     }
 }

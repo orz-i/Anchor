@@ -311,6 +311,7 @@ fn operation_label(operation: ControlOperation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     use crate::workspace::WorkspaceProfile;
 
     #[test]
@@ -365,7 +366,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     #[tokio::test]
     async fn unsupported_platform_start_fails_closed_without_local_runtime_fallback() {
         let profile = WorkspaceProfile::new(".".into(), Some("unsupported-daemon".into()));
@@ -381,7 +382,13 @@ mod tests {
         .await
         .expect_err("unsupported daemon start must fail");
 
-        assert!(error.to_string().contains("daemon 目前仅支持 Linux"));
+        assert!(error.to_string().contains("daemon 当前平台尚未支持"));
         assert!(!daemon::inspect(&profile).expect("inspection").running);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_workspace_daemon_is_a_supported_control_plane() {
+        assert!(daemon::supported());
     }
 }

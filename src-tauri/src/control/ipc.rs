@@ -15,14 +15,14 @@ use crate::error::{AppError, AppResult};
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 use crate::workspace::WorkspaceProfile;
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use super::events::read_workspace_events;
 use super::events::{MAX_EVENT_BATCH, MAX_EVENT_WAIT_MS};
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use super::logs::read_log_batch;
 #[cfg(any(feature = "cli", test))]
 use super::protocol::ControlError;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use super::protocol::{
     validate_protocol_version, ERROR_CONTROL_COMMAND_UNAVAILABLE, ERROR_INTERNAL,
     ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND, ERROR_WORKSPACE_MISMATCH,
@@ -37,8 +37,10 @@ use super::{workspace_status, WorkspaceControlStatus};
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const CONTROL_OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const MAX_CONTROL_OPERATIONS: usize = 128;
+#[cfg(windows)]
+const WINDOWS_PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonControlCommand {
@@ -87,6 +89,68 @@ pub(crate) fn finish_config_apply_operation(
             });
         }
     }
+}
+
+#[cfg(windows)]
+fn create_windows_pipe_server(
+    name: &str,
+    first_instance: bool,
+) -> AppResult<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    // DACL is protected and grants full control only to LocalSystem and the
+    // owner of this pipe object. Windows assigns a new object's owner from the
+    // creating process token, so a per-user daemon remains reachable by that
+    // user while excluding Everyone/Anonymous from the control plane.
+    let sddl = std::ffi::OsStr::new(WINDOWS_PIPE_SECURITY_SDDL)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|error| {
+            AppError::Message(format!(
+                "failed to build Windows daemon pipe security descriptor: {error}"
+            ))
+        })?;
+    }
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let result = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first_instance)
+            .reject_remote_clients(true)
+            .max_instances(32)
+            .create_with_security_attributes_raw(
+                name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    result.map_err(|error| {
+        AppError::Message(format!(
+            "failed to create Windows daemon named pipe {name}: {error}"
+        ))
+    })
 }
 
 pub async fn request_apply_config_operation(
@@ -380,7 +444,7 @@ pub async fn request_events(
 #[derive(Debug, Clone)]
 #[cfg(any(feature = "cli", test))]
 struct StoredControlOperation {
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     workspace_id: String,
     operation: ControlAsyncOperation,
 }
@@ -391,7 +455,7 @@ fn operation_store() -> &'static Mutex<HashMap<String, StoredControlOperation>> 
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn create_control_operation(workspace_id: &str) -> Option<String> {
     let operation_id = uuid::Uuid::new_v4().to_string();
     let mut operations = operation_store()
@@ -426,7 +490,7 @@ fn create_control_operation(workspace_id: &str) -> Option<String> {
     Some(operation_id)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn control_operation(workspace_id: &str, operation_id: &str) -> Option<ControlAsyncOperation> {
     operation_store()
         .lock()
@@ -639,6 +703,7 @@ pub fn endpoint(profile_id: &str) -> AppResult<LocalControlEndpoint> {
             daemon::control_socket_path(profile_id)?,
         ));
     }
+
     #[cfg(windows)]
     {
         return Ok(LocalControlEndpoint::WindowsNamedPipe(
@@ -968,7 +1033,64 @@ impl ControlServer {
         Ok(Self { endpoint, task })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub fn start(
+        profile: WorkspaceProfile,
+        command_sender: DaemonControlSender,
+    ) -> AppResult<Self> {
+        let endpoint = endpoint(&profile.id)?;
+        let LocalControlEndpoint::WindowsNamedPipe(name) = &endpoint else {
+            return Err(AppError::Message(
+                "Windows daemon resolved a non-pipe control endpoint".into(),
+            ));
+        };
+        let mut server = create_windows_pipe_server(name, true)?;
+        let task_profile = profile.clone();
+        let pipe_name = name.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if let Err(error) = server.connect().await {
+                    crate::tunnel::append_profile_log(
+                        &task_profile.id,
+                        "daemon.log",
+                        &format!("[control] named pipe connect failed: {error}"),
+                    );
+                    break;
+                }
+
+                // Create the next instance before serving the connected client so
+                // another same-user client can connect without a NotFound gap.
+                let next = match create_windows_pipe_server(&pipe_name, false) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        crate::tunnel::append_profile_log(
+                            &task_profile.id,
+                            "daemon.log",
+                            &format!("[control] named pipe instance creation failed: {error}"),
+                        );
+                        break;
+                    }
+                };
+                let connected = std::mem::replace(&mut server, next);
+                let profile = task_profile.clone();
+                let command_sender = command_sender.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_connection(connected, &profile, &command_sender).await
+                    {
+                        crate::tunnel::append_profile_log(
+                            &profile.id,
+                            "daemon.log",
+                            &format!("[control] request failed: {error}"),
+                        );
+                    }
+                });
+            }
+        });
+        Ok(Self { endpoint, task })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn start(
         _profile: WorkspaceProfile,
         _command_sender: DaemonControlSender,
@@ -992,7 +1114,7 @@ impl Drop for ControlServer {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn handle_connection<S>(
     mut stream: S,
     profile: &WorkspaceProfile,
@@ -1048,13 +1170,13 @@ where
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 struct HandledRequest {
     response: ControlResponse,
     command: Option<DaemonControlCommand>,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn handle_request(
     request: ControlRequest,
     profile: &WorkspaceProfile,
@@ -1340,7 +1462,7 @@ async fn handle_request(
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn lifecycle_request(
     request_id: String,
     profile: &WorkspaceProfile,
@@ -1370,7 +1492,7 @@ fn lifecycle_request(
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn workspace_mismatch(
     request_id: &str,
     profile: &WorkspaceProfile,
@@ -1388,7 +1510,7 @@ fn workspace_mismatch(
     })
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn handled(response: ControlResponse) -> HandledRequest {
     HandledRequest {
         response,
@@ -1474,6 +1596,30 @@ mod tests {
             endpoint,
             LocalControlEndpoint::WindowsNamedPipe(_)
         ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_server_accepts_repeated_same_user_requests() {
+        let profile = WorkspaceProfile::new(".".into(), Some("pipe-round-trip".into()));
+        let (command_sender, _command_receiver) = control_channel();
+        let server = ControlServer::start(profile.clone(), command_sender).expect("start pipe");
+
+        assert!(matches!(
+            server.endpoint(),
+            LocalControlEndpoint::WindowsNamedPipe(name)
+                if name.starts_with(r"\\.\pipe\") && name.contains(&profile.id)
+        ));
+        ping(&profile.id).await.expect("first pipe ping");
+        ping(&profile.id).await.expect("second pipe ping");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_named_pipe_uses_protected_owner_and_system_dacl() {
+        assert_eq!(WINDOWS_PIPE_SECURITY_SDDL, "D:P(A;;GA;;;SY)(A;;GA;;;OW)");
+        assert!(!WINDOWS_PIPE_SECURITY_SDDL.contains("WD"));
+        assert!(!WINDOWS_PIPE_SECURITY_SDDL.contains("AN"));
     }
 
     #[tokio::test]

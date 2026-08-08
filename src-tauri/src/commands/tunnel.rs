@@ -528,7 +528,7 @@ mod tests {
                 ambiguous: false,
                 pid_matches: true,
                 state: Some(DaemonState {
-                    schema_version: 1,
+                    schema_version: 2,
                     workspace_id: profile.id.clone(),
                     workspace_name: profile.name.clone(),
                     workspace_path: profile.path.clone(),
@@ -539,6 +539,7 @@ mod tests {
                     tunnel_services: Some(ServiceSelection::Mcp),
                     log_path: "daemon.log".into(),
                     version: "test".into(),
+                    executable_path: "anchor.exe".into(),
                 }),
                 detail: "running".into(),
             },

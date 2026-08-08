@@ -935,7 +935,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
-不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Linux 后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
 
 pub fn gateway_usage() -> &'static str {

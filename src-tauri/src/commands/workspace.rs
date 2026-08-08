@@ -224,7 +224,7 @@ async fn rollback_workspace_config(
     }
     if scope.gateway_reload {
         #[cfg(windows)]
-        let gateway_result = if super::runtime::desktop_server_mode() {
+        let gateway_result = if super::runtime::desktop_gateway_server_mode() {
             super::runtime::reconcile_server_gateway(state)
                 .await
                 .map(|_| ())
@@ -371,7 +371,7 @@ pub async fn update_workspace(
         return Err(AppError::Message(gateway_inspection.detail));
     }
     #[cfg(windows)]
-    let server_gateway_status = if super::runtime::desktop_server_mode() {
+    let server_gateway_status = if super::runtime::desktop_gateway_server_mode() {
         Some(crate::mcp::gateway::status(&previous_settings.mcp_gateway).await)
     } else {
         None
@@ -501,7 +501,7 @@ pub async fn update_workspace(
     let gateway_reload = gateway_profile_live && apply_plan.mcp_tunnel_changed;
     if gateway_reload {
         #[cfg(windows)]
-        if super::runtime::desktop_server_mode() {
+        if super::runtime::desktop_gateway_server_mode() {
             if let Err(error) = super::runtime::reconcile_server_gateway(&state).await {
                 return Err(rollback_workspace_config(
                     &state,
@@ -604,7 +604,7 @@ pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResu
         ));
     }
     #[cfg(windows)]
-    if super::runtime::desktop_server_mode() {
+    if super::runtime::desktop_gateway_server_mode() {
         let gateway = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
         let status = crate::mcp::gateway::status(&gateway).await;
         if status.state == "running" && status.route_workspace_ids.contains(&id) {

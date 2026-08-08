@@ -80,9 +80,18 @@ fn acquire_single_instance() -> bool {
     true
 }
 
+#[cfg(all(feature = "desktop", feature = "cli"))]
+fn is_internal_daemon_command(arg: Option<&str>) -> bool {
+    arg.is_some_and(|arg| matches!(arg, "daemon-run" | "gateway-daemon-run"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg(feature = "desktop")]
 pub fn run() {
+    #[cfg(feature = "cli")]
+    if is_internal_daemon_command(std::env::args().nth(1).as_deref()) {
+        std::process::exit(cli::run());
+    }
     if !acquire_single_instance() {
         return;
     }
@@ -162,4 +171,17 @@ pub fn run() {
             });
         }
     });
+}
+
+#[cfg(all(test, feature = "desktop", feature = "cli"))]
+mod tests {
+    use super::is_internal_daemon_command;
+
+    #[test]
+    fn desktop_binary_dispatches_only_internal_daemon_entrypoints_before_tauri() {
+        assert!(is_internal_daemon_command(Some("daemon-run")));
+        assert!(is_internal_daemon_command(Some("gateway-daemon-run")));
+        assert!(!is_internal_daemon_command(Some("status")));
+        assert!(!is_internal_daemon_command(None));
+    }
 }
