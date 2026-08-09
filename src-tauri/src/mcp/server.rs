@@ -2587,7 +2587,7 @@ mod tests {
         )
         .await;
         let native_skill = &native_list["result"]["skills"][0];
-        assert_eq!(native_skill["uri"], "skill://review/SKILL.md");
+        assert_eq!(native_skill["uri"], "skill://anchor/review/SKILL.md");
         assert_eq!(native_skill["frontmatter"]["name"], "review");
         assert_eq!(
             native_skill["frontmatter"]["description"],
@@ -2617,7 +2617,7 @@ mod tests {
                 "jsonrpc":"2.0",
                 "id":7,
                 "method":"skills/get",
-                "params":{"uri":"skill://review/SKILL.md"}
+                "params":{"uri":"skill://anchor/review/SKILL.md"}
             }),
         )
         .await;
@@ -2681,7 +2681,7 @@ mod tests {
         let index_text = index["result"]["contents"][0]["text"]
             .as_str()
             .expect("index text");
-        assert!(index_text.contains("skill://review/SKILL.md"));
+        assert!(index_text.contains("skill://anchor/review/SKILL.md"));
 
         let page = handle_request(
             &state,
@@ -2689,7 +2689,7 @@ mod tests {
                 "jsonrpc":"2.0",
                 "id":5,
                 "method":"resources/read",
-                "params":{"uri":"skill://review/SKILL.md?start_line=2&end_line=2"}
+                "params":{"uri":"skill://anchor/review/SKILL.md?start_line=2&end_line=2"}
             }),
         )
         .await;

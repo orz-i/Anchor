@@ -339,8 +339,9 @@ pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Va
         if let Some(next_start_line) = skill_md.next_start_line {
             result["_meta"]["nextStartLine"] = json!(next_start_line);
             result["_meta"]["nextUri"] = Value::String(format!(
-                "skill://{}/SKILL.md?start_line={next_start_line}&max_bytes={}",
-                request.name, request.max_bytes
+                "{}?start_line={next_start_line}&max_bytes={}",
+                resource::skill_resource_uri(&request.name, "SKILL.md"),
+                request.max_bytes
             ));
         }
         return Ok(result);
@@ -421,18 +422,31 @@ fn parse_skill_uri(uri: &str) -> Result<SkillUriRequest, String> {
     let (base_uri, query) = uri
         .split_once('?')
         .map_or((uri, None), |(base, query)| (base, Some(query)));
-    let remainder = base_uri
-        .strip_prefix("skill://")
-        .ok_or_else(|| "Skill resource URI must use skill://<name>/<path>".to_string())?;
-    let (name, encoded_path) = remainder
-        .split_once('/')
-        .ok_or_else(|| "Skill resource URI must use skill://<name>/<path>".to_string())?;
-    if name.is_empty() || encoded_path.is_empty() {
-        return Err("Skill resource URI must use skill://<name>/<path>".into());
+    let remainder = base_uri.strip_prefix("skill://").ok_or_else(|| {
+        "Skill resource URI must use skill://<namespace>/<name>/<path>".to_string()
+    })?;
+    let (namespace, skill_and_path) = remainder.split_once('/').ok_or_else(|| {
+        "Skill resource URI must use skill://<namespace>/<name>/<path>".to_string()
+    })?;
+    if namespace != resource::SKILL_URI_NAMESPACE {
+        return Err(format!(
+            "Skill resource URI namespace must be {}",
+            resource::SKILL_URI_NAMESPACE
+        ));
+    }
+    let (encoded_name, encoded_path) = skill_and_path.split_once('/').ok_or_else(|| {
+        "Skill resource URI must use skill://<namespace>/<name>/<path>".to_string()
+    })?;
+    if encoded_name.is_empty() || encoded_path.is_empty() {
+        return Err("Skill resource URI must use skill://<namespace>/<name>/<path>".into());
+    }
+    let name = resource::percent_decode_path(encoded_name)?;
+    if name.contains('/') || name.contains('\\') {
+        return Err("Skill name URI segment must not decode to a path separator".into());
     }
     let path = resource::percent_decode_path(encoded_path)?;
     let mut request = SkillUriRequest {
-        name: name.to_string(),
+        name,
         path,
         start_line: None,
         end_line: None,
@@ -515,6 +529,8 @@ fn rpc_error(code: i32, message: &str) -> Value {
 mod tests {
     use std::fs;
 
+    use sha2::{Digest, Sha256};
+
     use super::*;
 
     fn catalog_with_skill() -> (tempfile::TempDir, SkillCatalog) {
@@ -538,14 +554,14 @@ mod tests {
         let index: Value =
             serde_json::from_str(&catalog.index_json().expect("index")).expect("index json");
         assert_eq!(index["skills"][0]["type"], "skill-md");
-        assert_eq!(index["skills"][0]["url"], "skill://example/SKILL.md");
+        assert_eq!(index["skills"][0]["url"], "skill://anchor/example/SKILL.md");
 
         let listed = resources_list(&catalog, &json!({})).expect("resources");
         assert!(listed["resources"]
             .as_array()
             .expect("resources")
             .iter()
-            .any(|item| item["uri"] == "skill://example/references/INFO.md"));
+            .any(|item| item["uri"] == "skill://anchor/example/references/INFO.md"));
     }
 
     #[test]
@@ -570,13 +586,73 @@ mod tests {
         assert!(object.contains_key("skills"));
         assert_eq!(listed["skills"].as_array().expect("skills").len(), 5);
 
-        let exposed = native_skill_get(&catalog, &json!({"uri": "skill://skill-4/SKILL.md"}))
-            .expect("exposed get");
+        let exposed =
+            native_skill_get(&catalog, &json!({"uri": "skill://anchor/skill-4/SKILL.md"}))
+                .expect("exposed get");
         assert_eq!(exposed["skill"]["frontmatter"]["name"], "skill-4");
 
-        let omitted = native_skill_get(&catalog, &json!({"uri": "skill://skill-5/SKILL.md"}))
-            .expect_err("omitted skill must not be gettable");
+        let omitted =
+            native_skill_get(&catalog, &json!({"uri": "skill://anchor/skill-5/SKILL.md"}))
+                .expect_err("omitted skill must not be gettable");
         assert_eq!(omitted["code"], -32002);
+    }
+
+    #[test]
+    fn native_catalog_matches_openai_scan_tools_import_contract() {
+        let (_temp, catalog) = catalog_with_skill();
+
+        let listed = native_skills_list(&catalog, &json!({})).expect("native list");
+        let skills = listed["skills"].as_array().expect("skills");
+        assert_eq!(skills.len(), 1);
+        let skill = &skills[0];
+        let skill_uri = skill["uri"].as_str().expect("skill uri");
+        assert_eq!(skill_uri, "skill://anchor/example/SKILL.md");
+
+        let path = skill_uri
+            .strip_prefix("skill://anchor/")
+            .expect("Anchor skill namespace");
+        let (directory, file) = path.split_once('/').expect("skill path");
+        assert_eq!(directory, skill["frontmatter"]["name"]);
+        assert_eq!(file, "SKILL.md");
+
+        let fetched = native_skill_get(&catalog, &json!({"uri": skill_uri}))
+            .expect("skills/get must return the listed entry");
+        assert_eq!(fetched["skill"], *skill);
+
+        let resources = skill["resources"].as_array().expect("resource manifest");
+        assert_eq!(resources.len(), 2);
+        for resource in resources {
+            let uri = resource["uri"].as_str().expect("resource uri");
+            assert!(uri.starts_with("skill://anchor/example/"));
+            let read = resource_read(&catalog, &json!({"uri": uri}))
+                .expect("every manifested resource must be readable");
+            let contents = read["contents"].as_array().expect("contents");
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0]["uri"], uri);
+            let bytes = if let Some(text) = contents[0]["text"].as_str() {
+                text.as_bytes().to_vec()
+            } else {
+                let blob = contents[0]["blob"].as_str().expect("text or blob");
+                base64::engine::general_purpose::STANDARD
+                    .decode(blob)
+                    .expect("base64 resource")
+            };
+            assert_eq!(
+                resource["digest"],
+                format!("sha256:{:x}", Sha256::digest(&bytes))
+            );
+
+            if uri.ends_with("/SKILL.md") {
+                let text = contents[0]["text"].as_str().expect("SKILL.md text");
+                let parsed = model::parse_skill_markdown(text, directory)
+                    .expect("fetched SKILL.md frontmatter");
+                assert_eq!(parsed.frontmatter, skill["frontmatter"]);
+            }
+        }
+
+        let legacy = native_skill_get(&catalog, &json!({"uri": "skill://example/SKILL.md"}))
+            .expect_err("pre-OpenAI path shape must not remain canonical");
+        assert_eq!(legacy["code"], -32602);
     }
 
     #[test]
@@ -603,7 +679,7 @@ mod tests {
     fn resource_read_returns_skill_markdown() {
         let (_temp, catalog) = catalog_with_skill();
 
-        let result = resource_read(&catalog, &json!({"uri": "skill://example/SKILL.md"}))
+        let result = resource_read(&catalog, &json!({"uri": "skill://anchor/example/SKILL.md"}))
             .expect("read resource");
 
         assert!(result["contents"][0]["text"]
@@ -630,7 +706,7 @@ mod tests {
 
         let first = resource_read(
             &catalog,
-            &json!({"uri": "skill://large/SKILL.md?start_line=1&max_bytes=512"}),
+            &json!({"uri": "skill://anchor/large/SKILL.md?start_line=1&max_bytes=512"}),
         )
         .expect("first page");
         assert_eq!(first["_meta"]["truncated"], true);
@@ -654,8 +730,11 @@ mod tests {
         fs::write(skill_dir.join("SKILL.md"), &raw).expect("skill");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
 
-        let result = resource_read(&catalog, &json!({"uri": "skill://native-large/SKILL.md"}))
-            .expect("native import read");
+        let result = resource_read(
+            &catalog,
+            &json!({"uri": "skill://anchor/native-large/SKILL.md"}),
+        )
+        .expect("native import read");
 
         assert_eq!(result["contents"][0]["text"], raw);
         assert_eq!(result["_meta"]["truncated"], false);
@@ -667,14 +746,14 @@ mod tests {
         let (_temp, catalog) = catalog_with_skill();
         let too_large = resource_read(
             &catalog,
-            &json!({"uri": "skill://example/SKILL.md?max_bytes=131073"}),
+            &json!({"uri": "skill://anchor/example/SKILL.md?max_bytes=262145"}),
         )
         .expect_err("bounded max bytes");
         assert_eq!(too_large["code"], -32602);
 
         let unknown = resource_read(
             &catalog,
-            &json!({"uri": "skill://example/SKILL.md?offset=1"}),
+            &json!({"uri": "skill://anchor/example/SKILL.md?offset=1"}),
         )
         .expect_err("unknown query");
         assert_eq!(unknown["code"], -32602);

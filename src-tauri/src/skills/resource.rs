@@ -309,13 +309,16 @@ fn slice_lines(
     (content, start, end, lines.len(), truncated, next_start_line)
 }
 
+pub(super) const SKILL_URI_NAMESPACE: &str = crate::brand::SERVER_NAME;
+
 pub(super) fn skill_resource_uri(skill_name: &str, path: &str) -> String {
+    let encoded_skill = percent_encode_segment(skill_name);
     let encoded = path
         .split('/')
         .map(percent_encode_segment)
         .collect::<Vec<_>>()
         .join("/");
-    format!("skill://{skill_name}/{encoded}")
+    format!("skill://{SKILL_URI_NAMESPACE}/{encoded_skill}/{encoded}")
 }
 
 pub(super) fn percent_decode_path(path: &str) -> Result<String, String> {
@@ -468,7 +471,7 @@ mod tests {
         let uri = skill_resource_uri("example", "references/中文 file.md");
         assert_eq!(
             uri,
-            "skill://example/references/%E4%B8%AD%E6%96%87%20file.md"
+            "skill://anchor/example/references/%E4%B8%AD%E6%96%87%20file.md"
         );
         let encoded = uri.split_once("/references/").unwrap().1;
         assert_eq!(

@@ -1341,6 +1341,7 @@ fn oauth_not_configured() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1583,6 +1584,112 @@ mod tests {
         .await;
         assert_eq!(notification.status(), StatusCode::ACCEPTED);
         (session_id, headers)
+    }
+
+    #[tokio::test]
+    async fn streamable_http_exposes_openai_native_skill_import_contract() {
+        let (workspace, state) = test_listener_state();
+        let skill_dir = workspace.path().join("skills/http-skill");
+        fs::create_dir_all(skill_dir.join("references")).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: http-skill\ndescription: Exercise the HTTP Skill import contract.\n---\nUse the reference.\n",
+        )
+        .expect("skill md");
+        fs::write(
+            skill_dir.join("references/INFO.md"),
+            "HTTP import reference.\n",
+        )
+        .expect("skill resource");
+
+        let response = mcp_post(
+            State(state.clone()),
+            request_headers(),
+            Ok(Json(initialize_request("2025-11-25"))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session_id = response.headers()["mcp-session-id"]
+            .to_str()
+            .expect("session header")
+            .to_string();
+        let initialized = response_json(response).await;
+        assert_eq!(
+            initialized["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/skills"],
+            json!({})
+        );
+
+        let mut headers = request_headers();
+        headers.insert("mcp-session-id", session_id.parse().unwrap());
+        headers.insert("mcp-protocol-version", "2025-11-25".parse().unwrap());
+        let notification = mcp_post(
+            State(state.clone()),
+            headers.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }))),
+        )
+        .await;
+        assert_eq!(notification.status(), StatusCode::ACCEPTED);
+
+        let listed = mcp_post(
+            State(state.clone()),
+            headers.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "skills/list",
+                "params": {}
+            }))),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = response_json(listed).await;
+        let skill = &listed["result"]["skills"][0];
+        assert_eq!(skill["uri"], "skill://anchor/http-skill/SKILL.md");
+        assert_eq!(skill["frontmatter"]["name"], "http-skill");
+        assert_eq!(skill["resources"].as_array().expect("resources").len(), 2);
+
+        let fetched = mcp_post(
+            State(state.clone()),
+            headers.clone(),
+            Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "skills/get",
+                "params": {"uri": "skill://anchor/http-skill/SKILL.md"}
+            }))),
+        )
+        .await;
+        assert_eq!(response_json(fetched).await["result"]["skill"], *skill);
+
+        for (index, resource) in skill["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .enumerate()
+        {
+            let uri = resource["uri"].as_str().expect("resource uri");
+            let read = mcp_post(
+                State(state.clone()),
+                headers.clone(),
+                Ok(Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 4 + index,
+                    "method": "resources/read",
+                    "params": {"uri": uri}
+                }))),
+            )
+            .await;
+            let read = response_json(read).await;
+            let contents = read["result"]["contents"]
+                .as_array()
+                .unwrap_or_else(|| panic!("resources/read response missing contents: {read:#}"));
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0]["uri"], uri);
+        }
     }
 
     #[tokio::test]

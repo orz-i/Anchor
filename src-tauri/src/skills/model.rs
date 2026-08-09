@@ -550,7 +550,7 @@ mod tests {
             source: "workspace".into(),
             source_id: "workspace-agents".into(),
             relative_path: "example".into(),
-            uri: "skill://example/SKILL.md".into(),
+            uri: "skill://anchor/example/SKILL.md".into(),
             digest: "sha256:test".into(),
             instruction_lines: 1,
             instruction_chars: 7,

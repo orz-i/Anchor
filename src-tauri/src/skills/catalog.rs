@@ -15,7 +15,7 @@ use super::resource::{discover_files, read_resource, ResourceReadRequest, MAX_RE
 
 const DEFAULT_SKILL_ROOTS: &str = ".agents/skills\n.codex/skills\nskills";
 const MAX_SKILLS: usize = 200;
-pub(super) const MAX_SKILL_MD_BYTES: u64 = 131_072;
+pub(super) const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 pub(super) const MAX_NATIVE_IMPORT_SKILLS: usize = 5;
 const MAX_NATIVE_IMPORT_FILES: usize = 100;
 const MAX_NATIVE_IMPORT_BYTES: u64 = 5 * 1024 * 1024;
@@ -612,7 +612,7 @@ fn read_skill_record(
     let skill_md_digest = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
     let (source, source_id, relative_path) =
         source_descriptor(workspace_root, configured_root, source_root, &canonical_dir);
-    let uri = format!("skill://{}/SKILL.md", parsed.name);
+    let uri = super::resource::skill_resource_uri(&parsed.name, "SKILL.md");
     let summary = SkillSummary {
         name: parsed.name,
         description: parsed.description,
@@ -1110,6 +1110,23 @@ mod tests {
             .is_some_and(|value| value.contains("3.6.11")));
         assert!(skill.allowed_tools.contains(&"start_feature".to_string()));
         assert!(skill.allowed_tools.contains(&"workflow".to_string()));
+
+        let native = catalog.native_catalog();
+        assert_eq!(native.omitted_count, 0, "{:?}", native.warnings);
+        let imported = native
+            .skills
+            .iter()
+            .find(|entry| entry["frontmatter"]["name"] == "mcp-probe-kit")
+            .expect("repository Skill must enter the native import catalog");
+        assert_eq!(imported["uri"], "skill://anchor/mcp-probe-kit/SKILL.md");
+        assert!(imported["resources"]
+            .as_array()
+            .expect("native resources")
+            .iter()
+            .any(|resource| {
+                resource["uri"] == "skill://anchor/mcp-probe-kit/SKILL.md"
+                    && is_full_sha256(resource["digest"].as_str().unwrap_or_default())
+            }));
     }
 
     #[test]
@@ -1146,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_markdown_keeps_the_128_kib_hard_boundary() {
+    fn skill_markdown_keeps_the_256_kib_hard_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         let accepted_dir = skills.join("accepted");
@@ -1181,6 +1198,6 @@ mod tests {
         assert!(listed
             .warnings
             .iter()
-            .any(|warning| warning.contains("131072")));
+            .any(|warning| warning.contains(&MAX_SKILL_MD_BYTES.to_string())));
     }
 }
