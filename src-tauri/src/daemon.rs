@@ -281,9 +281,10 @@ pub(crate) fn control_pipe_name(profile_id: &str) -> AppResult<String> {
     let config_dir = crate::platform::app_config_dir_override()
         .map(Ok)
         .unwrap_or_else(|| platform().app_config_dir())?;
-    let user = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown-user".into());
+    // Keep the historical per-user pipe identity for upgrade compatibility.
+    // The SCM service injects the configuration owner's username so a
+    // LocalSystem child resolves the same pipe name as the user's GUI.
+    let user = crate::windows_service::pipe_identity_user();
     let digest = Sha256::digest(format!("{user}\0{}", config_dir.display()).as_bytes());
     let scope = digest[..8]
         .iter()

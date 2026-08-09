@@ -80,12 +80,19 @@ pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceContro
         .as_ref()
         .filter(|_| daemon.running)
         .map(|state| state.pid);
+    let gateway_pid = crate::gateway_daemon::inspect()
+        .ok()
+        .filter(|inspection| inspection.running && inspection.pid_matches)
+        .and_then(|inspection| inspection.state)
+        .filter(|state| state.workspace_ids.iter().any(|id| id == &profile.id))
+        .map(|state| state.pid);
 
     let mcp = port_status(
         "mcp",
         profile.runtime.local_port,
         profile.local_endpoint(),
         daemon_pid,
+        gateway_pid,
     )?;
     let mcp_activity = mcp
         .listening
@@ -102,6 +109,7 @@ pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceContro
             profile.actions.local_port,
             profile.actions_local_base_url(),
             daemon_pid,
+            None,
         )?,
         mcp_activity,
         mcp_tunnel: None,
@@ -118,6 +126,7 @@ fn port_status(
     port: u16,
     endpoint: String,
     daemon_pid: Option<u32>,
+    gateway_pid: Option<u32>,
 ) -> AppResult<PortStatus> {
     let pid = platform().find_pid_listening_on_port(port)?;
     Ok(PortStatus {
@@ -125,14 +134,15 @@ fn port_status(
         port,
         listening: pid.is_some(),
         pid,
-        owner: port_owner(pid, daemon_pid).to_string(),
+        owner: port_owner(pid, daemon_pid, gateway_pid).to_string(),
         endpoint,
     })
 }
 
-fn port_owner(pid: Option<u32>, daemon_pid: Option<u32>) -> &'static str {
+fn port_owner(pid: Option<u32>, daemon_pid: Option<u32>, gateway_pid: Option<u32>) -> &'static str {
     match pid {
         Some(pid) if Some(pid) == daemon_pid => "daemon",
+        Some(pid) if Some(pid) == gateway_pid => "gateway",
         Some(pid) if crate::runtime::is_own_process(pid) => "server",
         Some(_) => "external",
         None => "none",
@@ -145,8 +155,9 @@ mod tests {
 
     #[test]
     fn port_ownership_distinguishes_daemon_external_and_stopped() {
-        assert_eq!(port_owner(Some(7), Some(7)), "daemon");
-        assert_eq!(port_owner(Some(std::process::id()), None), "server");
-        assert_eq!(port_owner(None, Some(7)), "none");
+        assert_eq!(port_owner(Some(7), Some(7), None), "daemon");
+        assert_eq!(port_owner(Some(8), None, Some(8)), "gateway");
+        assert_eq!(port_owner(Some(std::process::id()), None, None), "server");
+        assert_eq!(port_owner(None, Some(7), None), "none");
     }
 }

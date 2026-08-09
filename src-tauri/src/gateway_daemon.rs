@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
+#[cfg(unix)]
 const SIGTERM_VALUE: i32 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +26,22 @@ pub struct GatewayDaemonState {
     pub local_port: u16,
     pub log_path: String,
     pub version: String,
+    #[serde(default)]
+    pub executable_path: String,
+}
+
+#[cfg(windows)]
+fn sanitize_pipe_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +87,7 @@ impl Drop for GatewayDaemonGuard {
 }
 
 pub fn supported() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "windows"))
 }
 
 pub fn config_scope() -> AppResult<String> {
@@ -111,14 +128,12 @@ pub(crate) fn control_socket_path() -> AppResult<PathBuf> {
 
 #[cfg(windows)]
 pub(crate) fn control_pipe_name() -> AppResult<String> {
-    let user = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown-user".into());
+    let user = crate::windows_service::pipe_identity_user();
     Ok(format!(
         r"\\.\pipe\{}-{}-gateway-{}",
         crate::brand::SERVER_NAME,
         config_scope()?,
-        sanitize_component(&user)
+        sanitize_pipe_component(&user)
     ))
 }
 
@@ -131,7 +146,7 @@ pub fn inspect() -> AppResult<GatewayDaemonInspection> {
             ambiguous: false,
             pid_matches: false,
             state: None,
-            detail: "Gateway daemon 目前仅支持 Linux".into(),
+            detail: "Gateway daemon 当前仅支持 Windows 和 Linux".into(),
         });
     }
     let scope = config_scope()?;
@@ -238,7 +253,7 @@ fn running_inspection(state: GatewayDaemonState, recovered: bool) -> GatewayDaem
 }
 
 pub fn acquire(workspace_ids: &[String], local_port: u16) -> AppResult<GatewayDaemonGuard> {
-    ensure_linux()?;
+    ensure_supported()?;
     let paths = gateway_paths()?;
     ensure_private_dir(&paths.dir)?;
     let lock_file = open_private_file(&paths.lock, false)?;
@@ -256,6 +271,7 @@ pub fn acquire(workspace_ids: &[String], local_port: u16) -> AppResult<GatewayDa
         local_port,
         log_path: daemon_log_path()?.display().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
+        executable_path: std::env::current_exe()?.display().to_string(),
     };
     atomic_write_json(&paths.state, &state)?;
     write_private_text(&paths.pid, &format!("{pid}\n"))?;
@@ -267,7 +283,7 @@ pub fn acquire(workspace_ids: &[String], local_port: u16) -> AppResult<GatewayDa
 }
 
 pub fn update_state(workspace_ids: &[String], local_port: u16) -> AppResult<()> {
-    ensure_linux()?;
+    ensure_supported()?;
     let paths = gateway_paths()?;
     let mut state = read_state(&paths.state)?.ok_or_else(|| {
         AppError::Message("Gateway daemon state disappeared while updating runtime metadata".into())
@@ -286,7 +302,7 @@ pub fn update_state(workspace_ids: &[String], local_port: u16) -> AppResult<()> 
 }
 
 pub fn spawn(workspace_ids: &[String]) -> AppResult<u32> {
-    ensure_linux()?;
+    ensure_supported()?;
     let inspection = inspect()?;
     if inspection.ambiguous {
         return Err(AppError::Message(inspection.detail));
@@ -325,6 +341,8 @@ pub fn spawn(workspace_ids: &[String]) -> AppResult<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    #[cfg(windows)]
+    crate::platform::hide_std_console(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -391,7 +409,7 @@ pub async fn wait_ready(expected_pid: u32, timeout: Duration) -> AppResult<Gatew
 }
 
 pub async fn terminate_spawned(pid: u32) -> AppResult<()> {
-    ensure_linux()?;
+    ensure_supported()?;
     let scope = config_scope()?;
     if !platform().is_process_alive(pid) {
         cleanup()?;
@@ -402,7 +420,10 @@ pub async fn terminate_spawned(pid: u32) -> AppResult<()> {
             "启动失败后的 PID {pid} 不再匹配当前 Gateway daemon，拒绝终止"
         )));
     }
+    #[cfg(unix)]
     signal(pid, SIGTERM_VALUE)?;
+    #[cfg(windows)]
+    platform().terminate_process_tree(pid)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while platform().is_process_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -505,6 +526,7 @@ fn discover_gateway_daemons(scope: &str) -> AppResult<Vec<GatewayDaemonState>> {
                 local_port: 0,
                 log_path: daemon_log_path()?.display().to_string(),
                 version: "unknown".into(),
+                executable_path: args.first().copied().unwrap_or_default().to_string(),
             });
         }
         states.sort_by_key(|state| state.pid);
@@ -528,8 +550,32 @@ fn process_matches_gateway_daemon(pid: u32, scope: &str) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (pid, scope);
-        false
+        #[cfg(windows)]
+        {
+            let Ok(paths) = gateway_paths() else {
+                return false;
+            };
+            let Ok(Some(state)) = read_state(&paths.state) else {
+                return false;
+            };
+            if state.pid != pid
+                || state.config_scope != scope
+                || state.schema_version != STATE_SCHEMA_VERSION
+                || state.executable_path.trim().is_empty()
+            {
+                return false;
+            }
+            let Ok(Some(actual)) = platform().process_image_path(pid) else {
+                return false;
+            };
+            normalize_windows_image_path(Path::new(&state.executable_path))
+                == normalize_windows_image_path(Path::new(&actual))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (pid, scope);
+            false
+        }
     }
 }
 
@@ -625,49 +671,37 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn signal(pid: u32, value: i32) -> AppResult<()> {
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as i32, value) };
-        if result == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        Err(AppError::Message(format!(
-            "发送信号 {value} 到 Gateway daemon PID {pid} 失败：{error}"
-        )))
+    let result = unsafe { libc::kill(pid as i32, value) };
+    if result == 0 {
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, value);
-        Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()))
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Ok(());
     }
+    Err(AppError::Message(format!(
+        "发送信号 {value} 到 Gateway daemon PID {pid} 失败：{error}"
+    )))
 }
 
-fn ensure_linux() -> AppResult<()> {
+fn ensure_supported() -> AppResult<()> {
     if supported() {
         Ok(())
     } else {
         Err(AppError::Message(
-            "Gateway daemon 目前仅支持 Linux；可继续使用 gateway serve 前台模式".into(),
+            "Gateway daemon 当前仅支持 Windows 和 Linux；可继续使用 gateway serve 前台模式".into(),
         ))
     }
 }
 
-fn sanitize_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+#[cfg(windows)]
+fn normalize_windows_image_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 fn unix_now() -> u64 {

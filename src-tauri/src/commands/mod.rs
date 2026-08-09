@@ -6,6 +6,7 @@ mod runtime;
 mod secrets;
 mod software;
 mod tunnel;
+mod windows_service;
 mod workspace;
 
 pub use canvs::{get_canvs_snapshot, get_canvs_task_snapshot, list_canvs_tasks};
@@ -30,6 +31,11 @@ pub use software::{
     get_download_config, install_software, list_software, set_download_config, uninstall_software,
 };
 pub use tunnel::{get_frp_snippet, restart_tunnel, start_tunnel, stop_tunnel, test_tunnel};
+pub use windows_service::{
+    get_windows_service_status, install_windows_service, restart_windows_service,
+    start_windows_service, stop_windows_service, sync_windows_service_plan,
+    uninstall_windows_service,
+};
 pub use workspace::{
     create_workspace, delete_workspace, inspect_workspace_skills, list_workspaces,
     open_workspace_directory, update_workspace,

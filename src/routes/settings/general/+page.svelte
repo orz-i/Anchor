@@ -5,11 +5,19 @@
     getMcpGateway,
     getMcpGatewayStatus,
     getProxy,
+    getWindowsServiceStatus,
+    installWindowsService,
+    restartWindowsService,
     setMcpGateway,
     setProxy,
+    startWindowsService,
+    stopWindowsService,
+    syncWindowsServicePlan,
     type McpGatewayConfigDto,
     type McpGatewayStatusDto,
     type ProxyConfigDto,
+    type WindowsScmServiceStatusDto,
+    uninstallWindowsService,
   } from "$lib/api/settings";
   import {
     getGatewayControlEvents,
@@ -39,6 +47,8 @@
   let gatewayEventFault = $state("");
   let gatewayLog = $state<GatewayLogChunk | null>(null);
   let gatewayLogError = $state("");
+  let windowsService = $state<WindowsScmServiceStatusDto | null>(null);
+  let windowsServiceBusy = $state(false);
 
   async function refreshGatewayRuntimeStatus() {
     if (gatewayRefreshing) return;
@@ -56,6 +66,21 @@
       }
     } finally {
       gatewayRefreshing = false;
+    }
+  }
+
+  async function runWindowsServiceAction(
+    action: () => Promise<WindowsScmServiceStatusDto>,
+    success: string,
+  ) {
+    windowsServiceBusy = true;
+    try {
+      windowsService = await action();
+      await message(success, { title: "Windows Service", kind: "info" });
+    } catch (e) {
+      await message(String(e), { title: "Windows Service 操作失败", kind: "error" });
+    } finally {
+      windowsServiceBusy = false;
     }
   }
 
@@ -106,17 +131,19 @@
 
   async function refresh() {
     try {
-      const [nextProxy, nextGateway, nextGatewayStatus, nextWorkspaces] =
+      const [nextProxy, nextGateway, nextGatewayStatus, nextWorkspaces, nextWindowsService] =
         await Promise.all([
           getProxy(),
           getMcpGateway(),
           getMcpGatewayStatus(),
           listWorkspaces(),
+          getWindowsServiceStatus(),
         ]);
       proxy = nextProxy;
       gateway = nextGateway;
       gatewayStatus = nextGatewayStatus;
       workspaces = nextWorkspaces;
+      windowsService = nextWindowsService;
       changed = false;
       gatewayChanged = false;
       await refreshGatewayLog();
@@ -268,6 +295,88 @@
       </form>
     </div>
 
+    {#if windowsService?.supported}
+      <div class="tx-card p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 class="text-sm font-semibold">Windows 后台服务</h3>
+            <p class="mt-1 max-w-3xl text-xs leading-5 text-[var(--text-muted)]">
+              使用 Windows SCM 在开机时监督 Workspace daemon 与 Gateway daemon。安装后 GUI 只负责修改运行计划和控制面，不需要保持桌面窗口常驻。
+            </p>
+          </div>
+          <span class="rounded-full border border-[var(--border)] px-2.5 py-1 text-xs">
+            {windowsService.installed
+              ? `${windowsService.state}${windowsService.autoStart ? " · 自动启动" : ""}`
+              : "未安装"}
+          </span>
+        </div>
+
+        <div class="mt-4 grid gap-3 text-xs text-[var(--text-muted)] md:grid-cols-2">
+          <div class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-3">
+            <p><span class="font-medium text-[var(--text)]">Service</span> · {windowsService.serviceName}</p>
+            <p class="mt-1 break-all">配置域：{windowsService.configDir}</p>
+            <p class="mt-1 break-all">启动计划：{windowsService.planPath}</p>
+          </div>
+          <div class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-3">
+            <p>
+              开机 Workspace · {windowsService.plan.workspaces.length}；Gateway routes · {windowsService.plan.gatewayWorkspaceIds.length}
+            </p>
+            <p class="mt-1">
+              配置所有者 · {windowsService.plan.ownerUsername || "未记录"}
+            </p>
+            <p class="mt-1">
+              安装、卸载和服务启停会触发标准 Windows UAC，仅提升该次 SCM 操作。
+            </p>
+          </div>
+        </div>
+
+        <div class="mt-4 flex flex-wrap justify-end gap-2">
+          <button
+            type="button"
+            class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
+            disabled={windowsServiceBusy}
+            onclick={() => void runWindowsServiceAction(syncWindowsServicePlan, "已将当前 daemon/Gateway 运行态同步为开机启动计划。")}
+          >同步当前运行态</button>
+          {#if !windowsService.installed}
+            <button
+              type="button"
+              class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+              disabled={windowsServiceBusy}
+              onclick={() => void runWindowsServiceAction(installWindowsService, "Windows SCM Service 已安装并设置为自动启动。")}
+            >安装并自动启动</button>
+          {:else}
+            {#if windowsService.state === "running"}
+              <button
+                type="button"
+                class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
+                disabled={windowsServiceBusy}
+                onclick={() => void runWindowsServiceAction(stopWindowsService, "Windows SCM Service 已停止。")}
+              >停止</button>
+            {:else}
+              <button
+                type="button"
+                class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
+                disabled={windowsServiceBusy}
+                onclick={() => void runWindowsServiceAction(startWindowsService, "Windows SCM Service 已启动。")}
+              >启动</button>
+            {/if}
+            <button
+              type="button"
+              class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
+              disabled={windowsServiceBusy}
+              onclick={() => void runWindowsServiceAction(restartWindowsService, "Windows SCM Service 已重启。")}
+            >重启</button>
+            <button
+              type="button"
+              class="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-600 disabled:opacity-50"
+              disabled={windowsServiceBusy}
+              onclick={() => void runWindowsServiceAction(uninstallWindowsService, "Windows SCM Service 已卸载；启动计划配置仍保留，可再次安装。")}
+            >卸载</button>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
     <div class="tx-card p-4">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
@@ -389,8 +498,7 @@
 
         {#if gatewayStatus && !gatewayStatus.daemonSupported}
           <p class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2 text-xs text-[var(--text-muted)]">
-            <strong>Windows GUI Server 模式已自动启用，无需切换入口。</strong>
-            启用 Gateway 后，只要至少一个 Workspace MCP Server 正在运行，Gateway listener、route 与共享隧道就由当前 Anchor 桌面进程统一管理；关闭 Anchor 即停止。后台 daemon/Named Pipe server 尚未实现，因此这里不会提示使用不可用的 <code>gateway start</code>。
+            当前平台不支持独立 Gateway daemon。配置可以保存，但后台 Gateway 需要在支持 Windows/Linux daemon 的环境中运行。
           </p>
         {:else if gatewayStatus?.state === "configured"}
           <p class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2 text-xs text-[var(--text-muted)]">

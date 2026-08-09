@@ -333,13 +333,29 @@ anchor events --control-plane --follow --wait 15
 
 Windows Workspace 已使用真实后台 daemon：GUI 的 MCP/Actions 状态、启停、重启、Workspace Tunnel 和配置应用都走同一 Named Pipe 控制面，Workspace 进程内 `RuntimeSupervisor` 不再是 Windows 主路径。桌面二进制自身支持内部 `daemon-run` 分流，子进程会在进入 Tauri 单实例锁/窗口前直接执行 daemon 主循环，因此安装版 GUI 也能作为 per-user Workspace daemon 的启动镜像。
 
-Windows Gateway 仍是独立的过渡边界：Gateway daemon 服务端暂未实现，所以只在 Gateway 域保留 process-local GUI Server。该兼容 Gateway 会把已由 Workspace daemon 启动的 MCP workspace 纳入 route 集合；Workspace daemon MCP 启停后只触发 Gateway 域 reconcile，不创建第二个 Workspace listener。后续 Gateway Windows daemon 落地后才能删除这部分剩余兼容运行时。
+Windows Gateway 也使用独立后台 daemon 与 Named Pipe 控制面。Gateway 开启时，选中的 Workspace MCP listener 由 Gateway daemon PID 直接持有，Workspace 独立 daemon 不再同时持有同一 MCP route；Actions 仍可由 Workspace daemon 独立运行。GUI 的 MCP 启停在 Gateway 模式下变成 route 集合更新，并通过受控 restart/reload 完成，不再依赖 process-local GUI Server。
+
+Windows 还提供配置域级 SCM Service，用于开机自动恢复已选择的 Workspace/Gateway 运行计划：
+
+```powershell
+anchor service status
+anchor service sync
+anchor service install
+anchor service start
+anchor service restart
+anchor service stop
+anchor service uninstall
+```
+
+`service sync` 把当前后台 Workspace daemon 与 Gateway route 集合写入 `windows-service.json`；后续 GUI/CLI 的 Workspace/Gateway 启停也会持续更新这个计划。`install` 注册配置目录专属的 `AnchorControlPlane-<scope>` 服务并设置 `start= auto`。安装、卸载通常需要管理员权限；服务本身运行在 Session 0，因此计划同时保存配置所有者 SID/用户名，用于复用用户态 Named Pipe 身份并给 owner/System 设置受保护 DACL。
+
+GUI 的安装/卸载/启停按钮会通过内部 `service-admin-run` helper 触发标准 Windows UAC，只提升该次 SCM 操作，不要求整个 Anchor 桌面进程长期以管理员身份运行；普通 CLI 命令仍要求从已提升的管理员终端执行。`service-admin-run` 与 `service-run` 都是内部入口，不应人工调用。
 
 ## 与 systemd 的关系
 
-内置 daemon 解决的是“命令退出后继续运行”和日常人工运维，不负责开机自启或进程崩溃后的操作系统级拉起。
+Windows 上可使用上述 SCM Service 提供开机自启和操作系统级 supervisor；Linux 生产服务器仍推荐 systemd 直接监督前台 `serve`。
 
-生产服务器仍推荐 systemd 直接监督前台 `serve`：
+Linux systemd 示例：
 
 ```ini
 [Service]
@@ -368,6 +384,8 @@ anchor --json gateway logs
 anchor --json gateway events
 anchor --json status --control-plane
 anchor --json events --control-plane
+anchor --json service status
+anchor --json service sync
 ```
 
 失败时返回非零退出码，并输出：
@@ -378,20 +396,22 @@ anchor --json events --control-plane
 
 ## 安全边界
 
-- Workspace 后台 daemon 支持 Windows/Linux；Gateway 后台 daemon 当前仍仅支持 Linux。Windows Gateway GUI Server 是 Gateway 域的临时兼容路径，不代表 Gateway daemon 已支持 Windows；
-- Windows Workspace Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；Unix UDS 继续使用私有目录/socket 权限；
+- Workspace 与 Gateway 后台 daemon 都支持 Windows/Linux；Windows 不再需要 process-local Gateway Server 作为正常运行路径；
+- Windows Workspace/Gateway Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；SCM service 的 LocalSystem 子进程通过持久化 owner SID/用户名与用户 GUI 共享同一控制端点身份；Unix UDS 继续使用私有目录/socket 权限；
 - PID 所有权校验失败时拒绝生命周期写操作；Windows additionally 校验 state v2 `executablePath` 与实际 PID 镜像；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
 - 端口被 GUI 或外部进程占用时拒绝启动；
 - `daemon-run` 是内部命令，不应直接调用；
 - `gateway-daemon-run` 是内部命令，不应直接调用；
+- `service-run` 是 Windows SCM 内部入口，不应直接调用；
+- `service-admin-run` 是 Windows UAC 内部入口，不应直接调用；
 - 状态文件不是远程控制接口，不监听公网端口。
 
 ## 当前验证边界
 
-Windows 开发机已完成真实 per-user Workspace daemon smoke：Actions-only `start` 经 Named Pipe readiness 返回后台 PID，`status` 确认 state v2 / PID image ownership / `owner=daemon`，`stop` 经 Named Pipe graceful shutdown 清理 state/PID 并释放端口；另有连续 Named Pipe round-trip、protected DACL 和 Windows 原子 state replace 专项测试。
+Windows 开发机已完成真实 per-user Workspace daemon smoke，并完成真实 Gateway daemon `start/status/reload/restart/stop` smoke：Gateway route listener 的 PID 与 Gateway daemon PID 一致，Workspace 状态报告 `owner=gateway`，restart 完成 PID handoff，stop 后释放 route 并清空开机 Gateway 计划。Windows Gateway Named Pipe 连续请求和原生 control-plane 模式也有专项回归。
 
-Windows **SCM Service 安装/卸载尚未实现**。当前 `anchor start/stop/restart/status` 管理的是当前用户配置域下的后台 Workspace daemon 子进程，不注册 Windows Service，也不提供开机自启。Gateway Windows daemon 也仍待迁移。Linux 专用 `setsid`、`/proc` PID 校验和 Gateway 后台生命周期仍应在 Linux CI 或 Linux 主机执行 smoke：
+SCM `status` 与计划持久化已在标准用户 token 下真实验证；`install` 会调用 `sc.exe` 注册自动启动服务。当前开发测试进程不是管理员，因此真实 install probe 按预期返回 Windows SCM 错误 5，并明确提示需要管理员权限，没有创建服务。完整 `install → start → reboot/autostart → stop → uninstall` 仍需要从提升权限的 Windows 测试终端执行。Linux 专用 `setsid`、`/proc` PID 校验和后台生命周期仍应在 Linux CI 或 Linux 主机执行 smoke：
 
 ```bash
 anchor start PROFILE_ID

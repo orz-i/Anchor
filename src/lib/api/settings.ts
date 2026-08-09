@@ -79,3 +79,56 @@ export async function setMcpGateway(
 ): Promise<McpGatewayStatusDto> {
   return invoke<McpGatewayStatusDto>("set_mcp_gateway", { config });
 }
+
+export interface WindowsWorkspaceAutostartDto {
+  workspaceId: string;
+  service: "mcp" | "actions" | "all";
+  tunnelServices?: "mcp" | "actions" | "all";
+}
+
+export interface WindowsServicePlanDto {
+  schemaVersion: number;
+  ownerSid: string;
+  ownerUsername: string;
+  workspaces: WindowsWorkspaceAutostartDto[];
+  gatewayWorkspaceIds: string[];
+}
+
+export interface WindowsScmServiceStatusDto {
+  supported: boolean;
+  serviceName: string;
+  installed: boolean;
+  state: string;
+  autoStart: boolean;
+  configDir: string;
+  planPath: string;
+  plan: WindowsServicePlanDto;
+}
+
+export async function getWindowsServiceStatus(): Promise<WindowsScmServiceStatusDto> {
+  return invokeRead<WindowsScmServiceStatusDto>("get_windows_service_status");
+}
+
+export async function installWindowsService(): Promise<WindowsScmServiceStatusDto> {
+  return invoke<WindowsScmServiceStatusDto>("install_windows_service");
+}
+
+export async function uninstallWindowsService(): Promise<WindowsScmServiceStatusDto> {
+  return invoke<WindowsScmServiceStatusDto>("uninstall_windows_service");
+}
+
+export async function startWindowsService(): Promise<WindowsScmServiceStatusDto> {
+  return invoke<WindowsScmServiceStatusDto>("start_windows_service");
+}
+
+export async function stopWindowsService(): Promise<WindowsScmServiceStatusDto> {
+  return invoke<WindowsScmServiceStatusDto>("stop_windows_service");
+}
+
+export async function restartWindowsService(): Promise<WindowsScmServiceStatusDto> {
+  return invoke<WindowsScmServiceStatusDto>("restart_windows_service");
+}
+
+export async function syncWindowsServicePlan(): Promise<WindowsScmServiceStatusDto> {
+  return invoke<WindowsScmServiceStatusDto>("sync_windows_service_plan");
+}

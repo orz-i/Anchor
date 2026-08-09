@@ -228,7 +228,10 @@ pub async fn set_daemon_service(
         service,
         tunnels: desired_tunnels,
     });
-    reconcile_daemon(profile, desired, timeout, force).await
+    let result = reconcile_daemon(profile, desired, timeout, force).await?;
+    #[cfg(windows)]
+    crate::windows_service::set_workspace_desired(&profile.id, desired)?;
+    Ok(result)
 }
 
 pub async fn restart_daemon_service(

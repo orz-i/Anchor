@@ -32,14 +32,46 @@ use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 use args::{
     CliArgs, Command, EventsOptions, EventsTarget, GatewayCommand, GatewayConfigureOptions,
     GatewayEventsOptions, GatewayLogsOptions, GatewayStartOptions, GatewayStopOptions,
-    LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceSelection, StatusOptions,
-    StopOptions,
+    LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceCommand, ServiceSelection,
+    StatusOptions, StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct CliTunnelRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
+}
+
+fn execute_service(command: ServiceCommand, as_json: bool) -> AppResult<i32> {
+    #[cfg(windows)]
+    {
+        let status = match command {
+            ServiceCommand::Status => crate::windows_service::scm_status()?,
+            ServiceCommand::Install => crate::windows_service::install_scm_service()?,
+            ServiceCommand::Uninstall => crate::windows_service::uninstall_scm_service()?,
+            ServiceCommand::Start => crate::windows_service::start_scm_service()?,
+            ServiceCommand::Stop => crate::windows_service::stop_scm_service()?,
+            ServiceCommand::Restart => crate::windows_service::restart_scm_service()?,
+            ServiceCommand::Sync => {
+                let _ = crate::windows_service::sync_plan_from_running()?;
+                crate::windows_service::scm_status()?
+            }
+        };
+        if as_json {
+            print_json(&status)?;
+        } else {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Ok(0)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (command, as_json);
+        Err(AppError::Message(
+            "Windows SCM Service 命令仅支持 Windows".into(),
+        ))
+    }
 }
 
 async fn show_control_plane_status(options: StatusOptions, as_json: bool) -> AppResult<()> {
@@ -906,7 +938,7 @@ fn resolve_gateway_workspace_ids(selectors: &[String]) -> AppResult<Vec<String>>
 async fn start_gateway_daemon(options: GatewayStartOptions, as_json: bool) -> AppResult<()> {
     if !gateway_daemon::supported() {
         return Err(AppError::Message(
-            "Gateway daemon 目前仅支持 Linux；请使用 gateway serve 前台模式".into(),
+            "Gateway daemon 当前仅支持 Windows 和 Linux；请使用 gateway serve 前台模式".into(),
         ));
     }
     let workspace_ids = resolve_gateway_workspace_ids(&options.workspaces)?;
@@ -937,6 +969,8 @@ async fn start_gateway_daemon(options: GatewayStartOptions, as_json: bool) -> Ap
     let status = gateway_control::request_status()
         .await
         .map_err(|error| AppError::Message(error.to_string()))?;
+    #[cfg(windows)]
+    crate::windows_service::set_gateway_desired(&workspace_ids)?;
     if as_json {
         print_json(&json!({
             "event": "gateway_started",
@@ -956,7 +990,9 @@ async fn start_gateway_daemon(options: GatewayStartOptions, as_json: bool) -> Ap
 
 async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppResult<()> {
     if !gateway_daemon::supported() {
-        return Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()));
+        return Err(AppError::Message(
+            "Gateway daemon 当前仅支持 Windows 和 Linux".into(),
+        ));
     }
     let inspection = gateway_daemon::inspect()?;
     if inspection.ambiguous {
@@ -995,6 +1031,8 @@ async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppR
         options.force,
     )
     .await?;
+    #[cfg(windows)]
+    crate::windows_service::set_gateway_desired(&[])?;
     if as_json {
         print_json(&json!({ "event": "gateway_stopped", "pid": state.pid }))?;
     } else {
@@ -1005,7 +1043,9 @@ async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppR
 
 async fn restart_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppResult<()> {
     if !gateway_daemon::supported() {
-        return Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()));
+        return Err(AppError::Message(
+            "Gateway daemon 当前仅支持 Windows 和 Linux".into(),
+        ));
     }
     let inspection = gateway_daemon::inspect()?;
     if inspection.ambiguous {
@@ -1057,7 +1097,9 @@ async fn restart_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> A
 
 async fn reload_gateway_daemon(as_json: bool) -> AppResult<()> {
     if !gateway_daemon::supported() {
-        return Err(AppError::Message("Gateway daemon 目前仅支持 Linux".into()));
+        return Err(AppError::Message(
+            "Gateway daemon 当前仅支持 Windows 和 Linux".into(),
+        ));
     }
     gateway_control::request_reload(Duration::from_secs(20))
         .await
@@ -1158,6 +1200,10 @@ async fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> A
         }
     } else {
         gateway_control::persist_config(&config)?;
+    }
+    #[cfg(windows)]
+    if !config.enabled {
+        crate::windows_service::set_gateway_desired(&[])?;
     }
     let applied_config = DataStore::load()?.settings().mcp_gateway;
     if as_json {
@@ -1584,7 +1630,7 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let tunnel = options.tunnel.unwrap_or(false);
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
-            "MCP Gateway 模式不支持每工作区独立 daemon；请使用 `anchor gateway serve <workspace ...>` 并交由 systemd 监督。"
+            "MCP Gateway 模式不支持每工作区独立 MCP daemon；请使用 `anchor gateway start <workspace ...>` 管理 Gateway route。"
                 .into(),
         ));
     }
@@ -1602,6 +1648,14 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         Duration::from_secs(options.wait_seconds),
     )
     .await?;
+    #[cfg(windows)]
+    crate::windows_service::set_workspace_desired(
+        &profile.id,
+        Some(control::DaemonLaunchSpec {
+            service,
+            tunnels: tunnel.then_some(service),
+        }),
+    )?;
     print_daemon_result(
         if already_running {
             "already_running"
@@ -1626,6 +1680,8 @@ async fn stop_daemon(options: StopOptions, as_json: bool) -> AppResult<()> {
         options.force,
     )
     .await?;
+    #[cfg(windows)]
+    crate::windows_service::set_workspace_desired(&profile.id, None)?;
     if as_json {
         print_json(&json!({
             "event": if stopped.is_some() { "stopped" } else { "already_stopped" },
@@ -2058,7 +2114,7 @@ async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     };
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
-            "MCP Gateway 模式不支持每工作区独立 daemon；请使用 `anchor gateway serve <workspace ...>` 并交由 systemd 监督。"
+            "MCP Gateway 模式不支持每工作区独立 MCP daemon；请使用 `anchor gateway start <workspace ...>` 管理 Gateway route。"
                 .into(),
         ));
     }
@@ -2079,6 +2135,11 @@ async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         Duration::from_secs(options.wait_seconds),
     )
     .await?;
+    #[cfg(windows)]
+    crate::windows_service::set_workspace_desired(
+        &profile.id,
+        Some(control::DaemonLaunchSpec { service, tunnels }),
+    )?;
     print_daemon_result(
         "started",
         &profile,
@@ -2203,13 +2264,67 @@ pub fn run() -> i32 {
         }
     };
     if let Some(path) = &parsed.config_dir {
-        std::env::set_var(crate::brand::CONFIG_DIR_ENV, path);
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.clone())
+        };
+        std::env::set_var(crate::brand::CONFIG_DIR_ENV, absolute);
+    }
+
+    if let Command::ServiceRun { config_dir } = &parsed.command {
+        #[cfg(windows)]
+        {
+            return match crate::windows_service::run_service_dispatcher(config_dir.clone()) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        crate::logging::timestamped_line(&format!("错误：{error}"))
+                    );
+                    1
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = config_dir;
+            eprintln!("错误：service-run 仅支持 Windows");
+            return 1;
+        }
+    }
+
+    if let Command::ServiceAdminRun { action, config_dir } = &parsed.command {
+        #[cfg(windows)]
+        {
+            return match crate::windows_service::run_admin_action(action, config_dir.clone()) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        crate::logging::timestamped_line(&format!("错误：{error}"))
+                    );
+                    1
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (action, config_dir);
+            eprintln!("错误：service-admin-run 仅支持 Windows");
+            return 1;
+        }
     }
 
     let as_json = parsed.json;
     let daemon_mode = matches!(
         &parsed.command,
-        Command::DaemonRun { .. } | Command::GatewayDaemonRun { .. }
+        Command::DaemonRun { .. }
+            | Command::GatewayDaemonRun { .. }
+            | Command::ServiceRun { .. }
+            | Command::ServiceAdminRun { .. }
     );
     match crate::async_runtime::block_on(execute(parsed)) {
         Ok(exit_code) => exit_code,
@@ -2275,6 +2390,19 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Config(command) => config::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
+        Command::Service(command) => execute_service(command, cli.json),
+        Command::ServiceRun { config_dir } => {
+            let _ = config_dir;
+            Err(AppError::Message(
+                "service-run 必须由 Windows Service Control Manager 入口直接分派".into(),
+            ))
+        }
+        Command::ServiceAdminRun { action, config_dir } => {
+            let _ = (action, config_dir);
+            Err(AppError::Message(
+                "service-admin-run 必须由 Windows UAC helper 入口直接分派".into(),
+            ))
+        }
         Command::GatewayDaemonRun {
             config_scope,
             workspaces,
@@ -3749,33 +3877,8 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test]
-    async fn gateway_daemon_writes_fail_closed_on_unsupported_windows_server() {
-        let start = start_gateway_daemon(
-            GatewayStartOptions {
-                workspaces: vec!["workspace".into()],
-                wait_seconds: 1,
-            },
-            false,
-        )
-        .await
-        .expect_err("Windows Gateway daemon start must fail closed");
-        assert!(start.to_string().contains("仅支持 Linux"));
-
-        let stop = stop_gateway_daemon(
-            GatewayStopOptions {
-                timeout_seconds: 1,
-                force: false,
-            },
-            false,
-        )
-        .await
-        .expect_err("Windows Gateway daemon stop must fail closed");
-        assert!(stop.to_string().contains("仅支持 Linux"));
-
-        let reload = reload_gateway_daemon(false)
-            .await
-            .expect_err("Windows Gateway daemon reload must fail closed");
-        assert!(reload.to_string().contains("仅支持 Linux"));
+    #[test]
+    fn gateway_daemon_is_supported_on_windows() {
+        assert!(gateway_daemon::supported());
     }
 }

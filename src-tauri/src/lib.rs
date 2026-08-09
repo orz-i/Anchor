@@ -33,6 +33,8 @@ mod settings;
 mod skills;
 pub mod tools;
 mod tunnel;
+#[cfg(target_os = "windows")]
+pub mod windows_service;
 mod workspace;
 
 #[cfg(feature = "desktop")]
@@ -43,14 +45,17 @@ use commands::{
     get_app_settings, get_canvs_snapshot, get_canvs_task_snapshot, get_control_plane_events,
     get_control_plane_status, get_download_config, get_frp_snippet, get_gateway_control_events,
     get_last_workspace_id, get_mcp_gateway, get_mcp_gateway_status, get_proxy, get_runtime_status,
-    get_shared_secret, get_workspace_control_events, get_workspace_control_status,
-    get_workspace_secret, inspect_workspace_skills, install_software, list_canvs_tasks,
-    list_frp_profiles, list_software, list_workspaces, open_workspace_directory, read_gateway_logs,
-    read_workspace_logs, regenerate_shared_secret, regenerate_workspace_secret,
-    restart_actions_runtime, restart_runtime, restart_tunnel, run_health_checks, save_frp_profile,
-    set_download_config, set_last_workspace, set_mcp_gateway, set_proxy, set_shared_secret,
-    set_workspace_secret, start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime,
-    stop_runtime, stop_tunnel, test_tunnel, uninstall_software, update_workspace,
+    get_shared_secret, get_windows_service_status, get_workspace_control_events,
+    get_workspace_control_status, get_workspace_secret, inspect_workspace_skills, install_software,
+    install_windows_service, list_canvs_tasks, list_frp_profiles, list_software, list_workspaces,
+    open_workspace_directory, read_gateway_logs, read_workspace_logs, regenerate_shared_secret,
+    regenerate_workspace_secret, restart_actions_runtime, restart_runtime, restart_tunnel,
+    restart_windows_service, run_health_checks, save_frp_profile, set_download_config,
+    set_last_workspace, set_mcp_gateway, set_proxy, set_shared_secret, set_workspace_secret,
+    start_actions_runtime, start_runtime, start_tunnel, start_windows_service,
+    stop_actions_runtime, stop_runtime, stop_tunnel, stop_windows_service,
+    sync_windows_service_plan, test_tunnel, uninstall_software, uninstall_windows_service,
+    update_workspace,
 };
 #[cfg(feature = "desktop")]
 use tauri::Manager;
@@ -82,7 +87,12 @@ fn acquire_single_instance() -> bool {
 
 #[cfg(all(feature = "desktop", feature = "cli"))]
 fn is_internal_daemon_command(arg: Option<&str>) -> bool {
-    arg.is_some_and(|arg| matches!(arg, "daemon-run" | "gateway-daemon-run"))
+    arg.is_some_and(|arg| {
+        matches!(
+            arg,
+            "daemon-run" | "gateway-daemon-run" | "service-run" | "service-admin-run"
+        )
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -117,6 +127,13 @@ pub fn run() {
             get_gateway_control_events,
             get_workspace_control_events,
             get_workspace_control_status,
+            get_windows_service_status,
+            install_windows_service,
+            uninstall_windows_service,
+            start_windows_service,
+            stop_windows_service,
+            restart_windows_service,
+            sync_windows_service_plan,
             get_canvs_snapshot,
             list_canvs_tasks,
             get_canvs_task_snapshot,
@@ -181,6 +198,8 @@ mod tests {
     fn desktop_binary_dispatches_only_internal_daemon_entrypoints_before_tauri() {
         assert!(is_internal_daemon_command(Some("daemon-run")));
         assert!(is_internal_daemon_command(Some("gateway-daemon-run")));
+        assert!(is_internal_daemon_command(Some("service-run")));
+        assert!(is_internal_daemon_command(Some("service-admin-run")));
         assert!(!is_internal_daemon_command(Some("status")));
         assert!(!is_internal_daemon_command(None));
     }

@@ -39,8 +39,6 @@ const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const CONTROL_OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(any(unix, windows, test))]
 const MAX_CONTROL_OPERATIONS: usize = 128;
-#[cfg(windows)]
-const WINDOWS_PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonControlCommand {
@@ -110,7 +108,8 @@ fn create_windows_pipe_server(
     // owner of this pipe object. Windows assigns a new object's owner from the
     // creating process token, so a per-user daemon remains reachable by that
     // user while excluding Everyone/Anonymous from the control plane.
-    let sddl = std::ffi::OsStr::new(WINDOWS_PIPE_SECURITY_SDDL)
+    let security_sddl = crate::windows_service::control_pipe_security_sddl();
+    let sddl = std::ffi::OsStr::new(&security_sddl)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
@@ -1617,9 +1616,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_named_pipe_uses_protected_owner_and_system_dacl() {
-        assert_eq!(WINDOWS_PIPE_SECURITY_SDDL, "D:P(A;;GA;;;SY)(A;;GA;;;OW)");
-        assert!(!WINDOWS_PIPE_SECURITY_SDDL.contains("WD"));
-        assert!(!WINDOWS_PIPE_SECURITY_SDDL.contains("AN"));
+        let sddl = crate::windows_service::control_pipe_security_sddl();
+        assert!(sddl.starts_with("D:P(A;;GA;;;SY)(A;;GA;;;OW)"));
+        assert!(!sddl.contains("WD"));
+        assert!(!sddl.contains("AN"));
     }
 
     #[tokio::test]

@@ -16,11 +16,11 @@ use crate::gateway_daemon;
 use crate::mcp::gateway;
 use crate::settings::McpGatewayConfig;
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use super::events::read_gateway_events;
 use super::events::{MAX_GATEWAY_EVENT_BATCH, MAX_GATEWAY_EVENT_WAIT_MS};
 use super::logs::read_gateway_log;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use super::protocol::{
     validate_protocol_version, ERROR_CONFIG_SCOPE_MISMATCH, ERROR_CONTROL_COMMAND_UNAVAILABLE,
     ERROR_LOG_READ_FAILED, ERROR_OPERATION_NOT_FOUND,
@@ -36,8 +36,68 @@ use super::protocol::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 const MAX_OPERATIONS: usize = 128;
+
+#[cfg(windows)]
+fn create_windows_pipe_server(
+    name: &str,
+    first_instance: bool,
+) -> AppResult<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    let security_sddl = crate::windows_service::control_pipe_security_sddl();
+    let sddl = std::ffi::OsStr::new(&security_sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|error| {
+            AppError::Message(format!(
+                "failed to build Windows Gateway pipe security descriptor: {error}"
+            ))
+        })?;
+    }
+
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let result = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(first_instance)
+            .reject_remote_clients(true)
+            .max_instances(32)
+            .create_with_security_attributes_raw(
+                name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    result.map_err(|error| {
+        AppError::Message(format!(
+            "failed to create Windows Gateway named pipe {name}: {error}"
+        ))
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayControlCommand {
@@ -214,7 +274,7 @@ impl std::error::Error for GatewayControlClientError {}
 #[derive(Debug, Clone)]
 #[cfg(any(feature = "cli", test))]
 struct StoredOperation {
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     config_scope: String,
     operation: GatewayAsyncOperation,
 }
@@ -225,7 +285,7 @@ fn operation_store() -> &'static Mutex<HashMap<String, StoredOperation>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn create_operation(config_scope: &str) -> Option<String> {
     let operation_id = uuid::Uuid::new_v4().to_string();
     let mut operations = operation_store()
@@ -257,7 +317,7 @@ fn create_operation(config_scope: &str) -> Option<String> {
     Some(operation_id)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn operation(config_scope: &str, operation_id: &str) -> Option<GatewayAsyncOperation> {
     operation_store()
         .lock()
@@ -497,7 +557,7 @@ async fn local_status() -> AppResult<GatewayControlStatus> {
     })
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn daemon_status() -> AppResult<GatewayControlStatus> {
     let store = DataStore::load()?;
     let config = store.settings().mcp_gateway;
@@ -767,7 +827,46 @@ impl GatewayControlServer {
         Ok(Self { endpoint, task })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub fn start(command_sender: GatewayControlSender) -> AppResult<Self> {
+        let endpoint = endpoint()?;
+        let GatewayLocalEndpoint::WindowsNamedPipe(name) = &endpoint else {
+            return Err(AppError::Message(
+                "Windows Gateway daemon resolved a non-pipe control endpoint".into(),
+            ));
+        };
+        let mut server = create_windows_pipe_server(name, true)?;
+        let pipe_name = name.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if let Err(error) = server.connect().await {
+                    gateway_daemon::append_log(&format!(
+                        "[control] named pipe connect failed: {error}"
+                    ));
+                    break;
+                }
+                let next = match create_windows_pipe_server(&pipe_name, false) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        gateway_daemon::append_log(&format!(
+                            "[control] named pipe instance creation failed: {error}"
+                        ));
+                        break;
+                    }
+                };
+                let connected = std::mem::replace(&mut server, next);
+                let command_sender = command_sender.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(connected, &command_sender).await {
+                        gateway_daemon::append_log(&format!("[control] request failed: {error}"));
+                    }
+                });
+            }
+        });
+        Ok(Self { endpoint, task })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn start(_command_sender: GatewayControlSender) -> AppResult<Self> {
         Err(AppError::Message(
             "Gateway control server is not enabled on this platform yet".into(),
@@ -788,7 +887,7 @@ impl Drop for GatewayControlServer {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn handle_connection<S>(mut stream: S, command_sender: &GatewayControlSender) -> AppResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -816,13 +915,13 @@ where
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 struct HandledRequest {
     response: GatewayResponse,
     command: Option<GatewayControlCommand>,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn handled(response: GatewayResponse) -> HandledRequest {
     HandledRequest {
         response,
@@ -830,7 +929,7 @@ fn handled(response: GatewayResponse) -> HandledRequest {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 async fn handle_request(request: GatewayRequest, command_available: bool) -> HandledRequest {
     if let Err(response) = validate_protocol_version(&request) {
         return handled(*response);
@@ -984,7 +1083,7 @@ async fn handle_request(request: GatewayRequest, command_available: bool) -> Han
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn lifecycle_request(
     request_id: String,
     operation: GatewayOperation,
@@ -1040,6 +1139,20 @@ mod tests {
         ));
         #[cfg(unix)]
         assert!(matches!(endpoint, GatewayLocalEndpoint::UnixSocket(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_gateway_named_pipe_accepts_repeated_requests() {
+        let (command_sender, _command_receiver) = control_channel();
+        let server = GatewayControlServer::start(command_sender).expect("start gateway pipe");
+        assert!(matches!(
+            server.endpoint(),
+            GatewayLocalEndpoint::WindowsNamedPipe(name)
+                if name.starts_with(r"\\.\pipe\") && name.contains("gateway")
+        ));
+        ping().await.expect("first gateway ping");
+        ping().await.expect("second gateway ping");
     }
 
     #[tokio::test]

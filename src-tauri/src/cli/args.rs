@@ -10,6 +10,52 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceCommand {
+    Status,
+    Install,
+    Uninstall,
+    Start,
+    Stop,
+    Restart,
+    Sync,
+}
+
+fn parse_service_command(args: &mut VecDeque<String>) -> Result<ServiceCommand, String> {
+    let command = match args.pop_front().as_deref() {
+        Some("status") => ServiceCommand::Status,
+        Some("install") => ServiceCommand::Install,
+        Some("uninstall") => ServiceCommand::Uninstall,
+        Some("start") => ServiceCommand::Start,
+        Some("stop") => ServiceCommand::Stop,
+        Some("restart") => ServiceCommand::Restart,
+        Some("sync") => ServiceCommand::Sync,
+        Some(other) => return Err(format!("未知 service 命令：{other}\n\n{}", service_usage())),
+        None => return Err(format!("service 缺少子命令\n\n{}", service_usage())),
+    };
+    ensure_empty(args, "service")?;
+    Ok(command)
+}
+
+fn parse_service_run(args: &mut VecDeque<String>) -> Result<Command, String> {
+    let config_dir = PathBuf::from(pop_value(args, "service-run")?);
+    ensure_empty(args, "service-run")?;
+    Ok(Command::ServiceRun { config_dir })
+}
+
+fn parse_service_admin_run(args: &mut VecDeque<String>) -> Result<Command, String> {
+    let action = pop_value(args, "service-admin-run")?;
+    if !matches!(
+        action.as_str(),
+        "install" | "uninstall" | "start" | "stop" | "restart"
+    ) {
+        return Err(format!("service-admin-run 不支持操作：{action}"));
+    }
+    let config_dir = PathBuf::from(pop_value(args, "service-admin-run")?);
+    ensure_empty(args, "service-admin-run")?;
+    Ok(Command::ServiceAdminRun { action, config_dir })
+}
+
 pub fn config_usage() -> &'static str {
     "Config 命令：\n\
   anchor config get <workspace> [--pending] [--key PATH]\n\
@@ -60,6 +106,7 @@ fn parse_config_assignment(raw: String) -> Result<ConfigAssignment, String> {
     if path.is_empty() {
         return Err("--set 的 PATH 不能为空".into());
     }
+
     Ok(ConfigAssignment {
         path: path.to_string(),
         value: value.to_string(),
@@ -811,6 +858,14 @@ pub enum Command {
     Config(ConfigCommand),
     Workspace(WorkspaceCommand),
     Gateway(GatewayCommand),
+    Service(ServiceCommand),
+    ServiceRun {
+        config_dir: PathBuf,
+    },
+    ServiceAdminRun {
+        action: String,
+        config_dir: PathBuf,
+    },
     GatewayDaemonRun {
         config_scope: String,
         workspaces: Vec<String>,
@@ -869,6 +924,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("config" | "cfg") => Command::Config(parse_config_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
+        Some("service" | "svc") => Command::Service(parse_service_command(&mut args)?),
+        Some("service-run") => parse_service_run(&mut args)?,
+        Some("service-admin-run") => parse_service_admin_run(&mut args)?,
         Some("gateway-daemon-run") => parse_gateway_daemon_run(&mut args)?,
         Some("daemon-run") => parse_daemon_run(&mut args)?,
         Some(other) => return Err(format!("未知命令：{other}\n\n{}", usage())),
@@ -934,6 +992,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] config <get|diff|set|apply> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
+  anchor [--config-dir PATH] [--json] service <command>\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
 不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
@@ -951,6 +1010,18 @@ pub fn gateway_usage() -> &'static str {
   anchor gateway events [--follow|-f] [--wait SECONDS]\n\
   anchor gateway serve <workspace> [workspace ...]\n\n\
 gateway start/stop/restart 管理独立全局 Gateway daemon；gateway serve 保留为前台调试/外部 supervisor 模式。"
+}
+
+pub fn service_usage() -> &'static str {
+    "Windows SCM Service 命令：\n\
+  anchor service status\n\
+  anchor service install\n\
+  anchor service uninstall\n\
+  anchor service start\n\
+  anchor service stop\n\
+  anchor service restart\n\
+  anchor service sync\n\n\
+install 会创建当前配置域专属的自动启动 SCM service，并保留/捕获当前 Workspace/Gateway 后台运行计划；sync 将当前运行态刷新为下次开机自动启动计划。install/uninstall 通常需要管理员权限。"
 }
 
 pub fn workspace_usage() -> &'static str {
@@ -995,6 +1066,48 @@ mod tests {
                 workspace: "workspace-a".into(),
                 service: ServiceSelection::All,
                 tunnel: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_windows_service_lifecycle_and_internal_service_run() {
+        for (name, expected) in [
+            ("status", ServiceCommand::Status),
+            ("install", ServiceCommand::Install),
+            ("uninstall", ServiceCommand::Uninstall),
+            ("start", ServiceCommand::Start),
+            ("stop", ServiceCommand::Stop),
+            ("restart", ServiceCommand::Restart),
+            ("sync", ServiceCommand::Sync),
+        ] {
+            let parsed = parse(strings(&["service", name])).expect("service command");
+            assert_eq!(parsed.command, Command::Service(expected));
+        }
+
+        let internal = parse(strings(&[
+            "service-run",
+            r"C:\Users\Demo User\AppData\Roaming\anchor",
+        ]))
+        .expect("service-run");
+        assert_eq!(
+            internal.command,
+            Command::ServiceRun {
+                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor")
+            }
+        );
+
+        let elevated = parse(strings(&[
+            "service-admin-run",
+            "install",
+            r"C:\Users\Demo User\AppData\Roaming\anchor",
+        ]))
+        .expect("service-admin-run");
+        assert_eq!(
+            elevated.command,
+            Command::ServiceAdminRun {
+                action: "install".into(),
+                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor")
             }
         );
     }

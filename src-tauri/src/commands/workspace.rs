@@ -637,5 +637,8 @@ pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResu
             teardown_workspace(store, &id)?;
         }
         Ok(())
-    })
+    })?;
+    #[cfg(windows)]
+    crate::windows_service::forget_workspace(&id)?;
+    Ok(())
 }

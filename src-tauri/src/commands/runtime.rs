@@ -740,6 +740,158 @@ async fn daemon_runtime_status(
     ))
 }
 
+#[cfg(windows)]
+async fn gateway_route_runtime_status(
+    state: &AppState,
+    profile: &crate::workspace::WorkspaceProfile,
+) -> AppResult<RuntimeStatusDto> {
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    let profiles = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
+    let plane = control::control_plane_status(&profiles).await?;
+    let workspace = plane
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.status.id == profile.id)
+        .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
+    let mut status =
+        runtime_status_from_control(profile, &settings, &workspace.status, WorkspaceService::Mcp);
+    status.state = workspace.mcp_state.clone();
+    let routed = plane
+        .gateway
+        .route_workspace_ids
+        .iter()
+        .any(|workspace_id| workspace_id == &profile.id);
+    if routed {
+        status.pid = plane.gateway.pid;
+        status.local_message = match workspace.mcp_state.as_str() {
+            "running" => format!(
+                "MCP 由 Gateway daemon 路由并监听 127.0.0.1:{}",
+                profile.runtime.local_port
+            ),
+            "recovering" => format!(
+                "Gateway daemon 已选择该工作区，但 MCP 端口 {} 尚未就绪",
+                profile.runtime.local_port
+            ),
+            "error" => format!(
+                "Gateway daemon 路由异常：{}",
+                if plane.gateway.error.is_empty() {
+                    plane.gateway.detail.as_str()
+                } else {
+                    plane.gateway.error.as_str()
+                }
+            ),
+            _ => "Gateway daemon 未启动该工作区 MCP route".into(),
+        };
+        let public_base = plane.gateway.public_base_url.trim().trim_end_matches('/');
+        if !public_base.is_empty() {
+            status.public_message = public_base.to_string();
+            status.public_endpoint = format!("{public_base}/w/{}/mcp", profile.id);
+        }
+    } else {
+        status.pid = None;
+        status.state = "stopped".into();
+        status.local_message = "未启动".into();
+        status.recovery.enabled = false;
+    }
+    Ok(status)
+}
+
+#[cfg(windows)]
+async fn set_windows_gateway_route(
+    state: &AppState,
+    workspace_id: &str,
+    enabled: bool,
+) -> AppResult<()> {
+    let (config, profiles) =
+        state.with_settings(|store| Ok((store.settings().mcp_gateway, store.list().to_vec())))?;
+    if !config.enabled {
+        return Err(AppError::Message("MCP Gateway 尚未启用".into()));
+    }
+    gateway::validate_config(&config, &profiles)?;
+    if enabled && !profiles.iter().any(|profile| profile.id == workspace_id) {
+        return Err(AppError::Message(format!(
+            "Gateway route workspace 不存在：{workspace_id}"
+        )));
+    }
+    if enabled {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.id == workspace_id)
+            .expect("validated workspace route");
+        let direct = crate::daemon::inspect(profile)?;
+        if direct
+            .state
+            .as_ref()
+            .filter(|_| direct.running && direct.pid_matches)
+            .is_some_and(|state| state.service.includes_mcp())
+        {
+            control::set_daemon_service(
+                profile,
+                WorkspaceService::Mcp,
+                false,
+                false,
+                DESKTOP_DAEMON_TIMEOUT,
+                true,
+            )
+            .await?;
+        }
+    }
+
+    let inspection = gateway_daemon::inspect()?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    let current_state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches);
+    let mut routes = current_state
+        .as_ref()
+        .map(|state| state.workspace_ids.clone())
+        .unwrap_or_default();
+    routes.retain(|id| id != workspace_id);
+    if enabled {
+        routes.push(workspace_id.to_string());
+    }
+    routes.sort();
+    routes.dedup();
+
+    if let Some(current) = current_state {
+        if current.workspace_ids == routes {
+            gateway_control::ping()
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            #[cfg(windows)]
+            crate::windows_service::set_gateway_desired(&routes)?;
+            return Ok(());
+        }
+        let operation = if routes.is_empty() {
+            GatewayOperation::Shutdown
+        } else {
+            GatewayOperation::Restart
+        };
+        let accepted_pid = gateway_control::request_exit(operation)
+            .await
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        if accepted_pid != current.pid {
+            return Err(AppError::Message(format!(
+                "Gateway route transition PID mismatch: state={}, response={accepted_pid}",
+                current.pid
+            )));
+        }
+        gateway_daemon::wait_for_exit(current.pid, DESKTOP_DAEMON_TIMEOUT, true).await?;
+    }
+
+    if !routes.is_empty() {
+        let pid = gateway_daemon::spawn(&routes)?;
+        if let Err(error) = gateway_daemon::wait_ready(pid, DESKTOP_DAEMON_TIMEOUT).await {
+            let _ = gateway_daemon::terminate_spawned(pid).await;
+            return Err(error);
+        }
+    }
+    crate::windows_service::set_gateway_desired(&routes)?;
+    Ok(())
+}
+
 fn ensure_daemon_gateway_compatible(
     state: &AppState,
     desired: Option<crate::daemon::ServiceSelection>,
@@ -765,6 +917,14 @@ async fn start_desktop_service(
 ) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(state, id, service)?;
     let profile = profile_by_id(state, id)?;
+    #[cfg(windows)]
+    if service == WorkspaceService::Mcp
+        && !desktop_gateway_server_mode()
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        set_windows_gateway_route(state, id, true).await?;
+        return gateway_route_runtime_status(state, &profile_by_id(state, id)?).await;
+    }
     let inspection = crate::daemon::inspect(&profile)?;
     let current = inspection
         .state
@@ -808,6 +968,14 @@ async fn stop_desktop_service(
     service: WorkspaceService,
 ) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(state, id)?;
+    #[cfg(windows)]
+    if service == WorkspaceService::Mcp
+        && !desktop_gateway_server_mode()
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        set_windows_gateway_route(state, id, false).await?;
+        return gateway_route_runtime_status(state, &profile).await;
+    }
     control::set_daemon_service(
         &profile,
         service,
@@ -834,6 +1002,17 @@ async fn restart_desktop_service(
 ) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(state, id, service)?;
     let profile = profile_by_id(state, id)?;
+    #[cfg(windows)]
+    if service == WorkspaceService::Mcp
+        && !desktop_gateway_server_mode()
+        && state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+    {
+        set_windows_gateway_route(state, id, true).await?;
+        gateway_control::request_reload(DESKTOP_DAEMON_TIMEOUT)
+            .await
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        return gateway_route_runtime_status(state, &profile_by_id(state, id)?).await;
+    }
     let inspection = crate::daemon::inspect(&profile)?;
     let current = inspection
         .state
@@ -897,9 +1076,10 @@ pub async fn set_mcp_gateway(
         config.observed_tunnel_signature = previous.observed_tunnel_signature.clone();
     }
     gateway::validate_config(&config, &profiles)?;
+    let gateway_enabled = config.enabled;
 
     let inspection = gateway_daemon::inspect()?;
-    match gateway_config_write_action(&inspection, config.enabled)? {
+    match gateway_config_write_action(&inspection, gateway_enabled)? {
         GatewayConfigWriteAction::ApplyViaDaemon { pid } => {
             gateway_control::ping().await.map_err(|error| {
                 AppError::Message(format!("Gateway daemon IPC 不可用：{error}"))
@@ -936,6 +1116,10 @@ pub async fn set_mcp_gateway(
         GatewayConfigWriteAction::PersistLocally => gateway_control::persist_config(&config)?,
     }
     state.reload_data_from_disk()?;
+    #[cfg(windows)]
+    if !gateway_enabled {
+        crate::windows_service::set_gateway_desired(&[])?;
+    }
     gateway_control::status_via_daemon_or_local().await
 }
 
@@ -1041,6 +1225,12 @@ pub async fn get_runtime_status(
     if desktop_server_mode() {
         return server_runtime_status(&state, &profile, WorkspaceService::Mcp);
     }
+    #[cfg(windows)]
+    if state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
+        && gateway_daemon::supported()
+    {
+        return gateway_route_runtime_status(&state, &profile).await;
+    }
     daemon_runtime_status(&state, &profile, WorkspaceService::Mcp).await
 }
 
@@ -1130,7 +1320,7 @@ mod tests {
             ambiguous,
             pid_matches,
             state: running.then(|| crate::gateway_daemon::GatewayDaemonState {
-                schema_version: 1,
+                schema_version: 2,
                 config_scope: "scope".into(),
                 pid: 42,
                 started_at_unix: 1,
@@ -1138,6 +1328,7 @@ mod tests {
                 local_port: 28_765,
                 log_path: "gateway.log".into(),
                 version: "test".into(),
+                executable_path: "anchor.exe".into(),
             }),
             detail: if ambiguous {
                 "ambiguous".into()
@@ -1383,10 +1574,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_workspace_daemon_and_gateway_fallback_are_independent() {
+    fn windows_workspace_and_gateway_daemons_are_native_control_planes() {
         assert!(crate::daemon::supported());
         assert!(!desktop_server_mode());
-        assert!(!crate::gateway_daemon::supported());
-        assert!(desktop_gateway_server_mode());
+        assert!(crate::gateway_daemon::supported());
+        assert!(!desktop_gateway_server_mode());
     }
 }
