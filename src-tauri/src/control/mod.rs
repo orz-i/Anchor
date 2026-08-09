@@ -22,9 +22,9 @@ pub(crate) use events::{publish_workspace_event, reset_workspace_event_stream};
 pub use ipc::{
     control_channel, endpoint, ping as ipc_ping, request_apply_config_operation,
     request_daemon_exit, request_events, request_logs, request_oauth_redirect_policy_update,
-    request_reload_operation, request_tunnel_operation, request_workspace_status,
-    workspace_status_via_daemon_or_local, ControlClientError, ControlServer, DaemonControlCommand,
-    DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
+    request_reload_operation, request_tunnel_operation, request_version, request_workspace_status,
+    workspace_status_via_daemon_or_local, ControlClientError, ControlServer, ControlVersionInfo,
+    DaemonControlCommand, DaemonControlReceiver, DaemonControlSender, LocalControlEndpoint,
 };
 #[cfg(any(feature = "cli", test))]
 pub(crate) use ipc::{

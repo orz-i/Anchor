@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+use crate::build_identity::BuildIdentity;
 use crate::settings::McpGatewayConfig;
 
 pub const GATEWAY_CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION: u16 = 1;
 pub const MAX_GATEWAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
@@ -24,8 +26,16 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     pub fn new(config_scope: String, method: GatewayMethod) -> Self {
+        Self::with_protocol_version(config_scope, method, GATEWAY_CONTROL_PROTOCOL_VERSION)
+    }
+
+    pub fn with_protocol_version(
+        config_scope: String,
+        method: GatewayMethod,
+        protocol_version: u16,
+    ) -> Self {
         Self {
-            protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+            protocol_version,
             request_id: uuid::Uuid::new_v4().to_string(),
             config_scope,
             method,
@@ -103,6 +113,8 @@ pub struct GatewayControlStatus {
     pub running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<BuildIdentity>,
     pub state: String,
     pub local_endpoint: String,
     pub public_base_url: String,
@@ -213,6 +225,8 @@ pub enum GatewayResult {
     Version {
         daemon_version: String,
         protocol_version: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_identity: Option<BuildIdentity>,
     },
     Status {
         status: Box<GatewayControlStatus>,
@@ -286,6 +300,24 @@ mod tests {
             response.error.expect("error").code,
             ERROR_PROTOCOL_VERSION_UNSUPPORTED
         );
+    }
+
+    #[test]
+    fn legacy_version_result_without_build_identity_still_decodes() {
+        let result: GatewayResult = serde_json::from_value(serde_json::json!({
+            "type": "version",
+            "daemon_version": "0.1.22",
+            "protocol_version": 1
+        }))
+        .expect("legacy Gateway version response");
+        assert!(matches!(
+            result,
+            GatewayResult::Version {
+                daemon_version,
+                protocol_version: 1,
+                build_identity: None,
+            } if daemon_version == "0.1.22"
+        ));
     }
 
     #[test]

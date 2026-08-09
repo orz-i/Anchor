@@ -1980,20 +1980,20 @@ struct DoctorCheck {
     hint: String,
 }
 
-fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
+async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
     let inspection = daemon::inspect(&profile)?;
     let mut checks = Vec::new();
     checks.push(doctor_check(
-        "Linux daemon 支持",
+        "后台 daemon 支持",
         daemon::supported(),
         if daemon::supported() {
             "可使用 start/stop/restart".into()
         } else {
             "当前平台只支持 serve 前台模式".into()
         },
-        "在 Linux 主机运行 daemon 运维命令",
+        "在 Windows/Linux 主机运行 daemon 运维命令",
     ));
     checks.push(doctor_check(
         "Workspace 目录",
@@ -2007,6 +2007,41 @@ fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
         inspection.detail.clone(),
         "停止错误进程或清理过期状态后重新 start",
     ));
+    if inspection.running && inspection.pid_matches {
+        match control::request_version(&profile.id).await {
+            Ok(version) => {
+                let current = crate::build_identity::BuildIdentity::current();
+                let detail = match version.build_identity.as_ref() {
+                    Some(identity) => format!(
+                        "protocol={} package={} git={}{}",
+                        version.protocol_version,
+                        identity.package_version,
+                        identity.short_git_sha(),
+                        if identity.git_dirty { " dirty" } else { "" }
+                    ),
+                    None => format!(
+                        "protocol={} package={} build identity=unavailable",
+                        version.protocol_version, version.daemon_version
+                    ),
+                };
+                checks.push(doctor_check(
+                    "Daemon 构建",
+                    version
+                        .build_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.same_build(&current)),
+                    detail,
+                    "使用当前 Anchor 构建协调 restart；若由 Windows SCM 监督，请先更新 SCM Service，再确认 daemon 已由新构建恢复",
+                ));
+            }
+            Err(error) => checks.push(doctor_check(
+                "Daemon 构建",
+                false,
+                error.to_string(),
+                "检查 daemon 控制协议；升级时仅 lifecycle drain 允许兼容旧协议，普通写操作仍会 fail-closed",
+            )),
+        }
+    }
 
     let owner_pid = inspection.state.as_ref().map(|state| state.pid);
     for (label, port) in [
@@ -2384,9 +2419,9 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Logs(options) => show_logs(options, cli.json).await.map(|_| 0),
         Command::Events(options) => show_events(options, cli.json).await.map(|_| 0),
         Command::Reload(options) => reload_daemon_config(options, cli.json).await.map(|_| 0),
-        Command::Doctor { workspace } => {
-            doctor_workspace(&workspace, cli.json).map(|healthy| if healthy { 0 } else { 1 })
-        }
+        Command::Doctor { workspace } => doctor_workspace(&workspace, cli.json)
+            .await
+            .map(|healthy| if healthy { 0 } else { 1 }),
         Command::Config(command) => config::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,

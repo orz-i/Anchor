@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::build_identity::BuildIdentity;
 use crate::daemon;
 use crate::error::{AppError, AppResult};
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
@@ -31,7 +32,8 @@ use super::protocol::{
     ControlAsyncOperation, ControlAsyncState, ControlConfigApplyResult, ControlEventBatch,
     ControlEventCursor, ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod,
     ControlOperation, ControlRequest, ControlResponse, ControlResult, ControlService,
-    ControlTunnelAction, MAX_CONTROL_FRAME_BYTES,
+    ControlTunnelAction, CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION, CONTROL_PROTOCOL_VERSION,
+    MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
@@ -87,6 +89,45 @@ pub(crate) fn finish_config_apply_operation(
             });
         }
     }
+}
+
+pub async fn request_version(profile_id: &str) -> Result<ControlVersionInfo, ControlClientError> {
+    let result = match request(profile_id, ControlMethod::Version).await {
+        Ok(result) => result,
+        Err(ControlClientError::VersionMismatch {
+            daemon_protocol, ..
+        }) if daemon_protocol > 0 && daemon_protocol < CONTROL_PROTOCOL_VERSION => {
+            request_with_protocol_version(
+                profile_id,
+                ControlMethod::Version,
+                CONTROL_REQUEST_TIMEOUT,
+                daemon_protocol,
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    match result {
+        ControlResult::Version {
+            daemon_version,
+            protocol_version,
+            build_identity,
+        } => Ok(ControlVersionInfo {
+            daemon_version,
+            protocol_version,
+            build_identity,
+        }),
+        other => Err(ControlClientError::Protocol(format!(
+            "daemon returned unexpected version result: {other:?}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlVersionInfo {
+    pub daemon_version: String,
+    pub protocol_version: u16,
+    pub build_identity: Option<BuildIdentity>,
 }
 
 #[cfg(windows)]
@@ -670,7 +711,22 @@ pub async fn request_daemon_exit(
             workspace_id: profile_id.to_string(),
         },
     };
-    match request(profile_id, method).await? {
+    let result = match request(profile_id, method.clone()).await {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(protocol_version) = legacy_lifecycle_retry_protocol(&error) else {
+                return Err(error);
+            };
+            request_with_protocol_version(
+                profile_id,
+                method,
+                CONTROL_REQUEST_TIMEOUT,
+                protocol_version,
+            )
+            .await?
+        }
+    };
+    match result {
         ControlResult::Accepted {
             operation: accepted,
             daemon_pid,
@@ -718,8 +774,15 @@ pub fn endpoint(profile_id: &str) -> AppResult<LocalControlEndpoint> {
 #[derive(Debug)]
 pub enum ControlClientError {
     Unavailable(String),
+    VersionMismatch {
+        daemon_protocol: u16,
+        client_protocol: u16,
+    },
     Protocol(String),
-    Remote { code: String, message: String },
+    Remote {
+        code: String,
+        message: String,
+    },
     Io(io::Error),
 }
 
@@ -733,6 +796,13 @@ impl fmt::Display for ControlClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(message) | Self::Protocol(message) => formatter.write_str(message),
+            Self::VersionMismatch {
+                daemon_protocol,
+                client_protocol,
+            } => write!(
+                formatter,
+                "daemon responded with protocol version {daemon_protocol}; client supports {client_protocol}"
+            ),
             Self::Remote { code, message } => write!(formatter, "daemon error {code}: {message}"),
             Self::Io(error) => write!(formatter, "daemon control I/O error: {error}"),
         }
@@ -790,10 +860,19 @@ async fn request_with_timeout(
     method: ControlMethod,
     timeout: Duration,
 ) -> Result<ControlResult, ControlClientError> {
+    request_with_protocol_version(profile_id, method, timeout, CONTROL_PROTOCOL_VERSION).await
+}
+
+async fn request_with_protocol_version(
+    profile_id: &str,
+    method: ControlMethod,
+    timeout: Duration,
+    protocol_version: u16,
+) -> Result<ControlResult, ControlClientError> {
     let endpoint = endpoint(profile_id).map_err(|error| {
         ControlClientError::Protocol(format!("cannot resolve daemon control endpoint: {error}"))
     })?;
-    let request = ControlRequest::new(method);
+    let request = ControlRequest::with_protocol_version(method, protocol_version);
     let request_id = request.request_id.clone();
     let response = tokio::time::timeout(timeout, exchange_with_endpoint(&endpoint, &request))
         .await
@@ -803,12 +882,11 @@ async fn request_with_timeout(
             ))
         })??;
 
-    if response.protocol_version != super::protocol::CONTROL_PROTOCOL_VERSION {
-        return Err(ControlClientError::Protocol(format!(
-            "daemon responded with protocol version {}; client supports {}",
-            response.protocol_version,
-            super::protocol::CONTROL_PROTOCOL_VERSION
-        )));
+    if response.protocol_version != protocol_version {
+        return Err(ControlClientError::VersionMismatch {
+            daemon_protocol: response.protocol_version,
+            client_protocol: CONTROL_PROTOCOL_VERSION,
+        });
     }
     if response.request_id != request_id {
         return Err(ControlClientError::Protocol(format!(
@@ -828,6 +906,19 @@ async fn request_with_timeout(
     response.result.ok_or_else(|| {
         ControlClientError::Protocol("daemon returned ok=true without a result".into())
     })
+}
+
+fn legacy_lifecycle_retry_protocol(error: &ControlClientError) -> Option<u16> {
+    let ControlClientError::VersionMismatch {
+        daemon_protocol,
+        client_protocol,
+    } = error
+    else {
+        return None;
+    };
+    (*daemon_protocol < *client_protocol
+        && *daemon_protocol >= CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION)
+        .then_some(*daemon_protocol)
 }
 
 #[cfg(unix)]
@@ -1201,6 +1292,7 @@ async fn handle_request(
             ControlResult::Version {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: super::protocol::CONTROL_PROTOCOL_VERSION,
+                build_identity: Some(crate::build_identity::BuildIdentity::current()),
             },
         )),
         ControlMethod::WorkspaceStatus { workspace_id } => {
@@ -1524,6 +1616,30 @@ fn handled(response: ControlResponse) -> HandledRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_drain_only_retries_supported_older_protocols() {
+        let compatible = ControlClientError::VersionMismatch {
+            daemon_protocol: CONTROL_PROTOCOL_VERSION - 1,
+            client_protocol: CONTROL_PROTOCOL_VERSION,
+        };
+        assert_eq!(
+            legacy_lifecycle_retry_protocol(&compatible),
+            Some(CONTROL_PROTOCOL_VERSION - 1)
+        );
+
+        let too_old = ControlClientError::VersionMismatch {
+            daemon_protocol: CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION - 1,
+            client_protocol: CONTROL_PROTOCOL_VERSION,
+        };
+        assert_eq!(legacy_lifecycle_retry_protocol(&too_old), None);
+
+        let newer = ControlClientError::VersionMismatch {
+            daemon_protocol: CONTROL_PROTOCOL_VERSION + 1,
+            client_protocol: CONTROL_PROTOCOL_VERSION,
+        };
+        assert_eq!(legacy_lifecycle_retry_protocol(&newer), None);
+    }
 
     #[tokio::test]
     async fn framed_json_round_trip_is_bounded_and_newline_delimited() {

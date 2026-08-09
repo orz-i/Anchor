@@ -9,12 +9,13 @@ use std::process::{Command, Output};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::build_identity::BuildIdentity;
 use crate::control::{self, DaemonLaunchSpec};
 use crate::daemon::ServiceSelection;
 use crate::error::{AppError, AppResult};
@@ -27,6 +28,8 @@ const SERVICE_NAME_PREFIX: &str = "AnchorControlPlane";
 const SERVICE_DISPLAY_NAME_PREFIX: &str = "Anchor Control Plane";
 const SERVICE_PLAN_FILE: &str = "windows-service.json";
 const SERVICE_PLAN_LOCK_FILE: &str = ".windows-service.lock";
+const SERVICE_RUNTIME_FILE: &str = "windows-service-runtime.json";
+const SERVICE_RUNTIME_SCHEMA_VERSION: u32 = 1;
 const PIPE_USER_ENV: &str = "ANCHOR_PIPE_USER";
 const SERVICE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const SERVICE_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -49,6 +52,27 @@ pub struct WindowsWorkspaceAutostart {
     pub service: ServiceSelection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_services: Option<ServiceSelection>,
+}
+
+fn service_build_state(
+    installed: bool,
+    state: &str,
+    runtime: Option<&WindowsServiceRuntimeState>,
+    current_build: &BuildIdentity,
+) -> &'static str {
+    if !installed {
+        "not_installed"
+    } else if state != "running" {
+        "stopped"
+    } else if let Some(runtime) = runtime {
+        if runtime.build_identity.same_build(current_build) {
+            "current"
+        } else {
+            "different"
+        }
+    } else {
+        "unknown"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,9 +109,25 @@ pub struct WindowsScmServiceStatus {
     pub installed: bool,
     pub state: String,
     pub auto_start: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
     pub config_dir: String,
     pub plan_path: String,
     pub plan: WindowsServicePlan,
+    pub build_state: String,
+    pub current_build: BuildIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<WindowsServiceRuntimeState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsServiceRuntimeState {
+    pub schema_version: u32,
+    pub pid: u32,
+    pub started_at_unix: u64,
+    pub executable_path: String,
+    pub build_identity: BuildIdentity,
 }
 
 #[derive(Debug)]
@@ -256,6 +296,90 @@ fn write_plan_unlocked(path: &Path, plan: &WindowsServicePlan) -> AppResult<()> 
     Ok(())
 }
 
+fn service_runtime_path() -> AppResult<PathBuf> {
+    Ok(platform().app_config_dir()?.join(SERVICE_RUNTIME_FILE))
+}
+
+fn read_service_runtime_state() -> AppResult<Option<WindowsServiceRuntimeState>> {
+    let path = service_runtime_path()?;
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            let state: WindowsServiceRuntimeState =
+                serde_json::from_str(&raw).map_err(|error| {
+                    AppError::Message(format!("Windows service runtime state 损坏：{error}"))
+                })?;
+            if state.schema_version != SERVICE_RUNTIME_SCHEMA_VERSION {
+                return Err(AppError::Message(format!(
+                    "Windows service runtime schema={}，当前仅支持 {}",
+                    state.schema_version, SERVICE_RUNTIME_SCHEMA_VERSION
+                )));
+            }
+            Ok(Some(state))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_service_runtime_state(state: &WindowsServiceRuntimeState) -> AppResult<()> {
+    let path = service_runtime_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(format!("tmp-{}", state.pid));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)?;
+    file.write_all(serde_json::to_string_pretty(state)?.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn remove_service_runtime_state_if_owned(pid: u32) {
+    let Ok(path) = service_runtime_path() else {
+        return;
+    };
+    let owned = read_service_runtime_state()
+        .ok()
+        .flatten()
+        .is_some_and(|state| state.pid == pid);
+    if owned {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn valid_service_runtime_state(
+    state: WindowsServiceRuntimeState,
+    scm_pid: Option<u32>,
+) -> Option<WindowsServiceRuntimeState> {
+    let scm_pid = scm_pid?;
+    if scm_pid != state.pid || !platform().is_process_alive(state.pid) {
+        return None;
+    }
+    let actual = platform().process_image_path(state.pid).ok().flatten()?;
+    (normalize_windows_path(&actual) == normalize_windows_path(&state.executable_path))
+        .then_some(state)
+}
+
+fn normalize_windows_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches(r"\\?\")
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn normalize_plan(plan: &mut WindowsServicePlan) {
     plan.schema_version = PLAN_SCHEMA_VERSION;
     plan.owner_sid = plan.owner_sid.trim().to_string();
@@ -422,7 +546,7 @@ pub fn sync_plan_from_running() -> AppResult<WindowsServicePlan> {
 pub fn scm_status() -> AppResult<WindowsScmServiceStatus> {
     let config_dir = platform().app_config_dir()?;
     let service_name = service_name_for_dir(&config_dir);
-    let query = run_sc(&["query", &service_name])?;
+    let query = run_sc(&["queryex", &service_name])?;
     let (installed, state) = if query.success {
         (true, parse_scm_state(&query.stdout).to_string())
     } else if contains_sc_error(&query, 1060) {
@@ -440,15 +564,30 @@ pub fn scm_status() -> AppResult<WindowsScmServiceStatus> {
     } else {
         false
     };
+    let process_id = installed.then(|| parse_scm_pid(&query.stdout)).flatten();
+    let runtime = if state == "running" {
+        read_service_runtime_state()
+            .ok()
+            .flatten()
+            .and_then(|runtime| valid_service_runtime_state(runtime, process_id))
+    } else {
+        None
+    };
+    let current_build = BuildIdentity::current();
+    let build_state = service_build_state(installed, &state, runtime.as_ref(), &current_build);
     Ok(WindowsScmServiceStatus {
         supported: true,
         service_name,
         installed,
         state,
         auto_start,
+        process_id,
         config_dir: config_dir.display().to_string(),
         plan_path: plan_path()?.display().to_string(),
         plan: load_plan()?,
+        build_state: build_state.into(),
+        current_build,
+        runtime,
     })
 }
 
@@ -497,11 +636,10 @@ pub fn install_scm_service() -> AppResult<WindowsScmServiceStatus> {
         "actions=",
         "restart/5000/restart/15000/restart/60000",
     ]);
-    let started = run_sc(&["start", &service_name])?;
-    if !started.success && !contains_sc_error(&started, 1056) {
-        return Err(sc_error("启动 Windows SCM service", &started));
+    if status.installed && status.state != "stopped" {
+        stop_scm_service()?;
     }
-    scm_status()
+    start_scm_service()
 }
 
 pub fn uninstall_scm_service() -> AppResult<WindowsScmServiceStatus> {
@@ -510,10 +648,8 @@ pub fn uninstall_scm_service() -> AppResult<WindowsScmServiceStatus> {
     if !status.installed {
         return Ok(status);
     }
-    let stopped = run_sc(&["stop", &service_name])?;
-    if !stopped.success && !contains_sc_error(&stopped, 1062) && !contains_sc_error(&stopped, 1060)
-    {
-        return Err(sc_error("停止 Windows SCM service", &stopped));
+    if status.state != "stopped" {
+        stop_scm_service()?;
     }
     let deleted = run_sc(&["delete", &service_name])?;
     if !deleted.success && !contains_sc_error(&deleted, 1060) {
@@ -532,6 +668,7 @@ pub fn start_scm_service() -> AppResult<WindowsScmServiceStatus> {
     if !started.success && !contains_sc_error(&started, 1056) {
         return Err(sc_error("启动 Windows SCM service", &started));
     }
+    wait_for_scm_state(&service_name, "running", SERVICE_OPERATION_TIMEOUT)?;
     scm_status()
 }
 
@@ -541,12 +678,12 @@ pub fn stop_scm_service() -> AppResult<WindowsScmServiceStatus> {
     if !stopped.success && !contains_sc_error(&stopped, 1062) {
         return Err(sc_error("停止 Windows SCM service", &stopped));
     }
+    wait_for_scm_state(&service_name, "stopped", SERVICE_OPERATION_TIMEOUT)?;
     scm_status()
 }
 
 pub fn restart_scm_service() -> AppResult<WindowsScmServiceStatus> {
     stop_scm_service()?;
-    std::thread::sleep(Duration::from_millis(500));
     start_scm_service()
 }
 
@@ -727,6 +864,44 @@ fn parse_scm_state(output: &str) -> &'static str {
     }
 }
 
+fn parse_scm_pid(output: &str) -> Option<u32> {
+    let regex = regex::Regex::new(r"(?mi)^\s*PID\s*:\s*(\d+)\s*$").expect("SCM PID regex");
+    regex
+        .captures(output)
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+}
+
+fn wait_for_scm_state(service_name: &str, expected: &str, timeout: Duration) -> AppResult<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let query = run_sc(&["query", service_name])?;
+        if query.success && parse_scm_state(&query.stdout) == expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let observed = if query.success {
+                parse_scm_state(&query.stdout).to_string()
+            } else {
+                combined_sc_output(&query)
+            };
+            return Err(AppError::Message(format!(
+                "等待 Windows SCM service {service_name} 进入 {expected} 超时；当前状态：{observed}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn combined_sc_output(output: &ScOutput) -> String {
+    [output.stdout.trim(), output.stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
 fn parse_scm_auto_start(output: &str) -> bool {
     let regex = regex::Regex::new(r":\s+2\s+").expect("SCM start type regex");
     output.lines().any(|line| regex.is_match(line))
@@ -820,6 +995,7 @@ fn service_main_inner() {
     }
     SERVICE_STATUS_HANDLE.store(handle as usize, Ordering::SeqCst);
     report_service_status(SERVICE_START_PENDING, 0, NO_ERROR, 5_000);
+    publish_current_service_runtime_state();
     report_service_status(
         SERVICE_RUNNING,
         SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
@@ -866,10 +1042,32 @@ fn report_service_status(state: u32, controls: u32, exit_code: u32, wait_hint: u
     }
 }
 
+fn publish_current_service_runtime_state() {
+    let service_pid = std::process::id();
+    match std::env::current_exe() {
+        Ok(executable) => {
+            let runtime = WindowsServiceRuntimeState {
+                schema_version: SERVICE_RUNTIME_SCHEMA_VERSION,
+                pid: service_pid,
+                started_at_unix: unix_now(),
+                executable_path: executable.display().to_string(),
+                build_identity: BuildIdentity::current(),
+            };
+            if let Err(error) = write_service_runtime_state(&runtime) {
+                append_service_log(&format!("[service] runtime state write failed: {error}"));
+            }
+        }
+        Err(error) => append_service_log(&format!(
+            "[service] current executable lookup failed: {error}"
+        )),
+    }
+}
+
 async fn run_service_supervisor() -> AppResult<()> {
+    let service_pid = std::process::id();
     append_service_log(&format!(
         "[service] started pid={} configDir={}",
-        std::process::id(),
+        service_pid,
         SERVICE_CONFIG_DIR
             .get()
             .map(|path| path.display().to_string())
@@ -895,6 +1093,7 @@ async fn run_service_supervisor() -> AppResult<()> {
         tokio::time::sleep(SERVICE_RECONCILE_INTERVAL).await;
     }
     shutdown_managed_control_plane(&mut managed_workspaces, &mut gateway_managed).await;
+    remove_service_runtime_state_if_owned(service_pid);
     append_service_log("[service] stopped");
     Ok(())
 }
@@ -1118,6 +1317,51 @@ mod tests {
     fn scm_state_parser_uses_numeric_state_and_ignores_type() {
         let output = "SERVICE_NAME: Anchor\r\n        TYPE               : 10  WIN32_OWN_PROCESS\r\n        STATE              : 4  RUNNING\r\n";
         assert_eq!(parse_scm_state(output), "running");
+    }
+
+    #[test]
+    fn scm_queryex_parser_reads_nonzero_pid() {
+        let output = "SERVICE_NAME: Anchor\r\n        TYPE               : 10  WIN32_OWN_PROCESS\r\n        STATE              : 4  RUNNING\r\n        PID                : 12345\r\n";
+        assert_eq!(parse_scm_pid(output), Some(12_345));
+        assert_eq!(parse_scm_pid("PID : 0\r\n"), None);
+    }
+
+    #[test]
+    fn service_build_state_detects_same_version_different_git_sha() {
+        let current = BuildIdentity {
+            package_version: "0.1.23".into(),
+            git_sha: "aaaaaaaa".into(),
+            git_dirty: false,
+            build_workspace: "D:/anchor".into(),
+        };
+        let runtime = WindowsServiceRuntimeState {
+            schema_version: SERVICE_RUNTIME_SCHEMA_VERSION,
+            pid: 42,
+            started_at_unix: 1,
+            executable_path: r"D:\Program Files\Anchor\anchor-desktop.exe".into(),
+            build_identity: BuildIdentity {
+                package_version: "0.1.23".into(),
+                git_sha: "bbbbbbbb".into(),
+                git_dirty: false,
+                build_workspace: "C:/build".into(),
+            },
+        };
+
+        assert_eq!(
+            service_build_state(true, "running", Some(&runtime), &current),
+            "different"
+        );
+        assert_eq!(
+            service_build_state(true, "running", None, &current),
+            "unknown"
+        );
+
+        let mut same = runtime;
+        same.build_identity.git_sha = current.git_sha.clone();
+        assert_eq!(
+            service_build_state(true, "running", Some(&same), &current),
+            "current"
+        );
     }
 
     #[test]

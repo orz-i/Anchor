@@ -8,6 +8,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::build_identity::BuildIdentity;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 
@@ -26,6 +27,8 @@ pub struct GatewayDaemonState {
     pub local_port: u16,
     pub log_path: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<BuildIdentity>,
     #[serde(default)]
     pub executable_path: String,
 }
@@ -271,6 +274,7 @@ pub fn acquire(workspace_ids: &[String], local_port: u16) -> AppResult<GatewayDa
         local_port,
         log_path: daemon_log_path()?.display().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
+        build_identity: Some(BuildIdentity::current()),
         executable_path: std::env::current_exe()?.display().to_string(),
     };
     atomic_write_json(&paths.state, &state)?;
@@ -526,6 +530,7 @@ fn discover_gateway_daemons(scope: &str) -> AppResult<Vec<GatewayDaemonState>> {
                 local_port: 0,
                 log_path: daemon_log_path()?.display().to_string(),
                 version: "unknown".into(),
+                build_identity: None,
                 executable_path: args.first().copied().unwrap_or_default().to_string(),
             });
         }

@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::WorkspaceControlStatus;
+use crate::build_identity::BuildIdentity;
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 6;
+pub const CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
@@ -26,8 +28,12 @@ pub struct ControlRequest {
 
 impl ControlRequest {
     pub fn new(method: ControlMethod) -> Self {
+        Self::with_protocol_version(method, CONTROL_PROTOCOL_VERSION)
+    }
+
+    pub fn with_protocol_version(method: ControlMethod, protocol_version: u16) -> Self {
         Self {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
+            protocol_version,
             request_id: uuid::Uuid::new_v4().to_string(),
             method,
         }
@@ -268,6 +274,8 @@ pub enum ControlResult {
     Version {
         daemon_version: String,
         protocol_version: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_identity: Option<BuildIdentity>,
     },
     WorkspaceStatus {
         status: Box<WorkspaceControlStatus>,
@@ -359,6 +367,41 @@ mod tests {
             response.error.expect("protocol error").code,
             ERROR_PROTOCOL_VERSION_UNSUPPORTED
         );
+    }
+
+    #[test]
+    fn legacy_version_result_without_build_identity_still_decodes() {
+        let result: ControlResult = serde_json::from_value(serde_json::json!({
+            "type": "version",
+            "daemon_version": "0.1.22",
+            "protocol_version": 5
+        }))
+        .expect("legacy version response");
+        assert!(matches!(
+            result,
+            ControlResult::Version {
+                daemon_version,
+                protocol_version: 5,
+                build_identity: None,
+            } if daemon_version == "0.1.22"
+        ));
+    }
+
+    #[test]
+    fn explicit_protocol_request_keeps_stable_lifecycle_shape() {
+        let request = ControlRequest::with_protocol_version(
+            ControlMethod::PrepareRestart {
+                workspace_id: "workspace-1".into(),
+            },
+            CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION,
+        );
+        let value = serde_json::to_value(request).expect("serialize legacy lifecycle request");
+        assert_eq!(
+            value["protocolVersion"],
+            CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION
+        );
+        assert_eq!(value["method"], "prepare_restart");
+        assert_eq!(value["workspaceId"], "workspace-1");
     }
 
     #[test]

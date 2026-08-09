@@ -325,6 +325,18 @@
               配置所有者 · {windowsService.plan.ownerUsername || "未记录"}
             </p>
             <p class="mt-1">
+              运行构建 · {windowsService.buildState === "current"
+                ? `${windowsService.runtime?.buildIdentity.packageVersion ?? windowsService.currentBuild.packageVersion} · ${(windowsService.runtime?.buildIdentity.gitSha ?? windowsService.currentBuild.gitSha).slice(0, 8)}`
+                : windowsService.buildState === "different"
+                  ? `待更新 · ${windowsService.runtime?.buildIdentity.gitSha.slice(0, 8) ?? "unknown"} → ${windowsService.currentBuild.gitSha.slice(0, 8)}`
+                  : windowsService.buildState === "unknown"
+                    ? "未知（旧版 Service 未发布 build identity）"
+                    : windowsService.buildState === "stopped"
+                      ? "Service 已停止"
+                      : "未安装"}
+              {windowsService.processId ? ` · PID ${windowsService.processId}` : ""}
+            </p>
+            <p class="mt-1">
               安装、卸载和服务启停会触发标准 Windows UAC，仅提升该次 SCM 操作。
             </p>
           </div>
@@ -345,6 +357,12 @@
               onclick={() => void runWindowsServiceAction(installWindowsService, "Windows SCM Service 已安装并设置为自动启动。")}
             >安装并自动启动</button>
           {:else}
+            <button
+              type="button"
+              class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
+              disabled={windowsServiceBusy}
+              onclick={() => void runWindowsServiceAction(installWindowsService, "Windows SCM Service 已更新到当前构建并完成重启。")}
+            >更新服务版本</button>
             {#if windowsService.state === "running"}
               <button
                 type="button"

@@ -435,6 +435,7 @@ mod tests {
             daemon_supported: true,
             running: true,
             pid,
+            build_identity: None,
             state: "running".into(),
             local_endpoint: "http://127.0.0.1:28765".into(),
             public_base_url: String::new(),

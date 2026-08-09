@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::build_identity::BuildIdentity;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::gateway_daemon;
@@ -31,7 +32,7 @@ use super::protocol::{
     GatewayAsyncState, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor,
     GatewayLogChunk, GatewayLogCursor, GatewayMethod, GatewayOperation, GatewayRequest,
     GatewayResponse, GatewayResult, GATEWAY_CONTROL_PROTOCOL_VERSION,
-    MAX_GATEWAY_CONTROL_FRAME_BYTES,
+    GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION, MAX_GATEWAY_CONTROL_FRAME_BYTES,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
@@ -97,6 +98,40 @@ fn create_windows_pipe_server(
             "failed to create Windows Gateway named pipe {name}: {error}"
         ))
     })
+}
+
+pub async fn request_version() -> Result<GatewayVersionInfo, GatewayControlClientError> {
+    let result = match request(GatewayMethod::Version).await {
+        Ok(result) => result,
+        Err(GatewayControlClientError::VersionMismatch {
+            daemon_protocol, ..
+        }) if daemon_protocol > 0 && daemon_protocol < GATEWAY_CONTROL_PROTOCOL_VERSION => {
+            request_with_protocol_version(GatewayMethod::Version, REQUEST_TIMEOUT, daemon_protocol)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
+    match result {
+        GatewayResult::Version {
+            daemon_version,
+            protocol_version,
+            build_identity,
+        } => Ok(GatewayVersionInfo {
+            daemon_version,
+            protocol_version,
+            build_identity,
+        }),
+        other => Err(GatewayControlClientError::Protocol(format!(
+            "Gateway daemon returned unexpected version result: {other:?}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayVersionInfo {
+    pub daemon_version: String,
+    pub protocol_version: u16,
+    pub build_identity: Option<BuildIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,8 +281,15 @@ pub fn endpoint() -> AppResult<GatewayLocalEndpoint> {
 #[derive(Debug)]
 pub enum GatewayControlClientError {
     Unavailable(String),
+    VersionMismatch {
+        daemon_protocol: u16,
+        client_protocol: u16,
+    },
     Protocol(String),
-    Remote { code: String, message: String },
+    Remote {
+        code: String,
+        message: String,
+    },
     Io(io::Error),
 }
 
@@ -261,6 +303,13 @@ impl fmt::Display for GatewayControlClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable(message) | Self::Protocol(message) => formatter.write_str(message),
+            Self::VersionMismatch {
+                daemon_protocol,
+                client_protocol,
+            } => write!(
+                formatter,
+                "Gateway daemon responded with protocol version {daemon_protocol}; client supports {client_protocol}"
+            ),
             Self::Remote { code, message } => {
                 write!(formatter, "Gateway daemon error {code}: {message}")
             }
@@ -393,7 +442,16 @@ pub async fn request_exit(operation: GatewayOperation) -> Result<u32, GatewayCon
         GatewayOperation::Shutdown => GatewayMethod::Shutdown,
         GatewayOperation::Restart => GatewayMethod::PrepareRestart,
     };
-    match request(method).await? {
+    let result = match request(method.clone()).await {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(protocol_version) = legacy_lifecycle_retry_protocol(&error) else {
+                return Err(error);
+            };
+            request_with_protocol_version(method, REQUEST_TIMEOUT, protocol_version).await?
+        }
+    };
+    match result {
         GatewayResult::Accepted {
             operation: accepted,
             daemon_pid,
@@ -489,32 +547,6 @@ async fn local_status() -> AppResult<GatewayControlStatus> {
     let store = DataStore::load()?;
     let config = store.settings().mcp_gateway;
     let inspection = gateway_daemon::inspect()?;
-    if !inspection.supported && cfg!(target_os = "windows") {
-        let runtime = gateway::status(&config).await;
-        let running = runtime.state == "running";
-        let state = if runtime.state == "error" {
-            "error"
-        } else if running {
-            "running"
-        } else if config.enabled {
-            "configured"
-        } else {
-            "stopped"
-        };
-        return Ok(GatewayControlStatus {
-            daemon_supported: false,
-            running,
-            pid: None,
-            state: state.into(),
-            local_endpoint: runtime.local_endpoint,
-            public_base_url: runtime.public_base_url,
-            route_count: runtime.route_count,
-            route_workspace_ids: runtime.route_workspace_ids,
-            owner_workspace_id: runtime.owner_workspace_id,
-            error: runtime.error,
-            detail: "Windows GUI 自动使用前台 Server 模式；关闭 Anchor 桌面应用即停止 Gateway。后台 daemon/Named Pipe server 尚未实现。".into(),
-        });
-    }
     let route_workspace_ids = if inspection.running {
         inspection
             .state
@@ -528,6 +560,10 @@ async fn local_status() -> AppResult<GatewayControlStatus> {
         .running
         .then(|| inspection.state.as_ref().map(|state| state.pid))
         .flatten();
+    let build_identity = inspection
+        .state
+        .as_ref()
+        .and_then(|state| state.build_identity.clone());
     let state = if inspection.running {
         "error"
     } else if config.enabled {
@@ -546,6 +582,7 @@ async fn local_status() -> AppResult<GatewayControlStatus> {
         daemon_supported: inspection.supported,
         running: inspection.running,
         pid,
+        build_identity,
         state: state.into(),
         local_endpoint: format!("http://127.0.0.1:{}", config.local_port),
         public_base_url: config.effective_public_url(),
@@ -568,10 +605,15 @@ async fn daemon_status() -> AppResult<GatewayControlStatus> {
         .as_ref()
         .map(|state| state.workspace_ids.clone())
         .unwrap_or_default();
+    let build_identity = inspection
+        .state
+        .as_ref()
+        .and_then(|state| state.build_identity.clone());
     Ok(GatewayControlStatus {
         daemon_supported: inspection.supported,
         running: inspection.running,
         pid: inspection.state.as_ref().map(|state| state.pid),
+        build_identity,
         state: runtime.state,
         local_endpoint: runtime.local_endpoint,
         public_base_url: runtime.public_base_url,
@@ -591,6 +633,14 @@ async fn request_with_timeout(
     method: GatewayMethod,
     timeout: Duration,
 ) -> Result<GatewayResult, GatewayControlClientError> {
+    request_with_protocol_version(method, timeout, GATEWAY_CONTROL_PROTOCOL_VERSION).await
+}
+
+async fn request_with_protocol_version(
+    method: GatewayMethod,
+    timeout: Duration,
+    protocol_version: u16,
+) -> Result<GatewayResult, GatewayControlClientError> {
     let config_scope = gateway_daemon::config_scope().map_err(|error| {
         GatewayControlClientError::Protocol(format!("cannot resolve Gateway config scope: {error}"))
     })?;
@@ -599,7 +649,7 @@ async fn request_with_timeout(
             "cannot resolve Gateway control endpoint: {error}"
         ))
     })?;
-    let request = GatewayRequest::new(config_scope, method);
+    let request = GatewayRequest::with_protocol_version(config_scope, method, protocol_version);
     let request_id = request.request_id.clone();
     let response = tokio::time::timeout(timeout, exchange_with_endpoint(&endpoint, &request))
         .await
@@ -608,11 +658,11 @@ async fn request_with_timeout(
                 "Gateway control endpoint timed out: {endpoint:?}"
             ))
         })??;
-    if response.protocol_version != GATEWAY_CONTROL_PROTOCOL_VERSION {
-        return Err(GatewayControlClientError::Protocol(format!(
-            "Gateway daemon responded with protocol version {}; client supports {}",
-            response.protocol_version, GATEWAY_CONTROL_PROTOCOL_VERSION
-        )));
+    if response.protocol_version != protocol_version {
+        return Err(GatewayControlClientError::VersionMismatch {
+            daemon_protocol: response.protocol_version,
+            client_protocol: GATEWAY_CONTROL_PROTOCOL_VERSION,
+        });
     }
     if response.request_id != request_id {
         return Err(GatewayControlClientError::Protocol(format!(
@@ -634,6 +684,19 @@ async fn request_with_timeout(
     response.result.ok_or_else(|| {
         GatewayControlClientError::Protocol("Gateway daemon returned ok=true without result".into())
     })
+}
+
+fn legacy_lifecycle_retry_protocol(error: &GatewayControlClientError) -> Option<u16> {
+    let GatewayControlClientError::VersionMismatch {
+        daemon_protocol,
+        client_protocol,
+    } = error
+    else {
+        return None;
+    };
+    (*daemon_protocol < *client_protocol
+        && *daemon_protocol >= GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION)
+        .then_some(*daemon_protocol)
 }
 
 #[cfg(unix)]
@@ -970,6 +1033,7 @@ async fn handle_request(request: GatewayRequest, command_available: bool) -> Han
             GatewayResult::Version {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+                build_identity: Some(crate::build_identity::BuildIdentity::current()),
             },
         )),
         GatewayMethod::Status => match daemon_status().await {
@@ -1114,6 +1178,24 @@ fn lifecycle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_lifecycle_drain_only_retries_supported_older_protocols() {
+        let compatible = GatewayControlClientError::VersionMismatch {
+            daemon_protocol: GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION,
+            client_protocol: GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION + 1,
+        };
+        assert_eq!(
+            legacy_lifecycle_retry_protocol(&compatible),
+            Some(GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION)
+        );
+
+        let newer = GatewayControlClientError::VersionMismatch {
+            daemon_protocol: GATEWAY_CONTROL_PROTOCOL_VERSION + 1,
+            client_protocol: GATEWAY_CONTROL_PROTOCOL_VERSION,
+        };
+        assert_eq!(legacy_lifecycle_retry_protocol(&newer), None);
+    }
     use crate::settings::McpGatewayConfig;
 
     #[tokio::test]

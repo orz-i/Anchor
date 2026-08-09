@@ -835,6 +835,7 @@ mod tests {
                 local_port: 28_765,
                 log_path: "gateway.log".into(),
                 version: "test".into(),
+                build_identity: None,
                 executable_path: "anchor.exe".into(),
             }),
             detail: if ambiguous {
@@ -919,6 +920,7 @@ mod tests {
             tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "daemon.log".into(),
             version: "test".into(),
+            build_identity: None,
             executable_path: "anchor.exe".into(),
         };
         let status = WorkspaceControlStatus {

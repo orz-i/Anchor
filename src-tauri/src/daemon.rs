@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
 
+use crate::build_identity::BuildIdentity;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::tunnel::log_dir_for_profile;
@@ -90,6 +91,8 @@ pub struct DaemonState {
     pub tunnel_services: Option<ServiceSelection>,
     pub log_path: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_identity: Option<BuildIdentity>,
     pub executable_path: String,
 }
 
@@ -135,6 +138,7 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
                 tunnel_services,
                 log_path: daemon_log_path(&profile.id).display().to_string(),
                 version: "unknown".into(),
+                build_identity: None,
                 executable_path: args.first().copied().unwrap_or_default().to_string(),
             });
         }
@@ -453,6 +457,7 @@ pub fn acquire_with_tunnels(
         tunnel_services,
         log_path: daemon_log_path(&profile.id).display().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
+        build_identity: Some(BuildIdentity::current()),
         executable_path: std::env::current_exe()?.display().to_string(),
     };
     atomic_write_json(&paths.state, &state)?;
@@ -1057,6 +1062,7 @@ mod tests {
             tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "/tmp/daemon.log".into(),
             version: "1".into(),
+            build_identity: None,
             executable_path: "/usr/local/bin/anchor".into(),
         };
 

@@ -210,6 +210,8 @@ Unix 运行目录权限为 `0700`，状态、PID 和锁文件使用当前用户�
 
 Workspace 控制协议当前版本为 `6`，支持 `ping`、`version`、`workspace_status`、`logs`、`events`、`reload`、`apply_config`、`update_oauth_redirect_policy`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
 
+`version` 与 daemon state 还以 additive optional 字段发布 `buildIdentity`（package version、Git SHA、dirty 标志和构建工作区）。旧 daemon 没有该字段时新客户端按 `None` 处理，因此同一 `0.1.x` 包版本下也能在新旧构建之间建立明确的升级可观察性，而不会把“package version 相同”误当成“运行构建相同”。
+
 Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|actions|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|actions|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
 
 Tunnel 写控制是异步操作：daemon 先返回 `OperationAccepted` 并完整关闭本次响应帧，然后主循环才执行 Tunnel Supervisor 的 start/stop/restart；客户端使用 `operation_status` 查询 `pending/running/succeeded/failed`。这保证协议响应不会被正在执行的 tunnel 替换操作截断。FRP restart 继续使用 supervisor 的原子 route replacement，失败时保留旧线路；非 FRP restart 失败时也尝试恢复上一线路和持久配置。
@@ -223,7 +225,8 @@ CLI 生命周期语义：
 - `start` 在 daemon 不存在时负责创建后台进程；若状态显示 daemon 已运行，必须先通过 IPC `ping` 验证目标控制面；
 - `stop` 先发送 `shutdown`，由目标 daemon 完成 Runtime、Tunnel 和监听器清理后退出；
 - `restart` 先发送 `prepare_restart`，等待原 PID 退出后再执行一次新的 `start` 引导；
-- IPC 不可用、协议版本不兼容或响应 PID 不匹配时，写命令直接失败，不会回退到客户端直接发送信号或启动第二套运行时；
+- 普通运行/配置写请求继续要求当前协议精确匹配。只有 `version` 只读探测，以及自 Workspace protocol v2 起未改变 wire shape 的 `shutdown` / `prepare_restart`，允许新客户端在发现**较旧且不低于 v2** 的 daemon 后以该旧协议版本重试；该兼容通道只用于识别和排空旧运行权威，不允许 tunnel/reload/apply_config 等新写语义跨版本执行；
+- IPC 不可用、生命周期协议低于兼容下限、新 daemon 比客户端更新、响应 PID 不匹配或普通写请求协议不兼容时，命令直接失败，不会回退到客户端直接发送信号或启动第二套运行时；
 - `--force` 只在 daemon 已接受 IPC 退出请求但超过等待时间后生效，并再次验证 PID 仍属于目标 Workspace。
 
 运行中 daemon 的 `logs` 和 `logs --follow` 通过 IPC 获取有界日志快照和增量游标。单次响应日志内容最多 8 KiB，避免日志内容突破控制帧上限。daemon 已停止时，CLI 仍允许直接读取已有历史日志文件。
@@ -268,7 +271,9 @@ gateway.json
 gateway.sock
 ```
 
-状态文件记录 daemon PID、配置域、route Workspace IDs、Gateway 本地端口和版本。Unix socket 父目录保持 `0700`、socket 为 `0600`。readiness 同时要求 Gateway 本地端口属于目标 PID 且 control `ping` 成功。
+状态文件记录 daemon PID、配置域、route Workspace IDs、Gateway 本地端口、版本和 optional `buildIdentity`。Unix socket 父目录保持 `0700`、socket 为 `0600`。readiness 同时要求 Gateway 本地端口属于目标 PID 且 control `ping` 成功。
+
+Gateway lifecycle 从 protocol v1 起保持稳定，因此未来客户端协议升级后，只允许 `version` 与 `shutdown` / `prepare_restart` 对较旧且不低于 v1 的 daemon 使用其旧协议版本重试。其他 Gateway 写请求仍严格要求当前协议，避免“为了升级兼容”扩大运行控制权限或产生部分应用。
 
 Gateway protocol v1 的可观察性方法采用 additive tag 扩展，没有修改已有 v1 请求/响应形状：
 
@@ -348,6 +353,10 @@ anchor service uninstall
 ```
 
 `service sync` 把当前后台 Workspace daemon 与 Gateway route 集合写入 `windows-service.json`；后续 GUI/CLI 的 Workspace/Gateway 启停也会持续更新这个计划。`install` 注册配置目录专属的 `AnchorControlPlane-<scope>` 服务并设置 `start= auto`。安装、卸载通常需要管理员权限；服务本身运行在 Session 0，因此计划同时保存配置所有者 SID/用户名，用于复用用户态 Named Pipe 身份并给 owner/System 设置受保护 DACL。
+
+SCM supervisor 运行时额外写入 `windows-service-runtime.json`，记录当前 Service PID、启动时间、实际 executable path 和 `buildIdentity`。`service status` 使用 `sc queryex` 获取真实 SCM PID，并同时校验 runtime state 的 PID 存活与进程镜像路径，输出 `buildState=not_installed|stopped|current|different|unknown`。旧 Service 没有 runtime state 时明确返回 `unknown`，不会因为 package version 相同而误报为 current。
+
+`service install` 同时承担显式“安装/更新到当前二进制”的语义：若 Service 已安装且仍运行，先请求 SCM 停止并等待真正进入 `STOPPED`，由 supervisor 优雅排空其管理的 Workspace/Gateway daemon，再启动刚写入 `binPath` 的当前构建并等待 `RUNNING`。GUI 的“更新服务版本”按钮复用同一路径并通过 UAC 执行。普通状态查询、Workspace 配置保存或桌面启动都不会隐式重启 SCM。
 
 GUI 的安装/卸载/启停按钮会通过内部 `service-admin-run` helper 触发标准 Windows UAC，只提升该次 SCM 操作，不要求整个 Anchor 桌面进程长期以管理员身份运行；普通 CLI 命令仍要求从已提升的管理员终端执行。`service-admin-run` 与 `service-run` 都是内部入口，不应人工调用。
 

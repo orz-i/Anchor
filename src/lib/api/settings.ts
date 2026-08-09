@@ -94,15 +94,34 @@ export interface WindowsServicePlanDto {
   gatewayWorkspaceIds: string[];
 }
 
+export interface BuildIdentityDto {
+  packageVersion: string;
+  gitSha: string;
+  gitDirty: boolean;
+  buildWorkspace: string;
+}
+
+export interface WindowsServiceRuntimeStateDto {
+  schemaVersion: number;
+  pid: number;
+  startedAtUnix: number;
+  executablePath: string;
+  buildIdentity: BuildIdentityDto;
+}
+
 export interface WindowsScmServiceStatusDto {
   supported: boolean;
   serviceName: string;
   installed: boolean;
   state: string;
   autoStart: boolean;
+  processId?: number;
   configDir: string;
   planPath: string;
   plan: WindowsServicePlanDto;
+  buildState: "not_installed" | "stopped" | "current" | "different" | "unknown";
+  currentBuild: BuildIdentityDto;
+  runtime?: WindowsServiceRuntimeStateDto;
 }
 
 export async function getWindowsServiceStatus(): Promise<WindowsScmServiceStatusDto> {

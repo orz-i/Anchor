@@ -162,6 +162,13 @@ export interface DaemonState {
   tunnelServices?: "mcp" | "actions" | "all" | null;
   logPath: string;
   version: string;
+  buildIdentity?: {
+    packageVersion: string;
+    gitSha: string;
+    gitDirty: boolean;
+    buildWorkspace: string;
+  } | null;
+  executablePath: string;
 }
 
 export interface DaemonInspection {
@@ -234,6 +241,12 @@ export interface GatewayControlStatus {
   daemonSupported: boolean;
   running: boolean;
   pid?: number | null;
+  buildIdentity?: {
+    packageVersion: string;
+    gitSha: string;
+    gitDirty: boolean;
+    buildWorkspace: string;
+  } | null;
   state: "stopped" | "configured" | "running" | "error";
   localEndpoint: string;
   publicBaseUrl: string;

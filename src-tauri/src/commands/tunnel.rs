@@ -421,6 +421,7 @@ mod tests {
                     tunnel_services: Some(ServiceSelection::Mcp),
                     log_path: "daemon.log".into(),
                     version: "test".into(),
+                    build_identity: None,
                     executable_path: "anchor.exe".into(),
                 }),
                 detail: "running".into(),

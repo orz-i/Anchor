@@ -10,6 +10,7 @@ mod app_state;
 mod async_runtime;
 mod auth;
 mod brand;
+pub mod build_identity;
 mod canvs;
 mod canvs_web;
 #[cfg(feature = "cli")]

@@ -131,7 +131,7 @@ GUI 工作区控制迁移现状：
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
 - 若升级时检测到旧桌面进程仍持有 process-local listener，Windows GUI 将其报告为冲突并拒绝接管，防止旧进程与 daemon 控制域同时成为运行权威。
 
-尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及升级前排空/版本协商/崩溃治理。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；真实 Windows reboot 后的自动恢复仍属于发布验收项。
+尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及崩溃报告/升级编排的更高层自动化。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；本阶段已补 build identity、只读版本探测和 lifecycle-only 旧协议排空边界，真实 Windows reboot 后自动恢复与安装包升级后的实机滚动切换仍属于发布验收项。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -156,7 +156,9 @@ GUI 工作区控制迁移现状：
 ### 阶段 4：运行与升级治理
 
 - daemon 自恢复、崩溃报告和升级前排空；
-- CLI/GUI/daemon 版本协商；
+- Workspace/Gateway daemon state 与 `version` 已发布 additive `buildIdentity`；CLI doctor 可比较当前客户端构建与活动 Workspace daemon；Gateway canonical status 也携带 build identity；
+- 协议兼容严格限制在只读 `version` 与稳定 lifecycle drain：Workspace 仅允许新客户端对 v2+ 旧 daemon 发送 `shutdown/prepare_restart`，Gateway 下限为 v1；其他写操作仍精确版本 fail-closed；
+- Windows SCM 发布经过 PID/image 校验的 runtime build identity；`service status` 区分 current/different/unknown，显式 `service install` 更新已有 Service 时会等待旧 supervisor 停止后启动当前二进制；
 - 服务安装状态、日志轮转和资源限制；
 - 可重复的跨平台安装、升级、降级和卸载测试。
 
