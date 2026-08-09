@@ -1127,7 +1127,11 @@ where
         .map_err(|error| AppError::Message(format!("invalid control request: {error:?}")))?;
     let handled = handle_request(request, profile, !command_sender.is_closed()).await;
     write_json_frame(&mut stream, &handled.response).await?;
-    stream.shutdown().await?;
+    // The response is already fully flushed. On Windows Named Pipes the client
+    // may close immediately after reading it, causing shutdown() to report
+    // ERROR_NO_DATA (232 / "pipe is being closed"). That is a normal completed
+    // request, not a control-plane failure, so connection teardown is best effort.
+    let _ = stream.shutdown().await;
     if let Some(command) = handled.command {
         enum AsyncCommandKind {
             Tunnel(String),

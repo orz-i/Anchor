@@ -69,7 +69,7 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 | 维度 | 当前实现 |
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
-| 进程管理 | Linux：Workspace daemon 管理各自 listener + Workspace Tunnel，独立 Gateway daemon 管理全局 Gateway listener/routes/tunnel；Windows：后台 daemon 服务端未落地前，桌面进程自动使用唯一 process-local Server runtime 管理同一组能力 |
+| 进程管理 | Windows/Linux：Workspace daemon 管理各自 listener + Workspace Tunnel，独立 Gateway daemon 管理全局 Gateway listener/routes/tunnel；Windows 可由配置域级 SCM supervisor 按持久化计划开机恢复这些 daemon |
 | UI | Tauri 2 + SvelteKit 设计系统 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | 桌面安装包与独立 `anchor` CLI |
@@ -88,10 +88,10 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 
 ### control/ 与 daemon.rs
 - **职责**: CLI/GUI 共用的 Workspace 控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal、单服务配置 reload，以及跨 Workspace/Gateway 的纯只读聚合
-- **传输**: Unix Domain Socket；Windows Named Pipe 抽象
+- **传输**: Linux Unix Domain Socket；Windows owner/System protected-DACL Named Pipe
 - **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
-- **协议**: 当前 v4；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel 写请求使用 accepted → operation status 异步状态机
-- **GUI 接入**: daemon 支持的平台上，Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Windows daemon 不受支持时自动选择 process-local Server 模式，并复用相同状态 DTO/事件 journal，不提供可能产生双权威的手动切换
+- **协议**: Workspace 当前 v6；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel/apply_config 写请求使用 accepted → operation status 异步状态机
+- **GUI 接入**: Windows/Linux 上 Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Windows GUI 不再提供 process-local Server 回退，检测到旧 listener 时按冲突处理而不是接管
 - **配置应用**: 已运行服务使用 daemon 内单 listener reload；daemon PID、另一 listener 与 Tunnel ownership 不因普通配置应用而重启，新 listener 失败时尝试恢复旧 listener
 - **聚合读取**: `control::aggregate` 并发读取独立 Workspace/Gateway 控制域，返回 canonical MCP/Actions 状态和按 source 保留游标的事件批；聚合层不持有 Runtime/Tunnel/Gateway 运行权威
 
@@ -105,7 +105,7 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - **GUI 边界**: GUI 状态和 route 列表直接来自 Gateway control status，配置写入调用 daemon；Gateway 设置页使用 events 唤醒状态/日志刷新；不创建共享 listener/tunnel，不在协议错误时本地回退
 - **Workspace 交互**: route/owner profile 更新触发 Gateway reload；活动 route 禁止删除/注销，避免 live Gateway 指向不存在的 Workspace
 - **跨进程一致性**: AppState 每次数据访问前从磁盘刷新；Gateway observed URL 采用窄字段原子更新，避免后台 daemon 与桌面缓存互相覆盖
-- **平台边界**: Linux daemon 服务端已实现；Windows 仅保留 Named Pipe 客户端/地址抽象，服务端与当前用户 ACL 后续实现。Windows 桌面在此期间自动使用 process-local Server Gateway，不改变 `daemonSupported=false`，关闭桌面时同步停止 Gateway 与受管 tunnel 子进程
+- **平台边界**: Windows/Linux Gateway daemon 服务端均已实现；Windows Named Pipe 使用配置 owner 与 LocalSystem 的受保护 DACL，Gateway state v2 校验 executable/PID ownership。Windows GUI 不保留 process-local Gateway 回退
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport

@@ -85,10 +85,6 @@
   let actionsStatusMessage = $state("");
   let mcpRecovery = $state<RuntimeRecovery>({ ...EMPTY_RECOVERY });
   let mcpActivity = $state<McpActivity | null>(null);
-  const windowsServerMode = $derived(
-    mcpStatusMessage.includes("Windows GUI Server 模式") ||
-      actionsStatusMessage.includes("Windows GUI Server 模式"),
-  );
   let actionsRecovery = $state<RuntimeRecovery>({ ...EMPTY_RECOVERY });
   let mcpBusy = $state(false);
   let actionsBusy = $state(false);
@@ -861,13 +857,6 @@
           删除工作区
         </button>
       </div>
-
-      {#if windowsServerMode}
-        <div class="mt-4 rounded-md border border-[var(--border)] bg-[var(--primary-soft)] p-3 text-xs leading-5 text-[var(--text-secondary)]">
-          <strong>Windows GUI Server 模式已自动启用。</strong>
-          当前版本尚未实现 Windows 后台 daemon/Named Pipe server，因此无需寻找额外的模式开关；MCP、Actions 与隧道由当前 Anchor 桌面进程统一管理。关闭 Anchor 桌面应用会同时停止这些 Server 服务。
-        </div>
-      {/if}
 
       <div class="mt-4">
         <WorkspaceMetaForm

@@ -897,7 +897,10 @@ where
         .map_err(|error| AppError::Message(format!("invalid Gateway request: {error:?}")))?;
     let handled = handle_request(request, !command_sender.is_closed()).await;
     write_json_frame(&mut stream, &handled.response).await?;
-    stream.shutdown().await?;
+    // The response has already been flushed. A Windows Named Pipe client can
+    // close before server-side shutdown and yield ERROR_NO_DATA (232); treat
+    // that teardown race as successful completion rather than a request error.
+    let _ = stream.shutdown().await;
     if let Some(command) = handled.command {
         let async_operation = match &command {
             GatewayControlCommand::Reload { operation_id }

@@ -241,7 +241,7 @@ GUI Workspace 控制使用同一生命周期客户端：
 - Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；GUI 不再根据 `running` 状态自行调用 restart。名称等纯元数据变化不触发 listener，MCP/Actions 运行参数和认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
 - Workspace control protocol v6 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 GUI/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
 - Tunnel 仍保持独立事务语义：保存 tunnel 配置后由 tunnel control 执行 start/stop/restart；Workspace profile 更新本身不会把 tunnel 字段误判为 listener 配置。Gateway 仅在其实际使用的 MCP tunnel/owner 字段变化时 reload，不再因 Workspace 名称等无关配置变化重建；
-- Gateway 不归属于任何 Workspace daemon。Linux GUI/CLI 使用独立 Gateway daemon；Windows Gateway daemon 尚未迁移完成，因此只在 **Gateway 控制域** 保留 GUI Server 兼容运行时。该 Gateway 兼容域会读取 Workspace daemon 的 MCP 活动状态并把 route 指向 daemon-owned 本地端口，不会恢复 Workspace 进程内 listener。
+- Gateway 不归属于任何 Workspace daemon。Windows/Linux GUI/CLI 都使用独立 Gateway daemon；Windows 使用配置域级 Named Pipe，Linux 使用私有 UDS。GUI 不再创建 process-local Gateway listener 或 Tunnel，route 始终由 Gateway daemon 持有并指向对应 Workspace 目标端口。
 
 ## 独立 Gateway daemon
 

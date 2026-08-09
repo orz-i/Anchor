@@ -4,15 +4,11 @@ use std::time::Duration;
 use tauri::State;
 
 use crate::app_state::{teardown_workspace, AppState};
-#[cfg(windows)]
-use crate::auth::update_oauth_redirect_policy;
 use crate::auth::validate_redirect_policy;
 use crate::daemon;
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
 use crate::runtime::ServiceKind;
-#[cfg(windows)]
-use crate::tunnel::append_profile_log;
 use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::workspace::config_apply::plan_workspace_config_apply;
 use crate::workspace::resources::{
@@ -59,7 +55,6 @@ fn oauth_redirect_policy(
 }
 
 async fn apply_live_service_config(
-    state: &AppState,
     profile: &WorkspaceProfile,
     service: crate::workspace::resources::WorkspaceService,
     daemon_running: bool,
@@ -75,29 +70,6 @@ async fn apply_live_service_config(
     }
     if !daemon_running && !legacy_running {
         return Ok(false);
-    }
-
-    #[cfg(windows)]
-    if super::runtime::desktop_server_mode() && legacy_running {
-        if callback_policy_hot_update && !listener_reload {
-            let applied = update_oauth_redirect_policy(
-                &profile.id,
-                service_name,
-                redirect_uris,
-                redirect_hosts,
-            )
-            .map_err(AppError::Message)?;
-            if applied {
-                append_profile_log(
-                    &profile.id,
-                    &format!("{service_name}-oauth.log"),
-                    "[config] event=callback_policy_hot_updated authority=windows_gui_server",
-                );
-                return Ok(true);
-            }
-        }
-        super::runtime::restart_server_service(state, &profile.id, service).await?;
-        return Ok(true);
     }
 
     if daemon_running {
@@ -194,7 +166,6 @@ async fn rollback_workspace_config(
     let mut rollback_errors = Vec::new();
     if scope.mcp_applied {
         if let Err(error) = apply_live_service_config(
-            state,
             previous_profile,
             crate::workspace::resources::WorkspaceService::Mcp,
             scope.daemon_mcp_running,
@@ -209,7 +180,6 @@ async fn rollback_workspace_config(
     }
     if scope.actions_applied {
         if let Err(error) = apply_live_service_config(
-            state,
             previous_profile,
             crate::workspace::resources::WorkspaceService::Actions,
             scope.daemon_actions_running,
@@ -223,17 +193,6 @@ async fn rollback_workspace_config(
         }
     }
     if scope.gateway_reload {
-        #[cfg(windows)]
-        let gateway_result = if super::runtime::desktop_gateway_server_mode() {
-            super::runtime::reconcile_server_gateway(state)
-                .await
-                .map(|_| ())
-        } else {
-            crate::gateway_control::request_reload(Duration::from_secs(20))
-                .await
-                .map_err(|error| AppError::Message(error.to_string()))
-        };
-        #[cfg(not(windows))]
         let gateway_result = crate::gateway_control::request_reload(Duration::from_secs(20))
             .await
             .map_err(|error| AppError::Message(error.to_string()));
@@ -370,27 +329,13 @@ pub async fn update_workspace(
     if gateway_inspection.ambiguous {
         return Err(AppError::Message(gateway_inspection.detail));
     }
-    #[cfg(windows)]
-    let server_gateway_status = if super::runtime::desktop_gateway_server_mode() {
-        Some(crate::mcp::gateway::status(&previous_settings.mcp_gateway).await)
-    } else {
-        None
-    };
-    #[cfg(not(windows))]
-    let server_gateway_status: Option<crate::mcp::gateway::McpGatewayStatus> = None;
-    let gateway_route_running = (gateway_inspection.running
+    let gateway_route_running = gateway_inspection.running
         && gateway_inspection
             .state
             .as_ref()
-            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id)))
-        || server_gateway_status.as_ref().is_some_and(|status| {
-            status.state == "running" && status.route_workspace_ids.contains(&profile.id)
-        });
-    let gateway_owner_running = (gateway_inspection.running
-        && previous_settings.mcp_gateway.owner_workspace_id == profile.id)
-        || server_gateway_status.as_ref().is_some_and(|status| {
-            status.state == "running" && status.owner_workspace_id == profile.id
-        });
+            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id));
+    let gateway_owner_running = gateway_inspection.running
+        && previous_settings.mcp_gateway.owner_workspace_id == profile.id;
     let gateway_profile_live = gateway_route_running || gateway_owner_running;
     let mcp_running = daemon_mcp_running || legacy_mcp_running || gateway_route_running;
     let actions_running = daemon_actions_running || legacy_actions_running;
@@ -436,7 +381,6 @@ pub async fn update_workspace(
     })?;
 
     let mcp_applied = match apply_live_service_config(
-        &state,
         &profile,
         crate::workspace::resources::WorkspaceService::Mcp,
         daemon_mcp_running,
@@ -467,7 +411,6 @@ pub async fn update_workspace(
         }
     };
     let actions_applied = match apply_live_service_config(
-        &state,
         &profile,
         crate::workspace::resources::WorkspaceService::Actions,
         daemon_actions_running,
@@ -500,28 +443,6 @@ pub async fn update_workspace(
 
     let gateway_reload = gateway_profile_live && apply_plan.mcp_tunnel_changed;
     if gateway_reload {
-        #[cfg(windows)]
-        if super::runtime::desktop_gateway_server_mode() {
-            if let Err(error) = super::runtime::reconcile_server_gateway(&state).await {
-                return Err(rollback_workspace_config(
-                    &state,
-                    &previous_profile,
-                    &previous_settings,
-                    WorkspaceConfigRollbackScope {
-                        daemon_mcp_running,
-                        daemon_actions_running,
-                        legacy_mcp_running,
-                        legacy_actions_running,
-                        mcp_applied,
-                        actions_applied,
-                        gateway_reload: true,
-                    },
-                    error,
-                )
-                .await);
-            }
-            return Ok(());
-        }
         if let Err(error) =
             crate::gateway_control::request_reload(std::time::Duration::from_secs(20)).await
         {
@@ -602,17 +523,6 @@ pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResu
             "该 Workspace 正由 Gateway daemon 提供路由。请先执行 `anchor gateway stop`，再删除 Workspace；GUI 不会在后台静默改写 Gateway route 集合。"
                 .into(),
         ));
-    }
-    #[cfg(windows)]
-    if super::runtime::desktop_gateway_server_mode() {
-        let gateway = state.with_settings(|store| Ok(store.settings().mcp_gateway))?;
-        let status = crate::mcp::gateway::status(&gateway).await;
-        if status.state == "running" && status.route_workspace_ids.contains(&id) {
-            return Err(AppError::Message(
-                "该 Workspace 正由 Windows GUI Server Gateway 提供路由。请先在 Workspace 页面停止 MCP 服务，再删除 Workspace。"
-                    .into(),
-            ));
-        }
     }
     let profile = state.with_workspaces(|store| {
         store

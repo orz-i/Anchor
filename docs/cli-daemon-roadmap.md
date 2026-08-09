@@ -17,7 +17,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 现有实现已经具备：
 
 - 独立 `anchor` CLI，包含 Workspace、Gateway、运行、日志和诊断命令；
-- Windows/Linux Workspace 后台 daemon，以及适合外部 supervisor 监督的前台 `serve`；Gateway 后台 daemon 当前仍为 Linux-only；
+- Windows/Linux Workspace 后台 daemon、Windows/Linux 独立 Gateway daemon，以及适合外部 supervisor 监督的前台 `serve`；
 - Rust `RuntimeSupervisor`、Tunnel Supervisor 和 Gateway；
 - Tauri GUI 对上述运行时的直接进程内调用。
 
@@ -26,8 +26,8 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 1. daemon 原先位于 CLI 私有模块，桌面端无法复用其状态模型；
 2. GUI 历史上直接编排 listener、tunnel 和 Gateway，形成第二个运行权威；主路径现已迁移到对应 daemon 控制客户端；
 3. CLI、GUI 分别组装部分状态，存在语义漂移风险；
-4. Workspace daemon 已在 Windows/Linux 提供服务端：Windows 使用 owner/System protected-DACL Named Pipe，Linux 使用私有 UDS；Gateway daemon Windows 服务端尚未落地，因此只在 Gateway 控制域保留 Windows GUI Server 兼容路径；
-5. 配置写入、运行应用和进程监督尚未形成清晰的单写者边界。
+4. Workspace/Gateway daemon 已在 Windows/Linux 提供服务端：Windows 使用 owner/System protected-DACL Named Pipe，Linux 使用私有 UDS；Windows SCM 可按配置域监督两类 daemon 的开机恢复；
+5. Windows GUI 的 process-local Runtime/Tunnel/Gateway 兼容运行权威已移除；仍需继续收缩跨平台遗留接口、增强字段级 hot reload 与升级治理。
 
 ## 目标分层
 
@@ -127,11 +127,11 @@ GUI 工作区控制迁移现状：
 - Workspace 页面已从固定 5 秒双 runtime 轮询迁移为 daemon event-first 长轮询；只有 endpoint unavailable 才进入 polling fallback，协议/远端错误不会静默降级，fallback 会继续探测并自动恢复事件模式；
 - Workspace 配置保存已把差异判断从 GUI 收回 Rust 控制层：纯元数据不 reload，MCP/Actions 运行参数与认证身份只 reload 对应活动 listener；GUI 不再自行读取运行状态后调用 restart；
 - Workspace protocol 升级为 v6：OAuth Callback URI/Host 支持 daemon 进程内字段级 hot update；新增 daemon-owner `apply_config`，由运行权威以当前内存 profile 对比磁盘 desired profile，事务协调 listener/direct tunnel 并回滚失败操作；
-- Windows Workspace GUI 已切到 Workspace daemon Named Pipe，不再以进程内 `RuntimeSupervisor`/Tunnel Supervisor 作为主运行权威；Gateway Windows daemon 尚未完成，因此 Gateway 域仍保留独立 GUI Server 兼容路径，并可代理 daemon-owned Workspace MCP 本地端口；
+- Windows Workspace GUI 已切到 Workspace daemon Named Pipe；Gateway 也使用独立 Windows Gateway daemon。Windows GUI 不再以进程内 `RuntimeSupervisor`/Tunnel Supervisor/Gateway 作为运行权威；
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
-- 若旧桌面进程仍持有兼容 Gateway listener，GUI 仍拒绝热改 Gateway 配置，防止旧进程与新 daemon 控制域同时成为运行权威。
+- 若升级时检测到旧桌面进程仍持有 process-local listener，Windows GUI 将其报告为冲突并拒绝接管，防止旧进程与 daemon 控制域同时成为运行权威。
 
-尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Windows Gateway daemon、Windows SCM Service install/uninstall 与开机自启，以及 Gateway Windows daemon 完成后删除剩余 GUI Server 兼容运行时。
+尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及升级前排空/版本协商/崩溃治理。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；真实 Windows reboot 后的自动恢复仍属于发布验收项。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -151,7 +151,7 @@ GUI 工作区控制迁移现状：
 4. GUI 进程内 `RuntimeSupervisor` 进入兼容模式；
 5. 删除 GUI 内的业务编排，仅保留配置、展示和控制客户端。
 
-当前已完成第 1 项、日志读取、Workspace 级启停/重启、Workspace Tunnel 写控制、Workspace 事件消费、配置差异后端 apply plan、单服务 reload，以及 CLI `config get/set/diff/apply` staging/apply 闭环；OAuth Callback 策略已经是首个无需 listener 重建的字段级 hot reload，Workspace daemon 也可通过 v6 `apply_config` 统一应用磁盘 desired config。Windows Workspace daemon 已通过 Named Pipe + protected DACL + state v2/PID image ownership 成为真实后台运行权威，GUI Workspace 控制走同一控制面。Gateway 已保持独立控制域；Windows 仅 Gateway 域仍保留 GUI Server 兼容。下一步优先推进 Windows Gateway daemon、Windows SCM Service install/uninstall、更多字段级 hot reload，并在 Gateway Windows daemon 可用后删除最后的 process-local Gateway 运行编排。
+当前第 1–5 项在 Windows 主路径均已完成：Workspace/Gateway 状态、日志、事件、生命周期、Tunnel、配置应用都走版本化 daemon 控制面；CLI `config get/set/diff/apply` staging/apply 闭环已完成；OAuth Callback 策略是首个无需 listener 重建的字段级 hot reload。Windows Workspace/Gateway daemon 都使用 Named Pipe + protected DACL + state v2/PID image ownership，SCM supervisor 负责按 `windows-service.json` 恢复所选控制域。Windows GUI 中最后的 process-local Server 兼容运行编排已删除；`RuntimeSupervisor` 仅保留给显式前台 `serve`/非 GUI 运行入口等仍需要的场景。下一步优先推进更多字段级 hot reload、统一运维可观察性与升级治理。
 
 ### 阶段 4：运行与升级治理
 
