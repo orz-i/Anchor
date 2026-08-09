@@ -18,7 +18,7 @@ fn timestamp() -> String {
 }
 
 #[test]
-fn close_outbox_recovers_checkpoint_after_history_storage_returns() {
+fn close_outbox_recovers_on_next_harness_call_after_restart() {
     let temp = tempdir().expect("temp");
     let workspace = temp.path().join("workspace");
     let harness_root = temp.path().join("harness");
@@ -97,6 +97,26 @@ fn close_outbox_recovers_checkpoint_after_history_storage_returns() {
     .expect("restore history");
     drop(ctx);
     let restarted = ToolContext::for_test(workspace, harness_root).expect("restarted context");
+    let still_pending = restarted
+        .harness
+        .load_close_outbox(&task_id)
+        .expect("load")
+        .expect("outbox");
+    assert_eq!(
+        still_pending.phase,
+        WorkSessionClosePhase::CheckpointPending,
+        "ToolContext construction must not block listener startup on outbox recovery"
+    );
+
+    let status = call(
+        &restarted,
+        "harness_status",
+        &json!({}),
+        &CancellationToken::default(),
+        None,
+    )
+    .expect("harness status triggers recovery");
+    assert!(status["outbox_recovery"].is_array(), "{status}");
     let completed = restarted
         .harness
         .load_close_outbox(&task_id)

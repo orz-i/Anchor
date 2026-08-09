@@ -162,7 +162,11 @@ impl ToolContext {
             command_cost: Arc::new(command_cost),
             published_catalog: Arc::new(Mutex::new(None)),
         };
-        let _ = crate::harness::tools::recover_close_outboxes(&context);
+        // Durable close-outbox recovery is already performed before normal Harness
+        // tool calls. Keep ToolContext construction side-effect free: MCP listener
+        // startup must bind its port before potentially expensive historical task
+        // recovery, otherwise a valid daemon can look alive while never becoming
+        // reachable on its configured port.
         context
     }
 
@@ -517,7 +521,56 @@ impl ToolContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::model::{
+        HarnessSessionStatus, WorkSessionCloseOutbox, WorkSessionClosePhase, SCHEMA_VERSION,
+    };
     use crate::tools::catalog::build_effective_catalog_from_parts;
+    use serde_json::json;
+
+    #[test]
+    fn tool_context_construction_does_not_recover_close_outboxes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task_id = "missing-task-for-startup";
+        harness
+            .save_close_outbox(&WorkSessionCloseOutbox {
+                schema_version: SCHEMA_VERSION,
+                task_id: task_id.into(),
+                history_session_key: "startup-test-session".into(),
+                history_session_path: "docs/history-session/startup-test.md".into(),
+                session_status: HarnessSessionStatus::Paused,
+                finish_args: json!({"task_id": task_id}),
+                checkpoint_args: json!({
+                    "session_key": "startup-test-session",
+                    "expected_path": "docs/history-session/startup-test.md"
+                }),
+                phase: WorkSessionClosePhase::Prepared,
+                attempts: 0,
+                last_error: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .expect("save outbox");
+
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        let persisted = ctx
+            .harness
+            .load_close_outbox(task_id)
+            .expect("load outbox")
+            .expect("persisted outbox");
+
+        assert_eq!(persisted.phase, WorkSessionClosePhase::Prepared);
+        assert_eq!(persisted.attempts, 0);
+    }
 
     #[test]
     fn published_catalog_remains_stable_and_requires_reconnect_on_drift() {
