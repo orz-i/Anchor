@@ -1,6 +1,12 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 32;
+pub const CATALOG_VERSION: u32 = 33;
+
+pub const SKILL_OPERATIONS: &[(&str, &str)] = &[
+    ("list", "list_skills"),
+    ("get", "load_skill"),
+    ("read_resource", "read_skill_resource"),
+];
 
 pub const LEGACY_GIT_TOOLS: &[&str] = &[
     "git_status",
@@ -100,6 +106,7 @@ pub const COMMIT_STAGE_OPERATIONS: &[(&str, &str)] = &[
 
 fn facade_operations(facade: &str) -> Option<&'static [(&'static str, &'static str)]> {
     match facade {
+        "skill" => Some(SKILL_OPERATIONS),
         "git" => Some(GIT_OPERATIONS),
         "task" => Some(TASK_OPERATIONS),
         "slice" => Some(SLICE_OPERATIONS),
@@ -161,6 +168,14 @@ pub fn git_operations_for_profile(tool_profile: &str) -> Vec<&'static str> {
 }
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
+    (
+        "skill",
+        "Agent Skill",
+        "[anchor-core anchor-skill] Discover and load workspace Agent Skills through one read-only MCP tool for hosts such as ChatGPT Developer Mode that reliably discover tools but may not surface native Skill UI. Use operation=list to find a relevant Skill, operation=get before following its instructions, and operation=read_resource only for supporting files needed by that Skill.",
+        true,
+        false,
+        false,
+    ),
     (
         "task",
         "Task",
@@ -770,6 +785,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser_wait_for_build",
     "begin_work_session",
     "close_work_session",
+    "skill",
     "task",
     "update_verification_disposition",
     "accept_latest_baseline",
@@ -816,6 +832,7 @@ pub const CORE_TOOLS: &[&str] = &[
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "server_info",
     "browser_build_info",
+    "skill",
     "list_skills",
     "load_skill",
     "list_skill_resources",
@@ -841,6 +858,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 pub const ALLOWED_TOOLS: &[&str] = &[
+    "skill",
     "task",
     "slice",
     "commit_stage",
@@ -964,6 +982,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
 ];
 
 pub const READ_ONLY_TOOLS: &[&str] = &[
+    "skill",
     "harness_status",
     "task_gate_status",
     "operation_log",
@@ -3701,10 +3720,11 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 46);
+        assert_eq!(tools.len(), 47);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"git"));
         assert!(names.contains(&"task"));
+        assert!(names.contains(&"skill"));
         assert!(names.contains(&"list_skills"));
         assert!(names.contains(&"git_worktree_list"));
         assert!(names.contains(&"load_skill"));
@@ -3777,6 +3797,7 @@ mod tests {
             "kill_session",
             "git",
             "task",
+            "skill",
         ] {
             assert!(
                 core.contains(required),
@@ -3788,7 +3809,12 @@ mod tests {
             "core schema group must stay bounded: {core:?}"
         );
 
-        for tag in ["anchor-files", "anchor-command", "anchor-git"] {
+        for tag in [
+            "anchor-skill",
+            "anchor-files",
+            "anchor-command",
+            "anchor-git",
+        ] {
             assert!(
                 tools.iter().any(|tool| {
                     tool["description"]
@@ -3903,5 +3929,23 @@ mod tests {
         assert!(!read_only.iter().any(|tool| tool["name"] == "task"));
         assert!(!read_only.iter().any(|tool| tool["name"] == "slice"));
         assert!(!read_only.iter().any(|tool| tool["name"] == "commit_stage"));
+
+        for (profile, tools) in [
+            ("core", core),
+            ("advanced", advanced),
+            ("read-only", read_only),
+        ] {
+            let skill = tools
+                .iter()
+                .find(|tool| tool["name"] == "skill")
+                .unwrap_or_else(|| panic!("{profile} skill facade"));
+            let operations = skill["inputSchema"]["properties"]["operation"]["enum"]
+                .as_array()
+                .expect("skill operations");
+            let expected_operations = vec![json!("list"), json!("get"), json!("read_resource")];
+            assert_eq!(operations, &expected_operations);
+            assert_eq!(skill["annotations"]["readOnlyHint"], true);
+            assert_eq!(skill["annotations"]["destructiveHint"], false);
+        }
     }
 }

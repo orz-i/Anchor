@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 32,
+    "catalog_version": 33,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -29,16 +29,17 @@
       "search_text",
       "server_info",
       "set_default_cwd",
+      "skill",
       "slice",
       "task",
       "view_image",
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 32
+    "tool_count": 33
   },
   "core": {
-    "catalog_version": 32,
+    "catalog_version": 33,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -63,15 +64,16 @@
       "search_text",
       "server_info",
       "set_default_cwd",
+      "skill",
       "task",
       "view_image",
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 27
+    "tool_count": 28
   },
   "read-only": {
-    "catalog_version": 32,
+    "catalog_version": 33,
     "names": [
       "browser_build_info",
       "check_exec_environment",
@@ -85,9 +87,10 @@
       "read_output",
       "search_text",
       "server_info",
+      "skill",
       "view_image",
       "wait_command"
     ],
-    "tool_count": 14
+    "tool_count": 15
   }
 }

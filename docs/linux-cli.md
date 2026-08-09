@@ -165,7 +165,7 @@ Linux CLI 启动 MCP 时会读取同一个 WorkspaceProfile 中的 Skill 服务�
 anchor serve PROFILE_ID --service mcp
 ```
 
-确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 将声明 `io.modelcontextprotocol/skills` extension，并提供 `skills/list`、`skills/get` 和 `skill://anchor/<skill-name>/...` resources，作为兼容该扩展宿主的 runtime 路径；旧 Skill helper 工具仅保留显式调用兼容且不再发布到 `tools/list`。当前 ChatGPT Plugin 的 Skill 需要额外打包到 `.codex-plugin/plugin.json` 声明的 `skills/` 目录，可使用 `anchor plugin package PROFILE_ID --app-id plugin_asdk_app...` 生成本地 marketplace 与静态 Skill 快照。Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
+确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 会稳定发布一个只读 `skill` facade tool（`list` / `get` / `read_resource`），供 ChatGPT Developer Mode 等以 `tools/list` 为可靠发现入口的宿主使用；四个旧 Skill helper 仅保留缓存客户端兼容，不再单独占工具槽。与此同时，MCP 仍声明 `io.modelcontextprotocol/skills` extension，并提供 `skills/list`、`skills/get` 和 `skill://anchor/<skill-name>/...` resources，作为兼容该扩展宿主的标准方向。若需要 ChatGPT Plugin 原生 Skill UI，可另用 `anchor plugin package PROFILE_ID --app-id plugin_asdk_app...` 生成静态 Plugin 快照。Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
 
 ## 自动恢复
 

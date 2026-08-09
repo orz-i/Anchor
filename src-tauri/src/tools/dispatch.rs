@@ -1918,7 +1918,7 @@ fn server_info_for_session(
         "current_proxy_tool_count": current_catalog.proxy_count,
         "schema_discovery": {
             "recommended_query": "anchor-core",
-            "group_queries": ["anchor-core", "anchor-files", "anchor-command", "anchor-git"],
+            "group_queries": ["anchor-core", "anchor-skill", "anchor-files", "anchor-command", "anchor-git"],
             "strategy": "Load one tagged schema group per workflow instead of repeatedly discovering exact tool names.",
             "host_followup_notice": "A separate 'found tools; listed in the follow-up message' response is rendered by the lazy-schema host, not by the Anchor MCP server."
         },
@@ -1980,7 +1980,10 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
                 | "history_session_validate"
         ) {
             &mut task
-        } else if matches!(*tool, "list_skills" | "load_skill" | "read_skill_resource") {
+        } else if matches!(
+            *tool,
+            "skill" | "list_skills" | "load_skill" | "list_skill_resources" | "read_skill_resource"
+        ) {
             &mut skills
         } else if tool.contains("browser")
             || tool.ends_with("__health_check")

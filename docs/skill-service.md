@@ -1,9 +1,10 @@
 # MCP Agent Skills 服务
 
-Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills。Skill 有两条明确分离的发布路径：
+Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills。Skill 有三条明确分离的消费路径，共用同一个 `SkillCatalog`：
 
+- **ChatGPT Developer Mode / MCP tools**：公开单一只读 `skill` facade tool，提供 `list`、`get`、`read_resource`；这是只通过 ChatGPT 网页 Developer Mode 注册 MCP 时的主路径，只占一个 `tools/list` 槽位；
 - **MCP runtime compatibility**：Anchor 继续声明 MCP Skills extension，并提供 `skills/list`、`skills/get`、`resources/read` 给支持该扩展的宿主；
-- **ChatGPT/Codex Plugin package**：当前 OpenAI Plugin 架构要求 Skill 作为插件目录中的静态 `skills/` 文件夹，由 `.codex-plugin/plugin.json` 声明，并通过 `.app.json` 绑定已注册的 Anchor MCP app。
+- **ChatGPT/Codex Plugin package**：需要原生 Plugin Skill UI 时，把 Skill 作为插件目录中的静态 `skills/` 文件夹，由 `.codex-plugin/plugin.json` 声明，并通过 `.app.json` 绑定已注册的 Anchor MCP app。
 
 旧的 Skill helper 工具仍保留为兼容调用入口，但不再发布到 `tools/list`，因此不会重新占用 ChatGPT 的工具目录配额。
 
@@ -87,6 +88,38 @@ skills
 
 “扫描目录”只读取文件，不启动 MCP、Actions、脚本或隧道。
 
+## ChatGPT Developer Mode（MCP-only 主路径）
+
+当 ChatGPT 只能通过 Developer Mode 注册一个 MCP endpoint 时，不依赖宿主是否实现 MCP Skills extension，也不要求 Plugin package。Anchor 稳定发布一个 `skill` tool：
+
+```json
+{
+  "operation": "list",
+  "query": "review"
+}
+```
+
+如果命中相关 Skill，再读取正文：
+
+```json
+{
+  "operation": "get",
+  "name": "code-review"
+}
+```
+
+`get` 返回 Skill 指令以及可读 resources/scripts 清单。只有指令明确需要某个支持文件时再读取：
+
+```json
+{
+  "operation": "read_resource",
+  "name": "code-review",
+  "path": "references/review-checklist.md"
+}
+```
+
+三个 operation 均为只读，并继续受 Workspace 路径、资源 manifest、文件大小和摘要校验约束。`skill` 在 Skill 服务关闭时仍保持在 `tools/list`，此时 `list` 返回 `enabled=false` 和空 Skill 列表，因此切换 Skill 服务不需要改变 MCP tool schema。旧的 `list_skills`、`load_skill`、`list_skill_resources`、`read_skill_resource` 只用于缓存过旧 schema 的客户端，不再公开。
+
 ## MCP Skills extension（兼容路径）
 
 Skill 服务启用时，MCP `initialize` 会声明：
@@ -110,7 +143,7 @@ Anchor 实现 `skills/list`、`skills/get` 与 `resources/read`：
 
 这条 MCP extension 是兼容能力，不是当前 ChatGPT Plugin 的 Skill 打包入口。Anchor 仍对该目录执行保守完整性约束：`SKILL.md` 不超过 256 KiB、单个支持文件不超过 1 MiB、单个 Skill 最多 100 个文件且总资源不超过 5 MiB；符号链接、资源扫描截断、未进入受控清单的额外文件或不可读取资源不会进入可导出的安全快照。
 
-## ChatGPT/Codex Plugin package（当前 ChatGPT 主路径）
+## ChatGPT/Codex Plugin package（可选原生 Skill UI 路径）
 
 仅在 Developer mode 中把 Anchor MCP URL 注册成一个 app，会得到工具连接，但**不会自动把 Workspace Skill 变成该 app 详情页中的 Plugin Skills**。要让详情页出现 Skill，需要把 app 与静态 Skill 目录组装成真正的 Plugin package。
 

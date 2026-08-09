@@ -80,9 +80,10 @@ pub fn build_effective_catalog_from_parts(
     mut proxy_tools: Vec<Value>,
 ) -> Result<EffectiveCatalog, WorkspaceError> {
     let mut tools = crate::tools::registry::list_tools_for_profile(tool_profile);
-    // Agent Skills use the native MCP Skills extension, and domain facades keep
-    // high-cardinality legacy handlers callable without publishing every leaf
-    // operation into tools/list. Cached clients can keep calling the old names.
+    // Agent Skills keep their native MCP extension/resources while a single
+    // read-only `skill` facade gives tool-only hosts such as ChatGPT Developer
+    // Mode a stable discovery path. High-cardinality legacy handlers stay
+    // callable without publishing every leaf operation into tools/list.
     tools.retain(|tool| {
         tool.get("name").and_then(Value::as_str).is_none_or(|name| {
             !crate::skills::is_skill_tool(name)
@@ -472,7 +473,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 27);
+        assert_eq!(catalog.local_count, 28);
         assert_eq!(catalog.proxy_count, 48);
         assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
             !tool["name"]
@@ -496,9 +497,9 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 27);
+        assert_eq!(catalog.local_count, 28);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 35);
+        assert_eq!(catalog.tools.len(), 36);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
@@ -555,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn native_skill_helpers_never_consume_effective_tool_slots() {
+    fn legacy_skill_helpers_are_hidden_while_single_facade_is_published() {
         for enabled in [true, false] {
             for profile in ["core", "read-only", "advanced"] {
                 let catalog = build_effective_catalog_from_parts(profile, enabled, Vec::new())
@@ -571,6 +572,10 @@ mod tests {
                         "{skill_tool} leaked into {profile} tools/list with enabled={enabled}"
                     );
                 }
+                assert!(
+                    names.contains("skill"),
+                    "skill facade missing from {profile} tools/list with enabled={enabled}"
+                );
             }
         }
     }
@@ -586,6 +591,10 @@ mod tests {
                 .filter_map(|tool| tool["name"].as_str())
                 .collect::<HashSet<_>>();
             assert!(names.contains("git"), "git facade missing from {profile}");
+            assert!(
+                names.contains("skill"),
+                "skill facade missing from {profile}"
+            );
             for legacy in crate::tools::registry::LEGACY_GIT_TOOLS
                 .iter()
                 .chain(crate::tools::registry::LEGACY_TASK_TOOLS)
@@ -608,12 +617,16 @@ mod tests {
     }
 
     #[test]
-    fn advanced_with_default_browser_proxy_count_fits_one_64_tool_page() {
+    fn advanced_with_default_browser_keeps_skill_facade_in_first_64_entries() {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(32))
             .expect("advanced plus default browser catalog");
-        assert_eq!(catalog.local_count, 32);
+        assert_eq!(catalog.local_count, 33);
         assert_eq!(catalog.proxy_count, 32);
-        assert_eq!(catalog.tools.len(), 64);
+        assert_eq!(catalog.tools.len(), 65);
+        assert!(catalog.tools[..64]
+            .iter()
+            .any(|tool| tool["name"] == "skill"));
+        assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
     }
 
     #[test]
