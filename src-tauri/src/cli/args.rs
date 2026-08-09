@@ -833,6 +833,48 @@ pub struct ReloadOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPackageOptions {
+    pub workspace: String,
+    pub app_id: String,
+    pub output: Option<PathBuf>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginCommand {
+    Package(PluginPackageOptions),
+}
+
+fn parse_plugin_command(args: &mut VecDeque<String>) -> Result<PluginCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("package") => {
+            let workspace = pop_value(args, "plugin package")?;
+            let mut app_id = None;
+            let mut output = None;
+            let mut name = None;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--app-id" => app_id = Some(pop_value(args, "--app-id")?),
+                    "--output" => output = Some(PathBuf::from(pop_value(args, "--output")?)),
+                    "--name" => name = Some(pop_value(args, "--name")?),
+                    other => return Err(format!("plugin package 不支持参数：{other}")),
+                }
+            }
+            Ok(PluginCommand::Package(PluginPackageOptions {
+                workspace,
+                app_id: app_id.ok_or_else(|| {
+                    "plugin package 缺少 --app-id；请使用 ChatGPT Developer mode 注册 MCP 后浏览器 URL 中的 plugin_asdk_app... technical ID".to_string()
+                })?,
+                output,
+                name,
+            }))
+        }
+        Some(other) => Err(format!("未知 plugin 命令：{other}\n\n{}", plugin_usage())),
+        None => Err(plugin_usage().to_string()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
@@ -857,6 +899,7 @@ pub enum Command {
     },
     Config(ConfigCommand),
     Workspace(WorkspaceCommand),
+    Plugin(PluginCommand),
     Gateway(GatewayCommand),
     Service(ServiceCommand),
     ServiceRun {
@@ -923,6 +966,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         }
         Some("config" | "cfg") => Command::Config(parse_config_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
+        Some("plugin") => Command::Plugin(parse_plugin_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
         Some("service" | "svc") => Command::Service(parse_service_command(&mut args)?),
         Some("service-run") => parse_service_run(&mut args)?,
@@ -991,10 +1035,17 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
   anchor [--config-dir PATH] [--json] config <get|diff|set|apply> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
+  anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
   anchor [--config-dir PATH] [--json] service <command>\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
 不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+}
+
+pub fn plugin_usage() -> &'static str {
+    "ChatGPT Plugin 命令：\n\
+  anchor plugin package <workspace> --app-id plugin_asdk_app... [--name NAME] [--output PATH]\n\n\
+将当前 Workspace 配置的 Agent Skills 导出为 ChatGPT/Codex Plugin 静态快照，并生成 .codex-plugin/plugin.json、.app.json 与本地 marketplace.json。--app-id 来自 ChatGPT Developer mode 中已注册 MCP app 的浏览器 URL。默认输出到 Workspace 的 .anchor/chatgpt-plugin-marketplace。"
 }
 
 pub fn gateway_usage() -> &'static str {
@@ -1533,5 +1584,34 @@ mod tests {
         ]))
         .expect_err("assignment requires equals");
         assert!(malformed.contains("PATH=VALUE"));
+    }
+
+    #[test]
+    fn parses_chatgpt_plugin_package_options() {
+        let parsed = parse(strings(&[
+            "plugin",
+            "package",
+            "Anchor",
+            "--app-id",
+            "plugin_asdk_app_123",
+            "--name",
+            "anchor",
+            "--output",
+            ".anchor/plugin-marketplace",
+        ]))
+        .expect("plugin package");
+        assert_eq!(
+            parsed.command,
+            Command::Plugin(PluginCommand::Package(PluginPackageOptions {
+                workspace: "Anchor".into(),
+                app_id: "plugin_asdk_app_123".into(),
+                output: Some(PathBuf::from(".anchor/plugin-marketplace")),
+                name: Some("anchor".into()),
+            }))
+        );
+
+        let missing = parse(strings(&["plugin", "package", "Anchor"]))
+            .expect_err("plugin app id is required");
+        assert!(missing.contains("--app-id"));
     }
 }

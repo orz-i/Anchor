@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::ToolContext;
 
-pub use catalog::{SkillCatalog, SkillSettings};
+pub use catalog::{PluginSkillExport, SkillCatalog, SkillSettings};
 
 pub const TOOL_NAMES: &[&str] = &[
     "list_skills",

@@ -30,6 +30,47 @@ pub struct SkillSettings {
     pub roots: Vec<String>,
 }
 
+fn copy_skill_tree(record: &SkillRecord, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| format!("无法创建 Skill 导出目录：{error}"))?;
+    for entry in WalkDir::new(&record.directory)
+        .min_depth(1)
+        .max_depth(16)
+        .follow_links(false)
+        .into_iter()
+    {
+        let entry = entry.map_err(|error| format!("遍历 Skill 目录失败：{error}"))?;
+        let relative = entry
+            .path()
+            .strip_prefix(&record.directory)
+            .map_err(|_| "Skill 导出路径无法映射到源目录".to_string())?;
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Plugin Skill 快照不接受符号链接：{}",
+                relative.to_string_lossy().replace('\\', "/")
+            ));
+        }
+        let target = destination.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .map_err(|error| format!("无法创建 Skill 子目录：{error}"))?;
+            continue;
+        }
+        if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("无法创建 Skill 文件父目录：{error}"))?;
+            }
+            fs::copy(entry.path(), &target).map_err(|error| {
+                format!(
+                    "无法复制 Skill 文件 {}：{error}",
+                    relative.to_string_lossy().replace('\\', "/")
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct NativeSkillEntry {
     value: Value,
@@ -41,6 +82,15 @@ pub struct NativeSkillCatalog {
     pub skills: Vec<Value>,
     pub eligible_count: usize,
     pub omitted_count: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSkillExport {
+    pub skills: Vec<String>,
+    pub total_bytes: u64,
+    pub catalog_digest: String,
     pub warnings: Vec<String>,
 }
 
@@ -383,6 +433,66 @@ impl SkillCatalog {
             omitted_count,
             warnings,
         }
+    }
+
+    /// Export a static Agent Skills snapshot suitable for a ChatGPT/Codex
+    /// plugin `skills/` directory. This is intentionally separate from the
+    /// runtime MCP Skills extension: current ChatGPT plugins package Skill
+    /// folders in `.codex-plugin/plugin.json` rather than discovering them
+    /// dynamically from `skills/list` during ordinary chats.
+    pub fn export_plugin_skills(&self, destination: &Path) -> Result<PluginSkillExport, String> {
+        let settings = self.settings();
+        if !settings.enabled {
+            return Err("当前 workspace/profile 未启用 Skill 服务".into());
+        }
+        let snapshot = self.refresh_snapshot();
+        fs::create_dir_all(destination)
+            .map_err(|error| format!("无法创建 Plugin skills 目录：{error}"))?;
+
+        let mut exported = Vec::new();
+        let mut total_bytes = 0_u64;
+        let mut warnings = snapshot.warnings.clone();
+        for record in snapshot.records.values() {
+            if record.summary.source != "workspace" {
+                warnings.push(format!(
+                    "Skill {} 来源为 {}，Plugin package 默认只快照 workspace 内 Skill，已跳过",
+                    record.summary.name, record.summary.source
+                ));
+                continue;
+            }
+            let entry = match native_entry_with_size(record) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Skill {} 未进入 Plugin 静态快照：{error}",
+                        record.summary.name
+                    ));
+                    continue;
+                }
+            };
+            let target = destination.join(&record.summary.name);
+            copy_skill_tree(record, &target)?;
+            total_bytes = total_bytes.saturating_add(entry.total_bytes);
+            exported.push(record.summary.name.clone());
+        }
+
+        if exported.is_empty() {
+            return Err(format!(
+                "当前 workspace 没有可打包的 Skill{}",
+                if warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{}", warnings.join("；"))
+                }
+            ));
+        }
+
+        Ok(PluginSkillExport {
+            skills: exported,
+            total_bytes,
+            catalog_digest: snapshot.digest.clone(),
+            warnings,
+        })
     }
 
     pub fn read_skill_markdown(
@@ -910,6 +1020,28 @@ mod tests {
             .expect("read resource");
         assert_eq!(resource.content, "line 2\nline 3");
         assert_eq!(resource.encoding, "utf-8");
+    }
+
+    #[test]
+    fn plugin_export_only_packages_workspace_skill_sources() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external");
+        write_skill(external.path(), "private-skill", "Private external skill.");
+        let catalog = SkillCatalog::new(workspace.path().to_path_buf());
+        catalog.configure(SkillSettings {
+            enabled: true,
+            roots: vec![external.path().to_string_lossy().to_string()],
+        });
+
+        let error = catalog
+            .export_plugin_skills(&workspace.path().join("plugin-skills"))
+            .expect_err("external skill must not be packaged");
+        assert!(error.contains("没有可打包的 Skill"));
+        assert!(error.contains("Plugin package 默认只快照 workspace 内 Skill"));
+        assert!(!workspace
+            .path()
+            .join("plugin-skills/private-skill/SKILL.md")
+            .exists());
     }
 
     #[test]

@@ -1,6 +1,11 @@
 # MCP Agent Skills 服务
 
-Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills。对支持原生 Skills 的 ChatGPT Plugin，Anchor 按 MCP Skills extension 暴露 Skill；旧的 Skill helper 工具仍保留为兼容调用入口，但不再发布到 `tools/list`，因此不占用 ChatGPT 的工具目录配额。
+Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills。Skill 有两条明确分离的发布路径：
+
+- **MCP runtime compatibility**：Anchor 继续声明 MCP Skills extension，并提供 `skills/list`、`skills/get`、`resources/read` 给支持该扩展的宿主；
+- **ChatGPT/Codex Plugin package**：当前 OpenAI Plugin 架构要求 Skill 作为插件目录中的静态 `skills/` 文件夹，由 `.codex-plugin/plugin.json` 声明，并通过 `.app.json` 绑定已注册的 Anchor MCP app。
+
+旧的 Skill helper 工具仍保留为兼容调用入口，但不再发布到 `tools/list`，因此不会重新占用 ChatGPT 的工具目录配额。
 
 数据模型保持不变：**一个 workspace 对应一个 WorkspaceProfile**。Skill 服务开关和目录列表保存在该 profile 的 `runtime` 配置中，GUI 与 Linux CLI 启动的 MCP 使用同一份配置。
 
@@ -78,11 +83,11 @@ skills
 2. 每行填写一个 Skill 根目录；
 3. 点击“扫描目录”进行只读预览；
 4. 点击“保存 Skill 服务”；
-5. MCP 已运行时，停止并重新启动 MCP 服务；ChatGPT Plugin 中使用 **Scan Tools** 重新扫描并更新 Skill 快照。
+5. MCP 已运行时，停止并重新启动 MCP 服务；若 Skill 还需要出现在 ChatGPT Plugin 中，重新执行后文的 `anchor plugin package` 生成插件静态快照。
 
 “扫描目录”只读取文件，不启动 MCP、Actions、脚本或隧道。
 
-## 原生 MCP Skills extension
+## MCP Skills extension（兼容路径）
 
 Skill 服务启用时，MCP `initialize` 会声明：
 
@@ -103,19 +108,48 @@ Anchor 实现 `skills/list`、`skills/get` 与 `resources/read`：
 - `skills/get` 通过 canonical `SKILL.md` URI 返回与目录相同的完整 Skill manifest；
 - `resources/read` 对 manifest 中的 canonical URI 返回完整文件内容，以便宿主核对 digest。
 
-当前 ChatGPT Plugin 导入边界按 OpenAI 的静态扫描限制收紧：最多暴露 5 个可导入 Skill，每个 Skill 最多 100 个文件、`SKILL.md` 不超过 256 KiB、单个支持文件不超过 1 MiB、总资源不超过 5 MiB。OpenAI 还限制一次 Scan Tools 生成的 Skill 归档总量为 8 MiB（含 ZIP 开销），因此 Anchor 进一步使用保守的 7 MiB 原始资源总预算，为归档元数据预留空间。存在资源扫描截断、符号链接、未进入受控清单的额外文件、被安全策略排除的文件或不可读取支持文件时，该 Skill 不进入原生导入目录，避免生成不完整快照。
+这条 MCP extension 是兼容能力，不是当前 ChatGPT Plugin 的 Skill 打包入口。Anchor 仍对该目录执行保守完整性约束：`SKILL.md` 不超过 256 KiB、单个支持文件不超过 1 MiB、单个 Skill 最多 100 个文件且总资源不超过 5 MiB；符号链接、资源扫描截断、未进入受控清单的额外文件或不可读取资源不会进入可导出的安全快照。
 
-ChatGPT 的原生 MCP Skill 导入发生在 Plugin **Scan Tools / 提交阶段**。导入的是静态快照：仅把 Anchor MCP connector 连到 ChatGPT，并不会让普通聊天在运行时再次调用 `skills/list` 动态发现当前 workspace 的 Skill。修改 Skill 或 Anchor 的 Skill 导入协议后，需要重新 **Scan Tools**，确认 Skill 已被导入，再发布/刷新插件版本并用新聊天验证 activation。
+## ChatGPT/Codex Plugin package（当前 ChatGPT 主路径）
 
-完整验证流程：
+仅在 Developer mode 中把 Anchor MCP URL 注册成一个 app，会得到工具连接，但**不会自动把 Workspace Skill 变成该 app 详情页中的 Plugin Skills**。要让详情页出现 Skill，需要把 app 与静态 Skill 目录组装成真正的 Plugin package。
 
-1. 安装并启动包含当前 Skill 协议实现的 Anchor；
-2. 确认 Workspace 的 Skill 服务启用且根目录包含 `<skill-name>/SKILL.md`；
-3. 在 ChatGPT Plugin 提交流程对该 MCP server 重新执行 **Scan Tools**；
-4. 若 Scan Tools 仍只显示 Tools 而 Skills 未更新，应首先检查 `skill://anchor/<skill-name>/...` 路径、frontmatter、完整 resources 清单和所有 SHA-256 digest；任一 Skill 条目校验失败都可能导致本次 Skill 快照不更新；
-5. 发布/刷新插件版本后，开启一个新聊天验证 Skill 是否被激活和使用。
+先在 ChatGPT Developer mode 注册 Anchor MCP，并从浏览器 URL 复制 `plugin_asdk_app...` technical ID。然后执行：
 
-若要测试“完整插件”而不仅是裸 MCP server，还需要 Plugin package 中的 manifest 与 MCP mapping；其中 ChatGPT 注册后生成的 MCP technical ID 属于宿主配置，不能由 Anchor 仓库静态猜测或硬编码。
+```bash
+anchor plugin package PROFILE_ID --app-id plugin_asdk_app_xxx
+```
+
+默认生成：
+
+```text
+<workspace>/.anchor/chatgpt-plugin-marketplace/
+├── marketplace.json
+└── plugins/
+    └── anchor-<workspace>/
+        ├── .codex-plugin/
+        │   └── plugin.json
+        ├── .app.json
+        └── skills/
+            └── <skill-name>/
+                ├── SKILL.md
+                └── ...supporting files
+```
+
+`plugin.json` 声明 `"skills": "./skills/"` 与 `"apps": "./.app.json"`；`.app.json` 将逻辑 app 名 `anchor` 映射到传入的 `plugin_asdk_app...`。打包只复制**位于当前 workspace 内**且通过 Anchor 现有 Skill 完整性/路径/资源校验的目录；`~/.codex/skills` 等 home/external 来源默认不会被复制到 Plugin package，避免无意把用户级私有资源打包出去。所有被跳过 Skill 都会作为 warning 返回。
+
+可用 `--output PATH` 指定独立 marketplace 根目录，或用 `--name stable-kebab-name` 固定 plugin name。相对 `--output` 以 Workspace 根目录解析。
+
+本地验证流程：
+
+1. 确认 Workspace Skill 服务已启用并能扫描到 `<skill-name>/SKILL.md`；
+2. 在 ChatGPT Developer mode 注册 Anchor MCP app，取得 `plugin_asdk_app...`；
+3. 执行 `anchor plugin package ... --app-id ...`；
+4. 按命令输出运行 `codex plugin marketplace add "<marketplace-root>"`；
+5. 重启 ChatGPT desktop app，在 Plugins Directory 选择该 local marketplace 并安装生成的 Plugin；
+6. 新建聊天，打开 Plugin 详情确认 Skills 列表，再测试 Skill activation/use。
+
+`plugin_asdk_app...` 属于 ChatGPT 对当前注册 app 分配的宿主技术 ID，Anchor 不静态猜测或硬编码。修改 Workspace Skill 后，需重新运行 `anchor plugin package` 更新插件静态快照；仅重启 MCP daemon 不会修改已经安装的 Plugin Skill 文件。
 
 ## 兼容 Skill helper 工具
 

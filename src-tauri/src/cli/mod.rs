@@ -1,5 +1,6 @@
 mod args;
 mod config;
+mod plugin;
 mod workspace;
 
 use std::fs::File;
@@ -2424,6 +2425,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             .map(|healthy| if healthy { 0 } else { 1 }),
         Command::Config(command) => config::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
+        Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::Service(command) => execute_service(command, cli.json),
         Command::ServiceRun { config_dir } => {
