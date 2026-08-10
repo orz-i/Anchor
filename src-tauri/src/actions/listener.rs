@@ -187,7 +187,7 @@ async fn serve(
         .filter(|tool| {
             tool.get("name")
                 .and_then(Value::as_str)
-                .map(|name| is_allowed_tool(name) && !crate::skills::is_skill_tool(name))
+                .map(is_allowed_tool)
                 .unwrap_or(false)
         })
         .collect();

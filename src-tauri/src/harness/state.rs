@@ -562,14 +562,6 @@ impl Harness {
     }
 
     pub fn start_task(&self, objective: &str) -> HarnessResult<TaskSession> {
-        self.start_task_with_handoff(objective, false)
-    }
-
-    pub fn start_task_with_handoff(
-        &self,
-        objective: &str,
-        _pause_current: bool,
-    ) -> HarnessResult<TaskSession> {
         self.start_task_configured(objective, Uuid::new_v4().simple().to_string(), None)
     }
 

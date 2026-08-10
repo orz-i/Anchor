@@ -1,29 +1,11 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 33;
+pub const CATALOG_VERSION: u32 = 34;
 
 pub const SKILL_OPERATIONS: &[(&str, &str)] = &[
     ("list", "list_skills"),
     ("get", "load_skill"),
     ("read_resource", "read_skill_resource"),
-];
-
-pub const LEGACY_GIT_TOOLS: &[&str] = &[
-    "git_status",
-    "git_worktree_list",
-    "git_worktree_create",
-    "git_worktree_remove",
-    "git_worktree_prune",
-    "git_stage",
-    "git_commit",
-    "git_restore",
-    "git_reset",
-    "git_revert",
-    "git_clean",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
 ];
 
 pub const GIT_OPERATIONS: &[(&str, &str)] = &[
@@ -42,27 +24,6 @@ pub const GIT_OPERATIONS: &[(&str, &str)] = &[
     ("log", "git_log"),
     ("show", "git_show"),
     ("blame", "git_blame"),
-];
-
-pub const LEGACY_TASK_TOOLS: &[&str] = &[
-    "harness_status",
-    "operation_log",
-    "update_verification_disposition",
-    "project_state",
-    "start_task",
-    "refresh_baseline",
-    "accept_current_baseline",
-    "accept_latest_baseline",
-    "update_task",
-    "task_gate_status",
-    "pause_task",
-    "resume_task",
-    "switch_task",
-    "finish_task",
-    "task_context",
-    "list_task_events",
-    "change_summary",
-    "export_work_session",
 ];
 
 pub const TASK_OPERATIONS: &[(&str, &str)] = &[
@@ -89,15 +50,12 @@ pub const TASK_OPERATIONS: &[(&str, &str)] = &[
     ("export", "export_work_session"),
 ];
 
-pub const LEGACY_SLICE_TOOLS: &[&str] = &["start_slice", "update_slice", "complete_slice"];
 pub const SLICE_OPERATIONS: &[(&str, &str)] = &[
     ("start", "start_slice"),
     ("update", "update_slice"),
     ("complete", "complete_slice"),
 ];
 
-pub const LEGACY_COMMIT_STAGE_TOOLS: &[&str] =
-    &["stage_commit", "stage_commit_status", "wait_stage_commit"];
 pub const COMMIT_STAGE_OPERATIONS: &[(&str, &str)] = &[
     ("run", "stage_commit"),
     ("status", "stage_commit_status"),
@@ -119,25 +77,19 @@ pub fn is_facade_tool(name: &str) -> bool {
     facade_operations(name).is_some()
 }
 
-pub fn is_legacy_facade_tool(name: &str) -> bool {
-    LEGACY_GIT_TOOLS.contains(&name)
-        || LEGACY_TASK_TOOLS.contains(&name)
-        || LEGACY_SLICE_TOOLS.contains(&name)
-        || LEGACY_COMMIT_STAGE_TOOLS.contains(&name)
+pub fn facade_for_operation_tool(name: &str) -> Option<&'static str> {
+    ["skill", "git", "task", "slice", "commit_stage"]
+        .into_iter()
+        .find(|facade| {
+            facade_operations(facade)
+                .into_iter()
+                .flatten()
+                .any(|(_, tool)| *tool == name)
+        })
 }
 
-pub fn facade_for_legacy_tool(name: &str) -> Option<&'static str> {
-    if LEGACY_GIT_TOOLS.contains(&name) {
-        Some("git")
-    } else if LEGACY_TASK_TOOLS.contains(&name) {
-        Some("task")
-    } else if LEGACY_SLICE_TOOLS.contains(&name) {
-        Some("slice")
-    } else if LEGACY_COMMIT_STAGE_TOOLS.contains(&name) {
-        Some("commit_stage")
-    } else {
-        None
-    }
+pub fn is_facade_operation_tool(name: &str) -> bool {
+    facade_for_operation_tool(name).is_some()
 }
 
 pub fn facade_tool_for_operation(facade: &str, operation: &str) -> Option<&'static str> {
@@ -147,16 +99,12 @@ pub fn facade_tool_for_operation(facade: &str, operation: &str) -> Option<&'stat
 }
 
 pub fn facade_operations_for_profile(facade: &str, tool_profile: &str) -> Vec<&'static str> {
-    let exposed = exposed_tool_names(tool_profile);
+    let available = profile_tool_names(tool_profile);
     facade_operations(facade)
         .into_iter()
         .flatten()
-        .filter_map(|(operation, tool)| exposed.contains(tool).then_some(*operation))
+        .filter_map(|(operation, tool)| available.contains(tool).then_some(*operation))
         .collect()
-}
-
-pub fn is_legacy_git_tool(name: &str) -> bool {
-    LEGACY_GIT_TOOLS.contains(&name)
 }
 
 pub fn git_tool_for_operation(operation: &str) -> Option<&'static str> {
@@ -321,14 +269,6 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
-        "list_skill_resources",
-        "List Skill resources",
-        "List the exact bounded resource and script manifest that read_skill_resource is allowed to read for one discovered Skill.",
-        true,
-        false,
-        false,
-    ),
-    (
         "read_skill_resource",
         "Read Skill resource",
         "Read a supporting resource or script source inside a discovered Skill directory without executing it.",
@@ -371,7 +311,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "start_task",
         "Start task",
-        "Start a durable coding task, capture the shared workspace baseline, and bind it to the calling MCP session without pausing other tasks unless pause_current=true.",
+        "Start a durable coding task, capture the shared workspace baseline, and bind it to the calling MCP session while preserving peer task lifecycle states.",
         false,
         false,
         false,
@@ -778,7 +718,8 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     ),
 ];
 
-/// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
+/// Core profile capability set. It includes internal facade operation handlers;
+/// `exposed_tool_names` removes those implementation details before publication.
 pub const CORE_TOOLS: &[&str] = &[
     "server_info",
     "browser_build_info",
@@ -791,7 +732,6 @@ pub const CORE_TOOLS: &[&str] = &[
     "accept_latest_baseline",
     "list_skills",
     "load_skill",
-    "list_skill_resources",
     "read_skill_resource",
     "switch_task",
     "history_session_bootstrap",
@@ -835,7 +775,6 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "skill",
     "list_skills",
     "load_skill",
-    "list_skill_resources",
     "read_skill_resource",
     "check_exec_environment",
     "command_cost_explain",
@@ -854,85 +793,6 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "git_log",
     "git_show",
     "git_blame",
-    "view_image",
-];
-
-pub const ALLOWED_TOOLS: &[&str] = &[
-    "skill",
-    "task",
-    "slice",
-    "commit_stage",
-    "harness_status",
-    "task_gate_status",
-    "operation_log",
-    "begin_work_session",
-    "close_work_session",
-    "complete_work_session",
-    "update_verification_disposition",
-    "accept_current_baseline",
-    "accept_latest_baseline",
-    "server_info",
-    "browser_build_info",
-    "browser_wait_for_build",
-    "list_skills",
-    "load_skill",
-    "list_skill_resources",
-    "read_skill_resource",
-    "history_session_bootstrap",
-    "history_session_checkpoint",
-    "history_session_validate",
-    "check_exec_environment",
-    "exec_health_check",
-    "command_cost_explain",
-    "get_default_cwd",
-    "set_default_cwd",
-    "read_file",
-    "list_dir",
-    "list_files",
-    "search_text",
-    "apply_patch",
-    "patch_check",
-    "remove_path",
-    "exec_command",
-    "write_stdin",
-    "wait_command",
-    "list_command_sessions",
-    "kill_session",
-    "read_output",
-    "git",
-    "git_status",
-    "git_worktree_list",
-    "git_worktree_create",
-    "git_worktree_remove",
-    "git_worktree_prune",
-    "git_stage",
-    "git_commit",
-    "git_restore",
-    "git_reset",
-    "git_revert",
-    "git_clean",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "project_state",
-    "start_task",
-    "refresh_baseline",
-    "stage_commit",
-    "stage_commit_status",
-    "wait_stage_commit",
-    "update_task",
-    "start_slice",
-    "update_slice",
-    "complete_slice",
-    "pause_task",
-    "resume_task",
-    "switch_task",
-    "finish_task",
-    "task_context",
-    "list_task_events",
-    "change_summary",
-    "export_work_session",
     "view_image",
 ];
 
@@ -944,9 +804,6 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "complete_work_session",
     "browser_wait_for_build",
     "close_work_session",
-    "update_verification_disposition",
-    "accept_current_baseline",
-    "accept_latest_baseline",
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
@@ -954,71 +811,13 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "remove_path",
     "exec_command",
     "git",
-    "git_worktree_create",
-    "git_worktree_remove",
-    "git_worktree_prune",
-    "git_stage",
-    "git_commit",
-    "git_restore",
-    "git_reset",
-    "git_revert",
-    "git_clean",
     "write_stdin",
     "kill_session",
     "set_default_cwd",
-    "start_task",
-    "refresh_baseline",
-    "stage_commit",
-    "wait_stage_commit",
-    "update_task",
-    "start_slice",
-    "update_slice",
-    "complete_slice",
-    "pause_task",
-    "resume_task",
-    "switch_task",
-    "finish_task",
-    "export_work_session",
-];
-
-pub const READ_ONLY_TOOLS: &[&str] = &[
-    "skill",
-    "harness_status",
-    "task_gate_status",
-    "operation_log",
-    "stage_commit_status",
-    "server_info",
-    "browser_build_info",
-    "list_skills",
-    "load_skill",
-    "read_skill_resource",
-    "check_exec_environment",
-    "exec_health_check",
-    "command_cost_explain",
-    "get_default_cwd",
-    "read_file",
-    "list_dir",
-    "list_files",
-    "search_text",
-    "read_output",
-    "wait_command",
-    "list_command_sessions",
-    "git_status",
-    "git_worktree_list",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "view_image",
-    "patch_check",
-    "project_state",
-    "task_context",
-    "list_task_events",
-    "change_summary",
 ];
 
 pub fn is_allowed_tool(name: &str) -> bool {
-    ALLOWED_TOOLS.contains(&name)
+    exposed_tool_names("advanced").contains(&name)
 }
 
 fn error_output_schema() -> Value {
@@ -1396,7 +1195,7 @@ pub fn output_schema(name: &str) -> Value {
                 },
                 "facade": { "type": "string", "const": facade },
                 "status": { "type": "string" },
-                "summary": { "type": "string" }
+                "summary": { "type": ["string", "object", "null"] }
             }),
             &["operation", "facade"],
         ),
@@ -1713,28 +1512,6 @@ pub fn output_schema(name: &str) -> Value {
                 "harness": { "type": "object" }
             }),
             &["task", "harness"],
-        ),
-        "list_skill_resources" => success_output_schema(
-            json!({
-                "skill": { "type": "string", "minLength": 1 },
-                "resources": { "type": "array", "items": { "type": "object" } },
-                "totalResources": { "type": "integer", "minimum": 0 },
-                "nextCursor": nullable_integer_property(),
-                "resourceTruncated": { "type": "boolean" },
-                "snapshotMode": { "type": "string" },
-                "catalogDigest": { "type": "string" },
-                "warnings": warnings_property()
-            }),
-            &[
-                "skill",
-                "resources",
-                "totalResources",
-                "nextCursor",
-                "resourceTruncated",
-                "snapshotMode",
-                "catalogDigest",
-                "warnings",
-            ],
         ),
         "read_file" => success_output_schema(
             json!({
@@ -2734,12 +2511,19 @@ pub fn require_tool_profile(profile: &str) -> Result<&'static str, String> {
     }
 }
 
-pub fn exposed_tool_names(tool_profile: &str) -> Vec<&'static str> {
+fn profile_tool_names(tool_profile: &str) -> Vec<&'static str> {
     match require_tool_profile(tool_profile).expect("tool profile must be validated") {
         "read-only" => CORE_READ_ONLY_TOOLS.to_vec(),
         "advanced" => P0_TOOLS.iter().map(|(name, ..)| *name).collect(),
         _ => CORE_TOOLS.to_vec(),
     }
+}
+
+pub fn exposed_tool_names(tool_profile: &str) -> Vec<&'static str> {
+    profile_tool_names(tool_profile)
+        .into_iter()
+        .filter(|name| !is_facade_operation_tool(name))
+        .collect()
 }
 
 pub fn list_tools() -> Vec<Value> {
@@ -3012,16 +2796,6 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["name"],
             "additionalProperties": false
         }),
-        "list_skill_resources" => json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "minLength": 1 },
-                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 }
-            },
-            "required": ["name"],
-            "additionalProperties": false
-        }),
         "read_skill_resource" => json!({
             "type": "object",
             "properties": {
@@ -3113,7 +2887,6 @@ pub fn input_schema(name: &str) -> Value {
                 "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
-                "pause_current_and_start": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Starting a task preserves peer task lifecycle states and only selects the new task as the shared-workspace default writer." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
@@ -3173,7 +2946,6 @@ pub fn input_schema(name: &str) -> Value {
                 "objective": { "type": "string", "minLength": 1 },
                 "completed_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "pending_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
-                "pause_current": { "type": "boolean", "default": true, "description": "Deprecated compatibility flag. Shared-checkout tasks transfer the shared writer lease; worktree tasks use independent write domains." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared" },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
@@ -3709,10 +3481,13 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{input_schema, list_tools_for_profile, output_schema, require_tool_profile};
+    use super::{
+        input_schema, is_facade_operation_tool, list_tools_for_profile, output_schema,
+        require_tool_profile,
+    };
 
     #[test]
-    fn core_catalog_keeps_legacy_git_routes_plus_the_git_facade() {
+    fn core_catalog_publishes_facades_without_internal_operation_handlers() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -3720,16 +3495,11 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 28);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"git"));
         assert!(names.contains(&"task"));
         assert!(names.contains(&"skill"));
-        assert!(names.contains(&"list_skills"));
-        assert!(names.contains(&"git_worktree_list"));
-        assert!(names.contains(&"load_skill"));
-        assert!(names.contains(&"list_skill_resources"));
-        assert!(names.contains(&"read_skill_resource"));
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"history_session_validate"));
@@ -3741,16 +3511,9 @@ mod tests {
         assert!(names.contains(&"browser_wait_for_build"));
         assert!(names.contains(&"search_text"));
         assert!(names.contains(&"command_cost_explain"));
-        assert!(names.contains(&"git_stage"));
-        assert!(names.contains(&"git_commit"));
-        assert!(names.contains(&"git_restore"));
         assert!(names.contains(&"remove_path"));
-        assert!(names.contains(&"git_reset"));
-        assert!(names.contains(&"git_revert"));
-        assert!(names.contains(&"git_clean"));
-        assert!(names.contains(&"accept_latest_baseline"));
-        assert!(names.contains(&"switch_task"));
         assert!(!names.contains(&"request_permissions"));
+        assert!(names.iter().all(|name| !is_facade_operation_tool(name)));
 
         for name in names {
             let schema = input_schema(name);
@@ -3843,6 +3606,34 @@ mod tests {
             jsonschema::meta::validate(schema)
                 .unwrap_or_else(|error| panic!("{name} output schema: {error}"));
         }
+    }
+
+    #[test]
+    fn task_facade_output_accepts_structured_operation_log_summary() {
+        let schema = output_schema("task");
+        let validator = jsonschema::validator_for(&schema).expect("task facade output schema");
+        let payload = json!({
+            "ok": true,
+            "facade": "task",
+            "operation": "operation_log",
+            "operations": [],
+            "summary": {
+                "total_matches": 3,
+                "returned_operations": 3,
+                "failed_operations": 3,
+                "running_operations": 0,
+                "affected_files": [],
+                "tool_counts": {"apply_patch": 3},
+                "duration_ms": 0
+            },
+            "diagnostics": [],
+            "total_matches": 3,
+            "next_cursor": null,
+            "filters": {}
+        });
+        validator
+            .validate(&payload)
+            .expect("structured operation-log summary must satisfy task facade output schema");
     }
 
     #[test]

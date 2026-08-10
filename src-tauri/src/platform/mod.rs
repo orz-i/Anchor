@@ -5,10 +5,7 @@ use crate::error::AppResult;
 /// Cross-platform OS primitives used by the desktop runtime.
 ///
 /// Windows uses `windows-rs`. macOS and Linux live in dedicated modules.
-#[allow(dead_code)]
 pub trait Platform: Send + Sync {
-    fn os_name(&self) -> &'static str;
-
     fn app_config_dir(&self) -> AppResult<PathBuf>;
 
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>>;
@@ -31,8 +28,6 @@ pub trait Platform: Send + Sync {
         Ok(0)
     }
 
-    fn resolve_executable(&self, name: &str) -> Option<PathBuf>;
-
     fn cloudflared_candidates(&self) -> Vec<PathBuf>;
 
     fn frpc_candidates(&self) -> Vec<PathBuf>;
@@ -52,12 +47,14 @@ mod macos;
 mod windows;
 
 mod child_process;
+#[cfg(feature = "desktop")]
 mod open;
 mod paths;
 
 pub(crate) use child_process::{
     configure_supervised_tokio_process, hide_std_console, hide_tokio_console,
 };
+#[cfg(feature = "desktop")]
 pub use open::open_path_in_file_manager;
 
 #[cfg(target_os = "linux")]
@@ -90,9 +87,6 @@ fn create_platform() -> Box<dyn Platform> {
     {
         struct Unsupported;
         impl Platform for Unsupported {
-            fn os_name(&self) -> &'static str {
-                "unsupported"
-            }
             fn app_config_dir(&self) -> AppResult<PathBuf> {
                 Err(crate::error::AppError::Message(
                     "unsupported operating system".into(),
@@ -109,9 +103,6 @@ fn create_platform() -> Box<dyn Platform> {
             }
             fn terminate_process_tree(&self, _pid: u32) -> AppResult<()> {
                 Ok(())
-            }
-            fn resolve_executable(&self, name: &str) -> Option<PathBuf> {
-                paths::resolve_from_path(name)
             }
             fn cloudflared_candidates(&self) -> Vec<PathBuf> {
                 paths::resolve_from_path("cloudflared")

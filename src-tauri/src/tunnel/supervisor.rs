@@ -83,6 +83,7 @@ impl TunnelSupervisor {
     /// exit is different: no route should survive the owning GUI process, so
     /// every child is terminated and in-memory ownership is cleared even if a
     /// later cleanup step reports an error.
+    #[cfg(feature = "desktop")]
     pub async fn shutdown_all(&mut self) {
         let workspace_ids = self
             .frp_routes
@@ -379,6 +380,7 @@ impl TunnelSupervisor {
     }
 
     /// Terminate a supervised tunnel when the local runtime is not listening.
+    #[cfg(feature = "desktop")]
     pub async fn cleanup_orphan(
         &mut self,
         profile: &WorkspaceProfile,
@@ -608,6 +610,7 @@ impl TunnelSupervisor {
         }
     }
 
+    #[cfg(feature = "desktop")]
     fn frp_route_matches(
         &self,
         key: &(String, TunnelServiceKind),

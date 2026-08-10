@@ -12,6 +12,7 @@ pub(crate) use client::{
     acquire_frpc_operation_lock, clear_managed_frpc_pid, managed_frpc_config_matches,
     stop_recorded_frpc_instance,
 };
+#[cfg(feature = "desktop")]
 pub(crate) use client::{cached_frpc_path, download_frpc_to_cache};
 pub use client::{resolve_frpc, spawn_frpc};
 
@@ -20,6 +21,7 @@ pub(crate) const VERSION: &str = FRP_VERSION;
 const FRP_PROXY_HTTP: &str = "http";
 const FRP_PROXY_HTTPS2HTTP: &str = "https2http";
 
+#[cfg(any(feature = "desktop", test))]
 pub fn frp_snippet(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,

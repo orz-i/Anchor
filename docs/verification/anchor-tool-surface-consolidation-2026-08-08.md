@@ -1,5 +1,7 @@
 # Anchor 工具面收敛复核（2026-08-08）
 
+> **2026-08-10 / Catalog 34 更新：** 本文记录的是 Catalog 32–33 的迁移期设计。Catalog 34 已删除“隐藏 legacy leaf 仍可直接 `tools/call`”的兼容桥；公开 facade 现在是唯一 MCP tool 调用边界，内部 operation handler 不发布也不可直调。下文关于 cached client/legacy leaf 直调兼容的描述仅保留为历史记录，不再代表当前实现。
+
 ## 背景
 
 Catalog 31 已将旧 Skill helper 从 `tools/list` 移除，但本地工具仍按细粒度操作持续增长。调研时 effective catalog 的本地工具数量为：

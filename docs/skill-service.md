@@ -118,7 +118,9 @@ skills
 }
 ```
 
-三个 operation 均为只读，并继续受 Workspace 路径、资源 manifest、文件大小和摘要校验约束。`skill` 在 Skill 服务关闭时仍保持在 `tools/list`，此时 `list` 返回 `enabled=false` 和空 Skill 列表，因此切换 Skill 服务不需要改变 MCP tool schema。旧的 `list_skills`、`load_skill`、`list_skill_resources`、`read_skill_resource` 只用于缓存过旧 schema 的客户端，不再公开。
+三个 operation 均为只读，并继续受 Workspace 路径、资源 manifest、文件大小和摘要校验约束。`skill` 在 Skill 服务关闭时仍保持在 `tools/list`，此时 `list` 返回 `enabled=false` 和空 Skill 列表，因此切换 Skill 服务不需要改变 MCP tool schema。
+
+从 Catalog 34 起，旧的 Skill helper 直调兼容层已删除：`list_skill_resources` 不再存在；`list_skills`、`load_skill`、`read_skill_resource` 仅作为 `skill` facade 的内部 operation handler 使用，既不进入 `tools/list`，也不能通过 `tools/call` 绕过公开目录直接调用。新客户端和旧客户端都应迁移到 `skill` facade，或使用标准 `skills/list`、`skills/get`、`resources/read` 协议路径。
 
 ## MCP Skills extension（兼容路径）
 

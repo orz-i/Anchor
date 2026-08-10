@@ -10,12 +10,6 @@ use crate::tools::ToolContext;
 
 pub use catalog::{PluginSkillExport, SkillCatalog, SkillSettings};
 
-pub const TOOL_NAMES: &[&str] = &[
-    "list_skills",
-    "load_skill",
-    "list_skill_resources",
-    "read_skill_resource",
-];
 const RESOURCE_PAGE_SIZE: usize = 200;
 const MAX_RESOURCE_ENTRIES: usize = 5000;
 const DEFAULT_SKILL_PAGE_BYTES: u64 = 65_536;
@@ -28,62 +22,6 @@ struct SkillUriRequest {
     start_line: Option<usize>,
     end_line: Option<usize>,
     max_bytes: u64,
-}
-
-pub fn list_resources_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
-    let name = required_string(args, "name")?;
-    let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(100)
-        .clamp(1, 500) as usize;
-    let listed = catalog.list(None, 1_000);
-    let skill = listed
-        .skills
-        .into_iter()
-        .find(|skill| skill.name == name)
-        .ok_or_else(|| skill_not_found_or_invalid(format!("找不到 Skill: {name}")))?;
-    let mut resources = skill
-        .resources
-        .iter()
-        .chain(skill.scripts.iter())
-        .map(|item| {
-            json!({
-                "path": item.path,
-                "kind": item.kind,
-                "sizeBytes": item.size_bytes,
-                "mimeType": item.mime_type,
-                "readable": item.readable,
-                "digest": item.digest,
-                "uri": resource::skill_resource_uri(&skill.name, &item.path),
-                "readArgs": if item.readable {
-                    json!({"name": skill.name, "path": item.path})
-                } else {
-                    Value::Null
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    resources.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-    if cursor > resources.len() {
-        return Err(WorkspaceError::invalid_argument(
-            "cursor exceeds the readable resource manifest",
-        ));
-    }
-
-    let end = (cursor + limit).min(resources.len());
-    let page = resources[cursor..end].to_vec();
-    Ok(tool_ok(json!({
-        "skill": skill.name,
-        "resources": page,
-        "totalResources": resources.len(),
-        "nextCursor": if end < resources.len() { Some(end) } else { None },
-        "resourceTruncated": skill.resource_truncated,
-        "snapshotMode": listed.snapshot_mode,
-        "catalogDigest": listed.catalog_digest,
-        "warnings": listed.warnings
-    })))
 }
 
 pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -364,10 +302,6 @@ pub fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Va
         })
     };
     Ok(json!({ "contents": [content] }))
-}
-
-pub fn is_skill_tool(name: &str) -> bool {
-    TOOL_NAMES.contains(&name)
 }
 
 fn available_tools(ctx: &ToolContext) -> Result<Vec<String>, WorkspaceError> {
@@ -653,26 +587,6 @@ mod tests {
         let legacy = native_skill_get(&catalog, &json!({"uri": "skill://example/SKILL.md"}))
             .expect_err("pre-OpenAI path shape must not remain canonical");
         assert_eq!(legacy["code"], -32602);
-    }
-
-    #[test]
-    fn direct_tool_lists_exact_readable_resource_manifest() {
-        let (_temp, catalog) = catalog_with_skill();
-
-        let listed = list_resources_tool(
-            &catalog,
-            &json!({"name": "example", "cursor": 0, "limit": 10}),
-        )
-        .expect("resource manifest");
-
-        assert_eq!(listed["skill"], "example");
-        assert_eq!(listed["totalResources"], 1);
-        assert_eq!(listed["resources"][0]["path"], "references/INFO.md");
-        assert_eq!(listed["resources"][0]["readable"], true);
-        assert_eq!(
-            listed["resources"][0]["readArgs"],
-            json!({"name": "example", "path": "references/INFO.md"})
-        );
     }
 
     #[test]

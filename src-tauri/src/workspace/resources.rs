@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::error::{AppError, AppResult};
 use crate::workspace::WorkspaceProfile;
 
@@ -27,38 +25,10 @@ struct ServiceClaim<'a> {
     uses_frp: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn validate_workspace_resources(
-    profiles: &[WorkspaceProfile],
-    candidate: &WorkspaceProfile,
-) -> AppResult<()> {
-    let existing_claims: Vec<_> = profiles
-        .iter()
-        .filter(|profile| profile.id != candidate.id)
-        .flat_map(service_claims)
-        .collect();
-    let candidate_claims = service_claims(candidate);
-
-    validate_candidate_ports(&existing_claims, &candidate_claims)?;
-    validate_candidate_subdomains(&existing_claims, &candidate_claims)
-}
-
 /// Assign free MCP / Actions ports for a newly created workspace.
 ///
 /// Creating a workspace should not force the user to edit ports first. Defaults
 /// are kept when free; otherwise the next free ports above the defaults are used.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn assign_free_workspace_ports(
-    profiles: &[WorkspaceProfile],
-    candidate: &mut WorkspaceProfile,
-) -> AppResult<()> {
-    assign_free_workspace_ports_with_reserved(
-        profiles,
-        candidate,
-        &std::collections::HashSet::new(),
-    )
-}
-
 pub fn assign_free_workspace_ports_with_reserved(
     profiles: &[WorkspaceProfile],
     candidate: &mut WorkspaceProfile,
@@ -113,6 +83,7 @@ pub fn validate_workspace_resources_update(
     validate_changed_candidate_subdomains(&existing_claims, &candidate_claims, current, candidate)
 }
 
+#[cfg(any(feature = "desktop", test))]
 pub fn validate_service_start(
     profiles: &[WorkspaceProfile],
     workspace_id: &str,
@@ -141,27 +112,6 @@ pub fn validate_service_start(
     Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn validate_candidate_ports(
-    existing: &[ServiceClaim<'_>],
-    candidate: &[ServiceClaim<'_>],
-) -> AppResult<()> {
-    let mut candidate_ports = HashMap::<u16, ServiceClaim<'_>>::new();
-    for claim in candidate.iter().copied() {
-        if let Some(owner) = existing
-            .iter()
-            .copied()
-            .find(|owner| owner.local_port == claim.local_port)
-        {
-            return Err(port_conflict_error(claim, owner));
-        }
-        if let Some(owner) = candidate_ports.insert(claim.local_port, claim) {
-            return Err(port_conflict_error(claim, owner));
-        }
-    }
-    Ok(())
-}
-
 fn validate_changed_candidate_ports(
     existing: &[ServiceClaim<'_>],
     candidate: &[ServiceClaim<'_>],
@@ -186,32 +136,6 @@ fn validate_changed_candidate_ports(
             .find(|owner| owner.service != claim.service && owner.local_port == claim.local_port)
         {
             return Err(port_conflict_error(claim, owner));
-        }
-    }
-    Ok(())
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn validate_candidate_subdomains(
-    existing: &[ServiceClaim<'_>],
-    candidate: &[ServiceClaim<'_>],
-) -> AppResult<()> {
-    let mut candidate_subdomains = HashMap::<String, ServiceClaim<'_>>::new();
-    for claim in candidate.iter().copied().filter(|claim| claim.uses_frp) {
-        let subdomain = claim.subdomain.trim();
-        if subdomain.is_empty() {
-            continue;
-        }
-        if let Some(owner) = existing
-            .iter()
-            .copied()
-            .find(|owner| same_non_empty_subdomain(claim, *owner))
-        {
-            return Err(subdomain_conflict_error(claim, owner));
-        }
-        let normalized = subdomain.to_ascii_lowercase();
-        if let Some(owner) = candidate_subdomains.insert(normalized, claim) {
-            return Err(subdomain_conflict_error(claim, owner));
         }
     }
     Ok(())
@@ -319,9 +243,8 @@ fn subdomain_conflict_error(target: ServiceClaim<'_>, owner: ServiceClaim<'_>) -
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_free_workspace_ports, assign_free_workspace_ports_with_reserved,
-        validate_service_start, validate_workspace_resources, validate_workspace_resources_update,
-        WorkspaceService,
+        assign_free_workspace_ports_with_reserved, validate_service_start,
+        validate_workspace_resources_update, WorkspaceService,
     };
     use crate::workspace::WorkspaceProfile;
 
@@ -358,7 +281,12 @@ mod tests {
     fn assign_free_ports_keeps_defaults_when_available() {
         let mut candidate = WorkspaceProfile::new("C:/workspace/new".into(), Some("new".into()));
 
-        assign_free_workspace_ports(&[], &mut candidate).expect("assign");
+        assign_free_workspace_ports_with_reserved(
+            &[],
+            &mut candidate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("assign");
 
         assert_eq!(candidate.runtime.local_port, 28_766);
         assert_eq!(candidate.actions.local_port, 8_787);
@@ -369,11 +297,21 @@ mod tests {
         let owner = profile("owner", 28_766, 8_787);
         let mut candidate = WorkspaceProfile::new("C:/workspace/new".into(), Some("new".into()));
 
-        assign_free_workspace_ports(std::slice::from_ref(&owner), &mut candidate).expect("assign");
+        assign_free_workspace_ports_with_reserved(
+            std::slice::from_ref(&owner),
+            &mut candidate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("assign");
 
         assert_eq!(candidate.runtime.local_port, 28_767);
         assert_eq!(candidate.actions.local_port, 8_788);
-        assert!(validate_workspace_resources(&[owner], &candidate).is_ok());
+        assert!(validate_service_start(
+            &[owner, candidate.clone()],
+            &candidate.id,
+            WorkspaceService::Mcp,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -382,8 +320,7 @@ mod tests {
         candidate.runtime.local_port = 28_765;
         let reserved = std::collections::HashSet::from([28_765]);
 
-        assign_free_workspace_ports_with_reserved(&[], &mut candidate, &reserved)
-            .expect("assign");
+        assign_free_workspace_ports_with_reserved(&[], &mut candidate, &reserved).expect("assign");
 
         assert_eq!(candidate.runtime.local_port, 28_766);
     }
@@ -394,7 +331,12 @@ mod tests {
         let owner = profile("owner", 8_787, 9_001);
         let mut candidate = WorkspaceProfile::new("C:/workspace/new".into(), Some("new".into()));
 
-        assign_free_workspace_ports(std::slice::from_ref(&owner), &mut candidate).expect("assign");
+        assign_free_workspace_ports_with_reserved(
+            std::slice::from_ref(&owner),
+            &mut candidate,
+            &std::collections::HashSet::new(),
+        )
+        .expect("assign");
 
         assert_eq!(candidate.runtime.local_port, 28_766);
         assert_eq!(candidate.actions.local_port, 8_788);
@@ -424,7 +366,12 @@ mod tests {
     fn rejects_duplicate_ports_between_services_in_one_workspace() {
         let candidate = profile("target", 28_766, 28_766);
 
-        let error = validate_workspace_resources(&[], &candidate).unwrap_err();
+        let error = validate_service_start(
+            std::slice::from_ref(&candidate),
+            &candidate.id,
+            WorkspaceService::Mcp,
+        )
+        .unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains("28766"));
@@ -437,7 +384,12 @@ mod tests {
         let original = profile("target", 28_766, 8_787);
         let updated = original.clone();
 
-        assert!(validate_workspace_resources(&[original], &updated).is_ok());
+        assert!(validate_workspace_resources_update(
+            std::slice::from_ref(&original),
+            &original,
+            &updated,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -470,15 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_update_is_not_blocked_by_existing_duplicates() {
-        let first = profile("first", 28_766, 8_787);
-        let second = profile("second", 28_766, 8_788);
-        let candidate = profile("candidate", 28_769, 8_789);
-
-        assert!(validate_workspace_resources(&[first, second], &candidate).is_ok());
-    }
-
-    #[test]
     fn start_is_blocked_when_target_participates_in_existing_duplicate() {
         let first = profile("first", 28_766, 8_787);
         let target = profile("target", 28_766, 8_788);
@@ -496,8 +439,12 @@ mod tests {
         let mut candidate = profile("target", 28_766, 8_788);
         candidate.tunnel.frp_subdomain = owner.tunnel.frp_subdomain.clone();
 
-        let error =
-            validate_workspace_resources(std::slice::from_ref(&owner), &candidate).unwrap_err();
+        let error = validate_service_start(
+            &[owner.clone(), candidate.clone()],
+            &candidate.id,
+            WorkspaceService::Mcp,
+        )
+        .unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains(&owner.tunnel.frp_subdomain));
@@ -512,6 +459,11 @@ mod tests {
         first.tunnel.frp_subdomain.clear();
         second.tunnel.frp_subdomain.clear();
 
-        assert!(validate_workspace_resources(&[first], &second).is_ok());
+        assert!(validate_service_start(
+            &[first, second.clone()],
+            &second.id,
+            WorkspaceService::Mcp,
+        )
+        .is_ok());
     }
 }

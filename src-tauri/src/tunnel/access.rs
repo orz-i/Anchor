@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use tokio::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
+#[cfg(feature = "desktop")]
 use crate::platform::platform;
 use crate::runtime::{current_public_url, update_public_url};
 use crate::settings::{AppSettings, McpGatewayConfig};
@@ -169,6 +170,7 @@ pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
     guard.drop_workspace(workspace_id).await
 }
 
+#[cfg(feature = "desktop")]
 pub async fn cleanup_orphan_for_runtime(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,

@@ -187,6 +187,7 @@ pub async fn await_listener_shutdown(handle: Option<JoinHandle<()>>, port: u16) 
     }
 }
 
+#[cfg(feature = "desktop")]
 pub fn await_listener_shutdown_blocking(handle: Option<JoinHandle<()>>, port: u16) {
     if let Some(handle) = handle {
         // begin_stop 已经发送了优雅退出信号。这里必须等待监听端口真正释放，

@@ -210,11 +210,11 @@ fn track_task_recovery(
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty());
     let explicit_retry_identity = has_explicit_recovery_identity(args);
-    let non_mutating_preflight_rejection = !workspace_mutated
+    let non_mutating_input_rejection = !workspace_mutated
         && !explicit_retry_identity
         && (output.get("execution_started").and_then(Value::as_bool) == Some(false)
-            || matches!(category, "policy" | "permission"));
-    if non_mutating_preflight_rejection {
+            || matches!(category, "policy" | "permission" | "validation"));
+    if non_mutating_input_rejection {
         return;
     }
     if matches!(tool, "wait_command" | "read_output" | "kill_session")
@@ -1197,7 +1197,6 @@ fn call_tool_impl(
         "server_info" => server_info_for_session(ctx, session_id),
         "list_skills" => crate::skills::list_tool(ctx, &effective_args),
         "load_skill" => crate::skills::load_tool(ctx, &effective_args),
-        "list_skill_resources" => crate::skills::list_resources_tool(&ctx.skills, &effective_args),
         "read_skill_resource" => crate::skills::read_resource_tool(&ctx.skills, &effective_args),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),
@@ -1794,10 +1793,10 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
     let exposed = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
     let mut filtered = Vec::new();
     for action in actions {
-        if !exposed.contains(&action.as_str()) || crate::skills::is_skill_tool(&action) {
+        let public = crate::tools::registry::facade_for_operation_tool(&action).unwrap_or(&action);
+        if !exposed.contains(&public) {
             continue;
         }
-        let public = crate::tools::registry::facade_for_legacy_tool(&action).unwrap_or(&action);
         if exposed.contains(&public) && !filtered.iter().any(|item| item == public) {
             filtered.push(public.to_string());
         }
@@ -1982,7 +1981,7 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
             &mut task
         } else if matches!(
             *tool,
-            "skill" | "list_skills" | "load_skill" | "list_skill_resources" | "read_skill_resource"
+            "skill" | "list_skills" | "load_skill" | "read_skill_resource"
         ) {
             &mut skills
         } else if tool.contains("browser")

@@ -34,6 +34,78 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
+fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let task = ctx
+        .harness
+        .start_task("旧版 Patch 预检恢复兼容")
+        .expect("task");
+
+    let recovery = ctx
+        .harness
+        .record_recovery(
+            &task.id,
+            "apply_patch",
+            Some("legacy-patch-fingerprint"),
+            "tooling_failure",
+            Some("PATCH_CONTEXT_MISMATCH"),
+            None,
+            false,
+            false,
+            "not_required",
+            vec!["读取当前上下文后重新生成 Patch".into()],
+            "ready_to_close",
+        )
+        .expect("record legacy patch recovery");
+    assert_eq!(recovery.status, TaskRecoveryStatus::Open);
+    assert!(!recovery.blocks_completion());
+
+    let completed = ctx
+        .harness
+        .complete_task(&task.id, true, HarnessSessionStatus::Active)
+        .expect("complete task");
+    let recovery = completed
+        .recovery
+        .expect("resolved recovery retained for audit");
+    assert_eq!(recovery.status, TaskRecoveryStatus::Resolved);
+    assert_eq!(
+        recovery.resolved_by_step.as_deref(),
+        Some("task_completion")
+    );
+}
+
+#[test]
+fn patch_context_mismatch_without_stable_identity_does_not_open_task_recovery() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("main.txt"), "current\n").expect("写入测试文件");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "Patch 上下文不匹配不应创建持久恢复"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let rejected = call_tool(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Update File: main.txt\n@@\n-missing\n+replacement\n*** End Patch"
+        }),
+    );
+
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "PATCH_CONTEXT_MISMATCH");
+    assert!(rejected.get("task_recovery").is_none(), "{rejected}");
+    assert!(ctx.harness.task(task_id).unwrap().recovery.is_none());
+}
+
+#[test]
 fn policy_rejection_without_stable_identity_does_not_open_task_recovery() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -760,8 +832,7 @@ fn begin_work_session_can_handoff_and_switch_between_tasks() {
         &json!({
             "objective": "任务 B",
             "session_key": "task-handoff-contract",
-            "workspace_root": workspace.to_string_lossy(),
-            "pause_current_and_start": true
+            "workspace_root": workspace.to_string_lossy()
         }),
         mcp_session,
     );
@@ -3088,14 +3159,34 @@ fn 工具清单包含项目状态和任务上下文能力() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
-    for expected in [
+    assert!(names.contains(&"task"), "缺少 task facade");
+    for internal in [
         "project_state",
         "start_task",
         "task_context",
         "list_task_events",
         "change_summary",
     ] {
-        assert!(names.contains(&expected), "缺少工具 {expected}");
+        assert!(!names.contains(&internal), "内部工具泄漏 {internal}");
+    }
+    let task = tools
+        .iter()
+        .find(|tool| tool["name"] == "task")
+        .expect("task facade");
+    let operations = task["inputSchema"]["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("task operations");
+    for expected in [
+        "project_state",
+        "start",
+        "context",
+        "events",
+        "change_summary",
+    ] {
+        assert!(
+            operations.iter().any(|operation| operation == expected),
+            "task facade 缺少 operation {expected}"
+        );
     }
     assert!(!names.contains(&"undo_last_patch"));
 }
@@ -3452,20 +3543,43 @@ fn failed_tool_opens_recovery_and_same_step_success_resolves_it() {
 }
 
 #[test]
-fn catalog_v30_exposes_task_governance_tools_and_schemas() {
+fn catalog_v34_exposes_task_governance_facades_and_schemas() {
     let tools = anchor_lib::tools::list_tools_for_profile("advanced");
     let names = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
-    for expected in [
-        "complete_work_session",
+    for expected in ["complete_work_session", "task", "slice"] {
+        assert!(names.contains(&expected), "缺少工具 {expected}");
+    }
+    for internal in [
         "task_gate_status",
         "start_slice",
         "update_slice",
         "complete_slice",
     ] {
-        assert!(names.contains(&expected), "缺少工具 {expected}");
+        assert!(!names.contains(&internal), "内部工具泄漏 {internal}");
+    }
+    let task = tools
+        .iter()
+        .find(|tool| tool["name"] == "task")
+        .expect("task facade");
+    assert!(task["inputSchema"]["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("task operations")
+        .iter()
+        .any(|operation| operation == "gate_status"));
+    let slice = tools
+        .iter()
+        .find(|tool| tool["name"] == "slice")
+        .expect("slice facade");
+    let slice_operations = slice["inputSchema"]["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("slice operations");
+    for expected in ["start", "update", "complete"] {
+        assert!(slice_operations
+            .iter()
+            .any(|operation| operation == expected));
     }
     let begin = tools
         .iter()

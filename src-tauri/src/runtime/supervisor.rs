@@ -86,15 +86,18 @@ impl RuntimeSupervisor {
         self.start(profile, ServiceKind::Actions)
     }
 
+    #[cfg(feature = "desktop")]
     pub fn restart_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.restart(profile, ServiceKind::Mcp)
     }
 
+    #[cfg(feature = "desktop")]
     pub fn restart_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.restart(profile, ServiceKind::Actions)
     }
 
     /// True when the service for this workspace is currently running.
+    #[cfg(feature = "desktop")]
     pub fn is_running(&self, workspace_id: &str, kind: ServiceKind) -> bool {
         matches!(
             self.entries
@@ -112,6 +115,7 @@ impl RuntimeSupervisor {
         self.maintain(profile, ServiceKind::Actions)
     }
 
+    #[cfg(feature = "desktop")]
     pub fn drop_workspace(&mut self, profile: &WorkspaceProfile) {
         self.sync_stop_and_wait(profile, ServiceKind::Mcp);
         self.sync_stop_and_wait(profile, ServiceKind::Actions);
@@ -588,6 +592,7 @@ impl RuntimeSupervisor {
     /// be freed instantly (the old listener's socket is closed on the tokio
     /// event loop). We retry `start` with a short back-off to smooth over this
     /// window.
+    #[cfg(feature = "desktop")]
     fn restart(
         &mut self,
         profile: &WorkspaceProfile,
@@ -597,6 +602,7 @@ impl RuntimeSupervisor {
         self.start(profile, kind)
     }
 
+    #[cfg(feature = "desktop")]
     fn sync_stop_and_wait(&mut self, profile: &WorkspaceProfile, kind: ServiceKind) {
         let port = port_for(profile, kind);
         let handle = self.begin_stop(&profile.id, kind);

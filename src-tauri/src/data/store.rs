@@ -55,6 +55,7 @@ impl Drop for DataFileGuard {
     }
 }
 
+#[cfg(feature = "desktop")]
 const SHARED_KEYS: &[&str] = &[
     "oauth_client_id",
     "bearer_token",
@@ -103,6 +104,7 @@ impl DataStore {
         Ok(result)
     }
 
+    #[cfg(feature = "desktop")]
     pub fn data(&self) -> &AppData {
         &self.data
     }
@@ -173,6 +175,7 @@ impl DataStore {
         Ok(Some(removed))
     }
 
+    #[cfg(feature = "desktop")]
     pub fn init_shared_secrets(&mut self) -> AppResult<()> {
         let mut changed = false;
         for key in SHARED_KEYS {
@@ -199,6 +202,7 @@ impl DataStore {
             .cloned())
     }
 
+    #[cfg(feature = "desktop")]
     pub fn set_workspace_secret(
         &mut self,
         profile_id: &str,
@@ -213,6 +217,7 @@ impl DataStore {
         self.save()
     }
 
+    #[cfg(feature = "desktop")]
     pub fn regenerate_workspace_secret(
         &mut self,
         profile_id: &str,
@@ -223,6 +228,7 @@ impl DataStore {
         Ok(value)
     }
 
+    #[cfg(feature = "desktop")]
     pub fn remove_workspace_secrets(&mut self, profile_id: &str) -> AppResult<()> {
         self.data.workspace_secrets.remove(profile_id);
         self.save()
@@ -232,6 +238,7 @@ impl DataStore {
         self.data.shared_secrets.get(key).cloned()
     }
 
+    #[cfg(feature = "desktop")]
     pub fn set_shared_secret(&mut self, key: &str, value: &str) -> AppResult<()> {
         self.data
             .shared_secrets
@@ -239,12 +246,14 @@ impl DataStore {
         self.save()
     }
 
+    #[cfg(feature = "desktop")]
     pub fn regenerate_shared_secret(&mut self, key: &str) -> AppResult<String> {
         let value = random_secret();
         self.set_shared_secret(key, &value)?;
         Ok(value)
     }
 
+    #[cfg(feature = "desktop")]
     pub fn get_app_secret(&self, scope: &str, item_id: &str) -> Option<String> {
         self.data
             .app_secrets
@@ -254,6 +263,7 @@ impl DataStore {
             .cloned()
     }
 
+    #[cfg(feature = "desktop")]
     pub fn set_app_secret(&mut self, scope: &str, item_id: &str, value: &str) -> AppResult<()> {
         self.data
             .app_secrets
@@ -263,6 +273,7 @@ impl DataStore {
         self.save()
     }
 
+    #[cfg(feature = "desktop")]
     pub fn delete_app_secret(&mut self, scope: &str, item_id: &str) -> AppResult<()> {
         if let Some(items) = self.data.app_secrets.get_mut(scope) {
             items.remove(item_id);
@@ -303,6 +314,7 @@ fn random_secret() -> String {
     format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "")
 }
 
+#[cfg(feature = "desktop")]
 fn shared_value_for_key(key: &str) -> String {
     if key == "oauth_client_id" {
         format!("chatgpt-client-{}", &uuid::Uuid::new_v4().to_string()[..12])

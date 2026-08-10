@@ -610,9 +610,8 @@ fn git_log_root_does_not_pass_empty_pathspec() {
 
 #[test]
 fn advanced_profile_exposes_every_declared_tool() {
-    let declared = anchor_lib::tools::registry::P0_TOOLS
-        .iter()
-        .map(|(name, ..)| *name)
+    let declared = anchor_lib::tools::registry::exposed_tool_names("advanced")
+        .into_iter()
         .collect::<std::collections::HashSet<_>>();
     let tool_values = anchor_lib::tools::list_tools_for_profile("advanced");
     let exposed = tool_values
@@ -624,6 +623,17 @@ fn advanced_profile_exposes_every_declared_tool() {
     assert!(declared
         .iter()
         .all(|name| anchor_lib::tools::is_allowed_tool(name)));
+    for internal in anchor_lib::tools::registry::P0_TOOLS
+        .iter()
+        .map(|(name, ..)| *name)
+        .filter(|name| anchor_lib::tools::registry::is_facade_operation_tool(name))
+    {
+        assert!(
+            !exposed.contains(internal),
+            "internal operation leaked: {internal}"
+        );
+        assert!(!anchor_lib::tools::is_allowed_tool(internal));
+    }
 }
 
 #[test]
@@ -633,26 +643,17 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<std::collections::HashSet<_>>();
-    let expected = anchor_lib::tools::registry::CORE_TOOLS
+    let expected = anchor_lib::tools::registry::exposed_tool_names("core")
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 47);
+    assert_eq!(names.len(), 28);
     assert!(names.contains("git"));
     assert!(names.contains("task"));
     assert!(names.contains("skill"));
-    assert!(names.contains("list_skills"));
-    assert!(names.contains("load_skill"));
-    assert!(names.contains("list_skill_resources"));
-    assert!(names.contains("read_skill_resource"));
     assert!(names.contains("search_text"));
     assert!(names.contains("command_cost_explain"));
-    assert!(names.contains("git_stage"));
-    assert!(names.contains("git_worktree_list"));
-    assert!(names.contains("git_commit"));
-    assert!(names.contains("git_restore"));
-    assert!(names.contains("update_verification_disposition"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));
@@ -664,6 +665,9 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("close_work_session"));
     assert!(!names.contains("harness_status"));
     assert!(!names.contains("start_task"));
+    assert!(!names.contains("list_skills"));
+    assert!(!names.contains("load_skill"));
+    assert!(!names.contains("read_skill_resource"));
 }
 
 #[test]

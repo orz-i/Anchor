@@ -1,8 +1,4 @@
 #![cfg_attr(target_os = "windows", allow(linker_messages))]
-#![cfg_attr(
-    all(feature = "cli", not(feature = "desktop")),
-    allow(dead_code, unused_imports)
-)]
 
 mod actions;
 #[cfg(feature = "desktop")]
@@ -24,6 +20,7 @@ mod error;
 pub mod gateway_control;
 pub mod gateway_daemon;
 pub mod harness;
+#[cfg(feature = "desktop")]
 mod health;
 mod logging;
 mod mcp;

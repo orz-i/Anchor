@@ -217,15 +217,15 @@ impl TaskRecoveryState {
             return false;
         }
 
-        matches!(
-            self.error_code.as_deref(),
-            Some(
+        self.error_code.as_deref().is_some_and(|code| {
+            matches!(
+                code,
                 "POLICY_REJECTED"
                     | "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
                     | "PROTECTED_REPOSITORY_ASSET"
                     | "SESSION_NOT_FOUND"
-            )
-        )
+            ) || code.starts_with("PATCH_")
+        })
     }
 
     pub fn blocks_completion(&self) -> bool {

@@ -504,8 +504,9 @@ fn diagnostic_recommendation(code: &str, link_path: Option<&str>) -> (String, Va
         "SKILL_RESOURCE_INVALID" => (
             "请求的 Skill 资源不在当前受控清单中。".into(),
             json!([{
-                "tool": "list_skill_resources",
-                "description": "先枚举该 Skill 当前可读取的精确资源路径。"
+                "tool": "skill",
+                "args": {"operation": "get"},
+                "description": "通过公开 skill facade 重新读取该 Skill 的受控资源清单。"
             }]),
         ),
         "NOT_FOUND" => (
@@ -1661,10 +1662,7 @@ fn start_task_for_workspace_mode(
         .and_then(Value::as_str)
         .unwrap_or("shared");
     match mode {
-        "shared" => ctx
-            .harness
-            .start_task_with_handoff(objective, true)
-            .map_err(map_error),
+        "shared" => ctx.harness.start_task(objective).map_err(map_error),
         "worktree" => {
             let task_id = Uuid::new_v4().simple().to_string();
             let branch = args.get("worktree_branch").and_then(Value::as_str);

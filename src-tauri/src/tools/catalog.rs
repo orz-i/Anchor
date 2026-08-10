@@ -80,16 +80,6 @@ pub fn build_effective_catalog_from_parts(
     mut proxy_tools: Vec<Value>,
 ) -> Result<EffectiveCatalog, WorkspaceError> {
     let mut tools = crate::tools::registry::list_tools_for_profile(tool_profile);
-    // Agent Skills keep their native MCP extension/resources while a single
-    // read-only `skill` facade gives tool-only hosts such as ChatGPT Developer
-    // Mode a stable discovery path. High-cardinality legacy handlers stay
-    // callable without publishing every leaf operation into tools/list.
-    tools.retain(|tool| {
-        tool.get("name").and_then(Value::as_str).is_none_or(|name| {
-            !crate::skills::is_skill_tool(name)
-                && !crate::tools::registry::is_legacy_facade_tool(name)
-        })
-    });
     tools.sort_by(tool_name_order);
     proxy_tools.sort_by(tool_name_order);
     let local_count = tools.len();
@@ -438,12 +428,7 @@ mod tests {
 
         assert_eq!(
             catalog.local_count,
-            crate::tools::registry::P0_TOOLS.len()
-                - crate::skills::TOOL_NAMES.len()
-                - crate::tools::registry::LEGACY_GIT_TOOLS.len()
-                - crate::tools::registry::LEGACY_TASK_TOOLS.len()
-                - crate::tools::registry::LEGACY_SLICE_TOOLS.len()
-                - crate::tools::registry::LEGACY_COMMIT_STAGE_TOOLS.len()
+            crate::tools::registry::exposed_tool_names("advanced").len()
         );
         assert_eq!(catalog.proxy_count, 48);
         let first_page_names = catalog.tools[..64]
@@ -520,12 +505,7 @@ mod tests {
         );
         assert_eq!(
             diagnostic["details"]["local_tool_count"],
-            crate::tools::registry::P0_TOOLS.len()
-                - crate::skills::TOOL_NAMES.len()
-                - crate::tools::registry::LEGACY_GIT_TOOLS.len()
-                - crate::tools::registry::LEGACY_TASK_TOOLS.len()
-                - crate::tools::registry::LEGACY_SLICE_TOOLS.len()
-                - crate::tools::registry::LEGACY_COMMIT_STAGE_TOOLS.len()
+            crate::tools::registry::exposed_tool_names("advanced").len()
         );
         assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
         assert!(diagnostic["details"]["suggestions"]
@@ -556,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_skill_helpers_are_hidden_while_single_facade_is_published() {
+    fn internal_skill_operation_handlers_are_hidden_while_single_facade_is_published() {
         for enabled in [true, false] {
             for profile in ["core", "read-only", "advanced"] {
                 let catalog = build_effective_catalog_from_parts(profile, enabled, Vec::new())
@@ -566,7 +546,7 @@ mod tests {
                     .iter()
                     .filter_map(|tool| tool["name"].as_str())
                     .collect::<HashSet<_>>();
-                for skill_tool in crate::skills::TOOL_NAMES {
+                for skill_tool in ["list_skills", "load_skill", "read_skill_resource"] {
                     assert!(
                         !names.contains(skill_tool),
                         "{skill_tool} leaked into {profile} tools/list with enabled={enabled}"
@@ -581,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_facades_replace_legacy_leaf_tools_in_effective_catalogs() {
+    fn domain_facades_hide_internal_operation_handlers_in_effective_catalogs() {
         for profile in ["core", "read-only", "advanced"] {
             let catalog = build_effective_catalog_from_parts(profile, true, Vec::new())
                 .expect("effective catalog");
@@ -595,15 +575,14 @@ mod tests {
                 names.contains("skill"),
                 "skill facade missing from {profile}"
             );
-            for legacy in crate::tools::registry::LEGACY_GIT_TOOLS
+            for internal in crate::tools::registry::P0_TOOLS
                 .iter()
-                .chain(crate::tools::registry::LEGACY_TASK_TOOLS)
-                .chain(crate::tools::registry::LEGACY_SLICE_TOOLS)
-                .chain(crate::tools::registry::LEGACY_COMMIT_STAGE_TOOLS)
+                .map(|(name, ..)| *name)
+                .filter(|name| crate::tools::registry::is_facade_operation_tool(name))
             {
                 assert!(
-                    !names.contains(legacy),
-                    "legacy facade leaf {legacy} leaked into {profile} tools/list"
+                    !names.contains(internal),
+                    "internal facade operation {internal} leaked into {profile} tools/list"
                 );
             }
             if profile != "read-only" {

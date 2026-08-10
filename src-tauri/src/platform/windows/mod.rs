@@ -5,16 +5,11 @@ mod process;
 use std::path::{Path, PathBuf};
 
 use crate::error::AppResult;
-use crate::platform::paths as shared_paths;
 use crate::platform::Platform;
 
 pub struct WindowsPlatform;
 
 impl Platform for WindowsPlatform {
-    fn os_name(&self) -> &'static str {
-        "windows"
-    }
-
     fn app_config_dir(&self) -> AppResult<PathBuf> {
         if let Some(path) = crate::platform::app_config_dir_override() {
             return Ok(path);
@@ -44,10 +39,6 @@ impl Platform for WindowsPlatform {
 
     fn terminate_processes_by_image_path(&self, image_path: &Path) -> AppResult<usize> {
         process::terminate_processes_by_image_path(image_path)
-    }
-
-    fn resolve_executable(&self, name: &str) -> Option<PathBuf> {
-        shared_paths::resolve_from_path(name)
     }
 
     fn cloudflared_candidates(&self) -> Vec<PathBuf> {
