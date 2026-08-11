@@ -22,6 +22,61 @@ pub struct EffectiveCatalog {
     pub estimated_tokens: usize,
 }
 
+const CORE_BROWSER_PROXY_SUFFIXES: &[&str] = &[
+    "health_check",
+    "reconnect",
+    "reset_session",
+    "list_pages",
+    "new_page",
+    "navigate_page",
+    "take_snapshot",
+    "take_screenshot",
+    "evaluate_script",
+    "click",
+    "fill",
+    "fill_form",
+    "wait_for",
+    "select_page",
+    "close_page",
+    "press_key",
+    "type_text",
+    "hover",
+    "handle_dialog",
+    "upload_file",
+    "resize_page",
+];
+
+const READ_ONLY_BROWSER_PROXY_SUFFIXES: &[&str] = &[
+    "health_check",
+    "list_pages",
+    "take_snapshot",
+    "take_screenshot",
+    "list_console_messages",
+    "get_console_message",
+    "list_network_requests",
+    "get_network_request",
+];
+
+fn filter_proxy_tools_for_profile(tool_profile: &str, proxy_tools: Vec<Value>) -> Vec<Value> {
+    let allowed_browser_suffixes = match tool_profile {
+        "advanced" => return proxy_tools,
+        "read-only" => READ_ONLY_BROWSER_PROXY_SUFFIXES,
+        _ => CORE_BROWSER_PROXY_SUFFIXES,
+    };
+    proxy_tools
+        .into_iter()
+        .filter(|tool| {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                return true;
+            };
+            let Some(suffix) = name.strip_prefix("browser__") else {
+                return true;
+            };
+            allowed_browser_suffixes.contains(&suffix)
+        })
+        .collect()
+}
+
 fn proxy_discovery_priority(tool: &Value) -> Option<usize> {
     const FIRST_PAGE_SUFFIXES: &[&str] = &[
         "health_check",
@@ -77,9 +132,10 @@ pub fn build_effective_catalog(ctx: &ToolContext) -> Result<EffectiveCatalog, Wo
 pub fn build_effective_catalog_from_parts(
     tool_profile: &str,
     _skill_service_enabled: bool,
-    mut proxy_tools: Vec<Value>,
+    proxy_tools: Vec<Value>,
 ) -> Result<EffectiveCatalog, WorkspaceError> {
     let mut tools = crate::tools::registry::list_tools_for_profile(tool_profile);
+    let mut proxy_tools = filter_proxy_tools_for_profile(tool_profile, proxy_tools);
     tools.sort_by(tool_name_order);
     proxy_tools.sort_by(tool_name_order);
     let local_count = tools.len();
@@ -357,8 +413,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_effective_catalog_from_parts, snapshot_document, MAX_CHATGPT_CATALOG_BYTES,
-        MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS, MAX_CHATGPT_CATALOG_TOOLS,
+        build_effective_catalog_from_parts, snapshot_document, CORE_BROWSER_PROXY_SUFFIXES,
+        MAX_CHATGPT_CATALOG_BYTES, MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS, MAX_CHATGPT_CATALOG_TOOLS,
     };
 
     fn proxy_tool(name: &str) -> serde_json::Value {
@@ -454,12 +510,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_profile_keeps_only_read_only_browser_workflow_tools() {
+        let mut proxies = browser_tools(48);
+        proxies.push(proxy_tool("external__search"));
+        let catalog = build_effective_catalog_from_parts("read-only", true, proxies)
+            .expect("read-only browser catalog");
+        let names = catalog
+            .tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(names.contains("browser__health_check"));
+        assert!(names.contains("browser__take_snapshot"));
+        assert!(!names.contains("browser__click"));
+        assert!(!names.contains("browser__navigate_page"));
+        assert!(names.contains("external__search"));
+        assert_eq!(catalog.proxy_count, 5);
+    }
+
+    #[test]
     fn core_plus_browser_catalog_stays_within_chatgpt_budget() {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
         assert_eq!(catalog.local_count, 28);
-        assert_eq!(catalog.proxy_count, 48);
+        assert_eq!(catalog.proxy_count, CORE_BROWSER_PROXY_SUFFIXES.len());
         assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
             !tool["name"]
                 .as_str()

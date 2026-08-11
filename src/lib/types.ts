@@ -91,6 +91,7 @@ export interface RuntimeConfig {
   local_port: number;
   tool_profile: string;
   permission_mode: string;
+  preferred_shell?: string;
   runtime_command?: string;
   mcp_config?: string;
   allowed_commands?: string;

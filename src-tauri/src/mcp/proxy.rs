@@ -753,6 +753,8 @@ fn proxy_management_tools(
             "transport_connected": {"type": "boolean"},
             "operational": {"type": "boolean"},
             "browser_cdp_reachable": {"type": ["boolean", "null"]},
+            "observed_at": {"type": "string", "minLength": 1},
+            "recovered_during_probe": {"type": "boolean"},
             "page_count": {"type": "integer", "minimum": 0},
             "pages": {"type": "array", "items": {"type": "object"}},
             "selected_page": {"type": ["object", "null"]},
@@ -761,7 +763,7 @@ fn proxy_management_tools(
         "required": [
             "ok", "status", "server", "connection", "retryable",
             "browser_session_id", "connection_status", "transport_connected",
-            "operational", "page_count", "pages"
+            "operational", "observed_at", "recovered_during_probe", "page_count", "pages"
         ],
         "additionalProperties": true
     });
@@ -1745,6 +1747,11 @@ impl ProxyServer {
         cancellation: &CancellationToken,
     ) -> Value {
         let browser_server = self.is_browser_server();
+        let initial_connection = self.status(self.downstream_tools.len());
+        let initial_operational = initial_connection
+            .get("operational")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (mut result, page_state) = match kind {
             ProxyRouteKind::HealthCheck if browser_server => (
                 Ok("healthy"),
@@ -1836,6 +1843,11 @@ impl ProxyServer {
             .get("operational")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let recovered_during_probe = !initial_operational && operational;
+        let observed_at = connection
+            .get("observed_at")
+            .cloned()
+            .unwrap_or_else(|| Value::String(proxy_timestamp()));
         let browser_cdp_reachable = connection
             .get("browser_cdp_reachable")
             .cloned()
@@ -1869,6 +1881,8 @@ impl ProxyServer {
                 "transport_connected": transport_connected,
                 "operational": operational,
                 "browser_cdp_reachable": browser_cdp_reachable,
+                "observed_at": observed_at,
+                "recovered_during_probe": recovered_during_probe,
                 "page_count": pages.len(),
                 "pages": pages,
                 "selected_page": selected_page,
@@ -1894,6 +1908,8 @@ impl ProxyServer {
                     "transport_connected": transport_connected,
                     "operational": operational,
                     "browser_cdp_reachable": browser_cdp_reachable,
+                    "observed_at": observed_at,
+                    "recovered_during_probe": recovered_during_probe,
                     "page_count": pages.len(),
                     "pages": pages,
                     "selected_page": selected_page,
@@ -2318,6 +2334,7 @@ impl ProxyServer {
     }
 
     fn status(&self, tool_count: usize) -> Value {
+        let observed_at = proxy_timestamp();
         let (transport_connected, state_busy, mut client_status) = match self.client.try_lock() {
             Ok(client) => {
                 let connected = client.as_ref().is_some_and(|client| !client.is_closed());
@@ -2382,6 +2399,11 @@ impl ProxyServer {
             "transport_connected": transport_connected,
             "operational": operational,
             "browser_cdp_reachable": browser_cdp_reachable,
+            "observed_at": observed_at,
+            "freshness": {
+                "transport": "current_client_snapshot",
+                "browser_cdp": if browser_cdp_reachable.is_some() { "live_tcp_probe" } else { "unavailable" }
+            },
             "state_busy": state_busy,
             "client": client_status,
             "reconnect_scheduled": self.reconnect_scheduled.load(Ordering::Acquire),
@@ -4741,6 +4763,23 @@ mod tests {
     }
 
     #[test]
+    fn browser_management_contract_exposes_probe_freshness() {
+        let mut spec = test_spec();
+        spec.management_tools = true;
+        let entries = proxy_management_tools(&spec);
+        let health = entries
+            .iter()
+            .find(|(name, ..)| name.ends_with("__health_check"))
+            .expect("health management tool");
+        let output_schema = &health.4;
+        assert!(output_schema["properties"]["observed_at"].is_object());
+        assert!(output_schema["properties"]["recovered_during_probe"].is_object());
+        let required = output_schema["required"].as_array().expect("required");
+        assert!(required.iter().any(|item| item == "observed_at"));
+        assert!(required.iter().any(|item| item == "recovered_during_probe"));
+    }
+
+    #[test]
     fn parses_standard_mcp_servers_and_expands_workspace_folder() {
         let specs = parse_mcp_proxy_config(
             r#"{
@@ -4838,6 +4877,8 @@ mod tests {
                 "transport_connected": true,
                 "operational": true,
                 "browser_cdp_reachable": true,
+                "observed_at": "2026-08-11T03:00:00Z",
+                "recovered_during_probe": false,
                 "page_count": 0,
                 "pages": [],
                 "selected_page": null,

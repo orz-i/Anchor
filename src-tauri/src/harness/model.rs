@@ -417,6 +417,10 @@ pub struct HarnessStatus {
     pub default_task_id: Option<String>,
     pub active_task_ids: Vec<String>,
     pub active_task_count: usize,
+    #[serde(default)]
+    pub stale_active_task_ids: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub task_id: Option<String>,
     pub task_state: Option<TaskStatus>,
     pub task_updated_at: Option<String>,

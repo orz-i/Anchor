@@ -54,6 +54,8 @@ pub struct RuntimeConfig {
     pub local_port: u16,
     pub tool_profile: String,
     pub permission_mode: String,
+    #[serde(default = "default_preferred_shell")]
+    pub preferred_shell: String,
     pub runtime_command: String,
     /// Optional JSON configuration containing stdio MCP servers to merge into this service.
     pub mcp_config: String,
@@ -211,6 +213,10 @@ fn default_permission_mode() -> String {
     "trusted".to_string()
 }
 
+fn default_preferred_shell() -> String {
+    "auto".to_string()
+}
+
 fn default_allowed_commands() -> String {
     "pytest,python,python3,npm,npx,node,pnpm,yarn,make,mvn,mvnw,gradle,gradlew,cargo,go,ruff,mypy,eslint,tsc,git,cmd,powershell,pwsh".to_string()
 }
@@ -283,6 +289,7 @@ impl Default for RuntimeConfig {
             local_port: default_mcp_port(),
             tool_profile: default_tool_profile(),
             permission_mode: default_permission_mode(),
+            preferred_shell: default_preferred_shell(),
             runtime_command: String::new(),
             mcp_config: String::new(),
             allowed_commands: default_allowed_commands(),

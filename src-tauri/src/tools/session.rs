@@ -15,12 +15,14 @@ use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
-const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::from_secs(60);
+const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
 
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
     max_sessions: usize,
-    terminal_retention: Duration,
+    terminal_slot_retention: Duration,
+    terminal_log_retention: Duration,
 }
 
 struct StreamDecoder {
@@ -432,7 +434,11 @@ fn timestamp() -> String {
 
 impl Default for SessionStore {
     fn default() -> Self {
-        Self::with_limits(DEFAULT_MAX_EXEC_SESSIONS, DEFAULT_TERMINAL_RETENTION)
+        Self::with_retention_limits(
+            DEFAULT_MAX_EXEC_SESSIONS,
+            DEFAULT_TERMINAL_SLOT_RETENTION,
+            DEFAULT_TERMINAL_LOG_RETENTION,
+        )
     }
 }
 
@@ -587,6 +593,31 @@ mod tests {
     }
 
     #[test]
+    fn observed_terminal_releases_slot_before_retained_output_expires() {
+        let store = SessionStore::with_retention_limits(
+            1,
+            Duration::from_millis(40),
+            Duration::from_millis(500),
+        );
+        let first = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("insert first"));
+        let first_id = first.session_id.clone();
+        wait_until_exited(&first);
+        first.mark_terminal_observed();
+
+        std::thread::sleep(Duration::from_millis(60));
+        let second = store
+            .insert(spawn_test_session())
+            .unwrap_or_else(|_| panic!("observed terminal should no longer consume capacity"));
+        assert!(
+            store.get(&first_id).is_ok(),
+            "retained output remains readable"
+        );
+        wait_until_exited(&second);
+    }
+
+    #[test]
     fn capacity_never_evicts_unobserved_terminal_result() {
         let store = SessionStore::with_limits(1, Duration::ZERO);
         let first = store
@@ -633,17 +664,31 @@ impl SessionStore {
     }
 
     pub fn with_limits(max_sessions: usize, terminal_retention: Duration) -> Self {
+        Self::with_retention_limits(max_sessions, terminal_retention, terminal_retention)
+    }
+
+    pub fn with_retention_limits(
+        max_sessions: usize,
+        terminal_slot_retention: Duration,
+        terminal_log_retention: Duration,
+    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             max_sessions: max_sessions.max(1),
-            terminal_retention,
+            terminal_slot_retention,
+            terminal_log_retention: terminal_log_retention.max(terminal_slot_retention),
         }
     }
 
     pub fn insert(&self, session: ExecSession) -> Result<Arc<ExecSession>, Box<ExecSession>> {
         let mut sessions = self.sessions.lock().expect("sessions lock");
-        prune_terminal_sessions(&mut sessions, self.terminal_retention);
-        if sessions.len() >= self.max_sessions {
+        prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
+        if sessions
+            .values()
+            .filter(|session| session_consumes_slot(session, self.terminal_slot_retention))
+            .count()
+            >= self.max_sessions
+        {
             return Err(Box::new(session));
         }
         let arc = Arc::new(session);
@@ -653,7 +698,7 @@ impl SessionStore {
 
     pub fn get(&self, session_id: &str) -> Result<Arc<ExecSession>, WorkspaceError> {
         let mut sessions = self.sessions.lock().expect("sessions lock");
-        prune_terminal_sessions(&mut sessions, self.terminal_retention);
+        prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
         let session = sessions
             .get(session_id)
             .cloned()
@@ -670,7 +715,7 @@ impl SessionStore {
     pub fn list_snapshots(&self, include_terminal: bool, max_output_bytes: usize) -> Vec<Value> {
         let sessions = {
             let mut sessions = self.sessions.lock().expect("sessions lock");
-            prune_terminal_sessions(&mut sessions, self.terminal_retention);
+            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
             sessions.values().cloned().collect::<Vec<_>>()
         };
         let mut snapshots = sessions
@@ -694,7 +739,7 @@ impl SessionStore {
     pub fn running_task_ids(&self) -> Vec<String> {
         let sessions = {
             let mut sessions = self.sessions.lock().expect("sessions lock");
-            prune_terminal_sessions(&mut sessions, self.terminal_retention);
+            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
             sessions.values().cloned().collect::<Vec<_>>()
         };
         let mut task_ids = sessions
@@ -750,7 +795,7 @@ impl SessionStore {
     {
         let sessions = {
             let mut sessions = self.sessions.lock().expect("sessions lock");
-            prune_terminal_sessions(&mut sessions, self.terminal_retention);
+            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
             sessions.values().cloned().collect::<Vec<_>>()
         };
         let mut running = Vec::new();
@@ -787,11 +832,20 @@ impl SessionStore {
             retryable: true,
             details: json!({
                 "max_sessions": self.max_sessions,
-                "terminal_retention_ms": self.terminal_retention.as_millis(),
-                "suggestion": "结束不再需要的运行会话，或等待已结束会话的保留期到期后重试"
+                "terminal_slot_retention_ms": self.terminal_slot_retention.as_millis(),
+                "terminal_log_retention_ms": self.terminal_log_retention.as_millis(),
+                "suggestion": "结束运行中会话或消费未观察的终态结果；已消费终态只在短暂 slot retention 内占用并发槽"
             }),
         }
     }
+}
+
+fn session_consumes_slot(session: &ExecSession, terminal_slot_retention: Duration) -> bool {
+    !session.has_exited()
+        || !session.terminal_observed()
+        || session
+            .last_access_elapsed()
+            .is_some_and(|elapsed| elapsed <= terminal_slot_retention)
 }
 
 fn prune_terminal_sessions(

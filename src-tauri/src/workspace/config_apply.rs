@@ -80,6 +80,7 @@ fn mcp_runtime_changed(current: &WorkspaceProfile, next: &WorkspaceProfile) -> b
     current.runtime.local_port != next.runtime.local_port
         || current.runtime.tool_profile != next.runtime.tool_profile
         || current.runtime.permission_mode != next.runtime.permission_mode
+        || current.runtime.preferred_shell != next.runtime.preferred_shell
         || current.runtime.runtime_command != next.runtime.runtime_command
         || current.runtime.mcp_config != next.runtime.mcp_config
         || current.runtime.allowed_commands != next.runtime.allowed_commands

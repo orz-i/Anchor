@@ -26,6 +26,7 @@ const DEFAULT_EVENT_LIMIT: usize = 20;
 pub const TOOL_NAMES: &[&str] = &[
     "harness_status",
     "operation_log",
+    "resolve_recovery",
     "begin_work_session",
     "close_work_session",
     "complete_work_session",
@@ -70,6 +71,7 @@ pub fn call(
     let value = match name {
         "harness_status" => harness_status(ctx, session_id),
         "operation_log" => operation_log(ctx, args),
+        "resolve_recovery" => resolve_recovery(ctx, args),
         "begin_work_session" => begin_work_session(ctx, args, session_id),
         "close_work_session" => close_work_session(ctx, args),
         "complete_work_session" => complete_work_session(ctx, args),
@@ -98,13 +100,67 @@ pub fn call(
         _ => return Err(tool_error("INVALID_ARGUMENT", "未知 Harness 工具")),
     }?;
     let mut value = value;
-    if !recovered_outboxes.is_empty() {
+    let visible_outboxes = visible_outbox_recovery(name, args, &value, recovered_outboxes);
+    if !visible_outboxes.is_empty() {
         if let Some(object) = value.as_object_mut() {
-            object.insert("outbox_recovery".into(), json!(recovered_outboxes));
+            object.insert("outbox_recovery".into(), json!(visible_outboxes));
         }
     }
 
     Ok(tool_ok(value))
+}
+
+fn resolve_recovery(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let recovery_id = args
+        .get("recovery_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "recovery_id 是必填项"))?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
+    let evidence = string_list(args.get("evidence"))?.unwrap_or_default();
+    let recovery = ctx
+        .harness
+        .resolve_recovery(task_id, recovery_id, reason, &evidence)
+        .map_err(map_error)?;
+    let task = ctx.harness.task(task_id).map_err(map_error)?;
+    Ok(json!({
+        "task_id": task_id,
+        "recovery": recovery,
+        "task": task_view(&task)
+    }))
+}
+
+fn visible_outbox_recovery(
+    name: &str,
+    args: &Value,
+    value: &Value,
+    recovered: Vec<Value>,
+) -> Vec<Value> {
+    if name == "project_state" {
+        return recovered;
+    }
+    let selected_task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("task_id").and_then(Value::as_str))
+        .or_else(|| value.pointer("/task/id").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .pointer("/work_session/task_id")
+                .and_then(Value::as_str)
+        });
+    let Some(selected_task_id) = selected_task_id else {
+        return Vec::new();
+    };
+    recovered
+        .into_iter()
+        .filter(|entry| entry.get("task_id").and_then(Value::as_str) == Some(selected_task_id))
+        .collect()
 }
 
 fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
@@ -200,6 +256,38 @@ fn finish_task_worktree_cleanup(ctx: &ToolContext, task_id: &str) -> Value {
                 "next_actions": ["git_worktree_list", "git_worktree_remove"]
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod response_shape_tests {
+    use super::*;
+
+    #[test]
+    fn peer_outbox_recovery_is_hidden_from_task_scoped_responses() {
+        let recovered = vec![
+            json!({"status": "checkpoint_pending", "task_id": "task-a"}),
+            json!({"status": "prepared", "task_id": "task-b"}),
+            json!({"status": "prepared", "task_id": null}),
+        ];
+        let visible = visible_outbox_recovery(
+            "operation_log",
+            &json!({"task_id": "task-a"}),
+            &json!({"task_id": "task-a"}),
+            recovered.clone(),
+        );
+        assert_eq!(visible, vec![recovered[0].clone()]);
+        assert_eq!(
+            visible_outbox_recovery("project_state", &json!({}), &json!({}), recovered.clone()),
+            recovered
+        );
+        assert!(visible_outbox_recovery(
+            "operation_log",
+            &json!({}),
+            &json!({}),
+            vec![json!({"status": "prepared", "task_id": null})]
+        )
+        .is_empty());
     }
 }
 
@@ -854,6 +942,34 @@ fn begin_work_session(
             .update_steps(&task.id, completed_steps, pending_steps)
             .map_err(map_error)?;
     }
+    let auto_paused_previous_task_ids = if task_created && task.git_worktree.is_none() {
+        let running_task_ids = ctx.sessions.running_task_ids();
+        ctx.harness
+            .list_tasks()
+            .map_err(map_error)?
+            .into_iter()
+            .filter(|previous| previous.id != task.id)
+            .filter(|previous| previous.git_worktree.is_none())
+            .filter(|previous| {
+                previous.history_session_key.as_deref() == Some(session_key)
+                    && previous.history_session_path.as_deref() == Some(current_path)
+            })
+            .filter(|previous| {
+                matches!(previous.status, TaskStatus::Active | TaskStatus::Verifying)
+                    && !running_task_ids
+                        .iter()
+                        .any(|task_id| task_id == &previous.id)
+            })
+            .filter_map(|previous| {
+                ctx.harness
+                    .transition(&previous.id, TaskStatus::Paused)
+                    .ok()
+                    .map(|_| previous.id)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     ctx.bind_task_for_session(mcp_session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     let scoped = ctx
@@ -872,6 +988,7 @@ fn begin_work_session(
             "task_id": task.id,
             "task_created": task_created,
             "previous_task_id": previous_task_id,
+            "auto_paused_previous_task_ids": auto_paused_previous_task_ids,
             "parallel": task.git_worktree.is_some(),
             "workspace_mode": task_workspace_mode(&task),
             "writer_mode": if task.git_worktree.is_some() { "isolated_worktree" } else { "single_shared_writer" },
@@ -1775,14 +1892,98 @@ fn task_gate_status(
         .list_verifications(&task.id)
         .map_err(map_error)?;
     let completion_gate = completion_gate_value(ctx, &task, &verifications, false, false);
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
+    let verification_summary = verification_presentation_summary(&verifications);
+    if detail == "full" {
+        return Ok(json!({
+            "task_id": task.id,
+            "ready": completion_gate["ready"],
+            "detail": "full",
+            "completion_gate": completion_gate,
+            "task": task_view(&task),
+            "verification": verification_views(&verifications, "effective"),
+            "verification_summary": verification_summary
+        }));
+    }
+    let missing = completion_gate["missing"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(compact_gate_missing_item)
+        .collect::<Vec<_>>();
+    let blocking_failures = blocking_verification_views(&verifications)
+        .into_iter()
+        .map(|verification| {
+            json!({
+                "verification_id": verification.get("verification_id").cloned().unwrap_or(Value::Null),
+                "verification_kind": verification.get("verification_kind").cloned().unwrap_or(Value::Null),
+                "verification_key": verification.get("verification_key").cloned().unwrap_or(Value::Null),
+                "test_file": verification.get("test_file").cloned().unwrap_or(Value::Null),
+                "test_name": verification.get("test_name").cloned().unwrap_or(Value::Null)
+            })
+        })
+        .collect::<Vec<_>>();
+    let current_slice = task.current_slice_id.as_deref().and_then(|slice_id| {
+        task.slices
+            .iter()
+            .find(|slice| slice.id == slice_id)
+            .map(|slice| json!({"id": slice.id, "title": slice.title, "status": slice.status}))
+    });
+    let blocking_recovery = task
+        .recovery
+        .as_ref()
+        .filter(|recovery| recovery.blocks_completion())
+        .map(|recovery| {
+            json!({
+                "id": recovery.id,
+                "failed_step": recovery.failed_step,
+                "error_code": recovery.error_code,
+                "recovery_key": recovery.id
+            })
+        });
     Ok(json!({
         "task_id": task.id,
         "ready": completion_gate["ready"],
-        "completion_gate": completion_gate,
-        "task": task_view(&task),
-        "verification": verification_views(&verifications, "effective"),
-        "verification_summary": verification_presentation_summary(&verifications)
+        "detail": "compact",
+        "completion_gate": {
+            "ready": completion_gate["ready"],
+            "task_id": task.id,
+            "phase": task.phase,
+            "missing": missing,
+            "next_actions": completion_gate["next_actions"],
+            "current_slice": current_slice,
+            "blocking_failures": blocking_failures,
+            "running_session_count": completion_gate["running_sessions"].as_array().map_or(0, Vec::len),
+            "unobserved_terminal_session_count": completion_gate["unobserved_terminal_sessions"].as_array().map_or(0, Vec::len),
+            "recovery": blocking_recovery
+        },
+        "current_slice": current_slice,
+        "blocking_failures": blocking_failures,
+        "verification_summary": verification_summary
     }))
+}
+
+fn compact_gate_missing_item(item: &Value) -> Value {
+    let mut compact = serde_json::Map::new();
+    compact.insert(
+        "code".into(),
+        item.get("code").cloned().unwrap_or(Value::Null),
+    );
+    for key in ["verification_status", "slice_id", "phase"] {
+        if let Some(value) = item.get(key) {
+            compact.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(requirement) = item.get("requirement") {
+        compact.insert(
+            "requirement_id".into(),
+            requirement.get("id").cloned().unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(compact)
 }
 
 fn start_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -2246,13 +2447,21 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         ctx.harness.check_baseline(task_id).map_err(map_error)?;
     }
     if completion_gate["ready"] != Value::Bool(true) {
-        let task = ctx.harness.mark_verifying(task_id).map_err(map_error)?;
         let missing_codes = completion_gate["missing"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|item| item.get("code").and_then(Value::as_str))
             .collect::<Vec<_>>();
+        let closure_protocol_only = !missing_codes.is_empty()
+            && missing_codes
+                .iter()
+                .all(|code| *code == "complete_work_session_required");
+        let task = if closure_protocol_only {
+            task_before.clone()
+        } else {
+            ctx.harness.mark_verifying(task_id).map_err(map_error)?
+        };
         let (code, reason, message) = if missing_codes.contains(&"command_results_pending") {
             (
                 "TASK_COMMAND_RESULTS_PENDING",
@@ -2292,7 +2501,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         };
         return Ok(json!({
             "ok": false,
-            "task_status": "verifying",
+            "task_status": task.status,
             "verification_status": verification_status,
             "closed": false,
             "session_status": "active",

@@ -78,6 +78,49 @@ fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion()
 }
 
 #[test]
+fn task_facade_can_resolve_recovery_from_explicit_post_failure_evidence() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let mut ctx =
+        ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    ctx.tool_profile = "advanced".into();
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "显式证据收口 Recovery"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let rejected = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"print('one')\" && python -c \"print('two')\"",
+            "recovery_key": "logical-step-that-will-be-proven-elsewhere",
+            "yield_time_ms": 30000
+        }),
+    );
+    let recovery_id = rejected["task_recovery"]["recovery"]["id"]
+        .as_str()
+        .expect("recovery id");
+
+    let resolved = call_tool(
+        &ctx,
+        "task",
+        &json!({
+            "operation": "resolve_recovery",
+            "task_id": task_id,
+            "recovery_id": recovery_id,
+            "reason": "A later dedicated step and its verification prove the intended work completed.",
+            "evidence": ["commit abc123 contains the intended change", "verification recovery-e2e passed"]
+        }),
+    );
+    assert_eq!(resolved["ok"], true, "{resolved}");
+    assert_eq!(resolved["recovery"]["status"], "resolved");
+    assert_eq!(resolved["recovery"]["resolved_by_step"], "resolve_recovery");
+}
+
+#[test]
 fn patch_context_mismatch_without_stable_identity_does_not_open_task_recovery() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -573,6 +616,14 @@ fn policy_rejection_is_recoverable_with_a_stable_logical_step_key() {
         rejected["task_recovery"]["recovery"]["workspace_mutated"],
         false
     );
+    let server_recovery_key = rejected["task_recovery"]["recovery_key"]
+        .as_str()
+        .expect("server recovery key")
+        .to_string();
+    assert_eq!(
+        server_recovery_key,
+        rejected["task_recovery"]["recovery"]["id"]
+    );
 
     let corrected = call_tool(
         &ctx,
@@ -580,7 +631,7 @@ fn policy_rejection_is_recoverable_with_a_stable_logical_step_key() {
         &json!({
             "executable": TEST_PYTHON,
             "args": ["-c", "print('corrected')"],
-            "recovery_key": "policy-step-1",
+            "recovery_key": server_recovery_key,
             "yield_time_ms": 30000
         }),
     );
@@ -804,7 +855,7 @@ fn latest_baseline_is_captured_and_accepted_in_one_call() {
 }
 
 #[test]
-fn begin_work_session_can_handoff_and_switch_between_tasks() {
+fn begin_work_session_handoff_pauses_previous_same_history_shared_writer() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -845,10 +896,14 @@ fn begin_work_session_can_handoff_and_switch_between_tasks() {
     assert_ne!(second_id, first_id);
     assert_eq!(
         ctx.harness.task(&first_id).unwrap().status,
-        anchor_lib::harness::TaskStatus::Active
+        anchor_lib::harness::TaskStatus::Paused
+    );
+    assert_eq!(
+        second["work_session"]["auto_paused_previous_task_ids"][0],
+        first_id
     );
     assert_eq!(second["harness"]["task_id"], second_id);
-    assert_eq!(second["harness"]["active_task_count"], 2);
+    assert_eq!(second["harness"]["active_task_count"], 1);
 
     let switched = call_tool_for_session(
         &ctx,
@@ -865,6 +920,62 @@ fn begin_work_session_can_handoff_and_switch_between_tasks() {
     );
     assert_eq!(switched["harness"]["default_task_id"], first_id);
     assert_eq!(switched["harness"]["active_task_count"], 2);
+}
+
+#[test]
+fn direct_finish_protocol_gate_does_not_downgrade_ready_task_to_verifying() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let mut ctx =
+        ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    ctx.tool_profile = "advanced".into();
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "只能通过 complete_work_session 关闭",
+            "phase": "verifying",
+            "contract": {
+                "completion_policy": {
+                    "require_complete_work_session": true
+                }
+            }
+        }),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    assert_eq!(started["task"]["status"], "active");
+    let ready = call_tool(
+        &ctx,
+        "update_task",
+        &json!({"task_id": task_id, "phase": "ready_to_close"}),
+    );
+    assert_eq!(ready["ok"], true, "{ready}");
+    assert_eq!(ready["task"]["phase"], "ready_to_close");
+    let verified = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('ready-to-close verified')"],
+            "verification_kind": "check",
+            "verification_key": "ready-to-close-protocol-only",
+            "yield_time_ms": 30000
+        }),
+    );
+    assert_eq!(verified["command_ok"], true, "{verified}");
+
+    let rejected = call_tool(
+        &ctx,
+        "task",
+        &json!({"operation": "finish", "task_id": task_id}),
+    );
+    assert_eq!(rejected["ok"], false, "{rejected}");
+    assert_eq!(rejected["task_status"], "active");
+    assert_eq!(
+        ctx.harness.task(task_id).unwrap().status,
+        anchor_lib::harness::TaskStatus::Active
+    );
 }
 
 #[test]
@@ -3254,6 +3365,17 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
     let initial_gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
     assert_eq!(initial_gate["ok"], true);
     assert_eq!(initial_gate["ready"], false);
+    assert_eq!(initial_gate["detail"], "compact");
+    assert!(initial_gate.get("task").is_none());
+    assert!(initial_gate.get("verification").is_none());
+    let full_gate = call_tool(
+        &ctx,
+        "task_gate_status",
+        &json!({"task_id": task_id, "detail": "full"}),
+    );
+    assert_eq!(full_gate["detail"], "full");
+    assert!(full_gate["task"].is_object());
+    assert!(full_gate["verification"].is_array());
     let initial_codes = initial_gate["completion_gate"]["missing"]
         .as_array()
         .unwrap()
@@ -3532,7 +3654,11 @@ fn failed_tool_opens_recovery_and_same_step_success_resolves_it() {
         .as_array()
         .is_some_and(|items| !items.is_empty()));
 
-    let recovered = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
+    let recovered = call_tool(
+        &ctx,
+        "task_gate_status",
+        &json!({"task_id": task_id, "detail": "full"}),
+    );
     let still_open = recovered["completion_gate"]["missing"]
         .as_array()
         .unwrap()

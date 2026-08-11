@@ -41,14 +41,15 @@ kill_session
 
 | 项目 | 限制 |
 | --- | ---: |
-| 最大保留命令 Session | 64 |
-| 已结束 Session 无访问保留期 | 30 分钟 |
+| 最大并发/占槽命令 Session | 64 |
+| 已消费终态的 Session 槽位保留 | 60 秒 |
+| 已消费终态的输出/日志保留 | 30 分钟 |
 | stdout 环形缓冲区 | 1 MiB |
 | stderr 环形缓冲区 | 1 MiB |
 
-已结束命令只有在终态通过 `wait_command` / `kill_session` 等路径被明确消费后才进入自动回收计时。后台 `list_command_sessions`、任务完成门禁等只读刷新不会延长这个计时；显式再次读取该 Session 会更新最后访问时间。未消费终态不会因 30 分钟保留期自动删除，避免绕过任务完成前必须消费命令结果的约束。
+已结束命令只有在终态通过 `wait_command` / `kill_session` 等路径被明确消费后才进入回收计时。容量槽位与日志保留从 Catalog 35 起分离：已消费终态在短暂的 60 秒槽位保留后不再占用 64-session 容量，但其输出仍可在 30 分钟日志保留期内通过 `read_output` / `wait_command` 读取。后台 `list_command_sessions`、任务完成门禁等只读刷新不会延长日志保留；显式再次读取该 Session 会更新最后访问时间。未消费终态始终继续占槽且不会自动删除，避免绕过任务完成前必须消费命令结果的约束。
 
-每次登记新命令前、查询 Session 前和列举 Session 前都会先回收超过保留期的“已结束 + 已消费”记录。达到 64 个 Session 容量且没有可回收记录时，服务器会终止刚启动但无法登记的子进程，然后返回可重试的 `SESSION_LIMIT_REACHED`，避免产生孤儿进程。自然过期后的 `wait_command`、`read_output` 或 `kill_session` 返回 `SESSION_NOT_FOUND`；这属于正常的保留期淘汰，不会为无工作区变更的 Harness Task 创建 Recovery。
+每次登记新命令前、查询 Session 前和列举 Session 前都会清理超过日志保留期的“已结束 + 已消费”记录；容量检查只统计仍运行、尚未消费终态或仍在短暂槽位保留窗口内的 Session。达到 64 个有效槽位且没有可释放记录时，服务器会终止刚启动但无法登记的子进程，然后返回可重试的 `SESSION_LIMIT_REACHED`，避免产生孤儿进程。日志自然过期后的 `wait_command`、`read_output` 或 `kill_session` 返回 `SESSION_NOT_FOUND`；这属于正常淘汰，不会为无工作区变更的 Harness Task 创建 Recovery。
 
 ### 输出 Offset
 
@@ -161,19 +162,26 @@ Phase 使用显式状态机。普通 `update_task` 不能从 planning 直接跳�
 
 任务生命周期状态与共享工作树的默认路由相互独立：
 
-- 新建或切换任务只更新工作区的默认任务，不会把其他 active/verifying 任务改成 paused；
-- 只有显式 `pause_task` 才会将任务生命周期改为 paused；
+- 切换已有任务只更新工作区的默认任务，不会把其他 active/verifying 任务改成 paused；
+- 同一个 History Session 在 shared 工作区创建新的 writer Task 时，上一代同 History shared writer 若没有运行中命令会自动降级为 paused，避免长会话不断堆积等价 writer；独立 History 或 worktree 并行任务不受该规则影响；
+- 除上述同 History writer handoff 外，任务只会通过显式 `pause_task` 或既有受控生命周期路径进入 paused；
 - 已绑定 MCP 会话始终继续路由到自己的任务；新连接默认跟随工作区当前选中的任务；
 - shared 模式的文件、命令和 Git 写操作通过工作区写锁串行执行；同一写域中已有运行命令时，其他任务仍可创建和读取，但写操作返回 `WORKSPACE_WRITER_BUSY`；
 - 一次 shared 写入完成后，Anchor 同步同一写域内所有可继续任务的 expected baseline，避免下一任务把已归因变更误判为外部漂移；
 - worktree 模式的任务使用独立目录、分支和命令租约，可同时保持 active 并独立写入。
 - History bootstrap 保留所有 active/verifying Task 绑定的 History Session；仅显式暂停/终止任务或未绑定活动任务的旧会话会被回收为 paused。
 
-`active_task_ids` 表示仍在推进的任务集合；`default_task_id`/`active_task_id` 只表示无显式绑定时的默认路由目标，不再代表唯一 active 任务。
+`active_task_ids` 表示仍在推进的任务集合；`default_task_id`/`active_task_id` 只表示无显式绑定时的默认路由目标，不再代表唯一 active 任务。`harness_status` 同时返回 `stale_active_task_ids` 和 `warnings`：active task 达到 8 个会提示生命周期压力，超过 12 小时没有活动的 active/verifying task 会被列为 stale 供调用方显式审阅，而不会被系统静默归档。
+
+### Recovery 闭环
+
+普通、未修改工作区且没有稳定重试身份的 preflight/Patch 验证失败不会创建持久 Recovery。需要持久 Recovery 时，失败响应会返回服务端生成的 `task_recovery.recovery_key`，调用方应在修正参数后重试同一个逻辑步骤时复用该 key；即使修正后的参数指纹发生变化，成功重试也能关联并关闭原 Recovery。
+
+如果原失败步骤没有被机械重试，但后续独立步骤、提交和 verification 已经证明目标完成，可通过 `task(operation="resolve_recovery")` 提交 `recovery_id`、原因和至少一条证据。该操作是审计式 resolution，不会制造 no-op mutation，也不同于放宽 completion gate 的 waive。
 
 ### 完成门禁
 
-`task_gate_status` 一次返回全部缺失条件，而不是只报告第一个错误。门禁可覆盖：
+`task_gate_status` 一次返回全部缺失条件，而不是只报告第一个错误。Catalog 35 默认返回 `detail="compact"`：仅包含 ready、缺失代码、当前 Slice、阻塞 verification、命令会话计数与当前阻塞 Recovery；需要完整 Task、全部 verification 和完整 gate 证据时显式传 `detail="full"`。门禁可覆盖：
 
 ```text
 运行中或未消费的命令结果

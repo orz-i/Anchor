@@ -675,6 +675,7 @@
         ...profile.runtime,
         tool_profile: draft.toolProfile,
         permission_mode: draft.permissionMode,
+        preferred_shell: draft.preferredShell,
         allowed_commands: draft.allowedCommands,
         workspace_local_entries: draft.workspaceLocalEntries,
         workspace_script_extensions: draft.workspaceScriptExtensions,
@@ -996,6 +997,7 @@
               <RuntimePolicyForm
                 toolProfile={profile.runtime.tool_profile}
                 permissionMode={profile.runtime.permission_mode}
+                preferredShell={profile.runtime.preferred_shell ?? "auto"}
                 allowedCommands={profile.runtime.allowed_commands ?? ""}
                 workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
                 workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}

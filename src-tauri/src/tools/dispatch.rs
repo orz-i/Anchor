@@ -160,10 +160,13 @@ fn track_task_recovery(
     let (recovery_step, step_fingerprint) = recovery_step_identity(tool, args, output);
     let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
     if succeeded {
-        if let Ok(Some(recovery)) =
-            ctx.harness
-                .resolve_recovery_for_step(task_id, &recovery_step, Some(&step_fingerprint))
-        {
+        let recovery_key = args.get("recovery_key").and_then(Value::as_str);
+        if let Ok(Some(recovery)) = ctx.harness.resolve_recovery_for_attempt(
+            task_id,
+            &recovery_step,
+            Some(&step_fingerprint),
+            recovery_key,
+        ) {
             if let Some(object) = output.as_object_mut() {
                 object.insert(
                     "task_recovery".into(),
@@ -287,6 +290,8 @@ fn track_task_recovery(
                 json!({
                     "status": "open",
                     "recovery": recovery,
+                    "recovery_key": recovery.id,
+                    "retry_hint": "Retry the corrected logical step with the returned recovery_key so Anchor can resolve this Recovery even when corrected arguments differ.",
                     "retry_original_step": retry_original_step,
                     "step_fingerprint": preserved_step_fingerprint,
                     "additional_failure_preserved": additional_failure_preserved
@@ -935,6 +940,19 @@ fn call_tool_impl(
     let ctx = scoped_context.as_ref().unwrap_or(ctx);
     let mut effective_args = apply_default_cwd(ctx, session_id, name, args);
     if name == "exec_command" {
+        if let Err(error) = exec::apply_preferred_shell(&mut effective_args, &ctx.policy) {
+            let output = tool_err(error);
+            let mut output =
+                normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+            track_task_recovery(
+                ctx,
+                initial_task.as_ref().map(|task| task.id.as_str()),
+                name,
+                &effective_args,
+                &mut output,
+            );
+            return output;
+        }
         if let Err(error) = exec::normalize_exec_arguments(&mut effective_args) {
             let output = tool_err(error);
             let mut output =
@@ -1880,7 +1898,22 @@ fn server_info_for_session(
         },
         "downstream_mcp": downstream_mcp.clone()
     });
-    Ok(tool_ok(json!({
+    let catalog_profile_guidance = if ctx.tool_profile == "advanced"
+        && running_catalog.estimated_tokens >= 24_000
+    {
+        json!({
+            "recommended_profile": "core",
+            "reason": "advanced exposes the full Browser proxy surface; use core for normal development and switch to advanced when low-frequency Browser/admin tools are needed",
+            "current_profile": ctx.tool_profile
+        })
+    } else {
+        json!({
+            "recommended_profile": ctx.tool_profile,
+            "reason": "current profile is within the normal workflow exposure policy",
+            "current_profile": ctx.tool_profile
+        })
+    };
+    let mut response = json!({
         "server": crate::brand::SERVER_NAME,
         "title": crate::brand::PRODUCT_NAME,
         "version": env!("CARGO_PKG_VERSION"),
@@ -1924,7 +1957,15 @@ fn server_info_for_session(
         "command_cost_policy": command_cost_policy,
         "downstream_mcp": downstream_mcp.clone(),
         "connection_layers": connection_layers
-    })))
+    });
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "preferred_shell".into(),
+            Value::String(ctx.policy.preferred_shell.clone()),
+        );
+        object.insert("catalog_profile_guidance".into(), catalog_profile_guidance);
+    }
+    Ok(tool_ok(response))
 }
 
 fn tool_group_manifest(tools: &[&str]) -> Value {

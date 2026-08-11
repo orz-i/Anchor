@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 34;
+pub const CATALOG_VERSION: u32 = 35;
 
 pub const SKILL_OPERATIONS: &[(&str, &str)] = &[
     ("list", "list_skills"),
@@ -29,6 +29,7 @@ pub const GIT_OPERATIONS: &[(&str, &str)] = &[
 pub const TASK_OPERATIONS: &[(&str, &str)] = &[
     ("status", "harness_status"),
     ("operation_log", "operation_log"),
+    ("resolve_recovery", "resolve_recovery"),
     (
         "verification_disposition",
         "update_verification_disposition",
@@ -176,6 +177,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "update_verification_disposition",
         "Update verification disposition",
         "Append an audited disposition to immutable verification evidence, such as expected_failure, diagnostic_only, superseded, or waived.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "resolve_recovery",
+        "Resolve task recovery",
+        "Resolve the current Task Recovery using explicit post-failure evidence when the logical work was completed by a corrected or later step.",
         false,
         false,
         false,
@@ -729,6 +738,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "skill",
     "task",
     "update_verification_disposition",
+    "resolve_recovery",
     "accept_latest_baseline",
     "list_skills",
     "load_skill",
@@ -1249,6 +1259,19 @@ pub fn output_schema(name: &str) -> Value {
                     "current_proxy_tool_count": { "type": "integer", "minimum": 0 }
                 }),
                 json!({
+                    "preferred_shell": { "type": "string", "enum": ["auto", "pwsh", "powershell", "cmd"] },
+                    "catalog_profile_guidance": {
+                        "type": "object",
+                        "properties": {
+                            "recommended_profile": { "type": "string", "enum": ["core", "read-only", "advanced"] },
+                            "reason": { "type": "string", "minLength": 1 },
+                            "current_profile": { "type": "string", "enum": ["core", "read-only", "advanced"] }
+                        },
+                        "required": ["recommended_profile", "reason", "current_profile"],
+                        "additionalProperties": false
+                    }
+                }),
+                json!({
                     "schema_discovery": {
                         "type": "object",
                         "properties": {
@@ -1287,6 +1310,7 @@ pub fn output_schema(name: &str) -> Value {
                 "protocol_version",
                 "workspace",
                 "permission_mode",
+                "preferred_shell",
                 "default_cwd",
                 "network_allowed",
                 "tool_profile",
@@ -1315,6 +1339,7 @@ pub fn output_schema(name: &str) -> Value {
                 "current_catalog_estimated_tokens",
                 "current_local_tool_count",
                 "current_proxy_tool_count",
+                "catalog_profile_guidance",
                 "schema_discovery",
                 "command_cost_policy",
                 "downstream_mcp",
@@ -2160,6 +2185,8 @@ pub fn output_schema(name: &str) -> Value {
                 "default_task_id": { "type": ["string", "null"] },
                 "active_task_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
                 "active_task_count": { "type": "integer", "minimum": 0 },
+                "stale_active_task_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                "warnings": { "type": "array", "items": { "type": "string" } },
                 "task_id": { "type": ["string", "null"] },
                 "task_state": { "type": ["string", "null"] },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
@@ -2185,6 +2212,8 @@ pub fn output_schema(name: &str) -> Value {
                 "default_task_id",
                 "active_task_ids",
                 "active_task_count",
+                "stale_active_task_ids",
+                "warnings",
                 "session_status",
                 "next_stage_started",
                 "writable",
@@ -2272,11 +2301,22 @@ pub fn output_schema(name: &str) -> Value {
                 "effective_disposition",
             ],
         ),
+        "resolve_recovery" => success_output_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1 },
+                "recovery": { "type": "object" },
+                "task": { "type": "object" }
+            }),
+            &["task_id", "recovery", "task"],
+        ),
         "task_gate_status" => success_output_schema(
             json!({
                 "task_id": { "type": "string", "minLength": 1 },
                 "ready": { "type": "boolean" },
+                "detail": { "type": "string", "enum": ["compact", "full"] },
                 "completion_gate": { "type": "object" },
+                "current_slice": { "type": ["object", "null"] },
+                "blocking_failures": { "type": "array", "items": { "type": "object" } },
                 "task": { "type": "object" },
                 "verification": { "type": "array", "items": { "type": "object" } },
                 "verification_summary": { "type": "object" }
@@ -2284,9 +2324,8 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "task_id",
                 "ready",
+                "detail",
                 "completion_gate",
-                "task",
-                "verification",
                 "verification_summary",
             ],
         ),
@@ -2933,6 +2972,22 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["task_id", "verification_id", "disposition", "reason"],
             "additionalProperties": false
         }),
+        "resolve_recovery" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "recovery_id": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+                }
+            },
+            "required": ["task_id", "recovery_id", "reason", "evidence"],
+            "additionalProperties": false
+        }),
         "project_state" => json!({
             "type": "object",
             "properties": {
@@ -2978,7 +3033,8 @@ pub fn input_schema(name: &str) -> Value {
         "task_gate_status" => json!({
             "type": "object",
             "properties": {
-                "task_id": { "type": "string", "minLength": 1 }
+                "task_id": { "type": "string", "minLength": 1 },
+                "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
             },
             "additionalProperties": false
         }),

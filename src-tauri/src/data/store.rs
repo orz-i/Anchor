@@ -20,7 +20,17 @@ struct DataFileGuard {
 pub(crate) fn validate_workspace_profile(profile: &WorkspaceProfile) -> AppResult<()> {
     crate::tools::registry::require_tool_profile(&profile.runtime.tool_profile)
         .map(|_| ())
-        .map_err(AppError::Message)
+        .map_err(AppError::Message)?;
+    if !matches!(
+        profile.runtime.preferred_shell.as_str(),
+        "auto" | "pwsh" | "powershell" | "cmd"
+    ) {
+        return Err(AppError::Message(format!(
+            "unsupported preferred shell `{}`; expected auto, pwsh, powershell, or cmd",
+            profile.runtime.preferred_shell
+        )));
+    }
+    Ok(())
 }
 
 fn validate_data(data: &AppData) -> AppResult<()> {

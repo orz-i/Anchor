@@ -20,6 +20,9 @@ use super::model::{
 };
 use super::store::{baseline_object_id, HarnessError, HarnessResult, HarnessStore};
 
+const ACTIVE_TASK_WARNING_THRESHOLD: usize = 8;
+const STALE_ACTIVE_TASK_AFTER_MS: u64 = 12 * 60 * 60 * 1000;
+
 #[derive(Debug, Clone)]
 pub struct Harness {
     workspace_root: PathBuf,
@@ -1492,15 +1495,27 @@ impl Harness {
         succeeded_step: &str,
         step_fingerprint: Option<&str>,
     ) -> HarnessResult<Option<TaskRecoveryState>> {
+        self.resolve_recovery_for_attempt(task_id, succeeded_step, step_fingerprint, None)
+    }
+
+    pub fn resolve_recovery_for_attempt(
+        &self,
+        task_id: &str,
+        succeeded_step: &str,
+        step_fingerprint: Option<&str>,
+        recovery_key: Option<&str>,
+    ) -> HarnessResult<Option<TaskRecoveryState>> {
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;
                 let Some(mut recovery) = task.recovery.clone() else {
                     return Ok(None);
                 };
+                let retry_key_matches = recovery_key.is_some_and(|key| key == recovery.id);
                 if recovery.status != TaskRecoveryStatus::Open
                     || recovery.failed_step != succeeded_step
-                    || recovery.step_fingerprint.as_deref() != step_fingerprint
+                    || (!retry_key_matches
+                        && recovery.step_fingerprint.as_deref() != step_fingerprint)
                 {
                     return Ok(None);
                 }
@@ -1519,6 +1534,65 @@ impl Harness {
                     json!({"ok": true}),
                 ))?;
                 Ok(Some(recovery))
+            })
+    }
+
+    pub fn resolve_recovery(
+        &self,
+        task_id: &str,
+        recovery_id: &str,
+        reason: &str,
+        evidence: &[String],
+    ) -> HarnessResult<TaskRecoveryState> {
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "resolve_recovery 必须提供 resolution reason",
+            ));
+        }
+        if evidence.is_empty() || evidence.iter().all(|item| item.trim().is_empty()) {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "resolve_recovery 必须提供至少一条后续完成证据",
+            ));
+        }
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                let Some(mut recovery) = task.recovery.clone() else {
+                    return Err(HarnessError::new(
+                        "RECOVERY_NOT_FOUND",
+                        "当前任务没有 Recovery 记录",
+                    ));
+                };
+                if recovery.id != recovery_id {
+                    return Err(HarnessError::new(
+                        "RECOVERY_NOT_FOUND",
+                        "指定的 recovery_id 与当前任务 Recovery 不匹配",
+                    ));
+                }
+                if recovery.status == TaskRecoveryStatus::Resolved {
+                    return Ok(recovery);
+                }
+                recovery.status = TaskRecoveryStatus::Resolved;
+                recovery.resolved_by_step = Some("resolve_recovery".into());
+                recovery.updated_at = timestamp();
+                task.recovery = Some(recovery.clone());
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_recovery_resolved",
+                    Some("resolve_recovery"),
+                    json!({
+                        "recovery_id": recovery.id,
+                        "reason": reason,
+                        "evidence": evidence
+                    }),
+                    json!({"ok": true, "resolution": "evidence_acknowledged"}),
+                ))?;
+                Ok(recovery)
             })
     }
 
@@ -1907,12 +1981,38 @@ impl Harness {
             .map(|task_id| self.task(task_id))
             .transpose()?
             .filter(|task| task.status.is_writable());
-        let active_task_ids = self
-            .active_tasks()?
-            .into_iter()
-            .map(|task| task.id)
+        let active_tasks = self.active_tasks()?;
+        let active_task_ids = active_tasks
+            .iter()
+            .map(|task| task.id.clone())
             .collect::<Vec<_>>();
         let active_task_count = active_task_ids.len();
+        let now_ms = current_millis();
+        let stale_active_task_ids = active_tasks
+            .iter()
+            .filter(|task| {
+                let last_activity = task
+                    .last_activity_at
+                    .as_deref()
+                    .unwrap_or(task.updated_at.as_str())
+                    .parse::<u64>()
+                    .unwrap_or(now_ms);
+                now_ms.saturating_sub(last_activity) >= STALE_ACTIVE_TASK_AFTER_MS
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        if active_task_count >= ACTIVE_TASK_WARNING_THRESHOLD {
+            warnings.push(format!(
+                "active task count is high ({active_task_count}); close or pause completed/dormant tasks"
+            ));
+        }
+        if !stale_active_task_ids.is_empty() {
+            warnings.push(format!(
+                "{} active task(s) have had no activity for at least 12 hours",
+                stale_active_task_ids.len()
+            ));
+        }
         let session_status = workspace_state
             .as_ref()
             .map(|state| state.session_status)
@@ -2065,6 +2165,8 @@ impl Harness {
             default_task_id,
             active_task_ids,
             active_task_count,
+            stale_active_task_ids,
+            warnings,
             task_id,
             task_state,
             task_updated_at,
@@ -2372,10 +2474,14 @@ fn git_value(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn timestamp() -> String {
+    current_millis().to_string()
+}
+
+fn current_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().to_string())
-        .unwrap_or_else(|_| "0".into())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

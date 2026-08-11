@@ -116,7 +116,10 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         None,
     )
     .expect("harness status triggers recovery");
-    assert!(status["outbox_recovery"].is_array(), "{status}");
+    assert!(
+        status.get("outbox_recovery").is_none(),
+        "task-scoped status must not surface peer/completed outbox diagnostics: {status}"
+    );
     let completed = restarted
         .harness
         .load_close_outbox(&task_id)

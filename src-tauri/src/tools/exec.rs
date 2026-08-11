@@ -24,6 +24,70 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None, None)
 }
 
+pub(crate) fn apply_preferred_shell(
+    args: &mut Value,
+    policy: &crate::tools::policy::PolicySettings,
+) -> Result<(), WorkspaceError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (args, policy);
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let preferred = policy.preferred_shell.trim();
+        if preferred.is_empty() || preferred == "auto" {
+            return Ok(());
+        }
+        let object = args.as_object_mut().ok_or_else(|| {
+            WorkspaceError::invalid_argument("exec_command arguments must be an object")
+        })?;
+        if object.contains_key("shell")
+            || object.contains_key("executable")
+            || object.contains_key("args")
+        {
+            return Ok(());
+        }
+        let Some(command) = object
+            .get("cmd")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let shell_args = match preferred {
+            "pwsh" | "powershell" => vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                command,
+            ],
+            "cmd" => vec![
+                "/d".to_string(),
+                "/s".to_string(),
+                "/c".to_string(),
+                command,
+            ],
+            _ => {
+                return Err(WorkspaceError::invalid_argument(
+                    "preferred shell must be auto, pwsh, powershell, or cmd",
+                ))
+            }
+        };
+        object.remove("cmd");
+        object.insert("shell".into(), Value::String(preferred.to_string()));
+        object.insert(
+            "args".into(),
+            Value::Array(shell_args.into_iter().map(Value::String).collect()),
+        );
+        Ok(())
+    }
+}
+
 fn parse_and_resolve_execution(
     execution: &Value,
     cmd: &str,
@@ -1235,6 +1299,26 @@ mod tests {
     use crate::tools::CancellationToken;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[cfg(windows)]
+    #[test]
+    fn preferred_pwsh_applies_only_when_shell_is_omitted() {
+        let policy = crate::tools::policy::PolicySettings {
+            preferred_shell: "pwsh".into(),
+            ..Default::default()
+        };
+        let mut args = json!({"cmd": "Write-Output $env:TEMP"});
+        apply_preferred_shell(&mut args, &policy).expect("preferred shell");
+        assert_eq!(args["shell"], "pwsh");
+        assert_eq!(args["args"][3], "-Command");
+        assert_eq!(args["args"][4], "Write-Output $env:TEMP");
+        normalize_exec_arguments(&mut args).expect("normalize");
+        assert!(args["cmd"].as_str().unwrap().contains("pwsh"));
+
+        let mut explicit = json!({"shell": "cmd", "args": ["/d", "/c", "echo explicit"]});
+        apply_preferred_shell(&mut explicit, &policy).expect("explicit shell");
+        assert_eq!(explicit["shell"], "cmd");
+    }
 
     fn assert_failure_result(
         error: WorkspaceError,

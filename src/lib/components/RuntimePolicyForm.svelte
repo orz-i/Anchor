@@ -2,6 +2,7 @@
   export interface RuntimePolicyDraft {
     toolProfile: string;
     permissionMode: string;
+    preferredShell: string;
     allowedCommands: string;
     workspaceLocalEntries: boolean;
     workspaceScriptExtensions: string;
@@ -13,6 +14,7 @@
   interface Props {
     toolProfile: string;
     permissionMode: string;
+    preferredShell: string;
     allowedCommands: string;
     workspaceLocalEntries: boolean;
     workspaceScriptExtensions: string;
@@ -34,10 +36,18 @@
     { value: "dangerous", label: "完全放开" },
   ] as const;
 
-  let { toolProfile, permissionMode, allowedCommands, workspaceLocalEntries, workspaceScriptExtensions, externalPaidCommandsEnabled, externalPaidMaxRunsPerDay, externalPaidMaxDurationSeconds, onSave }: Props = $props();
+  const PREFERRED_SHELL_OPTIONS = [
+    { value: "auto", label: "自动 / 直接执行" },
+    { value: "pwsh", label: "PowerShell 7 (pwsh)" },
+    { value: "powershell", label: "Windows PowerShell" },
+    { value: "cmd", label: "cmd.exe" },
+  ] as const;
+
+  let { toolProfile, permissionMode, preferredShell, allowedCommands, workspaceLocalEntries, workspaceScriptExtensions, externalPaidCommandsEnabled, externalPaidMaxRunsPerDay, externalPaidMaxDurationSeconds, onSave }: Props = $props();
 
   let draftProfile = $state("core");
   let draftMode = $state("trusted");
+  let draftPreferredShell = $state("auto");
   let draftCommands = $state("");
   let draftLocalEntries = $state(true);
   let draftExtensions = $state(".exe,.bat,.cmd,.ps1");
@@ -52,12 +62,13 @@
   }
 
   const dirty = $derived(
-    draftProfile !== canonicalProfile(toolProfile) || draftMode !== permissionMode || draftCommands !== allowedCommands || draftLocalEntries !== workspaceLocalEntries || draftExtensions !== workspaceScriptExtensions || draftExternalPaidEnabled !== externalPaidCommandsEnabled || draftExternalPaidRuns !== externalPaidMaxRunsPerDay || draftExternalPaidDuration !== externalPaidMaxDurationSeconds,
+    draftProfile !== canonicalProfile(toolProfile) || draftMode !== permissionMode || draftPreferredShell !== preferredShell || draftCommands !== allowedCommands || draftLocalEntries !== workspaceLocalEntries || draftExtensions !== workspaceScriptExtensions || draftExternalPaidEnabled !== externalPaidCommandsEnabled || draftExternalPaidRuns !== externalPaidMaxRunsPerDay || draftExternalPaidDuration !== externalPaidMaxDurationSeconds,
   );
 
   $effect(() => {
     draftProfile = canonicalProfile(toolProfile);
     draftMode = permissionMode;
+    draftPreferredShell = preferredShell;
     draftCommands = allowedCommands;
     draftLocalEntries = workspaceLocalEntries;
     draftExtensions = workspaceScriptExtensions;
@@ -70,7 +81,7 @@
     if (saving || !dirty) return;
     saving = true;
     try {
-      await onSave({ toolProfile: draftProfile, permissionMode: draftMode, allowedCommands: draftCommands.trim(), workspaceLocalEntries: draftLocalEntries, workspaceScriptExtensions: draftExtensions.trim(), externalPaidCommandsEnabled: draftExternalPaidEnabled, externalPaidMaxRunsPerDay: Math.max(1, Math.floor(draftExternalPaidRuns)), externalPaidMaxDurationSeconds: Math.max(1, Math.floor(draftExternalPaidDuration)) });
+      await onSave({ toolProfile: draftProfile, permissionMode: draftMode, preferredShell: draftPreferredShell, allowedCommands: draftCommands.trim(), workspaceLocalEntries: draftLocalEntries, workspaceScriptExtensions: draftExtensions.trim(), externalPaidCommandsEnabled: draftExternalPaidEnabled, externalPaidMaxRunsPerDay: Math.max(1, Math.floor(draftExternalPaidRuns)), externalPaidMaxDurationSeconds: Math.max(1, Math.floor(draftExternalPaidDuration)) });
     } finally {
       saving = false;
     }
@@ -94,6 +105,15 @@
         <option value={option.value}>{option.label}</option>
       {/each}
     </select>
+  </label>
+  <label class="grid gap-1">
+    <span class="text-xs text-[var(--text-muted)]">Windows 默认 Shell</span>
+    <select class="rounded-md border border-[var(--border)] bg-[var(--page-bg)] px-2.5 py-1.5 text-sm" bind:value={draftPreferredShell}>
+      {#each PREFERRED_SHELL_OPTIONS as option}
+        <option value={option.value}>{option.label}</option>
+      {/each}
+    </select>
+    <span class="text-xs text-[var(--text-muted)]">仅在 exec_command 未显式指定 shell 时生效；显式 shell 始终优先。</span>
   </label>
   <fieldset class="grid gap-2 rounded-md border border-[var(--border)] p-3">
     <legend class="px-1 text-xs text-[var(--text-muted)]">真实付费命令</legend>
