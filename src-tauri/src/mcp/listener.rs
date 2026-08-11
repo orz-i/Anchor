@@ -1934,8 +1934,8 @@ mod tests {
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "set_default_cwd",
-                    "arguments": {"path": "session-a"}
+                    "name": "cwd",
+                    "arguments": {"operation": "set", "path": "session-a"}
                 }
             }))),
         )
@@ -1952,7 +1952,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "get_default_cwd", "arguments": {}}
+                "params": {"name": "cwd", "arguments": {"operation": "get"}}
             }))),
         )
         .await;
@@ -1968,7 +1968,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "get_default_cwd", "arguments": {}}
+                "params": {"name": "cwd", "arguments": {"operation": "get"}}
             }))),
         )
         .await;

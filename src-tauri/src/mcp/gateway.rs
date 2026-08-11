@@ -1472,7 +1472,7 @@ mod tests {
                 "jsonrpc":"2.0",
                 "id":4,
                 "method":"tools/call",
-                "params":{"name":"get_default_cwd","arguments":{}}
+                "params":{"name":"cwd","arguments":{"operation":"get"}}
             }),
             Some(&session_a),
         )
@@ -1487,7 +1487,7 @@ mod tests {
                 "jsonrpc":"2.0",
                 "id":5,
                 "method":"tools/call",
-                "params":{"name":"get_default_cwd","arguments":{}}
+                "params":{"name":"cwd","arguments":{"operation":"get"}}
             }),
             Some(&session_b),
         )

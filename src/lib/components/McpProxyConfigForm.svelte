@@ -9,7 +9,8 @@
     "codegraph": {
       "type": "stdio",
       "command": "codegraph",
-      "args": ["serve", "--mcp", "--path", "\${workspaceFolder}"]
+      "args": ["serve", "--mcp", "--path", "\${workspaceFolder}"],
+      "maxTools": 16
     },
     "remote": {
       "type": "streamable-http",
@@ -103,6 +104,10 @@
     敏感头建议引用 <code class="font-mono">{"${env:VARIABLE}"}</code>，避免将令牌直接写入配置文件。
     可用 <code class="font-mono">includeTools</code>、<code class="font-mono">excludeTools</code>
     和 <code class="font-mono">maxTools</code> 控制下游工具数量；
+    <code class="font-mono">exposureMode</code> 默认为 <code class="font-mono">auto</code>：已知 Browser MCP
+    仅发布常用交互工作流，普通 MCP 未配置 <code class="font-mono">includeTools</code>/<code class="font-mono">maxTools</code>
+    时最多自动发布 24 个工具。确需完整目录时，审阅后可显式设置
+    <code class="font-mono">exposureMode: "full"</code>。
     <code class="font-mono">maxConcurrentRequests</code> 用于限制单个下游的并发压力。工具名使用下游 MCP
     原始名称，不包含服务器前缀。默认会额外发布
     <code class="font-mono">服务器名__health_check</code>、

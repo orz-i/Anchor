@@ -44,6 +44,34 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn environment_and_cwd_facades_route_to_existing_contracts() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    let environment = invoke(&ctx, "environment", json!({"operation": "check"}));
+    let environment = assert_ok(&environment);
+    assert_eq!(environment["facade"], "environment");
+    assert_eq!(environment["operation"], "check");
+    assert!(environment["workspace_exec_available"].is_boolean());
+
+    let initial = invoke(&ctx, "cwd", json!({"operation": "get"}));
+    let initial = assert_ok(&initial);
+    assert_eq!(initial["facade"], "cwd");
+    assert_eq!(initial["operation"], "get");
+
+    let set = invoke(&ctx, "cwd", json!({"operation": "set", "path": "src"}));
+    let set = assert_ok(&set);
+    assert_eq!(set["facade"], "cwd");
+    assert_eq!(set["operation"], "set");
+
+    let updated = invoke(&ctx, "cwd", json!({"operation": "get"}));
+    let updated = assert_ok(&updated);
+    assert!(updated["resolved_cwd"]
+        .as_str()
+        .is_some_and(|cwd| cwd.ends_with("src")));
+}
+
+#[test]
 fn structured_exec_rejects_sensitive_or_process_control_environment() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
@@ -648,12 +676,14 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 28);
+    assert_eq!(names.len(), 26);
     assert!(names.contains("git"));
     assert!(names.contains("task"));
     assert!(names.contains("skill"));
+    assert!(names.contains("environment"));
+    assert!(names.contains("cwd"));
     assert!(names.contains("search_text"));
-    assert!(names.contains("command_cost_explain"));
+    assert!(!names.contains("command_cost_explain"));
     assert!(names.contains("history_session_bootstrap"));
     assert!(names.contains("history_session_checkpoint"));
     assert!(names.contains("history_session_validate"));

@@ -30,6 +30,29 @@ const MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER: usize = 4_096;
 const MAX_PROXY_TOOLS_PER_SERVER: usize = 256;
 const MAX_PROXY_TOOLS_TOTAL: usize = 512;
 const MAX_PROXY_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
+const MAX_PROXY_TOOL_TITLE_BYTES: usize = 256;
+const MAX_PROXY_TOOL_DESCRIPTION_BYTES: usize = 2048;
+const MAX_AUTO_PROXY_TOOLS_PER_SERVER: usize = 24;
+const DEFAULT_BROWSER_PROXY_TOOLS: &[&str] = &[
+    "list_pages",
+    "new_page",
+    "navigate_page",
+    "take_snapshot",
+    "take_screenshot",
+    "evaluate_script",
+    "click",
+    "fill",
+    "fill_form",
+    "wait_for",
+    "select_page",
+    "close_page",
+    "press_key",
+    "type_text",
+    "hover",
+    "handle_dialog",
+    "upload_file",
+    "resize_page",
+];
 const DEFAULT_STDIO_MAX_CONCURRENT_REQUESTS: usize = 4;
 const DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS: usize = 16;
 const MAX_PROXY_CONCURRENT_REQUESTS: usize = 64;
@@ -834,6 +857,22 @@ struct SanitizedProxyCatalog {
     discovered_count: usize,
     filtered_count: usize,
     truncated_count: usize,
+    selection_source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyExposureMode {
+    Auto,
+    Full,
+}
+
+impl ProxyExposureMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -848,6 +887,7 @@ pub struct McpProxyServerSpec {
     include_tools: Option<BTreeSet<String>>,
     exclude_tools: BTreeSet<String>,
     max_tools: Option<usize>,
+    exposure_mode: ProxyExposureMode,
     max_concurrent_requests: usize,
     request_timeout: Duration,
     management_tools: bool,
@@ -910,10 +950,17 @@ fn valid_public_tool_name(name: &str) -> bool {
 }
 
 fn bounded_text(value: Option<&Value>, maximum: usize) -> Option<String> {
-    value
+    let text = value
         .and_then(Value::as_str)
-        .filter(|text| !text.is_empty() && text.len() <= maximum)
-        .map(str::to_string)
+        .filter(|text| !text.is_empty())?;
+    if text.len() <= maximum {
+        return Some(text.to_string());
+    }
+    let mut end = maximum.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (end > 0).then(|| text[..end].to_string())
 }
 
 fn sanitize_proxy_catalog(
@@ -961,6 +1008,25 @@ fn sanitize_proxy_catalog(
             ));
         }
     }
+
+    let selection_source = if spec.include_tools.is_some() {
+        "explicit_include"
+    } else if spec.max_tools.is_some() {
+        "explicit_max"
+    } else if spec.exposure_mode == ProxyExposureMode::Full {
+        "explicit_full"
+    } else if is_my_agent_browser_spec(spec) {
+        selected.retain(|(name, _)| DEFAULT_BROWSER_PROXY_TOOLS.contains(&name.as_str()));
+        "browser_workflow"
+    } else if selected.len() > MAX_AUTO_PROXY_TOOLS_PER_SERVER {
+        return Err(format!(
+            "downstream MCP `{}` advertises {} tools without an explicit exposure policy; automatic exposure is limited to {MAX_AUTO_PROXY_TOOLS_PER_SERVER}. Configure includeTools/maxTools, or set exposureMode to `full` after reviewing the catalog",
+            spec.name,
+            selected.len()
+        ));
+    } else {
+        "auto_all"
+    };
 
     selected.sort_by(|left, right| left.0.cmp(&right.0));
     let filtered_count = discovered_count.saturating_sub(selected.len());
@@ -1025,9 +1091,9 @@ fn sanitize_proxy_catalog(
             } else {
                 (fallback_proxy_output_schema(), true)
             };
-        let title = bounded_text(object.get("title"), 512)
+        let title = bounded_text(object.get("title"), MAX_PROXY_TOOL_TITLE_BYTES)
             .unwrap_or_else(|| format!("{} · {}", spec.name, downstream_name));
-        let description = bounded_text(object.get("description"), 8192)
+        let description = bounded_text(object.get("description"), MAX_PROXY_TOOL_DESCRIPTION_BYTES)
             .map(|description| format!("[{}] {description}", spec.name))
             .unwrap_or_else(|| format!("Proxied from MCP server {}", spec.name));
         let mut definition = json!({
@@ -1061,6 +1127,7 @@ fn sanitize_proxy_catalog(
         discovered_count,
         filtered_count,
         truncated_count,
+        selection_source,
     })
 }
 
@@ -1121,6 +1188,10 @@ struct ProxyServer {
     workspace_id: String,
     catalog_digest: String,
     downstream_tools: BTreeSet<String>,
+    discovered_tool_count: usize,
+    filtered_tool_count: usize,
+    truncated_tool_count: usize,
+    selection_source: &'static str,
     client: Mutex<Option<Arc<McpProxyClient>>>,
     session_id: StdMutex<String>,
     concurrency: Semaphore,
@@ -1166,6 +1237,8 @@ struct RawMcpServerConfig {
     exclude_tools: Vec<String>,
     #[serde(rename = "maxTools", default)]
     max_tools: Option<usize>,
+    #[serde(rename = "exposureMode", default)]
+    exposure_mode: Option<String>,
     #[serde(rename = "maxConcurrentRequests", default)]
     max_concurrent_requests: Option<usize>,
     #[serde(rename = "requestTimeoutSeconds", default)]
@@ -1197,6 +1270,7 @@ struct ProxyRoute {
 struct RegistryState {
     tools: Vec<Value>,
     routes: HashMap<String, ProxyRoute>,
+    failures: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -1341,10 +1415,17 @@ impl McpProxyRegistry {
             .into_values()
             .map(|(server, tool_count)| server.status(tool_count))
             .collect::<Vec<_>>();
+        let unavailable_servers = state
+            .failures
+            .iter()
+            .map(|(name, error)| json!({"name": name, "error": error}))
+            .collect::<Vec<_>>();
         json!({
             "configured": self.configured.load(Ordering::Acquire),
             "server_count": servers.len(),
-            "servers": servers
+            "servers": servers,
+            "unavailable_server_count": unavailable_servers.len(),
+            "unavailable_servers": unavailable_servers
         })
     }
 
@@ -1360,8 +1441,9 @@ impl McpProxyRegistry {
             });
         }
 
+        let mut connected_results = Vec::new();
         while let Some(joined) = tasks.join_next().await {
-            let Ok((server_name, workspace_id, result)) = joined else {
+            let Ok(result) = joined else {
                 append_profile_log(
                     workspace_id,
                     "stderr.log",
@@ -1369,6 +1451,11 @@ impl McpProxyRegistry {
                 );
                 continue;
             };
+            connected_results.push(result);
+        }
+        connected_results.sort_by(|left, right| left.0.cmp(&right.0));
+
+        for (server_name, workspace_id, result) in connected_results {
             match result {
                 Ok((server, catalog)) => {
                     let mut added = 0usize;
@@ -1444,18 +1531,27 @@ impl McpProxyRegistry {
                         &workspace_id,
                         "stdout.log",
                         &format!(
-                            "[mcp-proxy:{server_name}] connected; discovered={} filtered={} max_tools_truncated={} merged={added}",
+                            "[mcp-proxy:{server_name}] connected; exposure_mode={} selection_source={} discovered={} filtered={} max_tools_truncated={} merged={added}",
+                            server.spec.exposure_mode.label(),
+                            catalog.selection_source,
                             catalog.discovered_count,
                             catalog.filtered_count,
                             catalog.truncated_count
                         ),
                     );
                 }
-                Err(error) => append_profile_log(
-                    &workspace_id,
-                    "stderr.log",
-                    &format!("[mcp-proxy:{server_name}] unavailable: {error}"),
-                ),
+                Err(error) => {
+                    self.state
+                        .write()
+                        .expect("mcp proxy registry write")
+                        .failures
+                        .insert(server_name.clone(), error.clone());
+                    append_profile_log(
+                        &workspace_id,
+                        "stderr.log",
+                        &format!("[mcp-proxy:{server_name}] unavailable: {error}"),
+                    );
+                }
             }
         }
         self.state
@@ -1680,6 +1776,10 @@ impl ProxyServer {
             .iter()
             .map(|tool| tool.downstream_name.clone())
             .collect();
+        let discovered_tool_count = catalog.discovered_count;
+        let filtered_tool_count = catalog.filtered_count;
+        let truncated_tool_count = catalog.truncated_count;
+        let selection_source = catalog.selection_source;
         let max_concurrent_requests = spec.max_concurrent_requests;
         Ok((
             Arc::new(Self {
@@ -1687,6 +1787,10 @@ impl ProxyServer {
                 workspace_id,
                 catalog_digest,
                 downstream_tools,
+                discovered_tool_count,
+                filtered_tool_count,
+                truncated_tool_count,
+                selection_source,
                 client: Mutex::new(Some(client)),
                 session_id: StdMutex::new(Uuid::new_v4().to_string()),
                 concurrency: Semaphore::new(max_concurrent_requests),
@@ -2408,6 +2512,12 @@ impl ProxyServer {
             "client": client_status,
             "reconnect_scheduled": self.reconnect_scheduled.load(Ordering::Acquire),
             "tool_count": tool_count,
+            "selected_downstream_tool_count": self.downstream_tools.len(),
+            "discovered_tool_count": self.discovered_tool_count,
+            "filtered_tool_count": self.filtered_tool_count,
+            "truncated_tool_count": self.truncated_tool_count,
+            "exposure_mode": self.spec.exposure_mode.label(),
+            "selection_source": self.selection_source,
             "max_concurrent_requests": self.spec.max_concurrent_requests,
             "in_flight_requests": self.spec.max_concurrent_requests.saturating_sub(available_slots),
             "available_slots": available_slots,
@@ -3797,6 +3907,15 @@ pub fn parse_mcp_proxy_config(
             .transpose()?;
         let exclude_tools =
             parse_configured_tool_names(&name, "excludeTools", config.exclude_tools)?;
+        let exposure_mode = match config.exposure_mode.as_deref().unwrap_or("auto") {
+            "auto" => ProxyExposureMode::Auto,
+            "full" => ProxyExposureMode::Full,
+            other => {
+                return Err(format!(
+                    "MCP server `{name}` exposureMode must be `auto` or `full`, got `{other}`"
+                ));
+            }
+        };
         if config
             .max_tools
             .is_some_and(|maximum| maximum > MAX_PROXY_TOOLS_PER_SERVER)
@@ -3829,6 +3948,7 @@ pub fn parse_mcp_proxy_config(
             include_tools,
             exclude_tools,
             max_tools: config.max_tools,
+            exposure_mode,
             max_concurrent_requests,
             request_timeout: Duration::from_secs(
                 config
@@ -4007,7 +4127,7 @@ mod tests {
         proxy_catalog_digest, proxy_connection_status, proxy_failure_reason,
         proxy_management_tools, proxy_page_state, proxy_result_state_summary,
         sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
-        McpProxyTransportSpec, ProxyClientError, StdioMcpProxyClient,
+        McpProxyTransportSpec, ProxyClientError, ProxyExposureMode, StdioMcpProxyClient,
     };
 
     fn test_spec() -> McpProxyServerSpec {
@@ -4022,6 +4142,7 @@ mod tests {
             include_tools: None,
             exclude_tools: BTreeSet::new(),
             max_tools: None,
+            exposure_mode: ProxyExposureMode::Full,
             max_concurrent_requests: 4,
             request_timeout: Duration::from_secs(5),
             management_tools: false,
@@ -4244,6 +4365,26 @@ mod tests {
         let validator = jsonschema::validator_for(&catalog.tools[0].input_schema).unwrap();
         assert!(validator.validate(&json!({"path": "README.md"})).is_ok());
         assert!(validator.validate(&json!({"unknown": true})).is_err());
+    }
+
+    #[test]
+    fn proxy_catalog_bounds_untrusted_title_and_description_metadata() {
+        let catalog = sanitize_proxy_catalog(
+            &test_spec(),
+            vec![json!({
+                "name": "verbose",
+                "title": "标".repeat(300),
+                "description": "述".repeat(3000),
+                "inputSchema": {"type": "object", "properties": {}}
+            })],
+        )
+        .expect("bounded metadata catalog");
+        let definition = &catalog.tools[0].definition;
+        assert!(definition["title"].as_str().unwrap().len() <= 256);
+        let description = definition["description"].as_str().unwrap();
+        assert!(description.starts_with("[test] "));
+        assert!(description.len() <= 2048 + "[test] ".len());
+        assert!(description.is_char_boundary(description.len()));
     }
 
     #[test]
@@ -4595,6 +4736,61 @@ mod tests {
     }
 
     #[test]
+    fn automatic_generic_exposure_requires_policy_for_high_fanout_catalogs() {
+        let mut spec = test_spec();
+        spec.exposure_mode = ProxyExposureMode::Auto;
+        let tools = (0..25)
+            .map(|index| raw_proxy_tool(&format!("tool_{index:02}")))
+            .collect::<Vec<_>>();
+
+        let error = sanitize_proxy_catalog(&spec, tools).expect_err("unbounded catalog");
+        assert!(error.contains("without an explicit exposure policy"));
+        assert!(error.contains("limited to 24"));
+
+        spec.exposure_mode = ProxyExposureMode::Full;
+        let tools = (0..25)
+            .map(|index| raw_proxy_tool(&format!("tool_{index:02}")))
+            .collect::<Vec<_>>();
+        let catalog = sanitize_proxy_catalog(&spec, tools).expect("explicit full catalog");
+        assert_eq!(catalog.tools.len(), 25);
+        assert_eq!(catalog.selection_source, "explicit_full");
+    }
+
+    #[test]
+    fn automatic_browser_exposure_keeps_the_default_workflow_and_filters_low_frequency_tools() {
+        let mut spec = test_spec();
+        spec.command = "my-agent-browser".into();
+        spec.exposure_mode = ProxyExposureMode::Auto;
+        let catalog = sanitize_proxy_catalog(
+            &spec,
+            vec![
+                raw_proxy_tool("list_pages"),
+                raw_proxy_tool("navigate_page"),
+                raw_proxy_tool("take_snapshot"),
+                raw_proxy_tool("click"),
+                raw_proxy_tool("lighthouse_audit"),
+                raw_proxy_tool("take_heapsnapshot"),
+            ],
+        )
+        .expect("browser workflow catalog");
+
+        let names = catalog
+            .tools
+            .iter()
+            .map(|tool| tool.downstream_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            ["click", "list_pages", "navigate_page", "take_snapshot"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(catalog.selection_source, "browser_workflow");
+        assert_eq!(catalog.discovered_count, 6);
+        assert_eq!(catalog.filtered_count, 2);
+    }
+
+    #[test]
     fn proxy_catalog_rejects_missing_include_tools_entries() {
         let mut spec = test_spec();
         spec.include_tools = Some(["missing"].into_iter().map(str::to_string).collect());
@@ -4822,6 +5018,7 @@ mod tests {
 
         let spec = &specs[0];
         assert_eq!(spec.max_tools, Some(2));
+        assert_eq!(spec.exposure_mode, ProxyExposureMode::Auto);
         assert_eq!(spec.max_concurrent_requests, 3);
         assert!(spec
             .include_tools
@@ -4944,6 +5141,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    exposure_mode: ProxyExposureMode::Full,
                     max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(3),
                     management_tools: true,
@@ -4951,6 +5149,13 @@ for raw in sys.stdin:
                 "browser-health-error-test",
             )
             .await;
+
+        let status = registry.status();
+        let server = &status["servers"][0];
+        assert_eq!(server["exposure_mode"], "full");
+        assert_eq!(server["selection_source"], "explicit_full");
+        assert_eq!(server["discovered_tool_count"], 1);
+        assert_eq!(server["selected_downstream_tool_count"], 1);
 
         let health = registry
             .call_tool("browser__health_check", &json!({}))
@@ -5092,6 +5297,13 @@ for raw in sys.stdin:
         .expect_err("excessive maxTools");
         assert!(excessive.contains("maxTools must be at most 256"));
 
+        let invalid_exposure = parse_mcp_proxy_config(
+            r#"{"mcpServers":{"browser":{"command":"browser-mcp","exposureMode":"everything"}}}"#,
+            Path::new("/tmp/example"),
+        )
+        .expect_err("invalid exposure mode");
+        assert!(invalid_exposure.contains("exposureMode must be `auto` or `full`"));
+
         let invalid_concurrency = parse_mcp_proxy_config(
             r#"{"mcpServers":{"browser":{"command":"browser-mcp","maxConcurrentRequests":0}}}"#,
             Path::new("/tmp/example"),
@@ -5139,6 +5351,92 @@ for raw in sys.stdin:
             configured.configure(Vec::new(), "readiness-test").await;
         });
         assert!(registry.wait_until_configured(Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn proxy_status_surfaces_unavailable_servers_and_governance_failures() {
+        let registry = McpProxyRegistry::default();
+        registry
+            .state
+            .write()
+            .expect("proxy registry state")
+            .failures
+            .insert(
+                "large-catalog".into(),
+                "automatic exposure is limited to 24".into(),
+            );
+
+        let status = registry.status();
+        assert_eq!(status["server_count"], 0);
+        assert_eq!(status["unavailable_server_count"], 1);
+        assert_eq!(status["unavailable_servers"][0]["name"], "large-catalog");
+        assert!(status["unavailable_servers"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("limited to 24")));
+    }
+
+    #[tokio::test]
+    async fn concurrent_proxy_merge_resolves_duplicate_public_names_by_server_name() {
+        let Ok(python) = which::which("python") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("deterministic_merge_mcp.py");
+        fs::write(
+            &script,
+            r#"import json
+import sys
+import time
+
+server_name = sys.argv[1]
+delay = float(sys.argv[2])
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    request_id = message["id"]
+    method = message.get("method")
+    if method == "initialize":
+        if delay:
+            time.sleep(delay)
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": server_name, "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "ping", "description": server_name, "inputSchema": {"type": "object", "properties": {}}}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .expect("write deterministic merge fixture");
+
+        let make_spec = |name: &str, delay: &str| McpProxyServerSpec {
+            name: name.into(),
+            transport: McpProxyTransportSpec::Stdio,
+            command: python.display().to_string(),
+            args: vec![script.display().to_string(), name.into(), delay.into()],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            tool_prefix: "shared".into(),
+            include_tools: None,
+            exclude_tools: BTreeSet::new(),
+            max_tools: None,
+            exposure_mode: ProxyExposureMode::Full,
+            max_concurrent_requests: 2,
+            request_timeout: Duration::from_secs(5),
+            management_tools: false,
+        };
+
+        let registry = McpProxyRegistry::default();
+        registry
+            .configure(
+                vec![make_spec("zeta", "0"), make_spec("alpha", "0.2")],
+                "deterministic-merge-test",
+            )
+            .await;
+
+        let state = registry.state.read().expect("proxy registry state");
+        let route = state.routes.get("shared__ping").expect("shared ping route");
+        assert_eq!(route.server_name, "alpha");
     }
 
     #[tokio::test]
@@ -5297,6 +5595,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    exposure_mode: ProxyExposureMode::Full,
                     max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
                     management_tools: false,
@@ -5393,6 +5692,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    exposure_mode: ProxyExposureMode::Full,
                     max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(5),
                     management_tools: false,
@@ -5491,6 +5791,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    exposure_mode: ProxyExposureMode::Full,
                     max_concurrent_requests: 2,
                     request_timeout: Duration::from_secs(10),
                     management_tools: false,
@@ -5586,6 +5887,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    exposure_mode: ProxyExposureMode::Full,
                     max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
                     management_tools: false,
@@ -5676,6 +5978,7 @@ for raw in sys.stdin:
                     include_tools: None,
                     exclude_tools: BTreeSet::new(),
                     max_tools: None,
+                    exposure_mode: ProxyExposureMode::Full,
                     max_concurrent_requests: 4,
                     request_timeout: Duration::from_secs(5),
                     management_tools: false,

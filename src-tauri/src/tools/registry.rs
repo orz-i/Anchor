@@ -1,6 +1,25 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 35;
+pub const CATALOG_VERSION: u32 = 36;
+
+const FACADE_NAMES: &[&str] = &[
+    "skill",
+    "git",
+    "task",
+    "slice",
+    "commit_stage",
+    "environment",
+    "cwd",
+];
+
+pub const ENVIRONMENT_OPERATIONS: &[(&str, &str)] = &[
+    ("check", "check_exec_environment"),
+    ("health", "exec_health_check"),
+    ("cost", "command_cost_explain"),
+];
+
+pub const CWD_OPERATIONS: &[(&str, &str)] =
+    &[("get", "get_default_cwd"), ("set", "set_default_cwd")];
 
 pub const SKILL_OPERATIONS: &[(&str, &str)] = &[
     ("list", "list_skills"),
@@ -70,6 +89,8 @@ fn facade_operations(facade: &str) -> Option<&'static [(&'static str, &'static s
         "task" => Some(TASK_OPERATIONS),
         "slice" => Some(SLICE_OPERATIONS),
         "commit_stage" => Some(COMMIT_STAGE_OPERATIONS),
+        "environment" => Some(ENVIRONMENT_OPERATIONS),
+        "cwd" => Some(CWD_OPERATIONS),
         _ => None,
     }
 }
@@ -79,14 +100,12 @@ pub fn is_facade_tool(name: &str) -> bool {
 }
 
 pub fn facade_for_operation_tool(name: &str) -> Option<&'static str> {
-    ["skill", "git", "task", "slice", "commit_stage"]
-        .into_iter()
-        .find(|facade| {
-            facade_operations(facade)
-                .into_iter()
-                .flatten()
-                .any(|(_, tool)| *tool == name)
-        })
+    FACADE_NAMES.iter().copied().find(|facade| {
+        facade_operations(facade)
+            .into_iter()
+            .flatten()
+            .any(|(_, tool)| *tool == name)
+    })
 }
 
 pub fn is_facade_operation_tool(name: &str) -> bool {
@@ -122,6 +141,22 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "Agent Skill",
         "[anchor-core anchor-skill] Discover and load workspace Agent Skills through one read-only MCP tool for hosts such as ChatGPT Developer Mode that reliably discover tools but may not surface native Skill UI. Use operation=list to find a relevant Skill, operation=get before following its instructions, and operation=read_resource only for supporting files needed by that Skill.",
         true,
+        false,
+        false,
+    ),
+    (
+        "environment",
+        "Environment",
+        "[anchor-command] Inspect the execution environment through one read-only domain tool. Set operation to check, health, or cost; operation-specific arguments are validated against the existing command contracts.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "cwd",
+        "Working directory",
+        "[anchor-core] Read or update the session-scoped default working directory through one domain tool. Set operation to get or set; profile permissions remain enforced per operation.",
+        false,
         false,
         false,
     ),
@@ -747,6 +782,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
+    "environment",
+    "cwd",
     "check_exec_environment",
     "command_cost_explain",
     "get_default_cwd",
@@ -786,6 +823,8 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "list_skills",
     "load_skill",
     "read_skill_resource",
+    "environment",
+    "cwd",
     "check_exec_environment",
     "command_cost_explain",
     "get_default_cwd",
@@ -817,6 +856,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "history_session_bootstrap",
     "history_session_checkpoint",
     "history_session_validate",
+    "cwd",
     "apply_patch",
     "remove_path",
     "exec_command",
@@ -1289,6 +1329,19 @@ pub fn output_schema(name: &str) -> Value {
                         "properties": {
                             "configured": { "type": "boolean" },
                             "server_count": { "type": "integer", "minimum": 0 },
+                            "unavailable_server_count": { "type": "integer", "minimum": 0 },
+                            "unavailable_servers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string", "minLength": 1 },
+                                        "error": { "type": "string", "minLength": 1 }
+                                    },
+                                    "required": ["name", "error"],
+                                    "additionalProperties": false
+                                }
+                            },
                             "servers": {
                                 "type": "array",
                                 "items": {
@@ -1297,7 +1350,7 @@ pub fn output_schema(name: &str) -> Value {
                                 }
                             }
                         },
-                        "required": ["configured", "server_count", "servers"],
+                        "required": ["configured", "server_count", "servers", "unavailable_server_count", "unavailable_servers"],
                         "additionalProperties": false
                     },
                     "connection_layers": { "type": "object" }
@@ -3551,11 +3604,13 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 26);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"git"));
         assert!(names.contains(&"task"));
         assert!(names.contains(&"skill"));
+        assert!(names.contains(&"environment"));
+        assert!(names.contains(&"cwd"));
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"history_session_validate"));
@@ -3566,7 +3621,10 @@ mod tests {
         assert!(names.contains(&"browser_build_info"));
         assert!(names.contains(&"browser_wait_for_build"));
         assert!(names.contains(&"search_text"));
-        assert!(names.contains(&"command_cost_explain"));
+        assert!(!names.contains(&"command_cost_explain"));
+        assert!(!names.contains(&"check_exec_environment"));
+        assert!(!names.contains(&"get_default_cwd"));
+        assert!(!names.contains(&"set_default_cwd"));
         assert!(names.contains(&"remove_path"));
         assert!(!names.contains(&"request_permissions"));
         assert!(names.iter().all(|name| !is_facade_operation_tool(name)));
@@ -3703,8 +3761,28 @@ mod tests {
         assert!(!names.contains(&"set_default_cwd"));
         assert!(!names.contains(&"apply_patch"));
         assert!(!names.contains(&"exec_command"));
-        assert!(names.contains(&"get_default_cwd"));
+        assert!(!names.contains(&"get_default_cwd"));
+        assert!(names.contains(&"environment"));
+        assert!(names.contains(&"cwd"));
         assert!(names.contains(&"read_file"));
+
+        let cwd = tools
+            .iter()
+            .find(|tool| tool["name"] == "cwd")
+            .expect("cwd facade");
+        assert_eq!(
+            cwd["inputSchema"]["properties"]["operation"]["enum"],
+            json!(["get"])
+        );
+
+        let environment = tools
+            .iter()
+            .find(|tool| tool["name"] == "environment")
+            .expect("environment facade");
+        assert_eq!(
+            environment["inputSchema"]["properties"]["operation"]["enum"],
+            json!(["check", "cost"])
+        );
 
         let git = tools
             .iter()
@@ -3762,6 +3840,17 @@ mod tests {
         assert!(advanced_names.contains("task"));
         assert!(advanced_names.contains("slice"));
         assert!(advanced_names.contains("commit_stage"));
+        assert!(advanced_names.contains("environment"));
+        assert!(advanced_names.contains("cwd"));
+        for hidden_leaf in [
+            "check_exec_environment",
+            "exec_health_check",
+            "command_cost_explain",
+            "get_default_cwd",
+            "set_default_cwd",
+        ] {
+            assert!(!advanced_names.contains(hidden_leaf));
+        }
         for facade in ["task", "slice", "commit_stage"] {
             let tool = advanced
                 .iter()

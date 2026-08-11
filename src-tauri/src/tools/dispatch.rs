@@ -1975,7 +1975,8 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
             &mut git
         } else if matches!(
             *tool,
-            "exec_command"
+            "environment"
+                | "exec_command"
                 | "exec_health_check"
                 | "wait_command"
                 | "list_command_sessions"
@@ -2025,7 +2026,10 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
             || tool.ends_with("__reset_session")
         {
             &mut browser_proxy
-        } else if matches!(*tool, "server_info" | "get_default_cwd" | "set_default_cwd") {
+        } else if matches!(
+            *tool,
+            "server_info" | "cwd" | "get_default_cwd" | "set_default_cwd"
+        ) {
             &mut service
         } else {
             &mut workspace

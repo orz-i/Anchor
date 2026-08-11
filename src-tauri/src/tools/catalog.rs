@@ -260,7 +260,7 @@ fn enforce_chatgpt_catalog_budget(
             "estimated_tokens": estimated_tokens,
             "budget": catalog_budget_value(),
             "suggestions": [
-                "Set includeTools, excludeTools, or maxTools on downstream MCP servers",
+                "Use downstream exposureMode=auto with includeTools/maxTools, or reduce an explicit full catalog",
                 "Use the core or read-only Anchor tool profile",
                 "Restart Anchor and refresh or recreate the ChatGPT app after reducing the catalog"
             ]
@@ -534,7 +534,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 28);
+        assert_eq!(catalog.local_count, 26);
         assert_eq!(catalog.proxy_count, CORE_BROWSER_PROXY_SUFFIXES.len());
         assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
             !tool["name"]
@@ -558,9 +558,9 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 28);
+        assert_eq!(catalog.local_count, 26);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 36);
+        assert_eq!(catalog.tools.len(), 34);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
@@ -673,12 +673,12 @@ mod tests {
 
     #[test]
     fn advanced_with_default_browser_keeps_skill_facade_in_first_64_entries() {
-        let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(32))
+        let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(21))
             .expect("advanced plus default browser catalog");
-        assert_eq!(catalog.local_count, 33);
-        assert_eq!(catalog.proxy_count, 32);
-        assert_eq!(catalog.tools.len(), 65);
-        assert!(catalog.tools[..64]
+        assert_eq!(catalog.local_count, 30);
+        assert_eq!(catalog.proxy_count, 21);
+        assert_eq!(catalog.tools.len(), 51);
+        assert!(catalog.tools[..catalog.tools.len().min(64)]
             .iter()
             .any(|tool| tool["name"] == "skill"));
         assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
