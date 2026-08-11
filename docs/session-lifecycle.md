@@ -97,6 +97,8 @@ completed
 
 Checkpoint 可通过 `session_status` 修改状态。再次使用相同 `session_key` bootstrap 一个 `paused` 或 `completed` Session 时，服务器只更新 `Updated` 和 `Status` 元数据，将其重新激活为 `active`；既有 checkpoint 和继承摘要保持不变。
 
+显式 `history_session_checkpoint` 属于 History 元数据持久化，不是业务工作树 mutation。它按 `session_key + expected_path + workspace_root` 定位 History store，不继承 workspace 默认 Task，也不要求 unrelated Task 的 Git/worktree baseline 当前。这样在 `complete_work_session` 已关闭并解绑原 Task 后，即使工作区还有其他 stale peer Task，后续 History checkpoint 仍可独立保存；同样，worktree Task 的 checkpoint 仍写入主工作区 History store，而不会把 worktree expected branch 与主 checkout 交叉比较。该隔离不会放宽 retained-command 约束：当前调用方拥有 running 或 terminal-unconsumed command 时，checkpoint 仍返回 `HISTORY_COMMAND_RESULTS_PENDING`。
+
 ### 单次 Checkpoint 内容预算
 
 | 字段 | 限制 |

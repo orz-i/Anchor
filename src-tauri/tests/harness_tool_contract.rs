@@ -34,6 +34,148 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
+fn bound_worktree_history_checkpoint_uses_primary_history_store_without_task_baseline_gate() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "worktree history checkpoint\n").expect("写入文件");
+    fs::write(
+        workspace.join(".gitignore"),
+        "/.anchor/worktrees/\n/docs/history-session/\n",
+    )
+    .expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let caller = "worktree-history-checkpoint-session";
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "验证 worktree Task 的 History checkpoint 路由",
+            "session_key": "worktree-history-checkpoint",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": false
+        }),
+        caller,
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    assert_eq!(started["work_session"]["workspace_mode"], "worktree");
+
+    let checkpoint = call_tool_for_session(
+        &ctx,
+        "history_session_checkpoint",
+        &json!({
+            "workspace_root": workspace.to_string_lossy(),
+            "session_key": started["history"]["session_key"],
+            "expected_path": started["history"]["current_path"],
+            "turn_id": "worktree-history-checkpoint",
+            "user_intent": "persist metadata in the primary History store",
+            "session_status": "active"
+        }),
+        caller,
+    );
+    assert_eq!(checkpoint["ok"], true, "{checkpoint}");
+    assert_eq!(
+        checkpoint["path"], started["history"]["current_path"],
+        "History metadata remains in the primary workspace store"
+    );
+}
+
+#[test]
+fn unbound_history_checkpoint_does_not_inherit_unrelated_default_task_baseline() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join(".gitignore"), "/docs/history-session/\n").expect("写入 ignore");
+    fs::write(workspace.join("README.md"), "initial\n").expect("写入 README");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    // This models the post-close state: the History Session remains addressable by its
+    // stable key/path, while the caller has no writable Task binding and another Task is
+    // the workspace default writer.
+    let history = call_tool(
+        &ctx,
+        "history_session_bootstrap",
+        &json!({
+            "session_key": "checkpoint-after-close-routing",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+    );
+    assert_eq!(history["ok"], true, "{history}");
+    let peer = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "unrelated default peer task"}),
+    );
+    assert_eq!(peer["ok"], true, "{peer}");
+    let peer_id = peer["task"]["id"].as_str().expect("peer task id");
+    let expected_before = ctx
+        .harness
+        .task(peer_id)
+        .expect("peer task")
+        .expected_state
+        .worktree_fingerprint;
+
+    fs::write(workspace.join("README.md"), "external drift\n").expect("制造 peer stale baseline");
+
+    let checkpoint = call_tool(
+        &ctx,
+        "history_session_checkpoint",
+        &json!({
+            "workspace_root": workspace.to_string_lossy(),
+            "session_key": history["session_key"],
+            "expected_path": history["current_path"],
+            "turn_id": "checkpoint-after-close-routing",
+            "user_intent": "persist History metadata without inheriting a peer Task baseline",
+            "session_status": "active"
+        }),
+    );
+    assert_eq!(checkpoint["ok"], true, "{checkpoint}");
+
+    let peer_after = ctx
+        .harness
+        .task(peer_id)
+        .expect("peer task after checkpoint");
+    assert_eq!(
+        peer_after.expected_state.worktree_fingerprint, expected_before,
+        "History checkpoint must not silently accept or refresh the unrelated peer baseline"
+    );
+
+    let peer_history_operations = call_tool(
+        &ctx,
+        "operation_log",
+        &json!({
+            "task_id": peer_id,
+            "tool": "history_session_checkpoint",
+            "limit": 20
+        }),
+    );
+    assert_eq!(
+        peer_history_operations["ok"], true,
+        "{peer_history_operations}"
+    );
+    assert_eq!(peer_history_operations["total_matches"], 0);
+
+    let peer_write = call_tool(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: should-not-write.txt\n+blocked\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(peer_write["ok"], false, "{peer_write}");
+    assert!(matches!(
+        peer_write["error"]["code"].as_str(),
+        Some("FILE_CHANGED_EXTERNALLY" | "BASELINE_STALE")
+    ));
+}
+
+#[test]
 fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

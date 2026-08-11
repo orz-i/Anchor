@@ -343,6 +343,10 @@ fn tasks_share_write_domain(
     }
 }
 
+fn requires_workspace_mutation_guard(name: &str, args: &Value) -> bool {
+    requires_write_baseline(name, args) || name == "history_session_checkpoint"
+}
+
 fn worktree_remove_task_conflict(ctx: &ToolContext, args: &Value) -> Option<Value> {
     let raw_path = args.get("path").and_then(Value::as_str)?;
     let candidate = {
@@ -458,15 +462,8 @@ fn policy_alternatives(message: &str) -> Vec<Value> {
 
 fn advances_expected_state(name: &str, output: &Value) -> bool {
     match name {
-        "apply_patch"
-        | "history_session_checkpoint"
-        | "git_stage"
-        | "git_commit"
-        | "git_restore"
-        | "git_reset"
-        | "git_revert"
-        | "git_clean"
-        | "remove_path" => true,
+        "apply_patch" | "git_stage" | "git_commit" | "git_restore" | "git_reset" | "git_revert"
+        | "git_clean" | "remove_path" => true,
         "exec_command" => command_output_is_terminal(output),
         _ => false,
     }
@@ -1071,8 +1068,8 @@ fn call_tool_impl(
             );
         }
     }
-    let _workspace_mutation_guard =
-        requires_write_baseline(name, &effective_args).then(|| ctx.workspace_mutation_guard());
+    let _workspace_mutation_guard = requires_workspace_mutation_guard(name, &effective_args)
+        .then(|| ctx.workspace_mutation_guard());
 
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
         let active_task = selected_task.clone();
@@ -1657,6 +1654,12 @@ fn resolve_task_for_call(
     if name == "begin_work_session" {
         return ctx.bound_task_for_session(mcp_session_id);
     }
+    if name == "history_session_checkpoint" {
+        // History persistence is keyed by session_key + expected_path and lives in the
+        // primary workspace metadata store. It must never auto-bind an unbound/closed
+        // caller to the workspace's default peer Task merely because that Task is active.
+        return ctx.bound_task_for_session(mcp_session_id);
+    }
     if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
         if let Ok(task) = ctx.harness.task(task_id) {
             return Some(task);
@@ -1678,17 +1681,8 @@ fn resolve_task_for_call(
 
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
-        "exec_command"
-        | "history_session_checkpoint"
-        | "stage_commit"
-        | "wait_stage_commit"
-        | "remove_path"
-        | "git_stage"
-        | "git_commit"
-        | "git_restore"
-        | "git_reset"
-        | "git_revert"
-        | "git_clean" => true,
+        "exec_command" | "stage_commit" | "wait_stage_commit" | "remove_path" | "git_stage"
+        | "git_commit" | "git_restore" | "git_reset" | "git_revert" | "git_clean" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
