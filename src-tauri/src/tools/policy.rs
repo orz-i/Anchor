@@ -824,28 +824,40 @@ fn interpreter_mutation_pattern() -> &'static regex::Regex {
 }
 
 fn command_parts_contain_external_path(parts: &[String]) -> bool {
+    let command = parts
+        .first()
+        .map(|part| command_stem(part))
+        .unwrap_or_default();
     let inline_source_index = inline_source_argument_index(parts);
     parts.iter().enumerate().any(|(index, argument)| {
         if inline_source_index == Some(index) {
             inline_source_contains_external_path(argument)
+        } else if index > 0 && is_windows_slash_switch_for_command(&command, argument) {
+            false
         } else {
             text_contains_external_path(argument)
         }
     })
 }
 
-fn inline_source_argument_index(parts: &[String]) -> Option<usize> {
-    let executable = parts
-        .first()?
+fn command_stem(executable: &str) -> String {
+    let executable = executable
         .rsplit(['/', '\\'])
-        .next()?
+        .next()
+        .unwrap_or(executable)
         .to_ascii_lowercase();
-    let stem = executable
+    executable
         .strip_suffix(".exe")
         .or_else(|| executable.strip_suffix(".cmd"))
         .or_else(|| executable.strip_suffix(".bat"))
-        .unwrap_or(&executable);
-    let switches: &[&str] = match stem {
+        .or_else(|| executable.strip_suffix(".ps1"))
+        .unwrap_or(&executable)
+        .to_string()
+}
+
+fn inline_source_argument_index(parts: &[String]) -> Option<usize> {
+    let stem = command_stem(parts.first()?);
+    let switches: &[&str] = match stem.as_str() {
         "python" | "python3" | "py" => &["-c"],
         "node" | "deno" | "bun" => &["-e", "--eval"],
         "powershell" | "pwsh" => &["-command", "-c"],
@@ -950,9 +962,7 @@ fn text_contains_external_path(text: &str) -> bool {
     let normalized = text.replace('\\', "/");
     let posix_absolute = POSIX_ABSOLUTE_PATH_PATTERN
         .get_or_init(|| regex::Regex::new(r#"(?i)(^|["'\s])(/[^\s"']*)"#).expect("valid regex"))
-        .captures_iter(&normalized)
-        .filter_map(|captures| captures.get(2).map(|value| value.as_str()))
-        .any(|value| !is_windows_command_switch(value));
+        .is_match(&normalized);
     normalized == ".."
         || normalized.contains("../")
         || posix_absolute
@@ -961,22 +971,117 @@ fn text_contains_external_path(text: &str) -> bool {
             .is_match(&normalized)
 }
 
-fn is_windows_command_switch(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "/a" | "/c"
-            | "/d"
-            | "/e:off"
-            | "/e:on"
-            | "/f:off"
-            | "/f:on"
-            | "/k"
-            | "/q"
-            | "/s"
-            | "/u"
-            | "/v:off"
-            | "/v:on"
-    )
+#[cfg(windows)]
+fn is_windows_slash_switch_for_command(command: &str, value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    match command {
+        "cmd" => matches!(
+            value.as_str(),
+            "/a" | "/c"
+                | "/d"
+                | "/e:off"
+                | "/e:on"
+                | "/f:off"
+                | "/f:on"
+                | "/k"
+                | "/q"
+                | "/s"
+                | "/u"
+                | "/v:off"
+                | "/v:on"
+        ),
+        "find" => matches!(
+            value.as_str(),
+            "/v" | "/c" | "/n" | "/i" | "/off" | "/offline" | "/?"
+        ),
+        "findstr" => {
+            matches!(
+                value.as_str(),
+                "/b" | "/e"
+                    | "/l"
+                    | "/r"
+                    | "/s"
+                    | "/i"
+                    | "/x"
+                    | "/v"
+                    | "/n"
+                    | "/m"
+                    | "/o"
+                    | "/p"
+                    | "/off"
+                    | "/offline"
+                    | "/?"
+            ) || ["/a:", "/f:", "/c:", "/g:", "/d:"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        }
+        "dir" => {
+            matches!(
+                value.as_str(),
+                "/a" | "/b"
+                    | "/c"
+                    | "/d"
+                    | "/l"
+                    | "/n"
+                    | "/o"
+                    | "/p"
+                    | "/q"
+                    | "/r"
+                    | "/s"
+                    | "/t"
+                    | "/w"
+                    | "/x"
+                    | "/4"
+                    | "/-c"
+                    | "/?"
+            ) || ["/a:", "/o:", "/t:"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        }
+        "msbuild" => [
+            "/bl",
+            "/binarylogger",
+            "/clp",
+            "/consoleloggerparameters",
+            "/dl",
+            "/distributedlogger",
+            "/ds",
+            "/detailedsummary",
+            "/fl",
+            "/filelogger",
+            "/flp",
+            "/fileloggerparameters",
+            "/graphbuild",
+            "/isolateprojects",
+            "/m",
+            "/maxcpucount",
+            "/noconlog",
+            "/noconsolelogger",
+            "/noautoresponse",
+            "/nr",
+            "/nodereuse",
+            "/p",
+            "/property",
+            "/restore",
+            "/t",
+            "/target",
+            "/tl",
+            "/terminallogger",
+            "/v",
+            "/verbosity",
+            "/version",
+            "/warnaserror",
+            "/warnasmessage",
+        ]
+        .iter()
+        .any(|switch| value == *switch || value.starts_with(&format!("{switch}:"))),
+        _ => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn is_windows_slash_switch_for_command(_command: &str, _value: &str) -> bool {
+    false
 }
 
 fn command_targets_protected_repository_asset(command: &str) -> bool {
@@ -1089,6 +1194,43 @@ mod tests {
                 validate_command_for_workspace(&json!({"cmd": command}), &policy, Some(&workspace))
                     .expect_err("real external file access must remain blocked");
             assert!(error.0.contains("WORKSPACE_PATH_PROTECTED"), "{error}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strict_workspace_distinguishes_windows_switches_from_external_paths() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let workspace = Workspace::new(dir.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(true);
+        let policy = PolicySettings::default();
+
+        for command in [
+            r#"find /n "needle" src-tauri/src/tools/policy.rs"#,
+            r#"cmd /d /c echo local"#,
+            r#"dir /s src-tauri"#,
+            r#"msbuild /t:Build src-tauri/app.sln"#,
+        ] {
+            validate_command_for_workspace(&json!({"cmd": command}), &policy, Some(&workspace))
+                .unwrap_or_else(|error| {
+                    panic!("Windows switch should not be treated as a path: {command}: {error}")
+                });
+        }
+
+        for command in [
+            r#"find /n "needle" C:\outside.txt"#,
+            r#"cat /tmp/secret"#,
+            r#"git diff -- /tmp/secret"#,
+            r#"cat /c"#,
+        ] {
+            let error =
+                validate_command_for_workspace(&json!({"cmd": command}), &policy, Some(&workspace))
+                    .expect_err("real external path must remain blocked");
+            assert!(
+                error.0.contains("WORKSPACE_PATH_PROTECTED"),
+                "{command}: {error}"
+            );
         }
     }
 
