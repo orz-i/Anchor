@@ -39,8 +39,17 @@ fn parse_service_command(args: &mut VecDeque<String>) -> Result<ServiceCommand, 
 
 fn parse_service_run(args: &mut VecDeque<String>) -> Result<Command, String> {
     let config_dir = PathBuf::from(pop_value(args, "service-run")?);
+    let owner_sid = args.pop_front();
+    let owner_username = args.pop_front();
+    if owner_sid.is_some() != owner_username.is_some() {
+        return Err("service-run owner SID 与 username 必须同时提供".into());
+    }
     ensure_empty(args, "service-run")?;
-    Ok(Command::ServiceRun { config_dir })
+    Ok(Command::ServiceRun {
+        config_dir,
+        owner_sid,
+        owner_username,
+    })
 }
 
 fn parse_service_admin_run(args: &mut VecDeque<String>) -> Result<Command, String> {
@@ -52,8 +61,15 @@ fn parse_service_admin_run(args: &mut VecDeque<String>) -> Result<Command, Strin
         return Err(format!("service-admin-run 不支持操作：{action}"));
     }
     let config_dir = PathBuf::from(pop_value(args, "service-admin-run")?);
+    let owner_sid = pop_value(args, "service-admin-run")?;
+    let owner_username = pop_value(args, "service-admin-run")?;
     ensure_empty(args, "service-admin-run")?;
-    Ok(Command::ServiceAdminRun { action, config_dir })
+    Ok(Command::ServiceAdminRun {
+        action,
+        config_dir,
+        owner_sid,
+        owner_username,
+    })
 }
 
 pub fn config_usage() -> &'static str {
@@ -904,10 +920,14 @@ pub enum Command {
     Service(ServiceCommand),
     ServiceRun {
         config_dir: PathBuf,
+        owner_sid: Option<String>,
+        owner_username: Option<String>,
     },
     ServiceAdminRun {
         action: String,
         config_dir: PathBuf,
+        owner_sid: String,
+        owner_username: String,
     },
     GatewayDaemonRun {
         config_scope: String,
@@ -1139,12 +1159,30 @@ mod tests {
         let internal = parse(strings(&[
             "service-run",
             r"C:\Users\Demo User\AppData\Roaming\anchor",
+            "S-1-5-21-100-200-300-1001",
+            "Demo User",
         ]))
         .expect("service-run");
         assert_eq!(
             internal.command,
             Command::ServiceRun {
-                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor")
+                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor"),
+                owner_sid: Some("S-1-5-21-100-200-300-1001".into()),
+                owner_username: Some("Demo User".into()),
+            }
+        );
+
+        let legacy = parse(strings(&[
+            "service-run",
+            r"C:\Users\Demo User\AppData\Roaming\anchor",
+        ]))
+        .expect("legacy service-run shape is parsed so runtime can reject it explicitly");
+        assert_eq!(
+            legacy.command,
+            Command::ServiceRun {
+                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor"),
+                owner_sid: None,
+                owner_username: None,
             }
         );
 
@@ -1152,13 +1190,17 @@ mod tests {
             "service-admin-run",
             "install",
             r"C:\Users\Demo User\AppData\Roaming\anchor",
+            "S-1-5-21-100-200-300-1001",
+            "Demo User",
         ]))
         .expect("service-admin-run");
         assert_eq!(
             elevated.command,
             Command::ServiceAdminRun {
                 action: "install".into(),
-                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor")
+                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor"),
+                owner_sid: "S-1-5-21-100-200-300-1001".into(),
+                owner_username: "Demo User".into(),
             }
         );
     }

@@ -321,8 +321,9 @@ pub(crate) fn control_pipe_name(profile_id: &str) -> AppResult<String> {
         .map(Ok)
         .unwrap_or_else(|| platform().app_config_dir())?;
     // Keep the historical per-user pipe identity for upgrade compatibility.
-    // The SCM service injects the configuration owner's username so a
-    // LocalSystem child resolves the same pipe name as the user's GUI.
+    // The SCM supervisor uses the trusted registration owner username when it
+    // addresses the pipe; the owner-token daemon resolves the same username
+    // from its normal user environment.
     let user = crate::windows_service::pipe_identity_user();
     let digest = Sha256::digest(format!("{user}\0{}", config_dir.display()).as_bytes());
     let scope = digest[..8]
@@ -555,6 +556,15 @@ pub fn spawn_with_tunnels(
     }
     if inspection.state.is_some() && !inspection.pid_matches {
         cleanup(profile)?;
+    }
+
+    #[cfg(windows)]
+    if crate::windows_service::in_service_context() {
+        return crate::windows_service::spawn_workspace_daemon_as_owner(
+            profile,
+            service,
+            tunnel_services,
+        );
     }
 
     let log_path = daemon_log_path(&profile.id);

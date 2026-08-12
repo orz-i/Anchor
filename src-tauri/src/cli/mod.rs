@@ -462,6 +462,8 @@ async fn apply_gateway_reload(
 }
 
 async fn run_gateway_daemon(config_scope: &str, workspaces: &[String]) -> AppResult<()> {
+    #[cfg(windows)]
+    crate::logging::redirect_stdio_to_file(&gateway_daemon::daemon_log_path()?)?;
     if config_scope != gateway_daemon::config_scope()? {
         return Err(AppError::Message(
             "Gateway daemon child config scope does not match the active config domain".into(),
@@ -2200,6 +2202,11 @@ async fn run_daemon(
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<()> {
+    // daemon-run is an internal child entrypoint; all managed spawn paths pass
+    // the canonical workspace id as selector. Redirect before DataStore load so
+    // owner-token startup/config failures remain observable in daemon.log.
+    #[cfg(windows)]
+    crate::logging::redirect_stdio_to_file(&daemon::daemon_log_path(selector))?;
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
     let _guard = daemon::acquire_with_tunnels(&profile, service, tunnel_services)?;
@@ -2319,10 +2326,19 @@ pub fn run() -> i32 {
         std::env::set_var(crate::brand::CONFIG_DIR_ENV, absolute);
     }
 
-    if let Command::ServiceRun { config_dir } = &parsed.command {
+    if let Command::ServiceRun {
+        config_dir,
+        owner_sid,
+        owner_username,
+    } = &parsed.command
+    {
         #[cfg(windows)]
         {
-            return match crate::windows_service::run_service_dispatcher(config_dir.clone()) {
+            return match crate::windows_service::run_service_dispatcher(
+                config_dir.clone(),
+                owner_sid.clone(),
+                owner_username.clone(),
+            ) {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!(
@@ -2335,16 +2351,27 @@ pub fn run() -> i32 {
         }
         #[cfg(not(windows))]
         {
-            let _ = config_dir;
+            let _ = (config_dir, owner_sid, owner_username);
             eprintln!("错误：service-run 仅支持 Windows");
             return 1;
         }
     }
 
-    if let Command::ServiceAdminRun { action, config_dir } = &parsed.command {
+    if let Command::ServiceAdminRun {
+        action,
+        config_dir,
+        owner_sid,
+        owner_username,
+    } = &parsed.command
+    {
         #[cfg(windows)]
         {
-            return match crate::windows_service::run_admin_action(action, config_dir.clone()) {
+            return match crate::windows_service::run_admin_action(
+                action,
+                config_dir.clone(),
+                owner_sid,
+                owner_username,
+            ) {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!(
@@ -2357,7 +2384,7 @@ pub fn run() -> i32 {
         }
         #[cfg(not(windows))]
         {
-            let _ = (action, config_dir);
+            let _ = (action, config_dir, owner_sid, owner_username);
             eprintln!("错误：service-admin-run 仅支持 Windows");
             return 1;
         }
@@ -2437,13 +2464,15 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::Service(command) => execute_service(command, cli.json),
-        Command::ServiceRun { config_dir } => {
+        Command::ServiceRun { config_dir, .. } => {
             let _ = config_dir;
             Err(AppError::Message(
                 "service-run 必须由 Windows Service Control Manager 入口直接分派".into(),
             ))
         }
-        Command::ServiceAdminRun { action, config_dir } => {
+        Command::ServiceAdminRun {
+            action, config_dir, ..
+        } => {
             let _ = (action, config_dir);
             Err(AppError::Message(
                 "service-admin-run 必须由 Windows UAC helper 入口直接分派".into(),

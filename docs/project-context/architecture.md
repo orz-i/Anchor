@@ -110,6 +110,7 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 
 ### Windows SCM supervisor
 - **职责**: 配置域级开机恢复与操作系统 supervisor；desired state 保存于 `windows-service.json`
+- **权限边界**: SCM supervisor 自身以 LocalSystem 运行，但不再把该令牌继承给 Workspace/Gateway daemon。安装/更新 Service 时将配置 owner SID/username 固定在管理员保护的 SCM `ImagePath`；supervisor 只信任该 registration identity，而不信任用户可写 plan 的 owner 元数据来选择 token。它选择 SID 匹配的 Active Windows 登录会话，使用该用户 primary token 与用户环境启动受管 daemon；owner 未登录或 registration 仍是旧格式时 fail closed，禁止回退为 SYSTEM child
 - **运行身份**: `windows-service-runtime.json` 保存 supervisor PID、启动时间、实际 executable path 与 build identity；状态读取再以 SCM `queryex` PID、存活性和进程镜像路径交叉校验
 - **升级语义**: `service install` 对已运行 Service 是显式 update：先等待旧 supervisor `STOPPED`（其间优雅排空受管 Workspace/Gateway daemon），再从已更新 binPath 启动当前构建并等待 `RUNNING`。GUI “更新服务版本”使用同一路径；普通 GUI/CLI 操作不隐式升级 Service
 

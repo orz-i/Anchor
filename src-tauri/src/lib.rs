@@ -84,20 +84,32 @@ fn acquire_single_instance() -> bool {
 }
 
 #[cfg(all(feature = "desktop", feature = "cli"))]
-fn is_internal_daemon_command(arg: Option<&str>) -> bool {
-    arg.is_some_and(|arg| {
-        matches!(
-            arg,
-            "daemon-run" | "gateway-daemon-run" | "service-run" | "service-admin-run"
-        )
-    })
+fn is_internal_daemon_command(args: impl IntoIterator<Item = String>) -> bool {
+    let mut args = args.into_iter();
+    loop {
+        match args.next().as_deref() {
+            Some("--config-dir") => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            Some("--json") => {}
+            Some(arg) => {
+                return matches!(
+                    arg,
+                    "daemon-run" | "gateway-daemon-run" | "service-run" | "service-admin-run"
+                );
+            }
+            None => return false,
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg(feature = "desktop")]
 pub fn run() {
     #[cfg(feature = "cli")]
-    if is_internal_daemon_command(std::env::args().nth(1).as_deref()) {
+    if is_internal_daemon_command(std::env::args().skip(1)) {
         std::process::exit(cli::run());
     }
     if !acquire_single_instance() {
@@ -194,11 +206,35 @@ mod tests {
 
     #[test]
     fn desktop_binary_dispatches_only_internal_daemon_entrypoints_before_tauri() {
-        assert!(is_internal_daemon_command(Some("daemon-run")));
-        assert!(is_internal_daemon_command(Some("gateway-daemon-run")));
-        assert!(is_internal_daemon_command(Some("service-run")));
-        assert!(is_internal_daemon_command(Some("service-admin-run")));
-        assert!(!is_internal_daemon_command(Some("status")));
-        assert!(!is_internal_daemon_command(None));
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(is_internal_daemon_command(args(&["daemon-run"])));
+        assert!(is_internal_daemon_command(args(&["gateway-daemon-run"])));
+        assert!(is_internal_daemon_command(args(&["service-run"])));
+        assert!(is_internal_daemon_command(args(&["service-admin-run"])));
+        assert!(is_internal_daemon_command(args(&[
+            "--config-dir",
+            r"C:\Users\Demo User\AppData\Roaming\anchor",
+            "daemon-run",
+        ])));
+        assert!(is_internal_daemon_command(args(&[
+            "--json",
+            "--config-dir",
+            r"C:\Users\Demo User\AppData\Roaming\anchor",
+            "gateway-daemon-run",
+        ])));
+        assert!(!is_internal_daemon_command(args(&["status"])));
+        assert!(!is_internal_daemon_command(args(&[
+            "--config-dir",
+            r"C:\Users\Demo User\AppData\Roaming\anchor",
+            "status",
+        ])));
+        assert!(!is_internal_daemon_command(args(&["--config-dir"])));
+        assert!(!is_internal_daemon_command(std::iter::empty()));
     }
 }

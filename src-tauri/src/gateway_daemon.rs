@@ -326,6 +326,10 @@ pub fn spawn(workspace_ids: &[String]) -> AppResult<u32> {
             "Gateway daemon 至少需要一个 workspace route".into(),
         ));
     }
+    #[cfg(windows)]
+    if crate::windows_service::in_service_context() {
+        return crate::windows_service::spawn_gateway_daemon_as_owner(&workspace_ids);
+    }
     let log_path = daemon_log_path()?;
     if let Some(parent) = log_path.parent() {
         ensure_private_dir(parent)?;

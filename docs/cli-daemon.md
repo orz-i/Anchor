@@ -408,7 +408,7 @@ anchor --json service sync
 ## 安全边界
 
 - Workspace 与 Gateway 后台 daemon 都支持 Windows/Linux；Windows 不再需要 process-local Gateway Server 作为正常运行路径；
-- Windows Workspace/Gateway Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；SCM service 的 LocalSystem 子进程通过持久化 owner SID/用户名与用户 GUI 共享同一控制端点身份；Unix UDS 继续使用私有目录/socket 权限；
+- Windows Workspace/Gateway Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；SCM supervisor 本身保持 LocalSystem。安装/更新 Service 时会把配置 owner SID/username 固定到管理员保护的 SCM `ImagePath`，service-run 再以该可信身份匹配 Active Windows 登录会话，并通过 owner primary token + 用户环境启动 Workspace/Gateway daemon。用户可写的 `windows-service.json` 只保存 desired state/展示元数据，不能选择要 impersonate 的 Windows 用户。owner 未登录时 fail closed 并等待后续 reconcile，绝不以 LocalSystem 身份承载 Workspace 命令执行；旧 Service registration 未携带可信 owner 时也会 fail closed，必须先执行 service install/update；Unix UDS 继续使用私有目录/socket 权限；
 - PID 所有权校验失败时拒绝生命周期写操作；Windows additionally 校验 state v2 `executablePath` 与实际 PID 镜像；
 - Windows daemon state 还校验实际进程创建时间必须早于且接近 state 的 `startedAtUnix`，避免跨系统重启后旧 PID 被新的 `anchor-desktop.exe` 实例复用时误判为原 daemon；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；

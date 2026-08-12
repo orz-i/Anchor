@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -31,6 +31,8 @@ const SERVICE_PLAN_LOCK_FILE: &str = ".windows-service.lock";
 const SERVICE_RUNTIME_FILE: &str = "windows-service-runtime.json";
 const SERVICE_RUNTIME_SCHEMA_VERSION: u32 = 1;
 const PIPE_USER_ENV: &str = "ANCHOR_PIPE_USER";
+const SERVICE_OWNER_SID_ENV: &str = "ANCHOR_WINDOWS_SERVICE_OWNER_SID";
+const SERVICE_OWNER_USERNAME_ENV: &str = "ANCHOR_WINDOWS_SERVICE_OWNER_USERNAME";
 const SERVICE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const SERVICE_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -52,6 +54,70 @@ pub struct WindowsWorkspaceAutostart {
     pub service: ServiceSelection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_services: Option<ServiceSelection>,
+}
+
+fn validate_service_owner(owner_sid: &str, owner_username: &str) -> AppResult<()> {
+    let owner_sid = owner_sid.trim();
+    if !valid_sid(owner_sid) {
+        return Err(AppError::Message(
+            "Windows Service owner SID 无效；请从配置 owner 的 Windows 会话重试".into(),
+        ));
+    }
+    if matches!(owner_sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20") {
+        return Err(AppError::Message(
+            "Windows Service owner 不能是 LocalSystem/LocalService/NetworkService；请从实际桌面用户会话安装或更新 Service"
+                .into(),
+        ));
+    }
+    let owner_username = owner_username.trim();
+    if owner_username.is_empty()
+        || owner_username
+            .chars()
+            .any(|ch| ch == '\0' || ch == '\r' || ch == '\n')
+    {
+        return Err(AppError::Message(
+            "Windows Service owner username 无效；请从配置 owner 的 Windows 会话重试".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn trusted_service_owner_sid() -> AppResult<String> {
+    let sid = std::env::var(SERVICE_OWNER_SID_ENV).map_err(|_| {
+        AppError::Message(
+            "Windows Service registration 缺少可信 owner SID；请从配置 owner 会话重新执行 service install/update"
+                .into(),
+        )
+    })?;
+    let sid = sid.trim().to_string();
+    if !valid_sid(&sid) {
+        return Err(AppError::Message(
+            "Windows Service registration 中的 owner SID 无效；请重新执行 service install/update"
+                .into(),
+        ));
+    }
+    Ok(sid)
+}
+
+fn trusted_service_owner_username() -> AppResult<String> {
+    let username = std::env::var(SERVICE_OWNER_USERNAME_ENV).map_err(|_| {
+        AppError::Message(
+            "Windows Service registration 缺少可信 owner username；请从配置 owner 会话重新执行 service install/update"
+                .into(),
+        )
+    })?;
+    let username = username.trim().to_string();
+    if username.is_empty()
+        || username
+            .chars()
+            .any(|ch| ch == '\0' || ch == '\r' || ch == '\n')
+    {
+        return Err(AppError::Message(
+            "Windows Service registration 中的 owner username 无效；请重新执行 service install/update"
+                .into(),
+        ));
+    }
+    Ok(username)
 }
 
 fn service_build_state(
@@ -459,6 +525,13 @@ pub fn pipe_identity_user() -> String {
             return value.trim().to_string();
         }
     }
+    if !in_service_context() {
+        if let Ok(value) = std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
+            if !value.trim().is_empty() {
+                return value.trim().to_string();
+            }
+        }
+    }
     if let Ok(plan) = load_plan() {
         if !plan.owner_username.trim().is_empty() {
             return plan.owner_username;
@@ -477,35 +550,339 @@ fn valid_sid(value: &str) -> bool {
 }
 
 fn current_user_sid() -> AppResult<String> {
-    let mut command = Command::new("whoami.exe");
-    command.args(["/user", "/fo", "csv", "/nh"]);
-    crate::platform::hide_std_console(&mut command);
-    let output = command
-        .output()
-        .map_err(|error| AppError::Message(format!("无法查询当前 Windows SID：{error}")))?;
-    if !output.status.success() {
-        return Err(AppError::Message(format!(
-            "whoami /user 失败：{}",
-            combined_output(&output)
-        )));
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|error| {
+            AppError::Message(format!("无法读取当前 Windows 进程令牌：{error}"))
+        })?;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.split(|ch: char| ch == ',' || ch == '"' || ch.is_whitespace())
-        .map(str::trim)
-        .find(|part| valid_sid(part))
-        .map(str::to_string)
-        .ok_or_else(|| AppError::Message("whoami 未返回可识别的 Windows SID".into()))
+    let token = OwnedWindowsHandle(token);
+    token_user_sid(token.raw())
+}
+
+fn current_user_name() -> AppResult<String> {
+    let username = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .map_err(|_| AppError::Message("无法读取当前 Windows 用户名".into()))?;
+    let username = username.trim().to_string();
+    if username.is_empty()
+        || username
+            .chars()
+            .any(|ch| ch == '\0' || ch == '\r' || ch == '\n')
+    {
+        return Err(AppError::Message("当前 Windows 用户名无效".into()));
+    }
+    Ok(username)
 }
 
 pub fn control_pipe_security_sddl() -> String {
-    let owner_sid = load_plan()
-        .ok()
-        .map(|plan| plan.owner_sid)
-        .filter(|sid| valid_sid(sid));
+    let owner_sid = if in_service_context() {
+        trusted_service_owner_sid().ok()
+    } else {
+        current_user_sid().ok().or_else(|| {
+            load_plan()
+                .ok()
+                .map(|plan| plan.owner_sid)
+                .filter(|sid| valid_sid(sid))
+        })
+    };
     match owner_sid {
         Some(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;GA;;;{sid})"),
         None => "D:P(A;;GA;;;SY)(A;;GA;;;OW)".into(),
     }
+}
+
+pub fn in_service_context() -> bool {
+    std::env::var_os(crate::brand::WINDOWS_SERVICE_CONTEXT_ENV)
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+struct OwnedWindowsHandle(windows::Win32::Foundation::HANDLE);
+
+impl OwnedWindowsHandle {
+    fn raw(&self) -> windows::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedWindowsHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct OwnedEnvironmentBlock(*mut c_void);
+
+impl Drop for OwnedEnvironmentBlock {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = windows::Win32::System::Environment::DestroyEnvironmentBlock(self.0);
+            }
+        }
+    }
+}
+
+fn token_user_sid(token: windows::Win32::Foundation::HANDLE) -> AppResult<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+
+    let mut required = 0_u32;
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut required) };
+    if required == 0 {
+        return Err(AppError::Message(format!(
+            "无法读取 Windows 登录令牌 SID 大小：{}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let word = std::mem::size_of::<usize>();
+    let words = (required as usize).div_ceil(word);
+    let mut buffer = vec![0_usize; words];
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+        .map_err(|error| AppError::Message(format!("无法读取 Windows 登录令牌 SID：{error}")))?;
+    }
+    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut text = PWSTR::null();
+    unsafe {
+        ConvertSidToStringSidW(token_user.User.Sid, &mut text).map_err(|error| {
+            AppError::Message(format!("无法格式化 Windows 登录令牌 SID：{error}"))
+        })?;
+    }
+    let sid = unsafe {
+        let mut len = 0_usize;
+        while *text.0.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text.0, len))
+    };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+    }
+    Ok(sid)
+}
+
+fn process_user_sid(pid: u32) -> AppResult<String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = OwnedWindowsHandle(unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|error| {
+            AppError::Message(format!("无法打开 PID {pid} 查询进程 owner：{error}"))
+        })?
+    });
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(process.raw(), TOKEN_QUERY, &mut token).map_err(|error| {
+            AppError::Message(format!("无法读取 PID {pid} 的 Windows 进程令牌：{error}"))
+        })?;
+    }
+    let token = OwnedWindowsHandle(token);
+    token_user_sid(token.raw())
+}
+
+fn process_is_config_owner(pid: u32) -> AppResult<bool> {
+    Ok(process_user_sid(pid)?.eq_ignore_ascii_case(&trusted_service_owner_sid()?))
+}
+
+fn active_owner_token() -> AppResult<OwnedWindowsHandle> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken,
+        WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
+    };
+
+    let owner_sid = trusted_service_owner_sid()?;
+    let owner_username = trusted_service_owner_username()?;
+
+    let mut sessions = std::ptr::null_mut::<WTS_SESSION_INFOW>();
+    let mut count = 0_u32;
+    unsafe {
+        WTSEnumerateSessionsW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            0,
+            1,
+            &mut sessions,
+            &mut count,
+        )
+        .map_err(|error| AppError::Message(format!("无法枚举 Windows 登录会话：{error}")))?;
+    }
+    struct SessionBuffer(*mut WTS_SESSION_INFOW);
+    impl Drop for SessionBuffer {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { WTSFreeMemory(self.0.cast()) };
+            }
+        }
+    }
+    let _sessions_guard = SessionBuffer(sessions);
+    let sessions = if sessions.is_null() || count == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(sessions, count as usize) }
+    };
+
+    for session in sessions.iter().filter(|session| session.State == WTSActive) {
+        let mut token = HANDLE::default();
+        if unsafe { WTSQueryUserToken(session.SessionId, &mut token) }.is_err() {
+            continue;
+        }
+        let token = OwnedWindowsHandle(token);
+        match token_user_sid(token.raw()) {
+            Ok(sid) if sid.eq_ignore_ascii_case(&owner_sid) => return Ok(token),
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    Err(AppError::Message(format!(
+        "配置 owner {} ({}) 当前没有可用的 Active Windows 登录会话；Service 将等待用户登录后再启动 Workspace/Gateway daemon",
+        owner_username, owner_sid
+    )))
+}
+
+fn quote_windows_arg(value: &str) -> String {
+    if !value.is_empty() && !value.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return value.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0_usize;
+    for ch in value.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+            quoted.push('"');
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+            quoted.push(ch);
+        }
+        backslashes = 0;
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+fn owner_child_command_line(executable: &Path, args: &[String]) -> String {
+    let mut command_line = quote_windows_arg(&executable.display().to_string());
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(&quote_windows_arg(arg));
+    }
+    command_line
+}
+
+fn spawn_as_config_owner(args: Vec<String>, current_dir: &Path, label: &str) -> AppResult<u32> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::System::Environment::CreateEnvironmentBlock;
+    use windows::Win32::System::Threading::{
+        CreateProcessAsUserW, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    let owner_username = trusted_service_owner_username()?;
+    let token = active_owner_token()?;
+    let mut environment = std::ptr::null_mut::<c_void>();
+    unsafe {
+        CreateEnvironmentBlock(&mut environment, Some(token.raw()), false).map_err(|error| {
+            AppError::Message(format!(
+                "无法为配置 owner {} 创建 Windows 用户环境：{error}",
+                owner_username
+            ))
+        })?;
+    }
+    let _environment_guard = OwnedEnvironmentBlock(environment);
+
+    let executable = std::env::current_exe()?;
+    let application = wide_null(&executable.display().to_string());
+    let mut command_line = wide_null(&owner_child_command_line(&executable, &args));
+    let current_dir = wide_null(&current_dir.display().to_string());
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessAsUserW(
+            Some(token.raw()),
+            PCWSTR(application.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            Some(environment as *const c_void),
+            PCWSTR(current_dir.as_ptr()),
+            &startup,
+            &mut process,
+        )
+        .map_err(|error| {
+            AppError::Message(format!(
+                "以配置 owner {} 启动 {label} 失败：{error}",
+                owner_username
+            ))
+        })?;
+        let _ = windows::Win32::Foundation::CloseHandle(process.hThread);
+        let _ = windows::Win32::Foundation::CloseHandle(process.hProcess);
+    }
+    Ok(process.dwProcessId)
+}
+
+pub fn spawn_workspace_daemon_as_owner(
+    profile: &crate::workspace::WorkspaceProfile,
+    service: ServiceSelection,
+    tunnel_services: Option<ServiceSelection>,
+) -> AppResult<u32> {
+    let config_dir = platform().app_config_dir()?;
+    let mut args = vec![
+        "--config-dir".to_string(),
+        config_dir.display().to_string(),
+        "daemon-run".to_string(),
+        profile.id.clone(),
+        "--service".to_string(),
+        service.as_str().to_string(),
+    ];
+    if let Some(tunnels) = tunnel_services {
+        args.push("--tunnel-service".to_string());
+        args.push(tunnels.as_str().to_string());
+    } else {
+        args.push("--no-tunnel".to_string());
+    }
+    spawn_as_config_owner(args, Path::new(&profile.path), "Workspace daemon")
+}
+
+pub fn spawn_gateway_daemon_as_owner(workspace_ids: &[String]) -> AppResult<u32> {
+    let config_dir = platform().app_config_dir()?;
+    let mut args = vec![
+        "--config-dir".to_string(),
+        config_dir.display().to_string(),
+        "gateway-daemon-run".to_string(),
+        gateway_daemon::config_scope()?,
+    ];
+    args.extend(normalized_ids(workspace_ids));
+    spawn_as_config_owner(args, &config_dir, "Gateway daemon")
 }
 
 pub fn set_workspace_desired(
@@ -631,12 +1008,27 @@ pub fn scm_status() -> AppResult<WindowsScmServiceStatus> {
 }
 
 pub fn install_scm_service() -> AppResult<WindowsScmServiceStatus> {
+    let owner_sid = current_user_sid()?;
+    let owner_username = current_user_name()?;
+    install_scm_service_for_owner(&owner_sid, &owner_username)
+}
+
+fn install_scm_service_for_owner(
+    owner_sid: &str,
+    owner_username: &str,
+) -> AppResult<WindowsScmServiceStatus> {
+    validate_service_owner(owner_sid, owner_username)?;
     let existing = load_plan()?;
     if existing.workspaces.is_empty() && existing.gateway_workspace_ids.is_empty() {
         let _ = sync_plan_from_running()?;
-    } else {
-        let _ = mutate_plan(|_| Ok(()))?;
     }
+    let owner_sid = owner_sid.trim().to_string();
+    let owner_username = owner_username.trim().to_string();
+    let _ = mutate_plan(|plan| {
+        plan.owner_sid = owner_sid.clone();
+        plan.owner_username = owner_username.clone();
+        Ok(())
+    })?;
     let config_dir = platform().app_config_dir()?;
     let service_name = service_name_for_dir(&config_dir);
     let service_scope = service_name
@@ -644,7 +1036,7 @@ pub fn install_scm_service() -> AppResult<WindowsScmServiceStatus> {
         .unwrap_or(service_name.as_str());
     let display_name = format!("{SERVICE_DISPLAY_NAME_PREFIX} ({service_scope})");
     let executable = std::env::current_exe()?;
-    let binary_path = service_binary_path(&executable, &config_dir);
+    let binary_path = service_binary_path(&executable, &config_dir, &owner_sid, &owner_username);
     let status = scm_status()?;
     let operation = if status.installed { "config" } else { "create" };
     let mut args = vec![
@@ -726,7 +1118,12 @@ pub fn restart_scm_service() -> AppResult<WindowsScmServiceStatus> {
     start_scm_service()
 }
 
-pub fn run_admin_action(action: &str, config_dir: PathBuf) -> AppResult<()> {
+pub fn run_admin_action(
+    action: &str,
+    config_dir: PathBuf,
+    owner_sid: &str,
+    owner_username: &str,
+) -> AppResult<()> {
     if !config_dir.is_absolute() {
         return Err(AppError::Message(
             "service-admin-run config dir 必须是绝对路径".into(),
@@ -734,7 +1131,7 @@ pub fn run_admin_action(action: &str, config_dir: PathBuf) -> AppResult<()> {
     }
     std::env::set_var(crate::brand::CONFIG_DIR_ENV, &config_dir);
     let result = match action {
-        "install" => install_scm_service().map(|_| ()),
+        "install" => install_scm_service_for_owner(owner_sid, owner_username).map(|_| ()),
         "uninstall" => uninstall_scm_service().map(|_| ()),
         "start" => start_scm_service().map(|_| ()),
         "stop" => stop_scm_service().map(|_| ()),
@@ -778,9 +1175,7 @@ pub fn run_elevated_admin_action(action: &str) -> AppResult<()> {
     // still grant its control pipes to the owner of this config domain rather
     // than to the temporary elevation account.
     let owner_sid = current_user_sid()?;
-    let owner_username = std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "unknown-user".into());
+    let owner_username = current_user_name()?;
     mutate_plan(|plan| {
         plan.owner_sid = owner_sid.clone();
         plan.owner_username = owner_username.clone();
@@ -791,8 +1186,11 @@ pub fn run_elevated_admin_action(action: &str) -> AppResult<()> {
     let verb = wide_null("runas");
     let file = wide_null(&executable.display().to_string());
     let parameters = wide_null(&format!(
-        "service-admin-run {action} \"{}\"",
-        config_dir.display()
+        "service-admin-run {} {} {} {}",
+        quote_windows_arg(action),
+        quote_windows_arg(&config_dir.display().to_string()),
+        quote_windows_arg(&owner_sid),
+        quote_windows_arg(&owner_username)
     ));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -841,12 +1239,20 @@ fn wide_null(value: &str) -> Vec<u16> {
         .collect()
 }
 
-fn service_binary_path(executable: &Path, config_dir: &Path) -> String {
-    format!(
-        "\"{}\" service-run \"{}\"",
-        executable.display(),
-        config_dir.display()
-    )
+fn service_binary_path(
+    executable: &Path,
+    config_dir: &Path,
+    owner_sid: &str,
+    owner_username: &str,
+) -> String {
+    [
+        quote_windows_arg(&executable.display().to_string()),
+        "service-run".to_string(),
+        quote_windows_arg(&config_dir.display().to_string()),
+        quote_windows_arg(owner_sid),
+        quote_windows_arg(owner_username),
+    ]
+    .join(" ")
 }
 
 fn run_sc(args: &[&str]) -> AppResult<ScOutput> {
@@ -953,17 +1359,6 @@ fn parse_scm_auto_start(output: &str) -> bool {
     output.lines().any(|line| regex.is_match(line))
 }
 
-fn combined_output(output: &Output) -> String {
-    [
-        String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    ]
-    .into_iter()
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>()
-    .join("；")
-}
-
 fn normalized_ids(ids: &[String]) -> Vec<String> {
     let mut ids = ids
         .iter()
@@ -976,19 +1371,33 @@ fn normalized_ids(ids: &[String]) -> Vec<String> {
     ids
 }
 
-pub fn run_service_dispatcher(config_dir: PathBuf) -> AppResult<()> {
+pub fn run_service_dispatcher(
+    config_dir: PathBuf,
+    owner_sid: Option<String>,
+    owner_username: Option<String>,
+) -> AppResult<()> {
     if !config_dir.is_absolute() {
         return Err(AppError::Message(
             "Windows service-run config dir 必须是绝对路径".into(),
         ));
     }
     std::env::set_var(crate::brand::CONFIG_DIR_ENV, &config_dir);
-    std::env::set_var(crate::brand::WINDOWS_SERVICE_CONTEXT_ENV, "1");
-    if let Ok(plan) = load_plan() {
-        if !plan.owner_username.trim().is_empty() {
-            std::env::set_var(PIPE_USER_ENV, plan.owner_username);
+    let (owner_sid, owner_username) = match (owner_sid, owner_username) {
+        (Some(owner_sid), Some(owner_username)) => (owner_sid, owner_username),
+        _ => {
+            let error = AppError::Message(
+                "Windows Service registration 尚未固定配置 owner 身份；请从配置 owner 会话重新执行 service install/update 后再启动"
+                    .into(),
+            );
+            append_service_log(&format!("[service] registration rejected: {error}"));
+            return Err(error);
         }
-    }
+    };
+    validate_service_owner(&owner_sid, &owner_username)?;
+    std::env::set_var(crate::brand::WINDOWS_SERVICE_CONTEXT_ENV, "1");
+    std::env::set_var(SERVICE_OWNER_SID_ENV, owner_sid.trim());
+    std::env::set_var(SERVICE_OWNER_USERNAME_ENV, owner_username.trim());
+    std::env::set_var(PIPE_USER_ENV, owner_username.trim());
     let service_name = service_name_for_dir(&config_dir);
     SERVICE_CONFIG_DIR
         .set(config_dir)
@@ -1168,6 +1577,10 @@ async fn reconcile_service_plan(
 
     for profile in &profiles {
         if let Some(entry) = desired.get(profile.id.as_str()) {
+            if let Err(error) = ensure_workspace_process_owner(profile).await {
+                errors.push(format!("Workspace {} owner: {error}", profile.name));
+                continue;
+            }
             match control::reconcile_daemon(
                 profile,
                 Some(DaemonLaunchSpec {
@@ -1251,6 +1664,36 @@ async fn reconcile_service_plan(
     }
 }
 
+async fn ensure_workspace_process_owner(
+    profile: &crate::workspace::WorkspaceProfile,
+) -> AppResult<()> {
+    let inspection = crate::daemon::inspect(profile)?;
+    let Some(state) = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+    else {
+        return Ok(());
+    };
+    if process_is_config_owner(state.pid)? {
+        return Ok(());
+    }
+
+    let expected_sid = trusted_service_owner_sid()?;
+    let actual_sid = process_user_sid(state.pid).unwrap_or_else(|_| "unknown".into());
+    append_service_log(&format!(
+        "[service] Workspace {} PID {} owner mismatch: expected={}, actual={}; restarting under config owner",
+        profile.name, state.pid, expected_sid, actual_sid
+    ));
+    control::request_daemon_exit_and_wait(
+        profile,
+        control::ControlOperation::Restart,
+        SERVICE_OPERATION_TIMEOUT,
+        true,
+    )
+    .await?;
+    Ok(())
+}
+
 async fn ensure_gateway_running(workspace_ids: &[String]) -> AppResult<()> {
     let inspection = gateway_daemon::inspect()?;
     if inspection.ambiguous {
@@ -1260,11 +1703,20 @@ async fn ensure_gateway_running(workspace_ids: &[String]) -> AppResult<()> {
         .state
         .filter(|_| inspection.running && inspection.pid_matches)
     {
-        if state.workspace_ids == normalized_ids(workspace_ids) {
+        let owner_matches = process_is_config_owner(state.pid)?;
+        if owner_matches && state.workspace_ids == normalized_ids(workspace_ids) {
             gateway_control::ping()
                 .await
                 .map_err(|error| AppError::Message(error.to_string()))?;
             return Ok(());
+        }
+        if !owner_matches {
+            let expected_sid = trusted_service_owner_sid()?;
+            let actual_sid = process_user_sid(state.pid).unwrap_or_else(|_| "unknown".into());
+            append_service_log(&format!(
+                "[service] Gateway PID {} owner mismatch: expected={}, actual={}; restarting under config owner",
+                state.pid, expected_sid, actual_sid
+            ));
         }
         let accepted = gateway_control::request_exit(GatewayOperation::Restart)
             .await
@@ -1412,21 +1864,53 @@ mod tests {
     }
 
     #[test]
-    fn service_binary_path_quotes_executable_and_config_dir() {
+    fn service_binary_path_persists_config_owner_identity() {
         let binary = service_binary_path(
             Path::new(r"C:\Program Files\Anchor\anchor-desktop.exe"),
             Path::new(r"C:\Users\Demo User\AppData\Roaming\anchor"),
+            "S-1-5-21-100-200-300-1001",
+            "Demo User",
         );
         assert_eq!(
             binary,
-            r#""C:\Program Files\Anchor\anchor-desktop.exe" service-run "C:\Users\Demo User\AppData\Roaming\anchor""#
+            r#""C:\Program Files\Anchor\anchor-desktop.exe" service-run "C:\Users\Demo User\AppData\Roaming\anchor" S-1-5-21-100-200-300-1001 "Demo User""#
         );
+    }
+
+    #[test]
+    fn owner_child_command_line_uses_windows_argument_quoting() {
+        let command_line = owner_child_command_line(
+            Path::new(r"C:\Program Files\Anchor\anchor-desktop.exe"),
+            &[
+                "--config-dir".into(),
+                r"C:\Users\Demo User\AppData\Roaming\anchor".into(),
+                "daemon-run".into(),
+                "workspace-a".into(),
+            ],
+        );
+        assert_eq!(
+            command_line,
+            r#""C:\Program Files\Anchor\anchor-desktop.exe" --config-dir "C:\Users\Demo User\AppData\Roaming\anchor" daemon-run workspace-a"#
+        );
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg("a b"), r#""a b""#);
+        assert_eq!(quote_windows_arg(r#"a"b"#), r#""a\"b""#);
     }
 
     #[test]
     fn service_pipe_acl_includes_valid_owner_sid_only() {
         assert!(valid_sid("S-1-5-21-100-200-300-1001"));
         assert!(!valid_sid("S-1-5-21-100;(A;;GA;;;WD)"));
+    }
+
+    #[test]
+    fn service_owner_identity_validation_fails_closed() {
+        assert!(validate_service_owner("S-1-5-21-100-200-300-1001", "Demo User").is_ok());
+        assert!(validate_service_owner("not-a-sid", "Demo User").is_err());
+        assert!(validate_service_owner("S-1-5-18", "SYSTEM").is_err());
+        assert!(validate_service_owner("S-1-5-21-100-200-300-1001", "").is_err());
+        assert!(validate_service_owner("S-1-5-21-100-200-300-1001", "Demo\nUser").is_err());
     }
 
     #[test]

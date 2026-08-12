@@ -2,6 +2,40 @@ use chrono::{SecondsFormat, Utc};
 
 use crate::workspace::WorkspaceProfile;
 
+#[cfg(windows)]
+pub(crate) fn redirect_stdio_to_file(path: &std::path::Path) -> crate::error::AppResult<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::io::IntoRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stdout = OpenOptions::new().create(true).append(true).open(path)?;
+    let stderr = stdout.try_clone()?;
+    let stdout_handle = HANDLE(stdout.into_raw_handle());
+    let stderr_handle = HANDLE(stderr.into_raw_handle());
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, stdout_handle).map_err(|error| {
+            crate::error::AppError::Message(format!(
+                "无法将 daemon stdout 重定向到 {}：{error}",
+                path.display()
+            ))
+        })?;
+        SetStdHandle(STD_ERROR_HANDLE, stderr_handle).map_err(|error| {
+            crate::error::AppError::Message(format!(
+                "无法将 daemon stderr 重定向到 {}：{error}",
+                path.display()
+            ))
+        })?;
+    }
+    // SetStdHandle does not duplicate/own the supplied handles. into_raw_handle
+    // intentionally keeps both files open for the lifetime of this daemon.
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileLogService {
     Mcp,
@@ -30,7 +64,12 @@ pub(crate) fn profile_log_files(
     let (tunnel_type, tunnel_file, base_files) = match service {
         ProfileLogService::Mcp => (
             profile.tunnel.tunnel_type.as_str(),
-            ("mcp-cloudflare", "mcp-frp", "cloudflared.log", "frpc-mcp.log"),
+            (
+                "mcp-cloudflare",
+                "mcp-frp",
+                "cloudflared.log",
+                "frpc-mcp.log",
+            ),
             MCP_LOG_FILES,
         ),
         ProfileLogService::Actions => (
