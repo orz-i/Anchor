@@ -354,7 +354,9 @@ anchor service uninstall
 
 `service sync` 把当前后台 Workspace daemon 与 Gateway route 集合写入 `windows-service.json`；后续 GUI/CLI 的 Workspace/Gateway 启停也会持续更新这个计划。`install` 注册配置目录专属的 `AnchorControlPlane-<scope>` 服务并设置 `start= auto`。安装、卸载通常需要管理员权限；服务本身运行在 Session 0，因此计划同时保存配置所有者 SID/用户名，用于复用用户态 Named Pipe 身份并给 owner/System 设置受保护 DACL。
 
-SCM supervisor 运行时额外写入 `windows-service-runtime.json`，记录当前 Service PID、启动时间、实际 executable path 和 `buildIdentity`。`service status` 使用 `sc queryex` 获取真实 SCM PID，并同时校验 runtime state 的 PID 存活与进程镜像路径，输出 `buildState=not_installed|stopped|current|different|unknown`。旧 Service 没有 runtime state 时明确返回 `unknown`，不会因为 package version 相同而误报为 current。
+Windows 凭据同时保留 CurrentUser DPAPI 主密文和 LocalMachine DPAPI 的 Service mirror。普通 GUI/CLI 始终使用 CurrentUser 主密文；`service install/start/restart` 会在进入 UAC 前由配置所有者刷新 Service mirror，SCM supervisor 与其子 daemon 通过显式 service context 读取 mirror。SCM 自身仅为恢复 desired-state 时读取不含秘密的 `profiles.json`，因此 Session 0 无法解密用户凭据时也不会阻塞 stale PID 清理和 Workspace 重拉。旧凭据 envelope 没有 Service mirror 时，新版用户进程首次成功读取会原地补充 mirror，同时保持原 `protection/payload` 不变，便于滚动升级期间旧用户态 daemon 继续读取主密文。用户侧后续保存配置刷新 mirror 时，会保留 Service 已写入的 OAuth refresh-token replay runtime scope，避免普通配置保存回滚服务侧防重放状态。
+
+SCM supervisor 运行时额外写入 `windows-service-runtime.json`，记录当前 Service PID、启动时间、实际 executable path 和 `buildIdentity`。Windows 上 plan/runtime state 都使用可覆盖旧目标的 write-through 原子替换，避免系统重启后旧 runtime 文件导致新 Service 无法发布 build identity。`service status` 使用 `sc queryex` 获取真实 SCM PID，并同时校验 runtime state 的 PID 存活与进程镜像路径，输出 `buildState=not_installed|stopped|current|different|unknown`。旧 Service 没有 runtime state 时明确返回 `unknown`，不会因为 package version 相同而误报为 current。
 
 `service install` 同时承担显式“安装/更新到当前二进制”的语义：若 Service 已安装且仍运行，先请求 SCM 停止并等待真正进入 `STOPPED`，由 supervisor 优雅排空其管理的 Workspace/Gateway daemon，再启动刚写入 `binPath` 的当前构建并等待 `RUNNING`。GUI 的“更新服务版本”按钮复用同一路径并通过 UAC 执行。普通状态查询、Workspace 配置保存或桌面启动都不会隐式重启 SCM。
 
@@ -408,6 +410,7 @@ anchor --json service sync
 - Workspace 与 Gateway 后台 daemon 都支持 Windows/Linux；Windows 不再需要 process-local Gateway Server 作为正常运行路径；
 - Windows Workspace/Gateway Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；SCM service 的 LocalSystem 子进程通过持久化 owner SID/用户名与用户 GUI 共享同一控制端点身份；Unix UDS 继续使用私有目录/socket 权限；
 - PID 所有权校验失败时拒绝生命周期写操作；Windows additionally 校验 state v2 `executablePath` 与实际 PID 镜像；
+- Windows daemon state 还校验实际进程创建时间必须早于且接近 state 的 `startedAtUnix`，避免跨系统重启后旧 PID 被新的 `anchor-desktop.exe` 实例复用时误判为原 daemon；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
 - 端口被 GUI 或外部进程占用时拒绝启动；
 - `daemon-run` 是内部命令，不应直接调用；

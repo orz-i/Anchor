@@ -292,7 +292,7 @@ fn write_plan_unlocked(path: &Path, plan: &WindowsServicePlan) -> AppResult<()> 
         .open(&temp)?;
     file.write_all(serde_json::to_string_pretty(plan)?.as_bytes())?;
     file.sync_all()?;
-    fs::rename(temp, path)?;
+    replace_runtime_file(&temp, path)?;
     Ok(())
 }
 
@@ -334,8 +334,47 @@ fn write_service_runtime_state(state: &WindowsServiceRuntimeState) -> AppResult<
         .open(&temp)?;
     file.write_all(serde_json::to_string_pretty(state)?.as_bytes())?;
     file.sync_all()?;
-    fs::rename(temp, path)?;
+    replace_runtime_file(&temp, &path)?;
     Ok(())
+}
+
+fn replace_runtime_file(source: &Path, destination: &Path) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(destination.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|error| {
+                AppError::Message(format!("Windows service state replacement failed: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)?;
+        Ok(())
+    }
 }
 
 fn remove_service_runtime_state_if_owned(pid: u32) {
@@ -513,7 +552,7 @@ pub fn set_gateway_desired(workspace_ids: &[String]) -> AppResult<WindowsService
 }
 
 pub fn sync_plan_from_running() -> AppResult<WindowsServicePlan> {
-    let store = crate::data::DataStore::load()?;
+    let store = crate::data::DataStore::load_profiles_only()?;
     let profiles = store.list().to_vec();
     drop(store);
     let mut workspaces = Vec::new();
@@ -727,6 +766,13 @@ pub fn run_elevated_admin_action(action: &str) -> AppResult<()> {
             "未知 Windows Service 管理操作：{action}"
         )));
     }
+    if matches!(action, "install" | "start" | "restart") {
+        // Provision the LocalMachine DPAPI mirror before UAC. The user may
+        // choose a different administrator account at the prompt, but this
+        // process still owns the CurrentUser DPAPI key needed to decrypt the
+        // canonical user payload.
+        let _ = crate::data::DataStore::load()?;
+    }
     // Persist the unelevated caller identity before showing UAC. Windows may
     // allow the user to enter another administrator account; the service must
     // still grant its control pipes to the owner of this config domain rather
@@ -937,6 +983,7 @@ pub fn run_service_dispatcher(config_dir: PathBuf) -> AppResult<()> {
         ));
     }
     std::env::set_var(crate::brand::CONFIG_DIR_ENV, &config_dir);
+    std::env::set_var(crate::brand::WINDOWS_SERVICE_CONTEXT_ENV, "1");
     if let Ok(plan) = load_plan() {
         if !plan.owner_username.trim().is_empty() {
             std::env::set_var(PIPE_USER_ENV, plan.owner_username);
@@ -1103,7 +1150,7 @@ async fn reconcile_service_plan(
     managed_workspaces: &mut HashSet<String>,
     gateway_managed: &mut bool,
 ) -> AppResult<()> {
-    let store = crate::data::DataStore::load()?;
+    let store = crate::data::DataStore::load_profiles_only()?;
     let profiles = store.list().to_vec();
     let gateway_config = store.settings().mcp_gateway;
     drop(store);
@@ -1263,7 +1310,7 @@ async fn shutdown_managed_control_plane(
         let _ = stop_gateway_if_running().await;
         *gateway_managed = false;
     }
-    let Ok(store) = crate::data::DataStore::load() else {
+    let Ok(store) = crate::data::DataStore::load_profiles_only() else {
         return;
     };
     let profiles = store.list().to_vec();
@@ -1394,5 +1441,22 @@ mod tests {
         assert!(message.contains("错误 5"));
         assert!(message.contains("管理员权限"));
         assert!(!message.contains('�'));
+    }
+
+    #[test]
+    fn runtime_state_replacement_overwrites_stale_windows_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("runtime.tmp");
+        let destination = temp.path().join("runtime.json");
+        fs::write(&source, b"new-runtime").expect("write source");
+        fs::write(&destination, b"stale-runtime").expect("write destination");
+
+        replace_runtime_file(&source, &destination).expect("replace runtime state");
+
+        assert_eq!(
+            fs::read(&destination).expect("read destination"),
+            b"new-runtime"
+        );
+        assert!(!source.exists());
     }
 }

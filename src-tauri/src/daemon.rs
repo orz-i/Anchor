@@ -28,6 +28,41 @@ pub enum ServiceSelection {
     All,
 }
 
+#[cfg(windows)]
+fn windows_process_started_at_unix(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let result =
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user).ok() };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    result?;
+    let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+    ticks
+        .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
+        .map(|value| value / 10_000_000)
+}
+
+#[cfg(windows)]
+fn windows_process_start_matches_state(process_started_at: u64, state_started_at: u64) -> bool {
+    // DaemonState is written by the child shortly after process creation. A
+    // persisted PID from an earlier boot can be reused by another Anchor GUI
+    // process with the same executable path, but that reused process must have
+    // been created after the old state timestamp and is therefore rejected.
+    state_started_at >= process_started_at
+        && state_started_at.saturating_sub(process_started_at) <= 120
+}
+
 fn process_matches_spawned_daemon(pid: u32, workspace_id: &str) -> bool {
     if process_matches_daemon(pid, workspace_id) {
         return true;
@@ -838,8 +873,15 @@ fn process_matches_daemon(pid: u32, workspace_id: &str) -> bool {
         let Ok(Some(actual)) = platform().process_image_path(pid) else {
             return false;
         };
-        normalize_windows_image_path(Path::new(&state.executable_path))
-            == normalize_windows_image_path(Path::new(&actual))
+        if normalize_windows_image_path(Path::new(&state.executable_path))
+            != normalize_windows_image_path(Path::new(&actual))
+        {
+            return false;
+        }
+        let Some(process_started_at) = windows_process_started_at_unix(pid) else {
+            return false;
+        };
+        windows_process_start_matches_state(process_started_at, state.started_at_unix)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -1091,6 +1133,16 @@ mod tests {
             "new"
         );
         assert!(!source.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_state_rejects_pid_reused_after_state_timestamp() {
+        assert!(windows_process_start_matches_state(100, 100));
+        assert!(windows_process_start_matches_state(100, 101));
+        assert!(windows_process_start_matches_state(100, 220));
+        assert!(!windows_process_start_matches_state(100, 221));
+        assert!(!windows_process_start_matches_state(101, 100));
     }
 
     #[test]

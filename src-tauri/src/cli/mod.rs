@@ -46,6 +46,15 @@ struct CliTunnelRetry {
 fn execute_service(command: ServiceCommand, as_json: bool) -> AppResult<i32> {
     #[cfg(windows)]
     {
+        if matches!(
+            &command,
+            ServiceCommand::Install | ServiceCommand::Start | ServiceCommand::Restart
+        ) {
+            // Direct CLI service administration does not pass through the
+            // desktop UAC helper. Prepare the LocalMachine service mirror
+            // while the CLI still has the config owner's DPAPI identity.
+            let _ = DataStore::load()?;
+        }
         let status = match command {
             ServiceCommand::Status => crate::windows_service::scm_status()?,
             ServiceCommand::Install => crate::windows_service::install_scm_service()?,
