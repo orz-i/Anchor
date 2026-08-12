@@ -238,9 +238,10 @@ anchor plugin package PROFILE_ID --app-id plugin_asdk_app_xxx
 
 ## MCP Resources
 
-服务启用时，MCP `resources/list` 同时提供：
+MCP `resources/list` 始终提供 Anchor 自身的 UI resources；Skill 服务启用时再附加 Skill resources：
 
 ```text
+ui://anchor/image-viewer/v1.html
 skill://index.json
 skill://<skill-name>/SKILL.md
 skill://<skill-name>/references/<file>
@@ -268,7 +269,9 @@ skill://code-review/SKILL.md?start_line=401&max_bytes=65536
 }
 ```
 
-Skill 服务关闭时，MCP 不声明 Skills extension 或 resources capability。Skill 服务开启时，旧 Skill helper 工具同样不会进入 `tools/list`；原生 Skill 发现不再消耗工具槽位。
+`ui://anchor/image-viewer/v1.html` 是 `view_image` 与 Browser `take_screenshot` 共享的 MCP Apps Results UI。它通过标准 MCP image content 直接显示图片；Browser screenshot 指定 `filePath` 只落盘时，UI 使用返回的 workspace artifact 路径调用现有 `view_image` 读取预览。该能力不增加新的公开 MCP tool。
+
+Skill 服务关闭时，MCP 仍声明 resources capability 以提供 Anchor UI resources，但不声明 Skills extension；Skill URI 不可用。Skill 服务开启时，旧 Skill helper 工具同样不会进入 `tools/list`；原生 Skill 发现不再消耗工具槽位。
 
 ## Linux CLI
 

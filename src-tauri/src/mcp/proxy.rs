@@ -1112,6 +1112,10 @@ fn sanitize_proxy_catalog(
             }
         });
         definition["outputSchema"] = output_schema.clone();
+        if is_my_agent_browser_spec(spec) && downstream_name == "take_screenshot" {
+            definition["_meta"] =
+                crate::mcp::ui::image_viewer_tool_meta("Capturing screenshot…", "Screenshot ready");
+        }
         sanitized.push(SanitizedProxyTool {
             public_name,
             downstream_name,
@@ -4767,6 +4771,7 @@ mod tests {
                 raw_proxy_tool("list_pages"),
                 raw_proxy_tool("navigate_page"),
                 raw_proxy_tool("take_snapshot"),
+                raw_proxy_tool("take_screenshot"),
                 raw_proxy_tool("click"),
                 raw_proxy_tool("lighthouse_audit"),
                 raw_proxy_tool("take_heapsnapshot"),
@@ -4781,13 +4786,33 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             names,
-            ["click", "list_pages", "navigate_page", "take_snapshot"]
-                .into_iter()
-                .collect()
+            [
+                "click",
+                "list_pages",
+                "navigate_page",
+                "take_screenshot",
+                "take_snapshot",
+            ]
+            .into_iter()
+            .collect()
         );
         assert_eq!(catalog.selection_source, "browser_workflow");
-        assert_eq!(catalog.discovered_count, 6);
+        assert_eq!(catalog.discovered_count, 7);
         assert_eq!(catalog.filtered_count, 2);
+
+        let screenshot = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.downstream_name == "take_screenshot")
+            .expect("screenshot tool");
+        assert_eq!(
+            screenshot.definition["_meta"]["ui"]["resourceUri"],
+            crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
+        );
+        assert_eq!(
+            screenshot.definition["_meta"]["openai/outputTemplate"],
+            crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
+        );
     }
 
     #[test]

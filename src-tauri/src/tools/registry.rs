@@ -2639,7 +2639,7 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                 } else {
                     input_schema(name)
                 };
-                json!({
+                let mut definition = json!({
                     "name": name,
                     "title": title,
                     "description": description,
@@ -2652,7 +2652,12 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                         "idempotentHint": read_only,
                         "openWorldHint": open_world
                     }
-                })
+                });
+                if name == "view_image" {
+                    definition["_meta"] =
+                        crate::mcp::ui::image_viewer_tool_meta("Loading image…", "Image ready");
+                }
+                definition
             })
         })
         .collect()
@@ -2721,6 +2726,7 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
             }
         }
     }
+
     properties.insert(
         "operation".into(),
         json!({
@@ -3720,6 +3726,27 @@ mod tests {
             jsonschema::meta::validate(schema)
                 .unwrap_or_else(|error| panic!("{name} output schema: {error}"));
         }
+    }
+
+    #[test]
+    fn view_image_publishes_mcp_apps_image_viewer_metadata() {
+        let tools = list_tools_for_profile("advanced");
+        let view_image = tools
+            .iter()
+            .find(|tool| tool["name"] == "view_image")
+            .expect("view_image tool");
+        assert_eq!(
+            view_image["_meta"]["ui"]["resourceUri"],
+            crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
+        );
+        assert_eq!(
+            view_image["_meta"]["openai/outputTemplate"],
+            crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
+        );
+        assert_eq!(
+            view_image["_meta"]["ui"]["visibility"],
+            json!(["model", "app"])
+        );
     }
 
     #[test]

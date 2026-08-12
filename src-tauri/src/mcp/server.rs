@@ -358,8 +358,8 @@ pub async fn handle_request_with_protocol_session_and_cancellation(
         "tools/call" => handle_tools_call(state, &params, cancellation, session_id).await,
         "skills/list" => crate::skills::native_skills_list(&state.skills, &params),
         "skills/get" => crate::skills::native_skill_get(&state.skills, &params),
-        "resources/list" => crate::skills::resources_list(&state.skills, &params),
-        "resources/read" => crate::skills::resource_read(&state.skills, &params),
+        "resources/list" => crate::mcp::ui::resources_list(&state.skills, &params),
+        "resources/read" => crate::mcp::ui::resource_read(&state.skills, &params),
         _ => Err(serde_json::json!({
             "code": -32601,
             "message": format!("Method not found: {method}")
@@ -379,13 +379,13 @@ fn initialize_result(state: &SharedState) -> Value {
 
 fn initialize_result_for_version(state: &SharedState, protocol_version: &str) -> Value {
     let mut capabilities = serde_json::json!({
-        "tools": { "listChanged": false }
-    });
-    if state.skills.is_enabled() {
-        capabilities["resources"] = serde_json::json!({
+        "tools": { "listChanged": false },
+        "resources": {
             "subscribe": false,
             "listChanged": false
-        });
+        }
+    });
+    if state.skills.is_enabled() {
         capabilities["extensions"] = serde_json::json!({
             "io.modelcontextprotocol/skills": {}
         });
@@ -2563,6 +2563,16 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(tool_names.contains(&"skill"));
+        let view_image = tools["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == "view_image")
+            .expect("view_image tool");
+        assert_eq!(
+            view_image["_meta"]["ui"]["resourceUri"],
+            crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
+        );
         for internal in ["list_skills", "load_skill", "read_skill_resource"] {
             assert!(!tool_names.contains(&internal));
         }
@@ -2746,8 +2756,39 @@ mod tests {
             .configure(crate::skills::SkillSettings::from_text(false, "skills"));
 
         let initialized = initialize_result(&state);
-        assert!(initialized["capabilities"].get("resources").is_none());
+        assert_eq!(
+            initialized["capabilities"]["resources"]["listChanged"],
+            false
+        );
         assert!(initialized["capabilities"].get("extensions").is_none());
+
+        let resources = handle_request(
+            &state,
+            &json!({"jsonrpc":"2.0","id":0,"method":"resources/list","params":{}}),
+        )
+        .await;
+        assert_eq!(
+            resources["result"]["resources"][0]["uri"],
+            crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
+        );
+
+        let viewer = handle_request(
+            &state,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":3,
+                "method":"resources/read",
+                "params":{"uri": crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI}
+            }),
+        )
+        .await;
+        assert_eq!(
+            viewer["result"]["contents"][0]["mimeType"],
+            "text/html;profile=mcp-app"
+        );
+        assert!(viewer["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|html| html.contains("ui/notifications/tool-result")));
 
         let tools = handle_request(
             &state,
