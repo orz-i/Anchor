@@ -18,6 +18,11 @@
 - Browser screenshot 使用 `filePath` 时，下游不会 attach 图片。Anchor 已有 workspace artifact bridge；UI 从 `workspace_artifacts` 取得安全的 workspace 相对路径，再通过标准 `tools/call` 调用现有 `view_image` 获取预览。
 - resources capability 与 Skills extension 解耦：UI resource 始终可读；Skills extension 仍只在 Skill service enabled 时声明。
 - UI 没有外部脚本、样式、图片或网络依赖，resource CSP 的 connect/resource domains 为空。
+- UI resource 从当前 workspace 的 HTTPS MCP public base URL 提取 origin，并同时发布：
+  - `_meta.ui.domain`
+  - `_meta["openai/widgetDomain"]` compatibility alias
+  例如 `https://anchor.taoyan.icu/mcp` 会发布 `https://anchor.taoyan.icu`。这是 ChatGPT 提交带 UI plugin 时的必需字段，且 origin 必须对每个 plugin 唯一。
+- 如果使用 Gateway 且多个独立 ChatGPT plugins 共享同一个公网 hostname，仅靠 `/w/<workspace-id>` 路径不能满足“unique origin per plugin”；提交带 UI 的多个 plugin 时应为每个 plugin 使用独立 HTTPS hostname/subdomain。
 
 ## Compatibility
 
@@ -28,6 +33,7 @@
 ## Verification targets
 
 - UI resource 在 Skill service disabled 时仍能通过 `resources/list` / `resources/read` 发现和读取。
+- `resources/read` 会把当前 HTTPS MCP public origin 发布为标准 widget domain 和 ChatGPT compatibility alias；HTTP/local-only URL 不伪造 submission domain。
 - Skills disabled 时不发布 native Skills extension。
 - 最终 effective `tools/list` 保留 `view_image` 的 UI metadata。
 - Browser automatic exposure 的 `take_screenshot` 保留 UI metadata。

@@ -190,6 +190,7 @@ pub fn spawn_listener(
         policy,
         runtime.tool_profile.clone(),
         runtime.permission_mode.clone(),
+        public_base_url.clone(),
     );
     mcp.skills
         .configure(crate::skills::SkillSettings::from_text(
@@ -1468,6 +1469,7 @@ mod tests {
             PolicySettings::default(),
             "core".into(),
             "trusted".into(),
+            "https://mcp.example.com/workspace/listener-test".into(),
         );
         let workspace_id = format!("listener-test-{}", uuid::Uuid::new_v4());
         let workspace_path = workspace.path().to_path_buf();

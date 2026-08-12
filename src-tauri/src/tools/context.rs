@@ -19,6 +19,7 @@ pub struct ToolContext {
     pub harness: Harness,
     pub mcp_proxies: crate::mcp::proxy::McpProxyRegistry,
     pub skills: crate::skills::SkillCatalog,
+    pub(crate) ui_widget_domain: Option<String>,
     primary_workspace_root: PathBuf,
     default_cwd: Arc<Mutex<PathBuf>>,
     session_default_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
@@ -75,6 +76,7 @@ impl ToolContext {
             harness,
             mcp_proxies: self.mcp_proxies.clone(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
+            ui_widget_domain: self.ui_widget_domain.clone(),
             primary_workspace_root: self.primary_workspace_root.clone(),
             default_cwd: Arc::new(Mutex::new(root.clone())),
             session_default_cwds: self.session_default_cwds.clone(),
@@ -129,6 +131,11 @@ impl ToolContext {
         )
     }
 
+    pub(crate) fn with_ui_widget_domain(mut self, domain: Option<String>) -> Self {
+        self.ui_widget_domain = domain;
+        self
+    }
+
     pub fn from_workspace_with_harness_root(
         workspace: Workspace,
         auth: AuthConfig,
@@ -150,6 +157,7 @@ impl ToolContext {
             harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
+            ui_widget_domain: None,
             primary_workspace_root: root.clone(),
             default_cwd: Arc::new(Mutex::new(root)),
             session_default_cwds: Arc::new(Mutex::new(HashMap::new())),

@@ -37,26 +37,44 @@ pub(crate) fn resources_list(catalog: &SkillCatalog, params: &Value) -> Result<V
     Ok(result)
 }
 
-pub(crate) fn resource_read(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
+pub(crate) fn widget_domain_from_public_base_url(public_base_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(public_base_url.trim()).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let origin = parsed.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
+}
+
+pub(crate) fn resource_read(
+    catalog: &SkillCatalog,
+    widget_domain: Option<&str>,
+    params: &Value,
+) -> Result<Value, Value> {
     let uri = params
         .get("uri")
         .and_then(Value::as_str)
         .ok_or_else(|| rpc_error(-32602, "Missing resource uri"))?;
     if uri == IMAGE_VIEWER_RESOURCE_URI {
+        let mut metadata = json!({
+            "ui": {
+                "prefersBorder": true,
+                "csp": {
+                    "connectDomains": [],
+                    "resourceDomains": []
+                }
+            }
+        });
+        if let Some(domain) = widget_domain.filter(|domain| !domain.trim().is_empty()) {
+            metadata["ui"]["domain"] = Value::String(domain.to_string());
+            metadata["openai/widgetDomain"] = Value::String(domain.to_string());
+        }
         return Ok(json!({
             "contents": [{
                 "uri": IMAGE_VIEWER_RESOURCE_URI,
                 "mimeType": IMAGE_VIEWER_MIME_TYPE,
                 "text": IMAGE_VIEWER_HTML,
-                "_meta": {
-                    "ui": {
-                        "prefersBorder": true,
-                        "csp": {
-                            "connectDomains": [],
-                            "resourceDomains": []
-                        }
-                    }
-                }
+                "_meta": metadata
             }]
         }));
     }
@@ -252,7 +270,10 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
 
 #[cfg(test)]
 mod tests {
-    use super::{image_viewer_tool_meta, resource_read, resources_list, IMAGE_VIEWER_RESOURCE_URI};
+    use super::{
+        image_viewer_tool_meta, resource_read, resources_list, widget_domain_from_public_base_url,
+        IMAGE_VIEWER_RESOURCE_URI,
+    };
     use crate::skills::{SkillCatalog, SkillSettings};
     use serde_json::json;
 
@@ -265,9 +286,21 @@ mod tests {
         let listed = resources_list(&catalog, &json!({})).expect("resources/list");
         assert_eq!(listed["resources"][0]["uri"], IMAGE_VIEWER_RESOURCE_URI);
 
-        let read = resource_read(&catalog, &json!({"uri": IMAGE_VIEWER_RESOURCE_URI}))
-            .expect("resources/read");
+        let read = resource_read(
+            &catalog,
+            Some("https://anchor.taoyan.icu"),
+            &json!({"uri": IMAGE_VIEWER_RESOURCE_URI}),
+        )
+        .expect("resources/read");
         assert_eq!(read["contents"][0]["mimeType"], "text/html;profile=mcp-app");
+        assert_eq!(
+            read["contents"][0]["_meta"]["ui"]["domain"],
+            "https://anchor.taoyan.icu"
+        );
+        assert_eq!(
+            read["contents"][0]["_meta"]["openai/widgetDomain"],
+            "https://anchor.taoyan.icu"
+        );
         let html = read["contents"][0]["text"].as_str().expect("html");
         assert!(html.contains("ui/notifications/tool-result"));
         assert!(html.contains("toolResponseMetadata"));
@@ -281,5 +314,21 @@ mod tests {
         assert_eq!(metadata["ui"]["visibility"], json!(["model", "app"]));
         assert_eq!(metadata["openai/outputTemplate"], IMAGE_VIEWER_RESOURCE_URI);
         assert_eq!(metadata["openai/widgetAccessible"], true);
+    }
+
+    #[test]
+    fn widget_domain_uses_https_public_origin_without_path() {
+        assert_eq!(
+            widget_domain_from_public_base_url("https://anchor.taoyan.icu/mcp?x=1"),
+            Some("https://anchor.taoyan.icu".into())
+        );
+        assert_eq!(
+            widget_domain_from_public_base_url("https://gateway.example.com:8443/w/anchor"),
+            Some("https://gateway.example.com:8443".into())
+        );
+        assert_eq!(
+            widget_domain_from_public_base_url("http://127.0.0.1:28766"),
+            None
+        );
     }
 }

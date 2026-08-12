@@ -359,7 +359,9 @@ pub async fn handle_request_with_protocol_session_and_cancellation(
         "skills/list" => crate::skills::native_skills_list(&state.skills, &params),
         "skills/get" => crate::skills::native_skill_get(&state.skills, &params),
         "resources/list" => crate::mcp::ui::resources_list(&state.skills, &params),
-        "resources/read" => crate::mcp::ui::resource_read(&state.skills, &params),
+        "resources/read" => {
+            crate::mcp::ui::resource_read(&state.skills, state.ui_widget_domain.as_deref(), &params)
+        }
         _ => Err(serde_json::json!({
             "code": -32601,
             "message": format!("Method not found: {method}")
@@ -1796,14 +1798,14 @@ pub fn new_state(
     policy: crate::tools::policy::PolicySettings,
     tool_profile: String,
     permission_mode: String,
+    public_base_url: String,
 ) -> SharedState {
-    Arc::new(ToolContext::from_workspace(
-        workspace,
-        auth,
-        policy,
-        tool_profile,
-        permission_mode,
-    ))
+    Arc::new(
+        ToolContext::from_workspace(workspace, auth, policy, tool_profile, permission_mode)
+            .with_ui_widget_domain(crate::mcp::ui::widget_domain_from_public_base_url(
+                &public_base_url,
+            )),
+    )
 }
 
 #[cfg(test)]
@@ -1823,8 +1825,8 @@ mod tests {
         attach_browser_workspace_artifacts, await_local_tool_worker_with_limits,
         browser_build_matches, browser_current_build, browser_os_path, effective_catalog_error,
         extract_browser_json_payload, finalize_browser_workspace_artifacts, handle_request,
-        handle_tools_call, initialize_result, prepare_browser_workspace_arguments, tool_arguments,
-        tools_list_result,
+        handle_tools_call, initialize_result, new_state, prepare_browser_workspace_arguments,
+        tool_arguments, tools_list_result,
     };
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {
@@ -1835,6 +1837,40 @@ mod tests {
                 .expect("tool context"),
         );
         (workspace, harness, state)
+    }
+
+    #[tokio::test]
+    async fn resources_read_publishes_widget_domain_from_public_mcp_origin() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let state = new_state(
+            Workspace::new(workspace.path().to_path_buf()).expect("workspace state"),
+            crate::workspace::AuthConfig {
+                auth_type: "noauth".into(),
+                ..crate::workspace::AuthConfig::default()
+            },
+            crate::tools::policy::PolicySettings::default(),
+            "core".into(),
+            "trusted".into(),
+            "https://anchor.taoyan.icu/mcp".into(),
+        );
+        let response = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {"uri": crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI}
+            }),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["contents"][0]["_meta"]["ui"]["domain"],
+            "https://anchor.taoyan.icu"
+        );
+        assert_eq!(
+            response["result"]["contents"][0]["_meta"]["openai/widgetDomain"],
+            "https://anchor.taoyan.icu"
+        );
     }
 
     #[cfg(windows)]
