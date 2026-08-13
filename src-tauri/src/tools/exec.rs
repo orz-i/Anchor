@@ -10,10 +10,10 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
-use crate::tools::context::ToolContext;
-use crate::tools::session::{
+use crate::tools::command_session::{
     finalize_execution_result, ExecSession, SessionHarnessMetadata, StreamEncoding,
 };
+use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::CancellationToken;
 

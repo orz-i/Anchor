@@ -1,13 +1,13 @@
 mod cancellation;
 pub mod catalog;
 pub mod command_cost;
+pub mod command_session;
 pub mod context;
 pub mod dispatch;
 pub mod environment;
 pub mod exec;
 pub mod file;
 pub mod git;
-pub mod history;
 mod image_tool;
 pub mod patch;
 pub mod policy;

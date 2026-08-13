@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::model::{StageCommitReceipt, StageCommitStatus};
+use crate::tools::command_session as session;
 use crate::tools::context::ToolContext;
 use crate::tools::policy::validate_tool_arguments_for_workspace;
-use crate::tools::session;
 use crate::tools::workspace::WorkspaceError;
-use crate::tools::{exec, history, CancellationToken};
+use crate::tools::{exec, session as dev_session, CancellationToken};
 
 const DEFAULT_CHECK_TIMEOUT_MS: u64 = 600_000;
 const MAX_STAGE_PATHS: usize = 256;
@@ -131,7 +131,7 @@ pub fn run(
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_CHECK_TIMEOUT_MS)
         .clamp(1_000, 600_000);
-    let checkpoint = args.get("history_checkpoint").cloned();
+    let checkpoint = args.get("session_checkpoint").cloned();
     let deferred = args
         .get("execution_mode")
         .and_then(Value::as_str)
@@ -318,7 +318,7 @@ fn execute_new_workflow(
         check_timeout_ms,
         current_check_index: 0,
         current_session_id: None,
-        history_checkpoint: checkpoint.cloned(),
+        session_checkpoint: checkpoint.cloned(),
         paths: paths.clone(),
         checks: Vec::new(),
         verification_ids: Vec::new(),
@@ -340,8 +340,8 @@ fn execute_new_workflow(
     if receipt.required_checks.is_empty() {
         receipt.required_checks = checks.clone();
     }
-    if receipt.history_checkpoint.is_none() {
-        receipt.history_checkpoint = checkpoint.cloned();
+    if receipt.session_checkpoint.is_none() {
+        receipt.session_checkpoint = checkpoint.cloned();
     }
     receipt.check_timeout_ms = check_timeout_ms;
     save_receipt(ctx, &receipt)?;
@@ -665,7 +665,7 @@ pub fn wait(
         .get("restart_lost_check")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let checkpoint = args.get("history_checkpoint");
+    let checkpoint = args.get("session_checkpoint");
     let _workflow_lock = acquire_stage_commit_lock(ctx)?;
     let mut receipt = ctx
         .harness
@@ -714,7 +714,7 @@ fn advance_deferred_workflow(
     restart_lost_check: bool,
 ) -> Result<Value, WorkspaceError> {
     if let Some(checkpoint) = checkpoint_override {
-        receipt.history_checkpoint = Some(checkpoint.clone());
+        receipt.session_checkpoint = Some(checkpoint.clone());
         receipt.updated_at = timestamp();
         save_receipt(ctx, receipt)?;
     }
@@ -816,7 +816,7 @@ fn advance_deferred_workflow(
             StageCommitStatus::Committed | StageCommitStatus::CommittedCheckpointPending => {
                 let checkpoint = checkpoint_override
                     .cloned()
-                    .or_else(|| receipt.history_checkpoint.clone());
+                    .or_else(|| receipt.session_checkpoint.clone());
                 return resume_checkpoint(ctx, receipt, checkpoint.as_ref());
             }
             StageCommitStatus::Completed => return receipt_response(receipt, true, false),
@@ -957,7 +957,7 @@ fn commit_deferred_receipt(
 ) -> Result<Value, WorkspaceError> {
     let checkpoint = checkpoint_override
         .cloned()
-        .or_else(|| receipt.history_checkpoint.clone());
+        .or_else(|| receipt.session_checkpoint.clone());
     let args = json!({
         "task_id": receipt.task_id,
         "expected_head": receipt.expected_head,
@@ -968,7 +968,7 @@ fn commit_deferred_receipt(
         "required_checks": [],
         "check_timeout_ms": receipt.check_timeout_ms,
         "reason": receipt.reason,
-        "history_checkpoint": checkpoint.clone()
+        "session_checkpoint": checkpoint.clone()
     });
     execute_new_workflow(
         ctx,
@@ -1012,7 +1012,7 @@ fn resume_checkpoint(
         finish_operation(ctx, receipt, false);
         return receipt_response(receipt, false, true);
     };
-    match history::checkpoint(ctx, checkpoint, None) {
+    match dev_session::checkpoint(ctx, checkpoint, None) {
         Ok(result) => {
             receipt.checkpoint_hash = result
                 .get("content_hash")
@@ -1859,7 +1859,7 @@ mod tests {
         let Some((workspace, _harness, ctx)) = fixture() else {
             return;
         };
-        let bootstrap = history::bootstrap(
+        let bootstrap = dev_session::open(
             &ctx,
             &json!({
                 "session_key": "stage-commit-checkpoint-test",
@@ -1882,7 +1882,7 @@ mod tests {
             "idempotency_key": "checkpoint-retry"
         });
         let mut first_args = base.clone();
-        first_args["history_checkpoint"] = json!({
+        first_args["session_checkpoint"] = json!({
             "session_key": "stage-commit-checkpoint-test",
             "expected_path": "docs/history-session/not-the-current-session.md",
             "user_intent": "checkpoint retry test"
@@ -1900,7 +1900,7 @@ mod tests {
             .expect("baseline valid");
 
         let mut retry_args = base;
-        retry_args["history_checkpoint"] = json!({
+        retry_args["session_checkpoint"] = json!({
             "session_key": "stage-commit-checkpoint-test",
             "expected_path": current_path,
             "user_intent": "checkpoint retry test",

@@ -1,8 +1,9 @@
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 36;
+pub const CATALOG_VERSION: u32 = 37;
 
 const FACADE_NAMES: &[&str] = &[
+    "session",
     "skill",
     "git",
     "task",
@@ -10,6 +11,14 @@ const FACADE_NAMES: &[&str] = &[
     "commit_stage",
     "environment",
     "cwd",
+];
+
+pub const SESSION_OPERATIONS: &[(&str, &str)] = &[
+    ("open", "session_open"),
+    ("checkpoint", "session_checkpoint"),
+    ("list", "session_list"),
+    ("get", "session_get"),
+    ("validate", "session_validate"),
 ];
 
 pub const ENVIRONMENT_OPERATIONS: &[(&str, &str)] = &[
@@ -84,6 +93,7 @@ pub const COMMIT_STAGE_OPERATIONS: &[(&str, &str)] = &[
 
 fn facade_operations(facade: &str) -> Option<&'static [(&'static str, &'static str)]> {
     match facade {
+        "session" => Some(SESSION_OPERATIONS),
         "skill" => Some(SKILL_OPERATIONS),
         "git" => Some(GIT_OPERATIONS),
         "task" => Some(TASK_OPERATIONS),
@@ -136,6 +146,14 @@ pub fn git_operations_for_profile(tool_profile: &str) -> Vec<&'static str> {
 }
 
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
+    (
+        "session",
+        "Session",
+        "[anchor-core] Manage the current development Session through one domain tool. Use open once at conversation start; open never injects other Session history. Use list/get only when prior Session history is explicitly needed, checkpoint to persist current progress, and validate for explicit store integrity checks.",
+        false,
+        false,
+        false,
+    ),
     (
         "skill",
         "Agent Skill",
@@ -227,7 +245,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "begin_work_session",
         "Begin work session",
-        "[anchor-core] Create or resume a History Session and bind the calling MCP session to a shared-checkout task by default or an explicitly requested isolated Git worktree task.",
+        "[anchor-core] Open or resume only the current isolated Session and bind it to a shared-checkout task by default or an explicitly requested isolated Git worktree task.",
         false,
         false,
         false,
@@ -235,7 +253,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "close_work_session",
         "Close work session",
-        "[anchor-core] Validate and close the bound Harness Task, then persist the matching History Session checkpoint as a recoverable workflow. Closure is rejected while retained commands are running or their terminal results are unconsumed.",
+        "[anchor-core] Validate and close the bound Harness Task, then persist the matching explicit Session checkpoint as a recoverable workflow. Closure is rejected while retained commands are running or their terminal results are unconsumed.",
         false,
         false,
         false,
@@ -321,25 +339,41 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
-        "history_session_bootstrap",
-        "Initialize or restore development session",
-        "[anchor-core] At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
+        "session_open",
+        "Open Session",
+        "Create or resume only the current development Session. This operation never returns or injects other Session content.",
         false,
         false,
         false,
     ),
     (
-        "history_session_checkpoint",
-        "Save development checkpoint",
-        "[anchor-core] Save or update one idempotent, redacted development handoff. Pass session_key and expected_path exactly as returned by history_session_bootstrap. Any explicit checkpoint is rejected while this caller still owns running or terminal-unconsumed retained commands.",
+        "session_checkpoint",
+        "Checkpoint Session",
+        "Persist one idempotent, redacted checkpoint for an explicit session_id and expected_path.",
         false,
         false,
         false,
     ),
     (
-        "history_session_validate",
-        "Validate session archive",
-        "Validate history numbering, files, session mappings, and optionally rebuild the derived index without deleting history.",
+        "session_list",
+        "List Sessions",
+        "List bounded Session metadata from the Session index without reading Session Markdown bodies.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "session_get",
+        "Get Session",
+        "Read one explicit Session document by opaque session_id with a bounded byte budget.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "session_validate",
+        "Validate Session store",
+        "Validate the new docs/session store and optionally rebuild its metadata index. The frozen docs/history-session legacy archive is never scanned or migrated.",
         false,
         false,
         false,
@@ -770,6 +804,12 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser_wait_for_build",
     "begin_work_session",
     "close_work_session",
+    "session",
+    "session_open",
+    "session_checkpoint",
+    "session_list",
+    "session_get",
+    "session_validate",
     "skill",
     "task",
     "update_verification_disposition",
@@ -779,9 +819,6 @@ pub const CORE_TOOLS: &[&str] = &[
     "load_skill",
     "read_skill_resource",
     "switch_task",
-    "history_session_bootstrap",
-    "history_session_checkpoint",
-    "history_session_validate",
     "environment",
     "cwd",
     "check_exec_environment",
@@ -819,6 +856,9 @@ pub const CORE_TOOLS: &[&str] = &[
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "server_info",
     "browser_build_info",
+    "session",
+    "session_list",
+    "session_get",
     "skill",
     "list_skills",
     "load_skill",
@@ -846,6 +886,10 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 pub const MUTATING_TOOLS: &[&str] = &[
+    "session",
+    "session_open",
+    "session_checkpoint",
+    "session_validate",
     "task",
     "slice",
     "commit_stage",
@@ -853,9 +897,6 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "complete_work_session",
     "browser_wait_for_build",
     "close_work_session",
-    "history_session_bootstrap",
-    "history_session_checkpoint",
-    "history_session_validate",
     "cwd",
     "apply_patch",
     "remove_path",
@@ -1068,89 +1109,23 @@ fn task_configuration_input_properties() -> Value {
     })
 }
 
-fn history_bootstrap_output_properties() -> Value {
-    merge_schema_properties(vec![
-        json!({
-            "is_new_session": { "type": "boolean" },
-            "session_key": { "type": "string", "minLength": 1 },
-            "session_key_source": { "type": "string", "minLength": 1 },
-            "target_preserved": { "type": "boolean", "const": true },
-            "history_numbers": { "type": "array", "maxItems": 256, "items": { "type": "integer", "minimum": 1 } },
-            "history_numbers_total": { "type": "integer", "minimum": 0 },
-            "history_numbers_truncated": { "type": "boolean" },
-            "history_count": { "type": "integer", "minimum": 0 },
-            "history_summaries_returned": { "type": "integer", "minimum": 0 },
-            "history_summaries_omitted": { "type": "integer", "minimum": 0 },
-            "history_summary_truncated": { "type": "boolean" },
-            "latest_prior_number": nullable_integer_property(),
-            "latest_prior_path": { "type": ["string", "null"] },
-            "latest_prior_status": { "type": ["string", "null"], "enum": ["active", "paused", "completed", "unknown", null] },
-            "latest_completed_number": nullable_integer_property(),
-            "latest_completed_path": { "type": ["string", "null"] }
-        }),
-        json!({
-            "current_number": { "type": "integer", "minimum": 1 },
-            "current_path": { "type": "string", "minLength": 1 },
-            "session_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
-            "previous_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
-            "reactivated": { "type": "boolean" },
-            "checkpoint_count": { "type": "integer", "minimum": 0 },
-            "created": { "type": "boolean" },
-            "resumed": { "type": "boolean" },
-            "sequence_valid": { "type": "boolean" },
-            "all_history_summary": { "type": "string", "maxLength": 60000 },
-            "inherited_summary": { "type": ["string", "null"] },
-            "latest_handoff": { "type": ["string", "null"], "maxLength": 64000 },
-            "latest_handoff_source": { "type": "string", "enum": ["current_session", "latest_prior", "none"] },
-            "latest_handoff_session_number": nullable_integer_property(),
-            "latest_handoff_session_path": { "type": ["string", "null"] },
-            "latest_handoff_truncated": { "type": "boolean" },
-            "latest_handoff_total_bytes": { "type": "integer", "minimum": 0 }
-        }),
-        json!({
-            "session_summaries": {
-                "type": "array",
-                "maxItems": 64,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "number": { "type": "integer", "minimum": 1 },
-                        "path": { "type": "string", "minLength": 1 },
-                        "status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
-                        "updated_at": { "type": ["string", "null"] },
-                        "size_bytes": { "type": "integer", "minimum": 0 },
-                        "summary": { "type": "string", "maxLength": 3000 },
-                        "summary_truncated": { "type": "boolean" }
-                    },
-                    "required": ["number", "path", "status", "updated_at", "size_bytes", "summary", "summary_truncated"],
-                    "additionalProperties": false
-                }
-            },
-            "history_read_mode": { "type": "string", "minLength": 1 },
-            "total_history_bytes": { "type": "integer", "minimum": 0 },
-            "full_history_included": { "type": "boolean", "const": false },
-            "history_digest": { "type": "string", "minLength": 64, "maxLength": 64 },
-            "persistence_mode": { "type": "string", "minLength": 1 },
-            "assistant_instructions": { "type": "string", "minLength": 1 },
-            "required_next_actions": { "type": "array", "items": { "type": "string" } },
-            "checkpoint_policy": { "type": "object" },
-            "resume_state": { "type": "object" },
-            "persistence": {
-                "type": "object",
-                "properties": {
-                    "storage": { "type": "string", "const": "workspace_file" },
-                    "path": { "type": "string", "minLength": 1 },
-                    "git_tracked": { "type": "boolean" },
-                    "git_ignored": { "type": "boolean" },
-                    "git_dirty_after_write": { "type": "boolean" },
-                    "reason": { "type": "string", "minLength": 1 }
-                },
-                "required": ["storage", "path", "git_tracked", "git_ignored", "git_dirty_after_write", "reason"],
-                "additionalProperties": false
-            },
-            "warnings": warnings_property()
-        }),
-    ])
+fn session_open_output_properties() -> Value {
+    json!({
+        "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
+        "session_path": { "type": "string", "minLength": 1 },
+        "created": { "type": "boolean" },
+        "resumed": { "type": "boolean" },
+        "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
+        "previous_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
+        "reactivated": { "type": "boolean" },
+        "checkpoint_count": { "type": "integer", "minimum": 0 },
+        "automatic_history_loading": { "type": "boolean", "const": false },
+        "history_injected": { "type": "boolean", "const": false },
+        "archive_access": { "type": "object" },
+        "checkpoint_policy": { "type": "object" },
+        "persistence": { "type": "object" },
+        "warnings": warnings_property()
+    })
 }
 
 fn session_snapshot_output_schema() -> Value {
@@ -2079,61 +2054,29 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &["is_repo", "clean", "entries", "warnings"],
         ),
-        "history_session_bootstrap" => success_output_schema(
-            history_bootstrap_output_properties(),
+        "session_open" => success_output_schema(
+            session_open_output_properties(),
             &[
-                "is_new_session",
-                "session_key",
-                "session_key_source",
-                "target_preserved",
-                "history_numbers",
-                "history_numbers_total",
-                "history_numbers_truncated",
-                "history_count",
-                "history_summaries_returned",
-                "history_summaries_omitted",
-                "history_summary_truncated",
-                "latest_prior_number",
-                "latest_prior_path",
-                "latest_prior_status",
-                "latest_completed_number",
-                "latest_completed_path",
-                "current_number",
-                "current_path",
+                "session_id",
+                "session_path",
+                "created",
+                "resumed",
                 "session_status",
                 "previous_status",
                 "reactivated",
                 "checkpoint_count",
-                "created",
-                "resumed",
-                "sequence_valid",
-                "all_history_summary",
-                "inherited_summary",
-                "session_summaries",
-                "latest_handoff",
-                "latest_handoff_source",
-                "latest_handoff_session_number",
-                "latest_handoff_session_path",
-                "latest_handoff_truncated",
-                "latest_handoff_total_bytes",
-                "history_read_mode",
-                "total_history_bytes",
-                "full_history_included",
-                "history_digest",
-                "persistence_mode",
-                "assistant_instructions",
-                "required_next_actions",
+                "automatic_history_loading",
+                "history_injected",
+                "archive_access",
                 "checkpoint_policy",
-                "resume_state",
                 "persistence",
                 "warnings",
             ],
         ),
-        "history_session_checkpoint" => success_output_schema(
+        "session_checkpoint" => success_output_schema(
             json!({
-                "session_number": { "type": "integer", "minimum": 1 },
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "path": { "type": "string", "minLength": 1 },
-                "session_key": { "type": "string", "minLength": 1 },
                 "expected_path": { "type": "string", "minLength": 1 },
                 "target_preserved": { "type": "boolean", "const": true },
                 "turn_id": { "type": "string", "minLength": 1 },
@@ -2155,9 +2098,8 @@ pub fn output_schema(name: &str) -> Value {
                 "warnings": warnings_property()
             }),
             &[
-                "session_number",
+                "session_id",
                 "path",
-                "session_key",
                 "expected_path",
                 "target_preserved",
                 "turn_id",
@@ -2179,16 +2121,55 @@ pub fn output_schema(name: &str) -> Value {
                 "warnings",
             ],
         ),
-        "history_session_validate" => success_output_schema(
+        "session_list" => success_output_schema(
             json!({
-                "sequence_valid": { "type": "boolean" },
-                "numbers": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
-                "missing_numbers": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
-                "duplicate_session_keys": { "type": "array", "items": { "type": "string" } },
+                "sessions": { "type": "array", "items": { "type": "object" } },
+                "cursor": { "type": "integer", "minimum": 0 },
+                "next_cursor": { "type": ["integer", "null"], "minimum": 0 },
+                "total": { "type": "integer", "minimum": 0 },
+                "legacy_path": { "type": "string", "const": "docs/history-session" },
+                "legacy_included": { "type": "boolean", "const": false }
+            }),
+            &[
+                "sessions",
+                "cursor",
+                "next_cursor",
+                "total",
+                "legacy_path",
+                "legacy_included",
+            ],
+        ),
+        "session_get" => success_output_schema(
+            json!({
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
+                "path": { "type": "string", "minLength": 1 },
+                "title": { "type": "string" },
+                "status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
+                "created_at": { "type": "string" },
+                "updated_at": { "type": "string" },
+                "content": { "type": "string" },
+                "content_truncated": { "type": "boolean" },
+                "max_bytes": { "type": "integer", "minimum": 1 }
+            }),
+            &[
+                "session_id",
+                "path",
+                "title",
+                "status",
+                "created_at",
+                "updated_at",
+                "content",
+                "content_truncated",
+                "max_bytes",
+            ],
+        ),
+        "session_validate" => success_output_schema(
+            json!({
+                "valid": { "type": "boolean" },
+                "duplicate_session_ids": { "type": "array", "items": { "type": "string" } },
+                "duplicate_host_session_keys": { "type": "array", "items": { "type": "string" } },
                 "invalid_files": { "type": "array", "items": { "type": "string" } },
                 "empty_files": { "type": "array", "items": { "type": "string" } },
-                "latest_number": nullable_integer_property(),
-                "latest_path": { "type": ["string", "null"] },
                 "document_count": { "type": "integer", "minimum": 0 },
                 "status_counts": {
                     "type": "object",
@@ -2201,33 +2182,36 @@ pub fn output_schema(name: &str) -> Value {
                     "required": ["active", "paused", "completed", "unknown"],
                     "additionalProperties": false
                 },
-                "total_history_bytes": { "type": "integer", "minimum": 0 },
+                "total_session_bytes": { "type": "integer", "minimum": 0 },
                 "largest_document_bytes": { "type": "integer", "minimum": 0 },
                 "max_document_bytes": { "type": "integer", "minimum": 1 },
-                "max_total_history_bytes": { "type": "integer", "minimum": 1 },
+                "max_total_session_bytes": { "type": "integer", "minimum": 1 },
                 "max_documents": { "type": "integer", "minimum": 1 },
                 "index_status": { "type": "string", "minLength": 1 },
                 "repaired": { "type": "boolean" },
+                "legacy_path": { "type": "string", "const": "docs/history-session" },
+                "legacy_scanned": { "type": "boolean", "const": false },
+                "legacy_migration_performed": { "type": "boolean", "const": false },
                 "warnings": warnings_property()
             }),
             &[
-                "sequence_valid",
-                "numbers",
-                "missing_numbers",
-                "duplicate_session_keys",
+                "valid",
+                "duplicate_session_ids",
+                "duplicate_host_session_keys",
                 "invalid_files",
                 "empty_files",
-                "latest_number",
-                "latest_path",
                 "document_count",
                 "status_counts",
-                "total_history_bytes",
+                "total_session_bytes",
                 "largest_document_bytes",
                 "max_document_bytes",
-                "max_total_history_bytes",
+                "max_total_session_bytes",
                 "max_documents",
                 "index_status",
                 "repaired",
+                "legacy_path",
+                "legacy_scanned",
+                "legacy_migration_performed",
                 "warnings",
             ],
         ),
@@ -2299,14 +2283,14 @@ pub fn output_schema(name: &str) -> Value {
         "begin_work_session" => success_output_schema(
             json!({
                 "work_session": { "type": "object" },
-                "history": { "type": "object" },
+                "session": { "type": "object" },
                 "task": { "type": "object" },
                 "harness": { "type": "object" },
                 "reconnect_required": { "type": "boolean", "const": false }
             }),
             &[
                 "work_session",
-                "history",
+                "session",
                 "task",
                 "harness",
                 "reconnect_required",
@@ -2816,11 +2800,11 @@ pub fn input_schema(name: &str) -> Value {
                 "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
                 "wait_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 30000 },
                 "restart_lost_check": { "type": "boolean", "default": false },
-                "history_checkpoint": {
+                "session_checkpoint": {
                     "type": "object",
-                    "required": ["session_key", "expected_path"],
+                    "required": ["session_id", "expected_path"],
                     "properties": {
-                        "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                         "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 }
                     },
                     "additionalProperties": true
@@ -2861,11 +2845,11 @@ pub fn input_schema(name: &str) -> Value {
                 "check_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "default": 600000 },
                 "execution_mode": { "type": "string", "enum": ["blocking", "deferred"], "default": "blocking" },
                 "wait_timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 0 },
-                "history_checkpoint": {
+                "session_checkpoint": {
                     "type": "object",
-                    "required": ["session_key", "expected_path"],
+                    "required": ["session_id", "expected_path"],
                     "properties": {
-                        "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                         "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 }
                     },
                     "additionalProperties": true
@@ -2906,25 +2890,25 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["name", "path"],
             "additionalProperties": false
         }),
-        "history_session_bootstrap" => json!({
+        "session_open" => json!({
             "type": "object",
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "title": { "type": "string", "maxLength": 200 },
-                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "session_dir": { "type": "string", "default": "docs/session" },
                 "create_if_missing": { "type": "boolean", "default": true }
             },
             "additionalProperties": false
         }),
-        "history_session_checkpoint" => json!({
+        "session_checkpoint" => json!({
             "type": "object",
-            "required": ["session_key", "expected_path"],
+            "required": ["session_id", "expected_path"],
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
-                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "session_dir": { "type": "string", "default": "docs/session" },
                 "turn_id": { "type": "string", "minLength": 1, "maxLength": 128 },
                 "timestamp": { "type": "string", "maxLength": 128 },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
@@ -2940,11 +2924,32 @@ pub fn input_schema(name: &str) -> Value {
             },
             "additionalProperties": false
         }),
-        "history_session_validate" => json!({
+        "session_list" => json!({
             "type": "object",
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "session_dir": { "type": "string", "default": "docs/session" },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+            },
+            "additionalProperties": false
+        }),
+        "session_get" => json!({
+            "type": "object",
+            "required": ["session_id"],
+            "properties": {
+                "workspace_root": { "type": "string", "minLength": 1 },
+                "session_dir": { "type": "string", "default": "docs/session" },
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
+                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 262144, "default": 65536 }
+            },
+            "additionalProperties": false
+        }),
+        "session_validate" => json!({
+            "type": "object",
+            "properties": {
+                "workspace_root": { "type": "string", "minLength": 1 },
+                "session_dir": { "type": "string", "default": "docs/session" },
                 "repair": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
@@ -2965,7 +2970,7 @@ pub fn input_schema(name: &str) -> Value {
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
                 "task_id": { "type": "string", "minLength": 1 },
-                "history_session_key": { "type": "string", "minLength": 1 },
+                "session_id": { "type": "string", "minLength": 1 },
                 "mcp_session_id": { "type": "string", "minLength": 1 },
                 "started_after": { "type": "string", "minLength": 1, "description": "Epoch milliseconds or RFC3339" },
                 "started_before": { "type": "string", "minLength": 1, "description": "Epoch milliseconds or RFC3339" },
@@ -2982,14 +2987,14 @@ pub fn input_schema(name: &str) -> Value {
                 "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
                 "completed_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "pending_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
-                "session_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
                 "worktree_remove_on_close": { "type": "boolean", "default": false },
-                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "session_dir": { "type": "string", "default": "docs/session" },
                 "workspace_root": { "type": "string", "minLength": 1 }
             }), task_configuration_input_properties()]),
             "required": ["objective"],
@@ -3610,16 +3615,17 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 24);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"git"));
         assert!(names.contains(&"task"));
         assert!(names.contains(&"skill"));
         assert!(names.contains(&"environment"));
         assert!(names.contains(&"cwd"));
-        assert!(names.contains(&"history_session_bootstrap"));
-        assert!(names.contains(&"history_session_checkpoint"));
-        assert!(names.contains(&"history_session_validate"));
+        assert!(names.contains(&"session"));
+        assert!(!names
+            .iter()
+            .any(|name| name.starts_with("history_session_")));
         assert!(names.contains(&"begin_work_session"));
         assert!(names.contains(&"close_work_session"));
         assert!(names.contains(&"wait_command"));
@@ -3666,8 +3672,7 @@ mod tests {
             .collect::<HashSet<_>>();
         for required in [
             "server_info",
-            "history_session_bootstrap",
-            "history_session_checkpoint",
+            "session",
             "begin_work_session",
             "close_work_session",
             "read_file",

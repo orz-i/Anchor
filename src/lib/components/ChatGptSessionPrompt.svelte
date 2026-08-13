@@ -3,15 +3,15 @@
   import { onDestroy } from "svelte";
   import { showToast } from "$lib/stores/toast";
 
-  const sessionPrompt = `请使用当前工作区的 Anchor MCP 初始化或恢复项目会话。
-在回答本会话的第一个用户请求前，先且仅调用一次 history_session_bootstrap；即使用户没有明确要求恢复，也必须执行。
-如果没有历史记录，由 bootstrap 创建首个 history-session；如果已有历史记录，先阅读响应中的 all_history_summary、latest_handoff 和 inherited_summary，再继续工作。
-检查 history_summaries_omitted、history_summary_truncated 和 latest_handoff_truncated；只有当前任务确实需要被省略的细节时，才用 read_file 读取对应的精确归档路径。
-不要在同一 ChatGPT 会话中重复调用 bootstrap 或创建重复历史会话。
-保存 bootstrap 返回的 session_key 和 current_path；每次调用 history_session_checkpoint 时，将 session_key 原样传入 session_key，并将 current_path 原样作为 expected_path。
+  const sessionPrompt = `请使用当前工作区的 Anchor MCP 初始化本 ChatGPT 会话对应的独立开发 Session。
+在回答本会话的第一个用户请求前，先且仅调用一次 session，operation=open；即使用户没有明确要求恢复，也必须执行。
+Session 默认自然隔离：open 不会读取、摘要或注入其他 Session 的内容，也不要主动调用 list/get 恢复历史。
+只有当用户明确要求恢复、查找或引用之前的工作时，才调用 session operation=list 获取有限元数据，再对明确相关的 session_id 调用 operation=get。
+旧 docs/history-session/ 是冻结归档，不迁移、不参与新 Session；仅在用户明确要求旧归档内容时才用 read_file 精确读取。
+不要在同一 ChatGPT 会话中重复创建 Session。保存 open 返回的 session_id 和 session_path；后续 checkpoint 原样使用 session_id，并将 session_path 作为 expected_path。
 插件会在受支持的代码变更、提交、命令阶段和浏览器证据阶段同步写入幂等里程碑检查点，但这不能替代最终交接。
-每个用户任务完成后、发送最终答复前调用 history_session_checkpoint，记录已脱敏的结论、决策、文件变更、验证结果、遗留问题和下一步。
-只有最终 checkpoint 返回 ok=true，且返回的 session_key、path 和 expected_path 仍指向同一会话目标时，才能说明最终进度已保存。`;
+每个用户任务完成后、发送最终答复前调用 session operation=checkpoint，记录已脱敏的结论、决策、文件变更、验证结果、遗留问题和下一步。
+只有最终 checkpoint 返回 ok=true，且返回的 session_id、path 和 expected_path 仍指向同一 Session 时，才能说明最终进度已保存。`;
 
   let copying = $state(false);
   let copied = $state(false);
@@ -70,7 +70,7 @@
           ChatGPT 新会话启动提示词
         </h3>
         <p class="mt-0.5 text-xs leading-5 text-[var(--text-muted)]">
-          首次使用会初始化历史；后续新会话会自动恢复已有进度。
+          每个新聊天创建独立 Session；仅在明确需要时按索引读取历史。
         </p>
       </div>
     </div>

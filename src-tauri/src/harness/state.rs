@@ -127,9 +127,11 @@ fn tool_activity_resumes_paused_task(tool: &str) -> bool {
             | "task_context"
             | "list_task_events"
             | "change_summary"
-            | "history_session_bootstrap"
-            | "history_session_checkpoint"
-            | "history_session_validate"
+            | "session_open"
+            | "session_checkpoint"
+            | "session_list"
+            | "session_get"
+            | "session_validate"
             | "check_exec_environment"
             | "exec_health_check"
             | "command_cost_explain"
@@ -300,7 +302,7 @@ impl Harness {
             .list_operations(&self.workspace_id, 0, limit.clamp(1, 20_000))
     }
 
-    pub fn bind_history_session(
+    pub fn bind_session(
         &self,
         task_id: &str,
         session_key: &str,
@@ -309,9 +311,8 @@ impl Harness {
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;
-                if let Some(existing) = task.history_session_key.as_deref() {
-                    if existing != session_key || task.history_session_path.as_deref() != Some(path)
-                    {
+                if let Some(existing) = task.session_id.as_deref() {
+                    if existing != session_key || task.session_path.as_deref() != Some(path) {
                         return Err(HarnessError::new(
                             "WORK_SESSION_CONFLICT",
                             "当前任务已绑定到另一个 History Session",
@@ -319,14 +320,14 @@ impl Harness {
                     }
                     return Ok(task);
                 }
-                task.history_session_key = Some(session_key.to_string());
-                task.history_session_path = Some(path.to_string());
+                task.session_id = Some(session_key.to_string());
+                task.session_path = Some(path.to_string());
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
                 transaction.append_event(&harness_event(
                     &self.workspace_id,
                     task_id,
-                    "history_session_bound",
+                    "session_bound",
                     Some("begin_work_session"),
                     json!({"session_key": session_key, "path": path}),
                     json!({"ok": true}),
@@ -617,8 +618,8 @@ impl Harness {
                     pending_steps: Vec::new(),
                     latest_change_id: None,
                     latest_verification_id: None,
-                    history_session_key: None,
-                    history_session_path: None,
+                    session_id: None,
+                    session_path: None,
                     git_worktree: git_worktree.clone(),
                     created_at: now.clone(),
                     updated_at: now.clone(),
@@ -1769,9 +1770,9 @@ impl Harness {
             .get("reason")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let history_session_key = task_id
+        let session_id = task_id
             .and_then(|task_id| self.task(task_id).ok())
-            .and_then(|task| task.history_session_key);
+            .and_then(|task| task.session_id);
         let affected_files = result_summary
             .get("affected_files")
             .and_then(serde_json::Value::as_array)
@@ -1802,7 +1803,7 @@ impl Harness {
                 .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
             workspace_id: self.workspace_id.clone(),
             task_id: task_id.map(str::to_string),
-            history_session_key,
+            session_id,
             mcp_session_id: mcp_session_id.map(str::to_string),
             tool: tool.to_string(),
             kind: kind.to_string(),

@@ -40,7 +40,7 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         .as_str()
         .expect("task id")
         .to_string();
-    let expected_path = started["work_session"]["history_session_path"]
+    let expected_path = started["work_session"]["session_path"]
         .as_str()
         .expect("history path")
         .to_string();
@@ -54,8 +54,8 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         .save_close_outbox(&WorkSessionCloseOutbox {
             schema_version: SCHEMA_VERSION,
             task_id: task_id.clone(),
-            history_session_key: "close-outbox-recovery".into(),
-            history_session_path: expected_path.clone(),
+            session_id: "close-outbox-recovery".into(),
+            session_path: expected_path.clone(),
             session_status: HarnessSessionStatus::Paused,
             finish_args: json!({
                 "task_id": task_id,
@@ -87,7 +87,7 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
     assert_eq!(pending.phase, WorkSessionClosePhase::CheckpointPending);
     assert!(pending.last_error.is_some());
 
-    crate::tools::history::bootstrap(
+    crate::tools::session::open(
         &ctx,
         &json!({
             "session_key": "close-outbox-recovery",

@@ -3,37 +3,39 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryIndex {
+pub struct SessionIndex {
     pub version: u32,
-    pub latest_number: u64,
     pub sessions: BTreeMap<String, IndexEntry>,
+    #[serde(default)]
+    pub host_sessions: BTreeMap<String, String>,
 }
 
-impl Default for HistoryIndex {
+impl Default for SessionIndex {
     fn default() -> Self {
         Self {
-            version: 1,
-            latest_number: 0,
+            version: 2,
             sessions: BTreeMap::new(),
+            host_sessions: BTreeMap::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
-    pub number: u64,
     pub path: String,
+    pub title: String,
+    pub status: String,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct HistoryDocument {
-    pub number: u64,
+pub struct SessionDocument {
+    pub session_id: String,
     pub path: String,
-    pub content: String,
+    pub title: String,
     pub size_bytes: u64,
-    pub session_key: Option<String>,
+    pub host_session_key: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub status: Option<String>,
@@ -41,22 +43,17 @@ pub struct HistoryDocument {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
-    pub documents: Vec<HistoryDocument>,
-    pub numbers: Vec<u64>,
-    pub missing_numbers: Vec<u64>,
-    pub duplicate_session_keys: Vec<String>,
+    pub documents: Vec<SessionDocument>,
+    pub duplicate_session_ids: Vec<String>,
+    pub duplicate_host_session_keys: Vec<String>,
     pub invalid_files: Vec<String>,
     pub empty_files: Vec<String>,
 }
 
 impl ScanReport {
-    pub fn latest_number(&self) -> Option<u64> {
-        self.numbers.last().copied()
-    }
-
     pub fn sequence_valid(&self) -> bool {
-        self.missing_numbers.is_empty()
-            && self.duplicate_session_keys.is_empty()
+        self.duplicate_session_ids.is_empty()
+            && self.duplicate_host_session_keys.is_empty()
             && self.invalid_files.is_empty()
             && self.empty_files.is_empty()
     }

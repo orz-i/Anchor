@@ -8,7 +8,7 @@ use crate::tools::context::ToolContext;
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
 use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
 use crate::tools::{
-    exec, file, git, history, image_tool, patch, recovery, session, CancellationToken,
+    command_session, exec, file, git, image_tool, patch, recovery, session, CancellationToken,
 };
 
 fn policy_tool_err(err: PolicyError) -> Value {
@@ -344,7 +344,7 @@ fn tasks_share_write_domain(
 }
 
 fn requires_workspace_mutation_guard(name: &str, args: &Value) -> bool {
-    requires_write_baseline(name, args) || name == "history_session_checkpoint"
+    requires_write_baseline(name, args) || name == "session_checkpoint"
 }
 
 fn worktree_remove_task_conflict(ctx: &ToolContext, args: &Value) -> Option<Value> {
@@ -424,7 +424,7 @@ fn normalize_exec_preflight_result(
         object.insert("command_ok".into(), Value::Bool(false));
         object.insert("execution_started".into(), Value::Bool(false));
     }
-    session::finalize_execution_result(output)
+    command_session::finalize_execution_result(output)
 }
 
 fn policy_alternatives(message: &str) -> Vec<Value> {
@@ -890,8 +890,15 @@ fn call_tool_impl(
             .as_object_mut()
             .expect("facade arguments are schema-validated objects")
             .remove("operation");
+        let mut validation_args = delegated_args.clone();
+        if delegated_tool == "session_open" {
+            validation_args
+                .as_object_mut()
+                .expect("session arguments are objects")
+                .remove("_host_session_key");
+        }
         if let Err(error) =
-            crate::tools::schema::validate_tool_input(delegated_tool, &delegated_args)
+            crate::tools::schema::validate_tool_input(delegated_tool, &validation_args)
         {
             let mut output = tool_err(error);
             if let Some(object) = output.as_object_mut() {
@@ -1206,9 +1213,11 @@ fn call_tool_impl(
         }
     }
     let result = match name {
-        "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
-        "history_session_checkpoint" => history::checkpoint(ctx, &effective_args, session_id),
-        "history_session_validate" => history::validate(ctx, &effective_args),
+        "session_open" => session::open(ctx, &effective_args),
+        "session_checkpoint" => session::checkpoint(ctx, &effective_args, session_id),
+        "session_list" => session::list(ctx, &effective_args),
+        "session_get" => session::get(ctx, &effective_args),
+        "session_validate" => session::validate(ctx, &effective_args),
         "server_info" => server_info_for_session(ctx, session_id),
         "list_skills" => crate::skills::list_tool(ctx, &effective_args),
         "load_skill" => crate::skills::load_tool(ctx, &effective_args),
@@ -1232,11 +1241,13 @@ fn call_tool_impl(
             active_task.as_ref().map(|task| task.id.as_str()),
             session_id,
         ),
-        "read_output" => session::read_output(&ctx.sessions, &effective_args),
-        "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
-        "wait_command" => session::wait_command(&ctx.sessions, &effective_args),
-        "list_command_sessions" => session::list_command_sessions(&ctx.sessions, &effective_args),
-        "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
+        "read_output" => command_session::read_output(&ctx.sessions, &effective_args),
+        "write_stdin" => command_session::write_stdin(&ctx.sessions, &effective_args),
+        "wait_command" => command_session::wait_command(&ctx.sessions, &effective_args),
+        "list_command_sessions" => {
+            command_session::list_command_sessions(&ctx.sessions, &effective_args)
+        }
+        "kill_session" => command_session::kill_session(&ctx.sessions, &effective_args),
         "git_status" => git::git_status(ws, &effective_args),
         "git_worktree_list" => git::git_worktree_list(ws, &effective_args),
         "git_worktree_create" => git::git_worktree_create(ws, &effective_args),
@@ -1475,7 +1486,7 @@ fn attach_auto_checkpoint(
         .ok()
         .and_then(|status| status.baseline_matches)
         == Some(true);
-    match history::auto_checkpoint_after_tool(ctx, name, args, output, task_id) {
+    match session::auto_checkpoint_after_tool(ctx, name, args, output, task_id) {
         Ok(Some(checkpoint)) => {
             if baseline_was_current {
                 if let Some(task_id) = task_id {
@@ -1487,7 +1498,7 @@ fn attach_auto_checkpoint(
             if let Some(object) = output.as_object_mut() {
                 object.insert(
                     "checkpoint".into(),
-                    history::checkpoint_reference(&checkpoint),
+                    session::checkpoint_reference(&checkpoint),
                 );
             }
         }
@@ -1654,10 +1665,10 @@ fn resolve_task_for_call(
     if name == "begin_work_session" {
         return ctx.bound_task_for_session(mcp_session_id);
     }
-    if name == "history_session_checkpoint" {
-        // History persistence is keyed by session_key + expected_path and lives in the
-        // primary workspace metadata store. It must never auto-bind an unbound/closed
-        // caller to the workspace's default peer Task merely because that Task is active.
+    if name == "session_checkpoint" {
+        // Session persistence is keyed by session_id + expected_path and lives in the
+        // primary workspace metadata store. It must never auto-bind an unbound caller
+        // to the workspace's default peer Task merely because that Task is active.
         return ctx.bound_task_for_session(mcp_session_id);
     }
     if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
@@ -1702,9 +1713,11 @@ fn tool_uses_task_worktree(name: &str) -> bool {
             | "switch_task"
             | "resume_task"
             | "pause_task"
-            | "history_session_bootstrap"
-            | "history_session_checkpoint"
-            | "history_session_validate"
+            | "session_open"
+            | "session_checkpoint"
+            | "session_list"
+            | "session_get"
+            | "session_validate"
             | "git_worktree_list"
             | "git_worktree_create"
             | "git_worktree_remove"
@@ -1737,12 +1750,7 @@ fn should_log_operation(name: &str) -> bool {
     standalone_operation(name)
         || matches!(
             name,
-            "git_status"
-                | "git_diff"
-                | "git_log"
-                | "git_show"
-                | "git_blame"
-                | "history_session_checkpoint"
+            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "session_checkpoint"
         )
 }
 
@@ -2010,9 +2018,12 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
                 | "accept_current_baseline"
                 | "refresh_baseline"
                 | "operation_log"
-                | "history_session_bootstrap"
-                | "history_session_checkpoint"
-                | "history_session_validate"
+                | "session"
+                | "session_open"
+                | "session_checkpoint"
+                | "session_list"
+                | "session_get"
+                | "session_validate"
         ) {
             &mut task
         } else if matches!(

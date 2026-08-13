@@ -317,8 +317,10 @@ pub enum WorkSessionClosePhase {
 pub struct WorkSessionCloseOutbox {
     pub schema_version: u32,
     pub task_id: String,
-    pub history_session_key: String,
-    pub history_session_path: String,
+    #[serde(alias = "history_session_key")]
+    pub session_id: String,
+    #[serde(alias = "history_session_path")]
+    pub session_path: String,
     pub session_status: HarnessSessionStatus,
     pub finish_args: Value,
     pub checkpoint_args: Value,
@@ -372,7 +374,8 @@ pub struct StageCommitReceipt {
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
-    pub history_checkpoint: Option<Value>,
+    #[serde(alias = "history_checkpoint")]
+    pub session_checkpoint: Option<Value>,
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -534,9 +537,11 @@ pub struct TaskSession {
     pub latest_change_id: Option<String>,
     pub latest_verification_id: Option<String>,
     #[serde(default)]
-    pub history_session_key: Option<String>,
+    #[serde(alias = "history_session_key")]
+    pub session_id: Option<String>,
     #[serde(default)]
-    pub history_session_path: Option<String>,
+    #[serde(alias = "history_session_path")]
+    pub session_path: Option<String>,
     #[serde(default)]
     pub git_worktree: Option<TaskGitWorktree>,
     pub created_at: String,
@@ -590,7 +595,8 @@ pub struct OperationRecord {
     pub workspace_id: String,
     pub task_id: Option<String>,
     #[serde(default)]
-    pub history_session_key: Option<String>,
+    #[serde(alias = "history_session_key")]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub mcp_session_id: Option<String>,
     pub tool: String,

@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use super::model::CheckpointRecord;
 
 const CHECKPOINT_HEADING: &str = "## 本轮检查点";
-const INHERITED_SUMMARY_HEADING: &str = "继承的历史摘要";
 pub(super) const MAX_TURN_ID_CHARS: usize = 128;
 pub(super) const MAX_TIMESTAMP_CHARS: usize = 128;
 pub(super) const MAX_USER_INTENT_CHARS: usize = 4_000;
@@ -66,7 +65,7 @@ pub fn validate_session_status(value: &str) -> Result<&str, String> {
     }
 }
 
-pub fn document_title(content: &str, number: u64) -> String {
+pub fn document_title(content: &str) -> String {
     content
         .lines()
         .find_map(|line| line.trim().strip_prefix("# "))
@@ -74,15 +73,12 @@ pub fn document_title(content: &str, number: u64) -> String {
         .filter(|title| !title.is_empty())
         .unwrap_or("开发会话")
         .to_string()
-        .replace(&format!("会话 {number}"), "")
-        .trim_matches(['：', ':', ' '])
-        .to_string()
 }
 
 pub fn render_document(
-    number: u64,
+    session_id: &str,
     title: &str,
-    session_key: &str,
+    host_session_key: Option<&str>,
     created_at: &str,
     updated_at: &str,
     status: &str,
@@ -94,12 +90,16 @@ pub fn render_document(
         title.trim()
     };
     let mut output = format!(
-        "# 会话 {number}：{title}\n\n\
-**Session key:** {session_key}\n\
+        "# Session：{title}\n\n\
+**Session id:** {session_id}\n\
 **Created:** {created_at}\n\
 **Updated:** {updated_at}\n\
-**Status:** {status}\n\n"
+**Status:** {status}\n"
     );
+    if let Some(host_session_key) = host_session_key.filter(|value| !value.trim().is_empty()) {
+        output.push_str(&format!("**Host session key:** {host_session_key}\n"));
+    }
+    output.push('\n');
     push_section(
         &mut output,
         "用户核心目标",
@@ -171,32 +171,6 @@ pub fn render_document(
     output
 }
 
-pub fn attach_inherited_summary(mut content: String, summary: &str) -> String {
-    let summary = summary.trim();
-    if summary.is_empty() {
-        return content;
-    }
-    let Some(status_start) = content.find("**Status:**") else {
-        return content;
-    };
-    let Some(relative_end) = content[status_start..].find("\n\n") else {
-        return content;
-    };
-    let insert_at = status_start + relative_end + 2;
-    content.insert_str(
-        insert_at,
-        &format!("## {INHERITED_SUMMARY_HEADING}\n\n{summary}\n\n"),
-    );
-    content
-}
-
-pub fn inherited_summary(content: &str) -> Option<String> {
-    section_body(content, INHERITED_SUMMARY_HEADING)
-        .map(str::trim)
-        .filter(|summary| !summary.is_empty())
-        .map(str::to_string)
-}
-
 fn push_section<'a>(output: &mut String, heading: &str, values: impl Iterator<Item = &'a str>) {
     output.push_str("## ");
     output.push_str(heading);
@@ -235,46 +209,6 @@ pub fn parse_checkpoint_records(content: &str) -> Vec<CheckpointRecord> {
         remaining = &remaining[json_start + fence_end + "\n```".len()..];
     }
     records
-}
-
-pub fn summary(content: &str) -> String {
-    const SECTIONS: &[&str] = &[
-        "用户核心目标",
-        "已确认事实",
-        "已完成修改",
-        "关键设计决定",
-        "测试结果",
-        "当前运行状态",
-        "剩余问题",
-        "下一步",
-    ];
-    let mut parts = Vec::new();
-    for section in SECTIONS {
-        if let Some(body) = section_body(content, section) {
-            let compact = body
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !compact.is_empty() {
-                parts.push(format!("{section}: {compact}"));
-            }
-        }
-    }
-    if parts.is_empty() {
-        "未记录结构化摘要".to_string()
-    } else {
-        parts.join("；")
-    }
-}
-
-fn section_body<'a>(content: &'a str, heading: &str) -> Option<&'a str> {
-    let marker = format!("## {heading}");
-    let start = content.find(&marker)? + marker.len();
-    let tail = &content[start..];
-    let end = tail.find("\n## ").unwrap_or(tail.len());
-    Some(tail[..end].trim())
 }
 
 pub fn checkpoint_from_args(

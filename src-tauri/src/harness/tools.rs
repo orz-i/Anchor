@@ -381,9 +381,9 @@ fn export_work_session(
             "workspace_id": task.workspace_id,
             "git": git
         },
-        "history_session": {
-            "session_key": task.history_session_key,
-            "path": task.history_session_path
+        "session": {
+            "session_id": task.session_id,
+            "path": task.session_path
         },
         "task": task_view(&task),
         "commits": summary.get("commits").cloned().unwrap_or_else(|| json!([])),
@@ -394,7 +394,7 @@ fn export_work_session(
         "resume": {
             "strategy": "begin_work_session",
             "objective": task.objective,
-            "note": "Import this JSON as source evidence, then create a fresh local History Session and Harness Task instead of injecting private storage files."
+            "note": "Import this JSON as source evidence, then create a fresh isolated local Session and Harness Task instead of injecting private storage files."
         }
     });
     let encoded =
@@ -863,28 +863,21 @@ fn begin_work_session(
     let configuration = parse_task_configuration(args)?;
     let completed_steps = string_list(args.get("completed_steps"))?;
     let pending_steps = string_list(args.get("pending_steps"))?;
-    let history = crate::tools::history::bootstrap(ctx, args)?;
-    let session_key = history
-        .get("session_key")
+    let session_state = crate::tools::session::open(ctx, args)?;
+    let session_id = session_state
+        .get("session_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            tool_error(
-                "HISTORY_SESSION_INVALID",
-                "History Session 缺少 session_key",
-            )
-        })?;
-    let current_path = history
-        .get("current_path")
+        .ok_or_else(|| tool_error("SESSION_INVALID", "Session 缺少 session_id"))?;
+    let session_path = session_state
+        .get("session_path")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            tool_error(
-                "HISTORY_SESSION_INVALID",
-                "History Session 缺少 current_path",
-            )
-        })?;
+        .ok_or_else(|| tool_error("SESSION_INVALID", "Session 缺少 session_path"))?;
 
-    let explicit_task = ctx.bound_task_for_session(mcp_session_id);
-    let history_task = ctx
+    let explicit_task = ctx.bound_task_for_session(mcp_session_id).filter(|task| {
+        task.session_id.as_deref() == Some(session_id)
+            && task.session_path.as_deref() == Some(session_path)
+    });
+    let session_task = ctx
         .harness
         .list_tasks()
         .map_err(map_error)?
@@ -892,15 +885,10 @@ fn begin_work_session(
         .find(|task| {
             task.status.is_writable()
                 && task.objective == objective
-                && task.history_session_key.as_deref() == Some(session_key)
-                && task.history_session_path.as_deref() == Some(current_path)
+                && task.session_id.as_deref() == Some(session_id)
+                && task.session_path.as_deref() == Some(session_path)
         });
-    let fallback_task = if mcp_session_id.is_none() {
-        ctx.harness.current_task().map_err(map_error)?
-    } else {
-        None
-    };
-    let selected_task = history_task.or(explicit_task).or(fallback_task);
+    let selected_task = session_task.or(explicit_task);
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
             validate_requested_workspace_mode(args, &task)?;
@@ -922,7 +910,7 @@ fn begin_work_session(
     };
     let mut task = ctx
         .harness
-        .bind_history_session(&task.id, session_key, current_path)
+        .bind_session(&task.id, session_id, session_path)
         .map_err(map_error)?;
     if task_created && !configuration.is_empty() {
         task = ctx
@@ -951,8 +939,8 @@ fn begin_work_session(
             .filter(|previous| previous.id != task.id)
             .filter(|previous| previous.git_worktree.is_none())
             .filter(|previous| {
-                previous.history_session_key.as_deref() == Some(session_key)
-                    && previous.history_session_path.as_deref() == Some(current_path)
+                previous.session_id.as_deref() == Some(session_id)
+                    && previous.session_path.as_deref() == Some(session_path)
             })
             .filter(|previous| {
                 matches!(previous.status, TaskStatus::Active | TaskStatus::Verifying)
@@ -983,8 +971,8 @@ fn begin_work_session(
     Ok(json!({
         "work_session": {
             "status": "active",
-            "history_session_key": session_key,
-            "history_session_path": current_path,
+            "session_id": session_id,
+            "session_path": session_path,
             "task_id": task.id,
             "task_created": task_created,
             "previous_task_id": previous_task_id,
@@ -996,24 +984,24 @@ fn begin_work_session(
             "baseline": baseline_view(&task),
             "expected_state": task.expected_state
         },
-        "history": compact_history_view(&history),
+        "session": compact_session_view(&session_state),
         "task": task_view(&task),
         "harness": harness,
         "reconnect_required": false
     }))
 }
 
-fn compact_history_view(history: &Value) -> Value {
+fn compact_session_view(session: &Value) -> Value {
     json!({
-        "session_key": history.get("session_key").cloned().unwrap_or(Value::Null),
-        "current_path": history.get("current_path").cloned().unwrap_or(Value::Null),
-        "current_number": history.get("current_number").cloned().unwrap_or(Value::Null),
-        "created": history.get("created").cloned().unwrap_or(Value::Bool(false)),
-        "resumed": history.get("resumed").cloned().unwrap_or(Value::Bool(false)),
-        "session_status": history.get("session_status").cloned().unwrap_or(Value::Null),
-        "checkpoint_count": history.get("checkpoint_count").cloned().unwrap_or(Value::Null),
-        "persistence": history.get("persistence").cloned().unwrap_or(Value::Null),
-        "warnings": history.get("warnings").cloned().unwrap_or_else(|| json!([]))
+        "session_id": session.get("session_id").cloned().unwrap_or(Value::Null),
+        "session_path": session.get("session_path").cloned().unwrap_or(Value::Null),
+        "created": session.get("created").cloned().unwrap_or(Value::Bool(false)),
+        "resumed": session.get("resumed").cloned().unwrap_or(Value::Bool(false)),
+        "session_status": session.get("session_status").cloned().unwrap_or(Value::Null),
+        "checkpoint_count": session.get("checkpoint_count").cloned().unwrap_or(Value::Null),
+        "history_injected": session.get("history_injected").cloned().unwrap_or(Value::Bool(false)),
+        "persistence": session.get("persistence").cloned().unwrap_or(Value::Null),
+        "warnings": session.get("warnings").cloned().unwrap_or_else(|| json!([]))
     })
 }
 
@@ -1058,21 +1046,21 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
         return resume_close_outbox(ctx, outbox, true);
     }
     let task_before = ctx.harness.task(task_id).map_err(map_error)?;
-    let session_key = task_before
-        .history_session_key
+    let session_id = task_before
+        .session_id
         .clone()
-        .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 History Session"))?;
+        .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 Session"))?;
     let expected_path = task_before
-        .history_session_path
+        .session_path
         .clone()
-        .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 History Session 路径"))?;
+        .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 Session 路径"))?;
     let session_status = parse_session_status(args)?;
     let mut checkpoint = args
         .get("checkpoint")
         .cloned()
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
-    checkpoint["session_key"] = Value::String(session_key.clone());
+    checkpoint["session_id"] = Value::String(session_id.clone());
     checkpoint["expected_path"] = Value::String(expected_path.clone());
     checkpoint["turn_id"] = Value::String(format!("close-work-session-{task_id}"));
     if checkpoint.get("user_intent").is_none() {
@@ -1094,8 +1082,8 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
     let outbox = WorkSessionCloseOutbox {
         schema_version: SCHEMA_VERSION,
         task_id: task_id.to_string(),
-        history_session_key: session_key,
-        history_session_path: expected_path,
+        session_id,
+        session_path: expected_path,
         session_status,
         finish_args,
         checkpoint_args: checkpoint,
@@ -1156,8 +1144,8 @@ fn resume_close_outbox(
         }));
         checkpoint = Some(json!({
             "ok": true,
-            "session_key": outbox.history_session_key,
-            "path": outbox.history_session_path,
+            "session_id": outbox.session_id,
+            "path": outbox.session_path,
             "idempotent_retry": true,
             "outbox_completed": true
         }));
@@ -1223,7 +1211,7 @@ fn resume_close_outbox(
         outbox.phase,
         WorkSessionClosePhase::TaskClosed | WorkSessionClosePhase::CheckpointPending
     ) {
-        match crate::tools::history::checkpoint(ctx, &outbox.checkpoint_args, None) {
+        match crate::tools::session::checkpoint(ctx, &outbox.checkpoint_args, None) {
             Ok(result) => {
                 checkpoint = Some(result);
                 outbox.phase = WorkSessionClosePhase::Completed;
@@ -1235,7 +1223,7 @@ fn resume_close_outbox(
                 outbox.phase = WorkSessionClosePhase::CheckpointPending;
                 let cause = error.to_error_value();
                 outbox.last_error = Some(json!({
-                    "phase": "history_checkpoint",
+                    "phase": "session_checkpoint",
                     "cause": cause.clone()
                 }));
                 outbox.updated_at = harness_timestamp();
@@ -1244,7 +1232,7 @@ fn resume_close_outbox(
                     return Ok(json!({
                         "ok": false,
                         "closed": false,
-                        "phase": "history_checkpoint",
+                        "phase": "session_checkpoint",
                         "finish": finish,
                         "checkpoint": null,
                         "retryable": true,
@@ -1254,11 +1242,11 @@ fn resume_close_outbox(
                             "category": "runtime",
                             "retryable": true,
                             "details": {
-                                "phase": "history_checkpoint",
+                                "phase": "session_checkpoint",
                                 "task_closed": true,
                                 "task_id": outbox.task_id,
-                                "session_key": outbox.history_session_key,
-                                "expected_path": outbox.history_session_path,
+                                "session_id": outbox.session_id,
+                                "expected_path": outbox.session_path,
                                 "outbox": close_outbox_view(&outbox),
                                 "suggestion": "Checkpoint intent is durable and will be retried automatically on the next Harness call.",
                                 "cause": cause
@@ -1282,8 +1270,8 @@ fn resume_close_outbox(
         "ok": completed,
         "work_session": {
             "status": harness_session_status_text(outbox.session_status),
-            "history_session_key": outbox.history_session_key,
-            "history_session_path": outbox.history_session_path,
+            "session_id": outbox.session_id,
+            "session_path": outbox.session_path,
             "task_id": outbox.task_id,
             "task_status": task.status,
             "closed": completed,
@@ -1388,7 +1376,7 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let task_filter = optional_text(args, "task_id");
-    let history_filter = optional_text(args, "history_session_key");
+    let history_filter = optional_text(args, "session_id");
     let mcp_filter = optional_text(args, "mcp_session_id");
     let tool_filter = optional_text(args, "tool");
     let status_filter = optional_text(args, "status");
@@ -1410,7 +1398,7 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     };
     operations.retain(|operation| {
         matches_optional(operation, "task_id", task_filter.as_deref())
-            && matches_optional(operation, "history_session_key", history_filter.as_deref())
+            && matches_optional(operation, "session_id", history_filter.as_deref())
             && matches_optional(operation, "mcp_session_id", mcp_filter.as_deref())
             && matches_optional(operation, "tool", tool_filter.as_deref())
             && matches_optional(operation, "status", status_filter.as_deref())
@@ -1438,7 +1426,7 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         "next_cursor": if offset + page.len() < total_matches { Some(offset + page.len()) } else { None },
         "filters": {
             "task_id": task_filter,
-            "history_session_key": history_filter,
+            "session_id": history_filter,
             "mcp_session_id": mcp_filter,
             "tool": tool_filter,
             "status": status_filter,
@@ -1512,7 +1500,7 @@ fn operation_value(operation: OperationRecord) -> Value {
         "trace_id": operation.id,
         "workspace_id": operation.workspace_id,
         "task_id": operation.task_id,
-        "history_session_key": operation.history_session_key,
+        "session_id": operation.session_id,
         "mcp_session_id": operation.mcp_session_id,
         "session_id": session_id,
         "tool": operation.tool,
@@ -1605,7 +1593,7 @@ fn collapse_operation(records: Vec<OperationRecord>) -> Option<Value> {
         "trace_id": started.id,
         "workspace_id": started.workspace_id,
         "task_id": final_record.task_id.as_ref().or(started.task_id.as_ref()),
-        "history_session_key": final_record.history_session_key.as_ref().or(started.history_session_key.as_ref()),
+        "session_id": final_record.session_id.as_ref().or(started.session_id.as_ref()),
         "mcp_session_id": final_record.mcp_session_id.as_ref().or(started.mcp_session_id.as_ref()),
         "session_id": session_id,
         "tool": final_record.tool,
@@ -2920,8 +2908,8 @@ fn task_view(task: &TaskSession) -> Value {
         "pending_steps": bounded_strings(&task.pending_steps, 64, 1_000),
         "latest_change_id": task.latest_change_id,
         "latest_verification_id": task.latest_verification_id,
-        "history_session_key": task.history_session_key,
-        "history_session_path": task.history_session_path,
+        "session_id": task.session_id,
+        "session_path": task.session_path,
         "workspace_mode": task_workspace_mode(task),
         "git_worktree": task.git_worktree,
         "created_at": task.created_at,

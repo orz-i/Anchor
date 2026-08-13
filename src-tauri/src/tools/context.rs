@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::harness::Harness;
 use crate::tools::catalog::EffectiveCatalog;
 use crate::tools::command_cost::CommandCostGuard;
+use crate::tools::command_session::SessionStore;
 use crate::tools::policy::PolicySettings;
-use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
 use crate::workspace::AuthConfig;
 
@@ -549,8 +549,8 @@ mod tests {
             .save_close_outbox(&WorkSessionCloseOutbox {
                 schema_version: SCHEMA_VERSION,
                 task_id: task_id.into(),
-                history_session_key: "startup-test-session".into(),
-                history_session_path: "docs/history-session/startup-test.md".into(),
+                session_id: "startup-test-session".into(),
+                session_path: "docs/history-session/startup-test.md".into(),
                 session_status: HarnessSessionStatus::Paused,
                 finish_args: json!({"task_id": task_id}),
                 checkpoint_args: json!({
