@@ -11,8 +11,8 @@ use crate::auth::{
 };
 use crate::mcp::protocol::{
     requested_protocol_version, require_current_protocol_version, validate_client_message,
-    ClientMessage, InFlightRequests, InFlightReservation, KeyedRateLimiter, RateLimiter,
-    RequestReservation, SessionStore,
+    ClientMessage, InFlightRequests, InFlightReservation, KeyedRateLimiter, LegacyMcpSessionStore,
+    RateLimiter, RequestReservation,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{
@@ -63,7 +63,7 @@ struct ListenerState {
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     proxy_specs: Vec<McpProxyServerSpec>,
-    sessions: SessionStore,
+    sessions: LegacyMcpSessionStore,
     mcp_rate_limiter: RateLimiter,
     mcp_identity_rate_limiter: KeyedRateLimiter,
     oauth_rate_limiter: RateLimiter,
@@ -270,7 +270,7 @@ pub fn spawn_listener(
         oauth,
         oauth_client_secret,
         proxy_specs,
-        sessions: SessionStore::default(),
+        sessions: LegacyMcpSessionStore::default(),
         mcp_rate_limiter: RateLimiter::new(MCP_MAX_REQUESTS_PER_MINUTE, Duration::from_secs(60)),
         mcp_identity_rate_limiter: KeyedRateLimiter::new(
             MCP_MAX_REQUESTS_PER_IDENTITY_PER_MINUTE,
@@ -1357,7 +1357,9 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::sync::Semaphore;
 
-    use crate::mcp::protocol::{InFlightRequests, KeyedRateLimiter, RateLimiter, SessionStore};
+    use crate::mcp::protocol::{
+        InFlightRequests, KeyedRateLimiter, LegacyMcpSessionStore, RateLimiter,
+    };
     use crate::mcp::server::new_state;
     use crate::mcp::McpActivityTracker;
     use crate::runtime::{register_public_url, update_public_url};
@@ -1491,7 +1493,7 @@ mod tests {
                 oauth: None,
                 oauth_client_secret: None,
                 proxy_specs: Vec::new(),
-                sessions: SessionStore::default(),
+                sessions: LegacyMcpSessionStore::default(),
                 mcp_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
                 mcp_identity_rate_limiter: KeyedRateLimiter::new(100, 32, Duration::from_secs(60)),
                 oauth_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
@@ -1882,7 +1884,8 @@ mod tests {
     #[tokio::test]
     async fn expired_transport_session_clears_session_scoped_tool_state() {
         let (workspace, mut state) = test_listener_state();
-        state.sessions = SessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 16);
+        state.sessions =
+            LegacyMcpSessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 16);
         let response = mcp_post(
             State(state.clone()),
             request_headers(),

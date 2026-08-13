@@ -534,7 +534,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 26);
+        assert_eq!(catalog.local_count, 24);
         assert_eq!(catalog.proxy_count, CORE_BROWSER_PROXY_SUFFIXES.len());
         assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
             !tool["name"]
@@ -558,16 +558,16 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 26);
+        assert_eq!(catalog.local_count, 24);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 34);
+        assert_eq!(catalog.tools.len(), 32);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
 
     #[test]
     fn over_budget_catalog_returns_actionable_diagnostics() {
-        let error = build_effective_catalog_from_parts("advanced", true, browser_tools(100))
+        let error = build_effective_catalog_from_parts("advanced", true, browser_tools(102))
             .expect_err("catalog should exceed the tool-count budget");
         let diagnostic = error.to_error_value();
 
@@ -583,7 +583,7 @@ mod tests {
             diagnostic["details"]["local_tool_count"],
             crate::tools::registry::exposed_tool_names("advanced").len()
         );
-        assert_eq!(diagnostic["details"]["proxy_tool_count"], 100);
+        assert_eq!(diagnostic["details"]["proxy_tool_count"], 102);
         assert!(diagnostic["details"]["suggestions"]
             .as_array()
             .is_some_and(|suggestions| suggestions.iter().any(|suggestion| suggestion
@@ -675,9 +675,9 @@ mod tests {
     fn advanced_with_default_browser_keeps_skill_facade_in_first_64_entries() {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(21))
             .expect("advanced plus default browser catalog");
-        assert_eq!(catalog.local_count, 30);
+        assert_eq!(catalog.local_count, 28);
         assert_eq!(catalog.proxy_count, 21);
-        assert_eq!(catalog.tools.len(), 51);
+        assert_eq!(catalog.tools.len(), 49);
         assert!(catalog.tools[..catalog.tools.len().min(64)]
             .iter()
             .any(|tool| tool["name"] == "skill"));

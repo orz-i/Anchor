@@ -1,105 +1,86 @@
-# Session 生命周期与内容管理
+# Session 生命周期与隔离治理
 
-Anchor 同时存在三类用途不同的 Session。它们必须分开管理，不能共享标识、过期策略或内容预算。
+Anchor 使用三类完全不同的 Session 概念。开发 Session、命令进程 Session 和旧式 MCP transport Session 不共享标识、生命周期或持久化边界。
 
-## 1. MCP 传输 Session
+## 1. 开发 Session
 
-Streamable HTTP 客户端通过 `initialize` 获取 `MCP-Session-Id`，发送 `notifications/initialized` 后进入可操作状态。后续请求必须携带相同的 Session ID；客户端结束连接时应发送 `DELETE /mcp`。
+开发 Session 是 ChatGPT/Agent 一次独立开发对话的持久状态。公开入口统一为一个 `session` facade：
 
-服务器边界：
+```text
+session operation=open
+session operation=checkpoint
+session operation=list
+session operation=get
+session operation=validate
+```
+
+### 默认隔离原则
+
+每个新对话首次调用 `session operation=open` 时，Anchor 只创建或恢复该对话自己的 Session。`open` 不会：
+
+- 扫描或读取其他 Session Markdown；
+- 汇总历史 Session；
+- 返回 latest handoff、继承摘要或全局 resume state；
+- 自动暂停其他 active Session；
+- 自动选择或恢复其他 Session 的 Harness Task；
+- 扫描、迁移或改写 `docs/history-session/`。
+
+因此 Session 数量增长不会线性扩大 `open` 的模型上下文。只有用户明确要求恢复、查找、比较或引用以前的工作时，调用方才应先通过 `list` 获取有限元数据，再对一个明确相关的 `session_id` 使用 `get`。
+
+### 标识与存储
+
+Anchor 为开发 Session 生成 opaque handle：
+
+```text
+ses_<32 hex UUIDv4>
+```
+
+新存储位于：
+
+```text
+docs/session/
+├── index.json
+├── ses_<id>.md
+└── ...
+```
+
+`index.json` 只保存 Session metadata 和可选 host-conversation 映射，不保存 checkpoint 正文、摘要或 handoff。Session Markdown 只包含自己的元数据和 checkpoint。
+
+默认容量：
 
 | 项目 | 限制 |
 | --- | ---: |
-| 未初始化 Session TTL | 5 分钟 |
-| 已初始化 Session 空闲 TTL | 24 小时 |
-| 单 listener 最大 Session 数 | 512 |
-| 单 Session 历史 request ID 数 | 16,384 |
+| 单个 Session Markdown | 4 MiB |
+| Session store 总量 | 64 MiB |
+| Session 文档数 | 4,096 |
+| `index.json` | 1 MiB |
+| `session list` 默认页大小 | 20 |
+| `session list` 最大页大小 | 100 |
+| `session get` 默认读取 | 64 KiB |
+| `session get` 最大读取 | 256 KiB |
 
-行为：
+`session get` 在 UTF-8 字符边界截断，避免返回无效文本。
 
-- 未完成 `notifications/initialized` 时，只接受 `ping` 请求和 `notifications/initialized` 通知。
-- 非法 Header、非法阶段请求和过早通知不会延长 Session 生命周期。
-- request ID 在同一 Session 内必须唯一；达到历史预算时 Session 会终止，客户端应重新初始化。
-- Session 过期、容量淘汰或显式 DELETE 时，会同时取消 in-flight 请求并清理该 Session 的默认工作目录等关联状态。
-- 访问未知或已过期 Session 返回 HTTP 404，客户端应重新执行初始化流程。
+### Host conversation 映射
 
-这些限制只约束传输状态，不等同于 ChatGPT 对话、历史归档或命令进程 Session。
+ChatGPT 提供的 `_meta["openai/session"]` 只在 MCP server 完成公开 input schema 校验后作为内部 host-conversation hint 注入 `open`。它不是开发 Session 的持久主键，也不会直接暴露为 Session handle。
 
-## 2. 命令执行 Session
+同一个 host conversation 重复 `open` 时可幂等恢复同一个 opaque `session_id`；新的 host conversation 默认获得新的开发 Session。
 
-`exec_command` 对仍在运行、交互式或提前返回的进程创建命令 Session。后续通过：
+### Checkpoint
 
-```text
-write_stdin
-read_output
-kill_session
-```
-
-进行管理。
-
-服务器边界：
-
-| 项目 | 限制 |
-| --- | ---: |
-| 最大并发/占槽命令 Session | 64 |
-| 已消费终态的 Session 槽位保留 | 60 秒 |
-| 已消费终态的输出/日志保留 | 30 分钟 |
-| stdout 环形缓冲区 | 1 MiB |
-| stderr 环形缓冲区 | 1 MiB |
-
-已结束命令只有在终态通过 `wait_command` / `kill_session` 等路径被明确消费后才进入回收计时。容量槽位与日志保留从 Catalog 35 起分离：已消费终态在短暂的 60 秒槽位保留后不再占用 64-session 容量，但其输出仍可在 30 分钟日志保留期内通过 `read_output` / `wait_command` 读取。后台 `list_command_sessions`、任务完成门禁等只读刷新不会延长日志保留；显式再次读取该 Session 会更新最后访问时间。未消费终态始终继续占槽且不会自动删除，避免绕过任务完成前必须消费命令结果的约束。
-
-每次登记新命令前、查询 Session 前和列举 Session 前都会清理超过日志保留期的“已结束 + 已消费”记录；容量检查只统计仍运行、尚未消费终态或仍在短暂槽位保留窗口内的 Session。达到 64 个有效槽位且没有可释放记录时，服务器会终止刚启动但无法登记的子进程，然后返回可重试的 `SESSION_LIMIT_REACHED`，避免产生孤儿进程。日志自然过期后的 `wait_command`、`read_output` 或 `kill_session` 返回 `SESSION_NOT_FOUND`；这属于正常淘汰，不会为无工作区变更的 Harness Task 创建 Recovery。
-
-### 输出 Offset
-
-`read_output.offset` 是从进程输出流开始计算的绝对字节位置，不是当前环形缓冲区内的相对下标。
-
-返回值包含：
+显式 checkpoint 必须携带：
 
 ```text
-requested_offset
-offset
-retained_start_offset
-next_offset
-total_retained_bytes
-total_stream_bytes
+session_id
+expected_path
 ```
 
-当客户端请求的旧 offset 已被环形缓冲区淘汰时：
+`expected_path` 必须与 `open` 返回的 `session_path` 完全一致。这样即使调用方拿到另一个 Session 的路径，也不能把 checkpoint 跨 Session 写入。
 
-- `offset` 会移动到 `retained_start_offset`；
-- `truncated=true`；
-- `warnings` 明确说明旧内容已不再保留；
-- `next_offset` 仍是绝对 offset，可继续稳定分页。
+显式 checkpoint 属于 Session metadata 持久化，不是业务工作树 mutation。它不会继承 workspace 默认 Task，也不会要求 unrelated peer Task 的 Git/worktree baseline 当前；但当前调用方拥有 running 或 terminal-unconsumed command 时仍会返回 `SESSION_COMMAND_RESULTS_PENDING`。
 
-## 3. 持久历史 Session
-
-历史 Session 通过以下工具管理：
-
-```text
-history_session_bootstrap
-history_session_checkpoint
-history_session_validate
-```
-
-它使用稳定的 `session_key` 映射到 `docs/history-session/<number>.md`。`expected_path` 必须与 bootstrap 返回值完全一致，避免宿主会话标识变化导致跨文件串写。
-
-### 生命周期状态
-
-每个历史 Session 有三种有效状态：
-
-```text
-active
-paused
-completed
-```
-
-Checkpoint 可通过 `session_status` 修改状态。再次使用相同 `session_key` bootstrap 一个 `paused` 或 `completed` Session 时，服务器只更新 `Updated` 和 `Status` 元数据，将其重新激活为 `active`；既有 checkpoint 和继承摘要保持不变。
-
-显式 `history_session_checkpoint` 属于 History 元数据持久化，不是业务工作树 mutation。它按 `session_key + expected_path + workspace_root` 定位 History store，不继承 workspace 默认 Task，也不要求 unrelated Task 的 Git/worktree baseline 当前。这样在 `complete_work_session` 已关闭并解绑原 Task 后，即使工作区还有其他 stale peer Task，后续 History checkpoint 仍可独立保存；同样，worktree Task 的 checkpoint 仍写入主工作区 History store，而不会把 worktree expected branch 与主 checkout 交叉比较。该隔离不会放宽 retained-command 约束：当前调用方拥有 running 或 terminal-unconsumed command 时，checkpoint 仍返回 `HISTORY_COMMAND_RESULTS_PENDING`。
-
-### 单次 Checkpoint 内容预算
+单次 checkpoint 内容预算：
 
 | 字段 | 限制 |
 | --- | ---: |
@@ -111,131 +92,162 @@ Checkpoint 可通过 `session_status` 修改状态。再次使用相同 `session
 | 每个数组项 | 2,000 字符 |
 | Checkpoint JSON 总量 | 64 KiB |
 
-敏感信息会先脱敏，再生成自动 `turn_id`。未显式提供 timestamp 时，重复提交相同内容会复用原有服务器 timestamp，因此跨秒重试仍保持幂等。
+Checkpoint 在写入前脱敏；相同 `turn_id` 与相同内容重复提交保持幂等。
 
-### 历史归档容量
+### 生命周期状态
+
+开发 Session 支持：
+
+```text
+active
+paused
+completed
+```
+
+同一个 Session 被显式 reopen 时可重新激活为 `active`。这只修改当前 Session，不会改变其他 Session 的 lifecycle。
+
+## 2. 冻结的 legacy `docs/history-session/`
+
+旧目录：
+
+```text
+docs/history-session/
+```
+
+是冻结历史归档，不进行数据迁移。新 Session 实现遵循以下硬边界：
+
+- 不把它作为 `session_dir`；
+- 不扫描它来创建新索引；
+- 不把它计入 `docs/session` 容量；
+- `session validate` 不校验它；
+- 不自动读取、摘要或注入其中内容；
+- 不删除、不重写旧文件。
+
+只有用户明确要求查看 legacy 历史时，才通过 `read_file` 对一个精确旧路径进行按需读取。新工具不会提供自动 migration bridge。
+
+## 3. Harness Work Session 绑定
+
+`begin_work_session` 先打开当前开发 Session，再用明确的 `session_id + session_path` 绑定 Harness Task。
+
+关键约束：
+
+- 不再回退到 workspace default Task 来“猜测”当前 Session 的任务；
+- 只有已绑定到相同 `session_id + session_path` 的 Task 才能作为当前 Session 的恢复候选；
+- 同一开发 Session 的 shared writer handoff 可以暂停上一代同 Session writer；
+- 不同开发 Session 可以同时保持 active；
+- 一个 Session 的 checkpoint 不继承 peer Session Task 的 baseline；
+- worktree Task 的 Session checkpoint 仍写到主工作区的 `docs/session` metadata store，而不是 worktree 内复制一份 Session archive。
+
+Task 可保存 phase、contract、slices、working set、Recovery 和 verification。开发 Session 只是明确的会话归属，不替代 Harness 的工程状态机。
+
+### 完成路径
+
+`complete_work_session` 使用 recoverable outbox 把 Task 完成和开发 Session checkpoint 衔接起来。Outbox 持久字段使用：
+
+```text
+session_id
+session_path
+session_checkpoint
+```
+
+失败 phase 使用 `session_checkpoint`，不再使用 History Session 命名。
+
+任务完成仍受以下门禁约束：
+
+- running / terminal-unconsumed command；
+- 未提交或无法归属的业务变更；
+- verification failure / missing verification；
+- pending steps；
+- Slice acceptance；
+- open Recovery；
+- completion policy 指定的其他条件。
+
+## 4. 命令进程 Session
+
+`exec_command` 对仍运行、交互式或提前返回的进程创建独立的 command session。内部存储类型为 `CommandSessionStore`，与开发 Session store 无关。
+
+后续通过：
+
+```text
+wait_command
+read_output
+write_stdin
+kill_session
+list_command_sessions
+```
+
+管理。
+
+服务器边界：
 
 | 项目 | 限制 |
 | --- | ---: |
-| 单个历史 Markdown | 4 MiB |
-| 整个历史目录 | 64 MiB |
-| 历史文档数量 | 4,096 |
-| `index.json` | 1 MiB |
+| 最大并发/占槽 command session | 64 |
+| 已消费终态槽位保留 | 60 秒 |
+| 已消费终态日志保留 | 30 分钟 |
+| stdout 环形缓冲区 | 1 MiB |
+| stderr 环形缓冲区 | 1 MiB |
 
-容量超限返回 `HISTORY_CAPACITY_EXCEEDED`，不会继续读取或覆盖归档。
+命令工具的外部结果仍使用既有 `session_id` 表示 command session handle，以保持命令工具协议稳定；当命令信息被投影到 Harness operation log 时，字段明确命名为 `command_session_id`，而 `session_id` 专门表示开发 Session。
 
-### Bootstrap 响应窗口
+### 输出 offset
 
-历史文件可以长期保存，但 bootstrap 不再把整个归档无界注入模型上下文：
+`read_output.offset` 是从进程输出流起点计算的绝对字节位置。返回值包含：
 
-| 返回内容 | 响应预算 |
+```text
+requested_offset
+offset
+retained_start_offset
+next_offset
+total_retained_bytes
+total_stream_bytes
+```
+
+若旧内容已被环形缓冲区淘汰，`offset` 会前移到 `retained_start_offset`、`truncated=true`，而 `next_offset` 仍可继续稳定分页。
+
+## 5. Legacy MCP transport Session compatibility
+
+部分当前连接路径仍保留 stateful MCP transport compatibility。实现类型明确命名为：
+
+```text
+LegacyMcpSession
+LegacyMcpSessionInfo
+LegacyMcpSessionStore
+```
+
+它只负责 transport 初始化状态、request-id 去重、TTL 和连接清理，不是 Anchor 开发 Session，也不参与 `docs/session` 持久化。
+
+当前兼容边界：
+
+| 项目 | 限制 |
 | --- | ---: |
-| `historyNumbers` | 最近 256 个 |
-| `sessionSummaries` | 最近 64 个 |
-| 摘要总字符 | 48,000 |
-| 单个摘要 | 3,000 字符 |
-| `latestHandoff` | 64,000 字符，超限保留头尾 |
-| 新文件内继承摘要 | 16,000 字符 |
+| 未初始化 transport Session TTL | 5 分钟 |
+| 已初始化空闲 TTL | 24 小时 |
+| 单 listener 最大 transport Session | 512 |
+| 单 transport Session request ID 预算 | 16,384 |
 
-客户端应检查：
+将它标记为 `LegacyMcp*` 的目的，是防止应用层开发 Session 和 transport compatibility state 再次发生概念耦合。未来移除旧式 transport 状态时，不需要迁移开发 Session 或 command session。
 
-```text
-history_numbers_truncated
-history_summaries_omitted
-history_summary_truncated
-latest_handoff_truncated
-```
+## 6. Session 验证
 
-完整归档仍保存在 workspace 中；响应裁剪只影响本次上下文注入，不修改历史文件。
+`session operation=validate` 只验证新的 `docs/session` store：
 
-## 4. Harness Work Session 与任务闭环
+- opaque Session ID 与文件名一致；
+- metadata 可解析；
+- 是否存在 duplicate Session / duplicate host mapping；
+- 是否有无效或空文件；
+- active、paused、completed、unknown 状态计数；
+- 文档总量和容量边界；
+- `index.json` 状态。
 
-`begin_work_session` 将持久 History Session 与 Harness Task 绑定。任务可以同时保存：
+`repair=true` 只根据新的 Session Markdown 重建新的 metadata index，不接触 `docs/history-session/`。
 
-- `phase`：planning、implementing、verifying、deploying、browser_review、cleanup、ready_to_close 等工程阶段；
-- `contract`：不可违反的约束、必需 verification 和 completion policy；
-- `slices`：独立文件范围、验收检查、状态和提交证据；
-- `working_set`：主要源码、测试、本地化文件和只读参考文件；
-- `recovery`：失败步骤、失败类型、是否修改工作区、回滚状态、恢复动作和恢复目标。
+## 7. 长期治理原则
 
-Phase 使用显式状态机。普通 `update_task` 不能从 planning 直接跳到 ready_to_close；需要按实际工程阶段推进。系统内部的 Slice 和任务完成流程可以执行对应的受控状态迁移。
-
-### 同一工作区的多任务
-
-任务生命周期状态与共享工作树的默认路由相互独立：
-
-- 切换已有任务只更新工作区的默认任务，不会把其他 active/verifying 任务改成 paused；
-- 同一个 History Session 在 shared 工作区创建新的 writer Task 时，上一代同 History shared writer 若没有运行中命令会自动降级为 paused，避免长会话不断堆积等价 writer；独立 History 或 worktree 并行任务不受该规则影响；
-- 除上述同 History writer handoff 外，任务只会通过显式 `pause_task` 或既有受控生命周期路径进入 paused；
-- 已绑定 MCP 会话始终继续路由到自己的任务；新连接默认跟随工作区当前选中的任务；
-- shared 模式的文件、命令和 Git 写操作通过工作区写锁串行执行；同一写域中已有运行命令时，其他任务仍可创建和读取，但写操作返回 `WORKSPACE_WRITER_BUSY`；
-- 一次 shared 写入完成后，Anchor 同步同一写域内所有可继续任务的 expected baseline，避免下一任务把已归因变更误判为外部漂移；
-- worktree 模式的任务使用独立目录、分支和命令租约，可同时保持 active 并独立写入。
-- History bootstrap 保留所有 active/verifying Task 绑定的 History Session；仅显式暂停/终止任务或未绑定活动任务的旧会话会被回收为 paused。
-
-`active_task_ids` 表示仍在推进的任务集合；`default_task_id`/`active_task_id` 只表示无显式绑定时的默认路由目标，不再代表唯一 active 任务。`harness_status` 同时返回 `stale_active_task_ids` 和 `warnings`：active task 达到 8 个会提示生命周期压力，超过 12 小时没有活动的 active/verifying task 会被列为 stale 供调用方显式审阅，而不会被系统静默归档。
-
-### Recovery 闭环
-
-普通、未修改工作区且没有稳定重试身份的 preflight/Patch 验证失败不会创建持久 Recovery。需要持久 Recovery 时，失败响应会返回服务端生成的 `task_recovery.recovery_key`，调用方应在修正参数后重试同一个逻辑步骤时复用该 key；即使修正后的参数指纹发生变化，成功重试也能关联并关闭原 Recovery。
-
-如果原失败步骤没有被机械重试，但后续独立步骤、提交和 verification 已经证明目标完成，可通过 `task(operation="resolve_recovery")` 提交 `recovery_id`、原因和至少一条证据。该操作是审计式 resolution，不会制造 no-op mutation，也不同于放宽 completion gate 的 waive。
-
-### 完成门禁
-
-`task_gate_status` 一次返回全部缺失条件，而不是只报告第一个错误。Catalog 35 默认返回 `detail="compact"`：仅包含 ready、缺失代码、当前 Slice、阻塞 verification、命令会话计数与当前阻塞 Recovery；需要完整 Task、全部 verification 和完整 gate 证据时显式传 `detail="full"`。门禁可覆盖：
+Anchor 将三个概念保持独立：
 
 ```text
-运行中或未消费的命令结果
-未提交或无法归属的业务文件
-结构化 verification 失败或缺失
-Task Contract 指定的 verification
-未清空的 pending steps
-未完成的 Slice 或缺失的 Slice commit
-Slice acceptance checks
-未解除的 recovery
-尚未进入 ready_to_close
-必须使用 complete_work_session 的严格关闭策略
+Development Session != Command Session != MCP Transport Compatibility Session
 ```
 
-`no_early_stop=true` 会强制启用待办清空、全部 Slice 完成、无开放恢复、ready_to_close、严格工作会话关闭和禁止未验证完成。调用方不能通过同时传入宽松 completion policy 绕过该约束。
-
-### Slice 生命周期
-
-```text
-start_slice
-update_slice
-complete_slice
-```
-
-`complete_slice` 是唯一可把 Slice 标记为 completed 的工具。它会检查声明的 acceptance checks、blocker 和可选 commit 要求；失败时 Slice 状态保持不变，并返回所有缺失证据。
-
-### 严格关闭
-
-`finish_task` 保留兼容入口，但始终经过统一 completion gate。需要最终 History checkpoint 和完整验收的任务应设置 `require_complete_work_session=true`，并通过：
-
-```text
-complete_work_session
-```
-
-完成。该路径固定要求 verification 通过、将 Session 标记为 completed，并使用可恢复 outbox 原子衔接 Task 关闭与 History checkpoint。
-
-## 5. 验证与恢复
-
-`history_session_validate` 返回：
-
-- 编号缺口、重复 session key、无效文件和空文件；
-- active、paused、completed、unknown 状态数量；
-- 文档数、总字节数和最大单文件大小；
-- 当前容量上限；
-- 索引状态及是否重建。
-
-未知历史状态不会被静默当作 completed。验证会给出警告；下次按相同 key bootstrap 时会重新激活为 active。
-
-## 6. 兼容与演进
-
-当前实现遵循已发布的 Streamable HTTP Session 模型，同时把业务状态放在显式工具参数和持久文件中。未来协议若进一步弱化传输 Session，命令 Session 与历史 Session 不需要随传输标识迁移：
-
-- 命令进程继续使用自身 `session_id`；
-- 历史归档继续使用稳定 `session_key`；
-- 工作区与权限边界继续由 WorkspaceProfile 和工具策略控制。
+开发 Session 也不等于跨会话 Memory。若未来增加项目级长期知识，应建立独立的检索式 Memory/knowledge 层，由调用方按需检索，而不是重新让开发 Session 自动继承所有历史内容。

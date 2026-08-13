@@ -1647,11 +1647,7 @@ mod tests {
             &["config", "user.email", "anchor-tests@example.invalid"],
         );
         git(workspace.path(), &["config", "user.name", "Anchor Tests"]);
-        fs::write(
-            workspace.path().join(".gitignore"),
-            "docs/history-session/\n",
-        )
-        .expect("gitignore");
+        fs::write(workspace.path().join(".gitignore"), "docs/session/\n").expect("gitignore");
         fs::write(workspace.path().join("main.txt"), "before\n").expect("file");
         git(workspace.path(), &["add", ".gitignore", "main.txt"]);
         git(workspace.path(), &["commit", "-m", "initial"]);
@@ -1859,17 +1855,15 @@ mod tests {
         let Some((workspace, _harness, ctx)) = fixture() else {
             return;
         };
-        let bootstrap = dev_session::open(
-            &ctx,
-            &json!({
-                "session_key": "stage-commit-checkpoint-test",
-                "create_if_missing": true
-            }),
-        )
-        .expect("bootstrap");
-        let current_path = bootstrap["current_path"]
+        let opened =
+            dev_session::open(&ctx, &json!({"create_if_missing": true})).expect("open session");
+        let session_id = opened["session_id"]
             .as_str()
-            .expect("current path")
+            .expect("session id")
+            .to_string();
+        let session_path = opened["session_path"]
+            .as_str()
+            .expect("session path")
             .to_string();
         let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
         let base = json!({
@@ -1883,8 +1877,8 @@ mod tests {
         });
         let mut first_args = base.clone();
         first_args["session_checkpoint"] = json!({
-            "session_key": "stage-commit-checkpoint-test",
-            "expected_path": "docs/history-session/not-the-current-session.md",
+            "session_id": session_id,
+            "expected_path": "docs/session/ses_not-the-current-session.md",
             "user_intent": "checkpoint retry test"
         });
 
@@ -1901,8 +1895,8 @@ mod tests {
 
         let mut retry_args = base;
         retry_args["session_checkpoint"] = json!({
-            "session_key": "stage-commit-checkpoint-test",
-            "expected_path": current_path,
+            "session_id": opened["session_id"],
+            "expected_path": session_path,
             "user_intent": "checkpoint retry test",
             "findings": ["commit already exists; checkpoint resumed"]
         });

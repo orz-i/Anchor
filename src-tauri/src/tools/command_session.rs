@@ -18,7 +18,7 @@ const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
 const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::from_secs(60);
 const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
 
-pub struct SessionStore {
+pub struct CommandSessionStore {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
     max_sessions: usize,
     terminal_slot_retention: Duration,
@@ -230,7 +230,10 @@ pub fn finalize_execution_result(mut value: Value) -> Value {
     value
 }
 
-pub fn list_command_sessions(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn list_command_sessions(
+    store: &CommandSessionStore,
+    args: &Value,
+) -> Result<Value, WorkspaceError> {
     let include_terminal = args
         .get("include_terminal")
         .and_then(Value::as_bool)
@@ -287,7 +290,7 @@ pub fn list_command_sessions(store: &SessionStore, args: &Value) -> Result<Value
     })))
 }
 
-pub fn wait_command(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn wait_command(store: &CommandSessionStore, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
@@ -432,7 +435,7 @@ fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-impl Default for SessionStore {
+impl Default for CommandSessionStore {
     fn default() -> Self {
         Self::with_retention_limits(
             DEFAULT_MAX_EXEC_SESSIONS,
@@ -545,7 +548,7 @@ mod tests {
 
     #[test]
     fn background_terminal_refresh_does_not_extend_retention() {
-        let store = SessionStore::with_limits(4, Duration::from_millis(100));
+        let store = CommandSessionStore::with_limits(4, Duration::from_millis(100));
         let session = store
             .insert(spawn_test_session())
             .unwrap_or_else(|_| panic!("insert session"));
@@ -561,7 +564,7 @@ mod tests {
 
     #[test]
     fn unobserved_terminal_session_is_never_pruned_by_retention() {
-        let store = SessionStore::with_limits(4, Duration::ZERO);
+        let store = CommandSessionStore::with_limits(4, Duration::ZERO);
         let session = store
             .insert(spawn_test_session())
             .unwrap_or_else(|_| panic!("insert session"));
@@ -575,7 +578,7 @@ mod tests {
 
     #[test]
     fn capacity_prunes_expired_observed_terminal_before_insert() {
-        let store = SessionStore::with_limits(1, Duration::from_millis(100));
+        let store = CommandSessionStore::with_limits(1, Duration::from_millis(100));
         let first = store
             .insert(spawn_test_session())
             .unwrap_or_else(|_| panic!("insert first"));
@@ -594,7 +597,7 @@ mod tests {
 
     #[test]
     fn observed_terminal_releases_slot_before_retained_output_expires() {
-        let store = SessionStore::with_retention_limits(
+        let store = CommandSessionStore::with_retention_limits(
             1,
             Duration::from_millis(40),
             Duration::from_millis(500),
@@ -619,7 +622,7 @@ mod tests {
 
     #[test]
     fn capacity_never_evicts_unobserved_terminal_result() {
-        let store = SessionStore::with_limits(1, Duration::ZERO);
+        let store = CommandSessionStore::with_limits(1, Duration::ZERO);
         let first = store
             .insert(spawn_test_session())
             .unwrap_or_else(|_| panic!("insert first"));
@@ -658,7 +661,7 @@ fn page_retained_output(
     }
 }
 
-impl SessionStore {
+impl CommandSessionStore {
     pub fn new() -> Self {
         Self::default()
     }
@@ -1291,7 +1294,7 @@ fn truncate_tail(bytes: &[u8], max_bytes: usize) -> Truncated {
     }
 }
 
-pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn read_output(store: &CommandSessionStore, args: &Value) -> Result<Value, WorkspaceError> {
     let output_ref = args
         .get("output_ref")
         .and_then(Value::as_str)
@@ -1345,7 +1348,7 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     })))
 }
 
-pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn write_stdin(store: &CommandSessionStore, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
@@ -1409,7 +1412,7 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     ))
 }
 
-pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn kill_session(store: &CommandSessionStore, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)

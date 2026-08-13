@@ -560,7 +560,7 @@ pub fn auto_checkpoint_after_tool(
     let Some(task) = task else {
         return Ok(None);
     };
-    let (Some(session_key), Some(expected_path)) =
+    let (Some(session_id), Some(expected_path)) =
         (task.session_id.as_deref(), task.session_path.as_deref())
     else {
         return Ok(None);
@@ -706,7 +706,7 @@ pub fn auto_checkpoint_after_tool(
         )]
     };
     let checkpoint_args = json!({
-        "session_key": session_key,
+        "session_id": session_id,
         "expected_path": expected_path,
         "turn_id": turn_id,
         "user_intent": task.objective,

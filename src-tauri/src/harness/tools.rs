@@ -3284,11 +3284,17 @@ fn known_runtime_artifacts(root: &Path) -> Vec<String> {
 }
 
 fn known_ignored_paths(root: &Path) -> Vec<String> {
-    [".codegraph", ".gitnexus", "docs/history-session"]
-        .into_iter()
-        .filter(|path| root.join(path).exists() && is_git_ignored(root, path))
-        .map(|path| format!("{path}/"))
-        .collect()
+    [
+        ".codegraph",
+        ".gitnexus",
+        "docs/session",
+        // Frozen pre-Catalog-37 archive; retained locally but never used by the new Session store.
+        "docs/history-session",
+    ]
+    .into_iter()
+    .filter(|path| root.join(path).exists() && is_git_ignored(root, path))
+    .map(|path| format!("{path}/"))
+    .collect()
 }
 
 fn is_git_ignored(root: &Path, path: &str) -> bool {

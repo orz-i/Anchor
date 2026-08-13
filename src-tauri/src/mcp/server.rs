@@ -728,7 +728,7 @@ fn raw_tool_arguments(params: &Value) -> Value {
 fn tool_arguments(name: &str, params: &Value) -> Value {
     let mut args = raw_tool_arguments(params);
     if matches!(name, "session" | "session_open" | "begin_work_session") {
-        if let Some(session_key) = params
+        if let Some(host_session_key) = params
             .get("_meta")
             .and_then(|meta| meta.get("openai/session"))
             .and_then(Value::as_str)
@@ -738,7 +738,7 @@ fn tool_arguments(name: &str, params: &Value) -> Value {
             if !args.is_object() {
                 args = serde_json::json!({});
             }
-            args["_host_session_key"] = Value::String(session_key.to_string());
+            args["_host_session_key"] = Value::String(host_session_key.to_string());
         }
     }
     args

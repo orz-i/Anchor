@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::harness::Harness;
 use crate::tools::catalog::EffectiveCatalog;
 use crate::tools::command_cost::CommandCostGuard;
-use crate::tools::command_session::SessionStore;
+use crate::tools::command_session::CommandSessionStore;
 use crate::tools::policy::PolicySettings;
 use crate::tools::workspace::{relative_display, Workspace};
 use crate::workspace::AuthConfig;
@@ -28,7 +28,7 @@ pub struct ToolContext {
     session_cursor_scopes: Arc<Mutex<HashMap<String, String>>>,
     command_output_cursors: Arc<Mutex<HashMap<String, (usize, usize)>>>,
     workspace_mutation_lock: Arc<Mutex<()>>,
-    pub sessions: Arc<SessionStore>,
+    pub sessions: Arc<CommandSessionStore>,
     pub command_cost: Arc<CommandCostGuard>,
     published_catalog: Arc<Mutex<Option<EffectiveCatalog>>>,
 }
@@ -166,7 +166,7 @@ impl ToolContext {
             session_cursor_scopes: Arc::new(Mutex::new(HashMap::new())),
             command_output_cursors: Arc::new(Mutex::new(HashMap::new())),
             workspace_mutation_lock: Arc::new(Mutex::new(())),
-            sessions: Arc::new(SessionStore::new()),
+            sessions: Arc::new(CommandSessionStore::new()),
             command_cost: Arc::new(command_cost),
             published_catalog: Arc::new(Mutex::new(None)),
         };
@@ -550,12 +550,12 @@ mod tests {
                 schema_version: SCHEMA_VERSION,
                 task_id: task_id.into(),
                 session_id: "startup-test-session".into(),
-                session_path: "docs/history-session/startup-test.md".into(),
+                session_path: "docs/session/ses_startup-test.md".into(),
                 session_status: HarnessSessionStatus::Paused,
                 finish_args: json!({"task_id": task_id}),
                 checkpoint_args: json!({
-                    "session_key": "startup-test-session",
-                    "expected_path": "docs/history-session/startup-test.md"
+                    "session_id": "startup-test-session",
+                    "expected_path": "docs/session/ses_startup-test.md"
                 }),
                 phase: WorkSessionClosePhase::Prepared,
                 attempts: 0,

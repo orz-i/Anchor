@@ -29,7 +29,6 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         "begin_work_session",
         &json!({
             "objective": "recover close outbox",
-            "session_key": "close-outbox-recovery",
             "workspace_root": workspace.to_string_lossy()
         }),
         &CancellationToken::default(),
@@ -40,21 +39,27 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         .as_str()
         .expect("task id")
         .to_string();
+    let session_id = started["work_session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
     let expected_path = started["work_session"]["session_path"]
         .as_str()
-        .expect("history path")
+        .expect("session path")
         .to_string();
+    let session_index = fs::read(workspace.join("docs/session/index.json")).expect("session index");
+    let session_markdown = fs::read(workspace.join(&expected_path)).expect("session markdown");
     ctx.harness
         .complete_task(&task_id, false, HarnessSessionStatus::Paused)
         .expect("complete task");
-    fs::remove_dir_all(workspace.join("docs/history-session")).expect("remove history");
+    fs::remove_dir_all(workspace.join("docs/session")).expect("remove session store");
 
     let now = timestamp();
     ctx.harness
         .save_close_outbox(&WorkSessionCloseOutbox {
             schema_version: SCHEMA_VERSION,
             task_id: task_id.clone(),
-            session_id: "close-outbox-recovery".into(),
+            session_id: session_id.clone(),
             session_path: expected_path.clone(),
             session_status: HarnessSessionStatus::Paused,
             finish_args: json!({
@@ -63,7 +68,7 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
                 "session_status": "paused"
             }),
             checkpoint_args: json!({
-                "session_key": "close-outbox-recovery",
+                "session_id": session_id,
                 "expected_path": expected_path,
                 "turn_id": "close-outbox-recovery-test",
                 "user_intent": "recover close outbox",
@@ -87,14 +92,10 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
     assert_eq!(pending.phase, WorkSessionClosePhase::CheckpointPending);
     assert!(pending.last_error.is_some());
 
-    crate::tools::session::open(
-        &ctx,
-        &json!({
-            "session_key": "close-outbox-recovery",
-            "workspace_root": workspace.to_string_lossy()
-        }),
-    )
-    .expect("restore history");
+    let session_dir = workspace.join("docs/session");
+    fs::create_dir_all(&session_dir).expect("restore session dir");
+    fs::write(session_dir.join("index.json"), session_index).expect("restore session index");
+    fs::write(workspace.join(&expected_path), session_markdown).expect("restore session markdown");
     drop(ctx);
     let restarted = ToolContext::for_test(workspace, harness_root).expect("restarted context");
     let still_pending = restarted

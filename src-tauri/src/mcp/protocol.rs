@@ -331,13 +331,13 @@ fn invalid_params(message: &str) -> Value {
     json!({ "code": -32602, "message": message })
 }
 
-const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_UNINITIALIZED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_MAX_SESSIONS: usize = 512;
-const DEFAULT_MAX_REQUEST_IDS_PER_SESSION: usize = 16_384;
+const DEFAULT_LEGACY_MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_LEGACY_MCP_UNINITIALIZED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_MAX_LEGACY_MCP_SESSIONS: usize = 512;
+const DEFAULT_MAX_REQUEST_IDS_PER_LEGACY_MCP_SESSION: usize = 16_384;
 
 #[derive(Debug, Clone)]
-struct Session {
+struct LegacyMcpSession {
     protocol_version: String,
     initialized: bool,
     last_seen: Instant,
@@ -345,13 +345,13 @@ struct Session {
 }
 
 #[derive(Debug, Default)]
-struct SessionStoreState {
-    sessions: HashMap<String, Session>,
+struct LegacyMcpSessionStoreState {
+    sessions: HashMap<String, LegacyMcpSession>,
     retired: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionInfo {
+pub struct LegacyMcpSessionInfo {
     pub protocol_version: String,
     pub initialized: bool,
 }
@@ -365,26 +365,28 @@ pub enum RequestReservation {
 }
 
 #[derive(Clone)]
-pub struct SessionStore {
-    inner: Arc<Mutex<SessionStoreState>>,
+pub struct LegacyMcpSessionStore {
+    // Compatibility boundary for stateful MCP transport sessions. This is not
+    // the Anchor development Session domain exposed through the `session` tool.
+    inner: Arc<Mutex<LegacyMcpSessionStoreState>>,
     session_idle_ttl: Duration,
     uninitialized_ttl: Duration,
     max_sessions: usize,
     max_request_ids_per_session: usize,
 }
 
-impl Default for SessionStore {
+impl Default for LegacyMcpSessionStore {
     fn default() -> Self {
         Self::with_limits(
-            DEFAULT_SESSION_IDLE_TTL,
-            DEFAULT_UNINITIALIZED_SESSION_TTL,
-            DEFAULT_MAX_SESSIONS,
-            DEFAULT_MAX_REQUEST_IDS_PER_SESSION,
+            DEFAULT_LEGACY_MCP_SESSION_IDLE_TTL,
+            DEFAULT_LEGACY_MCP_UNINITIALIZED_SESSION_TTL,
+            DEFAULT_MAX_LEGACY_MCP_SESSIONS,
+            DEFAULT_MAX_REQUEST_IDS_PER_LEGACY_MCP_SESSION,
         )
     }
 }
 
-impl SessionStore {
+impl LegacyMcpSessionStore {
     pub fn with_limits(
         session_idle_ttl: Duration,
         uninitialized_ttl: Duration,
@@ -392,7 +394,7 @@ impl SessionStore {
         max_request_ids_per_session: usize,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(SessionStoreState::default())),
+            inner: Arc::new(Mutex::new(LegacyMcpSessionStoreState::default())),
             session_idle_ttl,
             uninitialized_ttl,
             max_sessions: max_sessions.max(1),
@@ -422,7 +424,7 @@ impl SessionStore {
         }
         state.sessions.insert(
             id.clone(),
-            Session {
+            LegacyMcpSession {
                 protocol_version: protocol_version.to_string(),
                 initialized: false,
                 last_seen: Instant::now(),
@@ -432,11 +434,11 @@ impl SessionStore {
         id
     }
 
-    pub fn inspect(&self, id: &str) -> Option<SessionInfo> {
+    pub fn inspect(&self, id: &str) -> Option<LegacyMcpSessionInfo> {
         let mut state = self.inner.lock().expect("MCP session lock");
         self.prune_locked(&mut state);
         let session = state.sessions.get(id)?;
-        Some(SessionInfo {
+        Some(LegacyMcpSessionInfo {
             protocol_version: session.protocol_version.clone(),
             initialized: session.initialized,
         })
@@ -496,7 +498,7 @@ impl SessionStore {
         std::mem::take(&mut self.inner.lock().expect("MCP session lock").retired)
     }
 
-    fn prune_locked(&self, state: &mut SessionStoreState) {
+    fn prune_locked(&self, state: &mut LegacyMcpSessionStoreState) {
         let now = Instant::now();
         let expired = state
             .sessions
@@ -522,7 +524,7 @@ impl SessionStore {
     }
 }
 
-fn retire_session(state: &mut SessionStoreState, id: String) {
+fn retire_session(state: &mut LegacyMcpSessionStoreState, id: String) {
     if !state.retired.iter().any(|existing| existing == &id) {
         state.retired.push(id);
     }
@@ -613,11 +615,11 @@ mod tests {
 
     #[test]
     fn session_store_tracks_initialized_state() {
-        let store = SessionStore::default();
+        let store = LegacyMcpSessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
         assert_eq!(
             store.inspect(&id),
-            Some(SessionInfo {
+            Some(LegacyMcpSessionInfo {
                 protocol_version: "2025-11-25".into(),
                 initialized: false
             })
@@ -633,7 +635,7 @@ mod tests {
 
     #[test]
     fn session_rejects_reused_request_ids() {
-        let store = SessionStore::default();
+        let store = LegacyMcpSessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
         assert_eq!(
             store.reserve_request_id(&id, &json!(1)),
@@ -651,8 +653,12 @@ mod tests {
 
     #[test]
     fn session_store_bounds_request_ids_and_total_sessions() {
-        let store =
-            SessionStore::with_limits(Duration::from_secs(60), Duration::from_secs(60), 2, 2);
+        let store = LegacyMcpSessionStore::with_limits(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            2,
+            2,
+        );
         let first = store.create("2025-11-25", &json!(1));
         assert_eq!(
             store.reserve_request_id(&first, &json!(2)),
@@ -673,7 +679,8 @@ mod tests {
 
     #[test]
     fn uninitialized_sessions_expire_without_touching_other_sessions() {
-        let store = SessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 4);
+        let store =
+            LegacyMcpSessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 4);
         let expired = store.create("2025-11-25", &json!(1));
         std::thread::sleep(Duration::from_millis(1));
         assert!(store.inspect(&expired).is_none());

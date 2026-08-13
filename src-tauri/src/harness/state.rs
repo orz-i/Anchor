@@ -305,22 +305,22 @@ impl Harness {
     pub fn bind_session(
         &self,
         task_id: &str,
-        session_key: &str,
+        session_id: &str,
         path: &str,
     ) -> HarnessResult<TaskSession> {
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;
                 if let Some(existing) = task.session_id.as_deref() {
-                    if existing != session_key || task.session_path.as_deref() != Some(path) {
+                    if existing != session_id || task.session_path.as_deref() != Some(path) {
                         return Err(HarnessError::new(
                             "WORK_SESSION_CONFLICT",
-                            "当前任务已绑定到另一个 History Session",
+                            "当前任务已绑定到另一个 Session",
                         ));
                     }
                     return Ok(task);
                 }
-                task.session_id = Some(session_key.to_string());
+                task.session_id = Some(session_id.to_string());
                 task.session_path = Some(path.to_string());
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
@@ -329,7 +329,7 @@ impl Harness {
                     task_id,
                     "session_bound",
                     Some("begin_work_session"),
-                    json!({"session_key": session_key, "path": path}),
+                    json!({"session_id": session_id, "path": path}),
                     json!({"ok": true}),
                 ))?;
                 Ok(task)
@@ -2705,22 +2705,18 @@ mod tests {
     }
 
     #[test]
-    fn git_baseline_ignores_history_metadata() {
+    fn git_baseline_ignores_session_metadata() {
         let workspace = tempdir().expect("workspace");
         initialize_git(workspace.path());
-        fs::write(
-            workspace.path().join(".gitignore"),
-            "docs/history-session/\n",
-        )
-        .expect("gitignore");
+        fs::write(workspace.path().join(".gitignore"), "docs/session/\n").expect("gitignore");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
         git(workspace.path(), &["add", ".gitignore", "main.rs"]);
         git(workspace.path(), &["commit", "-m", "initial"]);
 
         let before = capture_baseline(workspace.path());
-        let history = workspace.path().join("docs/history-session");
-        fs::create_dir_all(&history).expect("history dir");
-        fs::write(history.join("1.md"), "checkpoint\n").expect("history");
+        let session = workspace.path().join("docs/session");
+        fs::create_dir_all(&session).expect("session dir");
+        fs::write(session.join("ses_test.md"), "checkpoint\n").expect("session");
         let after = capture_baseline_snapshot(workspace.path());
 
         assert_eq!(
@@ -2731,7 +2727,7 @@ mod tests {
             .object
             .entries
             .iter()
-            .any(|entry| entry.path.starts_with("docs/history-session/")));
+            .any(|entry| entry.path.starts_with("docs/session/")));
     }
 
     #[test]

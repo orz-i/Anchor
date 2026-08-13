@@ -261,6 +261,55 @@ fn checkpoint_is_idempotent_and_cannot_cross_session_targets() {
 }
 
 #[test]
+fn automatic_milestone_checkpoint_uses_explicit_session_id_binding() {
+    let (_workspace, _harness, ctx) = test_context();
+    let opened = open_session(&ctx, "chat-auto-checkpoint", "automatic checkpoint");
+    let session_id = opened["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let session_path = opened["session_path"]
+        .as_str()
+        .expect("session path")
+        .to_string();
+    let task = ctx
+        .harness
+        .start_task("automatic checkpoint binding")
+        .expect("task");
+    ctx.harness
+        .bind_session(&task.id, &session_id, &session_path)
+        .expect("bind session");
+
+    let checkpoint = session::auto_checkpoint_after_tool(
+        &ctx,
+        "git_commit",
+        &json!({}),
+        &json!({
+            "ok": true,
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "affected_files": []
+        }),
+        Some(&task.id),
+    )
+    .expect("automatic checkpoint")
+    .expect("checkpoint created");
+
+    assert_eq!(checkpoint["session_id"], session_id);
+    assert_eq!(checkpoint["path"], session_path);
+    assert_eq!(checkpoint["checkpoint_count"], 1);
+    let fetched_result = invoke(
+        &ctx,
+        "session_get",
+        json!({"session_id": checkpoint["session_id"]}),
+    );
+    let fetched = assert_ok(&fetched_result);
+    assert!(fetched["content"]
+        .as_str()
+        .expect("content")
+        .contains("自动阶段检查点"));
+}
+
+#[test]
 fn checkpoint_rejects_running_or_unconsumed_command_results_for_the_same_caller() {
     let (_workspace, _harness, ctx) = test_context();
     let caller = "chat-command-owner";
