@@ -6,8 +6,8 @@ use regex::Regex;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
-use crate::tools::CancellationToken;
 use crate::tools::workspace::{relative_display, tool_ok, Workspace, WorkspaceError};
+use crate::tools::CancellationToken;
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), WorkspaceError> {
     if cancellation.is_cancelled() {
@@ -102,7 +102,10 @@ pub fn read_file(
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let end_line = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
 
     let data = fs::read(&resolved.path).map_err(|_| WorkspaceError::not_found("File not found"))?;
     ensure_not_cancelled(cancellation)?;
@@ -151,7 +154,10 @@ pub fn list_dir(
     if !resolved.path.is_dir() {
         return Err(WorkspaceError::not_a_directory("Path is not a directory"));
     }
-    let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+    let recursive = args
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let max_depth = args
         .get("max_depth")
         .and_then(Value::as_u64)
@@ -518,11 +524,7 @@ fn truncate_bytes(text: &str, max_bytes: usize) -> (String, bool, Option<&'stati
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    (
-        text[..end].to_string(),
-        true,
-        Some("bytes"),
-    )
+    (text[..end].to_string(), true, Some("bytes"))
 }
 
 fn string_list_arg(args: &Value, key: &str) -> Vec<String> {
@@ -578,9 +580,7 @@ fn simple_glob(pattern: &str, text: &str) -> bool {
 
 fn format_mtime(st: Option<SystemTime>) -> Option<String> {
     st.map(|t| {
-        let d = t
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         format!("{}.{:03}Z", d.as_secs(), d.subsec_millis())
     })
 }
@@ -602,12 +602,8 @@ mod tests {
         let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
         let cancellation = CancellationToken::default();
 
-        let read = read_file(
-            &workspace,
-            &json!({"path": "utf16.txt"}),
-            &cancellation,
-        )
-        .expect("read");
+        let read =
+            read_file(&workspace, &json!({"path": "utf16.txt"}), &cancellation).expect("read");
         assert_eq!(read["encoding"], "utf-16le");
         assert_eq!(read["content"], text);
 

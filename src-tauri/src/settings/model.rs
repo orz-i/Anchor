@@ -240,5 +240,4 @@ mod tests {
         assert!(gateway.observed_owner_workspace_id.is_empty());
         assert!(gateway.observed_tunnel_signature.is_empty());
     }
-
 }

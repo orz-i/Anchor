@@ -30,11 +30,7 @@ pub fn external_base_url(_headers: &HeaderMap, bind_port: u16, configured_url: &
     format!("http://127.0.0.1:{bind_port}")
 }
 
-pub fn request_origin_allowed(
-    headers: &HeaderMap,
-    bind_port: u16,
-    configured_url: &str,
-) -> bool {
+pub fn request_origin_allowed(headers: &HeaderMap, bind_port: u16, configured_url: &str) -> bool {
     let Some(origin) = headers.get("origin") else {
         return true;
     };
@@ -138,11 +134,11 @@ mod tests {
 
     #[test]
     fn protected_resource_metadata_lists_authorization_servers() {
-        let meta = protected_resource_metadata(
-            "https://example.com/mcp",
-            "https://example.com",
+        let meta = protected_resource_metadata("https://example.com/mcp", "https://example.com");
+        assert_eq!(
+            meta["authorization_servers"],
+            json!(["https://example.com"])
         );
-        assert_eq!(meta["authorization_servers"], json!(["https://example.com"]));
         assert_eq!(meta["resource"], "https://example.com/mcp");
     }
 
@@ -159,7 +155,10 @@ mod tests {
     fn external_base_url_ignores_untrusted_forwarded_host() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "new-tunnel.example.com".parse().unwrap());
+        headers.insert(
+            "x-forwarded-host",
+            "new-tunnel.example.com".parse().unwrap(),
+        );
         assert_eq!(
             external_base_url(&headers, 28767, "https://old-tunnel.example.com"),
             "https://old-tunnel.example.com"

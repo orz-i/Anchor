@@ -12,11 +12,7 @@ fn registry() -> &'static Mutex<OAuthRuntimeRegistry> {
     OAUTH_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn register_oauth_runtime(
-    workspace_id: &str,
-    service: &str,
-    runtime: &Arc<OAuthRuntime>,
-) {
+pub fn register_oauth_runtime(workspace_id: &str, service: &str, runtime: &Arc<OAuthRuntime>) {
     let mut runtimes = registry().lock().expect("oauth runtime registry lock");
     runtimes.retain(|_, value| value.strong_count() > 0);
     runtimes.insert(
