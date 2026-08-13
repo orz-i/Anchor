@@ -69,18 +69,7 @@ pub fn terminate_process_tree(root_pid: u32) -> AppResult<()> {
 
 /// 只终止镜像路径完全匹配的进程，避免误杀用户自行运行的其它 frpc。
 pub fn terminate_processes_by_image_path(image_path: &Path) -> AppResult<usize> {
-    let expected = normalize_image_path(image_path);
-    let mut matched = Vec::new();
-
-    for pid in process_ids()? {
-        // System/protected processes may deny PROCESS_QUERY_LIMITED_INFORMATION.
-        // They cannot be the managed frpc, so skip them without failing restart.
-        if let Ok(Some(actual)) = process_image_path(pid) {
-            if normalize_image_path(Path::new(&actual)) == expected {
-                matched.push(pid);
-            }
-        }
-    }
+    let matched = process_ids_by_image_path(image_path)?;
 
     let mut terminated = 0;
     for pid in matched {
@@ -89,6 +78,22 @@ pub fn terminate_processes_by_image_path(image_path: &Path) -> AppResult<usize> 
         }
     }
     Ok(terminated)
+}
+
+pub fn process_ids_by_image_path(image_path: &Path) -> AppResult<Vec<u32>> {
+    let expected = normalize_image_path(image_path);
+    let mut matched = Vec::new();
+    for pid in process_ids()? {
+        // Protected processes may deny PROCESS_QUERY_LIMITED_INFORMATION to an
+        // unprivileged caller. The SCM supervisor runs as LocalSystem and can
+        // therefore use the same primitive to find legacy service-owned children.
+        if let Ok(Some(actual)) = process_image_path(pid) {
+            if normalize_image_path(Path::new(&actual)) == expected {
+                matched.push(pid);
+            }
+        }
+    }
+    Ok(matched)
 }
 
 fn normalize_image_path(path: &Path) -> String {

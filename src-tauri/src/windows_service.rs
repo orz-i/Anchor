@@ -56,6 +56,21 @@ pub struct WindowsWorkspaceAutostart {
     pub tunnel_services: Option<ServiceSelection>,
 }
 
+fn parse_scm_binary_executable(output: &str) -> Option<String> {
+    let regex = regex::Regex::new(r"(?mi)^\s*BINARY_PATH_NAME\s*:\s*(.+?)\s*$")
+        .expect("SCM binary path regex");
+    let command_line = regex.captures(output)?.get(1)?.as_str().trim();
+    if let Some(quoted) = command_line.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        return Some(quoted[..end].to_string());
+    }
+    command_line
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn validate_service_owner(owner_sid: &str, owner_username: &str) -> AppResult<()> {
     let owner_sid = owner_sid.trim();
     if !valid_sid(owner_sid) {
@@ -184,6 +199,8 @@ pub struct WindowsScmServiceStatus {
     pub current_build: BuildIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<WindowsServiceRuntimeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_issue: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,17 +473,42 @@ fn remove_service_runtime_state_if_owned(pid: u32) {
     }
 }
 
-fn valid_service_runtime_state(
+fn validate_service_runtime_state(
     state: WindowsServiceRuntimeState,
     scm_pid: Option<u32>,
-) -> Option<WindowsServiceRuntimeState> {
-    let scm_pid = scm_pid?;
-    if scm_pid != state.pid || !platform().is_process_alive(state.pid) {
-        return None;
+    registered_executable: Option<&str>,
+) -> Result<WindowsServiceRuntimeState, String> {
+    let scm_pid = scm_pid.ok_or_else(|| "scm_pid_missing".to_string())?;
+    if scm_pid != state.pid {
+        return Err(format!("pid_mismatch:scm={scm_pid},runtime={}", state.pid));
     }
-    let actual = platform().process_image_path(state.pid).ok().flatten()?;
-    (normalize_windows_path(&actual) == normalize_windows_path(&state.executable_path))
-        .then_some(state)
+    // The caller already obtained `RUNNING` and this PID from SCM queryex.
+    // A non-elevated config owner may be denied OpenProcess against the
+    // LocalSystem service, so `is_process_alive`/process_image_path are not
+    // authoritative here. Prefer the SCM registration (`sc qc`), which is
+    // readable to the owner and is the same source SCM uses to launch the
+    // process. Fall back to process inspection only when registration data is
+    // unexpectedly unavailable.
+    let expected = match registered_executable {
+        Some(executable) => executable.to_string(),
+        None => {
+            if !platform().is_process_alive(state.pid) {
+                return Err(format!("runtime_pid_not_alive:{}", state.pid));
+            }
+            platform()
+                .process_image_path(state.pid)
+                .ok()
+                .flatten()
+                .ok_or_else(|| "registered_executable_unavailable".to_string())?
+        }
+    };
+    if normalize_windows_path(&expected) != normalize_windows_path(&state.executable_path) {
+        return Err(format!(
+            "executable_mismatch:registered={expected},runtime={}",
+            state.executable_path
+        ));
+    }
+    Ok(state)
 }
 
 fn normalize_windows_path(value: &str) -> String {
@@ -702,6 +744,52 @@ fn process_user_sid(pid: u32) -> AppResult<String> {
 
 fn process_is_config_owner(pid: u32) -> AppResult<bool> {
     Ok(process_user_sid(pid)?.eq_ignore_ascii_case(&trusted_service_owner_sid()?))
+}
+
+fn managed_frpc_image_candidates() -> AppResult<Vec<PathBuf>> {
+    let mut candidates = vec![platform().app_config_dir()?.join("bin").join("frpc.exe")];
+    if let Some(parent) = std::env::current_exe()?.parent() {
+        candidates.push(parent.join("frpc.exe"));
+    }
+    // Also include the exact candidates visible to the LocalSystem supervisor.
+    // Legacy service-owned daemons resolved frpc in this same account context,
+    // so PATH / Program Files candidates are required to reclaim those children.
+    candidates.extend(platform().frpc_candidates());
+    candidates.sort_by_key(|path| normalize_windows_path(&path.display().to_string()));
+    candidates.dedup_by(|left, right| {
+        normalize_windows_path(&left.display().to_string())
+            == normalize_windows_path(&right.display().to_string())
+    });
+    Ok(candidates)
+}
+
+fn cleanup_wrong_owner_managed_frpc_processes() -> AppResult<usize> {
+    let expected_sid = trusted_service_owner_sid()?;
+    let mut terminated = 0_usize;
+    for image in managed_frpc_image_candidates()? {
+        for pid in platform().process_ids_by_image_path(&image)? {
+            let actual_sid = process_user_sid(pid)?;
+            if actual_sid.eq_ignore_ascii_case(&expected_sid) {
+                continue;
+            }
+            append_service_log(&format!(
+                "[service] legacy frpc PID {pid} owner mismatch: expected={expected_sid}, actual={actual_sid}; terminating {}",
+                image.display()
+            ));
+            platform().terminate_process_tree(pid)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while platform().is_process_alive(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if platform().is_process_alive(pid) {
+                return Err(AppError::Message(format!(
+                    "legacy frpc PID {pid} owner 不匹配且无法终止"
+                )));
+            }
+            terminated = terminated.saturating_add(1);
+        }
+    }
+    Ok(terminated)
 }
 
 fn active_owner_token() -> AppResult<OwnedWindowsHandle> {
@@ -970,24 +1058,36 @@ pub fn scm_status() -> AppResult<WindowsScmServiceStatus> {
     } else {
         return Err(sc_error("查询 Windows SCM service", &query));
     };
-    let auto_start = if installed {
+    let service_config = if installed {
         let qc = run_sc(&["qc", &service_name])?;
         if qc.success {
-            parse_scm_auto_start(&qc.stdout)
+            Some(qc.stdout)
         } else {
-            false
+            None
         }
     } else {
-        false
-    };
-    let process_id = installed.then(|| parse_scm_pid(&query.stdout)).flatten();
-    let runtime = if state == "running" {
-        read_service_runtime_state()
-            .ok()
-            .flatten()
-            .and_then(|runtime| valid_service_runtime_state(runtime, process_id))
-    } else {
         None
+    };
+    let auto_start = service_config.as_deref().is_some_and(parse_scm_auto_start);
+    let registered_executable = service_config
+        .as_deref()
+        .and_then(parse_scm_binary_executable);
+    let process_id = installed.then(|| parse_scm_pid(&query.stdout)).flatten();
+    let (runtime, runtime_issue) = if state == "running" {
+        match read_service_runtime_state() {
+            Ok(Some(runtime)) => match validate_service_runtime_state(
+                runtime,
+                process_id,
+                registered_executable.as_deref(),
+            ) {
+                Ok(runtime) => (Some(runtime), None),
+                Err(issue) => (None, Some(issue)),
+            },
+            Ok(None) => (None, Some("runtime_state_missing".into())),
+            Err(error) => (None, Some(format!("runtime_state_read_failed:{error}"))),
+        }
+    } else {
+        (None, None)
     };
     let current_build = BuildIdentity::current();
     let build_state = service_build_state(installed, &state, runtime.as_ref(), &current_build);
@@ -1004,6 +1104,7 @@ pub fn scm_status() -> AppResult<WindowsScmServiceStatus> {
         build_state: build_state.into(),
         current_build,
         runtime,
+        runtime_issue,
     })
 }
 
@@ -1529,6 +1630,15 @@ async fn run_service_supervisor() -> AppResult<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_default()
     ));
+    match cleanup_wrong_owner_managed_frpc_processes() {
+        Ok(count) if count > 0 => append_service_log(&format!(
+            "[service] removed {count} legacy managed frpc process(es) owned by a non-config account"
+        )),
+        Ok(_) => {}
+        Err(error) => append_service_log(&format!(
+            "[service] legacy frpc owner cleanup failed: {error}"
+        )),
+    }
     let mut managed_workspaces = HashSet::<String>::new();
     let mut gateway_managed = false;
     loop {
@@ -1823,6 +1933,50 @@ mod tests {
         let output = "SERVICE_NAME: Anchor\r\n        TYPE               : 10  WIN32_OWN_PROCESS\r\n        STATE              : 4  RUNNING\r\n        PID                : 12345\r\n";
         assert_eq!(parse_scm_pid(output), Some(12_345));
         assert_eq!(parse_scm_pid("PID : 0\r\n"), None);
+    }
+
+    #[test]
+    fn scm_qc_parser_reads_registered_executable_without_process_access() {
+        let quoted = concat!(
+            "SERVICE_NAME: Anchor\r\n",
+            "        START_TYPE         : 2   AUTO_START\r\n",
+            "        BINARY_PATH_NAME   : \"D:\\Program Files\\Anchor\\anchor-desktop.exe\" service-run C:\\config SID user\r\n",
+        );
+        assert_eq!(
+            parse_scm_binary_executable(quoted).as_deref(),
+            Some(r"D:\Program Files\Anchor\anchor-desktop.exe")
+        );
+
+        let unquoted =
+            "BINARY_PATH_NAME : D:\\anchor\\anchor-desktop.exe service-run C:\\config\r\n";
+        assert_eq!(
+            parse_scm_binary_executable(unquoted).as_deref(),
+            Some(r"D:\anchor\anchor-desktop.exe")
+        );
+    }
+
+    #[test]
+    fn runtime_validation_uses_scm_registration_without_opening_system_process() {
+        let runtime = WindowsServiceRuntimeState {
+            schema_version: SERVICE_RUNTIME_SCHEMA_VERSION,
+            pid: u32::MAX - 7,
+            started_at_unix: 1,
+            executable_path: r"D:\Program Files\Anchor\anchor-desktop.exe".into(),
+            build_identity: BuildIdentity::current(),
+        };
+        assert!(validate_service_runtime_state(
+            runtime.clone(),
+            Some(runtime.pid),
+            Some(r"D:\Program Files\Anchor\anchor-desktop.exe")
+        )
+        .is_ok());
+        let issue = validate_service_runtime_state(
+            runtime.clone(),
+            Some(runtime.pid),
+            Some(r"D:\Other\anchor-desktop.exe"),
+        )
+        .expect_err("registered executable mismatch must fail");
+        assert!(issue.starts_with("executable_mismatch:"));
     }
 
     #[test]

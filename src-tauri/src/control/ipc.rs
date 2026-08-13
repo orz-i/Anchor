@@ -61,6 +61,20 @@ pub enum DaemonControlCommand {
     },
 }
 
+fn should_log_connection_error(error: &AppError) -> bool {
+    #[cfg(windows)]
+    if matches!(
+        error,
+        AppError::Io(io_error) if matches!(io_error.raw_os_error(), Some(109 | 232))
+    ) {
+        // Preserve the existing request-failure semantics, especially for
+        // response writes that precede command dispatch, but do not log the
+        // normal Windows Named Pipe peer-close race as a daemon failure.
+        return false;
+    }
+    true
+}
+
 #[cfg(any(feature = "cli", test))]
 pub(crate) fn finish_config_apply_operation(
     operation_id: &str,
@@ -1168,11 +1182,13 @@ impl ControlServer {
                     if let Err(error) =
                         handle_connection(connected, &profile, &command_sender).await
                     {
-                        crate::tunnel::append_profile_log(
-                            &profile.id,
-                            "daemon.log",
-                            &format!("[control] request failed: {error}"),
-                        );
+                        if should_log_connection_error(&error) {
+                            crate::tunnel::append_profile_log(
+                                &profile.id,
+                                "daemon.log",
+                                &format!("[control] request failed: {error}"),
+                            );
+                        }
                     }
                 });
             }
@@ -1616,6 +1632,18 @@ fn handled(response: ControlResponse) -> HandledRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_named_pipe_peer_close_errors_are_not_logged_as_request_failures() {
+        for code in [109, 232] {
+            let error = AppError::Io(io::Error::from_raw_os_error(code));
+            assert!(!should_log_connection_error(&error));
+        }
+        assert!(should_log_connection_error(&AppError::Io(
+            io::Error::from_raw_os_error(5)
+        )));
+    }
 
     #[test]
     fn lifecycle_drain_only_retries_supported_older_protocols() {

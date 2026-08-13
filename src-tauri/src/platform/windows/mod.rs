@@ -29,6 +29,10 @@ impl Platform for WindowsPlatform {
         process::process_image_path(pid)
     }
 
+    fn process_ids_by_image_path(&self, image_path: &Path) -> AppResult<Vec<u32>> {
+        process::process_ids_by_image_path(image_path)
+    }
+
     fn is_process_alive(&self, pid: u32) -> bool {
         process::is_process_alive(pid)
     }

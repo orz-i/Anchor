@@ -100,6 +100,17 @@ fn create_windows_pipe_server(
     })
 }
 
+fn should_log_connection_error(error: &AppError) -> bool {
+    #[cfg(windows)]
+    if matches!(
+        error,
+        AppError::Io(io_error) if matches!(io_error.raw_os_error(), Some(109 | 232))
+    ) {
+        return false;
+    }
+    true
+}
+
 pub async fn request_version() -> Result<GatewayVersionInfo, GatewayControlClientError> {
     let result = match request(GatewayMethod::Version).await {
         Ok(result) => result,
@@ -921,7 +932,11 @@ impl GatewayControlServer {
                 let command_sender = command_sender.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(connected, &command_sender).await {
-                        gateway_daemon::append_log(&format!("[control] request failed: {error}"));
+                        if should_log_connection_error(&error) {
+                            gateway_daemon::append_log(&format!(
+                                "[control] request failed: {error}"
+                            ));
+                        }
                     }
                 });
             }
@@ -1178,6 +1193,18 @@ fn lifecycle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_named_pipe_peer_close_errors_are_not_logged_as_request_failures() {
+        for code in [109, 232] {
+            let error = AppError::Io(io::Error::from_raw_os_error(code));
+            assert!(!should_log_connection_error(&error));
+        }
+        assert!(should_log_connection_error(&AppError::Io(
+            io::Error::from_raw_os_error(5)
+        )));
+    }
 
     #[test]
     fn gateway_lifecycle_drain_only_retries_supported_older_protocols() {

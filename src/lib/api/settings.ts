@@ -122,6 +122,7 @@ export interface WindowsScmServiceStatusDto {
   buildState: "not_installed" | "stopped" | "current" | "different" | "unknown";
   currentBuild: BuildIdentityDto;
   runtime?: WindowsServiceRuntimeStateDto;
+  runtimeIssue?: string;
 }
 
 export async function getWindowsServiceStatus(): Promise<WindowsScmServiceStatusDto> {

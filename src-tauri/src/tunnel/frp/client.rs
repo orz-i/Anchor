@@ -330,12 +330,6 @@ pub async fn spawn_frpc(
         .spawn()
         .map_err(|err| AppError::Message(format!("启动 frpc 失败: {err}")))?;
     let pid = child.id();
-    if let Some(pid) = pid {
-        if let Err(error) = write_managed_frpc_pid(workspace_id, pid, &frpc) {
-            let _ = stop_child(child, Some(pid)).await;
-            return Err(error);
-        }
-    }
     if let Some(stdout) = child.stdout.take() {
         let log_paths = log_paths.clone();
         tokio::spawn(async move {
@@ -353,16 +347,26 @@ pub async fn spawn_frpc(
         Ok(ready) => ready,
         Err(error) => {
             let _ = stop_child(child, pid).await;
-            clear_managed_frpc_pid(workspace_id);
             return Err(error);
         }
     };
     if !ready {
         let _ = stop_child(child, pid).await;
-        clear_managed_frpc_pid(workspace_id);
         return Err(AppError::Message(
             "frpc 已启动但很快退出。请检查 FRP 服务器地址、端口、Token 与子域名配置。".into(),
         ));
+    }
+
+    // Do not replace the workspace's durable PID ownership record until the
+    // candidate has actually established all requested proxies. A failed
+    // replacement (notably `proxy already exists`) must not overwrite and then
+    // delete the record for a previous managed instance, otherwise later
+    // recovery loses the only safe PID/image handle it can use for cleanup.
+    if let Some(pid) = pid {
+        if let Err(error) = write_managed_frpc_pid(workspace_id, pid, &frpc) {
+            let _ = stop_child(child, Some(pid)).await;
+            return Err(error);
+        }
     }
 
     Ok(FrpcHandle { child, pid })
