@@ -34,27 +34,26 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
-fn bound_worktree_history_checkpoint_uses_primary_history_store_without_task_baseline_gate() {
+fn bound_worktree_session_checkpoint_uses_primary_session_store_without_task_baseline_gate() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
-    fs::write(workspace.join("README.md"), "worktree history checkpoint\n").expect("写入文件");
+    fs::write(workspace.join("README.md"), "worktree session checkpoint\n").expect("写入文件");
     fs::write(
         workspace.join(".gitignore"),
-        "/.anchor/worktrees/\n/docs/history-session/\n",
+        "/.anchor/worktrees/\n/docs/session/\n",
     )
     .expect("写入 ignore");
     initialize_git(&workspace);
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
-    let caller = "worktree-history-checkpoint-session";
+    let caller = "worktree-session-checkpoint-caller";
 
     let started = call_tool_for_session(
         &ctx,
         "begin_work_session",
         &json!({
-            "objective": "验证 worktree Task 的 History checkpoint 路由",
-            "session_key": "worktree-history-checkpoint",
+            "objective": "验证 worktree Task 的 Session checkpoint 路由",
             "workspace_root": workspace.to_string_lossy(),
             "workspace_mode": "worktree",
             "worktree_remove_on_close": false
@@ -66,47 +65,46 @@ fn bound_worktree_history_checkpoint_uses_primary_history_store_without_task_bas
 
     let checkpoint = call_tool_for_session(
         &ctx,
-        "history_session_checkpoint",
+        "session_checkpoint",
         &json!({
             "workspace_root": workspace.to_string_lossy(),
-            "session_key": started["history"]["session_key"],
-            "expected_path": started["history"]["current_path"],
-            "turn_id": "worktree-history-checkpoint",
-            "user_intent": "persist metadata in the primary History store",
+            "session_id": started["session"]["session_id"],
+            "expected_path": started["session"]["session_path"],
+            "turn_id": "worktree-session-checkpoint",
+            "user_intent": "persist metadata in the primary Session store",
             "session_status": "active"
         }),
         caller,
     );
     assert_eq!(checkpoint["ok"], true, "{checkpoint}");
     assert_eq!(
-        checkpoint["path"], started["history"]["current_path"],
-        "History metadata remains in the primary workspace store"
+        checkpoint["path"], started["session"]["session_path"],
+        "Session metadata remains in the primary workspace store"
     );
 }
 
 #[test]
-fn unbound_history_checkpoint_does_not_inherit_unrelated_default_task_baseline() {
+fn unbound_session_checkpoint_does_not_inherit_unrelated_default_task_baseline() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
-    fs::write(workspace.join(".gitignore"), "/docs/history-session/\n").expect("写入 ignore");
+    fs::write(workspace.join(".gitignore"), "/docs/session/\n").expect("写入 ignore");
     fs::write(workspace.join("README.md"), "initial\n").expect("写入 README");
     initialize_git(&workspace);
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
 
-    // This models the post-close state: the History Session remains addressable by its
-    // stable key/path, while the caller has no writable Task binding and another Task is
+    // This models the post-close state: the Session remains addressable by its opaque
+    // id/path, while the caller has no writable Task binding and another Task is
     // the workspace default writer.
-    let history = call_tool(
+    let session = call_tool(
         &ctx,
-        "history_session_bootstrap",
+        "session_open",
         &json!({
-            "session_key": "checkpoint-after-close-routing",
             "workspace_root": workspace.to_string_lossy()
         }),
     );
-    assert_eq!(history["ok"], true, "{history}");
+    assert_eq!(session["ok"], true, "{session}");
     let peer = call_tool(
         &ctx,
         "start_task",
@@ -125,13 +123,13 @@ fn unbound_history_checkpoint_does_not_inherit_unrelated_default_task_baseline()
 
     let checkpoint = call_tool(
         &ctx,
-        "history_session_checkpoint",
+        "session_checkpoint",
         &json!({
             "workspace_root": workspace.to_string_lossy(),
-            "session_key": history["session_key"],
-            "expected_path": history["current_path"],
+            "session_id": session["session_id"],
+            "expected_path": session["session_path"],
             "turn_id": "checkpoint-after-close-routing",
-            "user_intent": "persist History metadata without inheriting a peer Task baseline",
+            "user_intent": "persist Session metadata without inheriting a peer Task baseline",
             "session_status": "active"
         }),
     );
@@ -143,23 +141,23 @@ fn unbound_history_checkpoint_does_not_inherit_unrelated_default_task_baseline()
         .expect("peer task after checkpoint");
     assert_eq!(
         peer_after.expected_state.worktree_fingerprint, expected_before,
-        "History checkpoint must not silently accept or refresh the unrelated peer baseline"
+        "Session checkpoint must not silently accept or refresh the unrelated peer baseline"
     );
 
-    let peer_history_operations = call_tool(
+    let peer_session_operations = call_tool(
         &ctx,
         "operation_log",
         &json!({
             "task_id": peer_id,
-            "tool": "history_session_checkpoint",
+            "tool": "session_checkpoint",
             "limit": 20
         }),
     );
     assert_eq!(
-        peer_history_operations["ok"], true,
-        "{peer_history_operations}"
+        peer_session_operations["ok"], true,
+        "{peer_session_operations}"
     );
-    assert_eq!(peer_history_operations["total_matches"], 0);
+    assert_eq!(peer_session_operations["total_matches"], 0);
 
     let peer_write = call_tool(
         &ctx,
@@ -387,7 +385,6 @@ fn complete_work_session_checkpoints_before_removed_worktree_becomes_unavailable
         "begin_work_session",
         &json!({
             "objective": "严格关闭后清理隔离目录",
-            "session_key": "strict-worktree-cleanup-history",
             "workspace_root": workspace.to_string_lossy(),
             "workspace_mode": "worktree",
             "worktree_remove_on_close": true
@@ -445,7 +442,7 @@ fn complete_work_session_checkpoint_failure_keeps_schema_compliant_retry_state()
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
     fs::write(workspace.join("README.md"), "checkpoint pending\n").expect("写入文件");
-    fs::write(workspace.join(".gitignore"), "/docs/history-session/\n").expect("写入 ignore");
+    fs::write(workspace.join(".gitignore"), "/docs/session/\n").expect("写入 ignore");
     initialize_git(&workspace);
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
@@ -456,7 +453,6 @@ fn complete_work_session_checkpoint_failure_keeps_schema_compliant_retry_state()
         "begin_work_session",
         &json!({
             "objective": "验证 checkpoint pending 输出契约",
-            "session_key": "checkpoint-pending-history",
             "workspace_root": workspace.to_string_lossy()
         }),
         caller,
@@ -491,7 +487,7 @@ fn complete_work_session_checkpoint_failure_keeps_schema_compliant_retry_state()
     );
     assert_eq!(pending["ok"], false, "{pending}");
     assert_eq!(pending["closed"], false, "{pending}");
-    assert_eq!(pending["phase"], "history_checkpoint", "{pending}");
+    assert_eq!(pending["phase"], "session_checkpoint", "{pending}");
     assert_eq!(
         pending["error"]["code"], "WORK_SESSION_CHECKPOINT_PENDING",
         "{pending}"
@@ -899,42 +895,44 @@ fn no_early_stop_forces_strict_completion_policy() {
 }
 
 #[test]
-fn begin_work_session_binds_history_and_task_idempotently() {
+fn begin_work_session_binds_session_and_task_idempotently() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
     fs::write(workspace.join("README.md"), "initial\n").expect("写入文件");
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
-    let arguments = json!({
+    let initial_arguments = json!({
         "objective": "统一工作会话测试",
-        "session_key": "work-session-contract",
         "workspace_root": workspace.to_string_lossy()
     });
     let mcp_session = "work-session-a";
 
-    let first = call_tool_for_session(&ctx, "begin_work_session", &arguments, mcp_session);
+    let first = call_tool_for_session(&ctx, "begin_work_session", &initial_arguments, mcp_session);
     assert_eq!(first["ok"], true);
     assert_eq!(first["work_session"]["status"], "active");
     assert_eq!(first["work_session"]["task_created"], true);
-    assert_eq!(
-        first["work_session"]["history_session_key"],
-        "work-session-contract"
-    );
+    let session_id = first["work_session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert!(session_id.starts_with("ses_"));
     let task_id = first["work_session"]["task_id"]
         .as_str()
         .expect("task id")
         .to_string();
-    let history_path = first["work_session"]["history_session_path"]
+    let session_path = first["work_session"]["session_path"]
         .as_str()
-        .expect("history path");
-    assert!(workspace.join(history_path).exists());
-    assert_eq!(
-        first["task"]["history_session_key"],
-        "work-session-contract"
-    );
+        .expect("session path");
+    assert!(workspace.join(session_path).exists());
+    assert_eq!(first["task"]["session_id"], session_id);
+    let resume_arguments = json!({
+        "objective": "统一工作会话测试",
+        "session_id": session_id,
+        "workspace_root": workspace.to_string_lossy()
+    });
 
-    let second = call_tool_for_session(&ctx, "begin_work_session", &arguments, mcp_session);
+    let second = call_tool_for_session(&ctx, "begin_work_session", &resume_arguments, mcp_session);
     assert_eq!(second["ok"], true);
     assert_eq!(second["work_session"]["task_created"], false);
     assert_eq!(second["work_session"]["task_id"], task_id);
@@ -950,7 +948,8 @@ fn begin_work_session_binds_history_and_task_idempotently() {
         call_tool_for_session(&ctx, "harness_status", &json!({}), mcp_session)["task_state"],
         "paused"
     );
-    let reconnected = call_tool_for_session(&ctx, "begin_work_session", &arguments, mcp_session);
+    let reconnected =
+        call_tool_for_session(&ctx, "begin_work_session", &resume_arguments, mcp_session);
     assert_eq!(reconnected["ok"], true);
     assert_eq!(reconnected["work_session"]["task_created"], false);
     assert_eq!(reconnected["work_session"]["task_id"], task_id);
@@ -997,7 +996,7 @@ fn latest_baseline_is_captured_and_accepted_in_one_call() {
 }
 
 #[test]
-fn begin_work_session_handoff_pauses_previous_same_history_shared_writer() {
+fn begin_work_session_handoff_pauses_previous_same_session_shared_writer() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -1011,20 +1010,23 @@ fn begin_work_session_handoff_pauses_previous_same_history_shared_writer() {
         "begin_work_session",
         &json!({
             "objective": "任务 A",
-            "session_key": "task-handoff-contract",
             "workspace_root": workspace.to_string_lossy()
         }),
         mcp_session,
     );
     assert_eq!(first["ok"], true);
     let first_id = first["task"]["id"].as_str().expect("first id").to_string();
+    let session_id = first["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
 
     let second = call_tool_for_session(
         &ctx,
         "begin_work_session",
         &json!({
             "objective": "任务 B",
-            "session_key": "task-handoff-contract",
+            "session_id": session_id,
             "workspace_root": workspace.to_string_lossy()
         }),
         mcp_session,
@@ -1144,6 +1146,7 @@ fn shared_tasks_remain_active_and_serialize_workspace_writes() {
         &json!({"objective": "并行任务 B"}),
         "parallel-session-b",
     );
+    assert_eq!(first["ok"], true, "{first}");
     let first_id = first["task"]["id"].as_str().expect("first id").to_string();
     let second_id = second["task"]["id"]
         .as_str()
@@ -1437,7 +1440,7 @@ fn failed_controlled_command_with_mutation_returns_the_refreshed_baseline() {
 }
 
 #[test]
-fn history_checkpoint_cannot_complete_an_active_bound_task() {
+fn session_checkpoint_cannot_complete_an_active_bound_task() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -1450,33 +1453,32 @@ fn history_checkpoint_cannot_complete_an_active_bound_task() {
         "begin_work_session",
         &json!({
             "objective": "必须通过关闭入口完成",
-            "session_key": "history-completion-gate",
             "workspace_root": workspace.to_string_lossy()
         }),
-        "history-completion-session",
+        "session-completion-caller",
     );
     assert_eq!(started["ok"], true, "{started}");
-    let session_key = started["history"]["session_key"]
+    let session_id = started["session"]["session_id"]
         .as_str()
-        .expect("session key");
-    let expected_path = started["history"]["current_path"]
+        .expect("session id");
+    let expected_path = started["session"]["session_path"]
         .as_str()
-        .expect("history path");
+        .expect("session path");
 
     let rejected = call_tool_for_session(
         &ctx,
-        "history_session_checkpoint",
+        "session_checkpoint",
         &json!({
-            "session_key": session_key,
+            "session_id": session_id,
             "expected_path": expected_path,
             "turn_id": "illegal-completion",
             "user_intent": "绕过关闭流程",
             "session_status": "completed"
         }),
-        "history-completion-session",
+        "session-completion-caller",
     );
     assert_eq!(rejected["ok"], false, "{rejected}");
-    assert_eq!(rejected["error"]["code"], "HISTORY_TASK_STILL_ACTIVE");
+    assert_eq!(rejected["error"]["code"], "SESSION_TASK_STILL_ACTIVE");
 }
 
 #[test]
@@ -1493,7 +1495,6 @@ fn work_session_export_is_versioned_portable_and_overwrite_safe() {
         "begin_work_session",
         &json!({
             "objective": "导出可移植交接",
-            "session_key": "handoff-export-history",
             "workspace_root": workspace.to_string_lossy()
         }),
         caller_session,
@@ -1529,8 +1530,8 @@ fn work_session_export_is_versioned_portable_and_overwrite_safe() {
     );
     assert_eq!(document["task"]["id"], task_id);
     assert_eq!(
-        document["history_session"]["session_key"],
-        "handoff-export-history"
+        document["session"]["session_id"],
+        started["session"]["session_id"]
     );
     assert!(document["commits"].is_array());
     assert!(document["verifications"].is_array());
@@ -1563,7 +1564,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     fs::write(workspace.join("README.md"), "optional worktree\n").expect("写入文件");
     fs::write(
         workspace.join(".gitignore"),
-        "/.anchor/worktrees/\n/.anchor/handoffs/\n/docs/history-session/\n",
+        "/.anchor/worktrees/\n/.anchor/handoffs/\n/docs/session/\n",
     )
     .expect("写入 ignore");
     initialize_git(&workspace);
@@ -1590,7 +1591,6 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
         "begin_work_session",
         &json!({
             "objective": "显式隔离工作区",
-            "session_key": "optional-worktree-history",
             "workspace_root": workspace.to_string_lossy(),
             "workspace_mode": "worktree",
             "worktree_base_ref": "HEAD"
@@ -1977,7 +1977,6 @@ fn close_work_session_can_remove_a_clean_managed_worktree_when_explicitly_reques
         "begin_work_session",
         &json!({
             "objective": "关闭后清理隔离目录",
-            "session_key": "worktree-cleanup-history",
             "workspace_root": workspace.to_string_lossy(),
             "workspace_mode": "worktree",
             "worktree_remove_on_close": true
@@ -2263,7 +2262,7 @@ fn sequential_retained_commands_keep_verifications_bound_to_their_sessions() {
 }
 
 #[test]
-fn reconnected_transport_recovers_task_by_history_session_not_workspace_default() {
+fn reconnected_transport_recovers_task_by_explicit_session_not_workspace_default() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -2272,7 +2271,6 @@ fn reconnected_transport_recovers_task_by_history_session_not_workspace_default(
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
     let first_args = json!({
         "objective": "可恢复并行任务 A",
-        "session_key": "parallel-history-a",
         "workspace_root": workspace.to_string_lossy()
     });
     let first = call_tool_for_session(
@@ -2281,14 +2279,23 @@ fn reconnected_transport_recovers_task_by_history_session_not_workspace_default(
         &first_args,
         "transport-a-original",
     );
+    assert_eq!(first["ok"], true, "{first}");
     let first_id = first["task"]["id"].as_str().expect("first id").to_string();
+    let first_session_id = first["session"]["session_id"]
+        .as_str()
+        .expect("first session id")
+        .to_string();
+    let reconnect_args = json!({
+        "objective": "可恢复并行任务 A",
+        "session_id": first_session_id,
+        "workspace_root": workspace.to_string_lossy()
+    });
 
     let second = call_tool_for_session(
         &ctx,
         "begin_work_session",
         &json!({
             "objective": "并行任务 B 成为工作区默认",
-            "session_key": "parallel-history-b",
             "workspace_root": workspace.to_string_lossy()
         }),
         "transport-b",
@@ -2310,7 +2317,7 @@ fn reconnected_transport_recovers_task_by_history_session_not_workspace_default(
     let reconnected = call_tool_for_session(
         &ctx,
         "begin_work_session",
-        &first_args,
+        &reconnect_args,
         "transport-a-reconnected",
     );
     assert_eq!(reconnected["ok"], true, "{reconnected}");
@@ -2459,7 +2466,7 @@ fn expected_failure_disposition_allows_audited_task_completion() {
 }
 
 #[test]
-fn close_work_session_closes_task_and_checkpoints_bound_history() {
+fn close_work_session_closes_task_and_checkpoints_bound_session() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -2470,16 +2477,19 @@ fn close_work_session_closes_task_and_checkpoints_bound_history() {
         "begin_work_session",
         &json!({
             "objective": "关闭统一工作会话",
-            "session_key": "close-work-session-contract",
             "workspace_root": workspace.to_string_lossy()
         }),
     );
     let task_id = started["work_session"]["task_id"]
         .as_str()
         .expect("task id");
-    let expected_path = started["work_session"]["history_session_path"]
+    let session_id = started["work_session"]["session_id"]
         .as_str()
-        .expect("history path")
+        .expect("session id")
+        .to_string();
+    let expected_path = started["work_session"]["session_path"]
+        .as_str()
+        .expect("session path")
         .to_string();
 
     let closed = call_tool(
@@ -2503,10 +2513,7 @@ fn close_work_session_closes_task_and_checkpoints_bound_history() {
         closed["work_session"]["task_status"],
         "completed_unverified"
     );
-    assert_eq!(
-        closed["checkpoint"]["session_key"],
-        "close-work-session-contract"
-    );
+    assert_eq!(closed["checkpoint"]["session_id"], session_id);
     assert_eq!(closed["checkpoint"]["path"], expected_path);
 
     let retried = call_tool(
@@ -2530,42 +2537,49 @@ fn operation_log_filters_and_collapses_bound_work_session_operations() {
     fs::create_dir_all(&workspace).expect("创建工作区");
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
-    let started = call_tool(
+    let caller = "operation-scope-caller";
+    let started = call_tool_for_session(
         &ctx,
         "begin_work_session",
         &json!({
             "objective": "作用域操作日志",
-            "session_key": "operation-scope-contract",
             "workspace_root": workspace.to_string_lossy()
         }),
+        caller,
     );
     let task_id = started["work_session"]["task_id"]
         .as_str()
         .expect("task id");
-    let executed = call_tool(
+    let session_id = started["work_session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let executed = call_tool_for_session(
         &ctx,
         "exec_command",
         &json!({"cmd": "python --version", "yield_time_ms": 30000}),
+        caller,
     );
     assert_eq!(executed["command_ok"], true);
 
-    let log = call_tool(
+    let log = call_tool_for_session(
         &ctx,
         "operation_log",
         &json!({
             "task_id": task_id,
-            "history_session_key": "operation-scope-contract",
+            "session_id": session_id,
             "tool": "exec_command",
             "collapse": true,
             "limit": 20
         }),
+        caller,
     );
     assert_eq!(log["ok"], true);
     assert_eq!(log["total_matches"], 1);
     assert_eq!(log["operations"].as_array().unwrap().len(), 1);
     let operation = &log["operations"][0];
     assert_eq!(operation["task_id"], task_id);
-    assert_eq!(operation["history_session_key"], "operation-scope-contract");
+    assert_eq!(operation["session_id"], session_id);
     assert_eq!(operation["tool"], "exec_command");
     assert_eq!(operation["status"], "completed");
     assert!(operation["started_at_iso"]
@@ -3457,7 +3471,6 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
         "begin_work_session",
         &json!({
             "objective": "严格任务契约",
-            "session_key": "strict-task-contract",
             "workspace_root": workspace.to_string_lossy(),
             "phase": "planning",
             "pending_steps": ["final review"],

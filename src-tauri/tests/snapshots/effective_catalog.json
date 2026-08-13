@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 36,
+    "catalog_version": 37,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -13,9 +13,6 @@
       "environment",
       "exec_command",
       "git",
-      "history_session_bootstrap",
-      "history_session_checkpoint",
-      "history_session_validate",
       "kill_session",
       "list_command_sessions",
       "list_dir",
@@ -26,6 +23,7 @@
       "remove_path",
       "search_text",
       "server_info",
+      "session",
       "skill",
       "slice",
       "task",
@@ -33,10 +31,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 30
+    "tool_count": 28
   },
   "core": {
-    "catalog_version": 36,
+    "catalog_version": 37,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -47,9 +45,6 @@
       "environment",
       "exec_command",
       "git",
-      "history_session_bootstrap",
-      "history_session_checkpoint",
-      "history_session_validate",
       "kill_session",
       "list_command_sessions",
       "list_dir",
@@ -59,16 +54,17 @@
       "remove_path",
       "search_text",
       "server_info",
+      "session",
       "skill",
       "task",
       "view_image",
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 26
+    "tool_count": 24
   },
   "read-only": {
-    "catalog_version": 36,
+    "catalog_version": 37,
     "names": [
       "browser_build_info",
       "cwd",
@@ -81,10 +77,11 @@
       "read_output",
       "search_text",
       "server_info",
+      "session",
       "skill",
       "view_image",
       "wait_command"
     ],
-    "tool_count": 14
+    "tool_count": 15
   }
 }

@@ -665,7 +665,7 @@ fn advanced_profile_exposes_every_declared_tool() {
 }
 
 #[test]
-fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
+fn core_profile_keeps_default_capabilities_and_exposes_one_session_facade() {
     let tools = anchor_lib::tools::list_tools_for_profile("core");
     let names = tools
         .iter()
@@ -676,7 +676,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 26);
+    assert_eq!(names.len(), 24);
     assert!(names.contains("git"));
     assert!(names.contains("task"));
     assert!(names.contains("skill"));
@@ -684,9 +684,10 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(names.contains("cwd"));
     assert!(names.contains("search_text"));
     assert!(!names.contains("command_cost_explain"));
-    assert!(names.contains("history_session_bootstrap"));
-    assert!(names.contains("history_session_checkpoint"));
-    assert!(names.contains("history_session_validate"));
+    assert!(names.contains("session"));
+    assert!(!names
+        .iter()
+        .any(|name| name.starts_with("history_session_")));
     assert!(names.contains("wait_command"));
     assert!(names.contains("list_command_sessions"));
     assert!(names.contains("browser_build_info"));

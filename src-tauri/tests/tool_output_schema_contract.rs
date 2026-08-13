@@ -123,34 +123,26 @@ fn high_value_local_tool_successes_match_published_output_schemas() {
 }
 
 #[test]
-fn history_successes_match_published_output_schemas() {
+fn session_successes_match_published_output_schemas() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    let session_key = "output-schema-contract-session";
-    let bootstrap = invoke(
-        &ctx,
-        "history_session_bootstrap",
-        json!({
-            "session_key": session_key,
-            "history_dir": "docs/history-session"
-        }),
-    );
-    assert_ok(&bootstrap);
-    assert_eq!(bootstrap["target_preserved"], true);
-    assert!(bootstrap.get("host_session_key_mismatch").is_none());
-    assert!(bootstrap.get("host_session_key_mismatch_level").is_none());
-    assert_eq!(bootstrap["persistence"]["storage"], "workspace_file");
-    assert_matches_output_schema("history_session_bootstrap", &bootstrap);
+    let opened = invoke(&ctx, "session_open", json!({"session_dir": "docs/session"}));
+    assert_ok(&opened);
+    assert_eq!(opened["history_injected"], false);
+    assert_eq!(opened["automatic_history_loading"], false);
+    assert_eq!(opened["persistence"]["storage"], "workspace_file");
+    assert_matches_output_schema("session_open", &opened);
 
-    let current_path = bootstrap["current_path"]
+    let session_id = opened["session_id"].as_str().expect("opened session_id");
+    let session_path = opened["session_path"]
         .as_str()
-        .expect("bootstrap current_path");
+        .expect("opened session_path");
     let checkpoint = invoke(
         &ctx,
-        "history_session_checkpoint",
+        "session_checkpoint",
         json!({
-            "session_key": session_key,
-            "expected_path": current_path,
+            "session_id": session_id,
+            "expected_path": session_path,
             "turn_id": "schema-contract-turn",
             "user_intent": "validate output schema",
             "tests": ["schema contract"]
@@ -163,15 +155,23 @@ fn history_successes_match_published_output_schemas() {
     assert!(checkpoint["git_ignored"].is_boolean());
     assert!(checkpoint["git_dirty_after_write"].is_boolean());
     assert!(checkpoint["persistence_reason"].is_string());
-    assert_matches_output_schema("history_session_checkpoint", &checkpoint);
+    assert_matches_output_schema("session_checkpoint", &checkpoint);
+
+    let list = invoke(&ctx, "session_list", json!({"limit": 20}));
+    assert_ok(&list);
+    assert_matches_output_schema("session_list", &list);
+
+    let get = invoke(&ctx, "session_get", json!({"session_id": session_id}));
+    assert_ok(&get);
+    assert_matches_output_schema("session_get", &get);
 
     let validate = invoke(
         &ctx,
-        "history_session_validate",
-        json!({"history_dir": "docs/history-session"}),
+        "session_validate",
+        json!({"session_dir": "docs/session"}),
     );
     assert_ok(&validate);
-    assert_matches_output_schema("history_session_validate", &validate);
+    assert_matches_output_schema("session_validate", &validate);
 }
 
 #[test]
@@ -271,7 +271,6 @@ fn complete_work_session_success_matches_published_output_schema() {
         "begin_work_session",
         json!({
             "objective": "complete work session output schema",
-            "session_key": "complete-work-session-output-schema",
             "workspace_root": fx.root.to_string_lossy()
         }),
     );

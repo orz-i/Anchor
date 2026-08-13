@@ -1481,7 +1481,7 @@ fn matches_optional(operation: &Value, key: &str, expected: Option<&str>) -> boo
 fn operation_value(operation: OperationRecord) -> Value {
     let created_at_iso = operation_iso(&operation);
     let result = &operation.result_summary;
-    let session_id = result
+    let command_session_id = result
         .get("session_id")
         .cloned()
         .or_else(|| operation.mcp_session_id.clone().map(Value::String));
@@ -1502,7 +1502,7 @@ fn operation_value(operation: OperationRecord) -> Value {
         "task_id": operation.task_id,
         "session_id": operation.session_id,
         "mcp_session_id": operation.mcp_session_id,
-        "session_id": session_id,
+        "command_session_id": command_session_id,
         "tool": operation.tool,
         "status": operation.kind,
         "input_summary": operation.input_summary,
@@ -1571,7 +1571,7 @@ fn collapse_operation(records: Vec<OperationRecord>) -> Option<Value> {
             .map(|(completed, started)| completed.saturating_sub(started).max(0) as u64)
     };
     let result = &final_record.result_summary;
-    let session_id = result
+    let command_session_id = result
         .get("session_id")
         .cloned()
         .or_else(|| final_record.mcp_session_id.clone().map(Value::String));
@@ -1595,7 +1595,7 @@ fn collapse_operation(records: Vec<OperationRecord>) -> Option<Value> {
         "task_id": final_record.task_id.as_ref().or(started.task_id.as_ref()),
         "session_id": final_record.session_id.as_ref().or(started.session_id.as_ref()),
         "mcp_session_id": final_record.mcp_session_id.as_ref().or(started.mcp_session_id.as_ref()),
-        "session_id": session_id,
+        "command_session_id": command_session_id,
         "tool": final_record.tool,
         "status": status,
         "input_summary": final_record.input_summary,
