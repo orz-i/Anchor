@@ -20,18 +20,37 @@ pub struct CloudflareTunnelHandle {
 }
 
 pub fn resolve_cloudflared() -> AppResult<PathBuf> {
-    platform()
-        .cloudflared_candidates()
-        .into_iter()
-        .find(|path| path.is_file())
-        .or_else(|| cached_cloudflared_path().filter(|path| path.is_file()))
+    cached_cloudflared_path()
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            platform()
+                .cloudflared_candidates()
+                .into_iter()
+                .find(|path| path.is_file())
+        })
         .ok_or_else(|| {
             AppError::Message(
-                "未找到 cloudflared。请到「软件管理」安装，或自行安装 Cloudflare Tunnel CLI。\n\
+                "未找到 cloudflared。CLI 可执行 `anchor software install cloudflared` 自动安装；也可自行安装 Cloudflare Tunnel CLI。\n\
                  Windows 可执行：winget install Cloudflare.cloudflared"
                     .into(),
             )
         })
+}
+
+pub async fn ensure_cloudflared() -> AppResult<PathBuf> {
+    if let Ok(path) = resolve_cloudflared() {
+        return Ok(path);
+    }
+    #[cfg(any(feature = "desktop", feature = "cli"))]
+    {
+        download_cloudflared_to_cache().await
+    }
+    #[cfg(not(any(feature = "desktop", feature = "cli")))]
+    {
+        Err(AppError::Message(
+            "未找到 cloudflared，当前构建也不包含自动下载能力。".into(),
+        ))
+    }
 }
 
 /// Path where the app caches a self-managed cloudflared binary.
@@ -54,7 +73,7 @@ pub(crate) fn cloudflared_binary_name() -> &'static str {
 }
 
 /// GitHub release asset name for the current platform.
-#[cfg(feature = "desktop")]
+#[cfg(any(feature = "desktop", feature = "cli"))]
 fn cloudflared_release_asset() -> AppResult<&'static str> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
@@ -96,13 +115,13 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
 }
 
 /// Latest cloudflared release. Pinned for reproducibility; bump as needed.
-#[cfg(feature = "desktop")]
+#[cfg(any(feature = "desktop", feature = "cli"))]
 const CLOUDFLARED_VERSION: &str = "2025.6.1";
 
 /// Download cloudflared into the app cache `bin/` directory, honoring the
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
 /// assets are `.tgz` archives that need extraction.
-#[cfg(feature = "desktop")]
+#[cfg(any(feature = "desktop", feature = "cli"))]
 pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     let settings = crate::settings::AppSettings::load()?;
     let asset = cloudflared_release_asset()?;
@@ -141,7 +160,7 @@ pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     }
 }
 
-#[cfg(all(feature = "desktop", target_os = "macos"))]
+#[cfg(all(any(feature = "desktop", feature = "cli"), target_os = "macos"))]
 fn extract_cloudflared_from_tar_gz(bytes: &[u8], dest: &Path) -> AppResult<()> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
@@ -167,7 +186,7 @@ fn extract_cloudflared_from_tar_gz(bytes: &[u8], dest: &Path) -> AppResult<()> {
     ))
 }
 
-#[cfg(all(feature = "desktop", not(target_os = "macos")))]
+#[cfg(all(any(feature = "desktop", feature = "cli"), not(target_os = "macos")))]
 fn extract_cloudflared_from_tar_gz(_bytes: &[u8], _dest: &Path) -> AppResult<()> {
     Err(AppError::Message(
         "当前平台的 cloudflared 无需解压。".into(),
@@ -232,7 +251,7 @@ pub async fn spawn_cloudflare_tunnel(
     named_public_url: &str,
     use_proxy: bool,
 ) -> AppResult<CloudflareTunnelHandle> {
-    let cloudflared = resolve_cloudflared()?;
+    let cloudflared = ensure_cloudflared().await?;
     let quick = cloudflare_mode != "named";
 
     if !quick {

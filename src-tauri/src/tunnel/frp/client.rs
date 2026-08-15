@@ -157,16 +157,16 @@ fn stale_lock(path: &Path) -> bool {
 
 pub fn resolve_frpc() -> AppResult<PathBuf> {
     bundled_frpc()
+        .or_else(|| cached_frpc_path().filter(|path| path.is_file()))
         .or_else(|| {
             platform()
                 .frpc_candidates()
                 .into_iter()
                 .find(|path| path.is_file())
         })
-        .or_else(|| cached_frpc_path().filter(|path| path.is_file()))
         .ok_or_else(|| {
             AppError::Message(
-                "未找到 frpc。连接隧道时将尝试自动下载；也可自行安装 frp 客户端。".into(),
+                "未找到 frpc。连接隧道时将尝试自动下载；也可执行 `anchor software install frpc` 预先安装。".into(),
             )
         })
 }

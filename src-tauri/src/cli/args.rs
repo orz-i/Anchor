@@ -438,6 +438,44 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoftwareCommand {
+    List,
+    Install { kind: String },
+    Uninstall { kind: String },
+}
+
+fn parse_software_kind(args: &mut VecDeque<String>, command: &str) -> Result<String, String> {
+    let kind = pop_value(args, command)?;
+    if !matches!(kind.as_str(), "frpc" | "cloudflared") {
+        return Err(format!(
+            "{command} 仅支持 frpc 或 cloudflared，收到：{kind}"
+        ));
+    }
+    ensure_empty(args, command)?;
+    Ok(kind)
+}
+
+fn parse_software_command(args: &mut VecDeque<String>) -> Result<SoftwareCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("list" | "status") => {
+            ensure_empty(args, "software list")?;
+            Ok(SoftwareCommand::List)
+        }
+        Some("install") => Ok(SoftwareCommand::Install {
+            kind: parse_software_kind(args, "software install")?,
+        }),
+        Some("uninstall" | "remove") => Ok(SoftwareCommand::Uninstall {
+            kind: parse_software_kind(args, "software uninstall")?,
+        }),
+        Some(other) => Err(format!(
+            "未知 software 命令：{other}\n\n{}",
+            software_usage()
+        )),
+        None => Err(software_usage().to_string()),
+    }
+}
+
 fn parse_config_assignment(raw: String) -> Result<ConfigAssignment, String> {
     let Some((path, value)) = raw.split_once('=') else {
         return Err("--set 必须使用 PATH=VALUE 格式".into());
@@ -1240,6 +1278,7 @@ pub enum Command {
     Config(ConfigCommand),
     Frp(FrpCommand),
     Tunnel(TunnelCommand),
+    Software(SoftwareCommand),
     Workspace(WorkspaceCommand),
     Plugin(PluginCommand),
     Gateway(GatewayCommand),
@@ -1313,6 +1352,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("config" | "cfg") => Command::Config(parse_config_command(&mut args)?),
         Some("frp") => Command::Frp(parse_frp_command(&mut args)?),
         Some("tunnel") => Command::Tunnel(parse_tunnel_command(&mut args)?),
+        Some("software" | "sw") => Command::Software(parse_software_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
         Some("plugin") => Command::Plugin(parse_plugin_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
@@ -1384,6 +1424,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] config <get|diff|set|apply> ...\n\n\
   anchor [--config-dir PATH] [--json] frp <list|show|add|update|delete> ...\n\n\
   anchor [--config-dir PATH] [--json] tunnel <show|configure> ...\n\n\
+  anchor [--config-dir PATH] [--json] software <list|install|uninstall> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
@@ -1412,6 +1453,14 @@ pub fn tunnel_usage() -> &'static str {
       [--proxy-type http|https2http] [--cert PATH|--clear-cert] [--key PATH|--clear-key]\n\
       [--cloudflare-mode quick|named] [--use-proxy|--no-proxy] [--apply] [--wait SECONDS]\n\n\
 configure 复用 config pending/apply 事务模型；FRP 参数会自动切换为 frp 类型。使用 --apply 时会在落盘后协调正在运行的 Workspace daemon/Gateway，并在失败时回滚。"
+}
+
+pub fn software_usage() -> &'static str {
+    "Tunnel Software 命令：\n\
+  anchor software list\n\
+  anchor software install <frpc|cloudflared>\n\
+  anchor software uninstall <frpc|cloudflared>\n\n\
+install 会把指定二进制下载到 Anchor 管理的缓存目录，并复用 download.github_mirror / download.proxy_mode 配置。uninstall 只删除 Anchor 自己缓存的副本，不会删除 PATH、apt、brew、winget 等系统安装。"
 }
 
 pub fn plugin_usage() -> &'static str {
@@ -1465,6 +1514,36 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_tunnel_software_management_commands() {
+        assert_eq!(
+            parse(strings(&["software", "list"]))
+                .expect("software list")
+                .command,
+            Command::Software(SoftwareCommand::List)
+        );
+        assert_eq!(
+            parse(strings(&["software", "install", "frpc"]))
+                .expect("software install")
+                .command,
+            Command::Software(SoftwareCommand::Install {
+                kind: "frpc".into()
+            })
+        );
+        assert_eq!(
+            parse(strings(&["sw", "remove", "cloudflared"]))
+                .expect("software remove")
+                .command,
+            Command::Software(SoftwareCommand::Uninstall {
+                kind: "cloudflared".into()
+            })
+        );
+
+        let error =
+            parse(strings(&["software", "install", "other"])).expect_err("unknown software kind");
+        assert!(error.contains("frpc 或 cloudflared"));
     }
 
     #[test]

@@ -722,8 +722,6 @@ fn validate_tunnel_requirements(
         return Err(AppError::Message("当前仅支持 FRP 和 Cloudflare。".into()));
     }
 
-    cloudflare::resolve_cloudflared()?;
-
     let (mode, token, named_url) = match kind {
         TunnelServiceKind::Mcp => (
             profile.tunnel.cloudflare_mode.as_str(),
@@ -825,6 +823,20 @@ mod tests {
         profile.tunnel.frp_server_port = 7000;
         profile.tunnel.frp_subdomain = subdomain.into();
         profile
+    }
+
+    #[test]
+    fn cloudflare_quick_validation_does_not_require_preinstalled_binary() {
+        let settings = AppSettings::default();
+        let mut profile = WorkspaceProfile::new(
+            "C:/workspace/cloudflare-quick".into(),
+            Some("cloudflare-quick".into()),
+        );
+        profile.tunnel.tunnel_type = "cloudflare".into();
+        profile.tunnel.cloudflare_mode = "quick".into();
+
+        validate_tunnel_requirements(&profile, TunnelServiceKind::Mcp, &settings)
+            .expect("quick tunnel validation should defer binary resolution to async spawn");
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub(crate) use client::{
     acquire_frpc_operation_lock, clear_managed_frpc_pid, managed_frpc_config_matches,
     stop_recorded_frpc_instance,
 };
-#[cfg(feature = "desktop")]
+#[cfg(any(feature = "desktop", feature = "cli"))]
 pub(crate) use client::{cached_frpc_path, download_frpc_to_cache};
 pub use client::{resolve_frpc, spawn_frpc};
 

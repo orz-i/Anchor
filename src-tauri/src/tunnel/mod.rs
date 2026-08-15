@@ -2,7 +2,7 @@ mod access;
 mod cloudflare;
 mod download;
 mod frp;
-#[cfg(feature = "desktop")]
+#[cfg(any(feature = "desktop", feature = "cli"))]
 mod software;
 mod supervisor;
 
@@ -23,6 +23,8 @@ pub use cloudflare::resolve_cloudflared;
 pub use frp::resolve_frpc;
 #[cfg(feature = "cli")]
 pub(crate) use frp::validate_workspace_frp_config;
+#[cfg(all(feature = "cli", not(feature = "desktop")))]
+pub(crate) use software::{install_software, list_software, uninstall_software};
 #[cfg(feature = "desktop")]
 pub use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 pub use supervisor::{

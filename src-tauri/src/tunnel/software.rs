@@ -75,10 +75,16 @@ pub fn list_software() -> Vec<SoftwareStatus> {
 pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
     match kind {
         "frpc" => {
+            if cached_frpc_path().is_some_and(|path| path.is_file()) {
+                return Ok(frpc_status());
+            }
             download_frpc_to_cache().await?;
             Ok(frpc_status())
         }
         "cloudflared" => {
+            if cached_cloudflared_path().is_some_and(|path| path.is_file()) {
+                return Ok(cloudflared_status());
+            }
             download_cloudflared_to_cache().await?;
             Ok(cloudflared_status())
         }
@@ -119,4 +125,17 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
         "frpc" => frpc_status(),
         _ => cloudflared_status(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn software_catalog_contains_both_supported_tunnel_binaries() {
+        let statuses = list_software();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().any(|status| status.kind == "frpc"));
+        assert!(statuses.iter().any(|status| status.kind == "cloudflared"));
+    }
 }

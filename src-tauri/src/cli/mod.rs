@@ -2,6 +2,7 @@ mod args;
 mod config;
 mod frp;
 mod plugin;
+mod software;
 mod tunnel;
 mod workspace;
 
@@ -2464,6 +2465,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Config(command) => config::execute(command, cli.json).await,
         Command::Frp(command) => frp::execute(command, cli.json).await,
         Command::Tunnel(command) => tunnel::execute(command, cli.json).await,
+        Command::Software(command) => software::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
