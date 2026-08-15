@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::harness::Harness;
 use crate::tools::catalog::EffectiveCatalog;
@@ -9,6 +9,75 @@ use crate::tools::command_session::CommandSessionStore;
 use crate::tools::policy::PolicySettings;
 use crate::tools::workspace::{relative_display, Workspace};
 use crate::workspace::AuthConfig;
+
+struct WorkspaceMutationLocks {
+    held_domains: Mutex<HashSet<PathBuf>>,
+    changed: Condvar,
+}
+
+impl Default for WorkspaceMutationLocks {
+    fn default() -> Self {
+        Self {
+            held_domains: Mutex::new(HashSet::new()),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+impl WorkspaceMutationLocks {
+    fn acquire(self: &Arc<Self>, domain: PathBuf) -> WorkspaceMutationGuard {
+        let mut held_domains = self
+            .held_domains
+            .lock()
+            .expect("workspace mutation domains lock");
+        while held_domains.contains(&domain) {
+            held_domains = self
+                .changed
+                .wait(held_domains)
+                .expect("workspace mutation domains wait");
+        }
+        held_domains.insert(domain.clone());
+        drop(held_domains);
+        WorkspaceMutationGuard {
+            locks: Arc::clone(self),
+            domain,
+        }
+    }
+
+    #[cfg(test)]
+    fn try_acquire(self: &Arc<Self>, domain: PathBuf) -> Option<WorkspaceMutationGuard> {
+        let mut held_domains = self
+            .held_domains
+            .lock()
+            .expect("workspace mutation domains lock");
+        if !held_domains.insert(domain.clone()) {
+            return None;
+        }
+        drop(held_domains);
+        Some(WorkspaceMutationGuard {
+            locks: Arc::clone(self),
+            domain,
+        })
+    }
+}
+
+pub(crate) struct WorkspaceMutationGuard {
+    locks: Arc<WorkspaceMutationLocks>,
+    domain: PathBuf,
+}
+
+impl Drop for WorkspaceMutationGuard {
+    fn drop(&mut self) {
+        let mut held_domains = self
+            .locks
+            .held_domains
+            .lock()
+            .expect("workspace mutation domains lock");
+        held_domains.remove(&self.domain);
+        drop(held_domains);
+        self.locks.changed.notify_all();
+    }
+}
 
 pub struct ToolContext {
     pub workspace: Workspace,
@@ -21,13 +90,14 @@ pub struct ToolContext {
     pub skills: crate::skills::SkillCatalog,
     pub(crate) ui_widget_domain: Option<String>,
     primary_workspace_root: PathBuf,
+    scoped_task_id: Option<String>,
     default_cwd: Arc<Mutex<PathBuf>>,
     session_default_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
+    task_default_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     session_task_ids: Arc<Mutex<HashMap<String, String>>>,
-    unbound_task_sessions: Arc<Mutex<HashSet<String>>>,
     session_cursor_scopes: Arc<Mutex<HashMap<String, String>>>,
     command_output_cursors: Arc<Mutex<HashMap<String, (usize, usize)>>>,
-    workspace_mutation_lock: Arc<Mutex<()>>,
+    workspace_mutation_locks: Arc<WorkspaceMutationLocks>,
     pub sessions: Arc<CommandSessionStore>,
     pub command_cost: Arc<CommandCostGuard>,
     published_catalog: Arc<Mutex<Option<EffectiveCatalog>>>,
@@ -78,26 +148,22 @@ impl ToolContext {
             skills: crate::skills::SkillCatalog::new(root.clone()),
             ui_widget_domain: self.ui_widget_domain.clone(),
             primary_workspace_root: self.primary_workspace_root.clone(),
+            scoped_task_id: Some(task.id.clone()),
             default_cwd: Arc::new(Mutex::new(root.clone())),
             session_default_cwds: self.session_default_cwds.clone(),
+            task_default_cwds: self.task_default_cwds.clone(),
             session_task_ids: self.session_task_ids.clone(),
-            unbound_task_sessions: self.unbound_task_sessions.clone(),
             session_cursor_scopes: self.session_cursor_scopes.clone(),
             command_output_cursors: self.command_output_cursors.clone(),
-            workspace_mutation_lock: self.workspace_mutation_lock.clone(),
+            workspace_mutation_locks: self.workspace_mutation_locks.clone(),
             sessions: self.sessions.clone(),
             command_cost: self.command_cost.clone(),
             published_catalog: self.published_catalog.clone(),
         };
         if let Some(session_id) = session_id {
-            let current = scoped
-                .session_default_cwds
-                .lock()
-                .expect("session cwd lock")
-                .get(session_id)
-                .cloned();
-            if current.as_ref().is_none_or(|path| !path.starts_with(&root)) {
-                scoped.set_default_cwd_for(Some(session_id), root);
+            let current = scoped.default_cwd_path_for(Some(session_id));
+            if !current.starts_with(&root) || !current.is_dir() {
+                scoped.set_default_cwd_for(Some(session_id), root.clone());
             }
         }
         Ok(Some(scoped))
@@ -159,13 +225,14 @@ impl ToolContext {
             skills: crate::skills::SkillCatalog::new(root.clone()),
             ui_widget_domain: None,
             primary_workspace_root: root.clone(),
+            scoped_task_id: None,
             default_cwd: Arc::new(Mutex::new(root)),
             session_default_cwds: Arc::new(Mutex::new(HashMap::new())),
+            task_default_cwds: Arc::new(Mutex::new(HashMap::new())),
             session_task_ids: Arc::new(Mutex::new(HashMap::new())),
-            unbound_task_sessions: Arc::new(Mutex::new(HashSet::new())),
             session_cursor_scopes: Arc::new(Mutex::new(HashMap::new())),
             command_output_cursors: Arc::new(Mutex::new(HashMap::new())),
-            workspace_mutation_lock: Arc::new(Mutex::new(())),
+            workspace_mutation_locks: Arc::new(WorkspaceMutationLocks::default()),
             sessions: Arc::new(CommandSessionStore::new()),
             command_cost: Arc::new(command_cost),
             published_catalog: Arc::new(Mutex::new(None)),
@@ -223,6 +290,17 @@ impl ToolContext {
 
     pub fn default_cwd_path_for(&self, session_id: Option<&str>) -> PathBuf {
         if let Some(session_id) = session_id {
+            if let Some(task_id) = self.task_scope_id_for_session(session_id) {
+                if let Some(path) = self
+                    .task_default_cwds
+                    .lock()
+                    .expect("task cwd lock")
+                    .get(&task_id)
+                    .cloned()
+                {
+                    return path;
+                }
+            }
             return self
                 .session_default_cwds
                 .lock()
@@ -236,6 +314,13 @@ impl ToolContext {
 
     pub fn set_default_cwd_for(&self, session_id: Option<&str>, path: PathBuf) {
         if let Some(session_id) = session_id {
+            if let Some(task_id) = self.task_scope_id_for_session(session_id) {
+                self.task_default_cwds
+                    .lock()
+                    .expect("task cwd lock")
+                    .insert(task_id, path);
+                return;
+            }
             self.session_default_cwds
                 .lock()
                 .expect("session cwd lock")
@@ -243,6 +328,27 @@ impl ToolContext {
         } else {
             *self.default_cwd.lock().expect("cwd lock") = path;
         }
+    }
+
+    fn task_scope_id_for_session(&self, session_id: &str) -> Option<String> {
+        self.scoped_task_id.clone().or_else(|| {
+            let scope_key = self.task_binding_scope_key_for_session(session_id);
+            let bindings = self.session_task_ids.lock().expect("session task lock");
+            scope_key
+                .as_ref()
+                .and_then(|key| bindings.get(key))
+                .cloned()
+                .or_else(|| bindings.get(session_id).cloned())
+        })
+    }
+
+    fn task_binding_scope_key_for_session(&self, session_id: &str) -> Option<String> {
+        self.session_cursor_scopes
+            .lock()
+            .expect("session cursor scope lock")
+            .get(session_id)
+            .filter(|scope| scope.starts_with("host-session:"))
+            .map(|scope| format!("scope:{scope}"))
     }
 
     pub fn clear_session_state(&self, session_id: &str) {
@@ -253,10 +359,6 @@ impl ToolContext {
         self.session_task_ids
             .lock()
             .expect("session task lock")
-            .remove(session_id);
-        self.unbound_task_sessions
-            .lock()
-            .expect("unbound task session lock")
             .remove(session_id);
         self.session_cursor_scopes
             .lock()
@@ -302,20 +404,25 @@ impl ToolContext {
             return Err(format!("Task {task_id} is not writable"));
         }
         if let Some(session_id) = session_id {
-            self.session_task_ids
-                .lock()
-                .expect("session task lock")
-                .insert(session_id.to_string(), task_id.to_string());
-            self.unbound_task_sessions
-                .lock()
-                .expect("unbound task session lock")
-                .remove(session_id);
             let execution_root = task
                 .git_worktree
                 .as_ref()
                 .map(|worktree| PathBuf::from(&worktree.path))
                 .unwrap_or_else(|| self.primary_workspace_root.clone());
-            self.set_default_cwd_for(Some(session_id), execution_root);
+            let scope_key = self.task_binding_scope_key_for_session(session_id);
+            let mut bindings = self.session_task_ids.lock().expect("session task lock");
+            bindings.insert(session_id.to_string(), task_id.to_string());
+            if let Some(scope_key) = scope_key {
+                bindings.insert(scope_key, task_id.to_string());
+            }
+            drop(bindings);
+            let mut task_cwds = self.task_default_cwds.lock().expect("task cwd lock");
+            let reset = task_cwds
+                .get(&task.id)
+                .is_none_or(|path| !path.starts_with(&execution_root) || !path.is_dir());
+            if reset {
+                task_cwds.insert(task.id.clone(), execution_root);
+            }
         }
         Ok(task)
     }
@@ -328,17 +435,13 @@ impl ToolContext {
             if let Some(task) = self.bound_task_for_session(Some(session_id)) {
                 return Some(task);
             }
-            if self
-                .unbound_task_sessions
-                .lock()
-                .expect("unbound task session lock")
-                .contains(session_id)
-            {
-                return None;
-            }
+            // Real MCP transports are fail-closed: an unbound caller must not inherit
+            // the workspace's presentation-level current/default Task. Reconnects must
+            // re-establish the explicit Session -> Task binding through begin_work_session
+            // or switch_task/resume_task.
+            return None;
         }
-        let task = self
-            .harness
+        self.harness
             .current_task()
             .ok()
             .flatten()
@@ -358,11 +461,7 @@ impl ToolContext {
                 (writable_tasks.len() == 1)
                     .then(|| writable_tasks.into_iter().next())
                     .flatten()
-            });
-        if let (Some(session_id), Some(task)) = (session_id, task.as_ref()) {
-            let _ = self.bind_task_for_session(Some(session_id), &task.id);
-        }
-        task
+            })
     }
 
     pub fn bound_task_for_session(
@@ -370,32 +469,44 @@ impl ToolContext {
         session_id: Option<&str>,
     ) -> Option<crate::harness::model::TaskSession> {
         let session_id = session_id?;
-        let task_id = self
-            .session_task_ids
-            .lock()
-            .expect("session task lock")
-            .get(session_id)
-            .cloned()?;
+        let scope_key = self.task_binding_scope_key_for_session(session_id);
+        let task_id = {
+            let bindings = self.session_task_ids.lock().expect("session task lock");
+            scope_key
+                .as_ref()
+                .and_then(|key| bindings.get(key))
+                .cloned()
+                .or_else(|| bindings.get(session_id).cloned())?
+        };
         if let Ok(task) = self.harness.task(&task_id) {
             if task.status.is_writable() {
+                self.session_task_ids
+                    .lock()
+                    .expect("session task lock")
+                    .insert(session_id.to_string(), task_id.clone());
                 return Some(task);
             }
         }
-        self.session_task_ids
-            .lock()
-            .expect("session task lock")
-            .remove(session_id);
-        self.unbound_task_sessions
-            .lock()
-            .expect("unbound task session lock")
-            .insert(session_id.to_string());
+        let mut bindings = self.session_task_ids.lock().expect("session task lock");
+        bindings.remove(session_id);
+        if let Some(scope_key) = scope_key {
+            if bindings
+                .get(&scope_key)
+                .is_some_and(|bound| bound == &task_id)
+            {
+                bindings.remove(&scope_key);
+            }
+        }
         None
     }
 
-    pub fn workspace_mutation_guard(&self) -> MutexGuard<'_, ()> {
-        self.workspace_mutation_lock
-            .lock()
-            .expect("workspace mutation lock")
+    pub(crate) fn workspace_mutation_guard(&self) -> WorkspaceMutationGuard {
+        let domain = self
+            .workspace
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace.root().to_path_buf());
+        self.workspace_mutation_locks.acquire(domain)
     }
 
     pub fn apply_command_output_cursor(
@@ -534,6 +645,109 @@ mod tests {
     };
     use crate::tools::catalog::build_effective_catalog_from_parts;
     use serde_json::json;
+
+    #[test]
+    fn unbound_transport_does_not_adopt_workspace_default_task() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        let task = ctx.harness.start_task("workspace default").expect("task");
+
+        assert_eq!(
+            ctx.task_for_session(None).map(|task| task.id),
+            Some(task.id)
+        );
+        assert!(ctx.task_for_session(Some("fresh-transport")).is_none());
+    }
+
+    #[test]
+    fn host_session_scope_recovers_task_across_transport_churn() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        let task = ctx.harness.start_task("host scoped task").expect("task");
+
+        ctx.bind_cursor_scope_for_session("transport-a", Some("host-session:conversation-a"));
+        ctx.bind_task_for_session(Some("transport-a"), &task.id)
+            .expect("bind first transport");
+        ctx.clear_session_state("transport-a");
+
+        ctx.bind_cursor_scope_for_session("transport-b", Some("host-session:conversation-a"));
+        assert_eq!(
+            ctx.task_for_session(Some("transport-b"))
+                .map(|task| task.id),
+            Some(task.id.clone())
+        );
+
+        ctx.bind_cursor_scope_for_session("transport-c", Some("oauth-principal:same-user"));
+        assert!(ctx.task_for_session(Some("transport-c")).is_none());
+    }
+
+    #[test]
+    fn task_scoped_cwd_is_restored_when_a_transport_switches_back() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        std::fs::create_dir_all(workspace.path().join("task-a-dir")).expect("task a dir");
+        std::fs::create_dir_all(workspace.path().join("task-b-dir")).expect("task b dir");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        let task_a = ctx.harness.start_task("task a").expect("task a");
+        let task_b = ctx.harness.start_task("task b").expect("task b");
+        let transport = "shared-transport";
+
+        ctx.bind_task_for_session(Some(transport), &task_a.id)
+            .expect("bind task a");
+        let cwd_a = workspace
+            .path()
+            .join("task-a-dir")
+            .canonicalize()
+            .expect("cwd a");
+        ctx.set_default_cwd_for(Some(transport), cwd_a.clone());
+
+        ctx.bind_task_for_session(Some(transport), &task_b.id)
+            .expect("bind task b");
+        let cwd_b = workspace
+            .path()
+            .join("task-b-dir")
+            .canonicalize()
+            .expect("cwd b");
+        ctx.set_default_cwd_for(Some(transport), cwd_b.clone());
+        assert_eq!(ctx.default_cwd_path_for(Some(transport)), cwd_b);
+
+        ctx.bind_task_for_session(Some(transport), &task_a.id)
+            .expect("rebind task a");
+        assert_eq!(ctx.default_cwd_path_for(Some(transport)), cwd_a);
+    }
+
+    #[test]
+    fn mutation_locks_are_partitioned_by_write_domain() {
+        let locks = Arc::new(WorkspaceMutationLocks::default());
+        let domain_a = PathBuf::from("domain-a");
+        let domain_b = PathBuf::from("domain-b");
+
+        let guard_a = locks
+            .try_acquire(domain_a.clone())
+            .expect("first domain a lock");
+        let guard_b = locks
+            .try_acquire(domain_b)
+            .expect("different domain must not block");
+        assert!(locks.try_acquire(domain_a.clone()).is_none());
+
+        drop(guard_b);
+        drop(guard_a);
+        assert!(locks.try_acquire(domain_a).is_some());
+    }
 
     #[test]
     fn tool_context_construction_does_not_recover_close_outboxes() {

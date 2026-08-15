@@ -1260,7 +1260,7 @@ fn shared_tasks_remain_active_and_serialize_workspace_writes() {
 }
 
 #[test]
-fn unique_active_writer_is_rebound_but_ambiguous_paused_tasks_fail_closed() {
+fn unbound_transport_never_adopts_workspace_default_task() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -1274,26 +1274,39 @@ fn unique_active_writer_is_rebound_but_ambiguous_paused_tasks_fail_closed() {
         &json!({"objective": "绑定任务 A"}),
         "binding-session-a",
     );
+    assert_eq!(first["ok"], true);
+    let unique_rejected = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: unique-forbidden.txt\n+forbidden\n*** End Patch\n"
+        }),
+        "unbound-unique-session",
+    );
+    assert_eq!(unique_rejected["ok"], false, "{unique_rejected}");
+    assert_eq!(unique_rejected["error"]["code"], "TASK_BINDING_REQUIRED");
+    assert!(!workspace.join("unique-forbidden.txt").exists());
+
     let second = call_tool_for_session(
         &ctx,
         "start_task",
         &json!({"objective": "绑定任务 B"}),
         "binding-session-b",
     );
-    assert_eq!(first["ok"], true);
     assert_eq!(second["ok"], true);
     assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
 
-    let rebound = call_tool_for_session(
+    let ambiguous_rejected = call_tool_for_session(
         &ctx,
         "apply_patch",
         &json!({
-            "patch": "*** Begin Patch\n*** Add File: rebound.txt\n+rebound\n*** End Patch\n"
+            "patch": "*** Begin Patch\n*** Add File: ambiguous-forbidden.txt\n+forbidden\n*** End Patch\n"
         }),
         "unbound-third-session",
     );
-    assert_eq!(rebound["ok"], true, "{rebound}");
-    assert!(workspace.join("rebound.txt").exists());
+    assert_eq!(ambiguous_rejected["ok"], false, "{ambiguous_rejected}");
+    assert_eq!(ambiguous_rejected["error"]["code"], "TASK_BINDING_REQUIRED");
+    assert!(!workspace.join("ambiguous-forbidden.txt").exists());
 
     let paused_second = call_tool_for_session(
         &ctx,
@@ -1320,6 +1333,161 @@ fn unique_active_writer_is_rebound_but_ambiguous_paused_tasks_fail_closed() {
     assert_eq!(rejected["ok"], false, "{rejected}");
     assert_eq!(rejected["error"]["code"], "TASK_BINDING_REQUIRED");
     assert!(!workspace.join("forbidden.txt").exists());
+}
+
+#[test]
+fn one_transport_restores_each_tasks_last_cwd_when_switching() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(workspace.join("task-a-dir")).expect("task a dir");
+    fs::create_dir_all(workspace.join("task-b-dir")).expect("task b dir");
+    fs::write(workspace.join("README.md"), "task cwd\n").expect("写入文件");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let transport = "task-cwd-switch-session";
+
+    let first = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "cwd task A"}),
+        transport,
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    let first_id = first["task"]["id"].as_str().expect("first id").to_string();
+    let set_a = call_tool_for_session(
+        &ctx,
+        "set_default_cwd",
+        &json!({"path": "task-a-dir"}),
+        transport,
+    );
+    assert_eq!(set_a["ok"], true, "{set_a}");
+    assert_eq!(set_a["default_cwd"], "task-a-dir");
+
+    let second = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "cwd task B"}),
+        transport,
+    );
+    assert_eq!(second["ok"], true, "{second}");
+    let second_id = second["task"]["id"]
+        .as_str()
+        .expect("second id")
+        .to_string();
+    let set_b = call_tool_for_session(
+        &ctx,
+        "set_default_cwd",
+        &json!({"path": "task-b-dir"}),
+        transport,
+    );
+    assert_eq!(set_b["ok"], true, "{set_b}");
+    assert_eq!(set_b["default_cwd"], "task-b-dir");
+
+    let back_to_a = call_tool_for_session(
+        &ctx,
+        "switch_task",
+        &json!({"task_id": first_id}),
+        transport,
+    );
+    assert_eq!(back_to_a["ok"], true, "{back_to_a}");
+    let cwd_a = call_tool_for_session(&ctx, "get_default_cwd", &json!({}), transport);
+    assert_eq!(cwd_a["ok"], true, "{cwd_a}");
+    assert_eq!(cwd_a["default_cwd"], "task-a-dir");
+
+    let back_to_b = call_tool_for_session(
+        &ctx,
+        "switch_task",
+        &json!({"task_id": second_id}),
+        transport,
+    );
+    assert_eq!(back_to_b["ok"], true, "{back_to_b}");
+    let cwd_b = call_tool_for_session(&ctx, "get_default_cwd", &json!({}), transport);
+    assert_eq!(cwd_b["ok"], true, "{cwd_b}");
+    assert_eq!(cwd_b["default_cwd"], "task-b-dir");
+}
+
+#[test]
+fn one_transport_restores_cwd_across_two_real_worktrees() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(workspace.join("task-subdir")).expect("task subdir");
+    fs::write(workspace.join("README.md"), "worktree cwd\n").expect("README");
+    fs::write(workspace.join("task-subdir/marker.txt"), "tracked\n").expect("marker");
+    fs::write(workspace.join(".gitignore"), "/.anchor/worktrees/\n").expect("ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let transport = "real-worktree-cwd-switch";
+
+    let first = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "real worktree A", "workspace_mode": "worktree"}),
+        transport,
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    let first_id = first["task"]["id"].as_str().expect("first id").to_string();
+    let first_root = std::path::PathBuf::from(
+        first["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("first root"),
+    );
+    let first_cwd = call_tool_for_session(
+        &ctx,
+        "set_default_cwd",
+        &json!({"path": "task-subdir"}),
+        transport,
+    );
+    assert_eq!(first_cwd["ok"], true, "{first_cwd}");
+    let first_resolved = std::path::PathBuf::from(
+        first_cwd["resolved_cwd"]
+            .as_str()
+            .expect("first resolved cwd"),
+    );
+    assert!(first_resolved.starts_with(&first_root));
+
+    let second = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({"objective": "real worktree B", "workspace_mode": "worktree"}),
+        transport,
+    );
+    assert_eq!(second["ok"], true, "{second}");
+    let second_root = std::path::PathBuf::from(
+        second["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("second root"),
+    );
+    let second_cwd = call_tool_for_session(
+        &ctx,
+        "set_default_cwd",
+        &json!({"path": "task-subdir"}),
+        transport,
+    );
+    assert_eq!(second_cwd["ok"], true, "{second_cwd}");
+    let second_resolved = std::path::PathBuf::from(
+        second_cwd["resolved_cwd"]
+            .as_str()
+            .expect("second resolved cwd"),
+    );
+    assert!(second_resolved.starts_with(&second_root));
+    assert_ne!(first_resolved, second_resolved);
+
+    let back_to_a = call_tool_for_session(
+        &ctx,
+        "switch_task",
+        &json!({"task_id": first_id}),
+        transport,
+    );
+    assert_eq!(back_to_a["ok"], true, "{back_to_a}");
+    let restored = call_tool_for_session(&ctx, "get_default_cwd", &json!({}), transport);
+    assert_eq!(restored["ok"], true, "{restored}");
+    let restored = std::path::PathBuf::from(
+        restored["resolved_cwd"]
+            .as_str()
+            .expect("restored resolved cwd"),
+    );
+    assert_eq!(restored, first_resolved);
 }
 
 #[test]
@@ -1630,6 +1798,16 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     assert_eq!(patched["ok"], true, "{patched}");
     assert!(worktree_path.join("isolated.txt").exists());
     assert!(!workspace.join("isolated.txt").exists());
+
+    let unbound_read = call_tool_for_session(
+        &ctx,
+        "read_file",
+        &json!({"path": "isolated.txt"}),
+        "fresh-unbound-worktree-reader",
+    );
+    assert_eq!(unbound_read["ok"], false, "{unbound_read}");
+    assert_eq!(unbound_read["error"]["code"], "NOT_FOUND");
+
     assert_eq!(
         ctx.harness
             .task(shared_task_id)
@@ -1774,7 +1952,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
 }
 
 #[test]
-fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_on_finish() {
+fn unbound_transports_stay_primary_until_explicitly_bound_and_cleanup_on_finish() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
@@ -1813,10 +1991,6 @@ fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_o
             .as_str()
             .expect("worktree path"),
     );
-    let worktree_branch = isolated["task"]["expected_state"]["branch"]
-        .as_str()
-        .expect("worktree branch");
-
     let cwd = call_tool_for_session(
         &ctx,
         "get_default_cwd",
@@ -1829,7 +2003,9 @@ fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_o
         std::path::PathBuf::from(cwd["resolved_cwd"].as_str().expect("resolved cwd"))
             .canonicalize()
             .expect("canonical cwd"),
-        worktree_path.canonicalize().expect("canonical worktree")
+        workspace
+            .canonicalize()
+            .expect("canonical primary workspace")
     );
 
     let status = call_tool_for_session(
@@ -1839,7 +2015,20 @@ fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_o
         "stateless-status-after-start",
     );
     assert_eq!(status["ok"], true, "{status}");
-    assert_eq!(status["branch"], worktree_branch);
+    assert_eq!(status["branch"], shared_branch);
+
+    let unbound_patch = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: stateless-route.txt\n+worktree\n*** End Patch\n"
+        }),
+        "stateless-patch-after-start",
+    );
+    assert_eq!(unbound_patch["ok"], false, "{unbound_patch}");
+    assert_eq!(unbound_patch["error"]["code"], "TASK_BINDING_REQUIRED");
+    assert!(!worktree_path.join("stateless-route.txt").exists());
+    assert!(!workspace.join("stateless-route.txt").exists());
 
     let patched = call_tool_for_session(
         &ctx,
@@ -1847,7 +2036,7 @@ fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_o
         &json!({
             "patch": "*** Begin Patch\n*** Add File: stateless-route.txt\n+worktree\n*** End Patch\n"
         }),
-        "stateless-patch-after-start",
+        "stateless-start-worktree",
     );
     assert_eq!(patched["ok"], true, "{patched}");
     assert!(worktree_path.join("stateless-route.txt").exists());
@@ -1857,7 +2046,7 @@ fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_o
         &ctx,
         "remove_path",
         &json!({"path": "stateless-route.txt"}),
-        "stateless-remove-after-start",
+        "stateless-start-worktree",
     );
     assert_eq!(removed["ok"], true, "{removed}");
 
@@ -1869,7 +2058,7 @@ fn stateless_transport_sessions_follow_the_workspace_selected_task_and_cleanup_o
             "allow_unverified": true,
             "session_status": "active"
         }),
-        "stateless-finish-worktree",
+        "stateless-start-worktree",
     );
     assert_eq!(finished["ok"], true, "{finished}");
     assert_eq!(finished["worktree_cleanup"]["requested"], true);
@@ -2310,9 +2499,9 @@ fn reconnected_transport_recovers_task_by_explicit_session_not_workspace_default
         &json!({}),
         "transport-a-reconnected",
     );
-    assert_eq!(renewed_status["task_id"], second_id);
+    assert!(renewed_status["task_id"].is_null(), "{renewed_status}");
     assert_eq!(renewed_status["active_task_count"], 2);
-    assert_eq!(renewed_status["writable"], true);
+    assert_eq!(renewed_status["writable"], false);
 
     let reconnected = call_tool_for_session(
         &ctx,

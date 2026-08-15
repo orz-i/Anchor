@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::tools::dispatch::call_tool_prevalidated_with_session_cancellation;
@@ -404,6 +405,25 @@ fn initialize_result_for_version(state: &SharedState, protocol_version: &str) ->
     })
 }
 
+fn bind_host_session_scope(state: &ToolContext, params: &Value, session_id: Option<&str>) {
+    let (Some(session_id), Some(host_session_key)) = (
+        session_id,
+        params
+            .get("_meta")
+            .and_then(|meta| meta.get("openai/session"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) else {
+        return;
+    };
+    let scope = format!(
+        "host-session:{:x}",
+        Sha256::digest(host_session_key.as_bytes())
+    );
+    state.bind_cursor_scope_for_session(session_id, Some(&scope));
+}
+
 async fn handle_tools_call(
     state: &SharedState,
     params: &Value,
@@ -415,6 +435,7 @@ async fn handle_tools_call(
         .and_then(Value::as_str)
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let raw_args = raw_tool_arguments(params);
+    bind_host_session_scope(state.as_ref(), params, session_id);
 
     if state.is_published_tool(name) == Some(false) {
         return Err(serde_json::json!({
@@ -727,7 +748,9 @@ fn raw_tool_arguments(params: &Value) -> Value {
 
 fn tool_arguments(name: &str, params: &Value) -> Value {
     let mut args = raw_tool_arguments(params);
-    if matches!(name, "session" | "session_open" | "begin_work_session") {
+    let inject_host_session = matches!(name, "session_open" | "begin_work_session")
+        || (name == "session" && args.get("operation").and_then(Value::as_str) == Some("open"));
+    if inject_host_session {
         if let Some(host_session_key) = params
             .get("_meta")
             .and_then(|meta| meta.get("openai/session"))
@@ -2449,6 +2472,20 @@ mod tests {
         let existing = tool_arguments("read_file", &params);
         assert_eq!(existing["operation"], "open");
         assert!(existing.get("_host_session_key").is_none());
+
+        let checkpoint = tool_arguments(
+            "session",
+            &json!({
+                "arguments": {
+                    "operation": "checkpoint",
+                    "session_id": "ses_0123456789abcdef0123456789abcdef",
+                    "expected_path": "docs/session/ses_0123456789abcdef0123456789abcdef.md"
+                },
+                "_meta": {"openai/session": "chatgpt-conversation"}
+            }),
+        );
+        assert_eq!(checkpoint["operation"], "checkpoint");
+        assert!(checkpoint.get("_host_session_key").is_none());
     }
 
     #[tokio::test]
@@ -2477,14 +2514,108 @@ mod tests {
         assert_eq!(structured["ok"], true);
         assert_eq!(structured["operation"], "open");
         assert_eq!(structured["history_injected"], false);
-        let session_id = structured["session_id"].as_str().expect("session id");
+        let session_id = structured["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
         assert!(session_id.starts_with("ses_"));
-        let path = structured["session_path"].as_str().expect("session path");
+        let path = structured["session_path"]
+            .as_str()
+            .expect("session path")
+            .to_string();
         assert!(path.starts_with("docs/session/"));
-        let content = fs::read_to_string(workspace.path().join(path)).expect("read session file");
+        let content = fs::read_to_string(workspace.path().join(&path)).expect("read session file");
         assert!(content.contains(&format!("**Session id:** {session_id}")));
         assert!(content.contains("**Host session key:** chatgpt-session"));
         assert!(!workspace.path().join("docs/history-session").exists());
+
+        let checkpoint = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "session",
+                    "arguments": {
+                        "operation": "checkpoint",
+                        "session_id": session_id,
+                        "expected_path": path,
+                        "turn_id": "mcp-host-meta-checkpoint",
+                        "user_intent": "verify host metadata does not leak into checkpoint schema"
+                    },
+                    "_meta": {"openai/session": "chatgpt-session"}
+                }
+            }),
+        )
+        .await;
+        let checkpoint = &checkpoint["result"]["structuredContent"];
+        assert_eq!(checkpoint["ok"], true, "{checkpoint}");
+        assert_eq!(checkpoint["operation"], "checkpoint");
+        assert_eq!(checkpoint["turn_id"], "mcp-host-meta-checkpoint");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_host_session_preserves_task_binding_across_transport_churn() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        fs::write(workspace.path().join("README.md"), "host session routing\n").expect("readme");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+        let cancellation = CancellationToken::default();
+        let host_meta = json!({"openai/session": "chatgpt-shared-host"});
+
+        let begin = super::handle_request_with_protocol_session_and_cancellation(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "begin_work_session",
+                    "arguments": {"objective": "host scoped task"},
+                    "_meta": host_meta
+                }
+            }),
+            crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
+            &cancellation,
+            Some("transport-a"),
+        )
+        .await;
+        let begin = &begin["result"]["structuredContent"];
+        assert_eq!(begin["ok"], true, "{begin}");
+        let task_id = begin["task"]["id"].as_str().expect("task id").to_string();
+
+        let patched = super::handle_request_with_protocol_session_and_cancellation(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "apply_patch",
+                    "arguments": {
+                        "patch": "*** Begin Patch\n*** Add File: host-scope.txt\n+host scoped\n*** End Patch\n"
+                    },
+                    "_meta": {"openai/session": "chatgpt-shared-host"}
+                }
+            }),
+            crate::mcp::protocol::CURRENT_PROTOCOL_VERSION,
+            &cancellation,
+            Some("transport-b"),
+        )
+        .await;
+        let patched = &patched["result"]["structuredContent"];
+        assert_eq!(patched["ok"], true, "{patched}");
+        assert!(workspace.path().join("host-scope.txt").exists());
+        assert_eq!(
+            state
+                .task_for_session(Some("transport-b"))
+                .map(|task| task.id),
+            Some(task_id)
+        );
     }
 
     #[tokio::test]

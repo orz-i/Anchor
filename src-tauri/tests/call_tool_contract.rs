@@ -438,6 +438,8 @@ fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
         .expect("task");
     let first_caller = "managed-cursor-transport-a";
     let second_caller = "managed-cursor-transport-b";
+    ctx.bind_task_for_session(Some(first_caller), &task.id)
+        .expect("bind first transport");
     let started = call_tool_for_session(
         &ctx,
         "exec_command",
@@ -471,11 +473,7 @@ fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
     );
     let second = assert_ok(&second);
     assert_eq!(second["stdout"]["content"], "");
-    assert_eq!(
-        ctx.task_for_session(Some(second_caller))
-            .map(|bound| bound.id),
-        Some(task.id)
-    );
+    assert!(ctx.task_for_session(Some(second_caller)).is_none());
 }
 
 #[test]
