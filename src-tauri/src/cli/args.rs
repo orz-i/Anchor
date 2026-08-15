@@ -10,6 +10,19 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+fn set_frp_token_input(
+    target: &mut Option<FrpTokenInput>,
+    value: FrpTokenInput,
+) -> Result<(), String> {
+    if target.is_some() {
+        return Err(
+            "FRP token 输入方式只能选择一种：--token、--token-file 或 --token-stdin".into(),
+        );
+    }
+    *target = Some(value);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceCommand {
     Status,
@@ -112,6 +125,317 @@ pub enum ConfigCommand {
     Diff(ConfigMutationOptions),
     Set(ConfigMutationOptions),
     Apply(ConfigApplyOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrpTokenInput {
+    Inline(String),
+    File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrpAddOptions {
+    pub name: String,
+    pub server: String,
+    pub server_port: u16,
+    pub token: Option<FrpTokenInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrpUpdateOptions {
+    pub profile: String,
+    pub name: Option<String>,
+    pub server: Option<String>,
+    pub server_port: Option<u16>,
+    pub token: Option<FrpTokenInput>,
+    pub clear_token: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrpDeleteOptions {
+    pub profile: String,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrpCommand {
+    List,
+    Show { profile: String },
+    Add(FrpAddOptions),
+    Update(FrpUpdateOptions),
+    Delete(FrpDeleteOptions),
+}
+
+fn parse_frp_command(args: &mut VecDeque<String>) -> Result<FrpCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("list") => {
+            ensure_empty(args, "frp list")?;
+            Ok(FrpCommand::List)
+        }
+        Some("show") => {
+            let profile = pop_value(args, "frp show")?;
+            ensure_empty(args, "frp show")?;
+            Ok(FrpCommand::Show { profile })
+        }
+        Some("add") => {
+            let name = pop_value(args, "frp add")?;
+            let mut server = None;
+            let mut server_port = 7000;
+            let mut token = None;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--server" => server = Some(pop_value(args, "--server")?),
+                    "--port" => {
+                        server_port = parse_u64(args, "--port", 1, 65_535)? as u16;
+                    }
+                    "--token" => set_frp_token_input(
+                        &mut token,
+                        FrpTokenInput::Inline(pop_value(args, "--token")?),
+                    )?,
+                    "--token-file" => set_frp_token_input(
+                        &mut token,
+                        FrpTokenInput::File(PathBuf::from(pop_value(args, "--token-file")?)),
+                    )?,
+                    "--token-stdin" => {
+                        set_frp_token_input(&mut token, FrpTokenInput::Stdin)?;
+                    }
+                    other => return Err(format!("frp add 不支持参数：{other}")),
+                }
+            }
+            Ok(FrpCommand::Add(FrpAddOptions {
+                name,
+                server: server.ok_or_else(|| "frp add 缺少 --server".to_string())?,
+                server_port,
+                token,
+            }))
+        }
+        Some("update") => {
+            let profile = pop_value(args, "frp update")?;
+            let mut name = None;
+            let mut server = None;
+            let mut server_port = None;
+            let mut token = None;
+            let mut clear_token = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--name" => name = Some(pop_value(args, "--name")?),
+                    "--server" => server = Some(pop_value(args, "--server")?),
+                    "--port" => {
+                        server_port = Some(parse_u64(args, "--port", 1, 65_535)? as u16);
+                    }
+                    "--token" => set_frp_token_input(
+                        &mut token,
+                        FrpTokenInput::Inline(pop_value(args, "--token")?),
+                    )?,
+                    "--token-file" => set_frp_token_input(
+                        &mut token,
+                        FrpTokenInput::File(PathBuf::from(pop_value(args, "--token-file")?)),
+                    )?,
+                    "--token-stdin" => {
+                        set_frp_token_input(&mut token, FrpTokenInput::Stdin)?;
+                    }
+                    "--clear-token" => clear_token = true,
+                    other => return Err(format!("frp update 不支持参数：{other}")),
+                }
+            }
+            if token.is_some() && clear_token {
+                return Err("frp update 的 --token 与 --clear-token 不能同时使用".into());
+            }
+            if name.is_none()
+                && server.is_none()
+                && server_port.is_none()
+                && token.is_none()
+                && !clear_token
+            {
+                return Err("frp update 至少需要一个修改参数".into());
+            }
+            Ok(FrpCommand::Update(FrpUpdateOptions {
+                profile,
+                name,
+                server,
+                server_port,
+                token,
+                clear_token,
+            }))
+        }
+        Some("delete" | "remove") => {
+            let profile = pop_value(args, "frp delete")?;
+            let mut force = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--force" => force = true,
+                    other => return Err(format!("frp delete 不支持参数：{other}")),
+                }
+            }
+            Ok(FrpCommand::Delete(FrpDeleteOptions { profile, force }))
+        }
+        Some(other) => Err(format!("未知 frp 命令：{other}\n\n{}", frp_usage())),
+        None => Err(frp_usage().to_string()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelShowOptions {
+    pub workspace: String,
+    pub service: ServiceSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelConfigureOptions {
+    pub workspace: String,
+    pub service: ServiceSelection,
+    pub tunnel_type: Option<String>,
+    pub frp_profile: Option<String>,
+    pub clear_frp_profile: bool,
+    pub frp_server: Option<String>,
+    pub frp_server_port: Option<u16>,
+    pub frp_subdomain: Option<String>,
+    pub public_url: Option<String>,
+    pub frp_proxy_type: Option<String>,
+    pub frp_cert_path: Option<String>,
+    pub frp_key_path: Option<String>,
+    pub cloudflare_mode: Option<String>,
+    pub use_proxy: Option<bool>,
+    pub apply: bool,
+    pub wait_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelCommand {
+    Show(TunnelShowOptions),
+    Configure(Box<TunnelConfigureOptions>),
+}
+
+fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("show") => {
+            let workspace = pop_value(args, "tunnel show")?;
+            let mut service = ServiceSelection::Mcp;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--service" => {
+                        service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
+                    }
+                    other => return Err(format!("tunnel show 不支持参数：{other}")),
+                }
+            }
+            Ok(TunnelCommand::Show(TunnelShowOptions {
+                workspace,
+                service,
+            }))
+        }
+        Some("configure" | "config" | "set") => {
+            let workspace = pop_value(args, "tunnel configure")?;
+            let mut service = ServiceSelection::Mcp;
+            let mut tunnel_type = None;
+            let mut frp_profile = None;
+            let mut clear_frp_profile = false;
+            let mut frp_server = None;
+            let mut frp_server_port = None;
+            let mut frp_subdomain = None;
+            let mut public_url = None;
+            let mut frp_proxy_type = None;
+            let mut frp_cert_path = None;
+            let mut frp_key_path = None;
+            let mut cloudflare_mode = None;
+            let mut use_proxy = None;
+            let mut apply = false;
+            let mut wait_seconds = 30;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--service" => {
+                        service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
+                    }
+                    "--type" => {
+                        let value = pop_value(args, "--type")?;
+                        if !matches!(value.as_str(), "frp" | "cloudflare") {
+                            return Err("--type 仅支持 frp 或 cloudflare".into());
+                        }
+                        tunnel_type = Some(value);
+                    }
+                    "--frp-profile" => frp_profile = Some(pop_value(args, "--frp-profile")?),
+                    "--clear-frp-profile" => clear_frp_profile = true,
+                    "--frp-server" => frp_server = Some(pop_value(args, "--frp-server")?),
+                    "--frp-port" => {
+                        frp_server_port = Some(parse_u64(args, "--frp-port", 1, 65_535)? as u16);
+                    }
+                    "--subdomain" => frp_subdomain = Some(pop_value(args, "--subdomain")?),
+                    "--public-url" => public_url = Some(pop_value(args, "--public-url")?),
+                    "--clear-public-url" => public_url = Some(String::new()),
+                    "--proxy-type" => {
+                        let value = pop_value(args, "--proxy-type")?;
+                        if !matches!(value.as_str(), "http" | "https2http") {
+                            return Err("--proxy-type 仅支持 http 或 https2http".into());
+                        }
+                        frp_proxy_type = Some(value);
+                    }
+                    "--cert" => frp_cert_path = Some(pop_value(args, "--cert")?),
+                    "--clear-cert" => frp_cert_path = Some(String::new()),
+                    "--key" => frp_key_path = Some(pop_value(args, "--key")?),
+                    "--clear-key" => frp_key_path = Some(String::new()),
+                    "--cloudflare-mode" => {
+                        let value = pop_value(args, "--cloudflare-mode")?;
+                        if !matches!(value.as_str(), "quick" | "named") {
+                            return Err("--cloudflare-mode 仅支持 quick 或 named".into());
+                        }
+                        cloudflare_mode = Some(value);
+                    }
+                    "--use-proxy" => use_proxy = Some(true),
+                    "--no-proxy" => use_proxy = Some(false),
+                    "--apply" => apply = true,
+                    "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 300)?,
+                    other => return Err(format!("tunnel configure 不支持参数：{other}")),
+                }
+            }
+            if frp_profile.is_some() && clear_frp_profile {
+                return Err("--frp-profile 与 --clear-frp-profile 不能同时使用".into());
+            }
+            if frp_profile.is_some() && frp_server.is_some() {
+                return Err(
+                    "--frp-profile 与 --frp-server 不能同时使用；全局 profile 与手动服务器二选一"
+                        .into(),
+                );
+            }
+            let has_change = tunnel_type.is_some()
+                || frp_profile.is_some()
+                || clear_frp_profile
+                || frp_server.is_some()
+                || frp_server_port.is_some()
+                || frp_subdomain.is_some()
+                || public_url.is_some()
+                || frp_proxy_type.is_some()
+                || frp_cert_path.is_some()
+                || frp_key_path.is_some()
+                || cloudflare_mode.is_some()
+                || use_proxy.is_some();
+            if !has_change && !apply {
+                return Err(
+                    "tunnel configure 至少需要一个配置参数，或使用 --apply 应用既有待配置".into(),
+                );
+            }
+            Ok(TunnelCommand::Configure(Box::new(TunnelConfigureOptions {
+                workspace,
+                service,
+                tunnel_type,
+                frp_profile,
+                clear_frp_profile,
+                frp_server,
+                frp_server_port,
+                frp_subdomain,
+                public_url,
+                frp_proxy_type,
+                frp_cert_path,
+                frp_key_path,
+                cloudflare_mode,
+                use_proxy,
+                apply,
+                wait_seconds,
+            })))
+        }
+        Some(other) => Err(format!("未知 tunnel 命令：{other}\n\n{}", tunnel_usage())),
+        None => Err(tunnel_usage().to_string()),
+    }
 }
 
 fn parse_config_assignment(raw: String) -> Result<ConfigAssignment, String> {
@@ -914,6 +1238,8 @@ pub enum Command {
         workspace: String,
     },
     Config(ConfigCommand),
+    Frp(FrpCommand),
+    Tunnel(TunnelCommand),
     Workspace(WorkspaceCommand),
     Plugin(PluginCommand),
     Gateway(GatewayCommand),
@@ -985,6 +1311,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
             Command::Doctor { workspace }
         }
         Some("config" | "cfg") => Command::Config(parse_config_command(&mut args)?),
+        Some("frp") => Command::Frp(parse_frp_command(&mut args)?),
+        Some("tunnel") => Command::Tunnel(parse_tunnel_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
         Some("plugin") => Command::Plugin(parse_plugin_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
@@ -1054,12 +1382,36 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
   anchor [--config-dir PATH] [--json] config <get|diff|set|apply> ...\n\n\
+  anchor [--config-dir PATH] [--json] frp <list|show|add|update|delete> ...\n\n\
+  anchor [--config-dir PATH] [--json] tunnel <show|configure> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
   anchor [--config-dir PATH] [--json] service <command>\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
 不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+}
+
+pub fn frp_usage() -> &'static str {
+    "FRP Profile 命令：\n\
+  anchor frp list\n\
+  anchor frp show <profile-id|name>\n\
+  anchor frp add <name> --server HOST [--port PORT] [--token-file PATH|--token-stdin|--token TOKEN]\n\
+  anchor frp update <profile-id|name> [--name NAME] [--server HOST] [--port PORT]\n\
+      [--token-file PATH|--token-stdin|--token TOKEN|--clear-token]\n\
+  anchor frp delete <profile-id|name> --force\n\n\
+FRP profile 是全局服务器连接配置；token 作为受保护 secret 保存且不会在 list/show 输出中回显。优先使用 --token-file 或 --token-stdin，避免 secret 进入 shell history/进程参数；--token 仅为兼容便捷场景保留。workspace tunnel 通过 profile ID 引用它。"
+}
+
+pub fn tunnel_usage() -> &'static str {
+    "Tunnel 配置命令：\n\
+  anchor tunnel show <workspace> [--service mcp|actions|all]\n\
+  anchor tunnel configure <workspace> [--service mcp|actions|all] [--type frp|cloudflare]\n\
+      [--frp-profile PROFILE|--frp-server HOST] [--clear-frp-profile] [--frp-port PORT]\n\
+      [--subdomain NAME] [--public-url URL|--clear-public-url]\n\
+      [--proxy-type http|https2http] [--cert PATH|--clear-cert] [--key PATH|--clear-key]\n\
+      [--cloudflare-mode quick|named] [--use-proxy|--no-proxy] [--apply] [--wait SECONDS]\n\n\
+configure 复用 config pending/apply 事务模型；FRP 参数会自动切换为 frp 类型。使用 --apply 时会在落盘后协调正在运行的 Workspace daemon/Gateway，并在失败时回滚。"
 }
 
 pub fn plugin_usage() -> &'static str {
@@ -1113,6 +1465,140 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn frp_token_input_modes_are_mutually_exclusive() {
+        let parsed = parse(strings(&[
+            "frp",
+            "add",
+            "prod",
+            "--server",
+            "frp.example.com",
+            "--token-file",
+            "token.txt",
+        ]))
+        .expect("token file parse");
+        assert_eq!(
+            parsed.command,
+            Command::Frp(FrpCommand::Add(FrpAddOptions {
+                name: "prod".into(),
+                server: "frp.example.com".into(),
+                server_port: 7000,
+                token: Some(FrpTokenInput::File(PathBuf::from("token.txt"))),
+            }))
+        );
+
+        let error = parse(strings(&[
+            "frp",
+            "add",
+            "prod",
+            "--server",
+            "frp.example.com",
+            "--token-stdin",
+            "--token",
+            "secret",
+        ]))
+        .expect_err("conflicting token sources");
+        assert!(error.contains("只能选择一种"));
+    }
+
+    #[test]
+    fn parses_frp_profile_crud_commands() {
+        let add = parse(strings(&[
+            "frp",
+            "add",
+            "prod",
+            "--server",
+            "43.157.17.95",
+            "--port",
+            "17001",
+            "--token",
+            "secret",
+        ]))
+        .expect("frp add");
+        assert_eq!(
+            add.command,
+            Command::Frp(FrpCommand::Add(FrpAddOptions {
+                name: "prod".into(),
+                server: "43.157.17.95".into(),
+                server_port: 17_001,
+                token: Some(FrpTokenInput::Inline("secret".into())),
+            }))
+        );
+
+        let update =
+            parse(strings(&["frp", "update", "prod", "--clear-token"])).expect("frp update");
+        assert_eq!(
+            update.command,
+            Command::Frp(FrpCommand::Update(FrpUpdateOptions {
+                profile: "prod".into(),
+                name: None,
+                server: None,
+                server_port: None,
+                token: None,
+                clear_token: true,
+            }))
+        );
+
+        let delete = parse(strings(&["frp", "delete", "prod", "--force"])).expect("frp delete");
+        assert_eq!(
+            delete.command,
+            Command::Frp(FrpCommand::Delete(FrpDeleteOptions {
+                profile: "prod".into(),
+                force: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_tunnel_frp_configuration_and_apply() {
+        let parsed = parse(strings(&[
+            "tunnel",
+            "configure",
+            "demo",
+            "--service",
+            "all",
+            "--frp-profile",
+            "prod",
+            "--subdomain",
+            "anchor",
+            "--proxy-type",
+            "https2http",
+            "--public-url",
+            "https://anchor.taoyan.icu",
+            "--cert",
+            ".anchor/cert/server.pem",
+            "--key",
+            ".anchor/cert/server.key",
+            "--no-proxy",
+            "--apply",
+            "--wait",
+            "45",
+        ]))
+        .expect("tunnel configure");
+
+        assert_eq!(
+            parsed.command,
+            Command::Tunnel(TunnelCommand::Configure(Box::new(TunnelConfigureOptions {
+                workspace: "demo".into(),
+                service: ServiceSelection::All,
+                tunnel_type: None,
+                frp_profile: Some("prod".into()),
+                clear_frp_profile: false,
+                frp_server: None,
+                frp_server_port: None,
+                frp_subdomain: Some("anchor".into()),
+                public_url: Some("https://anchor.taoyan.icu".into()),
+                frp_proxy_type: Some("https2http".into()),
+                frp_cert_path: Some(".anchor/cert/server.pem".into()),
+                frp_key_path: Some(".anchor/cert/server.key".into()),
+                cloudflare_mode: None,
+                use_proxy: Some(false),
+                apply: true,
+                wait_seconds: 45,
+            })))
+        );
     }
 
     #[test]

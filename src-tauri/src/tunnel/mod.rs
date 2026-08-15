@@ -21,6 +21,8 @@ pub use access::{
 pub use cloudflare::resolve_cloudflared;
 #[cfg(feature = "cli")]
 pub use frp::resolve_frpc;
+#[cfg(feature = "cli")]
+pub(crate) use frp::validate_workspace_frp_config;
 #[cfg(feature = "desktop")]
 pub use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 pub use supervisor::{

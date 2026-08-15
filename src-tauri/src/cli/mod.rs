@@ -1,6 +1,8 @@
 mod args;
 mod config;
+mod frp;
 mod plugin;
+mod tunnel;
 mod workspace;
 
 use std::fs::File;
@@ -2460,6 +2462,8 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             .await
             .map(|healthy| if healthy { 0 } else { 1 }),
         Command::Config(command) => config::execute(command, cli.json).await,
+        Command::Frp(command) => frp::execute(command, cli.json).await,
+        Command::Tunnel(command) => tunnel::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,

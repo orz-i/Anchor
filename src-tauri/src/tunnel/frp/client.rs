@@ -379,7 +379,7 @@ fn aggregate_uses_proxy(routes: &[(&WorkspaceProfile, TunnelServiceKind)]) -> bo
     })
 }
 
-fn validate_frp_config(config: &FrpServerConfig) -> AppResult<()> {
+pub(crate) fn validate_frp_config(config: &FrpServerConfig) -> AppResult<()> {
     if config.server_addr.trim().is_empty() {
         return Err(AppError::Message("FRP 模式需要填写服务器域名。".into()));
     }

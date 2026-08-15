@@ -65,7 +65,7 @@ struct ConfigDiffReport {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigSetReport {
+pub(crate) struct ConfigSetReport {
     event: &'static str,
     workspace_id: String,
     staged: bool,
@@ -75,7 +75,7 @@ struct ConfigSetReport {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigApplyReport {
+pub(crate) struct ConfigApplyReport {
     event: &'static str,
     workspace_id: String,
     applied: bool,
@@ -136,15 +136,12 @@ fn diff_config(options: ConfigMutationOptions, as_json: bool) -> AppResult<()> {
 }
 
 fn set_config(options: ConfigMutationOptions, as_json: bool) -> AppResult<()> {
-    let store = DataStore::load()?;
-    let active = super::resolve_workspace(store.list(), &options.workspace)?.clone();
-    let staged = load_pending_for_active(&active)?;
-    let starting = staged
-        .as_ref()
-        .map(|pending| pending.candidate.clone())
-        .unwrap_or_else(|| active.clone());
-    let candidate = apply_assignments(&starting, &options.assignments)?;
-    validate_candidate(&store, &active, &candidate)?;
+    let output = stage_config(options)?;
+    print_report(&output, as_json)
+}
+
+pub(crate) fn stage_config(options: ConfigMutationOptions) -> AppResult<ConfigSetReport> {
+    let (active, candidate) = preview_config(&options)?;
     let has_staged_changes = !profiles_equal(&candidate, &active)?;
     let report = diff_report("config_set", &active, &candidate, has_staged_changes);
     if !has_staged_changes {
@@ -164,14 +161,40 @@ fn set_config(options: ConfigMutationOptions, as_json: bool) -> AppResult<()> {
         changes: report.changes,
         apply_plan: report.apply_plan,
     };
-    print_report(&output, as_json)
+    Ok(output)
+}
+
+pub(crate) fn preview_config(
+    options: &ConfigMutationOptions,
+) -> AppResult<(WorkspaceProfile, WorkspaceProfile)> {
+    let store = DataStore::load()?;
+    let active = super::resolve_workspace(store.list(), &options.workspace)?.clone();
+    let staged = load_pending_for_active(&active)?;
+    let starting = staged
+        .as_ref()
+        .map(|pending| pending.candidate.clone())
+        .unwrap_or_else(|| active.clone());
+    let candidate = apply_assignments(&starting, &options.assignments)?;
+    validate_candidate(&store, &active, &candidate)?;
+    Ok((active, candidate))
+}
+
+pub(crate) fn pending_candidate(active: &WorkspaceProfile) -> AppResult<Option<WorkspaceProfile>> {
+    Ok(load_pending_for_active(active)?.map(|pending| pending.candidate))
 }
 
 async fn apply_config(options: ConfigApplyOptions, as_json: bool) -> AppResult<()> {
+    let output = apply_staged_config(options).await?;
+    print_report(&output, as_json)
+}
+
+pub(crate) async fn apply_staged_config(
+    options: ConfigApplyOptions,
+) -> AppResult<ConfigApplyReport> {
     let mut store = DataStore::load()?;
     let active = super::resolve_workspace(store.list(), &options.workspace)?.clone();
     let Some(pending) = load_pending_for_active(&active)? else {
-        let output = ConfigApplyReport {
+        return Ok(ConfigApplyReport {
             event: "config_apply",
             workspace_id: active.id.clone(),
             applied: false,
@@ -180,8 +203,7 @@ async fn apply_config(options: ConfigApplyOptions, as_json: bool) -> AppResult<(
             workspace_runtime: None,
             gateway_reloaded: false,
             warnings: vec!["没有待应用配置".into()],
-        };
-        return print_report(&output, as_json);
+        });
     };
     let candidate = pending.candidate;
     validate_candidate(&store, &active, &candidate)?;
@@ -264,7 +286,7 @@ async fn apply_config(options: ConfigApplyOptions, as_json: bool) -> AppResult<(
         gateway_reloaded,
         warnings,
     };
-    print_report(&output, as_json)
+    Ok(output)
 }
 
 async fn restore_active_config(
@@ -387,7 +409,7 @@ fn validate_candidate(
     Ok(())
 }
 
-fn apply_assignments(
+pub(crate) fn apply_assignments(
     profile: &WorkspaceProfile,
     assignments: &[ConfigAssignment],
 ) -> AppResult<WorkspaceProfile> {

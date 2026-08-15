@@ -111,6 +111,15 @@ pub fn frp_server_config(
     }
 }
 
+pub(crate) fn validate_workspace_frp_config(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    settings: &AppSettings,
+) -> AppResult<()> {
+    let config = prepare_frp_server_config(frp_server_config(profile, kind, settings, None))?;
+    client::validate_frp_config(&config)
+}
+
 fn resolve_frp_token(
     profile_id: &str,
     workspace: &WorkspaceProfile,
