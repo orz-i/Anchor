@@ -1571,10 +1571,61 @@ fn receipt_response(
             _ => Vec::<&str>::new(),
         }
     });
-    if let (Some(object), Some(error)) = (response.as_object_mut(), receipt.error.clone()) {
-        object.insert("error".into(), error);
+    if let (Some(object), Some(error)) = (response.as_object_mut(), receipt.error.as_ref()) {
+        object.insert("error".into(), receipt_error_output(error, retryable));
     }
     Ok(response)
+}
+
+fn receipt_error_output(error: &Value, retryable: bool) -> Value {
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("STAGE_COMMIT_FAILED");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match code {
+            "STAGE_COMMIT_CHECK_FAILED" => "A required staged-commit check failed.".into(),
+            "STAGE_COMMIT_CHECK_MODIFIED_WORKSPACE" => {
+                "A required staged-commit check modified the workspace or HEAD.".into()
+            }
+            "STAGE_COMMIT_EMPTY" => "The selected paths produced an empty staged diff.".into(),
+            "STAGE_COMMIT_POST_COMMIT_DRIFT" => {
+                "The commit completed, but additional workspace changes were detected afterward."
+                    .into()
+            }
+            "STAGE_COMMIT_CHECK_SESSION_LOST" => {
+                "The retained staged-commit check session is unavailable.".into()
+            }
+            _ => "The staged-commit workflow failed.".into(),
+        });
+    let category = error
+        .get("category")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("runtime");
+    let mut details = error.as_object().cloned().unwrap_or_default();
+    details.remove("code");
+    details.remove("message");
+    details.remove("category");
+    details.remove("retryable");
+    if details.is_empty() && !error.is_object() {
+        details.insert("receipt_error".into(), error.clone());
+    }
+    json!({
+        "code": code,
+        "message": message,
+        "category": category,
+        "retryable": error
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(retryable),
+        "details": details
+    })
 }
 
 fn process_details(output: &ProcessOutput) -> Value {
@@ -1705,6 +1756,73 @@ mod tests {
             .status()
             .expect("git diff");
         assert!(staged.success(), "real Git index must remain unchanged");
+    }
+
+    #[test]
+    fn failed_deferred_status_and_wait_match_published_output_schema() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
+        let cancellation = CancellationToken::default();
+        let idempotency_key = "failed-deferred-output-schema";
+        let started = run(
+            &ctx,
+            &json!({
+                "task_id": task_id,
+                "expected_head": expected_head,
+                "expected_fingerprint": expected_fingerprint,
+                "paths": ["main.txt"],
+                "message": "must not commit",
+                "required_checks": ["python -c \"import sys; sys.exit(7)\""],
+                "idempotency_key": idempotency_key,
+                "execution_mode": "deferred",
+                "wait_timeout_ms": 0
+            }),
+            &cancellation,
+        )
+        .expect("start deferred workflow");
+        assert_eq!(started["state"], "running");
+
+        let waited = wait(
+            &ctx,
+            &json!({
+                "task_id": task_id,
+                "idempotency_key": idempotency_key,
+                "wait_timeout_ms": 30_000
+            }),
+            &cancellation,
+        )
+        .expect("wait failed workflow");
+        assert_eq!(waited["state"], "failed");
+        assert_eq!(waited["error"]["code"], "STAGE_COMMIT_CHECK_FAILED");
+        assert!(waited["error"]["message"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(waited["error"]["category"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(waited["error"]["retryable"].is_boolean());
+        assert!(waited["error"]["details"].is_object());
+
+        let status = status(
+            &ctx,
+            &json!({"task_id": task_id, "idempotency_key": idempotency_key}),
+        )
+        .expect("status failed workflow");
+        assert_eq!(status["state"], "failed");
+
+        for (tool, value) in [
+            ("wait_stage_commit", waited),
+            ("stage_commit_status", status),
+        ] {
+            let value = crate::tools::workspace::tool_ok(value);
+            let schema = crate::tools::registry::output_schema(tool);
+            let validator = jsonschema::validator_for(&schema).expect("output schema validator");
+            validator
+                .validate(&value)
+                .unwrap_or_else(|error| panic!("{tool} output schema violation: {error}\n{value}"));
+        }
     }
 
     #[test]
