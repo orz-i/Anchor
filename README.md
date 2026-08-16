@@ -303,6 +303,8 @@ CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` �
 
 Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`，可直接注册项目、查看脱敏的 GPT 连接配置并验证 MCP/Actions 协议。见 [Workspace CLI 注册与 GPT 连接运维](docs/workspace-cli.md)。
 
+跨 Windows/Linux 迁移不要直接复制 `secrets.json`。使用 `anchor export` / `anchor import`（或 `anchor config export/import`）可在源平台解密后生成 passphrase 加密迁移包，并在目标平台按本机 secret protection 重新保存，同时保留 Workspace ID、OAuth client ID 和认证 secrets。`import` 支持 `--workspace-path WORKSPACE=ABSOLUTE_PATH` 与 `--dry-run` 进行目录映射和预检。完整说明见 [跨平台配置迁移](docs/config-migration.md)。
+
 多个工作区可以通过一个本地 Gateway 和一条公网隧道暴露为 `/w/<workspace-id>/mcp`。GUI 在 **设置 → 通用 → 单一 MCP Gateway** 配置；Linux 可使用 `gateway configure/show/serve`。完整隔离与运维说明见 [单一 MCP Gateway 与多工作区](docs/mcp-gateway.md)。
 
 ### 通过 MCP 提请 Agent Skill

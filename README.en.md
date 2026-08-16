@@ -295,6 +295,8 @@ The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `
 
 Workspace-level commands include `register`, `unregister`, `show`, `start`, `stop`, `gpt-config`, and `test`, covering profile registration, redacted GPT connection settings, and MCP/Actions protocol checks. See the [Workspace CLI guide](docs/workspace-cli.md).
 
+For Windows/Linux migration, do not copy `secrets.json` directly. `anchor export` / `anchor import` (also available as `anchor config export/import`) decrypt on the source platform into a passphrase-encrypted migration bundle, then re-protect secrets with the target platform's native mechanism while preserving Workspace IDs, OAuth client IDs, and authentication secrets. `import` supports `--workspace-path WORKSPACE=ABSOLUTE_PATH` and `--dry-run` for path mapping and validation. See [cross-platform configuration migration](docs/config-migration.md).
+
 Multiple workspaces can share one local Gateway and one public tunnel while remaining separate logical MCP servers at `/w/<workspace-id>/mcp`. Configure it under **Settings → General → Single MCP Gateway**, or use `gateway configure/show/serve` on Linux. See [Single MCP Gateway and multiple workspaces](docs/mcp-gateway.md).
 
 ### Request Agent Skills through MCP

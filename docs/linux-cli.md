@@ -46,6 +46,8 @@ anchor --config-dir /etc/anchor list
 
 不要为 CLI 创建第二套 profile。桌面端创建的 workspace/profile 可以直接由 CLI 按 ID、唯一名称或项目路径选择。
 
+从 Windows 等其他平台迁移时，不要直接复制受平台保护的 `secrets.json`。请使用 `anchor export` / `anchor import` 让源平台解密 secrets、目标 Linux 重新按本机权限机制落盘，并通过 `--workspace-path` 映射项目目录。详见 [跨平台配置迁移](config-migration.md)。
+
 CLI 也可以直接注册和注销 profile：
 
 ```bash
