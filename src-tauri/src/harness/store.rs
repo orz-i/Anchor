@@ -1088,6 +1088,42 @@ mod tests {
     }
 
     #[test]
+    fn schema5_task_without_termination_metadata_remains_compatible() {
+        let value = json!({
+            "schema_version": SCHEMA_VERSION,
+            "id": "existing-schema5-task",
+            "workspace_id": "workspace",
+            "objective": "task persisted before abort metadata existed",
+            "status": "verifying",
+            "phase": "verifying",
+            "baseline": {
+                "schema_version": SCHEMA_VERSION,
+                "branch": null,
+                "head": null,
+                "worktree_fingerprint": "0".repeat(64),
+                "object_id": "1".repeat(64),
+                "file_count": 0,
+                "captured_at": "0"
+            },
+            "expected_state": {
+                "branch": null,
+                "head": null,
+                "worktree_fingerprint": "0".repeat(64),
+                "accepted_at": "0",
+                "accepted_by_operation_id": null
+            },
+            "latest_change_id": null,
+            "latest_verification_id": null,
+            "created_at": "0",
+            "updated_at": "0"
+        });
+
+        let task: TaskSession = serde_json::from_value(value).expect("legacy schema-v5 task");
+        assert_eq!(task.status, TaskStatus::Verifying);
+        assert!(task.termination.is_none());
+    }
+
+    #[test]
     fn schema5_store_rejects_a_schema4_task_file() {
         let root = tempdir().expect("root");
         let store = HarnessStore::new(root.path().to_path_buf()).expect("store");
@@ -1103,6 +1139,7 @@ mod tests {
             current_slice_id: None,
             working_set: TaskWorkingSet::default(),
             recovery: None,
+            termination: None,
             baseline: ProjectBaseline {
                 schema_version: SCHEMA_VERSION,
                 branch: None,

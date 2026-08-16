@@ -70,6 +70,7 @@ pub const TASK_OPERATIONS: &[(&str, &str)] = &[
     ("update", "update_task"),
     ("gate_status", "task_gate_status"),
     ("pause", "pause_task"),
+    ("abort", "abort_task"),
     ("resume", "resume_task"),
     ("switch", "switch_task"),
     ("finish", "finish_task"),
@@ -253,7 +254,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "close_work_session",
         "Close work session",
-        "[anchor-core] Validate and close the bound Harness Task, then persist the matching explicit Session checkpoint as a recoverable workflow. Closure is rejected while retained commands are running or their terminal results are unconsumed.",
+        "[anchor-core] Close the bound Harness Task as completed (validated by completion gates) or explicitly incomplete after a user/operator abort, then persist the matching Session checkpoint as a recoverable workflow. Closure is rejected while retained commands are running or their terminal results are unconsumed.",
         false,
         false,
         false,
@@ -470,6 +471,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "pause_task",
         "Pause task",
         "Pause one explicit coding task without changing other active tasks.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "abort_task",
+        "Abort incomplete task",
+        "Terminate one explicit task as incomplete after an explicit user/operator stop decision. This never satisfies completion gates and never rewrites the task as completed.",
         false,
         false,
         false,
@@ -2451,6 +2460,42 @@ pub fn output_schema(name: &str) -> Value {
                 "next_actions",
             ],
         ),
+        "abort_task" => json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "task_status": { "type": "string", "enum": ["active", "paused", "verifying", "failed", "incomplete"] },
+                "outcome": { "type": "string", "const": "incomplete" },
+                "closed": { "type": "boolean" },
+                "session_status": { "type": "string", "enum": ["active", "paused"] },
+                "requested_session_status": { "type": "string", "enum": ["active", "paused"] },
+                "reason": { "type": "string" },
+                "running_sessions": { "type": "array", "items": { "type": "object" } },
+                "unobserved_terminal_sessions": { "type": "array", "items": { "type": "object" } },
+                "completion_gate": { "type": "object" },
+                "task": { "type": "object" },
+                "worktree_cleanup": { "type": "object" },
+                "error": error_output_schema()
+            },
+            "required": ["ok", "task_status", "outcome", "closed", "session_status", "requested_session_status", "reason", "completion_gate", "task"],
+            "allOf": [
+                {
+                    "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+                    "then": {
+                        "properties": { "task_status": { "const": "incomplete" }, "closed": { "const": true } },
+                        "required": ["worktree_cleanup"]
+                    }
+                },
+                {
+                    "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+                    "then": {
+                        "properties": { "closed": { "const": false } },
+                        "required": ["running_sessions", "unobserved_terminal_sessions", "error"]
+                    }
+                }
+            ],
+            "additionalProperties": true
+        }),
         "finish_task" => json!({
             "type": "object",
             "properties": {
@@ -3005,11 +3050,32 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "task_id": { "type": "string", "minLength": 1 },
                 "summary": { "type": "string", "maxLength": 8000 },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["completed", "incomplete"],
+                    "default": "completed",
+                    "description": "Use incomplete only after an explicit user/operator stop decision. It closes the task without satisfying completion gates."
+                },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
                 "allow_unverified": { "type": "boolean", "default": false },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"], "default": "paused" },
                 "checkpoint": { "type": "object", "additionalProperties": true }
             },
             "required": ["task_id"],
+            "allOf": [
+                {
+                    "if": {
+                        "properties": { "outcome": { "const": "incomplete" } },
+                        "required": ["outcome"]
+                    },
+                    "then": {
+                        "properties": {
+                            "session_status": { "type": "string", "enum": ["active", "paused"] }
+                        },
+                        "required": ["reason"]
+                    }
+                }
+            ],
             "additionalProperties": false
         }),
         "complete_work_session" => json!({
@@ -3143,6 +3209,21 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": { "task_id": { "type": "string", "minLength": 1 } },
             "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        "abort_task" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                "session_status": {
+                    "type": "string",
+                    "enum": ["active", "paused"],
+                    "default": "paused",
+                    "description": "Requested workspace session state after the incomplete task is terminated. Active peer tasks can keep the actual workspace session active."
+                }
+            },
+            "required": ["task_id", "reason"],
             "additionalProperties": false
         }),
         "finish_task" => json!({
@@ -3853,7 +3934,7 @@ mod tests {
                 "missing core task operation {allowed}"
             );
         }
-        for denied in ["status", "start", "finish", "pause", "resume"] {
+        for denied in ["status", "start", "finish", "pause", "abort", "resume"] {
             assert!(!core_task_operations
                 .iter()
                 .any(|operation| operation == denied));
@@ -3874,6 +3955,15 @@ mod tests {
         assert!(advanced_names.contains("commit_stage"));
         assert!(advanced_names.contains("environment"));
         assert!(advanced_names.contains("cwd"));
+        let advanced_task = advanced
+            .iter()
+            .find(|tool| tool["name"] == "task")
+            .expect("advanced task facade");
+        assert!(
+            advanced_task["inputSchema"]["properties"]["operation"]["enum"]
+                .as_array()
+                .is_some_and(|operations| operations.iter().any(|operation| operation == "abort"))
+        );
         for hidden_leaf in [
             "check_exec_environment",
             "exec_health_check",

@@ -45,6 +45,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "update_slice",
     "complete_slice",
     "pause_task",
+    "abort_task",
     "resume_task",
     "switch_task",
     "finish_task",
@@ -90,6 +91,7 @@ pub fn call(
         "update_slice" => update_slice(ctx, args),
         "complete_slice" => complete_slice(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
+        "abort_task" => abort_task(ctx, args),
         "resume_task" => resume_task(ctx, args, session_id),
         "switch_task" => switch_task(ctx, args, session_id),
         "finish_task" => finish_task(ctx, args),
@@ -1008,11 +1010,18 @@ fn compact_session_view(session: &Value) -> Value {
 fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
     if let Some(mut outbox) = ctx.harness.load_close_outbox(task_id).map_err(map_error)? {
+        if parse_close_outcome(&outbox.finish_args)? == "incomplete" {
+            return Err(tool_error(
+                "WORK_SESSION_ALREADY_ABORTING",
+                "该 Work Session 已开始按 incomplete outcome 终止，不能改写为 completed",
+            ));
+        }
         if outbox.phase == WorkSessionClosePhase::Prepared {
             let mut strict = args.clone();
             strict["task_id"] = Value::String(task_id.to_string());
             strict["allow_unverified"] = Value::Bool(false);
             strict["session_status"] = Value::String("completed".into());
+            strict["outcome"] = Value::String("completed".into());
             strict["_completion_via_work_session"] = Value::Bool(true);
             outbox.finish_args = strict;
             outbox.session_status = HarnessSessionStatus::Completed;
@@ -1036,6 +1045,7 @@ fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Works
     let mut strict = args.clone();
     strict["allow_unverified"] = Value::Bool(false);
     strict["session_status"] = Value::String("completed".into());
+    strict["outcome"] = Value::String("completed".into());
     strict["_completion_via_work_session"] = Value::Bool(true);
     close_work_session(ctx, &strict)
 }
@@ -1046,6 +1056,31 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
         return resume_close_outbox(ctx, outbox, true);
     }
     let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let outcome = parse_close_outcome(args)?;
+    if outcome == "completed" && task_before.status == TaskStatus::Incomplete {
+        return Err(tool_error(
+            "WORK_SESSION_TASK_INCOMPLETE",
+            "Task 已以 incomplete 终态关闭；请使用 close_work_session outcome=incomplete 完成 Session checkpoint，不能改写为 completed",
+        ));
+    }
+    if outcome == "incomplete" {
+        args.get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                tool_error(
+                    "INVALID_ARGUMENT",
+                    "close_work_session outcome=incomplete 必须提供 reason",
+                )
+            })?;
+        if !task_before.status.is_writable() && task_before.status != TaskStatus::Incomplete {
+            return Err(tool_error(
+                "WORK_SESSION_TASK_ALREADY_CLOSED",
+                "Task 已以其他终态关闭，不能改写为 incomplete",
+            ));
+        }
+    }
     let session_id = task_before
         .session_id
         .clone()
@@ -1055,6 +1090,12 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
         .clone()
         .ok_or_else(|| tool_error("WORK_SESSION_NOT_BOUND", "任务未绑定 Session 路径"))?;
     let session_status = parse_session_status(args)?;
+    if outcome == "incomplete" && session_status == HarnessSessionStatus::Completed {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            "outcome=incomplete 时 session_status 只能是 active 或 paused",
+        ));
+    }
     let mut checkpoint = args
         .get("checkpoint")
         .cloned()
@@ -1078,6 +1119,7 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
         Value::String(harness_session_status_text(session_status).to_string());
     let mut finish_args = args.clone();
     finish_args["task_id"] = Value::String(task_id.to_string());
+    finish_args["outcome"] = Value::String(outcome.to_string());
     let now = harness_timestamp();
     let outbox = WorkSessionCloseOutbox {
         schema_version: SCHEMA_VERSION,
@@ -1131,6 +1173,7 @@ fn resume_close_outbox(
 
     let mut finish = None;
     let mut checkpoint = None;
+    let outcome = parse_close_outcome(&outbox.finish_args)?;
     if outbox.phase == WorkSessionClosePhase::Completed {
         let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
         finish = Some(json!({
@@ -1157,17 +1200,44 @@ fn resume_close_outbox(
             .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
         let finish_context = scoped.as_ref().unwrap_or(ctx);
         let result = if task_before.status.is_writable() {
-            finish_task(finish_context, &outbox.finish_args)?
-        } else {
+            if outcome == "incomplete" {
+                abort_task(finish_context, &outbox.finish_args)?
+            } else {
+                finish_task(finish_context, &outbox.finish_args)?
+            }
+        } else if outcome == "incomplete" && task_before.status == TaskStatus::Incomplete {
+            json!({
+                "ok": true,
+                "task_status": "incomplete",
+                "outcome": "incomplete",
+                "closed": true,
+                "session_status": harness_session_status_text(outbox.session_status),
+                "requested_session_status": harness_session_status_text(outbox.session_status),
+                "reason": task_before.termination.as_ref().map(|termination| termination.reason.clone()),
+                "task": task_view(&task_before),
+                "idempotent_retry": true
+            })
+        } else if outcome == "completed"
+            && matches!(
+                task_before.status,
+                TaskStatus::Completed | TaskStatus::CompletedUnverified
+            )
+        {
             json!({
                 "ok": true,
                 "task_status": task_before.status,
+                "outcome": "completed",
                 "closed": true,
                 "session_status": harness_session_status_text(outbox.session_status),
                 "next_stage_started": false,
                 "task": task_view(&task_before),
                 "idempotent_retry": true
             })
+        } else {
+            return Err(tool_error(
+                "WORK_SESSION_OUTCOME_CONFLICT",
+                "Task 终态与 durable close outcome 不一致，拒绝改写历史结果",
+            ));
         };
         if result.get("ok").and_then(Value::as_bool) != Some(true) {
             let blocking = result
@@ -1180,6 +1250,22 @@ fn resume_close_outbox(
             }));
             outbox.updated_at = harness_timestamp();
             ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+            let (error_code, error_message) = if outcome == "incomplete" {
+                (
+                    "WORK_SESSION_ABORT_BLOCKED",
+                    "Harness task could not be aborted because retained command results are still pending.",
+                )
+            } else {
+                (
+                    "WORK_SESSION_VERIFICATION_BLOCKED",
+                    "Harness task could not be closed because verification or working-tree requirements are not satisfied.",
+                )
+            };
+            let suggestion = if outcome == "incomplete" {
+                "Terminate any running retained command, consume every terminal result, then retry the same incomplete close."
+            } else {
+                "Run the suggested verification action, or use update_verification_disposition for an audited false positive/expected failure."
+            };
             return Ok(json!({
                 "ok": false,
                 "closed": false,
@@ -1188,13 +1274,13 @@ fn resume_close_outbox(
                 "checkpoint": null,
                 "retryable": true,
                 "error": {
-                    "code": "WORK_SESSION_VERIFICATION_BLOCKED",
-                    "message": "Harness task could not be closed because verification or working-tree requirements are not satisfied.",
+                    "code": error_code,
+                    "message": error_message,
                     "category": "validation",
                     "retryable": true,
                     "details": {
                         "blocking_verifications": blocking,
-                        "suggestion": "Run the suggested verification action, or use update_verification_disposition for an audited false positive/expected failure."
+                        "suggestion": suggestion
                     }
                 },
                 "outbox": close_outbox_view(&outbox)
@@ -1260,8 +1346,15 @@ fn resume_close_outbox(
     }
 
     let completed = outbox.phase == WorkSessionClosePhase::Completed;
-    let worktree_cleanup = if completed {
+    let worktree_cleanup = if completed && outcome == "completed" {
         cleanup_closed_task_worktree(ctx, &outbox.task_id, "close_work_session")?
+    } else if completed {
+        json!({
+            "requested": false,
+            "removed": false,
+            "preserved": true,
+            "reason": "incomplete_task"
+        })
     } else {
         Value::Null
     };
@@ -1274,6 +1367,7 @@ fn resume_close_outbox(
             "session_path": outbox.session_path,
             "task_id": outbox.task_id,
             "task_status": task.status,
+            "outcome": outcome,
             "closed": completed,
             "next_stage_started": false
         },
@@ -1290,6 +1384,7 @@ fn close_outbox_view(outbox: &WorkSessionCloseOutbox) -> Value {
     json!({
         "schema_version": outbox.schema_version,
         "task_id": outbox.task_id,
+        "outcome": outbox.finish_args.get("outcome").and_then(Value::as_str).unwrap_or("completed"),
         "phase": outbox.phase,
         "attempts": outbox.attempts,
         "last_error": outbox.last_error,
@@ -2404,6 +2499,86 @@ fn transition(
     Ok(json!({"task": task_view(&task)}))
 }
 
+fn abort_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "abort_task 必须提供 reason"))?;
+    let requested_session_status = parse_session_status(args)?;
+    if requested_session_status == HarnessSessionStatus::Completed {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            "未完成任务终止后 session_status 只能是 active 或 paused",
+        ));
+    }
+    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    let completion_gate = completion_gate_value(ctx, &task_before, &verifications, false, false);
+    let running_sessions = completion_gate["running_sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let unobserved_terminal_sessions = completion_gate["unobserved_terminal_sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !running_sessions.is_empty() || !unobserved_terminal_sessions.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "task_status": task_before.status,
+            "outcome": "incomplete",
+            "closed": false,
+            "session_status": ctx.harness.status().map_err(map_error)?.session_status,
+            "requested_session_status": requested_session_status,
+            "reason": "任务仍有运行中或尚未消费终态的 retained command；请先终止/读取结果，再执行 abort。",
+            "running_sessions": running_sessions,
+            "unobserved_terminal_sessions": unobserved_terminal_sessions,
+            "completion_gate": completion_gate,
+            "task": task_view(&task_before),
+            "error": {
+                "code": "TASK_ABORT_COMMAND_RESULTS_PENDING",
+                "message": "Retained commands must be terminated or consumed before aborting the task.",
+                "category": "validation",
+                "retryable": true,
+                "details": {
+                    "running_sessions": running_sessions,
+                    "unobserved_terminal_sessions": unobserved_terminal_sessions
+                }
+            }
+        }));
+    }
+    let task = ctx
+        .harness
+        .abort_task(task_id, reason, requested_session_status)
+        .map_err(map_error)?;
+    let workspace_session_status = ctx.harness.status().map_err(map_error)?.session_status;
+    let stored_reason = task
+        .termination
+        .as_ref()
+        .map(|termination| termination.reason.as_str())
+        .unwrap_or(reason);
+    Ok(json!({
+        "ok": true,
+        "task_status": "incomplete",
+        "outcome": "incomplete",
+        "closed": true,
+        "session_status": workspace_session_status,
+        "requested_session_status": requested_session_status,
+        "reason": stored_reason,
+        "completion_gate": completion_gate,
+        "task": task_view(&task),
+        "worktree_cleanup": {
+            "requested": false,
+            "removed": false,
+            "preserved": true,
+            "reason": "incomplete_task"
+        }
+    }))
+}
+
 fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
     let allow_unverified = args
@@ -2879,6 +3054,21 @@ fn parse_session_status(args: &Value) -> Result<HarnessSessionStatus, WorkspaceE
     }
 }
 
+fn parse_close_outcome(args: &Value) -> Result<&str, WorkspaceError> {
+    match args
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("completed")
+    {
+        "completed" => Ok("completed"),
+        "incomplete" => Ok("incomplete"),
+        _ => Err(tool_error(
+            "INVALID_ARGUMENT",
+            "outcome 仅支持 completed 或 incomplete",
+        )),
+    }
+}
+
 fn baseline_view(task: &TaskSession) -> Value {
     json!({
         "file_count": task.baseline.file_count,
@@ -2902,6 +3092,7 @@ fn task_view(task: &TaskSession) -> Value {
         "current_slice_id": task.current_slice_id,
         "working_set": task.working_set,
         "recovery": task.recovery,
+        "termination": task.termination,
         "baseline": baseline_view(task),
         "expected_state": task.expected_state,
         "completed_steps": bounded_strings(&task.completed_steps, 64, 1_000),

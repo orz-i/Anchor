@@ -25,6 +25,7 @@ pub enum TaskPhase {
     Cleanup,
     ReadyToClose,
     Completed,
+    Aborted,
     Blocked,
     Paused,
 }
@@ -35,7 +36,7 @@ impl TaskPhase {
             return true;
         }
         match self {
-            Self::Unspecified => next != Self::Completed,
+            Self::Unspecified => !matches!(next, Self::Completed | Self::Aborted),
             Self::Planning => matches!(
                 next,
                 Self::Implementing | Self::Verifying | Self::Blocked | Self::Paused
@@ -98,7 +99,7 @@ impl TaskPhase {
                     | Self::Paused
             ),
             Self::Paused => !matches!(next, Self::Completed | Self::Unspecified),
-            Self::Completed => false,
+            Self::Completed | Self::Aborted => false,
         }
     }
 }
@@ -173,6 +174,21 @@ pub enum TaskSliceStatus {
     Blocked,
     Paused,
     Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTerminationKind {
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTermination {
+    pub kind: TaskTerminationKind,
+    pub reason: String,
+    pub requested_session_status: HarnessSessionStatus,
+    pub session_status: HarnessSessionStatus,
+    pub created_at: String,
 }
 
 impl TaskSliceStatus {
@@ -454,6 +470,7 @@ pub enum TaskStatus {
     Paused,
     Verifying,
     Failed,
+    Incomplete,
     Completed,
     CompletedUnverified,
     RolledBack,
@@ -472,12 +489,20 @@ impl TaskStatus {
             (self, next),
             (Self::Active, Self::Paused | Self::Verifying | Self::Failed)
                 | (Self::Active, Self::CompletedUnverified)
-                | (Self::Paused, Self::Active)
+                | (Self::Active, Self::Incomplete)
+                | (Self::Paused, Self::Active | Self::Incomplete)
                 | (
                     Self::Verifying,
-                    Self::Completed | Self::CompletedUnverified | Self::Failed
+                    Self::Paused
+                        | Self::Incomplete
+                        | Self::Completed
+                        | Self::CompletedUnverified
+                        | Self::Failed
                 )
-                | (Self::Failed, Self::Active | Self::RolledBack)
+                | (
+                    Self::Failed,
+                    Self::Active | Self::Incomplete | Self::RolledBack
+                )
         )
     }
 }
@@ -528,6 +553,8 @@ pub struct TaskSession {
     pub working_set: TaskWorkingSet,
     #[serde(default)]
     pub recovery: Option<TaskRecoveryState>,
+    #[serde(default)]
+    pub termination: Option<TaskTermination>,
     pub baseline: ProjectBaseline,
     pub expected_state: ExpectedWorkspaceState,
     #[serde(default)]

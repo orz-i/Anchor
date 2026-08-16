@@ -15,8 +15,9 @@ use super::model::{
     FileChangeRecord, HarnessEvent, HarnessSessionStatus, HarnessStatus, OperationRecord,
     ProjectBaseline, ProjectFileState, ProjectState, ReasonRecord, StageCommitReceipt,
     TaskContract, TaskGitWorktree, TaskPhase, TaskRecoveryState, TaskRecoveryStatus, TaskSession,
-    TaskSlice, TaskSliceStatus, TaskStatus, TaskWorkingSet, VerificationDispositionRecord,
-    VerificationRecord, WorkSessionCloseOutbox, WorkspaceHarnessState, SCHEMA_VERSION,
+    TaskSlice, TaskSliceStatus, TaskStatus, TaskTermination, TaskTerminationKind, TaskWorkingSet,
+    VerificationDispositionRecord, VerificationRecord, WorkSessionCloseOutbox,
+    WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{baseline_object_id, HarnessError, HarnessResult, HarnessStore};
 
@@ -138,6 +139,7 @@ fn tool_activity_resumes_paused_task(tool: &str) -> bool {
             | "get_default_cwd"
             | "list_command_sessions"
             | "pause_task"
+            | "abort_task"
             | "resume_task"
             | "switch_task"
             | "finish_task"
@@ -612,6 +614,7 @@ impl Harness {
                     current_slice_id: None,
                     working_set: TaskWorkingSet::default(),
                     recovery: None,
+                    termination: None,
                     expected_state: expected_state_from_baseline(&baseline, None),
                     baseline,
                     completed_steps: Vec::new(),
@@ -1000,6 +1003,82 @@ impl Harness {
             })
     }
 
+    pub fn abort_task(
+        &self,
+        task_id: &str,
+        reason: &str,
+        session_status: HarnessSessionStatus,
+    ) -> HarnessResult<TaskSession> {
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "终止未完成任务必须提供 reason",
+            ));
+        }
+        if session_status == HarnessSessionStatus::Completed {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "未完成任务终止后 Session 只能保持 active 或 paused，不能标记 completed",
+            ));
+        }
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if task.status == TaskStatus::Incomplete {
+                    return Ok(task);
+                }
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经以其他终态关闭，不能改写为 incomplete",
+                    ));
+                }
+                let now = timestamp();
+                task.status = TaskStatus::Incomplete;
+                task.phase = TaskPhase::Aborted;
+                task.updated_at = now.clone();
+                transaction.save_task(&task)?;
+                let default_task_id = self
+                    .store
+                    .load_workspace_state(&self.workspace_id)?
+                    .and_then(|state| state.active_task_id)
+                    .filter(|current| current != task_id)
+                    .or(self.preferred_default_task_id(Some(task_id))?);
+                let workspace_state =
+                    self.workspace_state(default_task_id.as_deref(), session_status, &now)?;
+                let actual_session_status = workspace_state.session_status;
+                task.termination = Some(TaskTermination {
+                    kind: TaskTerminationKind::Aborted,
+                    reason: reason.trim().to_string(),
+                    requested_session_status: session_status,
+                    session_status: actual_session_status,
+                    created_at: now.clone(),
+                });
+                transaction.save_task(&task)?;
+                transaction.save_workspace_state(&workspace_state)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_aborted",
+                    Some("abort_task"),
+                    json!({
+                        "reason": reason.trim(),
+                        "outcome": "incomplete",
+                        "no_early_stop": task.contract.no_early_stop,
+                        "requested_session_status": session_status,
+                        "session_status": actual_session_status
+                    }),
+                    json!({
+                        "ok": true,
+                        "closed": true,
+                        "task_status": "incomplete",
+                        "phase": "aborted"
+                    }),
+                ))?;
+                Ok(task)
+            })
+    }
+
     pub fn current_task(&self) -> HarnessResult<Option<TaskSession>> {
         if let Some(state) = self.store.load_workspace_state(&self.workspace_id)? {
             if let Some(task_id) = state.active_task_id.as_deref() {
@@ -1139,10 +1218,10 @@ impl Harness {
                     ));
                 }
                 if let Some(value) = phase {
-                    if value == TaskPhase::Completed {
+                    if matches!(value, TaskPhase::Completed | TaskPhase::Aborted) {
                         return Err(HarnessError::new(
                             "TASK_COMPLETION_TOOL_REQUIRED",
-                            "Task phase completed can only be set by the task completion transaction",
+                            "Terminal task phases can only be set by completion/abort transactions",
                         ));
                     }
                     if !task.phase.can_transition_to(value) {
@@ -2659,6 +2738,7 @@ mod tests {
             "harness_status",
             "task_context",
             "pause_task",
+            "abort_task",
             "resume_task",
             "finish_task",
             "close_work_session",
@@ -2702,6 +2782,89 @@ mod tests {
             .expect("activity")
             .expect("current task");
         assert_eq!(failed.status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn verifying_task_can_pause_without_claiming_completion() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness
+            .start_task("pause verification")
+            .expect("start task");
+        harness
+            .transition(&task.id, TaskStatus::Verifying)
+            .expect("verifying");
+
+        let paused = harness
+            .transition(&task.id, TaskStatus::Paused)
+            .expect("pause verifying task");
+        assert_eq!(paused.status, TaskStatus::Paused);
+        assert_ne!(paused.phase, TaskPhase::Completed);
+        assert!(paused.termination.is_none());
+    }
+
+    #[test]
+    fn no_early_stop_task_can_be_aborted_as_incomplete_from_verifying() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness
+            .start_task("strict but user-abortable")
+            .expect("start task");
+        let contract = TaskContract {
+            no_early_stop: true,
+            ..TaskContract::default()
+        };
+        harness
+            .configure_task(
+                &task.id,
+                Some(TaskPhase::Verifying),
+                Some(contract),
+                None,
+                None,
+            )
+            .expect("configure strict task");
+        harness
+            .transition(&task.id, TaskStatus::Verifying)
+            .expect("verifying status");
+
+        let aborted = harness
+            .abort_task(
+                &task.id,
+                "user requested termination before completion",
+                HarnessSessionStatus::Paused,
+            )
+            .expect("abort task");
+        assert_eq!(aborted.status, TaskStatus::Incomplete);
+        assert_eq!(aborted.phase, TaskPhase::Aborted);
+        assert!(aborted.contract.no_early_stop);
+        assert!(!aborted.status.is_writable());
+        let termination = aborted.termination.as_ref().expect("termination metadata");
+        assert_eq!(termination.kind, TaskTerminationKind::Aborted);
+        assert_eq!(
+            termination.reason,
+            "user requested termination before completion"
+        );
+        assert_eq!(termination.session_status, HarnessSessionStatus::Paused);
+        assert!(harness.current_task().expect("current task").is_none());
+
+        let retry = harness
+            .abort_task(&task.id, "duplicate retry", HarnessSessionStatus::Paused)
+            .expect("idempotent abort");
+        assert_eq!(retry.status, TaskStatus::Incomplete);
+        assert_eq!(
+            retry.termination.as_ref().expect("termination").reason,
+            "user requested termination before completion"
+        );
     }
 
     #[test]

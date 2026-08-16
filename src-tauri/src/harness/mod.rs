@@ -8,8 +8,8 @@ mod tools_tests;
 
 pub use model::{
     ProjectState, TaskCompletionPolicy, TaskContract, TaskPhase, TaskRecoveryState,
-    TaskRecoveryStatus, TaskSession, TaskSlice, TaskSliceStatus, TaskStatus, TaskWorkingSet,
-    VerificationRequirement,
+    TaskRecoveryStatus, TaskSession, TaskSlice, TaskSliceStatus, TaskStatus, TaskTermination,
+    TaskTerminationKind, TaskWorkingSet, VerificationRequirement,
 };
 pub use state::Harness;
 pub use store::{HarnessError, HarnessResult, HarnessStore};

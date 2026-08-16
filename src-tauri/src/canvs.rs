@@ -475,6 +475,7 @@ mod tests {
             task_status(TaskStatus::CompletedUnverified),
             "completed_unverified"
         );
+        assert_eq!(task_status(TaskStatus::Incomplete), "incomplete");
     }
 
     #[test]

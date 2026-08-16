@@ -895,6 +895,158 @@ fn no_early_stop_forces_strict_completion_policy() {
 }
 
 #[test]
+fn strict_verifying_task_can_pause_and_abort_without_fake_completion() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+
+    let pause_started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "verifying pause regression"}),
+    );
+    let pause_task_id = pause_started["task"]["id"].as_str().expect("task id");
+    ctx.harness
+        .transition(pause_task_id, anchor_lib::harness::TaskStatus::Verifying)
+        .expect("enter verifying");
+    let paused = call_tool(&ctx, "pause_task", &json!({"task_id": pause_task_id}));
+    assert_eq!(paused["ok"], true);
+    assert_eq!(paused["task"]["status"], "paused");
+
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "strict user termination",
+            "pending_steps": ["unfinished verification"],
+            "contract": {"no_early_stop": true}
+        }),
+    );
+    assert_eq!(started["ok"], true);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let blocked = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(blocked["task_status"], "verifying");
+
+    let aborted = call_tool(
+        &ctx,
+        "abort_task",
+        &json!({
+            "task_id": task_id,
+            "reason": "user explicitly terminated the unfinished task",
+            "session_status": "paused"
+        }),
+    );
+    assert_eq!(aborted["ok"], true);
+    assert_eq!(aborted["task_status"], "incomplete");
+    assert_eq!(aborted["outcome"], "incomplete");
+    assert_eq!(aborted["closed"], true);
+    assert_eq!(aborted["task"]["phase"], "aborted");
+    assert_eq!(aborted["task"]["contract"]["no_early_stop"], true);
+    assert_eq!(
+        aborted["task"]["termination"]["reason"],
+        "user explicitly terminated the unfinished task"
+    );
+    assert_eq!(aborted["completion_gate"]["ready"], false);
+    assert_eq!(
+        ctx.harness.task(task_id).expect("persisted task").status,
+        anchor_lib::harness::TaskStatus::Incomplete
+    );
+}
+
+#[test]
+fn close_work_session_can_checkpoint_a_no_early_stop_task_as_incomplete() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "用户终止严格 Work Session",
+            "workspace_root": workspace.to_string_lossy(),
+            "phase": "verifying",
+            "pending_steps": ["unfinished"],
+            "contract": {"no_early_stop": true}
+        }),
+    );
+    assert_eq!(started["ok"], true);
+    let task_id = started["work_session"]["task_id"]
+        .as_str()
+        .expect("task id");
+
+    let missing_reason = call_tool(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "outcome": "incomplete",
+            "session_status": "paused"
+        }),
+    );
+    assert_eq!(missing_reason["ok"], false);
+    assert_eq!(missing_reason["error"]["code"], "INVALID_ARGUMENT");
+
+    let invalid_completed_session = call_tool(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "outcome": "incomplete",
+            "reason": "user requested termination",
+            "session_status": "completed"
+        }),
+    );
+    assert_eq!(invalid_completed_session["ok"], false);
+    assert_eq!(
+        invalid_completed_session["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+
+    let closed = call_tool(
+        &ctx,
+        "close_work_session",
+        &json!({
+            "task_id": task_id,
+            "outcome": "incomplete",
+            "reason": "user requested termination before task completion",
+            "session_status": "paused",
+            "summary": "terminated by user; unfinished work preserved",
+            "checkpoint": {
+                "remaining_issues": ["unfinished"],
+                "runtime_state": ["termination=terminated-by-user"]
+            }
+        }),
+    );
+    assert_eq!(closed["ok"], true);
+    assert_eq!(closed["work_session"]["closed"], true);
+    assert_eq!(closed["work_session"]["outcome"], "incomplete");
+    assert_eq!(closed["work_session"]["task_status"], "incomplete");
+    assert_eq!(closed["work_session"]["status"], "paused");
+    assert_eq!(closed["finish"]["outcome"], "incomplete");
+    assert_eq!(closed["task"]["phase"], "aborted");
+    assert_eq!(closed["task"]["contract"]["no_early_stop"], true);
+    assert_eq!(
+        closed["task"]["termination"]["reason"],
+        "user requested termination before task completion"
+    );
+
+    let strict_complete = call_tool(
+        &ctx,
+        "complete_work_session",
+        &json!({"task_id": task_id, "summary": "must not rewrite incomplete"}),
+    );
+    assert_eq!(strict_complete["ok"], false);
+    assert_eq!(
+        strict_complete["error"]["code"],
+        "WORK_SESSION_ALREADY_ABORTING"
+    );
+}
+
+#[test]
 fn begin_work_session_binds_session_and_task_idempotently() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -3480,6 +3632,72 @@ fn finish_task_rejects_running_and_terminal_unobserved_commands() {
     );
     assert_eq!(finished["ok"], true);
     assert_eq!(finished["closed"], true);
+}
+
+#[test]
+fn abort_task_rejects_pending_command_results_then_closes_incomplete() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "用户终止仍需先消费后台命令"}),
+    );
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let command = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": TEST_PYTHON,
+            "args": ["-u", "-c", "import time; print('pending', flush=True); time.sleep(0.3)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 5_000
+        }),
+    );
+    let command_session = command["session_id"].as_str().expect("command session");
+
+    let running = call_tool(
+        &ctx,
+        "abort_task",
+        &json!({"task_id": task_id, "reason": "user stop", "session_status": "paused"}),
+    );
+    assert_eq!(running["ok"], false);
+    assert_eq!(
+        running["error"]["code"],
+        "TASK_ABORT_COMMAND_RESULTS_PENDING"
+    );
+    assert_eq!(running["closed"], false);
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let terminal = call_tool(
+        &ctx,
+        "abort_task",
+        &json!({"task_id": task_id, "reason": "user stop", "session_status": "paused"}),
+    );
+    assert_eq!(terminal["ok"], false);
+    assert_eq!(
+        terminal["unobserved_terminal_sessions"][0]["session_id"],
+        command_session
+    );
+
+    let observed = call_tool(
+        &ctx,
+        "wait_command",
+        &json!({"session_id": command_session, "timeout_ms": 0}),
+    );
+    assert_eq!(observed["ok"], true);
+    assert_eq!(observed["result_observed"], true);
+
+    let aborted = call_tool(
+        &ctx,
+        "abort_task",
+        &json!({"task_id": task_id, "reason": "user stop", "session_status": "paused"}),
+    );
+    assert_eq!(aborted["ok"], true);
+    assert_eq!(aborted["task_status"], "incomplete");
+    assert_eq!(aborted["closed"], true);
 }
 
 #[test]

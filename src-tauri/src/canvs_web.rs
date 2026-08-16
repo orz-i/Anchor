@@ -274,6 +274,7 @@ fn status_label(status: &str) -> String {
         "paused" => "已暂停",
         "verifying" => "验证中",
         "failed" => "失败",
+        "incomplete" => "未完成终止",
         "completed" => "已完成",
         "completed_unverified" => "完成未验证",
         "rolled_back" => "已回滚",
@@ -286,7 +287,7 @@ fn status_class(status: &str) -> &'static str {
     match status {
         "active" | "completed" => "ok",
         "verifying" => "warn",
-        "failed" => "bad",
+        "failed" | "incomplete" => "bad",
         _ => "neutral",
     }
 }

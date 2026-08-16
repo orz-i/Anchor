@@ -202,6 +202,62 @@ fn finish_task_success_matches_published_output_schema() {
 }
 
 #[test]
+fn incomplete_abort_successes_match_published_output_schemas() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "start_task",
+        json!({"objective": "abort task schema contract"}),
+    );
+    assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let aborted = invoke(
+        &ctx,
+        "abort_task",
+        json!({
+            "task_id": task_id,
+            "reason": "user requested stop",
+            "session_status": "paused"
+        }),
+    );
+    assert_ok(&aborted);
+    assert_eq!(aborted["task_status"], "incomplete");
+    assert_eq!(aborted["outcome"], "incomplete");
+    assert_matches_output_schema("abort_task", &aborted);
+
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "begin_work_session",
+        json!({
+            "objective": "incomplete work session schema contract",
+            "workspace_root": fx.root.to_string_lossy(),
+            "contract": {"no_early_stop": true},
+            "pending_steps": ["unfinished"]
+        }),
+    );
+    assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+    let closed = invoke(
+        &ctx,
+        "close_work_session",
+        json!({
+            "task_id": task_id,
+            "outcome": "incomplete",
+            "reason": "user requested stop",
+            "session_status": "paused",
+            "summary": "incomplete output schema"
+        }),
+    );
+    assert_ok(&closed);
+    assert_eq!(closed["work_session"]["outcome"], "incomplete");
+    assert_eq!(closed["work_session"]["task_status"], "incomplete");
+    assert_matches_output_schema("close_work_session", &closed);
+}
+
+#[test]
 fn task_governance_successes_match_published_output_schemas() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
