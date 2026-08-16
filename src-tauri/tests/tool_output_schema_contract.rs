@@ -360,6 +360,76 @@ fn complete_work_session_success_matches_published_output_schema() {
 }
 
 #[test]
+fn incomplete_work_session_conflicts_preserve_business_errors_and_match_output_schemas() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "begin_work_session",
+        json!({
+            "objective": "incomplete work session conflict output schema",
+            "workspace_root": fx.root.to_string_lossy(),
+            "phase": "verifying",
+            "pending_steps": ["intentional unfinished work"],
+            "contract": {"no_early_stop": true}
+        }),
+    );
+    assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let aborted = invoke(
+        &ctx,
+        "abort_task",
+        json!({
+            "task_id": task_id,
+            "reason": "intentional schema conflict fixture",
+            "session_status": "paused"
+        }),
+    );
+    assert_ok(&aborted);
+    assert_eq!(aborted["task_status"], "incomplete");
+
+    let wrong_outcome = invoke(
+        &ctx,
+        "close_work_session",
+        json!({
+            "task_id": task_id,
+            "outcome": "completed",
+            "session_status": "paused"
+        }),
+    );
+    assert_err(&wrong_outcome);
+    assert_eq!(
+        wrong_outcome["error"]["code"],
+        "WORK_SESSION_TASK_INCOMPLETE"
+    );
+    assert_matches_output_schema("close_work_session", &wrong_outcome);
+
+    let closed = invoke(
+        &ctx,
+        "close_work_session",
+        json!({
+            "task_id": task_id,
+            "outcome": "incomplete",
+            "reason": "intentional schema conflict fixture",
+            "session_status": "paused"
+        }),
+    );
+    assert_ok(&closed);
+    assert_eq!(closed["work_session"]["outcome"], "incomplete");
+    assert_matches_output_schema("close_work_session", &closed);
+
+    let rewrite = invoke(
+        &ctx,
+        "complete_work_session",
+        json!({"task_id": task_id, "summary": "must not rewrite incomplete"}),
+    );
+    assert_err(&rewrite);
+    assert_eq!(rewrite["error"]["code"], "WORK_SESSION_ALREADY_ABORTING");
+    assert_matches_output_schema("complete_work_session", &rewrite);
+}
+
+#[test]
 fn retained_session_tools_match_published_output_schemas() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

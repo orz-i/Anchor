@@ -2328,7 +2328,10 @@ pub fn output_schema(name: &str) -> Value {
                 },
                 {
                     "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
-                    "then": { "required": ["closed", "phase", "finish", "checkpoint", "retryable", "error"] }
+                    "then": {
+                        "required": ["error"],
+                        "description": "Workflow failures may additionally expose closed/phase/finish/checkpoint/retryable. Direct validation or state-conflict failures use the standard structured tool error shape."
+                    }
                 }
             ],
             "additionalProperties": true
