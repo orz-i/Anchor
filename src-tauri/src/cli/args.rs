@@ -90,8 +90,12 @@ pub fn config_usage() -> &'static str {
   anchor config get <workspace> [--pending] [--key PATH]\n\
   anchor config diff <workspace> [--set PATH=VALUE ...]\n\
   anchor config set <workspace> --set PATH=VALUE [--set PATH=VALUE ...]\n\
-  anchor config apply <workspace> [--wait SECONDS]\n\n\
-config set 只写入待应用配置，不改变活动配置或运行态；config apply 才会持久化并协调 daemon/Gateway 运行态。PATH 使用序列化字段名，例如 runtime.local_port、auth.oauth_redirect_hosts、tunnel.type。"
+  anchor config apply <workspace> [--wait SECONDS]\n\
+  anchor config export <file> (--passphrase-file FILE|--passphrase-stdin) [--force]\n\
+  anchor config import <file> (--passphrase-file FILE|--passphrase-stdin)\n\
+      [--workspace-path WORKSPACE=ABSOLUTE_PATH ...] [--dry-run] [--force]\n\n\
+config set 只写入待应用配置，不改变活动配置或运行态；config apply 才会持久化并协调 daemon/Gateway 运行态。PATH 使用序列化字段名，例如 runtime.local_port、auth.oauth_redirect_hosts、tunnel.type。\n\
+config export/import 用于跨平台迁移完整配置与注册身份，也可简写为顶层 anchor export/import；迁移包中的 secrets 使用 passphrase 加密。import 会校验每个目标 Workspace 目录存在且为绝对目录，跨平台路径通过 --workspace-path 显式映射。"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,11 +124,41 @@ pub struct ConfigApplyOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationPassphraseInput {
+    File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigExportOptions {
+    pub output: PathBuf,
+    pub passphrase: MigrationPassphraseInput,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWorkspacePathMapping {
+    pub selector: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigImportOptions {
+    pub input: PathBuf,
+    pub passphrase: MigrationPassphraseInput,
+    pub workspace_paths: Vec<ConfigWorkspacePathMapping>,
+    pub dry_run: bool,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigCommand {
     Get(ConfigGetOptions),
     Diff(ConfigMutationOptions),
     Set(ConfigMutationOptions),
     Apply(ConfigApplyOptions),
+    Export(ConfigExportOptions),
+    Import(ConfigImportOptions),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +547,37 @@ fn parse_config_mutation(
     })
 }
 
+fn set_migration_passphrase_input(
+    target: &mut Option<MigrationPassphraseInput>,
+    value: MigrationPassphraseInput,
+) -> Result<(), String> {
+    if target.is_some() {
+        return Err(
+            "迁移 passphrase 输入方式只能选择一种：--passphrase-file 或 --passphrase-stdin".into(),
+        );
+    }
+    *target = Some(value);
+    Ok(())
+}
+
+fn parse_workspace_path_mapping(raw: String) -> Result<ConfigWorkspacePathMapping, String> {
+    let Some((selector, path)) = raw.split_once('=') else {
+        return Err("--workspace-path 必须使用 WORKSPACE=ABSOLUTE_PATH 格式".into());
+    };
+    let selector = selector.trim();
+    let path = path.trim();
+    if selector.is_empty() {
+        return Err("--workspace-path 的 WORKSPACE 不能为空".into());
+    }
+    if path.is_empty() {
+        return Err("--workspace-path 的 ABSOLUTE_PATH 不能为空".into());
+    }
+    Ok(ConfigWorkspacePathMapping {
+        selector: selector.to_string(),
+        path: PathBuf::from(path),
+    })
+}
+
 fn parse_config_command(args: &mut VecDeque<String>) -> Result<ConfigCommand, String> {
     match args.pop_front().as_deref() {
         Some("get") => {
@@ -554,6 +619,72 @@ fn parse_config_command(args: &mut VecDeque<String>) -> Result<ConfigCommand, St
             Ok(ConfigCommand::Apply(ConfigApplyOptions {
                 workspace,
                 wait_seconds,
+            }))
+        }
+        Some("export") => {
+            let output = PathBuf::from(pop_value(args, "config export")?);
+            let mut passphrase = None;
+            let mut force = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--passphrase-file" => set_migration_passphrase_input(
+                        &mut passphrase,
+                        MigrationPassphraseInput::File(PathBuf::from(pop_value(
+                            args,
+                            "--passphrase-file",
+                        )?)),
+                    )?,
+                    "--passphrase-stdin" => set_migration_passphrase_input(
+                        &mut passphrase,
+                        MigrationPassphraseInput::Stdin,
+                    )?,
+                    "--force" => force = true,
+                    other => return Err(format!("config export 不支持参数：{other}")),
+                }
+            }
+            Ok(ConfigCommand::Export(ConfigExportOptions {
+                output,
+                passphrase: passphrase.ok_or_else(|| {
+                    "config export 必须指定 --passphrase-file 或 --passphrase-stdin".to_string()
+                })?,
+                force,
+            }))
+        }
+        Some("import") => {
+            let input = PathBuf::from(pop_value(args, "config import")?);
+            let mut passphrase = None;
+            let mut workspace_paths = Vec::new();
+            let mut dry_run = false;
+            let mut force = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--passphrase-file" => set_migration_passphrase_input(
+                        &mut passphrase,
+                        MigrationPassphraseInput::File(PathBuf::from(pop_value(
+                            args,
+                            "--passphrase-file",
+                        )?)),
+                    )?,
+                    "--passphrase-stdin" => set_migration_passphrase_input(
+                        &mut passphrase,
+                        MigrationPassphraseInput::Stdin,
+                    )?,
+                    "--workspace-path" => workspace_paths.push(parse_workspace_path_mapping(
+                        pop_value(args, "--workspace-path")?,
+                    )?),
+                    "--dry-run" => dry_run = true,
+                    "--force" => force = true,
+                    other => return Err(format!("config import 不支持参数：{other}")),
+                }
+            }
+            Ok(ConfigCommand::Import(ConfigImportOptions {
+                input,
+                passphrase: passphrase.ok_or_else(|| {
+                    "config import 必须指定 --passphrase-file 或 --passphrase-stdin".to_string()
+                })?,
+                workspace_paths,
+                dry_run,
+                force,
             }))
         }
         Some(other) => Err(format!("未知 config 命令：{other}\n\n{}", config_usage())),
@@ -1349,6 +1480,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
             ensure_empty(&args, "doctor")?;
             Command::Doctor { workspace }
         }
+        Some("export") => {
+            args.push_front("export".into());
+            Command::Config(parse_config_command(&mut args)?)
+        }
+        Some("import") => {
+            args.push_front("import".into());
+            Command::Config(parse_config_command(&mut args)?)
+        }
         Some("config" | "cfg") => Command::Config(parse_config_command(&mut args)?),
         Some("frp") => Command::Frp(parse_frp_command(&mut args)?),
         Some("tunnel") => Command::Tunnel(parse_tunnel_command(&mut args)?),
@@ -1421,7 +1560,9 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] events <workspace|--control-plane> [-f] [--wait SECONDS]\n\
   anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
-  anchor [--config-dir PATH] [--json] config <get|diff|set|apply> ...\n\n\
+  anchor [--config-dir PATH] [--json] export <file> (--passphrase-file FILE|--passphrase-stdin) [--force]\n\
+  anchor [--config-dir PATH] [--json] import <file> (--passphrase-file FILE|--passphrase-stdin) [--workspace-path WORKSPACE=ABSOLUTE_PATH ...] [--dry-run] [--force]\n\n\
+  anchor [--config-dir PATH] [--json] config <get|diff|set|apply|export|import> ...\n\n\
   anchor [--config-dir PATH] [--json] frp <list|show|add|update|delete> ...\n\n\
   anchor [--config-dir PATH] [--json] tunnel <show|configure> ...\n\n\
   anchor [--config-dir PATH] [--json] software <list|install|uninstall> ...\n\n\
@@ -2174,6 +2315,103 @@ mod tests {
                 wait_seconds: 45,
             }))
         );
+    }
+
+    #[test]
+    fn parses_config_export_and_import_migration_options() {
+        let export = parse(strings(&[
+            "config",
+            "export",
+            "anchor-migration.json",
+            "--passphrase-file",
+            "migration.pass",
+            "--force",
+        ]))
+        .expect("config export");
+        assert_eq!(
+            export.command,
+            Command::Config(ConfigCommand::Export(ConfigExportOptions {
+                output: PathBuf::from("anchor-migration.json"),
+                passphrase: MigrationPassphraseInput::File(PathBuf::from("migration.pass")),
+                force: true,
+            }))
+        );
+
+        let top_level_export = parse(strings(&[
+            "export",
+            "anchor-migration.json",
+            "--passphrase-stdin",
+        ]))
+        .expect("top-level export alias");
+        assert_eq!(
+            top_level_export.command,
+            Command::Config(ConfigCommand::Export(ConfigExportOptions {
+                output: PathBuf::from("anchor-migration.json"),
+                passphrase: MigrationPassphraseInput::Stdin,
+                force: false,
+            }))
+        );
+
+        let import = parse(strings(&[
+            "config",
+            "import",
+            "anchor-migration.json",
+            "--passphrase-stdin",
+            "--workspace-path",
+            "workspace-id=/srv/anchor/project",
+            "--workspace-path",
+            "other=/srv/anchor/other",
+            "--dry-run",
+        ]))
+        .expect("config import");
+        assert_eq!(
+            import.command,
+            Command::Config(ConfigCommand::Import(ConfigImportOptions {
+                input: PathBuf::from("anchor-migration.json"),
+                passphrase: MigrationPassphraseInput::Stdin,
+                workspace_paths: vec![
+                    ConfigWorkspacePathMapping {
+                        selector: "workspace-id".into(),
+                        path: PathBuf::from("/srv/anchor/project"),
+                    },
+                    ConfigWorkspacePathMapping {
+                        selector: "other".into(),
+                        path: PathBuf::from("/srv/anchor/other"),
+                    },
+                ],
+                dry_run: true,
+                force: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn config_migration_requires_one_passphrase_source_and_valid_mapping_shape() {
+        let missing = parse(strings(&["config", "export", "migration.json"]))
+            .expect_err("export passphrase is required");
+        assert!(missing.contains("--passphrase-file"));
+
+        let duplicate = parse(strings(&[
+            "config",
+            "export",
+            "migration.json",
+            "--passphrase-file",
+            "migration.pass",
+            "--passphrase-stdin",
+        ]))
+        .expect_err("passphrase source must be unique");
+        assert!(duplicate.contains("只能选择一种"));
+
+        let malformed = parse(strings(&[
+            "config",
+            "import",
+            "migration.json",
+            "--passphrase-stdin",
+            "--workspace-path",
+            "workspace-without-path",
+        ]))
+        .expect_err("workspace mapping requires equals");
+        assert!(malformed.contains("WORKSPACE=ABSOLUTE_PATH"));
     }
 
     #[test]

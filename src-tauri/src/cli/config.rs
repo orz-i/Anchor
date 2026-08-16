@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,7 +10,10 @@ use serde_json::Value;
 use crate::auth::validate_redirect_policy;
 use crate::control::{self, ControlConfigApplyResult};
 use crate::daemon;
-use crate::data::{validate_workspace_profile, DataStore};
+use crate::data::{
+    export_portable_config, import_portable_config, validate_workspace_profile,
+    ConfigExportSummary, ConfigImportSummary, DataStore, WorkspacePathMapping,
+};
 use crate::error::{AppError, AppResult};
 use crate::gateway_control;
 use crate::gateway_daemon;
@@ -20,11 +24,13 @@ use crate::workspace::resources::validate_workspace_resources_update;
 use crate::workspace::WorkspaceProfile;
 
 use super::args::{
-    ConfigApplyOptions, ConfigAssignment, ConfigCommand, ConfigGetOptions, ConfigMutationOptions,
+    ConfigApplyOptions, ConfigAssignment, ConfigCommand, ConfigExportOptions, ConfigGetOptions,
+    ConfigImportOptions, ConfigMutationOptions, MigrationPassphraseInput,
 };
 
 const PENDING_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MIGRATION_PASSPHRASE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,13 +92,119 @@ pub(crate) struct ConfigApplyReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigExportReport {
+    event: &'static str,
+    registration_identity_preserved: bool,
+    #[serde(flatten)]
+    summary: ConfigExportSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigImportReport {
+    event: &'static str,
+    registration_identity_preserved: bool,
+    target_platform: &'static str,
+    #[serde(flatten)]
+    summary: ConfigImportSummary,
+}
+
 pub async fn execute(command: ConfigCommand, as_json: bool) -> AppResult<i32> {
     match command {
         ConfigCommand::Get(options) => get_config(options, as_json).map(|_| 0),
         ConfigCommand::Diff(options) => diff_config(options, as_json).map(|_| 0),
         ConfigCommand::Set(options) => set_config(options, as_json).map(|_| 0),
         ConfigCommand::Apply(options) => apply_config(options, as_json).await.map(|_| 0),
+        ConfigCommand::Export(options) => export_config(options, as_json).map(|_| 0),
+        ConfigCommand::Import(options) => import_config(options, as_json).map(|_| 0),
     }
+}
+
+fn export_config(options: ConfigExportOptions, as_json: bool) -> AppResult<()> {
+    let passphrase = read_migration_passphrase(&options.passphrase)?;
+    let summary = export_portable_config(&options.output, &passphrase, options.force)?;
+    print_report(
+        &ConfigExportReport {
+            event: "config_export",
+            registration_identity_preserved: true,
+            summary,
+        },
+        as_json,
+    )
+}
+
+fn import_config(options: ConfigImportOptions, as_json: bool) -> AppResult<()> {
+    let passphrase = read_migration_passphrase(&options.passphrase)?;
+    let mappings = options
+        .workspace_paths
+        .into_iter()
+        .map(|mapping| WorkspacePathMapping {
+            selector: mapping.selector,
+            target: mapping.path,
+        })
+        .collect::<Vec<_>>();
+    let summary = import_portable_config(
+        &options.input,
+        &passphrase,
+        &mappings,
+        options.dry_run,
+        options.force,
+    )?;
+    print_report(
+        &ConfigImportReport {
+            event: "config_import",
+            registration_identity_preserved: true,
+            target_platform: std::env::consts::OS,
+            summary,
+        },
+        as_json,
+    )
+}
+
+fn read_migration_passphrase(input: &MigrationPassphraseInput) -> AppResult<Vec<u8>> {
+    let mut bytes = match input {
+        MigrationPassphraseInput::File(path) => {
+            let metadata = fs::metadata(path).map_err(|error| {
+                AppError::Message(format!(
+                    "无法读取迁移 passphrase 文件 {}：{error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(AppError::Message(format!(
+                    "迁移 passphrase 路径必须是普通文件：{}",
+                    path.display()
+                )));
+            }
+            if metadata.len() > MAX_MIGRATION_PASSPHRASE_BYTES {
+                return Err(AppError::Message(format!(
+                    "迁移 passphrase 文件超过 {} KiB 上限",
+                    MAX_MIGRATION_PASSPHRASE_BYTES / 1024
+                )));
+            }
+            fs::read(path)?
+        }
+        MigrationPassphraseInput::Stdin => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(MAX_MIGRATION_PASSPHRASE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_MIGRATION_PASSPHRASE_BYTES {
+                return Err(AppError::Message(format!(
+                    "stdin 中的迁移 passphrase 超过 {} KiB 上限",
+                    MAX_MIGRATION_PASSPHRASE_BYTES / 1024
+                )));
+            }
+            bytes
+        }
+    };
+
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    Ok(bytes)
 }
 
 fn get_config(options: ConfigGetOptions, as_json: bool) -> AppResult<()> {
