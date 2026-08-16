@@ -865,6 +865,10 @@ fn begin_work_session(
     let configuration = parse_task_configuration(args)?;
     let completed_steps = string_list(args.get("completed_steps"))?;
     let pending_steps = string_list(args.get("pending_steps"))?;
+    let create_if_missing = args
+        .get("create_if_missing")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let session_state = crate::tools::session::open(ctx, args)?;
     let session_id = session_state
         .get("session_id")
@@ -875,26 +879,61 @@ fn begin_work_session(
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("SESSION_INVALID", "Session 缺少 session_path"))?;
 
+    let tasks = ctx.harness.list_tasks().map_err(map_error)?;
     let explicit_task = ctx.bound_task_for_session(mcp_session_id).filter(|task| {
         task.session_id.as_deref() == Some(session_id)
             && task.session_path.as_deref() == Some(session_path)
     });
-    let session_task = ctx
-        .harness
-        .list_tasks()
-        .map_err(map_error)?
-        .into_iter()
+    let session_task = tasks
+        .iter()
         .find(|task| {
             task.status.is_writable()
                 && task.objective == objective
                 && task.session_id.as_deref() == Some(session_id)
                 && task.session_path.as_deref() == Some(session_path)
-        });
+        })
+        .cloned();
+    let existing_session_tasks = tasks
+        .iter()
+        .filter(|task| {
+            task.session_id.as_deref() == Some(session_id)
+                && task.session_path.as_deref() == Some(session_path)
+        })
+        .map(|task| {
+            json!({
+                "task_id": task.id,
+                "objective": task.objective,
+                "status": task.status,
+                "phase": task.phase,
+                "workspace_mode": task_workspace_mode(task),
+                "git_worktree": task.git_worktree.as_ref().map(|worktree| &worktree.path)
+            })
+        })
+        .collect::<Vec<_>>();
     let selected_task = session_task.or(explicit_task);
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
             validate_requested_workspace_mode(args, &task)?;
             if task.objective != objective {
+                if !create_if_missing {
+                    return Err(WorkspaceError::ToolDetails {
+                        code: "WORK_SESSION_TASK_CONFLICT",
+                        message: "The existing Session is bound to a different writable Harness Task, and create_if_missing=false forbids creating a replacement Task/worktree.".into(),
+                        category: "conflict",
+                        retryable: false,
+                        details: json!({
+                            "session_id": session_id,
+                            "session_path": session_path,
+                            "requested_objective": objective,
+                            "existing_task_id": task.id,
+                            "existing_objective": task.objective,
+                            "existing_status": task.status,
+                            "existing_phase": task.phase,
+                            "existing_workspace_mode": task_workspace_mode(&task),
+                            "create_if_missing": false
+                        }),
+                    });
+                }
                 let previous_task_id = task.id.clone();
                 let next = start_task_for_workspace_mode(ctx, objective, args)?;
                 (next, true, Some(previous_task_id))
@@ -904,11 +943,29 @@ fn begin_work_session(
                 (task, false, None)
             }
         }
-        None => (
-            start_task_for_workspace_mode(ctx, objective, args)?,
-            true,
-            None,
-        ),
+        None => {
+            if !create_if_missing {
+                return Err(WorkspaceError::ToolDetails {
+                    code: "WORK_SESSION_TASK_NOT_FOUND",
+                    message: "The Session exists, but no matching writable Harness Task is available and create_if_missing=false forbids creating a new Task/worktree.".into(),
+                    category: "not_found",
+                    retryable: false,
+                    details: json!({
+                        "session_id": session_id,
+                        "session_path": session_path,
+                        "requested_objective": objective,
+                        "create_if_missing": false,
+                        "existing_session_tasks": existing_session_tasks,
+                        "suggestion": "Inspect the existing terminal task directly, or set create_if_missing=true only when a genuinely new Task/worktree is intended."
+                    }),
+                });
+            }
+            (
+                start_task_for_workspace_mode(ctx, objective, args)?,
+                true,
+                None,
+            )
+        }
     };
     let mut task = ctx
         .harness
@@ -1881,7 +1938,10 @@ fn start_task_for_workspace_mode(
                 base_ref,
                 remove_on_close,
             )?;
-            ensure_writer_handoff_available(ctx, None, Some(&worktree.path))?;
+            if let Err(error) = ensure_writer_handoff_available(ctx, None, Some(&worktree.path)) {
+                let _ = crate::tools::git::remove_managed_task_worktree(&ctx.workspace, &worktree);
+                return Err(error);
+            }
             match ctx
                 .harness
                 .start_task_in_git_worktree(objective, task_id, worktree.clone())

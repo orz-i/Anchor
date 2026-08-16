@@ -1044,6 +1044,211 @@ fn close_work_session_can_checkpoint_a_no_early_stop_task_as_incomplete() {
         strict_complete["error"]["code"],
         "WORK_SESSION_ALREADY_ABORTING"
     );
+
+    let completion_failures = call_tool(
+        &ctx,
+        "operation_log",
+        &json!({
+            "task_id": task_id,
+            "tool": "complete_work_session",
+            "failures_only": true,
+            "collapse": false,
+            "limit": 20
+        }),
+    );
+    assert_eq!(completion_failures["ok"], true, "{completion_failures}");
+    assert!(completion_failures["operations"]
+        .as_array()
+        .is_some_and(|operations| operations.iter().any(|operation| {
+            operation["status"] == "failed"
+                && operation["error_code"] == "WORK_SESSION_ALREADY_ABORTING"
+        })));
+}
+
+#[test]
+fn begin_work_session_create_if_missing_false_never_creates_replacement_task_or_worktree() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "recovery-only begin\n").expect("写入文件");
+    fs::write(
+        workspace.join(".gitignore"),
+        "/.anchor/worktrees/\n/docs/session/\n",
+    )
+    .expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let caller = "begin-recovery-no-create";
+    let objective = "恢复已终止的隔离任务";
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": objective,
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": false
+        }),
+        caller,
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let task_id = started["task"]["id"].as_str().expect("task id").to_string();
+    let session_id = started["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let worktree_path = std::path::PathBuf::from(
+        started["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    assert!(worktree_path.is_dir());
+
+    let aborted = call_tool_for_session(
+        &ctx,
+        "abort_task",
+        &json!({
+            "task_id": task_id,
+            "reason": "fixture terminal task",
+            "session_status": "paused"
+        }),
+        caller,
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    assert_eq!(aborted["task_status"], "incomplete");
+
+    let task_count_before = ctx.harness.list_tasks().expect("tasks before").len();
+    let worktrees_before = call_tool(&ctx, "git_worktree_list", &json!({}));
+    assert_eq!(worktrees_before["ok"], true, "{worktrees_before}");
+    let worktree_count_before = worktrees_before["count"].as_u64().expect("worktree count");
+
+    let recovery_only = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": objective,
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "session_id": session_id,
+            "create_if_missing": false
+        }),
+        caller,
+    );
+    assert_eq!(recovery_only["ok"], false, "{recovery_only}");
+    assert_eq!(
+        recovery_only["error"]["code"],
+        "WORK_SESSION_TASK_NOT_FOUND"
+    );
+    assert_eq!(
+        recovery_only["error"]["details"]["create_if_missing"],
+        false
+    );
+    assert!(recovery_only["error"]["details"]["existing_session_tasks"]
+        .as_array()
+        .is_some_and(|tasks| tasks
+            .iter()
+            .any(|task| { task["task_id"] == task_id && task["status"] == "incomplete" })));
+    assert_eq!(
+        ctx.harness.list_tasks().expect("tasks after").len(),
+        task_count_before
+    );
+    let worktrees_after = call_tool(&ctx, "git_worktree_list", &json!({}));
+    assert_eq!(worktrees_after["ok"], true, "{worktrees_after}");
+    assert_eq!(worktrees_after["count"], worktree_count_before);
+    assert!(worktree_path.is_dir());
+}
+
+#[test]
+fn aborted_worktree_task_releases_remove_guard_and_initial_conflict_is_logged() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "abort then cleanup\n").expect("写入文件");
+    fs::write(
+        workspace.join(".gitignore"),
+        "/.anchor/worktrees/\n/docs/session/\n",
+    )
+    .expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let caller = "abort-worktree-cleanup";
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "终止后释放 worktree remove guard",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": false
+        }),
+        caller,
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let task_id = started["task"]["id"].as_str().expect("task id").to_string();
+    let managed_path = format!(".anchor/worktrees/{task_id}");
+    let worktree_path = std::path::PathBuf::from(
+        started["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+
+    let blocked = call_tool_for_session(
+        &ctx,
+        "git_worktree_remove",
+        &json!({"path": managed_path}),
+        caller,
+    );
+    assert_eq!(blocked["ok"], false, "{blocked}");
+    assert_eq!(blocked["error"]["code"], "GIT_WORKTREE_IN_USE");
+    assert_eq!(blocked["error"]["retryable"], true);
+    assert_eq!(blocked["error"]["details"]["blocking_task_ids"][0], task_id);
+    assert!(blocked.get("operation_id").is_some(), "{blocked}");
+    assert!(blocked.get("task_recovery").is_none(), "{blocked}");
+
+    let conflict_log = call_tool_for_session(
+        &ctx,
+        "operation_log",
+        &json!({
+            "task_id": task_id,
+            "tool": "git_worktree_remove",
+            "failures_only": true,
+            "collapse": false,
+            "limit": 20
+        }),
+        caller,
+    );
+    assert_eq!(conflict_log["ok"], true, "{conflict_log}");
+    assert!(conflict_log["operations"]
+        .as_array()
+        .is_some_and(|operations| operations.iter().any(|operation| {
+            operation["status"] == "failed" && operation["error_code"] == "GIT_WORKTREE_IN_USE"
+        })));
+
+    let aborted = call_tool_for_session(
+        &ctx,
+        "abort_task",
+        &json!({
+            "task_id": task_id,
+            "reason": "user terminated unfinished work",
+            "session_status": "paused"
+        }),
+        caller,
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    assert_eq!(aborted["task_status"], "incomplete");
+
+    let removed = call_tool_for_session(
+        &ctx,
+        "git_worktree_remove",
+        &json!({"path": format!(".anchor/worktrees/{task_id}")}),
+        caller,
+    );
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(!worktree_path.exists());
 }
 
 #[test]

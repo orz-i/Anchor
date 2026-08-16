@@ -226,6 +226,13 @@ fn track_task_recovery(
     {
         return;
     }
+    if tool == "git_worktree_remove"
+        && error_code == Some("GIT_WORKTREE_IN_USE")
+        && !workspace_mutated
+        && !explicit_retry_identity
+    {
+        return;
+    }
     let rollback_status = if workspace_mutated {
         "required"
     } else {
@@ -358,7 +365,7 @@ fn worktree_remove_task_conflict(ctx: &ToolContext, args: &Value) -> Option<Valu
         }
     };
     let candidate = candidate.canonicalize().unwrap_or(candidate);
-    let blocking_task_ids = ctx
+    let blocking_tasks = ctx
         .harness
         .list_tasks()
         .unwrap_or_default()
@@ -373,18 +380,44 @@ fn worktree_remove_task_conflict(ctx: &ToolContext, args: &Value) -> Option<Valu
                 })
                 .unwrap_or(false)
         })
-        .map(|task| task.id)
+        .map(|task| {
+            json!({
+                "task_id": task.id,
+                "status": task.status,
+                "phase": task.phase,
+                "objective": task.objective,
+                "session_id": task.session_id
+            })
+        })
         .collect::<Vec<_>>();
-    (!blocking_task_ids.is_empty()).then(|| {
-        tool_err_code(
-            "GIT_WORKTREE_IN_USE",
-            format!(
-                "The worktree is still attached to writable task(s): {}",
-                blocking_task_ids.join(", ")
-            ),
-            "conflict",
-        )
-    })
+    if blocking_tasks.is_empty() {
+        return None;
+    }
+    let blocking_task_ids = blocking_tasks
+        .iter()
+        .filter_map(|task| task.get("task_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let message = format!(
+        "The worktree is still attached to writable task(s): {}",
+        blocking_task_ids.join(", ")
+    );
+    Some(json!({
+        "ok": false,
+        "status": "error",
+        "summary": message,
+        "error": {
+            "code": "GIT_WORKTREE_IN_USE",
+            "message": message,
+            "category": "conflict",
+            "retryable": true,
+            "details": {
+                "blocking_task_ids": blocking_task_ids,
+                "blocking_tasks": blocking_tasks,
+                "required_action": "Close the blocking Harness Task as completed or incomplete before removing its managed worktree.",
+                "incomplete_path": "For user-terminated unfinished work, use task operation=abort or close_work_session outcome=incomplete, then retry worktree_remove."
+            }
+        }
+    }))
 }
 
 fn normalize_exec_preflight_result(
@@ -1207,76 +1240,86 @@ fn call_tool_impl(
     };
 
     let ws = &ctx.workspace;
-    if name == "git_worktree_remove" {
-        if let Some(error) = worktree_remove_task_conflict(ctx, &effective_args) {
-            return error;
-        }
-    }
-    let result = match name {
-        "session_open" => session::open(ctx, &effective_args),
-        "session_checkpoint" => session::checkpoint(ctx, &effective_args, session_id),
-        "session_list" => session::list(ctx, &effective_args),
-        "session_get" => session::get(ctx, &effective_args),
-        "session_validate" => session::validate(ctx, &effective_args),
-        "server_info" => server_info_for_session(ctx, session_id),
-        "list_skills" => crate::skills::list_tool(ctx, &effective_args),
-        "load_skill" => crate::skills::load_tool(ctx, &effective_args),
-        "read_skill_resource" => crate::skills::read_resource_tool(&ctx.skills, &effective_args),
-        "check_exec_environment" => check_exec_environment(ctx),
-        "exec_health_check" => exec::exec_health_check(ctx),
-        "command_cost_explain" => exec::command_cost_explain(ctx, &effective_args),
-        "get_default_cwd" => get_default_cwd_for_session(ctx, session_id),
-        "set_default_cwd" => set_default_cwd_for_session(ctx, session_id, &effective_args),
-        "read_file" => file::read_file(ws, &effective_args, cancellation),
-        "list_dir" => file::list_dir(ws, &effective_args, cancellation),
-        "list_files" => file::list_files(ws, &effective_args, cancellation),
-        "search_text" => file::search_text(ws, &effective_args, cancellation),
-        "patch_check" => patch::patch_check_with_cancellation(ctx, &effective_args, cancellation),
-        "apply_patch" => patch::apply_patch_with_cancellation(ctx, &effective_args, cancellation),
-        "remove_path" => recovery::remove_path(ctx, &effective_args),
-        "exec_command" => exec::exec_command_with_cancellation(
-            ctx,
-            &effective_args,
-            cancellation,
-            active_task.as_ref().map(|task| task.id.as_str()),
-            session_id,
-        ),
-        "read_output" => command_session::read_output(&ctx.sessions, &effective_args),
-        "write_stdin" => command_session::write_stdin(&ctx.sessions, &effective_args),
-        "wait_command" => command_session::wait_command(&ctx.sessions, &effective_args),
-        "list_command_sessions" => {
-            command_session::list_command_sessions(&ctx.sessions, &effective_args)
-        }
-        "kill_session" => command_session::kill_session(&ctx.sessions, &effective_args),
-        "git_status" => git::git_status(ws, &effective_args),
-        "git_worktree_list" => git::git_worktree_list(ws, &effective_args),
-        "git_worktree_create" => git::git_worktree_create(ws, &effective_args),
-        "git_worktree_remove" => {
-            git::git_worktree_remove(ws, &effective_args, ctx.policy.skip_permission_gates())
-        }
-        "git_worktree_prune" => git::git_worktree_prune(ws, &effective_args),
-        "git_stage" => git::git_stage(ws, &effective_args),
-        "git_commit" => git::git_commit(ws, &effective_args),
-        "git_restore" => git::git_restore(ws, &effective_args),
-        "git_reset" => git::git_reset(ws, &effective_args, ctx.policy.skip_permission_gates()),
-        "git_revert" => git::git_revert(ws, &effective_args),
-        "git_clean" => git::git_clean(ws, &effective_args, ctx.policy.skip_permission_gates()),
-        "git_diff" => git::git_diff(ws, &effective_args),
-        "git_log" => git::git_log(ws, &effective_args),
-        "git_show" => git::git_show(ws, &effective_args),
-        "git_blame" => git::git_blame(ws, &effective_args),
-        "view_image" => image_tool::view_image(ws, &effective_args),
-        _ => {
-            return tool_err_code(
-                "INVALID_ARGUMENT",
-                format!("Unknown tool: {name}"),
-                "validation",
-            )
-        }
+    let preflight_output = if name == "git_worktree_remove" {
+        worktree_remove_task_conflict(ctx, &effective_args)
+    } else {
+        None
     };
-    let mut output = match result {
-        Ok(v) => v,
-        Err(e) => tool_err(e),
+    let mut output = if let Some(output) = preflight_output {
+        output
+    } else {
+        let result = match name {
+            "session_open" => session::open(ctx, &effective_args),
+            "session_checkpoint" => session::checkpoint(ctx, &effective_args, session_id),
+            "session_list" => session::list(ctx, &effective_args),
+            "session_get" => session::get(ctx, &effective_args),
+            "session_validate" => session::validate(ctx, &effective_args),
+            "server_info" => server_info_for_session(ctx, session_id),
+            "list_skills" => crate::skills::list_tool(ctx, &effective_args),
+            "load_skill" => crate::skills::load_tool(ctx, &effective_args),
+            "read_skill_resource" => {
+                crate::skills::read_resource_tool(&ctx.skills, &effective_args)
+            }
+            "check_exec_environment" => check_exec_environment(ctx),
+            "exec_health_check" => exec::exec_health_check(ctx),
+            "command_cost_explain" => exec::command_cost_explain(ctx, &effective_args),
+            "get_default_cwd" => get_default_cwd_for_session(ctx, session_id),
+            "set_default_cwd" => set_default_cwd_for_session(ctx, session_id, &effective_args),
+            "read_file" => file::read_file(ws, &effective_args, cancellation),
+            "list_dir" => file::list_dir(ws, &effective_args, cancellation),
+            "list_files" => file::list_files(ws, &effective_args, cancellation),
+            "search_text" => file::search_text(ws, &effective_args, cancellation),
+            "patch_check" => {
+                patch::patch_check_with_cancellation(ctx, &effective_args, cancellation)
+            }
+            "apply_patch" => {
+                patch::apply_patch_with_cancellation(ctx, &effective_args, cancellation)
+            }
+            "remove_path" => recovery::remove_path(ctx, &effective_args),
+            "exec_command" => exec::exec_command_with_cancellation(
+                ctx,
+                &effective_args,
+                cancellation,
+                active_task.as_ref().map(|task| task.id.as_str()),
+                session_id,
+            ),
+            "read_output" => command_session::read_output(&ctx.sessions, &effective_args),
+            "write_stdin" => command_session::write_stdin(&ctx.sessions, &effective_args),
+            "wait_command" => command_session::wait_command(&ctx.sessions, &effective_args),
+            "list_command_sessions" => {
+                command_session::list_command_sessions(&ctx.sessions, &effective_args)
+            }
+            "kill_session" => command_session::kill_session(&ctx.sessions, &effective_args),
+            "git_status" => git::git_status(ws, &effective_args),
+            "git_worktree_list" => git::git_worktree_list(ws, &effective_args),
+            "git_worktree_create" => git::git_worktree_create(ws, &effective_args),
+            "git_worktree_remove" => {
+                git::git_worktree_remove(ws, &effective_args, ctx.policy.skip_permission_gates())
+            }
+            "git_worktree_prune" => git::git_worktree_prune(ws, &effective_args),
+            "git_stage" => git::git_stage(ws, &effective_args),
+            "git_commit" => git::git_commit(ws, &effective_args),
+            "git_restore" => git::git_restore(ws, &effective_args),
+            "git_reset" => git::git_reset(ws, &effective_args, ctx.policy.skip_permission_gates()),
+            "git_revert" => git::git_revert(ws, &effective_args),
+            "git_clean" => git::git_clean(ws, &effective_args, ctx.policy.skip_permission_gates()),
+            "git_diff" => git::git_diff(ws, &effective_args),
+            "git_log" => git::git_log(ws, &effective_args),
+            "git_show" => git::git_show(ws, &effective_args),
+            "git_blame" => git::git_blame(ws, &effective_args),
+            "view_image" => image_tool::view_image(ws, &effective_args),
+            _ => {
+                return tool_err_code(
+                    "INVALID_ARGUMENT",
+                    format!("Unknown tool: {name}"),
+                    "validation",
+                )
+            }
+        };
+        match result {
+            Ok(v) => v,
+            Err(e) => tool_err(e),
+        }
     };
     if name == "wait_command" {
         ctx.update_command_output_cursor(

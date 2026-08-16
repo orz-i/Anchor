@@ -246,7 +246,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "begin_work_session",
         "Begin work session",
-        "[anchor-core] Open or resume only the current isolated Session and bind it to a shared-checkout task by default or an explicitly requested isolated Git worktree task.",
+        "[anchor-core] Open or resume only the current isolated Session and bind it to a shared-checkout task by default or an explicitly requested isolated Git worktree task. With create_if_missing=false this is recovery-only: Anchor must not create a Session, Harness Task, or Git worktree.",
         false,
         false,
         false,
@@ -3037,7 +3037,7 @@ pub fn input_schema(name: &str) -> Value {
                 "pending_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "title": { "type": "string", "maxLength": 200 },
-                "create_if_missing": { "type": "boolean", "default": true },
+                "create_if_missing": { "type": "boolean", "default": true, "description": "When false, recover an already-existing Session + writable Harness Task only. Never create a replacement Task or Git worktree; return a structured not-found/conflict error instead." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
