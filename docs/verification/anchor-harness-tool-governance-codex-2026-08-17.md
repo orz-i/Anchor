@@ -87,3 +87,49 @@ Anchor 当前命令执行仍明确报告 `execution_boundary=policy_only`、`san
 3. 改为 production library 与 integration target 后，本轮相关实现和公共调用链均可编译并通过测试。
 
 最终收口阶段会继续运行当前环境可执行的 Harness、catalog/contract、Clippy、前端 check/build 与 Git 完整性验证，并把上述平台前置条件作为独立限制保留。
+
+## S4 最终收口结果
+
+最终验证全部在同一 worktree、同一 Harness Task 下执行；所有 retained command 的终态均已显式消费。
+
+### Rust / Harness
+
+- `cargo fmt --all -- --check`：passed。
+- `cargo clippy --no-default-features --features cli --lib`：passed。
+- `pnpm cli:build`：passed，release profile 构建完成。
+- 7 个可在当前 Linux 环境独立编译的 integration targets 合计 **156 passed / 0 failed**：
+  - `call_tool_contract`：36 passed；
+  - `call_tool_security`：26 passed；
+  - `config_migration_cli`：2 passed；
+  - `harness_state`：4 passed；
+  - `harness_tool_contract`：68 passed；
+  - `session`：11 passed；
+  - `tool_output_schema_contract`：9 passed。
+
+这组测试覆盖了本轮治理本身，也覆盖 worktree、Recovery、并行任务、command session、session checkpoint、output schema、security policy 和配置迁移等相邻契约。
+
+### Frontend
+
+- `pnpm check`：passed，最终 `svelte-check found 0 errors and 0 warnings`。
+- `pnpm build`：passed，adapter-static 成功写出 `build`。
+- 两条命令在 SvelteKit 生成 `.svelte-kit/tsconfig.json` 前会打印已有的 esbuild “Cannot find base config file” 瞬时 warning；最终 sync/check/build 均成功，因此该 warning 不影响本轮结果，但未在本轮 Harness 治理中扩展处理。
+
+### 已知 warning / 平台限制
+
+- CLI/headless Rust production target 当前仍有仓库既有 Linux 条件编译 warning；Clippy 成功，但不是 `-D warnings` clean。本轮没有新增这些 warning，也没有为了顺手清 warning 扩大 Harness 治理变更范围。
+- desktop all-features 仍受当前主机缺少 `glib-2.0` / GTK development package 阻塞。
+- library `cfg(test)` all-targets 仍受两处既有 Linux 平台测试编译问题阻塞；integration targets 已绕过该既有 unit-target 问题并完整验证公共工具链。
+
+### Live facade 复核补充
+
+收口期间，当前仍运行旧 Catalog 的 Anchor 插件又复现了一次同类 facade schema 问题：`environment.health` 的联合 schema 对调用方暴露了 `timeout_ms`，而 canonical `exec_health_check` 随后以 `unexpected property $.timeout_ms` 拒绝。Catalog 38 的 generic operation applicability + delegated diagnostics 不是只修 Git，而是覆盖所有 domain facade，因此该现象会随新版本一起获得相同治理。
+
+## 结论
+
+本轮没有继续增加 facade 或把更多能力机械合并到“大工具”中。治理重点转为：
+
+1. **低工具数量不再以模糊 operation schema 为代价**；
+2. **Recovery 只跟踪真正执行/变更/验证失败的恢复语义，而不是普通探测错误**；
+3. **保留既有 facade 调用形状和 `INVALID_TOOL_ARGUMENTS` 错误码兼容**；
+4. **对 sandbox 能力保持真实声明**，不把 `policy_only` 伪装成 OS enforcement；
+5. **用 integration contract 固化治理边界**，防止未来 Catalog 收敛再次引入 schema/leaf 漂移。
