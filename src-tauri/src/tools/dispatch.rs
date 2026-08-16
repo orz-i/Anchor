@@ -942,7 +942,9 @@ fn call_tool_impl(
                 .and_then(Value::as_str)
                 .unwrap_or("operation-specific argument validation failed");
             let mut output = tool_err(WorkspaceError::ToolDetails {
-                code: "INVALID_FACADE_ARGUMENTS",
+                // Preserve the established public validation error code while enriching the
+                // facade-specific diagnostics below. Cached clients may branch on this code.
+                code: "INVALID_TOOL_ARGUMENTS",
                 message: format!("Invalid arguments for {name}.{operation}: {canonical_message}"),
                 category: "validation",
                 retryable: false,
@@ -950,6 +952,7 @@ fn call_tool_impl(
                     "stage": "facade_operation_schema",
                     "facade": name,
                     "operation": operation,
+                    "reason": "facade_operation_arguments_invalid",
                     "delegated_tool": delegated_tool,
                     "allowed_arguments": allowed_arguments,
                     "required_arguments": required_arguments,

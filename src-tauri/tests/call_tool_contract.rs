@@ -132,6 +132,55 @@ fn git_facade_routes_to_existing_git_contracts() {
     let invalid_stage = assert_err(&invalid_stage);
     assert_eq!(invalid_stage["operation"], "stage");
     assert_eq!(invalid_stage["error"]["code"], "INVALID_TOOL_ARGUMENTS");
+    assert_eq!(
+        invalid_stage["error"]["details"]["required_arguments"],
+        json!(["paths"])
+    );
+}
+
+#[test]
+fn git_facade_describes_and_reports_operation_specific_arguments() {
+    let tools = list_tools_for_profile("core");
+    let git = tools
+        .iter()
+        .find(|tool| tool["name"] == "git")
+        .expect("git facade");
+    assert_eq!(
+        git["inputSchema"]["properties"]["include_ignored"]["description"],
+        "Valid only for git operation(s): clean."
+    );
+    assert!(git["inputSchema"]["properties"]["operation"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("Do not send arguments")));
+
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let mismatch = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "status", "include_ignored": false}),
+    );
+    let mismatch = assert_err(&mismatch);
+    assert_eq!(mismatch["facade"], "git");
+    assert_eq!(mismatch["operation"], "status");
+    assert_eq!(mismatch["error"]["code"], "INVALID_TOOL_ARGUMENTS");
+    assert_eq!(
+        mismatch["error"]["details"]["stage"],
+        "facade_operation_schema"
+    );
+    assert_eq!(
+        mismatch["error"]["details"]["reason"],
+        "facade_operation_arguments_invalid"
+    );
+    let allowed = mismatch["error"]["details"]["allowed_arguments"]
+        .as_array()
+        .expect("allowed arguments");
+    assert!(!allowed.iter().any(|value| value == "include_ignored"));
+    assert!(allowed.iter().any(|value| value == "include_untracked"));
+    assert_eq!(
+        mismatch["error"]["details"]["canonical_error"]["code"],
+        "INVALID_TOOL_ARGUMENTS"
+    );
 }
 
 #[test]
@@ -169,6 +218,10 @@ fn harness_facades_delegate_to_existing_task_slice_and_commit_stage_contracts() 
     let invalid_start = invoke(&ctx, "task", json!({"operation": "start"}));
     let invalid_start = assert_err(&invalid_start);
     assert_eq!(invalid_start["error"]["code"], "INVALID_TOOL_ARGUMENTS");
+    assert_eq!(
+        invalid_start["error"]["details"]["required_arguments"],
+        json!(["objective"])
+    );
 
     let started = invoke(
         &ctx,
@@ -203,6 +256,63 @@ fn harness_facades_delegate_to_existing_task_slice_and_commit_stage_contracts() 
         invalid_commit_stage["error"]["code"],
         "INVALID_TOOL_ARGUMENTS"
     );
+}
+
+#[test]
+fn command_discovery_failure_does_not_open_task_recovery() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("command discovery recovery boundary")
+        .expect("start task");
+
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": "which anchor-definitely-missing-program"}),
+    );
+    let result = assert_err(&result);
+    assert_eq!(result["error"]["code"], "COMMAND_NOT_FOUND");
+    assert_eq!(result["execution_started"], false);
+    assert!(result.get("task_recovery").is_none(), "{result}");
+    assert!(ctx
+        .harness
+        .task(&task.id)
+        .expect("reload task")
+        .recovery
+        .is_none());
+}
+
+#[test]
+fn command_that_started_and_failed_still_opens_task_recovery() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("started command recovery boundary")
+        .expect("start task");
+
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "raise SystemExit(7)"],
+            "timeout_ms": 10_000,
+            "yield_time_ms": 10_000
+        }),
+    );
+    let result = assert_err(&result);
+    assert_eq!(result["execution_started"], true);
+    assert_eq!(result["exit_code"], 7);
+    assert_eq!(result["task_recovery"]["status"], "open");
+    assert!(ctx
+        .harness
+        .task(&task.id)
+        .expect("reload task")
+        .recovery
+        .is_some());
 }
 
 #[test]
