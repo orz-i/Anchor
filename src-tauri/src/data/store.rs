@@ -125,6 +125,16 @@ impl DataStore {
         Ok(result)
     }
 
+    /// Atomically replace the complete persisted configuration without first
+    /// decrypting the destination secrets file. Portable config import needs
+    /// this path because a copied Windows DPAPI envelope is intentionally not
+    /// decryptable on Linux/macOS (and vice versa).
+    pub(crate) fn replace_file(data: AppData) -> AppResult<()> {
+        let _guard = lock_data_file()?;
+        validate_data(&data)?;
+        save(&data)
+    }
+
     #[cfg(feature = "desktop")]
     pub fn data(&self) -> &AppData {
         &self.data

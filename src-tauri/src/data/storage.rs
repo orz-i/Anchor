@@ -565,7 +565,7 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.bak"))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let parent = path.parent().ok_or_else(|| {
         crate::error::AppError::Message(format!("配置路径缺少父目录：{}", path.display()))
     })?;
