@@ -933,7 +933,29 @@ fn call_tool_impl(
         if let Err(error) =
             crate::tools::schema::validate_tool_input(delegated_tool, &validation_args)
         {
-            let mut output = tool_err(error);
+            let canonical_error = error.to_error_value();
+            let (allowed_arguments, required_arguments) =
+                crate::tools::registry::facade_operation_argument_contract(name, operation)
+                    .unwrap_or_default();
+            let canonical_message = canonical_error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("operation-specific argument validation failed");
+            let mut output = tool_err(WorkspaceError::ToolDetails {
+                code: "INVALID_FACADE_ARGUMENTS",
+                message: format!("Invalid arguments for {name}.{operation}: {canonical_message}"),
+                category: "validation",
+                retryable: false,
+                details: json!({
+                    "stage": "facade_operation_schema",
+                    "facade": name,
+                    "operation": operation,
+                    "delegated_tool": delegated_tool,
+                    "allowed_arguments": allowed_arguments,
+                    "required_arguments": required_arguments,
+                    "canonical_error": canonical_error
+                }),
+            });
             if let Some(object) = output.as_object_mut() {
                 object.insert("facade".into(), Value::String(name.to_string()));
                 object.insert("operation".into(), Value::String(operation.to_string()));
@@ -1321,6 +1343,12 @@ fn call_tool_impl(
             Err(e) => tool_err(e),
         }
     };
+    if name == "exec_command"
+        && output.get("ok").and_then(Value::as_bool) == Some(false)
+        && output.get("execution_started").is_none()
+    {
+        output = normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+    }
     if name == "wait_command" {
         ctx.update_command_output_cursor(
             session_id,

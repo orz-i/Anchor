@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 37;
+pub const CATALOG_VERSION: u32 = 38;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -136,6 +138,31 @@ pub fn facade_operations_for_profile(facade: &str, tool_profile: &str) -> Vec<&'
         .flatten()
         .filter_map(|(operation, tool)| available.contains(tool).then_some(*operation))
         .collect()
+}
+
+pub fn facade_operation_argument_contract(
+    facade: &str,
+    operation: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let tool = facade_tool_for_operation(facade, operation)?;
+    let schema = input_schema(tool);
+    let mut allowed = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.keys().cloned())
+        .collect::<Vec<_>>();
+    let mut required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    allowed.sort();
+    required.sort();
+    Some((allowed, required))
 }
 
 pub fn git_tool_for_operation(operation: &str) -> Option<&'static str> {
@@ -2719,6 +2746,7 @@ fn normalized_facade_property_schema(schema: &Value) -> Value {
 
 fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
     let mut properties = serde_json::Map::new();
+    let mut property_operations = BTreeMap::<String, Vec<String>>::new();
     let mut contracts = Vec::new();
     for operation in operations {
         let Some(tool) = facade_tool_for_operation(facade, operation) else {
@@ -2742,6 +2770,10 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
                 if property == "operation" {
                     continue;
                 }
+                property_operations
+                    .entry(property.clone())
+                    .or_default()
+                    .push((*operation).to_string());
                 let candidate = normalized_facade_property_schema(property_schema);
                 match properties.get(property) {
                     None => {
@@ -2759,13 +2791,27 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
         }
     }
 
+    for (property, valid_operations) in property_operations {
+        let Some(property_schema) = properties.get_mut(&property).and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        property_schema.insert(
+            "description".into(),
+            Value::String(format!(
+                "Valid only for {facade} operation(s): {}.",
+                valid_operations.join(", ")
+            )),
+        );
+    }
+
     properties.insert(
         "operation".into(),
         json!({
             "type": "string",
             "enum": operations,
             "description": format!(
-                "Select the {facade} operation. Operation-specific required arguments: {}.",
+                "Select the {facade} operation. Do not send arguments that are not valid for the selected operation. Operation-specific required arguments: {}.",
                 contracts.join("; ")
             )
         }),
