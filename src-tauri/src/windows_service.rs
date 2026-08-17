@@ -882,7 +882,12 @@ fn owner_child_command_line(executable: &Path, args: &[String]) -> String {
     command_line
 }
 
-fn spawn_as_config_owner(args: Vec<String>, current_dir: &Path, label: &str) -> AppResult<u32> {
+fn spawn_as_config_owner(
+    executable: &Path,
+    args: Vec<String>,
+    current_dir: &Path,
+    label: &str,
+) -> AppResult<u32> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::System::Environment::CreateEnvironmentBlock;
     use windows::Win32::System::Threading::{
@@ -903,7 +908,6 @@ fn spawn_as_config_owner(args: Vec<String>, current_dir: &Path, label: &str) -> 
     }
     let _environment_guard = OwnedEnvironmentBlock(environment);
 
-    let executable = std::env::current_exe()?;
     let application = wide_null(&executable.display().to_string());
     let mut command_line = wide_null(&owner_child_command_line(&executable, &args));
     let current_dir = wide_null(&current_dir.display().to_string());
@@ -938,7 +942,8 @@ fn spawn_as_config_owner(args: Vec<String>, current_dir: &Path, label: &str) -> 
     Ok(process.dwProcessId)
 }
 
-pub fn spawn_workspace_daemon_as_owner(
+pub(crate) fn spawn_workspace_daemon_as_owner_from_executable(
+    executable: &Path,
     profile: &crate::workspace::WorkspaceProfile,
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
@@ -958,10 +963,18 @@ pub fn spawn_workspace_daemon_as_owner(
     } else {
         args.push("--no-tunnel".to_string());
     }
-    spawn_as_config_owner(args, Path::new(&profile.path), "Workspace daemon")
+    spawn_as_config_owner(
+        executable,
+        args,
+        Path::new(&profile.path),
+        "Workspace daemon",
+    )
 }
 
-pub fn spawn_gateway_daemon_as_owner(workspace_ids: &[String]) -> AppResult<u32> {
+pub(crate) fn spawn_gateway_daemon_as_owner_from_executable(
+    executable: &Path,
+    workspace_ids: &[String],
+) -> AppResult<u32> {
     let config_dir = platform().app_config_dir()?;
     let mut args = vec![
         "--config-dir".to_string(),
@@ -970,7 +983,7 @@ pub fn spawn_gateway_daemon_as_owner(workspace_ids: &[String]) -> AppResult<u32>
         gateway_daemon::config_scope()?,
     ];
     args.extend(normalized_ids(workspace_ids));
-    spawn_as_config_owner(args, &config_dir, "Gateway daemon")
+    spawn_as_config_owner(executable, args, &config_dir, "Gateway daemon")
 }
 
 pub fn set_workspace_desired(

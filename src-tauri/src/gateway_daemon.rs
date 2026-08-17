@@ -306,6 +306,11 @@ pub fn update_state(workspace_ids: &[String], local_port: u16) -> AppResult<()> 
 }
 
 pub fn spawn(workspace_ids: &[String]) -> AppResult<u32> {
+    let executable = std::env::current_exe()?;
+    spawn_from_executable(workspace_ids, &executable)
+}
+
+pub(crate) fn spawn_from_executable(workspace_ids: &[String], executable: &Path) -> AppResult<u32> {
     ensure_supported()?;
     let inspection = inspect()?;
     if inspection.ambiguous {
@@ -328,7 +333,10 @@ pub fn spawn(workspace_ids: &[String]) -> AppResult<u32> {
     }
     #[cfg(windows)]
     if crate::windows_service::in_service_context() {
-        return crate::windows_service::spawn_gateway_daemon_as_owner(&workspace_ids);
+        return crate::windows_service::spawn_gateway_daemon_as_owner_from_executable(
+            executable,
+            &workspace_ids,
+        );
     }
     let log_path = daemon_log_path()?;
     if let Some(parent) = log_path.parent() {
@@ -336,7 +344,6 @@ pub fn spawn(workspace_ids: &[String]) -> AppResult<u32> {
     }
     let stdout = open_private_file(&log_path, true)?;
     let stderr = stdout.try_clone()?;
-    let executable = std::env::current_exe()?;
     let config_dir = platform().app_config_dir()?;
     fs::create_dir_all(&config_dir)?;
     let mut command = Command::new(executable);

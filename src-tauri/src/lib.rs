@@ -25,6 +25,7 @@ mod health;
 mod logging;
 mod mcp;
 mod platform;
+pub mod rollout;
 mod runtime;
 mod secret;
 mod settings;

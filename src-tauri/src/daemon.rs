@@ -543,6 +543,16 @@ pub fn spawn_with_tunnels(
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
 ) -> AppResult<u32> {
+    let executable = std::env::current_exe()?;
+    spawn_with_tunnels_from_executable(profile, service, tunnel_services, &executable)
+}
+
+pub(crate) fn spawn_with_tunnels_from_executable(
+    profile: &WorkspaceProfile,
+    service: ServiceSelection,
+    tunnel_services: Option<ServiceSelection>,
+    executable: &Path,
+) -> AppResult<u32> {
     ensure_daemon_supported()?;
     let inspection = inspect(profile)?;
     if inspection.ambiguous {
@@ -560,7 +570,8 @@ pub fn spawn_with_tunnels(
 
     #[cfg(windows)]
     if crate::windows_service::in_service_context() {
-        return crate::windows_service::spawn_workspace_daemon_as_owner(
+        return crate::windows_service::spawn_workspace_daemon_as_owner_from_executable(
+            executable,
             profile,
             service,
             tunnel_services,
@@ -574,7 +585,6 @@ pub fn spawn_with_tunnels(
     }
     let stdout = open_private_file(&log_path, true)?;
     let stderr = stdout.try_clone()?;
-    let executable = std::env::current_exe()?;
     let mut command = Command::new(executable);
     command
         .arg("daemon-run")
