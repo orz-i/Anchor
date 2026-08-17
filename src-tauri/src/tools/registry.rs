@@ -113,6 +113,16 @@ fn facade_operations(facade: &str) -> Option<&'static [(&'static str, &'static s
     }
 }
 
+fn merge_output_properties(parts: impl IntoIterator<Item = Value>) -> Value {
+    let mut merged = serde_json::Map::new();
+    for part in parts {
+        if let Value::Object(properties) = part {
+            merged.extend(properties);
+        }
+    }
+    Value::Object(merged)
+}
+
 pub fn is_facade_tool(name: &str) -> bool {
     facade_operations(name).is_some()
 }
@@ -1823,7 +1833,8 @@ pub fn output_schema(name: &str) -> Value {
             ],
         ),
         "exec_command" => success_output_schema(
-            json!({
+            merge_output_properties([
+                json!({
                 "session_id": { "type": ["string", "null"] },
                 "command": { "type": "string", "minLength": 1 },
                 "resolved_cwd": { "type": "string", "minLength": 1 },
@@ -1851,7 +1862,9 @@ pub fn output_schema(name: &str) -> Value {
                 "execution_status": { "type": "string", "enum": ["running", "succeeded", "failed", "cancelled", "timed_out", "killed", "spawn_failed", "rejected", "interrupted"] },
                 "success": { "type": ["boolean", "null"] },
                 "retryable": { "type": "boolean" },
-                "command_ok": { "type": ["boolean", "null"] },
+                "command_ok": { "type": ["boolean", "null"] }
+                }),
+                json!({
                 "verification_pending": { "type": "boolean" },
                 "verification_id": { "type": "string", "minLength": 1 },
                 "verification_level": { "type": "string", "enum": ["diagnostic", "informational", "required", "blocking"] },
@@ -1865,7 +1878,8 @@ pub fn output_schema(name: &str) -> Value {
                 "verification_skip_reason": { "type": "string" },
                 "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
                 "warnings": warnings_property()
-            }),
+                }),
+            ]),
             &[
                 "command",
                 "resolved_cwd",
