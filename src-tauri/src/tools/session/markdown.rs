@@ -1,4 +1,7 @@
-use std::sync::OnceLock;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
 
 use regex::Regex;
 use serde_json::Value;
@@ -7,6 +10,16 @@ use sha2::{Digest, Sha256};
 use super::model::CheckpointRecord;
 
 const CHECKPOINT_HEADING: &str = "## 本轮检查点";
+const CLOSE_WORK_SESSION_PREFIX: &str = "close-work-session-";
+const AUTO_CHECKPOINT_TOOLS: &[&str] = &[
+    "apply_patch",
+    "exec_command",
+    "wait_command",
+    "write_stdin",
+    "git_commit",
+    "stage_commit",
+    "wait_stage_commit",
+];
 pub(super) const MAX_TURN_ID_CHARS: usize = 128;
 pub(super) const MAX_TIMESTAMP_CHARS: usize = 128;
 pub(super) const MAX_USER_INTENT_CHARS: usize = 4_000;
@@ -25,6 +38,70 @@ pub fn metadata(content: &str, label: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckpointCompaction {
+    pub removed: usize,
+    pub superseded_closed_task_auto: usize,
+    pub coalesced_active_auto: usize,
+}
+
+pub fn compact_checkpoint_records(
+    records: Vec<CheckpointRecord>,
+) -> (Vec<CheckpointRecord>, CheckpointCompaction) {
+    if records.len() < 2 {
+        return (records, CheckpointCompaction::default());
+    }
+
+    let closed_task_ids = records
+        .iter()
+        .filter_map(|record| record.turn_id.strip_prefix(CLOSE_WORK_SESSION_PREFIX))
+        .filter(|task_id| !task_id.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let mut keep = vec![true; records.len()];
+    let mut latest_auto_slot = HashMap::<String, usize>::new();
+    let mut compaction = CheckpointCompaction::default();
+
+    for (index, record) in records.iter().enumerate() {
+        let Some(tool_name) = auto_checkpoint_tool(&record.turn_id) else {
+            continue;
+        };
+        let Some(task_id) = runtime_state_value(record, "task_id") else {
+            continue;
+        };
+        if closed_task_ids.contains(task_id) {
+            keep[index] = false;
+            compaction.superseded_closed_task_auto += 1;
+            continue;
+        }
+
+        let slot = if let Some(commit_sha) = runtime_state_value(record, "commit_sha") {
+            format!("{task_id}:commit:{commit_sha}")
+        } else if let Some(test) = verification_slot(record) {
+            format!("{task_id}:verification:{test}")
+        } else {
+            format!("{task_id}:progress:{tool_name}")
+        };
+        if let Some(previous) = latest_auto_slot.insert(slot, index) {
+            if keep[previous] {
+                keep[previous] = false;
+                compaction.coalesced_active_auto += 1;
+            }
+        }
+    }
+
+    compaction.removed = compaction.superseded_closed_task_auto + compaction.coalesced_active_auto;
+    if compaction.removed == 0 {
+        return (records, compaction);
+    }
+    let retained = records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, record)| keep[index].then_some(record))
+        .collect();
+    (retained, compaction)
 }
 
 pub fn validate_checkpoint_record(record: &CheckpointRecord) -> Result<(), String> {
@@ -123,31 +200,32 @@ pub fn render_document(metadata: DocumentMetadata<'_>, records: &[CheckpointReco
             .map(|record| record.user_intent.as_str())
             .filter(|value| !value.is_empty()),
     );
+    let handoff_records = current_handoff_records(records);
     push_section(
         &mut output,
         "已确认事实",
-        records
+        handoff_records
             .iter()
             .flat_map(|record| record.findings.iter().map(String::as_str)),
     );
     push_section(
         &mut output,
         "已完成修改",
-        records
+        handoff_records
             .iter()
             .flat_map(|record| record.files_changed.iter().map(String::as_str)),
     );
     push_section(
         &mut output,
         "关键设计决定",
-        records
+        handoff_records
             .iter()
             .flat_map(|record| record.decisions.iter().map(String::as_str)),
     );
     push_section(
         &mut output,
         "测试结果",
-        records
+        handoff_records
             .iter()
             .flat_map(|record| record.tests.iter().map(String::as_str)),
     );
@@ -193,16 +271,59 @@ fn push_section<'a>(output: &mut String, heading: &str, values: impl Iterator<It
     output.push_str("## ");
     output.push_str(heading);
     output.push_str("\n\n");
-    let mut seen = Vec::<String>::new();
+    let mut seen = HashSet::<&'a str>::new();
     for value in values.map(str::trim).filter(|value| !value.is_empty()) {
-        if !seen.iter().any(|existing| existing == value) {
+        if seen.insert(value) {
             output.push_str("- ");
             output.push_str(value);
             output.push('\n');
-            seen.push(value.to_string());
         }
     }
     output.push('\n');
+}
+
+fn current_handoff_records(records: &[CheckpointRecord]) -> &[CheckpointRecord] {
+    let Some(last_close) = records
+        .iter()
+        .rposition(|record| record.turn_id.starts_with(CLOSE_WORK_SESSION_PREFIX))
+    else {
+        return records;
+    };
+    if last_close + 1 < records.len() {
+        &records[last_close + 1..]
+    } else {
+        &records[last_close..]
+    }
+}
+
+fn auto_checkpoint_tool(turn_id: &str) -> Option<&'static str> {
+    let value = turn_id.strip_prefix("auto-")?;
+    AUTO_CHECKPOINT_TOOLS.iter().copied().find(|tool_name| {
+        value
+            .strip_prefix(tool_name)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+    })
+}
+
+fn verification_slot(record: &CheckpointRecord) -> Option<&str> {
+    record
+        .tests
+        .first()
+        .map(String::as_str)
+        .map(|value| value.split(", success=").next().unwrap_or(value))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn runtime_state_value<'a>(record: &'a CheckpointRecord, key: &str) -> Option<&'a str> {
+    record.runtime_state.iter().find_map(|value| {
+        value
+            .strip_prefix(key)
+            .and_then(|value| value.strip_prefix('='))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_matches('"'))
+    })
 }
 
 pub fn parse_checkpoint_records(content: &str) -> Vec<CheckpointRecord> {

@@ -309,6 +309,35 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     })))
 }
 
+fn auto_checkpoint_identity(args: &Value, output: &Value) -> String {
+    if let Some(commit_sha) = output.get("commit_sha").and_then(Value::as_str) {
+        return format!("commit:{commit_sha}");
+    }
+    if let Some(verification_key) = args.get("verification_key").and_then(Value::as_str) {
+        return format!("verification:{verification_key}");
+    }
+    let test_file = args.get("test_file").and_then(Value::as_str);
+    let test_name = args.get("test_name").and_then(Value::as_str);
+    if test_file.is_some() || test_name.is_some() {
+        return format!(
+            "verification:{}:{}",
+            test_file.unwrap_or_default(),
+            test_name.unwrap_or_default()
+        );
+    }
+    if let Some(kind) = args.get("verification_kind").and_then(Value::as_str) {
+        return format!("verification-kind:{kind}");
+    }
+    if let Some(verification) = output.get("verification") {
+        for key in ["verification_key", "id", "kind"] {
+            if let Some(value) = verification.get(key).and_then(Value::as_str) {
+                return format!("verification:{key}:{value}");
+            }
+        }
+    }
+    "progress".to_string()
+}
+
 pub fn list(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let session_dir = resolve_dir(ctx, args)?;
     let Some(index) = storage::read_index(&session_dir)? else {
@@ -577,8 +606,11 @@ pub fn checkpoint(
         updated = true;
     }
     updated |= status_changed;
+    let raw_checkpoint_count = records.len();
+    let (records, compaction) = markdown::compact_checkpoint_records(records);
+    updated |= compaction.removed > 0;
 
-    let final_content = if duplicate_ignored && !status_changed {
+    let final_content = if !updated {
         document_content.clone()
     } else {
         let created_at =
@@ -598,7 +630,7 @@ pub fn checkpoint(
             &records,
         )
     };
-    if !duplicate_ignored || status_changed {
+    if updated {
         let current_store_bytes = indexed_store_bytes(ctx, &index);
         let previous_document_bytes = fs::metadata(&document_path)
             .map(|value| value.len())
@@ -635,6 +667,12 @@ pub fn checkpoint(
         "previous_status": previous_status,
         "status_changed": status_changed,
         "checkpoint_count": records.len(),
+        "raw_checkpoint_count": raw_checkpoint_count,
+        "compacted_checkpoint_count": compaction.removed,
+        "checkpoint_compaction": {
+            "superseded_closed_task_auto": compaction.superseded_closed_task_auto,
+            "coalesced_active_auto": compaction.coalesced_active_auto
+        },
         "content_bytes": content_bytes,
         "max_content_bytes": storage::MAX_SESSION_FILE_BYTES,
         "created": false,
@@ -672,13 +710,7 @@ pub fn auto_checkpoint_after_tool(
         return Ok(None);
     };
     let structured = output.get("structuredContent").unwrap_or(output);
-    let identity = structured
-        .get("session_id")
-        .or_else(|| structured.get("commit_sha"))
-        .or_else(|| structured.get("operation_id"))
-        .or_else(|| structured.get("trace_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("stage");
+    let identity = auto_checkpoint_identity(args, structured);
     let turn_seed = format!("{}:{tool_name}:{identity}", task.id);
     let turn_hash = storage::sha256(turn_seed.as_bytes());
     let turn_id = format!(
@@ -777,17 +809,32 @@ pub fn auto_checkpoint_after_tool(
         ));
         runtime_state.push(format!("baseline_matches={:?}", status.baseline_matches));
     }
+    let verification = structured.get("verification");
     let tests = args
         .get("verification_kind")
         .and_then(Value::as_str)
+        .or_else(|| {
+            verification
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str)
+        })
         .map(|kind| {
-            vec![format!(
-                "verification_kind={kind}, success={}",
-                structured
+            let verification_succeeded = verification
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                .is_some_and(|status| status == "passed")
+                || verification
+                    .and_then(|value| value.get("success"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                || structured
                     .get("success")
                     .or_else(|| structured.get("command_ok"))
                     .and_then(Value::as_bool)
-                    .unwrap_or(success)
+                    .unwrap_or(success);
+            vec![format!(
+                "verification_kind={kind}, success={}",
+                verification_succeeded
             )]
         })
         .unwrap_or_default();
@@ -815,6 +862,7 @@ pub fn auto_checkpoint_after_tool(
         "session_id": session_id,
         "expected_path": expected_path,
         "turn_id": turn_id,
+        "timestamp": now_timestamp(),
         "user_intent": task.objective,
         "findings": findings,
         "files_changed": files_changed,
@@ -851,12 +899,12 @@ fn is_auto_checkpoint_tool(tool_name: &str, args: &Value, output: &Value) -> boo
         "exec_command" => {
             command_stage_is_terminal(structured)
                 && (output_has_workspace_changes(structured)
-                    || blocking_verification_failed(args, structured))
+                    || blocking_verification_requested(args))
         }
         "wait_command" | "write_stdin" => {
             command_stage_is_terminal(structured)
                 && (output_has_workspace_changes(structured)
-                    || output_blocking_verification_failed(structured))
+                    || output_blocking_verification_present(structured))
         }
         _ => false,
     }
@@ -871,29 +919,23 @@ fn tool_succeeded(output: &Value) -> bool {
         == Some(true)
 }
 
-fn blocking_verification_failed(args: &Value, output: &Value) -> bool {
+fn blocking_verification_requested(args: &Value) -> bool {
     let has_verification = args.get("verification_kind").is_some();
     let blocking = matches!(
         args.get("verification_level").and_then(Value::as_str),
         None | Some("blocking") | Some("required")
     );
-    has_verification && blocking && !tool_succeeded(output)
+    has_verification && blocking
 }
 
-fn output_blocking_verification_failed(output: &Value) -> bool {
+fn output_blocking_verification_present(output: &Value) -> bool {
     let Some(verification) = output.get("verification") else {
         return false;
     };
-    let blocking = matches!(
+    matches!(
         verification.get("level").and_then(Value::as_str),
         None | Some("blocking") | Some("required")
-    );
-    let passed = verification
-        .get("status")
-        .and_then(Value::as_str)
-        .is_some_and(|status| status == "passed")
-        || verification.get("success").and_then(Value::as_bool) == Some(true);
-    blocking && !passed
+    )
 }
 
 fn command_stage_is_terminal(output: &Value) -> bool {

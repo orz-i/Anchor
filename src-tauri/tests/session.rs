@@ -21,7 +21,7 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
 }
 
 #[test]
-fn get_exposes_latest_canonical_snapshot_while_history_remains_append_only() {
+fn get_exposes_latest_canonical_snapshot_while_manual_history_remains_append_only() {
     let (_workspace, _harness, ctx) = test_context();
     let opened = open_session(&ctx, "chat-snapshot", "snapshot");
     for (turn_id, runtime, issue, next) in [
@@ -452,6 +452,170 @@ fn automatic_milestone_checkpoint_uses_explicit_session_id_binding() {
         .as_str()
         .expect("content")
         .contains("自动阶段检查点"));
+}
+
+#[test]
+fn automatic_progress_checkpoint_reuses_stable_slots_and_clears_recovered_verification() {
+    let (_workspace, _harness, ctx) = test_context();
+    let opened = open_session(&ctx, "chat-auto-compact", "automatic compaction");
+    let session_id = opened["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let session_path = opened["session_path"]
+        .as_str()
+        .expect("session path")
+        .to_string();
+    let task = ctx.harness.start_task("stable auto slots").expect("task");
+    ctx.harness
+        .bind_session(&task.id, &session_id, &session_path)
+        .expect("bind session");
+
+    let first = session::auto_checkpoint_after_tool(
+        &ctx,
+        "apply_patch",
+        &json!({}),
+        &json!({
+            "ok": true,
+            "operation_id": "patch-one",
+            "mutation_attributed": true,
+            "affected_files": [{"path": "src/old.rs"}]
+        }),
+        Some(&task.id),
+    )
+    .expect("first automatic checkpoint")
+    .expect("checkpoint created");
+    let second = session::auto_checkpoint_after_tool(
+        &ctx,
+        "apply_patch",
+        &json!({}),
+        &json!({
+            "ok": true,
+            "operation_id": "patch-two",
+            "mutation_attributed": true,
+            "affected_files": [{"path": "src/current.rs"}]
+        }),
+        Some(&task.id),
+    )
+    .expect("second automatic checkpoint")
+    .expect("checkpoint created");
+    assert_eq!(first["turn_id"], second["turn_id"]);
+    assert_eq!(second["checkpoint_count"], 1);
+
+    let verification_args = json!({
+        "verification_kind": "lint",
+        "verification_key": "session-lint",
+        "verification_level": "blocking"
+    });
+    let failed = session::auto_checkpoint_after_tool(
+        &ctx,
+        "exec_command",
+        &verification_args,
+        &json!({
+            "ok": false,
+            "success": false,
+            "execution_status": "failed",
+            "error": {"code": "COMMAND_EXIT_NONZERO", "message": "lint failed"}
+        }),
+        Some(&task.id),
+    )
+    .expect("failed verification checkpoint")
+    .expect("checkpoint created");
+    assert_eq!(failed["checkpoint_count"], 2);
+
+    let recovered = session::auto_checkpoint_after_tool(
+        &ctx,
+        "exec_command",
+        &verification_args,
+        &json!({
+            "ok": true,
+            "success": true,
+            "execution_status": "succeeded"
+        }),
+        Some(&task.id),
+    )
+    .expect("recovered verification checkpoint")
+    .expect("checkpoint created");
+    assert_eq!(failed["turn_id"], recovered["turn_id"]);
+    assert_eq!(recovered["checkpoint_count"], 2);
+
+    let fetched_result = invoke(&ctx, "session_get", json!({"session_id": session_id}));
+    let fetched = assert_ok(&fetched_result);
+    assert_eq!(fetched["snapshot"]["remaining_issues"], json!([]));
+    assert_eq!(
+        fetched["snapshot"]["tests"],
+        json!(["verification_kind=lint, success=true"])
+    );
+    let content = fetched["content"].as_str().expect("content");
+    assert!(content.contains("src/current.rs"));
+    assert!(!content.contains("src/old.rs"));
+    assert!(!content.contains("lint failed"));
+}
+
+#[test]
+fn next_checkpoint_compacts_legacy_auto_noise_and_limits_current_handoff_window() {
+    let (workspace, _harness, ctx) = test_context();
+    let opened = open_session(&ctx, "chat-legacy-auto-noise", "legacy auto noise");
+    let session_path = opened["session_path"].as_str().expect("session path");
+    let document_path = workspace.path().join(session_path);
+    let original = fs::read_to_string(&document_path).expect("session file");
+    let prefix = original
+        .split("## 本轮检查点")
+        .next()
+        .expect("session prefix");
+    let records = [
+        json!({"turn_id": "auto-apply_patch-old-1", "findings": ["closed-noise-1"], "runtime_state": ["task_id=closed-task", "tool=apply_patch"]}),
+        json!({"turn_id": "auto-apply_patch-old-2", "findings": ["closed-noise-2"], "runtime_state": ["task_id=closed-task", "tool=apply_patch"]}),
+        json!({"turn_id": "auto-exec_command-old-3", "findings": ["closed-noise-3"], "runtime_state": ["task_id=closed-task", "tool=exec_command"]}),
+        json!({"turn_id": "close-work-session-closed-task", "findings": ["closed-summary"]}),
+        json!({"turn_id": "auto-apply_patch-active-1", "findings": ["active-old-1"], "runtime_state": ["task_id=active-task", "tool=apply_patch"]}),
+        json!({"turn_id": "auto-apply_patch-active-2", "findings": ["active-old-2"], "runtime_state": ["task_id=active-task", "tool=apply_patch"]}),
+        json!({"turn_id": "auto-apply_patch-active-3", "findings": ["active-latest"], "runtime_state": ["task_id=active-task", "tool=apply_patch"]}),
+    ];
+    let mut bloated = format!("{prefix}## 本轮检查点\n\n");
+    for record in records {
+        bloated.push_str("### ");
+        bloated.push_str(record["turn_id"].as_str().expect("turn id"));
+        bloated.push_str("\n\n```json\n");
+        bloated.push_str(&serde_json::to_string_pretty(&record).expect("record json"));
+        bloated.push_str("\n```\n\n");
+    }
+    fs::write(&document_path, bloated).expect("write legacy-shaped session");
+
+    let saved = invoke(
+        &ctx,
+        "session_checkpoint",
+        json!({
+            "session_id": opened["session_id"],
+            "expected_path": opened["session_path"],
+            "turn_id": "active-manual",
+            "findings": ["current-final"]
+        }),
+    );
+    let saved = assert_ok(&saved);
+    assert_eq!(saved["raw_checkpoint_count"], 8);
+    assert_eq!(saved["compacted_checkpoint_count"], 5);
+    assert_eq!(saved["checkpoint_count"], 3);
+    assert_eq!(
+        saved["checkpoint_compaction"]["superseded_closed_task_auto"],
+        3
+    );
+    assert_eq!(saved["checkpoint_compaction"]["coalesced_active_auto"], 2);
+
+    let compacted = fs::read_to_string(document_path).expect("compacted session");
+    let current_sections = compacted
+        .split("## 本轮检查点")
+        .next()
+        .expect("current sections");
+    assert!(current_sections.contains("active-latest"));
+    assert!(current_sections.contains("current-final"));
+    assert!(!current_sections.contains("closed-summary"));
+    assert!(!compacted.contains("closed-noise-1"));
+    assert!(!compacted.contains("closed-noise-2"));
+    assert!(!compacted.contains("closed-noise-3"));
+    assert!(!compacted.contains("active-old-1"));
+    assert!(!compacted.contains("active-old-2"));
+    assert!(compacted.contains("closed-summary"));
 }
 
 #[test]

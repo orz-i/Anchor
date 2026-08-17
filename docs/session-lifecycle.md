@@ -94,6 +94,18 @@ expected_path
 
 Checkpoint 在写入前脱敏；相同 `turn_id` 与相同内容重复提交保持幂等。
 
+Session Markdown 的职责是**可恢复 handoff snapshot**，不是 Harness operation journal。为避免长任务把每一次补丁、格式化命令和验证重试永久复制进开发 Session：
+
+- 顶部 `已确认事实 / 已完成修改 / 关键设计决定 / 测试结果` 只投影最近一次 `close_work_session` 之后的当前 handoff 窗口；若 Session 当前正好停在一个已关闭任务，则投影该关闭 checkpoint；
+- `runtime_state / remaining_issues / next_actions` 始终只取最新 checkpoint；
+- 自动进度 checkpoint 使用稳定的 task/tool 槽位更新，不再用 command session、operation id 等瞬时标识制造新记录；
+- blocking/required verification 的失败和后续成功使用稳定验证身份更新，因此恢复后的成功会清除旧失败的当前状态；
+- 当某 Harness Task 已存在 `close-work-session-<task_id>` 最终 checkpoint 时，该任务此前的 `auto-*` 执行细节在下一次 Session 写入时被最终摘要替代；
+- 对尚未关闭的任务，旧版本遗留的重复 `auto-*` 记录按 task + commit / verification / progress 槽位合并，只保留最新恢复所需状态；
+- 手工 checkpoint、任务最终 close checkpoint 和 commit milestone 不因上述自动噪音压缩策略而被当作普通执行细节删除。
+
+完整的命令、补丁、verification 和 Recovery 审计仍属于 Harness journal；开发 Session 不复制这份事件日志。`session checkpoint` 返回 `raw_checkpoint_count`、`compacted_checkpoint_count` 和 `checkpoint_compaction`，便于确认一次写入是否发生了历史噪音收敛。
+
 ### 生命周期状态
 
 开发 Session 支持：
