@@ -1,3 +1,4 @@
+mod listener_handoff;
 mod maintenance;
 mod port;
 mod public_url;
@@ -6,6 +7,7 @@ mod supervisor;
 #[cfg(feature = "desktop")]
 pub use maintenance::spawn_desktop_maintenance;
 
+pub(crate) use listener_handoff::{bind_loopback_listener, HandoffListener};
 pub use port::{await_listener_shutdown, is_own_process};
 #[cfg(feature = "desktop")]
 pub use port::{port_busy_message, try_reclaim_previous_macos_app_port, wait_for_port_free};

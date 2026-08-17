@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,7 +56,7 @@ fn actions_http_error(status: StatusCode, detail: &str) -> Response {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_listener(
+pub(crate) fn spawn_listener_with_handoff(
     workspace_id: &str,
     workspace_name: String,
     actions_port: u16,
@@ -72,7 +71,14 @@ pub fn spawn_listener(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     policy: PolicySettings,
-) -> Result<(ShutdownSender, crate::async_runtime::JoinHandle<()>), String> {
+) -> Result<
+    (
+        ShutdownSender,
+        crate::async_runtime::JoinHandle<()>,
+        crate::runtime::HandoffListener,
+    ),
+    String,
+> {
     if auth_type == "api_key" && api_key.as_ref().is_none_or(String::is_empty) {
         return Err("Actions API key is not configured".into());
     }
@@ -116,7 +122,7 @@ pub fn spawn_listener(
     }
 
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
-    let listener = bind_listener(actions_port)?;
+    let (listener, handoff) = bind_listener(actions_port)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = workspace_id.to_string();
     let handle = crate::async_runtime::spawn(async move {
@@ -150,7 +156,7 @@ pub fn spawn_listener(
             );
         }
     });
-    Ok((shutdown_tx, handle))
+    Ok((shutdown_tx, handle, handoff))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,15 +280,11 @@ async fn serve(
     Ok(())
 }
 
-fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|err| format!("Actions 本地端口 {port} 绑定失败: {err}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|err| format!("Actions 本地端口 {port} 设置非阻塞失败: {err}"))?;
-    tokio::net::TcpListener::from_std(listener)
-        .map_err(|err| format!("Actions 本地监听器初始化失败: {err}"))
+fn bind_listener(
+    port: u16,
+) -> Result<(tokio::net::TcpListener, crate::runtime::HandoffListener), String> {
+    crate::runtime::bind_loopback_listener(port)
+        .map_err(|err| format!("Actions 本地端口 {port} 绑定失败: {err}"))
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {

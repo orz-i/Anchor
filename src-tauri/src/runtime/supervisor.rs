@@ -50,6 +50,7 @@ struct RuntimeEntry {
     phase: RuntimePhase,
     shutdown: Option<mcp::ShutdownSender>,
     handle: Option<JoinHandle<()>>,
+    handoff_listener: Option<crate::runtime::HandoffListener>,
     error_message: Option<String>,
     started_at: Option<std::time::Instant>,
     missing_port_checks: u8,
@@ -146,6 +147,9 @@ impl RuntimeSupervisor {
         entry.phase = RuntimePhase::Stopping;
         entry.desired_running = false;
         entry.next_retry_at = None;
+        if let Some(listener) = entry.handoff_listener.take() {
+            listener.close();
+        }
         let shutdown = entry.shutdown.take();
         let handle = entry.handle.take();
         if let Some(shutdown) = shutdown {
@@ -334,6 +338,7 @@ impl RuntimeSupervisor {
                 phase: RuntimePhase::Starting,
                 shutdown: None,
                 handle: None,
+                handoff_listener: None,
                 error_message: previous_error,
                 started_at: Some(std::time::Instant::now()),
                 missing_port_checks: 0,
@@ -398,7 +403,7 @@ impl RuntimeSupervisor {
                 } else {
                     None
                 };
-                mcp::spawn_listener(
+                mcp::spawn_listener_with_handoff(
                     port,
                     PathBuf::from(&profile.path),
                     profile.id.clone(),
@@ -454,7 +459,7 @@ impl RuntimeSupervisor {
                 };
                 let public_base_url = profile.actions_public_base_url()?;
                 let policy = PolicySettings::from_actions_config(&profile.actions);
-                actions::spawn_listener(
+                actions::spawn_listener_with_handoff(
                     &profile.id,
                     profile.name.clone(),
                     port,
@@ -474,7 +479,7 @@ impl RuntimeSupervisor {
         };
 
         match spawn_result {
-            Ok((shutdown, handle)) => {
+            Ok((shutdown, handle, handoff_listener)) => {
                 let started_at = self
                     .entries
                     .get(&key)
@@ -486,6 +491,7 @@ impl RuntimeSupervisor {
                         phase: RuntimePhase::Running,
                         shutdown: Some(shutdown),
                         handle: Some(handle),
+                        handoff_listener: Some(handoff_listener),
                         error_message: None,
                         started_at,
                         missing_port_checks: 0,
@@ -532,6 +538,7 @@ impl RuntimeSupervisor {
                         phase: RuntimePhase::Error,
                         shutdown: None,
                         handle: None,
+                        handoff_listener: None,
                         error_message: Some(err.to_string()),
                         started_at: None,
                         missing_port_checks: 0,
@@ -572,6 +579,7 @@ impl RuntimeSupervisor {
                 },
                 shutdown: None,
                 handle: None,
+                handoff_listener: None,
                 error_message: Some(error_message),
                 started_at: None,
                 missing_port_checks: 0,
@@ -664,6 +672,9 @@ impl RuntimeSupervisor {
                         });
                     }
                     entry.shutdown.take();
+                    if let Some(listener) = entry.handoff_listener.take() {
+                        listener.close();
+                    }
                     let occupied_by_self = platform()
                         .find_pid_listening_on_port(port)
                         .ok()
@@ -835,6 +846,7 @@ mod tests {
             phase,
             shutdown: None,
             handle: None,
+            handoff_listener: None,
             error_message: None,
             started_at,
             missing_port_checks: 0,

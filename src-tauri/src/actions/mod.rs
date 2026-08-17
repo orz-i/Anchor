@@ -2,4 +2,4 @@ mod auth;
 mod listener;
 mod openapi;
 
-pub use listener::spawn_listener;
+pub(crate) use listener::spawn_listener_with_handoff;

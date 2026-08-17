@@ -198,6 +198,7 @@ struct GatewayRuntime {
     port: u16,
     routes: std::sync::Arc<RwLock<HashMap<String, u16>>>,
     workspace_rate_limiters: Arc<RwLock<HashMap<String, RateLimiter>>>,
+    handoff_listener: crate::runtime::HandoffListener,
     shutdown: oneshot::Sender<()>,
     handle: JoinHandle<()>,
     server_error: Arc<RwLock<String>>,
@@ -420,6 +421,7 @@ impl GatewaySupervisor {
             self.last_error.clear();
             return Ok(());
         };
+        runtime.handoff_listener.close();
         let _ = runtime.shutdown.send(());
         let mut handle = runtime.handle;
         match tokio::time::timeout(GATEWAY_SHUTDOWN_TIMEOUT, &mut handle).await {
@@ -465,14 +467,10 @@ async fn spawn_with_limits(
     max_requests_per_minute: usize,
     max_requests_per_workspace_per_minute: usize,
 ) -> AppResult<GatewayRuntime> {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
-        AppError::Message(format!("MCP Gateway 本地端口 {port} 绑定失败：{error}"))
-    })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| AppError::Message(format!("MCP Gateway 端口设置非阻塞失败：{error}")))?;
-    let listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|error| AppError::Message(format!("MCP Gateway 初始化失败：{error}")))?;
+    let (listener, handoff_listener) =
+        crate::runtime::bind_loopback_listener(port).map_err(|error| {
+            AppError::Message(format!("MCP Gateway 本地端口 {port} 绑定失败：{error}"))
+        })?;
     let workspace_rate_limiters = Arc::new(RwLock::new(
         routes
             .keys()
@@ -524,6 +522,7 @@ async fn spawn_with_limits(
         port,
         routes,
         workspace_rate_limiters,
+        handoff_listener,
         shutdown,
         handle,
         server_error,
@@ -1385,7 +1384,7 @@ mod tests {
             strict_workspace_reads: true,
             ..crate::workspace::RuntimeConfig::default()
         };
-        let (shutdown_a, handle_a) = crate::mcp::spawn_listener(
+        let (shutdown_a, handle_a, _handoff_a) = crate::mcp::spawn_listener_with_handoff(
             port_a,
             workspace_a.clone(),
             "workspace-a".into(),
@@ -1398,7 +1397,7 @@ mod tests {
             runtime_config.clone(),
         )
         .expect("listener a");
-        let (shutdown_b, handle_b) = crate::mcp::spawn_listener(
+        let (shutdown_b, handle_b, _handoff_b) = crate::mcp::spawn_listener_with_handoff(
             port_b,
             workspace_b.clone(),
             "workspace-b".into(),
