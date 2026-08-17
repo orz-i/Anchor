@@ -36,7 +36,13 @@ fn main() {
         std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"),
     );
     let repository = manifest_dir.parent().unwrap_or(&manifest_dir);
-    let git_sha = std::env::var("ANCHOR_BUILD_GIT_SHA")
+    // Do not use ANCHOR_BUILD_GIT_SHA itself as the input override. Cargo
+    // propagates values emitted with `cargo:rustc-env` into `cargo run` child
+    // processes, so a daemon started through `cargo run` can legitimately
+    // carry an old ANCHOR_BUILD_GIT_SHA in its runtime environment. Reusing
+    // that value as a future build input would permanently pin subsequent
+    // builds to the daemon's old revision.
+    let git_sha = std::env::var("ANCHOR_BUILD_GIT_SHA_OVERRIDE")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| git_value(repository, &["rev-parse", "HEAD"]))
@@ -52,7 +58,7 @@ fn main() {
         "cargo:rustc-env=ANCHOR_BUILD_WORKSPACE={}",
         repository.display()
     );
-    println!("cargo:rerun-if-env-changed=ANCHOR_BUILD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=ANCHOR_BUILD_GIT_SHA_OVERRIDE");
     watch_git_path(repository, "HEAD");
     watch_git_path(repository, "index");
     if let Some(head_ref) = git_value(repository, &["symbolic-ref", "-q", "HEAD"]) {
