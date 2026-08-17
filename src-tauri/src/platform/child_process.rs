@@ -35,22 +35,28 @@ pub fn configure_exec_tokio_process(command: &mut tokio::process::Command) {
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
+    #[cfg(not(windows))]
+    let _ = command;
+}
 
-        // SAFETY: `setpriority` is an async-signal-safe libc call and the
-        // closure does not allocate or acquire process-global Rust locks.
+/// Lower the priority of a newly spawned arbitrary workspace command.
+///
+/// Unix applies this from the parent immediately after spawn instead of a
+/// `pre_exec` hook, avoiding non-async-signal-safe work in the post-fork child.
+/// Windows already applies BELOW_NORMAL_PRIORITY_CLASS at process creation.
+pub fn lower_exec_child_priority(child: &tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: this call runs in the parent process and targets a child PID
+        // returned by Tokio. Failure is deliberately non-fatal: the resource
+        // governor and child parallelism caps still protect the host.
         unsafe {
-            command.as_std_mut().pre_exec(|| {
-                let _ = libc::setpriority(libc::PRIO_PROCESS, 0, 5);
-                Ok(())
-            });
+            let _ = libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, 5);
         }
     }
 
-    #[cfg(not(any(windows, unix)))]
-    let _ = command;
+    #[cfg(not(unix))]
+    let _ = child;
 }
 
 /// Configure a blocking std child process as an internal background process.

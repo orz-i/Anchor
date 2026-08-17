@@ -165,13 +165,22 @@ pub struct ExecutionResourceManager {
     heavy_lock_path: PathBuf,
 }
 
-#[derive(Debug)]
 pub struct ExecutionLease {
     _permit: OwnedSemaphorePermit,
     _heavy_lock: Option<File>,
     heavy: bool,
     parallelism: usize,
     policy: ExecutionResourcePolicy,
+}
+
+impl std::fmt::Debug for ExecutionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionLease")
+            .field("heavy", &self.heavy)
+            .field("parallelism", &self.parallelism)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionLease {

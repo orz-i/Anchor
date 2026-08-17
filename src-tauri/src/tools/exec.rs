@@ -922,6 +922,7 @@ async fn run_command(
             "suggestion": "检查命令路径、权限和运行时环境后重试"
         }),
     })?;
+    crate::platform::lower_exec_child_priority(&child);
 
     let harness_metadata = task_id
         .and_then(|task_id| ctx.harness.task(task_id).ok())

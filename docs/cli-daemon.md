@@ -216,6 +216,34 @@ anchor reload <workspace> [--service mcp|actions|all]
 
 任一关键检查失败时退出码为 1，`--json` 返回完整 checks 数组。
 
+## 自适应执行资源治理
+
+Workspace daemon 会对 `exec_command` 启动的子进程应用自适应资源预算，避免构建、测试或多个
+并发命令直接吃满宿主机。该预算只约束**正在运行的子进程**；CommandSession 的结果留存数量
+仍是独立概念，不能再被解释为可同时运行的进程数。
+
+- CPU 基线来自运行时实际可见的并行度；Linux 还会读取 cgroup CPU quota，并采用更严格的值；
+- 默认最多使用有效 CPU 的 75%，且有效 CPU 大于 1 时至少保留 1 个逻辑 CPU 给操作系统和交互进程；
+- live exec 并发会根据 CPU 与可检测的物理/cgroup 内存自动收缩到 1–4 个；例如 2 CPU 环境默认只允许 1 个 live exec；
+- `cargo build/test/check/clippy`、常见前端 build/test、`make`、`ninja`、CMake、Go/.NET 测试构建等已识别重任务会在共享 Harness 数据域内跨 Workspace daemon 串行；
+- 常见构建/数值运行时会继承并行度上限，包括 Cargo/Rust tests、Rayon、Go、CMake、libuv、OpenMP、OpenBLAS、MKL 和 NumExpr；显式更低的数值限制会保留；
+- Windows 子进程使用 below-normal priority；Unix 在 spawn 成功后立即对该 child PID 降低调度优先级。优先级调整失败不会放宽前面的硬并发/并行度限制；
+- 资源预算和 CommandSession 容量都会在 child spawn 前检查；资源队列默认最多等待 15 秒，超时返回可重试错误且不会启动子进程；
+- `environment check` 的 `execution_resources` 字段会输出探测到的 CPU/内存、保留 CPU、有效执行预算、live exec 上限和重任务策略。
+
+仅提供两个可选环境变量用于**进一步收紧**自动策略：
+
+```bash
+# CPU 目标百分比；有效范围 25–75，高于 75 会被钳制到 75
+ANCHOR_EXEC_CPU_PERCENT=50
+
+# live exec 上限；有效范围 1–4，且不能高于自动计算值
+ANCHOR_EXEC_MAX_CONCURRENT=1
+```
+
+因此，运维侧无需根据机器核数手工设置固定并发。低资源主机会自动收缩，高资源主机也保留
+明确的响应性余量；如机器仍承担数据库、模型服务等高负载工作，可通过上述变量继续收紧。
+
 ## 运行文件
 
 Daemon 使用独占锁、状态 JSON 和 PID 文件。运行目录按平台选择：

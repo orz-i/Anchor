@@ -57,9 +57,11 @@ tests, Rayon, Go, CMake, libuv, OpenMP, OpenBLAS, MKL, and NumExpr. Explicit low
 preserved; higher values are clamped to the governor budget. Direct `make`/`gmake`/`ninja` job flags
 are normalized for known heavy invocations so command-line flags cannot bypass the cap.
 
-Exec children run below normal priority: Unix children receive a positive nice value before exec;
-Windows children use `BELOW_NORMAL_PRIORITY_CLASS` together with the existing no-console flag.
-Descendants normally inherit that scheduling priority.
+Exec children run below normal priority: after a successful Unix spawn, the parent immediately
+applies a positive nice value to the child PID; Windows children use `BELOW_NORMAL_PRIORITY_CLASS`
+together with the existing no-console flag at process creation. Descendants normally inherit that
+scheduling priority. Priority lowering is best-effort and is deliberately secondary to the hard
+execution-budget and parallelism limits.
 
 ## Observability
 
