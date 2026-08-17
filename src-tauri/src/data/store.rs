@@ -8,7 +8,9 @@ use crate::settings::AppSettings;
 use crate::workspace::WorkspaceProfile;
 
 use super::model::AppData;
-use super::storage::{data_file_path, load, load_profiles_only as load_profiles_data_only, save};
+#[cfg(windows)]
+use super::storage::load_profiles_only as load_profiles_data_only;
+use super::storage::{data_file_path, load, save};
 
 static DATA_FILE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -101,6 +103,7 @@ impl DataStore {
     /// Windows SCM supervisor when it only needs the desired workspace plan;
     /// LocalSystem must not need to decrypt user-scoped DPAPI secrets just to
     /// decide which daemon processes should exist.
+    #[cfg(windows)]
     pub(crate) fn load_profiles_only() -> AppResult<Self> {
         let _guard = lock_data_file()?;
         let data = load_profiles_data_only()?;
@@ -376,6 +379,7 @@ mod tests {
         assert_eq!(loaded.as_deref(), Some("roundtrip-secret"));
     }
 
+    #[cfg(feature = "desktop")]
     #[test]
     fn shared_oauth_client_id_uses_client_id_format() {
         let value = shared_value_for_key("oauth_client_id");

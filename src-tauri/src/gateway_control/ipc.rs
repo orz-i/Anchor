@@ -100,8 +100,8 @@ fn create_windows_pipe_server(
     })
 }
 
+#[cfg(windows)]
 fn should_log_connection_error(error: &AppError) -> bool {
-    #[cfg(windows)]
     if matches!(
         error,
         AppError::Io(io_error) if matches!(io_error.raw_os_error(), Some(109 | 232))

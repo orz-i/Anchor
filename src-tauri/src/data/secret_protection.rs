@@ -3,11 +3,6 @@ pub(super) fn protect(data: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
     protect_windows(data, false)
 }
 
-#[cfg(not(windows))]
-pub(super) fn unprotect_for_service(protection: &str, data: &[u8]) -> Result<Vec<u8>, String> {
-    unprotect(protection, data)
-}
-
 #[cfg(windows)]
 pub(super) fn protect_for_service(data: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
     protect_windows(data, true)
@@ -122,11 +117,6 @@ pub(super) fn protect(data: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
 }
 
 #[cfg(not(windows))]
-pub(super) fn protect_for_service(data: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
-    protect(data)
-}
-
-#[cfg(not(windows))]
 pub(super) fn unprotect(protection: &str, data: &[u8]) -> Result<Vec<u8>, String> {
     if protection != "private-file-permissions-v1" {
         return Err(format!("unsupported secret protection: {protection}"));
@@ -146,6 +136,7 @@ mod tests {
         assert_ne!(protected, secret);
     }
 
+    #[cfg(windows)]
     #[test]
     fn service_protected_payload_round_trips() {
         let secret = br#"{\"token\":\"service-secret\"}"#;
@@ -154,10 +145,7 @@ mod tests {
         let plaintext =
             super::unprotect_for_service(protection, &protected).expect("service unprotect");
         assert_eq!(plaintext, secret);
-        #[cfg(windows)]
-        {
-            assert_eq!(protection, "windows-dpapi-local-machine-v1");
-            assert_ne!(protected, secret);
-        }
+        assert_eq!(protection, "windows-dpapi-local-machine-v1");
+        assert_ne!(protected, secret);
     }
 }

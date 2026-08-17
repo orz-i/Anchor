@@ -131,68 +131,68 @@ fn resolve_toolchain_paths(
         .collect()
 }
 
+#[cfg(not(windows))]
+pub(crate) fn apply_preferred_shell(
+    _args: &mut Value,
+    _policy: &crate::tools::policy::PolicySettings,
+) -> Result<(), WorkspaceError> {
+    Ok(())
+}
+
+#[cfg(windows)]
 pub(crate) fn apply_preferred_shell(
     args: &mut Value,
     policy: &crate::tools::policy::PolicySettings,
 ) -> Result<(), WorkspaceError> {
-    #[cfg(not(windows))]
-    {
-        let _ = (args, policy);
+    let preferred = policy.preferred_shell.trim();
+    if preferred.is_empty() || preferred == "auto" {
         return Ok(());
     }
-
-    #[cfg(windows)]
+    let object = args.as_object_mut().ok_or_else(|| {
+        WorkspaceError::invalid_argument("exec_command arguments must be an object")
+    })?;
+    if object.contains_key("shell")
+        || object.contains_key("executable")
+        || object.contains_key("args")
     {
-        let preferred = policy.preferred_shell.trim();
-        if preferred.is_empty() || preferred == "auto" {
-            return Ok(());
-        }
-        let object = args.as_object_mut().ok_or_else(|| {
-            WorkspaceError::invalid_argument("exec_command arguments must be an object")
-        })?;
-        if object.contains_key("shell")
-            || object.contains_key("executable")
-            || object.contains_key("args")
-        {
-            return Ok(());
-        }
-        let Some(command) = object
-            .get("cmd")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-        else {
-            return Ok(());
-        };
-        let shell_args = match preferred {
-            "pwsh" | "powershell" => vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-Command".to_string(),
-                command,
-            ],
-            "cmd" => vec![
-                "/d".to_string(),
-                "/s".to_string(),
-                "/c".to_string(),
-                command,
-            ],
-            _ => {
-                return Err(WorkspaceError::invalid_argument(
-                    "preferred shell must be auto, pwsh, powershell, or cmd",
-                ))
-            }
-        };
-        object.remove("cmd");
-        object.insert("shell".into(), Value::String(preferred.to_string()));
-        object.insert(
-            "args".into(),
-            Value::Array(shell_args.into_iter().map(Value::String).collect()),
-        );
-        Ok(())
+        return Ok(());
     }
+    let Some(command) = object
+        .get("cmd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(());
+    };
+    let shell_args = match preferred {
+        "pwsh" | "powershell" => vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            command,
+        ],
+        "cmd" => vec![
+            "/d".to_string(),
+            "/s".to_string(),
+            "/c".to_string(),
+            command,
+        ],
+        _ => {
+            return Err(WorkspaceError::invalid_argument(
+                "preferred shell must be auto, pwsh, powershell, or cmd",
+            ))
+        }
+    };
+    object.remove("cmd");
+    object.insert("shell".into(), Value::String(preferred.to_string()));
+    object.insert(
+        "args".into(),
+        Value::Array(shell_args.into_iter().map(Value::String).collect()),
+    );
+    Ok(())
 }
 
 fn parse_and_resolve_execution(
@@ -1555,6 +1555,7 @@ mod tests {
             workspace.path(),
             workspace.path(),
             &crate::tools::policy::PolicySettings::default(),
+            &[],
         )
         .expect("workspace entry resolves");
         assert_eq!(
@@ -1908,7 +1909,9 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script_path, permissions).expect("script executable");
 
-        let ctx = ToolContext::for_test(workspace, harness.path().to_path_buf()).expect("context");
+        let mut ctx =
+            ToolContext::for_test(workspace, harness.path().to_path_buf()).expect("context");
+        ctx.policy.allowed_commands.insert(script_name.into());
         let command = format!(r#""{script_name}" "argument with spaces""#);
         let output = call_tool(
             &ctx,
@@ -1984,19 +1987,22 @@ fn windows_batch_token(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+#[cfg(windows)]
 fn stream_encoding_for_program(program: &str) -> StreamEncoding {
-    #[cfg(windows)]
-    {
-        let path = Path::new(program);
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if stem == "cmd" {
-            return StreamEncoding::WindowsOem;
-        }
+    let path = Path::new(program);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if stem == "cmd" {
+        return StreamEncoding::WindowsOem;
     }
+    StreamEncoding::Utf8
+}
+
+#[cfg(not(windows))]
+fn stream_encoding_for_program(_program: &str) -> StreamEncoding {
     StreamEncoding::Utf8
 }
 

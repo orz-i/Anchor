@@ -45,9 +45,17 @@ fn package_manager_cpu_intensive(args: &[String]) -> bool {
     }
     args.iter().skip(1).any(|arg| {
         let arg = arg.to_ascii_lowercase();
-        ["build", "test", "check", "lint", "clippy", "compile", "typecheck"]
-            .iter()
-            .any(|marker| arg.contains(marker))
+        [
+            "build",
+            "test",
+            "check",
+            "lint",
+            "clippy",
+            "compile",
+            "typecheck",
+        ]
+        .iter()
+        .any(|marker| arg.contains(marker))
     })
 }
 
@@ -93,8 +101,8 @@ impl ExecutionResourcePolicy {
             detected_memory_bytes,
             cgroup_memory_limit_bytes.filter(|value| *value > 0),
         );
-        let cpu_target_percent = cpu_target_percent
-            .clamp(MIN_CPU_TARGET_PERCENT, DEFAULT_CPU_TARGET_PERCENT);
+        let cpu_target_percent =
+            cpu_target_percent.clamp(MIN_CPU_TARGET_PERCENT, DEFAULT_CPU_TARGET_PERCENT);
         let percentage_budget = (effective_cpus * cpu_target_percent / 100).max(1);
         let execution_cpu_budget = if effective_cpus > 1 {
             percentage_budget.min(effective_cpus - 1)
@@ -244,8 +252,13 @@ impl ExecutionResourceManager {
 
         let heavy_lock = if heavy {
             Some(
-                acquire_heavy_lock(&self.heavy_lock_path, queue_timeout, cancellation, &self.policy)
-                    .await?,
+                acquire_heavy_lock(
+                    &self.heavy_lock_path,
+                    queue_timeout,
+                    cancellation,
+                    &self.policy,
+                )
+                .await?,
             )
         } else {
             None
@@ -265,7 +278,7 @@ impl ExecutionResourceManager {
         })
     }
 
-    pub fn clamp_parallel_args(&self, program: &str, args: &mut Vec<String>, limit: usize) {
+    pub fn clamp_parallel_args(&self, program: &str, args: &mut [String], limit: usize) {
         let executable = executable_name(program);
         match executable.as_str() {
             "cargo" | "make" | "gmake" | "ninja" => clamp_jobs_flags(args, limit, true),
@@ -303,11 +316,14 @@ async fn acquire_heavy_lock(
     cancellation: &CancellationToken,
     policy: &ExecutionResourcePolicy,
 ) -> Result<File, WorkspaceError> {
-    let parent = path.parent().ok_or_else(|| resource_lock_error("invalid lock path"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| resource_lock_error("invalid lock path"))?;
     std::fs::create_dir_all(parent)
         .map_err(|error| resource_lock_error(&format!("create lock directory failed: {error}")))?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -329,7 +345,9 @@ async fn acquire_heavy_lock(
                 }
             }
             Err(error) => {
-                return Err(resource_lock_error(&format!("lock acquisition failed: {error}")))
+                return Err(resource_lock_error(&format!(
+                    "lock acquisition failed: {error}"
+                )))
             }
         }
     }
@@ -438,8 +456,8 @@ fn is_cpu_intensive_command(program: &str, args: &[String]) -> bool {
                 "build" | "check" | "test" | "clippy" | "bench" | "install"
             )
         }),
-        "rustc" | "make" | "gmake" | "ninja" | "cmake" | "msbuild" | "gradle"
-        | "gradlew" | "mvn" | "pytest" | "py.test" => true,
+        "rustc" | "make" | "gmake" | "ninja" | "cmake" | "msbuild" | "gradle" | "gradlew"
+        | "mvn" | "pytest" | "py.test" => true,
         "go" => args
             .first()
             .is_some_and(|arg| matches!(arg.as_str(), "build" | "test" | "install")),
@@ -449,9 +467,9 @@ fn is_cpu_intensive_command(program: &str, args: &[String]) -> bool {
                 || (args.first().is_some_and(|arg| arg == "compose")
                     && args.get(1).is_some_and(|arg| arg == "build"))
         }
-        "dotnet" => args.first().is_some_and(|arg| {
-            matches!(arg.as_str(), "build" | "test" | "publish" | "restore")
-        }),
+        "dotnet" => args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "build" | "test" | "publish" | "restore")),
         "sh" | "bash" | "zsh" | "cmd" | "powershell" | "pwsh" => {
             shell_payload_is_cpu_intensive(args)
         }
@@ -496,7 +514,7 @@ fn shell_payload_is_cpu_intensive(args: &[String]) -> bool {
     .any(|marker| payload.contains(marker))
 }
 
-fn clamp_jobs_flags(args: &mut Vec<String>, limit: usize, support_long: bool) {
+fn clamp_jobs_flags(args: &mut [String], limit: usize, support_long: bool) {
     let mut index = 0;
     while index < args.len() {
         let current = args[index].clone();
@@ -614,7 +632,11 @@ fn clamp_makeflags(command: &mut Command, limit: usize) {
         .collect::<Vec<_>>();
     let before = parts.clone();
     clamp_jobs_flags(&mut parts, limit, true);
-    if before == parts && !parts.iter().any(|part| part.starts_with("-j") || part.starts_with("--jobs")) {
+    if before == parts
+        && !parts
+            .iter()
+            .any(|part| part.starts_with("-j") || part.starts_with("--jobs"))
+    {
         parts.push(format!("-j{limit}"));
     }
     command.env("MAKEFLAGS", parts.join(" "));
@@ -666,12 +688,10 @@ fn quota_to_cpu_limit(quota: i64, period: u64) -> Option<usize> {
 #[cfg(target_os = "linux")]
 fn detect_physical_memory_bytes() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = contents.lines().find(|line| line.starts_with("MemTotal:"))?;
-    let kib = line
-        .split_whitespace()
-        .nth(1)?
-        .parse::<u64>()
-        .ok()?;
+    let line = contents
+        .lines()
+        .find(|line| line.starts_with("MemTotal:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     kib.checked_mul(1024)
 }
 
@@ -781,10 +801,7 @@ mod tests {
             "pnpm",
             &["run".into(), "build".into()]
         ));
-        assert!(!is_cpu_intensive_command(
-            "cargo",
-            &["--version".into()]
-        ));
+        assert!(!is_cpu_intensive_command("cargo", &["--version".into()]));
         assert!(!is_cpu_intensive_command("git", &["status".into()]));
         assert!(is_cpu_intensive_command(
             "sh",
@@ -834,7 +851,10 @@ mod tests {
         let first_manager = ExecutionResourceManager::with_policy(temp.path(), policy.clone());
         let second_manager = ExecutionResourceManager::with_policy(temp.path(), policy);
         let token = CancellationToken::default();
-        let first = first_manager.acquire(true, &token).await.expect("heavy lease");
+        let first = first_manager
+            .acquire(true, &token)
+            .await
+            .expect("heavy lease");
 
         let cancelled = CancellationToken::default();
         let cancellation = cancelled.clone();

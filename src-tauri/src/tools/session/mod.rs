@@ -142,13 +142,15 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 session_dir_display(ctx, &session_dir)
             );
             let child_content = markdown::render_document(
-                &child_session_id,
-                title,
-                host_session_key.as_deref(),
-                Some(parent_session_id.as_str()),
-                &timestamp,
-                &timestamp,
-                "active",
+                markdown::DocumentMetadata {
+                    session_id: &child_session_id,
+                    title,
+                    host_session_key: host_session_key.as_deref(),
+                    parent_session_id: Some(parent_session_id.as_str()),
+                    created_at: &timestamp,
+                    updated_at: &timestamp,
+                    status: "active",
+                },
                 &[],
             );
             storage::write_markdown(
@@ -234,13 +236,15 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         validate_bounded_text("title", title, MAX_SESSION_TITLE_CHARS)?;
         let relative_path = format!("{}/{session_id}.md", session_dir_display(ctx, &session_dir));
         let content = markdown::render_document(
-            &session_id,
-            title,
-            host_session_key.as_deref(),
-            None,
-            &timestamp,
-            &timestamp,
-            "active",
+            markdown::DocumentMetadata {
+                session_id: &session_id,
+                title,
+                host_session_key: host_session_key.as_deref(),
+                parent_session_id: None,
+                created_at: &timestamp,
+                updated_at: &timestamp,
+                status: "active",
+            },
             &[],
         );
         storage::write_markdown(&session_dir.join(format!("{session_id}.md")), &content)?;
@@ -579,14 +583,18 @@ pub fn checkpoint(
     } else {
         let created_at =
             markdown::metadata(&document_content, "Created").unwrap_or_else(|| timestamp.clone());
+        let title = markdown::document_title(&document_content);
+        let host_session_key = markdown::metadata(&document_content, "Host session key");
         markdown::render_document(
-            &session_id,
-            &markdown::document_title(&document_content),
-            markdown::metadata(&document_content, "Host session key").as_deref(),
-            entry.parent_session_id.as_deref(),
-            &created_at,
-            &timestamp,
-            &session_status,
+            markdown::DocumentMetadata {
+                session_id: &session_id,
+                title: &title,
+                host_session_key: host_session_key.as_deref(),
+                parent_session_id: entry.parent_session_id.as_deref(),
+                created_at: &created_at,
+                updated_at: &timestamp,
+                status: &session_status,
+            },
             &records,
         )
     };

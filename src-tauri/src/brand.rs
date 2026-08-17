@@ -9,4 +9,5 @@ pub const DESKTOP_EXECUTABLE_NAME: &str = "anchor-desktop";
 pub const BUNDLE_ID: &str = "com.anchor.desktop";
 pub(crate) const APP_CONFIG_DIR_NAME: &str = "anchor";
 pub(crate) const CONFIG_DIR_ENV: &str = "ANCHOR_CONFIG_DIR";
+#[cfg(windows)]
 pub(crate) const WINDOWS_SERVICE_CONTEXT_ENV: &str = "ANCHOR_WINDOWS_SERVICE_CONTEXT";

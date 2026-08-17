@@ -32,6 +32,7 @@ struct SecretsEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretAccess {
     User,
+    #[cfg(windows)]
     Service,
 }
 
@@ -323,6 +324,7 @@ pub fn save(data: &AppData) -> AppResult<()> {
     let secrets = SecretsData::from_app_data(data);
     match current_secret_access() {
         SecretAccess::User => write_secrets_data(&secrets_path, &secrets)?,
+        #[cfg(windows)]
         SecretAccess::Service => write_service_secrets_data(&secrets_path, &secrets)?,
     }
     write_data(&path, data)
@@ -375,6 +377,7 @@ fn service_secrets_for_user_write(path: &Path, data: &SecretsData) -> SecretsDat
     service_data
 }
 
+#[cfg(windows)]
 fn write_service_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> {
     let mut envelope = read_secrets_envelope(path).map_err(|error| {
         crate::error::AppError::Message(format!(
@@ -409,6 +412,7 @@ fn load_secrets_with_backup(path: &Path, access: SecretAccess) -> AppResult<Secr
             })?;
             match access {
                 SecretAccess::User => write_secrets_data(path, &recovered)?,
+                #[cfg(windows)]
                 SecretAccess::Service => {
                     let raw = fs::read(&backup)?;
                     atomic_write(path, &raw)?;
@@ -445,6 +449,7 @@ fn read_secrets_file(path: &Path, access: SecretAccess) -> AppResult<SecretsData
     let envelope = read_secrets_envelope(path)?;
     let (protection, payload) = match access {
         SecretAccess::User => (envelope.protection.as_str(), envelope.payload.as_str()),
+        #[cfg(windows)]
         SecretAccess::Service => (
             envelope.service_protection.as_deref().ok_or_else(|| {
                 crate::error::AppError::Message(
@@ -465,6 +470,7 @@ fn read_secrets_file(path: &Path, access: SecretAccess) -> AppResult<SecretsData
     })?;
     let plaintext = match access {
         SecretAccess::User => secret_protection::unprotect(protection, &protected),
+        #[cfg(windows)]
         SecretAccess::Service => secret_protection::unprotect_for_service(protection, &protected),
     }
     .map_err(crate::error::AppError::Message)?;

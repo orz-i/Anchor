@@ -31,6 +31,7 @@ pub struct CommandSessionStore {
 
 struct StreamDecoder {
     encoding: StreamEncoding,
+    #[cfg(windows)]
     pending: Vec<u8>,
 }
 
@@ -38,11 +39,14 @@ impl StreamDecoder {
     fn new(encoding: StreamEncoding) -> Self {
         Self {
             encoding,
+            #[cfg(windows)]
             pending: Vec::new(),
         }
     }
 
     fn decode(&mut self, chunk: &[u8], finish: bool) -> Vec<u8> {
+        #[cfg(not(windows))]
+        let _ = finish;
         match self.encoding {
             StreamEncoding::Utf8 => chunk.to_vec(),
             #[cfg(windows)]

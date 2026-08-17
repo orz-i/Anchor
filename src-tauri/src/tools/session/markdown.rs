@@ -75,16 +75,26 @@ pub fn document_title(content: &str) -> String {
         .to_string()
 }
 
-pub fn render_document(
-    session_id: &str,
-    title: &str,
-    host_session_key: Option<&str>,
-    parent_session_id: Option<&str>,
-    created_at: &str,
-    updated_at: &str,
-    status: &str,
-    records: &[CheckpointRecord],
-) -> String {
+pub struct DocumentMetadata<'a> {
+    pub session_id: &'a str,
+    pub title: &'a str,
+    pub host_session_key: Option<&'a str>,
+    pub parent_session_id: Option<&'a str>,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+    pub status: &'a str,
+}
+
+pub fn render_document(metadata: DocumentMetadata<'_>, records: &[CheckpointRecord]) -> String {
+    let DocumentMetadata {
+        session_id,
+        title,
+        host_session_key,
+        parent_session_id,
+        created_at,
+        updated_at,
+        status,
+    } = metadata;
     let title = if title.trim().is_empty() {
         "开发会话"
     } else {
