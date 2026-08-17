@@ -16,6 +16,8 @@ use crate::tunnel::log_dir_for_profile;
 use crate::workspace::WorkspaceProfile;
 
 const STATE_SCHEMA_VERSION: u32 = 2;
+#[cfg(unix)]
+const HANDOFF_SCHEMA_VERSION: u32 = 2;
 const DAEMON_LOG_FILE: &str = "daemon.log";
 #[cfg(unix)]
 const SIGTERM_VALUE: i32 = 15;
@@ -26,6 +28,134 @@ pub enum ServiceSelection {
     Mcp,
     Actions,
     All,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DaemonHandoffStage {
+    Requested,
+    SuccessorPrepared,
+    OwnershipReleased,
+    CanonicalReady,
+    Failed,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DaemonHandoffState {
+    pub schema_version: u32,
+    pub handoff_id: String,
+    pub workspace_id: String,
+    pub predecessor_pid: u32,
+    pub initiator_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_pid: Option<u32>,
+    pub service: ServiceSelection,
+    pub expected_build: BuildIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_snapshot: Option<crate::mcp::McpHandoffSnapshot>,
+    pub target_executable: String,
+    pub stage: DaemonHandoffStage,
+    #[serde(default)]
+    pub ownership_released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+#[cfg(unix)]
+impl DaemonHandoffState {
+    pub(crate) fn cutover_started(&self) -> bool {
+        self.ownership_released
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn create_handoff_state(
+    profile: &WorkspaceProfile,
+    handoff_id: &str,
+    service: ServiceSelection,
+    initiator_pid: u32,
+    expected_build: BuildIdentity,
+    mcp_snapshot: Option<crate::mcp::McpHandoffSnapshot>,
+    target_executable: &Path,
+) -> AppResult<DaemonHandoffState> {
+    let state = DaemonHandoffState {
+        schema_version: HANDOFF_SCHEMA_VERSION,
+        handoff_id: validate_handoff_id(handoff_id)?.to_string(),
+        workspace_id: profile.id.clone(),
+        predecessor_pid: std::process::id(),
+        initiator_pid,
+        successor_pid: None,
+        service,
+        expected_build,
+        mcp_snapshot,
+        target_executable: target_executable.display().to_string(),
+        stage: DaemonHandoffStage::Requested,
+        ownership_released: false,
+        failure: None,
+    };
+    write_handoff_state(&state)?;
+    Ok(state)
+}
+
+#[cfg(unix)]
+pub(crate) fn read_handoff_state(
+    profile_id: &str,
+    handoff_id: &str,
+) -> AppResult<Option<DaemonHandoffState>> {
+    let path = handoff_state_path(profile_id, handoff_id)?;
+    let state = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str::<DaemonHandoffState>(&raw)
+            .map(Some)
+            .map_err(|error| {
+                AppError::Message(format!("daemon handoff state is corrupt: {error}"))
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    if state.schema_version != HANDOFF_SCHEMA_VERSION
+        || state.workspace_id != profile_id
+        || state.handoff_id != handoff_id
+    {
+        return Err(AppError::Message(format!(
+            "daemon handoff state does not match workspace/id/schema: workspace={} id={} schema={}",
+            state.workspace_id, state.handoff_id, state.schema_version
+        )));
+    }
+    Ok(Some(state))
+}
+
+#[cfg(unix)]
+pub(crate) fn write_handoff_state(state: &DaemonHandoffState) -> AppResult<()> {
+    let path = handoff_state_path(&state.workspace_id, &state.handoff_id)?;
+    atomic_write_json(&path, state)
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_handoff_state(profile_id: &str, handoff_id: &str) {
+    if let Ok(path) = handoff_state_path(profile_id, handoff_id) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(unix)]
+fn handoff_state_path(profile_id: &str, handoff_id: &str) -> AppResult<PathBuf> {
+    let handoff_id = validate_handoff_id(handoff_id)?;
+    Ok(daemon_paths(profile_id)?
+        .dir
+        .join(format!("handoff-{handoff_id}.json")))
+}
+
+#[cfg(unix)]
+fn validate_handoff_id(handoff_id: &str) -> AppResult<&str> {
+    uuid::Uuid::parse_str(handoff_id)
+        .map_err(|_| AppError::Message("invalid daemon handoff id".into()))?;
+    Ok(handoff_id)
 }
 
 #[cfg(windows)]
@@ -227,7 +357,7 @@ fn parse_daemon_args(
 pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResult<()> {
     ensure_daemon_supported()?;
     if !platform().is_process_alive(pid) {
-        cleanup(profile)?;
+        cleanup_after_pid_exit(profile, pid)?;
         return Ok(());
     }
     if !process_matches_spawned_daemon(pid, &profile.id) {
@@ -246,7 +376,7 @@ pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResul
     if platform().is_process_alive(pid) {
         platform().terminate_process_tree(pid)?;
     }
-    cleanup(profile)
+    cleanup_after_pid_exit(profile, pid)
 }
 
 fn set_private_dir_permissions(path: &Path) -> AppResult<()> {
@@ -622,6 +752,105 @@ pub(crate) fn spawn_with_tunnels_from_executable(
     let child = command
         .spawn()
         .map_err(|error| AppError::Message(format!("启动 daemon 子进程失败：{error}")))?;
+    Ok(child.id())
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_handoff_successor(
+    profile: &WorkspaceProfile,
+    service: ServiceSelection,
+    executable: &Path,
+    handoff_id: &str,
+    predecessor_pid: u32,
+    mcp_listener: Option<&crate::runtime::InheritableListener>,
+    actions_listener: Option<&crate::runtime::InheritableListener>,
+) -> AppResult<u32> {
+    ensure_daemon_supported()?;
+    validate_handoff_id(handoff_id)?;
+    if predecessor_pid != std::process::id() {
+        return Err(AppError::Message(format!(
+            "handoff predecessor PID mismatch: expected {}, got {predecessor_pid}",
+            std::process::id()
+        )));
+    }
+    let executable = fs::canonicalize(executable).map_err(|error| {
+        AppError::Message(format!(
+            "cannot resolve handoff executable {}: {error}",
+            executable.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&executable)?;
+    if !metadata.is_file() {
+        return Err(AppError::Message(format!(
+            "handoff executable is not a file: {}",
+            executable.display()
+        )));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(AppError::Message(format!(
+            "handoff executable is not executable: {}",
+            executable.display()
+        )));
+    }
+    if service.includes_mcp() && mcp_listener.is_none() {
+        return Err(AppError::Message(
+            "handoff is missing the MCP listener".into(),
+        ));
+    }
+    if service.includes_actions() && actions_listener.is_none() {
+        return Err(AppError::Message(
+            "handoff is missing the Actions listener".into(),
+        ));
+    }
+
+    let log_path = daemon_log_path(&profile.id);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+        set_private_dir_permissions(parent)?;
+    }
+    let stdout = open_private_file(&log_path, true)?;
+    let stderr = stdout.try_clone()?;
+    let mut command = Command::new(&executable);
+    command
+        .arg("daemon-run")
+        .arg(&profile.id)
+        .arg("--service")
+        .arg(service.as_str())
+        .arg("--no-tunnel")
+        .arg("--handoff-id")
+        .arg(handoff_id)
+        .arg("--handoff-predecessor-pid")
+        .arg(predecessor_pid.to_string());
+    if let Some(listener) = mcp_listener {
+        command
+            .arg("--handoff-mcp-fd")
+            .arg(listener.raw_fd().to_string());
+    }
+    if let Some(listener) = actions_listener {
+        command
+            .arg("--handoff-actions-fd")
+            .arg(listener.raw_fd().to_string());
+    }
+    command
+        .current_dir(&profile.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| AppError::Message(format!("启动 handoff daemon 子进程失败：{error}")))?;
     Ok(child.id())
 }
 

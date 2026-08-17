@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::harness::Harness;
 use crate::tools::catalog::EffectiveCatalog;
 use crate::tools::command_cost::CommandCostGuard;
@@ -106,6 +108,17 @@ pub struct ToolContext {
 }
 
 pub type SharedToolContext = Arc<ToolContext>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ToolContextHandoffSnapshot {
+    default_cwd: PathBuf,
+    session_default_cwds: HashMap<String, PathBuf>,
+    task_default_cwds: HashMap<String, PathBuf>,
+    session_task_ids: HashMap<String, String>,
+    session_cursor_scopes: HashMap<String, String>,
+    command_output_cursors: HashMap<String, (usize, usize)>,
+}
 
 impl ToolContext {
     pub fn new(workspace_path: PathBuf) -> Result<Self, String> {
@@ -267,6 +280,53 @@ impl ToolContext {
 
     pub fn workspace_path(&self) -> String {
         self.workspace.root_display()
+    }
+
+    pub(crate) fn handoff_snapshot(&self) -> ToolContextHandoffSnapshot {
+        ToolContextHandoffSnapshot {
+            default_cwd: self.default_cwd.lock().expect("cwd lock").clone(),
+            session_default_cwds: self
+                .session_default_cwds
+                .lock()
+                .expect("session cwd lock")
+                .clone(),
+            task_default_cwds: self
+                .task_default_cwds
+                .lock()
+                .expect("task cwd lock")
+                .clone(),
+            session_task_ids: self
+                .session_task_ids
+                .lock()
+                .expect("session task lock")
+                .clone(),
+            session_cursor_scopes: self
+                .session_cursor_scopes
+                .lock()
+                .expect("session cursor scope lock")
+                .clone(),
+            command_output_cursors: self
+                .command_output_cursors
+                .lock()
+                .expect("command output cursors lock")
+                .clone(),
+        }
+    }
+
+    pub(crate) fn restore_handoff_snapshot(&self, snapshot: ToolContextHandoffSnapshot) {
+        *self.default_cwd.lock().expect("cwd lock") = snapshot.default_cwd;
+        *self.session_default_cwds.lock().expect("session cwd lock") =
+            snapshot.session_default_cwds;
+        *self.task_default_cwds.lock().expect("task cwd lock") = snapshot.task_default_cwds;
+        *self.session_task_ids.lock().expect("session task lock") = snapshot.session_task_ids;
+        *self
+            .session_cursor_scopes
+            .lock()
+            .expect("session cursor scope lock") = snapshot.session_cursor_scopes;
+        *self
+            .command_output_cursors
+            .lock()
+            .expect("command output cursors lock") = snapshot.command_output_cursors;
     }
 
     pub fn default_cwd_display(&self) -> String {
@@ -750,6 +810,47 @@ mod tests {
         ctx.bind_task_for_session(Some(transport), &task_a.id)
             .expect("rebind task a");
         assert_eq!(ctx.default_cwd_path_for(Some(transport)), cwd_a);
+    }
+
+    #[test]
+    fn handoff_snapshot_round_trip_preserves_session_scoped_tool_context() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        std::fs::create_dir_all(workspace.path().join("session-dir")).expect("session dir");
+        let source = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("source context");
+        let task = source.harness.start_task("handoff task").expect("task");
+        let transport = "handoff-transport";
+        source
+            .bind_task_for_session(Some(transport), &task.id)
+            .expect("bind task");
+        source.bind_cursor_scope_for_session(transport, Some("host-session:handoff"));
+        let cwd = workspace
+            .path()
+            .join("session-dir")
+            .canonicalize()
+            .expect("session cwd");
+        source.set_default_cwd_for(Some(transport), cwd.clone());
+        source
+            .command_output_cursors
+            .lock()
+            .expect("command output cursors lock")
+            .insert(format!("transport:{transport}\0command-1"), (17, 23));
+
+        let snapshot = source.handoff_snapshot();
+        let restored = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("restored context");
+        restored.restore_handoff_snapshot(snapshot.clone());
+
+        assert_eq!(restored.handoff_snapshot(), snapshot);
+        assert_eq!(restored.default_cwd_path_for(Some(transport)), cwd);
+        assert_eq!(restored.task_scope_id_for_session(transport), Some(task.id));
     }
 
     #[test]

@@ -45,6 +45,13 @@ pub enum RolloutTargetKind {
     Gateway,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutMode {
+    ZeroDowntimeHandoff,
+    BoundedOutage,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeRolloutResult {
@@ -61,6 +68,15 @@ pub struct RuntimeRolloutResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_build: Option<BuildIdentity>,
     pub current_build: BuildIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RolloutMode>,
+    pub handoff_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listener_ready_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drain_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_executable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +161,13 @@ pub async fn rollout_workspace(
         return Ok(result);
     }
 
+    let handoff_supported = control::request_version(&profile.id)
+        .await
+        .map(|version| version.supports_zero_downtime_handoff())
+        .unwrap_or(false);
+    let use_zero_downtime_handoff =
+        cfg!(unix) && handoff_supported && previous.managed_tunnels().is_none();
+
     let rollback_available = rollback_source_available(previous.pid, &previous.executable_path)?;
     if !rollback_available && !options.allow_no_rollback {
         return Err(AppError::Message(format!(
@@ -162,8 +185,20 @@ pub async fn rollout_workspace(
         result.pid = Some(previous.pid);
         result.active_executable = Some(previous.executable_path.clone());
         result.rollback_available = rollback_available;
-        result.message =
-            Some("将排空旧 daemon，启动当前构建并验证 readiness/build identity".into());
+        result.handoff_supported = handoff_supported;
+        result.mode = Some(if use_zero_downtime_handoff {
+            RolloutMode::ZeroDowntimeHandoff
+        } else {
+            RolloutMode::BoundedOutage
+        });
+        result.message = Some(if use_zero_downtime_handoff {
+            "将通过继承 listener 的 generation handoff 切换当前构建；成功路径不解绑业务端口".into()
+        } else if handoff_supported && previous.managed_tunnels().is_some() {
+            "当前 daemon 支持 handoff，但受管 tunnel 尚未支持跨代所有权转移；将使用 bounded-outage rollback-safe 升级"
+                .into()
+        } else {
+            "将排空旧 daemon，启动当前构建并验证 readiness/build identity".into()
+        });
         return Ok(result);
     }
 
@@ -180,6 +215,20 @@ pub async fn rollout_workspace(
         service: previous.service,
         tunnels: previous.managed_tunnels(),
     };
+
+    #[cfg(unix)]
+    if use_zero_downtime_handoff {
+        return rollout_workspace_handoff(
+            profile,
+            &previous,
+            spec,
+            rollback,
+            current_build,
+            options,
+        )
+        .await;
+    }
+
     if let Err(error) = control::request_daemon_exit_and_wait(
         profile,
         control::ControlOperation::Restart,
@@ -210,6 +259,8 @@ pub async fn rollout_workspace(
             result.pid = Some(next.pid);
             result.active_executable = Some(next.executable_path);
             result.rollback_available = rollback.is_some();
+            result.mode = Some(RolloutMode::BoundedOutage);
+            result.handoff_supported = handoff_supported;
             result.outage_ms = Some(duration_ms(outage_started.elapsed()));
             result.message = Some("Workspace daemon 已切换到当前构建".into());
             Ok(result)
@@ -220,7 +271,7 @@ pub async fn rollout_workspace(
                 next.pid
             );
             let _ = daemon::terminate_spawned(profile, next.pid).await;
-            rollback_workspace(
+            let mut result = rollback_workspace(
                 profile,
                 &previous,
                 spec,
@@ -232,10 +283,13 @@ pub async fn rollout_workspace(
                     timeout: options.timeout,
                 },
             )
-            .await
+            .await?;
+            result.mode = Some(RolloutMode::BoundedOutage);
+            result.handoff_supported = handoff_supported;
+            Ok(result)
         }
         Err(error) => {
-            rollback_workspace(
+            let mut result = rollback_workspace(
                 profile,
                 &previous,
                 spec,
@@ -247,9 +301,359 @@ pub async fn rollout_workspace(
                     timeout: options.timeout,
                 },
             )
-            .await
+            .await?;
+            result.mode = Some(RolloutMode::BoundedOutage);
+            result.handoff_supported = handoff_supported;
+            Ok(result)
         }
     }
+}
+
+#[cfg(unix)]
+async fn rollout_workspace_handoff(
+    profile: &WorkspaceProfile,
+    previous: &DaemonState,
+    spec: DaemonLaunchSpec,
+    rollback: Option<RollbackExecutable>,
+    current_build: BuildIdentity,
+    options: RolloutOptions,
+) -> AppResult<RuntimeRolloutResult> {
+    let current_executable = std::env::current_exe()?;
+    let handoff_started = Instant::now();
+    let (handoff_id, accepted_pid) = match control::request_daemon_handoff(
+        &profile.id,
+        current_executable.display().to_string(),
+        current_build.clone(),
+    )
+    .await
+    {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            if let Some(rollback) = rollback.as_ref() {
+                rollback.discard();
+            }
+            return Err(AppError::Message(format!(
+                "Workspace handoff request failed before cutover: {error}"
+            )));
+        }
+    };
+    if accepted_pid != previous.pid {
+        if let Some(rollback) = rollback.as_ref() {
+            rollback.discard();
+        }
+        return Err(AppError::Message(format!(
+            "Workspace handoff PID mismatch: state={} response={accepted_pid}",
+            previous.pid
+        )));
+    }
+
+    let deadline = tokio::time::Instant::now() + options.timeout;
+    loop {
+        let state = daemon::read_handoff_state(&profile.id, &handoff_id)?;
+        if let Some(state) = state.as_ref() {
+            if state.predecessor_pid != previous.pid {
+                if let Some(rollback) = rollback.as_ref() {
+                    rollback.discard();
+                }
+                daemon::remove_handoff_state(&profile.id, &handoff_id);
+                return Err(AppError::Message(format!(
+                    "Workspace handoff predecessor mismatch: expected {} state {}",
+                    previous.pid, state.predecessor_pid
+                )));
+            }
+            match state.stage {
+                daemon::DaemonHandoffStage::CanonicalReady => {
+                    let successor_pid = state.successor_pid.ok_or_else(|| {
+                        AppError::Message("canonical handoff state is missing successor PID".into())
+                    })?;
+                    let listener_ready_ms = duration_ms(handoff_started.elapsed());
+                    let remaining = deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .unwrap_or(Duration::from_millis(1));
+                    match verify_canonical_handoff_successor(
+                        profile,
+                        successor_pid,
+                        &current_build,
+                        remaining,
+                    )
+                    .await
+                    {
+                        Ok(next)
+                            if build_is_current(next.build_identity.as_ref(), &current_build) =>
+                        {
+                            if let Some(rollback) = rollback.as_ref() {
+                                rollback.discard();
+                            }
+                            let mut result = workspace_result(
+                                profile,
+                                &current_build,
+                                RolloutStatus::Upgraded,
+                                Some(previous),
+                            );
+                            result.pid = Some(next.pid);
+                            result.active_executable = Some(next.executable_path);
+                            result.rollback_available = rollback.is_some();
+                            result.mode = Some(RolloutMode::ZeroDowntimeHandoff);
+                            result.handoff_supported = true;
+                            result.handoff_id = Some(handoff_id.clone());
+                            result.listener_ready_ms = Some(listener_ready_ms);
+                            // The predecessor may still be finishing the request that invoked
+                            // `anchor upgrade`. Waiting for its PID here would deadlock that
+                            // self-upgrade request. Canonical successor readiness is sufficient
+                            // for the CLI to return; the predecessor drains independently.
+                            result.drain_ms = None;
+                            result.outage_ms = Some(0);
+                            result.message = Some(
+                                "Workspace daemon 已通过继承 listener 的 generation handoff 切换到当前构建"
+                                    .into(),
+                            );
+                            daemon::remove_handoff_state(&profile.id, &handoff_id);
+                            return Ok(result);
+                        }
+                        Ok(next) => {
+                            let failure = format!(
+                                "handoff successor PID {} readiness 通过，但 build identity 不是当前 CLI 构建",
+                                next.pid
+                            );
+                            let _ = daemon::terminate_spawned(profile, next.pid).await;
+                            return rollback_workspace_after_handoff(
+                                profile,
+                                previous,
+                                spec,
+                                rollback,
+                                current_build,
+                                handoff_started,
+                                options.timeout,
+                                handoff_id,
+                                failure,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            let _ = daemon::terminate_spawned(profile, successor_pid).await;
+                            return rollback_workspace_after_handoff(
+                                profile,
+                                previous,
+                                spec,
+                                rollback,
+                                current_build,
+                                handoff_started,
+                                options.timeout,
+                                handoff_id,
+                                error.to_string(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                daemon::DaemonHandoffStage::Failed => {
+                    let failure = state
+                        .failure
+                        .clone()
+                        .unwrap_or_else(|| "Workspace handoff failed".into());
+                    if !state.cutover_started()
+                        && predecessor_is_still_canonical(profile, previous)?
+                    {
+                        if let Some(successor_pid) = state.successor_pid {
+                            let _ = daemon::terminate_spawned(profile, successor_pid).await;
+                        }
+                        if let Some(rollback) = rollback.as_ref() {
+                            rollback.discard();
+                        }
+                        let mut result = workspace_result(
+                            profile,
+                            &current_build,
+                            RolloutStatus::Failed,
+                            Some(previous),
+                        );
+                        result.pid = Some(previous.pid);
+                        result.active_executable = Some(previous.executable_path.clone());
+                        result.rollback_available = rollback.is_some();
+                        result.mode = Some(RolloutMode::ZeroDowntimeHandoff);
+                        result.handoff_supported = true;
+                        result.handoff_id = Some(handoff_id.clone());
+                        result.outage_ms = Some(0);
+                        result.failure = Some(failure);
+                        result.message = Some(
+                            "handoff 在 cutover 前失败；旧 Workspace daemon 保持运行，未发生 listener outage"
+                                .into(),
+                        );
+                        daemon::remove_handoff_state(&profile.id, &handoff_id);
+                        return Ok(result);
+                    }
+                    return rollback_workspace_after_handoff(
+                        profile,
+                        previous,
+                        spec,
+                        rollback,
+                        current_build,
+                        handoff_started,
+                        options.timeout,
+                        handoff_id,
+                        failure,
+                    )
+                    .await;
+                }
+                daemon::DaemonHandoffStage::Requested
+                | daemon::DaemonHandoffStage::SuccessorPrepared
+                | daemon::DaemonHandoffStage::OwnershipReleased => {}
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let cutover_started = state.as_ref().is_some_and(|state| state.cutover_started());
+            if !cutover_started && predecessor_is_still_canonical(profile, previous)? {
+                if let Some(successor_pid) = state.as_ref().and_then(|state| state.successor_pid) {
+                    let _ = daemon::terminate_spawned(profile, successor_pid).await;
+                }
+                if let Some(rollback) = rollback.as_ref() {
+                    rollback.discard();
+                }
+                let mut result = workspace_result(
+                    profile,
+                    &current_build,
+                    RolloutStatus::Failed,
+                    Some(previous),
+                );
+                result.pid = Some(previous.pid);
+                result.active_executable = Some(previous.executable_path.clone());
+                result.rollback_available = rollback.is_some();
+                result.mode = Some(RolloutMode::ZeroDowntimeHandoff);
+                result.handoff_supported = true;
+                result.handoff_id = Some(handoff_id.clone());
+                result.outage_ms = Some(0);
+                result.failure = Some("Workspace handoff timed out before cutover".into());
+                result.message = Some(
+                    "handoff 超时但旧 Workspace daemon 仍保持 canonical；未发生 listener outage"
+                        .into(),
+                );
+                daemon::remove_handoff_state(&profile.id, &handoff_id);
+                return Ok(result);
+            }
+            return rollback_workspace_after_handoff(
+                profile,
+                previous,
+                spec,
+                rollback,
+                current_build,
+                handoff_started,
+                options.timeout,
+                handoff_id,
+                "Workspace handoff timed out after cutover started".into(),
+            )
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn verify_canonical_handoff_successor(
+    profile: &WorkspaceProfile,
+    successor_pid: u32,
+    current_build: &BuildIdentity,
+    timeout: Duration,
+) -> AppResult<DaemonState> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_detail = "successor state/control not ready".to_string();
+    loop {
+        let inspection = daemon::inspect(profile)?;
+        if inspection.running && inspection.pid_matches {
+            if let Some(state) = inspection.state {
+                if state.pid == successor_pid {
+                    if !build_is_current(state.build_identity.as_ref(), current_build) {
+                        return Err(AppError::Message(format!(
+                            "handoff successor PID {successor_pid} published a non-current build identity"
+                        )));
+                    }
+                    match control::request_version(&profile.id).await {
+                        Ok(version) => {
+                            if build_is_current(version.build_identity.as_ref(), current_build) {
+                                return Ok(state);
+                            }
+                            return Err(AppError::Message(format!(
+                                "handoff successor PID {successor_pid} control endpoint reported a non-current build identity"
+                            )));
+                        }
+                        Err(error) => {
+                            last_detail =
+                                format!("successor control endpoint is not ready: {error}");
+                        }
+                    }
+                } else {
+                    last_detail = format!(
+                        "canonical daemon state still reports PID {} instead of successor {successor_pid}",
+                        state.pid
+                    );
+                }
+            }
+        } else {
+            last_detail = inspection.detail;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Message(format!(
+                "handoff successor PID {successor_pid} did not become verifiably canonical before timeout: {last_detail}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(unix)]
+fn predecessor_is_still_canonical(
+    profile: &WorkspaceProfile,
+    previous: &DaemonState,
+) -> AppResult<bool> {
+    let inspection = daemon::inspect(profile)?;
+    Ok(inspection.running
+        && inspection.pid_matches
+        && inspection
+            .state
+            .as_ref()
+            .is_some_and(|state| state.pid == previous.pid))
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn rollback_workspace_after_handoff(
+    profile: &WorkspaceProfile,
+    previous: &DaemonState,
+    spec: DaemonLaunchSpec,
+    rollback: Option<RollbackExecutable>,
+    current_build: BuildIdentity,
+    outage_started: Instant,
+    timeout: Duration,
+    handoff_id: String,
+    failure: String,
+) -> AppResult<RuntimeRolloutResult> {
+    if let Some(state) = daemon::read_handoff_state(&profile.id, &handoff_id)? {
+        if let Some(successor_pid) = state.successor_pid {
+            if platform().is_process_alive(successor_pid) {
+                let _ = daemon::terminate_spawned(profile, successor_pid).await;
+            }
+        }
+    }
+    if platform().is_process_alive(previous.pid) {
+        let _ = daemon::terminate_spawned(profile, previous.pid).await;
+    }
+    let mut result = rollback_workspace(
+        profile,
+        previous,
+        spec,
+        rollback,
+        RolloutFailureContext {
+            current_build,
+            outage_started,
+            failure,
+            timeout,
+        },
+    )
+    .await?;
+    result.mode = Some(RolloutMode::ZeroDowntimeHandoff);
+    result.handoff_supported = true;
+    result.handoff_id = Some(handoff_id.clone());
+    daemon::remove_handoff_state(&profile.id, &handoff_id);
+    Ok(result)
 }
 
 pub async fn rollout_gateway(options: RolloutOptions) -> AppResult<RuntimeRolloutResult> {
@@ -596,6 +1000,11 @@ fn workspace_result(
         pid: None,
         previous_build: previous.and_then(|state| state.build_identity.clone()),
         current_build: current_build.clone(),
+        mode: None,
+        handoff_supported: false,
+        handoff_id: None,
+        listener_ready_ms: None,
+        drain_ms: None,
         previous_executable: previous.map(|state| state.executable_path.clone()),
         active_executable: None,
         rollback_available: false,
@@ -622,6 +1031,11 @@ fn gateway_result(
         pid: None,
         previous_build: previous.and_then(|state| state.build_identity.clone()),
         current_build: current_build.clone(),
+        mode: None,
+        handoff_supported: false,
+        handoff_id: None,
+        listener_ready_ms: None,
+        drain_ms: None,
         previous_executable: previous.map(|state| state.executable_path.clone()),
         active_executable: None,
         rollback_available: false,

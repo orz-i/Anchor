@@ -9,7 +9,7 @@ use crate::daemon;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::gateway_daemon;
-use crate::rollout::{self, RolloutOptions, RuntimeRolloutResult};
+use crate::rollout::{self, RolloutMode, RolloutOptions, RuntimeRolloutResult};
 use crate::workspace::WorkspaceProfile;
 
 #[derive(Debug, Serialize)]
@@ -210,8 +210,23 @@ fn print_report(report: &UpgradeReport, as_json: bool) -> AppResult<()> {
         if let Some(pid) = result.pid {
             details.push(format!("pid={pid}"));
         }
+        if let Some(mode) = result.mode {
+            details.push(format!(
+                "mode={}",
+                match mode {
+                    RolloutMode::ZeroDowntimeHandoff => "zero-downtime",
+                    RolloutMode::BoundedOutage => "bounded-outage",
+                }
+            ));
+        }
         if let Some(outage_ms) = result.outage_ms {
             details.push(format!("outage={}ms", outage_ms));
+        }
+        if let Some(listener_ready_ms) = result.listener_ready_ms {
+            details.push(format!("listener-ready={}ms", listener_ready_ms));
+        }
+        if let Some(drain_ms) = result.drain_ms {
+            details.push(format!("drain={}ms", drain_ms));
         }
         if result.rollback_attempted {
             details.push(format!(

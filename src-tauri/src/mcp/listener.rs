@@ -35,6 +35,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Semaphore};
@@ -71,6 +72,53 @@ struct ListenerState {
     concurrency: Arc<Semaphore>,
     in_flight: InFlightRequests,
     activity: McpActivityTracker,
+}
+
+#[derive(Clone)]
+pub(crate) struct McpHandoffReadiness {
+    sessions: LegacyMcpSessionStore,
+    mcp: SharedState,
+    in_flight: InFlightRequests,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct McpHandoffSnapshot {
+    transport_sessions: crate::mcp::protocol::LegacyMcpSessionStoreSnapshot,
+    tool_context: crate::tools::context::ToolContextHandoffSnapshot,
+}
+
+impl McpHandoffReadiness {
+    pub(crate) fn snapshot_for_handoff(
+        &self,
+        initiator_pid: u32,
+    ) -> Result<McpHandoffSnapshot, String> {
+        let initiator_transport_session =
+            self.mcp.sessions.prepare_daemon_handoff(initiator_pid)?;
+        let active_transport_sessions = self.sessions.active_session_count();
+        let initiator_is_active = initiator_transport_session
+            .as_deref()
+            .is_some_and(|session_id| self.sessions.inspect(session_id).is_some());
+        let supported_transport_shape = active_transport_sessions == 0
+            || (active_transport_sessions == 1 && initiator_is_active);
+        if !supported_transport_shape {
+            return Err(format!(
+                "zero-downtime handoff currently supports no active MCP transport session or only the upgrade-initiating session: active_transport_sessions={active_transport_sessions}"
+            ));
+        }
+        let non_initiator_requests = self
+            .in_flight
+            .count_excluding_session(initiator_transport_session.as_deref());
+        if non_initiator_requests != 0 {
+            return Err(format!(
+                "zero-downtime handoff is blocked by concurrent MCP requests: non_initiator_in_flight={non_initiator_requests}"
+            ));
+        }
+        Ok(McpHandoffSnapshot {
+            transport_sessions: self.sessions.handoff_snapshot(),
+            tool_context: self.mcp.handoff_snapshot(),
+        })
+    }
 }
 
 fn clear_session_associations(state: &ListenerState, session_id: &str) {
@@ -175,11 +223,14 @@ pub(crate) fn spawn_listener_with_handoff(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     runtime: RuntimeConfig,
+    imported_listener: Option<crate::runtime::HandoffListener>,
+    handoff_snapshot: Option<McpHandoffSnapshot>,
 ) -> Result<
     (
         ShutdownSender,
         crate::async_runtime::JoinHandle<()>,
         crate::runtime::HandoffListener,
+        McpHandoffReadiness,
     ),
     String,
 > {
@@ -265,6 +316,17 @@ pub(crate) fn spawn_listener_with_handoff(
         register_oauth_runtime(&workspace_id, "mcp", runtime);
     }
     let activity = register_activity(&workspace_id);
+    let sessions = LegacyMcpSessionStore::default();
+    if let Some(snapshot) = handoff_snapshot {
+        sessions.restore_handoff_snapshot(snapshot.transport_sessions);
+        mcp.restore_handoff_snapshot(snapshot.tool_context);
+    }
+    let in_flight = InFlightRequests::default();
+    let handoff_readiness = McpHandoffReadiness {
+        sessions: sessions.clone(),
+        mcp: mcp.clone(),
+        in_flight: in_flight.clone(),
+    };
     let state = ListenerState {
         mcp,
         auth,
@@ -277,7 +339,7 @@ pub(crate) fn spawn_listener_with_handoff(
         oauth,
         oauth_client_secret,
         proxy_specs,
-        sessions: LegacyMcpSessionStore::default(),
+        sessions,
         mcp_rate_limiter: RateLimiter::new(MCP_MAX_REQUESTS_PER_MINUTE, Duration::from_secs(60)),
         mcp_identity_rate_limiter: KeyedRateLimiter::new(
             MCP_MAX_REQUESTS_PER_IDENTITY_PER_MINUTE,
@@ -294,11 +356,16 @@ pub(crate) fn spawn_listener_with_handoff(
             Duration::from_secs(60),
         ),
         concurrency: Arc::new(Semaphore::new(MCP_MAX_CONCURRENT_REQUESTS)),
-        in_flight: InFlightRequests::default(),
+        in_flight,
         activity,
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
-    let (listener, handoff) = bind_listener(port)?;
+    let (listener, handoff) = match imported_listener {
+        Some(listener) => listener
+            .activate()
+            .map_err(|err| format!("MCP handoff listener 激活失败: {err}"))?,
+        None => bind_listener(port)?,
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = state.workspace_id.clone();
     let handle = crate::async_runtime::spawn(async move {
@@ -314,7 +381,7 @@ pub(crate) fn spawn_listener_with_handoff(
             append_profile_log(&profile_id, "stderr.log", "[mcp] listener stopped");
         }
     });
-    Ok((shutdown_tx, handle, handoff))
+    Ok((shutdown_tx, handle, handoff, handoff_readiness))
 }
 
 async fn serve(

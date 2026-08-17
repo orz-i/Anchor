@@ -71,6 +71,7 @@ pub(crate) fn spawn_listener_with_handoff(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     policy: PolicySettings,
+    imported_listener: Option<crate::runtime::HandoffListener>,
 ) -> Result<
     (
         ShutdownSender,
@@ -122,7 +123,12 @@ pub(crate) fn spawn_listener_with_handoff(
     }
 
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
-    let (listener, handoff) = bind_listener(actions_port)?;
+    let (listener, handoff) = match imported_listener {
+        Some(listener) => listener
+            .activate()
+            .map_err(|err| format!("Actions handoff listener 激活失败: {err}"))?,
+        None => bind_listener(actions_port)?,
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = workspace_id.to_string();
     let handle = crate::async_runtime::spawn(async move {

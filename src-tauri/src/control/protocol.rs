@@ -4,8 +4,9 @@ use super::WorkspaceControlStatus;
 use crate::build_identity::BuildIdentity;
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 6;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 7;
 pub const CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION: u16 = 2;
+pub const CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1: &str = "zero_downtime_handoff_v1";
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";
@@ -64,6 +65,16 @@ pub enum ControlMethod {
     PrepareRestart {
         #[serde(rename = "workspaceId")]
         workspace_id: String,
+    },
+    PrepareHandoff {
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        #[serde(rename = "initiatorPid")]
+        initiator_pid: u32,
+        #[serde(rename = "executablePath")]
+        executable_path: String,
+        #[serde(rename = "expectedBuild")]
+        expected_build: BuildIdentity,
     },
     TunnelControl {
         #[serde(rename = "workspaceId")]
@@ -276,6 +287,8 @@ pub enum ControlResult {
         protocol_version: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_identity: Option<BuildIdentity>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     WorkspaceStatus {
         status: Box<WorkspaceControlStatus>,
@@ -383,7 +396,9 @@ mod tests {
                 daemon_version,
                 protocol_version: 5,
                 build_identity: None,
+                capabilities,
             } if daemon_version == "0.1.22"
+                && capabilities.is_empty()
         ));
     }
 

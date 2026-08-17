@@ -7,6 +7,8 @@ mod supervisor;
 #[cfg(feature = "desktop")]
 pub use maintenance::spawn_desktop_maintenance;
 
+#[cfg(unix)]
+pub(crate) use listener_handoff::InheritableListener;
 pub(crate) use listener_handoff::{bind_loopback_listener, HandoffListener};
 pub use port::{await_listener_shutdown, is_own_process};
 #[cfg(feature = "desktop")]

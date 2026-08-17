@@ -1,6 +1,8 @@
 mod args;
 mod config;
 mod frp;
+#[cfg(unix)]
+mod handoff;
 mod plugin;
 mod software;
 mod tunnel;
@@ -45,6 +47,27 @@ use args::{
 struct CliTunnelRetry {
     attempts: u8,
     next_attempt: tokio::time::Instant,
+}
+
+struct DaemonOwnership {
+    guard: Option<daemon::DaemonGuard>,
+    control_server: Option<control::ControlServer>,
+}
+
+impl DaemonOwnership {
+    fn release(&mut self) {
+        self.control_server.take();
+        self.guard.take();
+    }
+}
+
+#[derive(Default)]
+struct WorkspaceServeContext {
+    ownership: Option<DaemonOwnership>,
+    #[cfg(unix)]
+    imported_listeners: Option<handoff::ImportedListeners>,
+    #[cfg(unix)]
+    handoff_id: Option<String>,
 }
 
 fn execute_service(command: ServiceCommand, as_json: bool) -> AppResult<i32> {
@@ -2205,6 +2228,7 @@ async fn run_daemon(
     selector: &str,
     service: ServiceSelection,
     tunnel_services: Option<ServiceSelection>,
+    handoff_options: Option<args::DaemonHandoffOptions>,
 ) -> AppResult<()> {
     // daemon-run is an internal child entrypoint; all managed spawn paths pass
     // the canonical workspace id as selector. Redirect before DataStore load so
@@ -2213,7 +2237,36 @@ async fn run_daemon(
     crate::logging::redirect_stdio_to_file(&daemon::daemon_log_path(selector))?;
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
-    let _guard = daemon::acquire_with_tunnels(&profile, service, tunnel_services)?;
+
+    #[cfg(not(unix))]
+    if handoff_options.is_some() {
+        return Err(AppError::Message(
+            "daemon handoff child mode is unsupported on this platform".into(),
+        ));
+    }
+
+    #[cfg(unix)]
+    let (imported_listeners, handoff_id) = if let Some(options) = handoff_options.as_ref() {
+        if tunnel_services.is_some() {
+            return Err(AppError::Message(
+                "zero-downtime handoff does not yet support managed tunnels".into(),
+            ));
+        }
+        let imported =
+            handoff::prepare_child(&profile, service, options, Duration::from_secs(15)).await?;
+        (Some(imported), Some(options.handoff_id.clone()))
+    } else {
+        (None, None)
+    };
+
+    #[cfg(unix)]
+    let guard = if handoff_options.is_some() {
+        handoff::acquire_successor_ownership(&profile, service, Duration::from_secs(3)).await?
+    } else {
+        daemon::acquire_with_tunnels(&profile, service, tunnel_services)?
+    };
+    #[cfg(not(unix))]
+    let guard = daemon::acquire_with_tunnels(&profile, service, tunnel_services)?;
     let (control_sender, control_receiver) = control::control_channel();
     let control_server = control::ControlServer::start(profile.clone(), control_sender)?;
     crate::tunnel::append_profile_log(
@@ -2236,6 +2289,16 @@ async fn run_daemon(
         false,
         false,
         Some(control_receiver),
+        WorkspaceServeContext {
+            ownership: Some(DaemonOwnership {
+                guard: Some(guard),
+                control_server: Some(control_server),
+            }),
+            #[cfg(unix)]
+            imported_listeners,
+            #[cfg(unix)]
+            handoff_id,
+        },
     )
     .await;
     if let Err(error) = &result {
@@ -2451,6 +2514,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             cli.json,
             true,
             None,
+            WorkspaceServeContext::default(),
         )
         .await
         .map(|_| 0),
@@ -2496,7 +2560,8 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
             workspace,
             service,
             tunnel_services,
-        } => run_daemon(&workspace, service, tunnel_services)
+            handoff,
+        } => run_daemon(&workspace, service, tunnel_services, handoff)
             .await
             .map(|_| 0),
     }
@@ -2638,6 +2703,7 @@ async fn serve_workspace(
     as_json: bool,
     foreground: bool,
     mut control_commands: Option<control::DaemonControlReceiver>,
+    mut serve_context: WorkspaceServeContext,
 ) -> AppResult<()> {
     let store = DataStore::load()?;
     let mut profile = resolve_workspace(store.list(), selector)?.clone();
@@ -2655,13 +2721,52 @@ async fn serve_workspace(
     let mut managed_tunnels = Vec::new();
     let mut tunnel_retries = std::collections::HashMap::new();
 
+    #[cfg(all(unix, debug_assertions))]
+    if let Some(handoff_id) = serve_context.handoff_id.as_deref() {
+        if std::env::var_os("ANCHOR_TEST_HANDOFF_FAIL_AFTER_CUTOVER").is_some() {
+            let error = AppError::Message(
+                "debug handoff failpoint requested after canonical ownership acquisition".into(),
+            );
+            handoff::mark_failed(&profile, handoff_id, &error.to_string());
+            return Err(error);
+        }
+    }
+
     let start_result = async {
         if service.includes_mcp() {
-            ensure_running(runtime.start_mcp(&profile)?, "MCP")?;
+            #[cfg(unix)]
+            let status = match serve_context.imported_listeners.as_mut() {
+                Some(listeners) => match listeners.mcp.take() {
+                    Some(listener) => runtime.start_from_handoff(
+                        &profile,
+                        ServiceKind::Mcp,
+                        listener,
+                        listeners.mcp_snapshot.take(),
+                    )?,
+                    None => runtime.start_mcp(&profile)?,
+                },
+                None => runtime.start_mcp(&profile)?,
+            };
+            #[cfg(not(unix))]
+            let status = runtime.start_mcp(&profile)?;
+            ensure_running(status, "MCP")?;
             started_services.push(ServiceKind::Mcp);
         }
         if service.includes_actions() {
-            ensure_running(runtime.start_actions(&profile)?, "Actions")?;
+            #[cfg(unix)]
+            let status = match serve_context
+                .imported_listeners
+                .as_mut()
+                .and_then(|listeners| listeners.actions.take())
+            {
+                Some(listener) => {
+                    runtime.start_from_handoff(&profile, ServiceKind::Actions, listener, None)?
+                }
+                None => runtime.start_actions(&profile)?,
+            };
+            #[cfg(not(unix))]
+            let status = runtime.start_actions(&profile)?;
+            ensure_running(status, "Actions")?;
             started_services.push(ServiceKind::Actions);
         }
 
@@ -2718,8 +2823,21 @@ async fn serve_workspace(
     .await;
 
     if let Err(error) = start_result {
+        #[cfg(unix)]
+        if let Some(handoff_id) = serve_context.handoff_id.as_deref() {
+            handoff::mark_failed(&profile, handoff_id, &error.to_string());
+        }
         let _ = shutdown(&mut runtime, &profile, &started_services, &managed_tunnels).await;
         return Err(error);
+    }
+
+    #[cfg(unix)]
+    if let Some(handoff_id) = serve_context.handoff_id.as_deref() {
+        if let Err(error) = handoff::mark_canonical_ready(&profile.id, handoff_id) {
+            handoff::mark_failed(&profile, handoff_id, &error.to_string());
+            let _ = shutdown(&mut runtime, &profile, &started_services, &managed_tunnels).await;
+            return Err(error);
+        }
     }
 
     if as_json {
@@ -2772,6 +2890,7 @@ async fn serve_workspace(
     maintenance.tick().await;
     let mut last_states = std::collections::HashMap::new();
     let mut terminal_error = None;
+    let mut handoff_completed = false;
     let shutdown_signal = wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
     loop {
@@ -2798,6 +2917,139 @@ async fn serve_workspace(
                             &format!("[control] accepted {operation:?}; beginning graceful shutdown"),
                         );
                         break;
+                    }
+                    Some(control::DaemonControlCommand::Handoff {
+                        handoff_id,
+                        initiator_pid,
+                        executable_path,
+                        expected_build,
+                    }) => {
+                        #[cfg(unix)]
+                        {
+                            if tunnel_services.is_some() {
+                                let error = AppError::Message(
+                                    "zero-downtime handoff does not yet support managed tunnels"
+                                        .into(),
+                                );
+                                let _ = daemon::create_handoff_state(
+                                    &profile,
+                                    &handoff_id,
+                                    service,
+                                    initiator_pid,
+                                    expected_build,
+                                    None,
+                                    Path::new(&executable_path),
+                                );
+                                handoff::mark_failed(&profile, &handoff_id, &error.to_string());
+                                crate::tunnel::append_profile_log(
+                                    &profile.id,
+                                    "daemon.log",
+                                    &format!("[handoff] rejected before cutover: {error}"),
+                                );
+                                continue;
+                            }
+                            let Some(ownership) = serve_context.ownership.as_mut() else {
+                                crate::tunnel::append_profile_log(
+                                    &profile.id,
+                                    "daemon.log",
+                                    "[handoff] rejected: canonical ownership unavailable",
+                                );
+                                continue;
+                            };
+                            let prepared = match handoff::prepare_successor(
+                                &profile,
+                                service,
+                                &handoff_id,
+                                Path::new(&executable_path),
+                                expected_build,
+                                initiator_pid,
+                                &runtime,
+                            )
+                            .await
+                            {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    crate::tunnel::append_profile_log(
+                                        &profile.id,
+                                        "daemon.log",
+                                        &format!("[handoff] successor preparation failed: {error}"),
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(error) = handoff::mark_ownership_released(&profile, &prepared) {
+                                handoff::mark_failed(&profile, &handoff_id, &error.to_string());
+                                let _ = platform().terminate_process_tree(prepared.successor_pid);
+                                crate::tunnel::append_profile_log(
+                                    &profile.id,
+                                    "daemon.log",
+                                    &format!("[handoff] activation failed before cutover: {error}"),
+                                );
+                                continue;
+                            }
+
+                            let mut drains = Vec::new();
+                            if service.includes_mcp() {
+                                drains.push((
+                                    ServiceKind::Mcp,
+                                    runtime.begin_stop(&profile.id, ServiceKind::Mcp),
+                                ));
+                            }
+                            if service.includes_actions() {
+                                drains.push((
+                                    ServiceKind::Actions,
+                                    runtime.begin_stop(&profile.id, ServiceKind::Actions),
+                                ));
+                            }
+                            ownership.release();
+
+                            match handoff::wait_canonical_ready(
+                                &profile,
+                                &prepared,
+                                Duration::from_secs(10),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    for (kind, handle) in drains {
+                                        if let Some(mut handle) = handle {
+                                            tokio::select! {
+                                                _ = &mut handle => {}
+                                                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                                                    handle.abort();
+                                                    let _ = handle.await;
+                                                }
+                                            }
+                                        }
+                                        runtime.finish_stop(&profile.id, kind);
+                                    }
+                                    crate::tunnel::append_profile_log(
+                                        &profile.id,
+                                        "daemon.log",
+                                        &format!(
+                                            "[handoff] successor PID {} is canonical; predecessor drained",
+                                            prepared.successor_pid
+                                        ),
+                                    );
+                                    handoff_completed = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    handoff::mark_failed(&profile, &handoff_id, &error.to_string());
+                                    terminal_error = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = (handoff_id, initiator_pid, executable_path, expected_build);
+                            terminal_error = Some(AppError::Message(
+                                "zero-downtime daemon handoff is unsupported on this platform"
+                                    .into(),
+                            ));
+                            break;
+                        }
                     }
                     Some(control::DaemonControlCommand::Tunnel {
                         operation_id,
@@ -3034,12 +3286,14 @@ async fn serve_workspace(
             }
         }
     }
-    if !as_json && foreground {
-        println!("正在停止……");
-    }
-    shutdown(&mut runtime, &profile, &started_services, &managed_tunnels).await?;
-    if as_json {
-        print_json(&json!({"event": "stopped", "workspace_id": profile.id}))?;
+    if !handoff_completed {
+        if !as_json && foreground {
+            println!("正在停止……");
+        }
+        shutdown(&mut runtime, &profile, &started_services, &managed_tunnels).await?;
+        if as_json {
+            print_json(&json!({"event": "stopped", "workspace_id": profile.id}))?;
+        }
     }
     match terminal_error {
         Some(error) => Err(error),

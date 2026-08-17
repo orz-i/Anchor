@@ -32,8 +32,8 @@ use super::protocol::{
     ControlAsyncOperation, ControlAsyncState, ControlConfigApplyResult, ControlEventBatch,
     ControlEventCursor, ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod,
     ControlOperation, ControlRequest, ControlResponse, ControlResult, ControlService,
-    ControlTunnelAction, CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION, CONTROL_PROTOCOL_VERSION,
-    MAX_CONTROL_FRAME_BYTES,
+    ControlTunnelAction, CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1,
+    CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION, CONTROL_PROTOCOL_VERSION, MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
@@ -59,6 +59,21 @@ pub enum DaemonControlCommand {
     ApplyConfig {
         operation_id: String,
     },
+    Handoff {
+        handoff_id: String,
+        initiator_pid: u32,
+        executable_path: String,
+        expected_build: BuildIdentity,
+    },
+}
+
+fn control_capabilities() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec![CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1.to_string()]
+    }
+    #[cfg(not(unix))]
+    Vec::new()
 }
 
 #[cfg(windows)]
@@ -126,10 +141,12 @@ pub async fn request_version(profile_id: &str) -> Result<ControlVersionInfo, Con
             daemon_version,
             protocol_version,
             build_identity,
+            capabilities,
         } => Ok(ControlVersionInfo {
             daemon_version,
             protocol_version,
             build_identity,
+            capabilities,
         }),
         other => Err(ControlClientError::Protocol(format!(
             "daemon returned unexpected version result: {other:?}"
@@ -142,6 +159,41 @@ pub struct ControlVersionInfo {
     pub daemon_version: String,
     pub protocol_version: u16,
     pub build_identity: Option<BuildIdentity>,
+    pub capabilities: Vec<String>,
+}
+
+impl ControlVersionInfo {
+    pub fn supports_zero_downtime_handoff(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability == CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1)
+    }
+}
+
+pub async fn request_daemon_handoff(
+    profile_id: &str,
+    executable_path: String,
+    expected_build: BuildIdentity,
+) -> Result<(String, u32), ControlClientError> {
+    match request(
+        profile_id,
+        ControlMethod::PrepareHandoff {
+            workspace_id: profile_id.to_string(),
+            initiator_pid: std::process::id(),
+            executable_path,
+            expected_build,
+        },
+    )
+    .await?
+    {
+        ControlResult::OperationAccepted {
+            operation_id,
+            daemon_pid,
+        } => Ok((operation_id, daemon_pid)),
+        other => Err(ControlClientError::Protocol(format!(
+            "daemon returned unexpected handoff result: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(windows)]
@@ -1255,7 +1307,7 @@ where
             DaemonControlCommand::ApplyConfig { operation_id } => {
                 Some(AsyncCommandKind::ApplyConfig(operation_id.clone()))
             }
-            DaemonControlCommand::Shutdown { .. } => None,
+            DaemonControlCommand::Shutdown { .. } | DaemonControlCommand::Handoff { .. } => None,
         };
         if command_sender.send(command).is_err() {
             let error = AppError::Message("daemon control command receiver is unavailable".into());
@@ -1309,6 +1361,7 @@ async fn handle_request(
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: super::protocol::CONTROL_PROTOCOL_VERSION,
                 build_identity: Some(crate::build_identity::BuildIdentity::current()),
+                capabilities: control_capabilities(),
             },
         )),
         ControlMethod::WorkspaceStatus { workspace_id } => {
@@ -1396,6 +1449,46 @@ async fn handle_request(
             ControlOperation::Restart,
             command_available,
         ),
+        ControlMethod::PrepareHandoff {
+            workspace_id,
+            initiator_pid,
+            executable_path,
+            expected_build,
+        } => {
+            if let Some(response) = workspace_mismatch(&request_id, profile, &workspace_id) {
+                return handled(response);
+            }
+            if !cfg!(unix) {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    "zero-downtime daemon handoff is not supported on this platform",
+                ));
+            }
+            if !command_available {
+                return handled(ControlResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    "daemon handoff command receiver is unavailable",
+                ));
+            }
+            let handoff_id = uuid::Uuid::new_v4().to_string();
+            HandledRequest {
+                response: ControlResponse::success(
+                    request_id,
+                    ControlResult::OperationAccepted {
+                        operation_id: handoff_id.clone(),
+                        daemon_pid: std::process::id(),
+                    },
+                ),
+                command: Some(DaemonControlCommand::Handoff {
+                    handoff_id,
+                    initiator_pid,
+                    executable_path,
+                    expected_build,
+                }),
+            }
+        }
         ControlMethod::TunnelControl {
             workspace_id,
             service,
@@ -1790,6 +1883,60 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_response_is_flushed_before_command_delivery() {
+        let profile = WorkspaceProfile::new(".".into(), Some("ipc-handoff".into()));
+        let workspace_id = profile.id.clone();
+        let expected_build = BuildIdentity::current();
+        let executable_path = "/tmp/anchor-handoff-target".to_string();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (command_sender, mut command_receiver) = control_channel();
+        let server_profile = profile.clone();
+        let server_task = tokio::spawn(async move {
+            handle_connection(server, &server_profile, &command_sender).await
+        });
+        let request = ControlRequest {
+            protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+            request_id: "handoff-request".into(),
+            method: ControlMethod::PrepareHandoff {
+                workspace_id,
+                initiator_pid: 4242,
+                executable_path: executable_path.clone(),
+                expected_build: expected_build.clone(),
+            },
+        };
+
+        write_json_frame(&mut client, &request)
+            .await
+            .expect("write handoff request");
+        let response: ControlResponse = read_json_frame(&mut client).await.expect("read response");
+        let handoff_id = match response.result.expect("accepted handoff") {
+            ControlResult::OperationAccepted {
+                operation_id,
+                daemon_pid,
+            } => {
+                assert_eq!(daemon_pid, std::process::id());
+                uuid::Uuid::parse_str(&operation_id).expect("handoff id is uuid");
+                operation_id
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        server_task
+            .await
+            .expect("server task")
+            .expect("serve handoff request");
+        assert_eq!(
+            command_receiver.recv().await,
+            Some(DaemonControlCommand::Handoff {
+                handoff_id,
+                initiator_pid: 4242,
+                executable_path,
+                expected_build,
+            })
+        );
+    }
+
     #[tokio::test]
     async fn request_handler_reports_protocol_and_daemon_versions() {
         let profile = WorkspaceProfile::new(".".into(), Some("ipc-version".into()));
@@ -1807,13 +1954,20 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.request_id, "version-request");
-        assert!(matches!(
-            response.result,
+        let capabilities = match response.result {
             Some(ControlResult::Version {
                 protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
+                capabilities,
                 ..
-            })
-        ));
+            }) => capabilities,
+            other => panic!("unexpected version response: {other:?}"),
+        };
+        #[cfg(unix)]
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability == CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1));
+        #[cfg(not(unix))]
+        assert!(capabilities.is_empty());
     }
 
     #[tokio::test]

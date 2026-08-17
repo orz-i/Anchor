@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::tools::CancellationToken;
@@ -13,6 +14,21 @@ pub enum ClientMessage {
     Request { id: Value, method: String },
     Notification { method: String },
     Response,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LegacyMcpSessionStoreSnapshot {
+    sessions: Vec<LegacyMcpSessionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyMcpSessionSnapshot {
+    session_id: String,
+    protocol_version: String,
+    initialized: bool,
+    used_request_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -103,6 +119,19 @@ impl Drop for InFlightRequestGuard {
 }
 
 impl InFlightRequests {
+    pub(crate) fn count_excluding_session(&self, excluded_session_id: Option<&str>) -> usize {
+        let requests = self.inner.lock().expect("MCP in-flight request lock");
+        let excluded_prefix = excluded_session_id.map(|session_id| format!("{session_id}:"));
+        requests
+            .keys()
+            .filter(|key| {
+                excluded_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| !key.starts_with(prefix))
+            })
+            .count()
+    }
+
     #[cfg(test)]
     pub fn insert(&self, session_id: &str, request_id: &Value) -> Option<InFlightRequestGuard> {
         match self.insert_with_session_limit(session_id, request_id, usize::MAX) {
@@ -498,6 +527,55 @@ impl LegacyMcpSessionStore {
         std::mem::take(&mut self.inner.lock().expect("MCP session lock").retired)
     }
 
+    pub(crate) fn active_session_count(&self) -> usize {
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        state.sessions.len()
+    }
+
+    pub(crate) fn handoff_snapshot(&self) -> LegacyMcpSessionStoreSnapshot {
+        let mut state = self.inner.lock().expect("MCP session lock");
+        self.prune_locked(&mut state);
+        let mut sessions = state
+            .sessions
+            .iter()
+            .map(|(session_id, session)| {
+                let mut used_request_ids =
+                    session.used_request_ids.iter().cloned().collect::<Vec<_>>();
+                used_request_ids.sort();
+                LegacyMcpSessionSnapshot {
+                    session_id: session_id.clone(),
+                    protocol_version: session.protocol_version.clone(),
+                    initialized: session.initialized,
+                    used_request_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        LegacyMcpSessionStoreSnapshot { sessions }
+    }
+
+    pub(crate) fn restore_handoff_snapshot(&self, snapshot: LegacyMcpSessionStoreSnapshot) {
+        let now = Instant::now();
+        let mut state = self.inner.lock().expect("MCP session lock");
+        state.sessions = snapshot
+            .sessions
+            .into_iter()
+            .map(|session| {
+                (
+                    session.session_id,
+                    LegacyMcpSession {
+                        protocol_version: session.protocol_version,
+                        initialized: session.initialized,
+                        last_seen: now,
+                        used_request_ids: session.used_request_ids.into_iter().collect(),
+                    },
+                )
+            })
+            .collect();
+        state.retired.clear();
+    }
+
     fn prune_locked(&self, state: &mut LegacyMcpSessionStoreState) {
         let now = Instant::now();
         let expired = state
@@ -634,6 +712,41 @@ mod tests {
     }
 
     #[test]
+    fn session_store_handoff_snapshot_preserves_transport_identity_and_request_history() {
+        let source = LegacyMcpSessionStore::default();
+        let session_id = source.create("2025-11-25", &json!(1));
+        assert!(source.mark_initialized(&session_id));
+        assert_eq!(
+            source.reserve_request_id(&session_id, &json!(2)),
+            RequestReservation::Reserved
+        );
+
+        let snapshot = source.handoff_snapshot();
+        let restored = LegacyMcpSessionStore::default();
+        restored.restore_handoff_snapshot(snapshot);
+
+        assert_eq!(
+            restored.inspect(&session_id),
+            Some(LegacyMcpSessionInfo {
+                protocol_version: "2025-11-25".into(),
+                initialized: true,
+            })
+        );
+        assert_eq!(
+            restored.reserve_request_id(&session_id, &json!(1)),
+            RequestReservation::Duplicate
+        );
+        assert_eq!(
+            restored.reserve_request_id(&session_id, &json!(2)),
+            RequestReservation::Duplicate
+        );
+        assert_eq!(
+            restored.reserve_request_id(&session_id, &json!(3)),
+            RequestReservation::Reserved
+        );
+    }
+
+    #[test]
     fn session_rejects_reused_request_ids() {
         let store = LegacyMcpSessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
@@ -767,5 +880,16 @@ mod tests {
         assert!(first.is_cancelled());
         assert!(second.is_cancelled());
         assert!(!other.is_cancelled());
+    }
+
+    #[test]
+    fn in_flight_registry_can_exclude_the_upgrade_initiating_session() {
+        let requests = InFlightRequests::default();
+        let initiator = requests.insert("initiator", &json!(1)).expect("initiator");
+        assert_eq!(requests.count_excluding_session(Some("initiator")), 0);
+        let other = requests.insert("other", &json!(2)).expect("other");
+        assert_eq!(requests.count_excluding_session(Some("initiator")), 1);
+        assert_eq!(requests.count_excluding_session(None), 2);
+        drop((initiator, other));
     }
 }

@@ -48,6 +48,86 @@ fn apply_toolchain_path_overlay(
     Ok(())
 }
 
+#[cfg(unix)]
+fn standard_user_toolchain_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        paths.push(PathBuf::from(cargo_home).join("bin"));
+    } else if let Some(home) = home.as_ref() {
+        paths.push(home.join(".cargo/bin"));
+    }
+    if let Some(pnpm_home) = std::env::var_os("PNPM_HOME") {
+        paths.push(PathBuf::from(pnpm_home));
+    }
+    if let Some(volta_home) = std::env::var_os("VOLTA_HOME") {
+        paths.push(PathBuf::from(volta_home).join("bin"));
+    }
+    if let Some(bun_install) = std::env::var_os("BUN_INSTALL") {
+        paths.push(PathBuf::from(bun_install).join("bin"));
+    }
+    if let Some(home) = home {
+        paths.extend([
+            home.join(".local/bin"),
+            home.join(".local/share/pnpm"),
+            home.join(".volta/bin"),
+            home.join(".bun/bin"),
+            home.join(".asdf/shims"),
+            home.join(".local/share/mise/shims"),
+            home.join(".pyenv/shims"),
+        ]);
+    }
+    paths.retain(|path| path.is_dir());
+    paths.dedup();
+    paths
+}
+
+#[cfg(unix)]
+fn apply_standard_user_toolchain_path(command: &mut Command) -> Result<(), WorkspaceError> {
+    let fallback = standard_user_toolchain_paths();
+    if fallback.is_empty() {
+        return Ok(());
+    }
+    let configured_path = command.as_std().get_envs().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("PATH")
+            .then(|| value.map(std::ffi::OsStr::to_os_string))
+            .flatten()
+    });
+    let mut paths = configured_path
+        .or_else(|| std::env::var_os("PATH"))
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for fallback in fallback {
+        if !paths.contains(&fallback) {
+            paths.push(fallback);
+        }
+    }
+    let joined = std::env::join_paths(paths).map_err(|error| WorkspaceError::Tool {
+        code: "TOOLCHAIN_PATH_INVALID",
+        message: format!("Unable to construct standard user toolchain PATH: {error}"),
+        category: "runtime",
+        retryable: true,
+    })?;
+    command.env("PATH", joined);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resolve_standard_user_toolchain_program(program: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    standard_user_toolchain_paths()
+        .into_iter()
+        .map(|directory| directory.join(program))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
 fn validate_toolchain_paths(value: Option<&Value>) -> Result<(), WorkspaceError> {
     let Some(value) = value else {
         return Ok(());
@@ -906,6 +986,8 @@ async fn run_command(
         .env("PYTHONLEGACYWINDOWSSTDIO", "0");
     #[cfg(windows)]
     configure_windows_command_environment(&mut command, &program);
+    #[cfg(unix)]
+    apply_standard_user_toolchain_path(&mut command)?;
     ctx.resources
         .apply_child_environment(&mut command, child_parallelism, &program);
     let toolchain_paths = resolve_toolchain_paths(execution, ctx.workspace.root())?;
@@ -947,6 +1029,7 @@ async fn run_command(
             cwd.display().to_string(),
             harness_metadata,
             ctx.command_owner_scope_for_session(mcp_session_id),
+            mcp_session_id.map(str::to_string),
             stream_encoding_for_program(&program),
             Some(resource_lease),
         )) {
@@ -961,6 +1044,7 @@ async fn run_command(
     let deadline = start + limit;
 
     if yield_time.is_zero() {
+        session.mark_externally_retained();
         let snapshot = session.snapshot(max_output);
         spawn_timeout_monitor(session.clone(), deadline);
         return Ok(merge_exec_result(
@@ -1068,6 +1152,7 @@ async fn run_command(
                     ));
                 }
             }
+            session.mark_externally_retained();
             let snapshot = session.snapshot(max_output);
             spawn_timeout_monitor(session.clone(), deadline);
             return Ok(merge_exec_result(
@@ -1439,6 +1524,13 @@ fn resolve_program(
             resolve_system_program_path(&p)
                 .to_string_lossy()
                 .into_owned()
+        })
+        .or_else(|error| {
+            #[cfg(unix)]
+            if let Some(program) = resolve_standard_user_toolchain_program(trimmed) {
+                return Ok(program);
+            }
+            Err(error)
         })
         .map_err(|_| WorkspaceError::Tool {
             code: "COMMAND_REJECTED",

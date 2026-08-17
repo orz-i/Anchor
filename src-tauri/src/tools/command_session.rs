@@ -481,6 +481,35 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    fn spawn_handoff_session(transport_session_id: &str) -> (u32, ExecSession) {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = crate::async_runtime::block_on(async {
+            command.spawn().expect("spawn handoff test child")
+        });
+        let pid = child.id().expect("handoff test child pid");
+        (
+            pid,
+            ExecSession::new_with_details_encoding_and_resources(
+                child,
+                false,
+                "sleep 30".into(),
+                ".".into(),
+                None,
+                None,
+                Some(transport_session_id.to_string()),
+                StreamEncoding::Utf8,
+                None,
+            ),
+        )
+    }
+
     #[test]
     fn execution_result_exposes_unambiguous_failure_contract() {
         let result = finalize_execution_result(json!({
@@ -515,6 +544,29 @@ mod tests {
         assert_eq!(result["execution_status"], "running");
         assert_eq!(result["success"], Value::Null);
         assert_eq!(result["session_id"], "session-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_handoff_preflight_only_allows_the_unexposed_initiator_command() {
+        let store = CommandSessionStore::with_limits(4, Duration::from_secs(60));
+        let (pid, exec_session) = spawn_handoff_session("mcp-session-1");
+        let session = store
+            .insert(exec_session)
+            .unwrap_or_else(|_| panic!("insert handoff session"));
+
+        assert_eq!(
+            store.prepare_daemon_handoff(pid),
+            Ok(Some("mcp-session-1".into()))
+        );
+
+        session.mark_externally_retained();
+        let error = store
+            .prepare_daemon_handoff(pid)
+            .expect_err("externally retained initiator must block handoff");
+        assert!(error.contains(&session.session_id));
+
+        crate::async_runtime::block_on(session.kill_and_wait());
     }
 
     #[test]
@@ -781,6 +833,46 @@ impl CommandSessionStore {
         task_ids
     }
 
+    pub(crate) fn prepare_daemon_handoff(
+        &self,
+        initiator_pid: u32,
+    ) -> Result<Option<String>, String> {
+        let sessions = {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        let mut initiator_transport_session = None;
+        let mut blockers = Vec::new();
+        for session in sessions {
+            crate::async_runtime::block_on(session.refresh_status());
+            let child_pid = if session.has_exited() {
+                None
+            } else {
+                crate::async_runtime::block_on(async {
+                    let child = session.child.lock().await;
+                    child.id()
+                })
+            };
+            let is_blocking_initiator = child_pid == Some(initiator_pid)
+                && !session.externally_retained()
+                && initiator_transport_session.is_none();
+            if is_blocking_initiator {
+                initiator_transport_session = session.transport_session_id.clone();
+                continue;
+            }
+            blockers.push(session.session_id.clone());
+        }
+        if blockers.is_empty() {
+            Ok(initiator_transport_session)
+        } else {
+            Err(format!(
+                "zero-downtime handoff is blocked by retained process-bound command sessions: {}",
+                blockers.join(",")
+            ))
+        }
+    }
+
     pub fn pending_for_task(
         &self,
         task_id: &str,
@@ -909,8 +1001,10 @@ pub struct ExecSession {
     reader_tasks: AsyncMutex<Vec<crate::async_runtime::JoinHandle<()>>>,
     harness_metadata: Option<SessionHarnessMetadata>,
     owner_scope: Option<String>,
+    transport_session_id: Option<String>,
     harness_finalized: AtomicBool,
     terminal_observed: AtomicBool,
+    externally_retained: AtomicBool,
     resource_lease: Mutex<Option<ExecutionLease>>,
     execution_resources: Option<Value>,
 }
@@ -988,6 +1082,7 @@ impl ExecSession {
             resolved_cwd,
             harness_metadata,
             owner_scope,
+            None,
             output_encoding,
             None,
         )
@@ -1001,6 +1096,7 @@ impl ExecSession {
         resolved_cwd: String,
         harness_metadata: Option<SessionHarnessMetadata>,
         owner_scope: Option<String>,
+        transport_session_id: Option<String>,
         output_encoding: StreamEncoding,
         resource_lease: Option<ExecutionLease>,
     ) -> Self {
@@ -1032,8 +1128,10 @@ impl ExecSession {
             reader_tasks: AsyncMutex::new(Vec::new()),
             harness_metadata,
             owner_scope,
+            transport_session_id,
             harness_finalized: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(false),
+            externally_retained: AtomicBool::new(false),
             resource_lease: Mutex::new(resource_lease),
             execution_resources,
         }
@@ -1045,6 +1143,14 @@ impl ExecSession {
 
     pub fn owner_scope(&self) -> Option<&str> {
         self.owner_scope.as_deref()
+    }
+
+    pub fn mark_externally_retained(&self) {
+        self.externally_retained.store(true, Ordering::Release);
+    }
+
+    fn externally_retained(&self) -> bool {
+        self.externally_retained.load(Ordering::Acquire)
     }
 
     pub fn terminal_observed(&self) -> bool {

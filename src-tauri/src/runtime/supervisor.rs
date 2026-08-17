@@ -51,6 +51,7 @@ struct RuntimeEntry {
     shutdown: Option<mcp::ShutdownSender>,
     handle: Option<JoinHandle<()>>,
     handoff_listener: Option<crate::runtime::HandoffListener>,
+    mcp_handoff_readiness: Option<mcp::McpHandoffReadiness>,
     error_message: Option<String>,
     started_at: Option<std::time::Instant>,
     missing_port_checks: u8,
@@ -85,6 +86,99 @@ impl RuntimeSupervisor {
 
     pub fn start_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.start(profile, ServiceKind::Actions)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn start_from_handoff(
+        &mut self,
+        profile: &WorkspaceProfile,
+        kind: ServiceKind,
+        listener: crate::runtime::HandoffListener,
+        mcp_snapshot: Option<mcp::McpHandoffSnapshot>,
+    ) -> AppResult<RuntimeStatusDto> {
+        self.attempt_start(profile, kind, false, Some(listener), mcp_snapshot)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn duplicate_listener_for_handoff(
+        &self,
+        workspace_id: &str,
+        kind: ServiceKind,
+        initiator_pid: u32,
+    ) -> AppResult<(
+        crate::runtime::InheritableListener,
+        Option<mcp::McpHandoffSnapshot>,
+    )> {
+        let entry = self
+            .entries
+            .get(&(workspace_id.to_string(), kind))
+            .filter(|entry| entry.phase == RuntimePhase::Running)
+            .ok_or_else(|| {
+                crate::error::AppError::Message(format!(
+                    "{} listener is not available for daemon handoff",
+                    service_label(kind).trim()
+                ))
+            })?;
+        let mcp_snapshot = if kind == ServiceKind::Mcp {
+            Some(
+                entry
+                    .mcp_handoff_readiness
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::error::AppError::Message(
+                            "MCP handoff readiness state is unavailable".into(),
+                        )
+                    })?
+                    .snapshot_for_handoff(initiator_pid)
+                    .map_err(crate::error::AppError::Message)?,
+            )
+        } else {
+            None
+        };
+        let listener = entry.handoff_listener.as_ref().ok_or_else(|| {
+            crate::error::AppError::Message(format!(
+                "{} listener is not available for daemon handoff",
+                service_label(kind).trim()
+            ))
+        })?;
+        let listener = listener
+            .duplicate_for_child()
+            .map_err(crate::error::AppError::from)?;
+        Ok((listener, mcp_snapshot))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_mcp_handoff_snapshot(
+        &self,
+        workspace_id: &str,
+        initiator_pid: u32,
+        expected: &mcp::McpHandoffSnapshot,
+    ) -> AppResult<()> {
+        let entry = self
+            .entries
+            .get(&(workspace_id.to_string(), ServiceKind::Mcp))
+            .filter(|entry| entry.phase == RuntimePhase::Running)
+            .ok_or_else(|| {
+                crate::error::AppError::Message(
+                    "MCP runtime stopped while preparing daemon handoff".into(),
+                )
+            })?;
+        let current = entry
+            .mcp_handoff_readiness
+            .as_ref()
+            .ok_or_else(|| {
+                crate::error::AppError::Message("MCP handoff readiness state is unavailable".into())
+            })?
+            .snapshot_for_handoff(initiator_pid)
+            .map_err(crate::error::AppError::Message)?;
+        if &current == expected {
+            Ok(())
+        } else {
+            Err(crate::error::AppError::Message(
+                "MCP session/tool state changed while the successor was preparing; handoff aborted before cutover"
+                    .into(),
+            ))
+        }
     }
 
     #[cfg(feature = "desktop")]
@@ -150,6 +244,7 @@ impl RuntimeSupervisor {
         if let Some(listener) = entry.handoff_listener.take() {
             listener.close();
         }
+        entry.mcp_handoff_readiness.take();
         let shutdown = entry.shutdown.take();
         let handle = entry.handle.take();
         if let Some(shutdown) = shutdown {
@@ -287,7 +382,7 @@ impl RuntimeSupervisor {
         profile: &WorkspaceProfile,
         kind: ServiceKind,
     ) -> AppResult<RuntimeStatusDto> {
-        self.attempt_start(profile, kind, false)
+        self.attempt_start(profile, kind, false, None, None)
     }
 
     fn attempt_start(
@@ -295,6 +390,8 @@ impl RuntimeSupervisor {
         profile: &WorkspaceProfile,
         kind: ServiceKind,
         recovery: bool,
+        imported_listener: Option<crate::runtime::HandoffListener>,
+        mcp_handoff_snapshot: Option<mcp::McpHandoffSnapshot>,
     ) -> AppResult<RuntimeStatusDto> {
         let key = (profile.id.clone(), kind);
         if !recovery
@@ -339,6 +436,7 @@ impl RuntimeSupervisor {
                 shutdown: None,
                 handle: None,
                 handoff_listener: None,
+                mcp_handoff_readiness: None,
                 error_message: previous_error,
                 started_at: Some(std::time::Instant::now()),
                 missing_port_checks: 0,
@@ -350,32 +448,34 @@ impl RuntimeSupervisor {
         );
 
         let port = port_for(profile, kind);
-        if let Some(pid) = platform().find_pid_listening_on_port(port)? {
-            if is_own_process(pid) {
-                wait_for_port_free_blocking(port, Duration::from_secs(3));
-            }
-            if try_reclaim_previous_macos_app_port(port) {
-                // A previous source-built or installed instance of this macOS
-                // app released the port; continue with the current listener.
-            }
+        if imported_listener.is_none() {
             if let Some(pid) = platform().find_pid_listening_on_port(port)? {
-                let message = port_busy_message(port, service_label(kind).trim(), pid);
-                append_profile_log(
-                    &profile.id,
-                    stderr_log_name(kind),
-                    &format!("[start] {message}"),
-                );
-                if recovery {
-                    self.record_recovery_failure(
-                        &key,
-                        recovery_attempt,
-                        previous_recovered_count,
-                        message,
-                    );
-                    return self.status(profile, kind);
+                if is_own_process(pid) {
+                    wait_for_port_free_blocking(port, Duration::from_secs(3));
                 }
-                self.entries.remove(&key);
-                return Err(crate::error::AppError::Message(message));
+                if try_reclaim_previous_macos_app_port(port) {
+                    // A previous source-built or installed instance of this macOS
+                    // app released the port; continue with the current listener.
+                }
+                if let Some(pid) = platform().find_pid_listening_on_port(port)? {
+                    let message = port_busy_message(port, service_label(kind).trim(), pid);
+                    append_profile_log(
+                        &profile.id,
+                        stderr_log_name(kind),
+                        &format!("[start] {message}"),
+                    );
+                    if recovery {
+                        self.record_recovery_failure(
+                            &key,
+                            recovery_attempt,
+                            previous_recovered_count,
+                            message,
+                        );
+                        return self.status(profile, kind);
+                    }
+                    self.entries.remove(&key);
+                    return Err(crate::error::AppError::Message(message));
+                }
             }
         }
 
@@ -414,7 +514,12 @@ impl RuntimeSupervisor {
                     oauth_password,
                     oauth_token_secret,
                     runtime_config,
+                    imported_listener,
+                    mcp_handoff_snapshot,
                 )
+                .map(|(shutdown, handle, listener, readiness)| {
+                    (shutdown, handle, listener, Some(readiness))
+                })
             }
             ServiceKind::Actions => {
                 let auth_type = profile.actions.auth_type.clone();
@@ -474,12 +579,14 @@ impl RuntimeSupervisor {
                     oauth_password,
                     oauth_token_secret,
                     policy,
+                    imported_listener,
                 )
+                .map(|(shutdown, handle, listener)| (shutdown, handle, listener, None))
             }
         };
 
         match spawn_result {
-            Ok((shutdown, handle, handoff_listener)) => {
+            Ok((shutdown, handle, handoff_listener, mcp_handoff_readiness)) => {
                 let started_at = self
                     .entries
                     .get(&key)
@@ -492,6 +599,7 @@ impl RuntimeSupervisor {
                         shutdown: Some(shutdown),
                         handle: Some(handle),
                         handoff_listener: Some(handoff_listener),
+                        mcp_handoff_readiness,
                         error_message: None,
                         started_at,
                         missing_port_checks: 0,
@@ -539,6 +647,7 @@ impl RuntimeSupervisor {
                         shutdown: None,
                         handle: None,
                         handoff_listener: None,
+                        mcp_handoff_readiness: None,
                         error_message: Some(err.to_string()),
                         started_at: None,
                         missing_port_checks: 0,
@@ -580,6 +689,7 @@ impl RuntimeSupervisor {
                 shutdown: None,
                 handle: None,
                 handoff_listener: None,
+                mcp_handoff_readiness: None,
                 error_message: Some(error_message),
                 started_at: None,
                 missing_port_checks: 0,
@@ -675,6 +785,7 @@ impl RuntimeSupervisor {
                     if let Some(listener) = entry.handoff_listener.take() {
                         listener.close();
                     }
+                    entry.mcp_handoff_readiness.take();
                     let occupied_by_self = platform()
                         .find_pid_listening_on_port(port)
                         .ok()
@@ -719,7 +830,7 @@ impl RuntimeSupervisor {
             }
         }
         if should_retry {
-            return self.attempt_start(profile, kind, true);
+            return self.attempt_start(profile, kind, true, None, None);
         }
         self.status(profile, kind)
     }
@@ -847,6 +958,7 @@ mod tests {
             shutdown: None,
             handle: None,
             handoff_listener: None,
+            mcp_handoff_readiness: None,
             error_message: None,
             started_at,
             missing_port_checks: 0,

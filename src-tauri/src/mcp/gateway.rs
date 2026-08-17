@@ -1384,32 +1384,38 @@ mod tests {
             strict_workspace_reads: true,
             ..crate::workspace::RuntimeConfig::default()
         };
-        let (shutdown_a, handle_a, _handoff_a) = crate::mcp::spawn_listener_with_handoff(
-            port_a,
-            workspace_a.clone(),
-            "workspace-a".into(),
-            "Workspace A".into(),
-            auth.clone(),
-            format!("http://127.0.0.1:{gateway_port}/w/workspace-a"),
-            None,
-            None,
-            None,
-            runtime_config.clone(),
-        )
-        .expect("listener a");
-        let (shutdown_b, handle_b, _handoff_b) = crate::mcp::spawn_listener_with_handoff(
-            port_b,
-            workspace_b.clone(),
-            "workspace-b".into(),
-            "Workspace B".into(),
-            auth,
-            format!("http://127.0.0.1:{gateway_port}/w/workspace-b"),
-            None,
-            None,
-            None,
-            runtime_config,
-        )
-        .expect("listener b");
+        let (shutdown_a, handle_a, _handoff_a, _handoff_state_a) =
+            crate::mcp::spawn_listener_with_handoff(
+                port_a,
+                workspace_a.clone(),
+                "workspace-a".into(),
+                "Workspace A".into(),
+                auth.clone(),
+                format!("http://127.0.0.1:{gateway_port}/w/workspace-a"),
+                None,
+                None,
+                None,
+                runtime_config.clone(),
+                None,
+                None,
+            )
+            .expect("listener a");
+        let (shutdown_b, handle_b, _handoff_b, _handoff_state_b) =
+            crate::mcp::spawn_listener_with_handoff(
+                port_b,
+                workspace_b.clone(),
+                "workspace-b".into(),
+                "Workspace B".into(),
+                auth,
+                format!("http://127.0.0.1:{gateway_port}/w/workspace-b"),
+                None,
+                None,
+                None,
+                runtime_config,
+                None,
+                None,
+            )
+            .expect("listener b");
         let gateway_runtime = spawn(
             gateway_port,
             HashMap::from([

@@ -1270,6 +1270,10 @@ fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
     let workspace = pop_value(args, "daemon-run")?;
     let mut service = ServiceSelection::Mcp;
     let mut tunnel_services = None;
+    let mut handoff_id = None;
+    let mut handoff_predecessor_pid = None;
+    let mut handoff_mcp_fd = None;
+    let mut handoff_actions_fd = None;
     while let Some(option) = args.pop_front() {
         match option.as_str() {
             "--service" => {
@@ -1283,13 +1287,50 @@ fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
                     "--tunnel-service",
                 )?)?);
             }
+            "--handoff-id" => handoff_id = Some(pop_value(args, "--handoff-id")?),
+            "--handoff-predecessor-pid" => {
+                handoff_predecessor_pid =
+                    Some(parse_u64(args, "--handoff-predecessor-pid", 1, u32::MAX as u64)? as u32)
+            }
+            "--handoff-mcp-fd" => {
+                handoff_mcp_fd =
+                    Some(parse_u64(args, "--handoff-mcp-fd", 0, i32::MAX as u64)? as i32)
+            }
+            "--handoff-actions-fd" => {
+                handoff_actions_fd =
+                    Some(parse_u64(args, "--handoff-actions-fd", 0, i32::MAX as u64)? as i32)
+            }
             other => return Err(format!("daemon-run 不支持参数：{other}")),
         }
     }
+    let handoff = match (
+        handoff_id,
+        handoff_predecessor_pid,
+        handoff_mcp_fd,
+        handoff_actions_fd,
+    ) {
+        (None, None, None, None) => None,
+        (Some(handoff_id), Some(predecessor_pid), mcp_fd, actions_fd) => {
+            if service.includes_mcp() && mcp_fd.is_none() {
+                return Err("daemon-run handoff 缺少 --handoff-mcp-fd".into());
+            }
+            if service.includes_actions() && actions_fd.is_none() {
+                return Err("daemon-run handoff 缺少 --handoff-actions-fd".into());
+            }
+            Some(DaemonHandoffOptions {
+                handoff_id,
+                predecessor_pid,
+                mcp_fd,
+                actions_fd,
+            })
+        }
+        _ => return Err("daemon-run handoff 参数不完整".into()),
+    };
     Ok(Command::DaemonRun {
         workspace,
         service,
         tunnel_services,
+        handoff,
     })
 }
 
@@ -1485,7 +1526,16 @@ pub enum Command {
         workspace: String,
         service: ServiceSelection,
         tunnel_services: Option<ServiceSelection>,
+        handoff: Option<DaemonHandoffOptions>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonHandoffOptions {
+    pub handoff_id: String,
+    pub predecessor_pid: u32,
+    pub mcp_fd: Option<i32>,
+    pub actions_fd: Option<i32>,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
@@ -2179,6 +2229,66 @@ mod tests {
                 service: ServiceSelection::Actions,
             })
         );
+    }
+
+    #[test]
+    fn daemon_run_handoff_requires_complete_listener_metadata() {
+        let child = parse(strings(&[
+            "daemon-run",
+            "workspace-a",
+            "--service",
+            "all",
+            "--no-tunnel",
+            "--handoff-id",
+            "handoff-1",
+            "--handoff-predecessor-pid",
+            "4242",
+            "--handoff-mcp-fd",
+            "11",
+            "--handoff-actions-fd",
+            "12",
+        ]))
+        .expect("complete handoff child");
+        assert_eq!(
+            child.command,
+            Command::DaemonRun {
+                workspace: "workspace-a".into(),
+                service: ServiceSelection::All,
+                tunnel_services: None,
+                handoff: Some(DaemonHandoffOptions {
+                    handoff_id: "handoff-1".into(),
+                    predecessor_pid: 4242,
+                    mcp_fd: Some(11),
+                    actions_fd: Some(12),
+                }),
+            }
+        );
+
+        let missing_actions = parse(strings(&[
+            "daemon-run",
+            "workspace-a",
+            "--service",
+            "all",
+            "--handoff-id",
+            "handoff-1",
+            "--handoff-predecessor-pid",
+            "4242",
+            "--handoff-mcp-fd",
+            "11",
+        ]))
+        .expect_err("all-service handoff must include Actions fd");
+        assert!(missing_actions.contains("--handoff-actions-fd"));
+
+        let partial = parse(strings(&[
+            "daemon-run",
+            "workspace-a",
+            "--handoff-id",
+            "handoff-1",
+            "--handoff-mcp-fd",
+            "11",
+        ]))
+        .expect_err("handoff id without predecessor pid must fail");
+        assert!(partial.contains("handoff 参数不完整"));
     }
 
     #[test]

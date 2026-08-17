@@ -10,15 +10,26 @@ Upgrade a running Workspace/Gateway daemon generation without creating a listene
 - This does not silently weaken daemon ownership, control-plane authentication, or build-identity checks.
 - A pre-handoff daemon that only understands `prepare_restart` continues to use the existing bounded-outage rollout for the one bootstrap upgrade into a handoff-capable build.
 
+## V1 safety boundary
+
+The first Unix Workspace handoff implementation supports either no active Streamable HTTP transport session, or exactly one active transport session when that session owns the still-blocking `exec_command` process that invoked `anchor upgrade`. In the latter case the predecessor snapshots and transfers the MCP session id/protocol/initialization/request-id reservations plus session-scoped cwd, task binding, principal/cursor scope, and command-output cursor state before exporting the listener.
+
+The initiating blocking `exec_command` itself is not migrated: it remains on the predecessor until the upgrade CLI verifies the successor and returns, after which the old request completes and the predecessor can drain. Any unrelated active MCP transport session, concurrent non-initiator request, or already-exposed retained/process-bound command session blocks handoff **before cutover**. This boundary prevents TCP continuity from masking application-state loss while still allowing the normal ChatGPT plugin session to upgrade its own daemon generation.
+
+The predecessor snapshots state before spawning the successor and performs the same preflight plus a full structural snapshot comparison again after the successor reports `successor_prepared`. If any request/session/tool-context mutation occurred during that preparation window, the successor is terminated and the predecessor remains canonical. This closes the race between initial preflight and ownership release without rejecting or freezing normal requests on the old listener.
+
+V1 does not transfer the transport identity of downstream stdio MCP proxy processes. The successor rebuilds its proxy registry using the normal configured startup path, and the handoff preflight rejects non-initiator concurrent Anchor MCP requests so no proxy tool call is deliberately cut over in flight. Durable downstream/browser-process identity, when required by a specific proxy, is a separate proxy-handoff problem and must not be inferred from listener continuity.
+
 ## Required invariants
 
 1. **No business-listener gap.** At least one generation owns every selected MCP/Actions/Gateway listener from handoff start until the successor is accepting traffic.
 2. **Single canonical owner.** Only one generation owns daemon state, the singleton lock, and the canonical control endpoint at a time.
 3. **Old generation remains the rollback authority before cutover.** If the successor cannot import listeners or initialize runtime state, the old generation keeps serving and the upgrade fails without outage.
-4. **Successor becomes canonical before predecessor exits.** After listener readiness, the predecessor stops accepting new work, releases control/lock ownership, and only drains already accepted work while the successor acquires canonical ownership.
-5. **Build identity is mandatory.** The successor must report the exact expected `BuildIdentity` before the rollout is considered successful.
-6. **Protocol is additive and capability-gated.** Handoff is never sent to a daemon that did not advertise the handoff capability.
-7. **Legacy rollback remains available.** If failure happens after canonical cutover, the existing saved rollback executable is still used to restore the previous generation.
+4. **No silent process-local state loss.** A generation is not allowed to enter cutover while it owns MCP transport/command session state that the successor cannot reconstruct.
+5. **Successor becomes canonical before predecessor exits.** After listener readiness, the predecessor stops accepting new work, releases control/lock ownership, and only drains already accepted work while the successor acquires canonical ownership.
+6. **Build identity is mandatory.** The successor must report the exact expected `BuildIdentity` before the rollout is considered successful.
+7. **Protocol is additive and capability-gated.** Handoff is never sent to a daemon that did not advertise the handoff capability.
+8. **Legacy rollback remains available.** If failure happens after canonical cutover, the existing saved rollback executable is still used to restore the previous generation.
 
 ## Generation handoff model
 
@@ -32,12 +43,13 @@ old generation
         | duplicate/inherit
         v
 new generation
-  listener A'' ----------> starts accepting before cutover
+  listener A'' ----------> inherited and validated, accept loop parked
         |
-        +---- ready(build identity, pid)
+        +---- successor-prepared(build identity, pid)
 
-old: stop accepting -> release control + singleton lock -> drain accepted work
-new: acquire singleton lock -> publish state -> bind canonical control -> canonical ready
+old: publish cutover -> stop accepting -> release control + singleton lock
+new: acquire singleton lock -> publish state -> bind canonical control -> activate A''
+new: canonical ready; queued/new connections are served by successor
 old: exit after bounded drain
 ```
 
@@ -72,10 +84,12 @@ The manifest contains only process-local coordination data:
 - nonce;
 - target kind and workspace id / Gateway scope;
 - predecessor PID;
+- upgrade initiator PID;
 - successor PID once spawned;
 - expected `BuildIdentity`;
 - selected services/routes;
-- transferred listener descriptors or Windows socket protocol records;
+- transferable MCP transport + ToolContext snapshot;
+- Windows socket protocol records when the Windows transport is implemented (Unix descriptors are inherited directly by the child process);
 - stage: `prepared | successor_started | listener_ready | ownership_released | canonical_ready | failed`;
 - bounded error text.
 
@@ -86,13 +100,11 @@ Atomic replacement is required for every stage transition. Stale manifests are i
 The daemon version response gains a handoff capability field. A capable CLI uses a new asynchronous control operation:
 
 ```text
-prepare_handoff(workspace_id, executable_path, expected_build, timeout)
+prepare_handoff(workspace_id, initiator_pid, executable_path, expected_build)
   -> operation_id
-operation_status(operation_id)
-  -> pending/running/succeeded/failed + successor_pid
 ```
 
-The daemon validates the requested executable before spawning it. The control response is flushed before command dispatch, preserving the current no-half-response rule.
+The daemon validates the initiator/session shape and requested executable before cutover. The control response is flushed before command dispatch, preserving the current no-half-response rule. Because the canonical control socket itself changes generations, the invoking CLI follows the operation through the private handoff manifest and then verifies the successor using canonical daemon state plus the new control endpoint/build identity.
 
 For a daemon that does not advertise handoff, `anchor upgrade` automatically uses the current `prepare_restart -> exit -> spawn -> readiness` path and reports the mode as `bounded_outage`.
 
@@ -105,7 +117,7 @@ MCP, Actions, and Gateway listener constructors are split into two steps:
 
 The runtime supervisor retains one handoff duplicate for each Running service and drops it whenever that runtime is stopped or replaced. Imported listeners bypass normal port-conflict probing because the socket itself proves continuity with the predecessor.
 
-The successor starts imported business listeners before acquiring canonical daemon ownership. It does not bind the normal daemon control endpoint until the predecessor explicitly releases ownership.
+The successor imports and validates business listener descriptors before cutover, but deliberately does not start their accept loops yet. After the predecessor publishes the cutover stage, triggers graceful shutdown of its accept loops, and releases canonical control/lock ownership, the successor acquires that ownership and activates the inherited listeners. The kernel listener itself remains continuously bound/listening throughout this parked interval, so new TCP connections queue rather than observing an unbound port.
 
 ## Drain semantics
 
