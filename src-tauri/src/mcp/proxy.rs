@@ -4124,6 +4124,8 @@ mod tests {
 
     use crate::tools::CancellationToken;
 
+    #[cfg(target_os = "windows")]
+    use super::StdioMcpProxyClient;
     use super::{
         browser_debugging_port, browser_proxy_error_code, expand_proxy_placeholders,
         merge_proxy_success_summary, normalize_proxy_tool_result, normalized_proxy_failure,
@@ -4131,7 +4133,7 @@ mod tests {
         proxy_catalog_digest, proxy_connection_status, proxy_failure_reason,
         proxy_management_tools, proxy_page_state, proxy_result_state_summary,
         sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
-        McpProxyTransportSpec, ProxyClientError, ProxyExposureMode, StdioMcpProxyClient,
+        McpProxyTransportSpec, ProxyClientError, ProxyExposureMode,
     };
 
     fn test_spec() -> McpProxyServerSpec {

@@ -1155,6 +1155,7 @@ mod tests {
             Some(&workspace),
         )
         .is_ok());
+        #[cfg(windows)]
         assert!(validate_command_for_workspace(
             &json!({"cmd": "cmd /c echo local"}),
             &policy,

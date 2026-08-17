@@ -923,6 +923,7 @@ mod tests {
             .is_ok());
     }
 
+    #[cfg(feature = "desktop")]
     #[test]
     fn stale_profile_does_not_match_a_replaced_route() {
         let settings = AppSettings::default();

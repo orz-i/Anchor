@@ -1844,9 +1844,11 @@ mod tests {
         build_effective_catalog_from_parts, CancellationToken, ToolContext, Workspace,
     };
 
+    #[cfg(windows)]
+    use super::browser_os_path;
     use super::{
         attach_browser_workspace_artifacts, await_local_tool_worker_with_limits,
-        browser_build_matches, browser_current_build, browser_os_path, effective_catalog_error,
+        browser_build_matches, browser_current_build, effective_catalog_error,
         extract_browser_json_payload, finalize_browser_workspace_artifacts, handle_request,
         handle_tools_call, initialize_result, new_state, prepare_browser_workspace_arguments,
         tool_arguments, tools_list_result,

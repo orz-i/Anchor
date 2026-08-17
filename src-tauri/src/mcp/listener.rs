@@ -1902,11 +1902,13 @@ mod tests {
         state
             .mcp
             .set_default_cwd_for(Some(&session_id), session_dir);
-        assert!(state
-            .mcp
-            .default_cwd_display_for(Some(&session_id))
-            .replace('\\', "/")
-            .ends_with("/expired-session"));
+        assert_eq!(
+            state
+                .mcp
+                .default_cwd_display_for(Some(&session_id))
+                .replace('\\', "/"),
+            "expired-session"
+        );
         std::thread::sleep(Duration::from_millis(1));
 
         let mut headers = request_headers();

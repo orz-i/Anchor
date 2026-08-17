@@ -291,7 +291,7 @@ fn portable_config_roundtrip_recovers_incompatible_dpapi_and_preserves_registrat
     assert_success(&after_import);
     let list_output = String::from_utf8_lossy(&after_import.stdout);
     assert!(list_output.contains(&workspace_id));
-    assert!(list_output.contains(&target_workspace.to_string_lossy().as_ref()));
+    assert!(list_output.contains(target_workspace.to_string_lossy().as_ref()));
 
     let target_gpt_config = run(&cli_args(
         &target_config,

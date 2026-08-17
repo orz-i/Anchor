@@ -430,6 +430,8 @@ mod tests {
             exit_code: Some(if passed { 0 } else { 1 }),
             passed,
             duration_ms: Some(10),
+            terminal_at: None,
+            output_refs: None,
             change_id: None,
             dispositions: Vec::new(),
             supersedes: Vec::new(),

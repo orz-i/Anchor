@@ -2501,6 +2501,8 @@ mod tests {
                 false,
                 Some(10),
                 None,
+                None,
+                None,
                 "blocking",
                 true,
             )
