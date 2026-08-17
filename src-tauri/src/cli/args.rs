@@ -10,6 +10,46 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+fn parse_upgrade(args: &mut VecDeque<String>) -> Result<UpgradeOptions, String> {
+    let mut workspaces = Vec::new();
+    let mut all = false;
+    let mut gateway = false;
+    let mut timeout_seconds = 20;
+    let mut force = false;
+    let mut dry_run = false;
+    let mut allow_no_rollback = false;
+
+    while let Some(value) = args.pop_front() {
+        match value.as_str() {
+            "--all" => all = true,
+            "--gateway" => gateway = true,
+            "--timeout" => timeout_seconds = parse_u64(args, "--timeout", 1, 300)?,
+            "--force" => force = true,
+            "--dry-run" => dry_run = true,
+            "--allow-no-rollback" => allow_no_rollback = true,
+            option if option.starts_with('-') => {
+                return Err(format!("upgrade 不支持参数：{option}"))
+            }
+            workspace => workspaces.push(workspace.to_string()),
+        }
+    }
+    if all && !workspaces.is_empty() {
+        return Err("upgrade --all 不能与显式 workspace 同时使用".into());
+    }
+    if !all && !gateway && workspaces.is_empty() {
+        return Err("upgrade 缺少目标；请指定 workspace、--gateway 或 --all".into());
+    }
+    Ok(UpgradeOptions {
+        workspaces,
+        all,
+        gateway,
+        timeout_seconds,
+        force,
+        dry_run,
+        allow_no_rollback,
+    })
+}
+
 fn set_frp_token_input(
     target: &mut Option<FrpTokenInput>,
     value: FrpTokenInput,
@@ -1285,6 +1325,17 @@ pub struct StopOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeOptions {
+    pub workspaces: Vec<String>,
+    pub all: bool,
+    pub gateway: bool,
+    pub timeout_seconds: u64,
+    pub force: bool,
+    pub dry_run: bool,
+    pub allow_no_rollback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusOptions {
     pub workspace: Option<String>,
     pub watch: bool,
@@ -1400,6 +1451,7 @@ pub enum Command {
     Start(RunOptions),
     Stop(StopOptions),
     Restart(RunOptions),
+    Upgrade(UpgradeOptions),
     Logs(LogsOptions),
     Events(EventsOptions),
     Reload(ReloadOptions),
@@ -1472,6 +1524,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("start") => Command::Start(parse_run_options(&mut args, "start")?),
         Some("stop") => Command::Stop(parse_stop(&mut args)?),
         Some("restart") => Command::Restart(parse_run_options(&mut args, "restart")?),
+        Some("upgrade") => Command::Upgrade(parse_upgrade(&mut args)?),
         Some("logs") => Command::Logs(parse_logs(&mut args)?),
         Some("events") => Command::Events(parse_events(&mut args)?),
         Some("reload") => Command::Reload(parse_reload(&mut args)?),
@@ -1556,6 +1609,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
   anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] upgrade (<workspace> [workspace ...]|--gateway|--all) [--gateway] [--timeout SECONDS] [--force] [--dry-run] [--allow-no-rollback]\n\
   anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
   anchor [--config-dir PATH] [--json] events <workspace|--control-plane> [-f] [--wait SECONDS]\n\
   anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
@@ -1571,7 +1625,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
   anchor [--config-dir PATH] [--json] service <command>\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
-不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。CLI 不会接管 GUI 或其他进程占用的端口。"
+不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。upgrade 将已运行 daemon 有界排空并切换到当前 CLI 构建，默认要求可自动回滚；它不下载或替换 CLI 本体。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
 
 pub fn frp_usage() -> &'static str {

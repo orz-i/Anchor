@@ -51,6 +51,13 @@ anchor reload PROFILE_ID --service mcp
 # 重启并沿用当前 service/tunnel 参数
 anchor restart PROFILE_ID
 
+# 预检并把运行中的 daemon 切换到当前 CLI 构建
+anchor upgrade PROFILE_ID --dry-run
+anchor upgrade PROFILE_ID
+
+# 一次升级所有运行中的 Workspace/Gateway daemon
+anchor upgrade --all
+
 # 优雅停止
 anchor stop PROFILE_ID
 
@@ -109,6 +116,30 @@ anchor restart <workspace> [--service ...] [--tunnel|--no-tunnel]
 ```
 
 未提供 service/tunnel 参数时，沿用当前 daemon 状态文件中的参数。没有当前状态时回退为 MCP、无隧道。
+
+### `upgrade`
+
+```bash
+anchor upgrade <workspace> [workspace ...] [--gateway] \
+  [--timeout SECONDS] [--force] [--dry-run] [--allow-no-rollback]
+
+anchor upgrade --gateway [--dry-run]
+anchor upgrade --all [--dry-run]
+```
+
+`upgrade` 是 **runtime rollout**，不是 CLI 下载器：先安装或运行目标 Anchor CLI 构建，再用该命令把正在运行的 Workspace/Gateway daemon 切换到当前 CLI 的 `BuildIdentity`。
+
+- 所有目标先整体执行 dry-run preflight；任何目标无法安全排空或无法准备 rollback 时，在停止第一个 daemon 前就 fail-closed；
+- 新客户端继续只对受支持的旧协议使用 `version` / `shutdown` / `prepare_restart` lifecycle 兼容，不扩大普通写权限；
+- 旧 daemon 完全退出后才启动新 daemon，因此不会让两代 listener 竞争同一固定端口；
+- readiness 同时验证 state PID、业务端口 owner 与本地 control ping；readiness 通过后还必须确认新 daemon `BuildIdentity` 与当前 CLI 一致；
+- Linux 在旧进程仍存活时从 `/proc/<pid>/exe` 保存真实运行映像。即使磁盘上的原路径已经被新版替换，新构建启动失败时仍能从该快照恢复旧 daemon；
+- 非 Linux 平台默认要求旧 state 的 `executablePath` 能被证明与当前 CLI 不是同一二进制，否则拒绝升级；只有显式 `--allow-no-rollback` 才允许放弃自动回滚；
+- 任一目标启动失败但旧构建恢复成功时状态为 `rolled_back`，命令仍返回非零退出码，自动化不会把“已回滚”误判成升级成功；
+- `--all` 选择所有正在运行的 Workspace daemon，并包含正在运行的 Gateway；显式 Workspace selector 可与 `--gateway` 组合；
+- Windows SCM 正在管理所选 runtime 时，普通 CLI 不与 supervisor 竞争启动权。先使用管理员权限执行 `anchor service install` 将 SCM supervisor 更新到当前构建，再由 Service 排空/恢复 desired state。
+
+当前实现是 **bounded-outage rolling replacement**：停机窗口从旧 PID 完全退出到新 generation readiness 完成。固定端口架构尚未引入 listener FD/handle handoff 或稳定前置代理，因此不宣称 zero-downtime。
 
 ### `status`
 

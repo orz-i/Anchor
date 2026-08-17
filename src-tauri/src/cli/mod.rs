@@ -4,6 +4,7 @@ mod frp;
 mod plugin;
 mod software;
 mod tunnel;
+mod upgrade;
 mod workspace;
 
 use std::fs::File;
@@ -2456,6 +2457,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Start(options) => start_daemon(options, cli.json).await.map(|_| 0),
         Command::Stop(options) => stop_daemon(options, cli.json).await.map(|_| 0),
         Command::Restart(options) => restart_daemon(options, cli.json).await.map(|_| 0),
+        Command::Upgrade(options) => upgrade::execute(options, cli.json).await,
         Command::Logs(options) => show_logs(options, cli.json).await.map(|_| 0),
         Command::Events(options) => show_events(options, cli.json).await.map(|_| 0),
         Command::Reload(options) => reload_daemon_config(options, cli.json).await.map(|_| 0),

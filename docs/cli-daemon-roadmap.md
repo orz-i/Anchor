@@ -156,11 +156,13 @@ GUI 工作区控制迁移现状：
 ### 阶段 4：运行与升级治理
 
 - daemon 自恢复、崩溃报告和升级前排空；
+- CLI 已新增 `anchor upgrade` runtime rollout：先对全部目标执行 preflight，再使用现有跨版本 `prepare_restart` 排空旧 Workspace/Gateway daemon；新 generation 必须通过 PID/端口/control readiness 和 `BuildIdentity` 校验。Linux 会从 `/proc/<pid>/exe` 保存真实旧映像并在新构建失败时自动回滚；Windows SCM 管理的 runtime 保持 supervisor 单一权威，普通 CLI fail-closed 并要求先更新 Service；
+- 当前 rollout 明确是固定端口下的 bounded-outage replacement，不宣称 zero-downtime。真正无缝切换仍需 listener FD/handle handoff 或稳定前置代理层；
 - Workspace/Gateway daemon state 与 `version` 已发布 additive `buildIdentity`；CLI doctor 可比较当前客户端构建与活动 Workspace daemon；Gateway canonical status 也携带 build identity；
 - 协议兼容严格限制在只读 `version` 与稳定 lifecycle drain：Workspace 仅允许新客户端对 v2+ 旧 daemon 发送 `shutdown/prepare_restart`，Gateway 下限为 v1；其他写操作仍精确版本 fail-closed；
 - Windows SCM 发布经过 PID/image 校验的 runtime build identity；`service status` 区分 current/different/unknown，显式 `service install` 更新已有 Service 时会等待旧 supervisor 停止后启动当前二进制；
 - 服务安装状态、日志轮转和资源限制；
-- 可重复的跨平台安装、升级、降级和卸载测试。
+- 可重复的跨平台安装、升级、降级和卸载测试；Linux runtime rollout 自动回滚链已进入代码与回归范围，Windows SCM 安装包升级后的真实管理员/重启 smoke 仍属于发布验收项。
 
 ## 第一阶段完成标准
 
