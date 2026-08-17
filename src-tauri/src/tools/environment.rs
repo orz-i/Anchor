@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-pub fn diagnose(root: &Path) -> Value {
+pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
     let package = read_package_json(root);
     let declared = declared_package_manager(root, package.as_ref());
     let git = probe("git", &["--version"], root, Duration::from_secs(3));
@@ -97,18 +97,35 @@ pub fn diagnose(root: &Path) -> Value {
     };
     let redirection_trust = redirection_trust_diagnostics();
     let node_modules = node_modules_diagnostics(root, package.as_ref(), &redirection_trust);
-    let host_frontend_healthy = node["healthy"] == true
-        && package_manager_probe(&declared, &pnpm, &corepack_pnpm)
-        && node_modules["traversable"] == true
-        && node_modules["direct_packages_healthy"] == true
-        && node_modules["required_bins_healthy"] == true;
-    let host_rust_healthy = cargo["healthy"] == true
-        && cargo_clippy["healthy"] == true
-        && cargo_fmt["healthy"] == true
-        && rustc["healthy"] == true;
-    let host_healthy = host_frontend_healthy && host_rust_healthy;
     let docker_project = has_docker_project(root);
     let requirements = project_requirements(root, package.as_ref(), docker_project);
+    let host_frontend_toolchain_healthy = requirements["node"] != true
+        || (node["healthy"] == true && package_manager_probe(&declared, &pnpm, &corepack_pnpm));
+    let workspace_frontend_dependencies_healthy = requirements["node"] != true
+        || (node_modules["traversable"] == true
+            && node_modules["direct_packages_healthy"] == true
+            && node_modules["required_bins_healthy"] == true);
+    let host_frontend_healthy =
+        host_frontend_toolchain_healthy && workspace_frontend_dependencies_healthy;
+    let host_rust_healthy = requirements["rust"] != true
+        || (cargo["healthy"] == true
+            && cargo_clippy["healthy"] == true
+            && cargo_fmt["healthy"] == true
+            && rustc["healthy"] == true);
+    let host_go_healthy = requirements["go"] != true || go["healthy"] == true;
+    let host_git_healthy = requirements["git"] != true || git["healthy"] == true;
+    let host_powershell_healthy = requirements["powershell"] != true
+        || pwsh["healthy"] == true
+        || windows_powershell["healthy"] == true;
+    let host_toolchains_healthy = host_git_healthy
+        && host_frontend_toolchain_healthy
+        && host_rust_healthy
+        && host_go_healthy
+        && host_powershell_healthy;
+    let host_healthy = host_toolchains_healthy && workspace_frontend_dependencies_healthy;
+    let workspace_setup_required = host_toolchains_healthy
+        && !workspace_frontend_dependencies_healthy
+        && requirements["node"] == true;
     let mut missing_required_tools = Vec::new();
     if requirements["git"] == true && git["healthy"] != true {
         missing_required_tools.push("git");
@@ -125,22 +142,19 @@ pub fn diagnose(root: &Path) -> Value {
     if requirements["go"] == true && go["healthy"] != true {
         missing_required_tools.push("go");
     }
-    if requirements["docker"] == true && docker_daemon["healthy"] != true {
-        missing_required_tools.push("docker-daemon");
-    }
     if requirements["powershell"] == true
         && pwsh["healthy"] != true
         && windows_powershell["healthy"] != true
     {
         missing_required_tools.push("powershell");
     }
-    let recommended_route = if host_healthy {
-        "host"
-    } else if docker_daemon["healthy"] == true && docker_project {
-        "docker"
-    } else {
-        "repair_host"
-    };
+    let docker_verification_healthy = docker_daemon["healthy"] == true && docker_project;
+    let recommended_route = recommended_verification_route(
+        host_healthy,
+        workspace_setup_required,
+        docker_verification_healthy,
+        docker_execution_allowed,
+    );
     let mut findings = Vec::new();
     if declared["name"] == "pnpm" && pnpm["healthy"] != true {
         findings.push("Host pnpm is unhealthy".to_string());
@@ -174,11 +188,20 @@ pub fn diagnose(root: &Path) -> Value {
                 .to_string(),
         );
     }
-    if node_modules["traversable"] != true {
+    if node_modules["exists"] == true && node_modules["traversable"] != true {
         findings.push("node_modules contains an unreadable symlink/junction boundary".to_string());
     }
-    if node_modules["direct_packages_healthy"] != true {
+    if node_modules["exists"] == true && node_modules["direct_packages_healthy"] != true {
         findings.push("One or more direct node_modules packages are not traversable".to_string());
+    }
+    if workspace_setup_required {
+        findings.push(if git_checkout_kind(root) == "worktree" {
+            "This Git worktree has usable host toolchains but its workspace-local frontend dependencies are missing or unusable; install dependencies in this worktree before host verification"
+                .to_string()
+        } else {
+            "The host toolchains are usable but workspace-local frontend dependencies are missing or unusable; install dependencies before host verification"
+                .to_string()
+        });
     }
     if node_modules["mixed_installer_metadata"] == true {
         findings.push(
@@ -194,6 +217,14 @@ pub fn diagnose(root: &Path) -> Value {
     }
     if recommended_route == "docker" {
         findings.push("Docker frontend verification is healthy and preferred".to_string());
+    } else if docker_verification_healthy && !docker_execution_allowed {
+        findings.push(if recommended_route == "workspace_setup" {
+            "Docker verification is healthy, but exec_command policy does not allow the docker executable; complete workspace-local dependency setup before host verification"
+                .to_string()
+        } else {
+            "Docker verification is healthy, but exec_command policy does not allow the docker executable; host repair remains the actionable route"
+                .to_string()
+        });
     }
     if git_line_endings["core_autocrlf"] == "true" && !root.join(".gitattributes").exists() {
         findings.push(
@@ -243,12 +274,65 @@ pub fn diagnose(root: &Path) -> Value {
         },
         "node_modules": node_modules,
         "docker_project_detected": docker_project,
+        "checkout_kind": git_checkout_kind(root),
+        "host_frontend_toolchain_healthy": host_frontend_toolchain_healthy,
+        "workspace_frontend_dependencies_healthy": workspace_frontend_dependencies_healthy,
+        "workspace_setup_required": workspace_setup_required,
         "host_frontend_healthy": host_frontend_healthy,
         "host_rust_healthy": host_rust_healthy,
+        "host_go_healthy": host_go_healthy,
+        "host_git_healthy": host_git_healthy,
+        "host_powershell_healthy": host_powershell_healthy,
+        "host_toolchains_healthy": host_toolchains_healthy,
         "host_healthy": host_healthy,
+        "docker_execution_allowed": docker_execution_allowed,
+        "docker_verification_healthy": docker_verification_healthy,
         "recommended_verification_route": recommended_route,
+        "toolchain_search_path": {
+            "process_path": std::env::var_os("PATH").map(|path| path.to_string_lossy().into_owned()),
+            "effective_additions": crate::tools::exec::effective_command_path_additions()
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        },
         "findings": findings
     })
+}
+
+fn recommended_verification_route(
+    host_healthy: bool,
+    workspace_setup_required: bool,
+    docker_verification_healthy: bool,
+    docker_execution_allowed: bool,
+) -> &'static str {
+    if host_healthy {
+        "host"
+    } else if docker_verification_healthy && docker_execution_allowed {
+        "docker"
+    } else if workspace_setup_required {
+        "workspace_setup"
+    } else {
+        "repair_host"
+    }
+}
+
+fn git_checkout_kind(root: &Path) -> &'static str {
+    let marker = root.join(".git");
+    if marker.is_file() {
+        let linked_worktree = std::fs::read_to_string(&marker)
+            .ok()
+            .map(|content| content.replace('\\', "/"))
+            .is_some_and(|content| content.contains("/worktrees/"));
+        if linked_worktree {
+            "worktree"
+        } else {
+            "gitfile"
+        }
+    } else if marker.is_dir() {
+        "primary"
+    } else {
+        "none"
+    }
 }
 
 fn project_requirements(root: &Path, package: Option<&Value>, docker_project: bool) -> Value {
@@ -623,9 +707,7 @@ fn unavailable_probe(message: &str) -> Value {
 }
 
 fn probe(program: &str, args: &[&str], cwd: &Path, limit: Duration) -> Value {
-    let resolved = which::which(program)
-        .ok()
-        .map(|path| crate::tools::exec::resolve_system_program_path(&path));
+    let resolved = crate::tools::exec::resolve_effective_system_program(program);
     probe_resolved(program, resolved, args, cwd, limit)
 }
 
@@ -649,6 +731,10 @@ fn probe_resolved(
     let output = crate::async_runtime::block_on(async {
         let mut command = probe_command(program, resolved.as_deref(), args);
         crate::platform::hide_tokio_console(&mut command);
+        #[cfg(unix)]
+        if let Some(path) = crate::tools::exec::effective_command_path() {
+            command.env("PATH", path);
+        }
         command
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -746,6 +832,64 @@ mod tests {
             declared_dependency_packages(Some(&package)),
             vec!["shared", "typescript", "vite"]
         );
+    }
+
+    #[test]
+    fn docker_route_is_only_recommended_when_exec_policy_can_use_it() {
+        assert_eq!(
+            recommended_verification_route(true, false, true, false),
+            "host"
+        );
+        assert_eq!(
+            recommended_verification_route(false, false, true, true),
+            "docker"
+        );
+        assert_eq!(
+            recommended_verification_route(false, false, true, false),
+            "repair_host"
+        );
+        assert_eq!(
+            recommended_verification_route(false, false, false, true),
+            "repair_host"
+        );
+        assert_eq!(
+            recommended_verification_route(false, true, false, false),
+            "workspace_setup"
+        );
+        assert_eq!(
+            recommended_verification_route(false, true, true, false),
+            "workspace_setup"
+        );
+        assert_eq!(
+            recommended_verification_route(false, true, true, true),
+            "docker"
+        );
+    }
+
+    #[test]
+    fn git_checkout_kind_distinguishes_primary_and_linked_worktrees() {
+        let primary = tempfile::tempdir().expect("primary");
+        std::fs::create_dir(primary.path().join(".git")).expect("primary git dir");
+        assert_eq!(git_checkout_kind(primary.path()), "primary");
+
+        let linked = tempfile::tempdir().expect("linked");
+        std::fs::write(
+            linked.path().join(".git"),
+            "gitdir: /tmp/example/.git/worktrees/linked\n",
+        )
+        .expect("linked git file");
+        assert_eq!(git_checkout_kind(linked.path()), "worktree");
+
+        let gitfile = tempfile::tempdir().expect("gitfile");
+        std::fs::write(
+            gitfile.path().join(".git"),
+            "gitdir: /tmp/example/.git/modules/nested\n",
+        )
+        .expect("generic git file");
+        assert_eq!(git_checkout_kind(gitfile.path()), "gitfile");
+
+        let plain = tempfile::tempdir().expect("plain");
+        assert_eq!(git_checkout_kind(plain.path()), "none");
     }
 
     #[cfg(windows)]

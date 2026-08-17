@@ -3409,13 +3409,44 @@ fn truncate_log_detail(value: &str, maximum: usize) -> String {
     format!("{}...", &value[..end])
 }
 
+#[cfg(unix)]
+fn apply_stdio_proxy_process_path(command: &mut Command, env: &BTreeMap<String, String>) {
+    if env.keys().any(|name| name.eq_ignore_ascii_case("PATH")) {
+        return;
+    }
+    if let Some(path) = crate::tools::exec::effective_command_path() {
+        command.env("PATH", path);
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_stdio_proxy_process_path(_command: &mut Command, _env: &BTreeMap<String, String>) {}
+
+#[cfg(unix)]
+fn resolve_stdio_proxy_program(command: &str, env: &BTreeMap<String, String>) -> PathBuf {
+    if Path::new(command).is_absolute()
+        || command.contains(['/', '\\'])
+        || env.keys().any(|name| name.eq_ignore_ascii_case("PATH"))
+    {
+        return PathBuf::from(command);
+    }
+    crate::tools::exec::resolve_effective_system_program(command)
+        .unwrap_or_else(|| PathBuf::from(command))
+}
+
+#[cfg(not(unix))]
+fn resolve_stdio_proxy_program(command: &str, _env: &BTreeMap<String, String>) -> PathBuf {
+    PathBuf::from(command)
+}
+
 impl StdioMcpProxyClient {
     async fn connect(
         mut spec: McpProxyServerSpec,
         workspace_id: &str,
     ) -> Result<(Arc<Self>, Vec<Value>), String> {
         let workspace_isolation = prepare_my_agent_browser_isolation(&mut spec, workspace_id)?;
-        let mut command = Command::new(&spec.command);
+        let executable = resolve_stdio_proxy_program(&spec.command, &spec.env);
+        let mut command = Command::new(&executable);
         crate::platform::hide_tokio_console(&mut command);
         command
             .args(&spec.args)
@@ -3425,6 +3456,7 @@ impl StdioMcpProxyClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        apply_stdio_proxy_process_path(&mut command, &spec.env);
 
         let mut child = command.spawn().map_err(|error| {
             format!(
@@ -4109,7 +4141,7 @@ fn sanitize_tool_segment(value: &str) -> String {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4127,14 +4159,54 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::StdioMcpProxyClient;
     use super::{
-        browser_debugging_port, browser_proxy_error_code, expand_proxy_placeholders,
-        merge_proxy_success_summary, normalize_proxy_tool_result, normalized_proxy_failure,
-        parse_mcp_proxy_config, prepare_my_agent_browser_isolation, proxy_browser_cdp_reachable,
-        proxy_catalog_digest, proxy_connection_status, proxy_failure_reason,
-        proxy_management_tools, proxy_page_state, proxy_result_state_summary,
-        sanitize_proxy_catalog, wrap_proxy_structured_result, McpProxyRegistry, McpProxyServerSpec,
-        McpProxyTransportSpec, ProxyClientError, ProxyExposureMode,
+        apply_stdio_proxy_process_path, browser_debugging_port, browser_proxy_error_code,
+        expand_proxy_placeholders, merge_proxy_success_summary, normalize_proxy_tool_result,
+        normalized_proxy_failure, parse_mcp_proxy_config, prepare_my_agent_browser_isolation,
+        proxy_browser_cdp_reachable, proxy_catalog_digest, proxy_connection_status,
+        proxy_failure_reason, proxy_management_tools, proxy_page_state, proxy_result_state_summary,
+        resolve_stdio_proxy_program, sanitize_proxy_catalog, wrap_proxy_structured_result,
+        McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
+        ProxyExposureMode,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_proxy_uses_effective_path_without_overriding_explicit_path() {
+        let empty = BTreeMap::new();
+        let mut inherited = tokio::process::Command::new("noop");
+        apply_stdio_proxy_process_path(&mut inherited, &empty);
+        let inherited_path = inherited.as_std().get_envs().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("PATH")
+                .then(|| value.map(std::ffi::OsStr::to_os_string))
+                .flatten()
+        });
+        assert_eq!(inherited_path, crate::tools::exec::effective_command_path());
+
+        let mut explicit_env = BTreeMap::new();
+        explicit_env.insert("PATH".to_string(), "explicit-toolchain-path".to_string());
+        let mut explicit = tokio::process::Command::new("noop");
+        explicit.envs(&explicit_env);
+        apply_stdio_proxy_process_path(&mut explicit, &explicit_env);
+        let explicit_path = explicit.as_std().get_envs().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("PATH")
+                .then(|| value.map(std::ffi::OsStr::to_os_string))
+                .flatten()
+        });
+        assert_eq!(
+            explicit_path,
+            Some(std::ffi::OsString::from("explicit-toolchain-path"))
+        );
+
+        let resolved_git = resolve_stdio_proxy_program("git", &empty);
+        assert_eq!(
+            Some(resolved_git),
+            crate::tools::exec::resolve_effective_system_program("git")
+        );
+        assert_eq!(
+            resolve_stdio_proxy_program("git", &explicit_env),
+            PathBuf::from("git")
+        );
+    }
 
     fn test_spec() -> McpProxyServerSpec {
         McpProxyServerSpec {

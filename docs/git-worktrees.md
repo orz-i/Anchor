@@ -39,6 +39,8 @@ The directory is ignored by the primary checkout. Task metadata stores the canon
 
 The worktree starts from the committed `worktree_base_ref`. Uncommitted files from the primary checkout are not copied into it.
 
+Git-ignored local dependency/build directories are also not materialized automatically. For example, a primary checkout may already have `node_modules`, while a newly created worktree does not. `environment check` runs against the task's actual execution root and distinguishes this case from a missing host toolchain: when Node/package-manager tooling is usable but the linked checkout still needs local dependencies, the recommended route is `workspace_setup` rather than `repair_host`. Install the workspace dependencies in that worktree before running host verification; do not assume the primary checkout's ignored dependency tree is shared.
+
 ## Routing and concurrency
 
 For a task bound to a worktree, Anchor routes these operations to the linked checkout automatically:

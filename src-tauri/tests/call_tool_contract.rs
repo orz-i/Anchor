@@ -105,6 +105,32 @@ fn task_status_surfaces_running_command_heartbeat() {
     assert_ok(&waited);
 }
 
+#[test]
+fn structured_direct_exec_treats_multiline_source_as_literal_argument() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let executed = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-c",
+                "print('literal && operator')\nprint('structured-direct-ok')"
+            ],
+            "yield_time_ms": 10_000,
+            "timeout_ms": 10_000,
+            "verification_level": "diagnostic"
+        }),
+    );
+
+    let executed = assert_ok(&executed);
+    assert_eq!(executed["execution_status"], "succeeded");
+    assert!(executed["stdout"]
+        .as_str()
+        .is_some_and(|output| output.contains("structured-direct-ok")));
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_command_uses_workspace_local_toolchain_path_for_resolution_and_children() {
@@ -113,23 +139,19 @@ fn exec_command_uses_workspace_local_toolchain_path_for_resolution_and_children(
     let fx = tiny_js_fixture();
     let bin = fx.root.join(".cache/bin");
     fs::create_dir_all(&bin).expect("toolchain bin");
-    let fake_make = bin.join("make");
-    let fake_lint = bin.join("golangci-lint");
-    fs::write(&fake_make, "#!/bin/sh\nexec golangci-lint\n").expect("fake make");
-    fs::write(
-        &fake_lint,
-        "#!/bin/sh\nprintf 'workspace-toolchain-ok\\n'\n",
-    )
-    .expect("fake lint");
-    fs::set_permissions(&fake_make, fs::Permissions::from_mode(0o755)).expect("chmod make");
-    fs::set_permissions(&fake_lint, fs::Permissions::from_mode(0o755)).expect("chmod lint");
+    let fake_node = bin.join("node");
+    let fake_tsc = bin.join("tsc");
+    fs::write(&fake_node, "#!/bin/sh\nexec tsc\n").expect("fake node");
+    fs::write(&fake_tsc, "#!/bin/sh\nprintf 'workspace-toolchain-ok\\n'\n").expect("fake tsc");
+    fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o755)).expect("chmod node");
+    fs::set_permissions(&fake_tsc, fs::Permissions::from_mode(0o755)).expect("chmod tsc");
     let ctx = ctx_for(&fx.root);
 
     let executed = invoke(
         &ctx,
         "exec_command",
         json!({
-            "executable": "make",
+            "executable": "node",
             "toolchain_paths": [".cache/bin"],
             "yield_time_ms": 10_000,
             "timeout_ms": 10_000,
@@ -147,7 +169,7 @@ fn exec_command_uses_workspace_local_toolchain_path_for_resolution_and_children(
         &ctx,
         "exec_command",
         json!({
-            "executable": "make",
+            "executable": "node",
             "toolchain_paths": ["../outside"]
         }),
     );
@@ -1110,6 +1132,16 @@ fn check_exec_environment_reports_policy_metadata() {
     let payload = assert_ok(&out);
     assert_eq!(payload["permission_mode"], "trusted");
     assert!(payload["system_command_allowlist"].is_array());
+    assert_eq!(
+        payload["development_environment"]["docker_execution_allowed"],
+        payload["system_command_allowlist"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| command == "docker"))
+    );
+    assert!(
+        payload["development_environment"]["toolchain_search_path"]["effective_additions"]
+            .is_array()
+    );
     assert!(payload["healthy"].is_boolean());
     assert!(matches!(
         payload["status"].as_str(),

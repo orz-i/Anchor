@@ -144,6 +144,10 @@ journalctl --user -u anchor.service -f
 
 systemd 必须直接运行前台 `serve` 或 `gateway serve`，不要使用 `start`；内置 daemon 适合人工 SSH 运维，不替代 systemd 的开机自启和进程监督。
 
+`serve`/`gateway serve` 运行在 systemd 等非交互环境时不会读取 shell 启动脚本。Anchor 的命令执行层会在继承的 `PATH` 之后补充当前用户常见的稳定工具链目录，包括 `~/.local/bin`、`~/.cargo/bin`、`~/.local/share/pnpm`、Volta/asdf/mise/Bun、Go，并尊重已继承的 `NVM_BIN`、fnm multishell、`PNPM_HOME`、`CARGO_HOME`、`GOBIN`/`GOROOT` 等环境变量；当 `NVM_BIN` 未继承时，还会解析 `NVM_DIR`（默认 `~/.nvm`）中的 `alias/default`，只选择该默认别名明确指向的已安装 Node 版本；没有 default alias 时，仅在本机只安装了一个 NVM Node 版本时使用该唯一版本。不会在多个未指定版本之间自行挑选。相同的有效 `PATH` 也用于未显式覆盖 `PATH` 的 stdio 下游 MCP 子进程，避免 `npx`/`node` 等启动器只因 daemon 环境较窄而整组失效。对于无法由上述确定性规则解析的 fnm/NVM 自定义选择或其他安装位置，仍应通过 service 的 `Environment=PATH=...` 显式固定。
+
+环境诊断只会在 Docker daemon 健康、项目存在 Docker/Compose 配置且当前 runtime 命令白名单明确允许 `docker` 时推荐 Docker 验证链路。默认不会因为“检测到 Docker”就推荐一个随后会被 `exec_command` 策略拒绝的路径；需要启用 Docker 命令时，应由操作者在 Workspace runtime 的 `allowed_commands` 中显式加入并接受 Docker daemon 带来的额外宿主机信任边界。
+
 需要在退出登录后继续运行时，可为该 Linux 用户启用 linger：
 
 ```bash
