@@ -97,6 +97,13 @@ struct RollbackExecutable {
     temporary: bool,
 }
 
+struct RolloutFailureContext {
+    current_build: BuildIdentity,
+    outage_started: Instant,
+    failure: String,
+    timeout: Duration,
+}
+
 impl RollbackExecutable {
     fn discard(&self) {
         if self.temporary {
@@ -218,10 +225,12 @@ pub async fn rollout_workspace(
                 &previous,
                 spec,
                 rollback,
-                current_build,
-                outage_started,
-                failure,
-                options.timeout,
+                RolloutFailureContext {
+                    current_build,
+                    outage_started,
+                    failure,
+                    timeout: options.timeout,
+                },
             )
             .await
         }
@@ -231,10 +240,12 @@ pub async fn rollout_workspace(
                 &previous,
                 spec,
                 rollback,
-                current_build,
-                outage_started,
-                error.to_string(),
-                options.timeout,
+                RolloutFailureContext {
+                    current_build,
+                    outage_started,
+                    failure: error.to_string(),
+                    timeout: options.timeout,
+                },
             )
             .await
         }
@@ -421,27 +432,24 @@ async fn rollback_workspace(
     previous: &DaemonState,
     spec: DaemonLaunchSpec,
     rollback: Option<RollbackExecutable>,
-    current_build: BuildIdentity,
-    outage_started: Instant,
-    failure: String,
-    timeout: Duration,
+    context: RolloutFailureContext,
 ) -> AppResult<RuntimeRolloutResult> {
     let Some(rollback) = rollback else {
         let mut result = workspace_result(
             profile,
-            &current_build,
+            &context.current_build,
             RolloutStatus::Failed,
             Some(previous),
         );
-        result.failure = Some(failure);
-        result.outage_ms = Some(duration_ms(outage_started.elapsed()));
+        result.failure = Some(context.failure);
+        result.outage_ms = Some(duration_ms(context.outage_started.elapsed()));
         return Ok(result);
     };
-    match start_workspace_generation(profile, spec, &rollback.path, timeout).await {
+    match start_workspace_generation(profile, spec, &rollback.path, context.timeout).await {
         Ok(state) if rollback_matches_previous(state.build_identity.as_ref(), previous) => {
             let mut result = workspace_result(
                 profile,
-                &current_build,
+                &context.current_build,
                 RolloutStatus::RolledBack,
                 Some(previous),
             );
@@ -450,8 +458,8 @@ async fn rollback_workspace(
             result.rollback_available = true;
             result.rollback_attempted = true;
             result.rollback_succeeded = Some(true);
-            result.outage_ms = Some(duration_ms(outage_started.elapsed()));
-            result.failure = Some(failure);
+            result.outage_ms = Some(duration_ms(context.outage_started.elapsed()));
+            result.failure = Some(context.failure);
             result.message = Some("当前构建启动失败，已恢复旧 Workspace daemon".into());
             Ok(result)
         }
@@ -464,18 +472,18 @@ async fn rollback_workspace(
             Ok(failed_workspace_result(
                 profile,
                 previous,
-                current_build,
-                outage_started,
-                failure,
+                context.current_build,
+                context.outage_started,
+                context.failure,
                 rollback_failure,
             ))
         }
         Err(error) => Ok(failed_workspace_result(
             profile,
             previous,
-            current_build,
-            outage_started,
-            failure,
+            context.current_build,
+            context.outage_started,
+            context.failure,
             error.to_string(),
         )),
     }
@@ -651,9 +659,7 @@ fn rollback_source_available(pid: u32, recorded_path: &str) -> AppResult<bool> {
     #[cfg(target_os = "linux")]
     {
         let _ = recorded_path;
-        return Ok(
-            platform().is_process_alive(pid) && fs::File::open(format!("/proc/{pid}/exe")).is_ok()
-        );
+        Ok(platform().is_process_alive(pid) && fs::File::open(format!("/proc/{pid}/exe")).is_ok())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -691,10 +697,10 @@ fn prepare_rollback_executable(
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         }
-        return Ok(RollbackExecutable {
+        Ok(RollbackExecutable {
             path,
             temporary: true,
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
