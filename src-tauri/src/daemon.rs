@@ -28,6 +28,23 @@ pub enum ServiceSelection {
     All,
 }
 
+fn process_matches_daemon_state(state: &DaemonState, workspace_id: &str) -> bool {
+    if state.workspace_id != workspace_id || !process_matches_daemon(state.pid, workspace_id) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(process_started_at) = linux_process_started_at_unix(state.pid) else {
+            return false;
+        };
+        process_start_matches_state(process_started_at, state.started_at_unix)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 #[cfg(windows)]
 fn windows_process_started_at_unix(pid: u32) -> Option<u64> {
     use windows::Win32::Foundation::{CloseHandle, FILETIME};
@@ -53,14 +70,39 @@ fn windows_process_started_at_unix(pid: u32) -> Option<u64> {
         .map(|value| value / 10_000_000)
 }
 
-#[cfg(windows)]
-fn windows_process_start_matches_state(process_started_at: u64, state_started_at: u64) -> bool {
+fn process_start_matches_state(process_started_at: u64, state_started_at: u64) -> bool {
     // DaemonState is written by the child shortly after process creation. A
-    // persisted PID from an earlier boot can be reused by another Anchor GUI
-    // process with the same executable path, but that reused process must have
-    // been created after the old state timestamp and is therefore rejected.
+    // persisted PID from an earlier boot can be reused by another process, but
+    // that reused process must have been created after the old state timestamp
+    // and is therefore rejected.
     state_started_at >= process_started_at
         && state_started_at.saturating_sub(process_started_at) <= 120
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_started_at_unix(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let command_end = stat.rfind(')')?;
+    // After the command name, the first whitespace-delimited value is field 3
+    // (`state`). Linux `starttime` is field 22, therefore index 19 here.
+    let start_ticks = stat
+        .get(command_end + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()?;
+    let boot_time = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    Some(boot_time.saturating_add(start_ticks / ticks_per_second as u64))
 }
 
 fn process_matches_spawned_daemon(pid: u32, workspace_id: &str) -> bool {
@@ -167,7 +209,7 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
                 workspace_name: profile.name.clone(),
                 workspace_path: profile.path.clone(),
                 pid,
-                started_at_unix: 0,
+                started_at_unix: linux_process_started_at_unix(pid).unwrap_or(0),
                 service,
                 tunnel: tunnel_services.is_some(),
                 tunnel_services,
@@ -227,8 +269,7 @@ fn parse_daemon_args(
 pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResult<()> {
     ensure_daemon_supported()?;
     if !platform().is_process_alive(pid) {
-        cleanup(profile)?;
-        return Ok(());
+        return cleanup_after_pid_exit(profile, pid);
     }
     if !process_matches_spawned_daemon(pid, &profile.id) {
         return Err(AppError::Message(format!(
@@ -246,7 +287,7 @@ pub async fn terminate_spawned(profile: &WorkspaceProfile, pid: u32) -> AppResul
     if platform().is_process_alive(pid) {
         platform().terminate_process_tree(pid)?;
     }
-    cleanup(profile)
+    cleanup_after_pid_exit(profile, pid)
 }
 
 fn set_private_dir_permissions(path: &Path) -> AppResult<()> {
@@ -315,6 +356,15 @@ pub(crate) fn control_socket_path(profile_id: &str) -> AppResult<PathBuf> {
     Ok(daemon_paths(profile_id)?.control)
 }
 
+#[cfg(unix)]
+pub(crate) fn control_socket_candidates(profile_id: &str) -> AppResult<Vec<PathBuf>> {
+    let safe = sanitize_id(profile_id);
+    Ok(runtime_dir_candidates()?
+        .into_iter()
+        .map(|dir| dir.join(format!("{safe}.sock")))
+        .collect())
+}
+
 #[cfg(windows)]
 pub(crate) fn control_pipe_name(profile_id: &str) -> AppResult<String> {
     let config_dir = crate::platform::app_config_dir_override()
@@ -375,7 +425,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
     };
     if let Some(state) = state.as_ref() {
         let alive = platform().is_process_alive(state.pid);
-        let pid_matches = alive && process_matches_daemon(state.pid, &profile.id);
+        let pid_matches = alive && process_matches_daemon_state(state, &profile.id);
         if alive && pid_matches {
             return Ok(running_inspection(state.clone(), false));
         }
@@ -414,7 +464,7 @@ pub fn inspect(profile: &WorkspaceProfile) -> AppResult<DaemonInspection> {
         });
     };
     let alive = platform().is_process_alive(state.pid);
-    let pid_matches = alive && process_matches_daemon(state.pid, &profile.id);
+    let pid_matches = alive && process_matches_daemon_state(&state, &profile.id);
     Ok(DaemonInspection {
         supported: true,
         running: false,
@@ -716,6 +766,33 @@ pub async fn stop(
     }
 }
 
+#[cfg(unix)]
+pub(crate) async fn stop_verified_without_control(
+    profile: &WorkspaceProfile,
+    state: &DaemonState,
+    timeout: Duration,
+    force: bool,
+) -> AppResult<()> {
+    ensure_daemon_supported()?;
+    if state.workspace_id != profile.id {
+        return Err(AppError::Message(format!(
+            "daemon state belongs to workspace {}, not {}",
+            state.workspace_id, profile.id
+        )));
+    }
+    if !platform().is_process_alive(state.pid) {
+        return cleanup_after_pid_exit(profile, state.pid);
+    }
+    if !process_matches_daemon_state(state, &profile.id) {
+        return Err(AppError::Message(format!(
+            "PID {} 不再匹配已验证的当前 workspace daemon，拒绝绕过控制端点停止",
+            state.pid
+        )));
+    }
+    signal(state.pid, SIGTERM_VALUE)?;
+    wait_for_controlled_exit(profile, state.pid, timeout, force).await
+}
+
 pub async fn wait_for_controlled_exit(
     profile: &WorkspaceProfile,
     pid: u32,
@@ -755,13 +832,17 @@ pub async fn wait_for_controlled_exit(
 
 fn cleanup_after_pid_exit(profile: &WorkspaceProfile, exited_pid: u32) -> AppResult<()> {
     let paths = daemon_paths(&profile.id)?;
+    cleanup_after_pid_exit_in(&paths, exited_pid)
+}
+
+fn cleanup_after_pid_exit_in(paths: &DaemonPaths, exited_pid: u32) -> AppResult<()> {
     if read_state(&paths.state)?
         .as_ref()
         .is_some_and(|state| state.pid != exited_pid)
     {
         return Ok(());
     }
-    cleanup_stale_files(&paths)
+    cleanup_stale_files(paths)
 }
 
 pub fn cleanup(profile: &WorkspaceProfile) -> AppResult<()> {
@@ -807,9 +888,9 @@ fn daemon_paths_in(dir: PathBuf, profile_id: &str) -> DaemonPaths {
 }
 
 pub(crate) fn runtime_dir() -> AppResult<PathBuf> {
-    let config_dir = crate::platform::app_config_dir_override();
     #[cfg(unix)]
     {
+        let config_dir = crate::platform::app_config_dir_override();
         let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
         return Ok(select_runtime_dir(config_dir, xdg_runtime, unsafe {
             libc::geteuid()
@@ -817,6 +898,7 @@ pub(crate) fn runtime_dir() -> AppResult<PathBuf> {
     }
     #[cfg(windows)]
     {
+        let config_dir = crate::platform::app_config_dir_override();
         if let Some(path) = config_dir {
             return Ok(path.join("run"));
         }
@@ -827,18 +909,67 @@ pub(crate) fn runtime_dir() -> AppResult<PathBuf> {
 }
 
 #[cfg(any(unix, test))]
+fn select_runtime_dirs(
+    config_dir: Option<PathBuf>,
+    xdg_runtime: Option<PathBuf>,
+    uid: u32,
+) -> Vec<PathBuf> {
+    if let Some(config_dir) = config_dir {
+        return vec![config_dir.join("run")];
+    }
+
+    let mut dirs = Vec::new();
+    if let Some(runtime) = xdg_runtime {
+        push_unique_runtime_dir(&mut dirs, runtime.join(crate::brand::SERVER_NAME));
+        #[cfg(target_os = "linux")]
+        push_unique_runtime_dir(
+            &mut dirs,
+            PathBuf::from(format!("/run/user/{uid}/{}", crate::brand::SERVER_NAME)),
+        );
+        push_unique_runtime_dir(
+            &mut dirs,
+            PathBuf::from(format!("/tmp/{}-{uid}", crate::brand::SERVER_NAME)),
+        );
+        return dirs;
+    }
+    push_unique_runtime_dir(
+        &mut dirs,
+        PathBuf::from(format!("/tmp/{}-{uid}", crate::brand::SERVER_NAME)),
+    );
+    #[cfg(target_os = "linux")]
+    push_unique_runtime_dir(
+        &mut dirs,
+        PathBuf::from(format!("/run/user/{uid}/{}", crate::brand::SERVER_NAME)),
+    );
+    dirs
+}
+
+#[cfg(any(unix, test))]
+fn push_unique_runtime_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !dirs.iter().any(|current| current == &path) {
+        dirs.push(path);
+    }
+}
+
+#[cfg(unix)]
+fn runtime_dir_candidates() -> AppResult<Vec<PathBuf>> {
+    let config_dir = crate::platform::app_config_dir_override();
+    let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    Ok(select_runtime_dirs(config_dir, xdg_runtime, unsafe {
+        libc::geteuid()
+    }))
+}
+
+#[cfg(any(unix, test))]
 fn select_runtime_dir(
     config_dir: Option<PathBuf>,
     xdg_runtime: Option<PathBuf>,
     uid: u32,
 ) -> PathBuf {
-    if let Some(config_dir) = config_dir {
-        return config_dir.join("run");
-    }
-    if let Some(runtime) = xdg_runtime {
-        return runtime.join(crate::brand::SERVER_NAME);
-    }
-    PathBuf::from(format!("/tmp/{}-{uid}", crate::brand::SERVER_NAME))
+    select_runtime_dirs(config_dir, xdg_runtime, uid)
+        .into_iter()
+        .next()
+        .expect("runtime candidates are never empty")
 }
 
 fn read_state(path: &Path) -> AppResult<Option<DaemonState>> {
@@ -901,7 +1032,7 @@ fn process_matches_daemon(pid: u32, workspace_id: &str) -> bool {
         let Some(process_started_at) = windows_process_started_at_unix(pid) else {
             return false;
         };
-        windows_process_start_matches_state(process_started_at, state.started_at_unix)
+        process_start_matches_state(process_started_at, state.started_at_unix)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -1110,6 +1241,25 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_candidates_cover_xdg_standard_and_tmp_locations_without_duplicates() {
+        assert_eq!(
+            select_runtime_dirs(None, Some(PathBuf::from("/run/user/1000")), 1000),
+            vec![
+                PathBuf::from("/run/user/1000/anchor"),
+                PathBuf::from("/tmp/anchor-1000"),
+            ]
+        );
+        assert_eq!(
+            select_runtime_dirs(None, None, 1000),
+            vec![
+                PathBuf::from("/tmp/anchor-1000"),
+                PathBuf::from("/run/user/1000/anchor"),
+            ]
+        );
+    }
+
     #[test]
     fn daemon_state_keeps_operational_parameters() {
         let state = DaemonState {
@@ -1137,6 +1287,44 @@ mod tests {
         assert_eq!(value["executablePath"], "/usr/local/bin/anchor");
     }
 
+    #[test]
+    fn failed_spawn_cleanup_preserves_a_replacement_daemon_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = daemon_paths_in(temp.path().to_path_buf(), "workspace");
+        ensure_private_dir(&paths.dir).expect("runtime dir");
+        let replacement = DaemonState {
+            schema_version: STATE_SCHEMA_VERSION,
+            workspace_id: "workspace".into(),
+            workspace_name: "Workspace".into(),
+            workspace_path: "/srv/workspace".into(),
+            pid: 222,
+            started_at_unix: 100,
+            service: ServiceSelection::Mcp,
+            tunnel: false,
+            tunnel_services: None,
+            log_path: "/tmp/daemon.log".into(),
+            version: "1".into(),
+            build_identity: None,
+            executable_path: "/usr/local/bin/anchor".into(),
+        };
+        atomic_write_json(&paths.state, &replacement).expect("state");
+        write_private_text(&paths.pid, "222\n").expect("pid");
+        write_private_text(&paths.control, "placeholder").expect("control");
+
+        cleanup_after_pid_exit_in(&paths, 111).expect("losing child cleanup");
+        assert!(paths.state.exists(), "replacement state must be preserved");
+        assert!(paths.pid.exists(), "replacement pid must be preserved");
+        assert!(
+            paths.control.exists(),
+            "replacement control path must be preserved"
+        );
+
+        cleanup_after_pid_exit_in(&paths, 222).expect("owner cleanup");
+        assert!(!paths.state.exists());
+        assert!(!paths.pid.exists());
+        assert!(!paths.control.exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_atomic_state_replace_replaces_existing_destination() {
@@ -1158,11 +1346,27 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_daemon_state_rejects_pid_reused_after_state_timestamp() {
-        assert!(windows_process_start_matches_state(100, 100));
-        assert!(windows_process_start_matches_state(100, 101));
-        assert!(windows_process_start_matches_state(100, 220));
-        assert!(!windows_process_start_matches_state(100, 221));
-        assert!(!windows_process_start_matches_state(101, 100));
+        assert!(process_start_matches_state(100, 100));
+        assert!(process_start_matches_state(100, 101));
+        assert!(process_start_matches_state(100, 220));
+        assert!(!process_start_matches_state(100, 221));
+        assert!(!process_start_matches_state(101, 100));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_start_time_rejects_pre_boot_state_timestamp() {
+        let started_at = linux_process_started_at_unix(std::process::id())
+            .expect("current process start timestamp");
+        assert!(process_start_matches_state(started_at, started_at));
+        assert!(process_start_matches_state(
+            started_at,
+            started_at.saturating_add(120)
+        ));
+        assert!(!process_start_matches_state(
+            started_at,
+            started_at.saturating_sub(1)
+        ));
     }
 
     #[test]

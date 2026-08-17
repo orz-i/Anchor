@@ -59,6 +59,40 @@ pub fn desired_service_selection(
     }
 }
 
+async fn wait_for_control_ready(
+    profile: &WorkspaceProfile,
+    timeout: Duration,
+) -> AppResult<Option<DaemonState>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let inspection = daemon::inspect(profile)?;
+        if inspection.ambiguous {
+            return Err(AppError::Message(inspection.detail));
+        }
+        let Some(state) = running_state(&inspection) else {
+            return Ok(None);
+        };
+        match ipc_ping(&profile.id).await {
+            Ok(()) => return Ok(Some(state)),
+            Err(error) if error.is_unavailable() => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(AppError::Message(format!(
+                        "daemon PID {} 在 {} 秒内未提供可用控制端点：{error}",
+                        state.pid,
+                        timeout.as_secs()
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(AppError::Message(format!(
+                    "daemon control endpoint failed readiness check: {error}"
+                )))
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub async fn ensure_daemon_running(
     profile: &WorkspaceProfile,
     spec: DaemonLaunchSpec,
@@ -69,34 +103,51 @@ pub async fn ensure_daemon_running(
         return Err(AppError::Message(inspection.detail));
     }
     if inspection.running {
-        let state = inspection.state.expect("running daemon state");
-        ipc_ping(&profile.id).await.map_err(|error| {
-            AppError::Message(format!(
-                "daemon 状态显示正在运行，但控制端点不可用：{error}；拒绝使用本地写回退"
-            ))
-        })?;
-        if state.service == spec.service && state.managed_tunnels() == spec.tunnels {
-            return Ok(state);
+        if let Some(state) = wait_for_control_ready(profile, timeout).await? {
+            if state.service == spec.service && state.managed_tunnels() == spec.tunnels {
+                return Ok(state);
+            }
+            return Err(AppError::Message(format!(
+                "daemon 已运行（service={}, tunnels={}），目标配置为 service={}, tunnels={}；请先通过控制面协调重启",
+                state.service.as_str(),
+                state
+                    .managed_tunnels()
+                    .map(ServiceSelection::as_str)
+                    .unwrap_or("none"),
+                spec.service.as_str(),
+                spec.tunnels
+                    .map(ServiceSelection::as_str)
+                    .unwrap_or("none")
+            )));
         }
-        return Err(AppError::Message(format!(
-            "daemon 已运行（service={}, tunnels={}），目标配置为 service={}, tunnels={}；请先通过控制面协调重启",
-            state.service.as_str(),
-            state
-                .managed_tunnels()
-                .map(ServiceSelection::as_str)
-                .unwrap_or("none"),
-            spec.service.as_str(),
-            spec.tunnels
-                .map(ServiceSelection::as_str)
-                .unwrap_or("none")
-        )));
     }
 
-    let child_pid = daemon::spawn_with_tunnels(profile, spec.service, spec.tunnels)?;
+    let child_pid = match daemon::spawn_with_tunnels(profile, spec.service, spec.tunnels) {
+        Ok(pid) => pid,
+        Err(spawn_error) => {
+            // Another `start`/`restart` may have won the race between our
+            // inspection and spawn. Follow that verified daemon through its
+            // startup window instead of failing on a transient missing socket.
+            if let Some(state) = wait_for_control_ready(profile, timeout).await? {
+                if state.service == spec.service && state.managed_tunnels() == spec.tunnels {
+                    return Ok(state);
+                }
+            }
+            return Err(spawn_error);
+        }
+    };
     match daemon::wait_ready(profile, spec.service, child_pid, timeout).await {
         Ok(state) => Ok(state),
         Err(error) => {
             let cleanup_error = daemon::terminate_spawned(profile, child_pid).await.err();
+            if let Some(state) = wait_for_control_ready(profile, timeout).await? {
+                if state.pid != child_pid
+                    && state.service == spec.service
+                    && state.managed_tunnels() == spec.tunnels
+                {
+                    return Ok(state);
+                }
+            }
             Err(AppError::Message(format!(
                 "daemon 子进程 PID {child_pid} 未就绪：{error}{}",
                 cleanup_error
@@ -133,14 +184,27 @@ pub async fn request_daemon_exit_and_wait(
             state.pid
         )));
     }
-    let accepted_pid = request_daemon_exit(&profile.id, operation)
-        .await
-        .map_err(|error| {
-            AppError::Message(format!(
-                "daemon 未接受 {} 请求：{error}；写操作不会回退到本地进程控制",
+    let accepted_pid = match request_daemon_exit(&profile.id, operation).await {
+        Ok(pid) => pid,
+        Err(error) => {
+            #[cfg(unix)]
+            if error.is_unavailable() {
+                daemon::stop_verified_without_control(profile, &state, timeout, force)
+                    .await
+                    .map_err(|fallback| {
+                        AppError::Message(format!(
+                            "daemon 未接受 {} 请求：{error}；Unix 本地恢复也失败：{fallback}",
+                            operation_label(operation)
+                        ))
+                    })?;
+                return Ok(Some(state.pid));
+            }
+            return Err(AppError::Message(format!(
+                "daemon 未接受 {} 请求：{error}；写操作不会回退到未验证的本地进程控制",
                 operation_label(operation)
-            ))
-        })?;
+            )));
+        }
+    };
     if accepted_pid != state.pid {
         return Err(AppError::Message(format!(
             "daemon 控制响应 PID 不匹配：状态文件为 {}，响应为 {accepted_pid}",
@@ -176,12 +240,7 @@ pub async fn reconcile_daemon(
         (Some(state), Some(spec))
             if state.service == spec.service && state.managed_tunnels() == spec.tunnels =>
         {
-            ipc_ping(&profile.id).await.map_err(|error| {
-                AppError::Message(format!(
-                    "daemon 状态显示正在运行，但控制端点不可用：{error}；拒绝使用本地写回退"
-                ))
-            })?;
-            Ok(Some(state))
+            wait_for_control_ready(profile, timeout).await
         }
         (Some(_), None) => {
             request_daemon_exit_and_wait(profile, ControlOperation::Shutdown, timeout, force)

@@ -883,18 +883,18 @@ async fn request_with_protocol_version(
     timeout: Duration,
     protocol_version: u16,
 ) -> Result<ControlResult, ControlClientError> {
-    let endpoint = endpoint(profile_id).map_err(|error| {
-        ControlClientError::Protocol(format!("cannot resolve daemon control endpoint: {error}"))
-    })?;
     let request = ControlRequest::with_protocol_version(method, protocol_version);
     let request_id = request.request_id.clone();
-    let response = tokio::time::timeout(timeout, exchange_with_endpoint(&endpoint, &request))
-        .await
-        .map_err(|_| {
-            ControlClientError::Unavailable(format!(
-                "daemon control endpoint timed out: {endpoint:?}"
-            ))
-        })??;
+    let response = tokio::time::timeout(
+        timeout,
+        exchange_with_profile_endpoint(profile_id, &request),
+    )
+    .await
+    .map_err(|_| {
+        ControlClientError::Unavailable(format!(
+            "daemon control endpoint timed out for workspace {profile_id}"
+        ))
+    })??;
 
     if response.protocol_version != protocol_version {
         return Err(ControlClientError::VersionMismatch {
@@ -936,26 +936,50 @@ fn legacy_lifecycle_retry_protocol(error: &ControlClientError) -> Option<u16> {
 }
 
 #[cfg(unix)]
-async fn exchange_with_endpoint(
-    endpoint: &LocalControlEndpoint,
+async fn exchange_with_profile_endpoint(
+    profile_id: &str,
     request: &ControlRequest,
 ) -> Result<ControlResponse, ControlClientError> {
-    let LocalControlEndpoint::UnixSocket(path) = endpoint else {
-        return Err(ControlClientError::Protocol(
-            "Unix client received a non-Unix control endpoint".into(),
-        ));
-    };
-    let mut stream = tokio::net::UnixStream::connect(path)
-        .await
-        .map_err(classify_connect_error)?;
+    let candidates = daemon::control_socket_candidates(profile_id).map_err(|error| {
+        ControlClientError::Protocol(format!("cannot resolve daemon control endpoint: {error}"))
+    })?;
+    let (mut stream, _) = connect_unix_control(candidates).await?;
     exchange(&mut stream, request).await
 }
 
+#[cfg(unix)]
+async fn connect_unix_control(
+    candidates: Vec<std::path::PathBuf>,
+) -> Result<(tokio::net::UnixStream, std::path::PathBuf), ControlClientError> {
+    let mut last_unavailable = None;
+    for path in candidates {
+        match tokio::net::UnixStream::connect(&path).await {
+            Ok(stream) => return Ok((stream, path)),
+            Err(error) if is_unavailable_io(&error) => {
+                last_unavailable = Some((path, error));
+            }
+            Err(error) => return Err(ControlClientError::Io(error)),
+        }
+    }
+    let Some((path, error)) = last_unavailable else {
+        return Err(ControlClientError::Unavailable(
+            "daemon control endpoint unavailable: no Unix socket candidates".into(),
+        ));
+    };
+    Err(ControlClientError::Unavailable(format!(
+        "daemon control endpoint unavailable: {}: {error}",
+        path.display()
+    )))
+}
+
 #[cfg(windows)]
-async fn exchange_with_endpoint(
-    endpoint: &LocalControlEndpoint,
+async fn exchange_with_profile_endpoint(
+    profile_id: &str,
     request: &ControlRequest,
 ) -> Result<ControlResponse, ControlClientError> {
+    let endpoint = endpoint(profile_id).map_err(|error| {
+        ControlClientError::Protocol(format!("cannot resolve daemon control endpoint: {error}"))
+    })?;
     let LocalControlEndpoint::WindowsNamedPipe(name) = endpoint else {
         return Err(ControlClientError::Protocol(
             "Windows client received a non-pipe control endpoint".into(),
@@ -968,8 +992,8 @@ async fn exchange_with_endpoint(
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn exchange_with_endpoint(
-    _endpoint: &LocalControlEndpoint,
+async fn exchange_with_profile_endpoint(
+    _profile_id: &str,
     _request: &ControlRequest,
 ) -> Result<ControlResponse, ControlClientError> {
     Err(ControlClientError::Unavailable(
@@ -993,6 +1017,7 @@ where
     })
 }
 
+#[cfg(windows)]
 fn classify_connect_error(error: io::Error) -> ControlClientError {
     if is_unavailable_io(&error) {
         ControlClientError::Unavailable(format!("daemon control endpoint unavailable: {error}"))
@@ -1743,6 +1768,22 @@ mod tests {
             endpoint,
             LocalControlEndpoint::WindowsNamedPipe(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_client_falls_back_to_an_alternate_runtime_socket_before_sending() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing.sock");
+        let fallback = temp.path().join("fallback.sock");
+        let listener = tokio::net::UnixListener::bind(&fallback).expect("bind fallback socket");
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept fallback") });
+
+        let (_stream, connected_path) = connect_unix_control(vec![missing, fallback.clone()])
+            .await
+            .expect("connect fallback");
+        assert_eq!(connected_path, fallback);
+        let _ = accept.await.expect("accept task");
     }
 
     #[cfg(windows)]
