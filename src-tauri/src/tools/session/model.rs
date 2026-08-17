@@ -27,6 +27,8 @@ pub struct IndexEntry {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ pub struct SessionDocument {
     pub title: String,
     pub size_bytes: u64,
     pub host_session_key: Option<String>,
+    pub parent_session_id: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub status: Option<String>,

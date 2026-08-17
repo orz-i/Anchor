@@ -159,8 +159,26 @@ fn track_task_recovery(
     }
     let (recovery_step, step_fingerprint) = recovery_step_identity(tool, args, output);
     let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-    if succeeded {
-        let recovery_key = args.get("recovery_key").and_then(Value::as_str);
+    let command_like = matches!(
+        tool,
+        "exec_command" | "wait_command" | "write_stdin" | "kill_session"
+    );
+    let terminal_success = succeeded && (!command_like || command_output_is_terminal(output));
+    if terminal_success {
+        let retained_recovery_key =
+            if matches!(tool, "wait_command" | "write_stdin" | "kill_session") {
+                args.get("session_id")
+                    .and_then(Value::as_str)
+                    .and_then(|session_id| ctx.sessions.get(session_id).ok())
+                    .and_then(|session| session.harness_metadata())
+                    .and_then(|metadata| metadata.recovery_key)
+            } else {
+                None
+            };
+        let recovery_key = args
+            .get("recovery_key")
+            .and_then(Value::as_str)
+            .or(retained_recovery_key.as_deref());
         if let Ok(Some(recovery)) = ctx.harness.resolve_recovery_for_attempt(
             task_id,
             &recovery_step,
@@ -178,6 +196,11 @@ fn track_task_recovery(
                 );
             }
         }
+        return;
+    }
+    if succeeded {
+        // A durable command that merely entered the running state has not recovered
+        // the failed logical step yet. Wait for its terminal result before resolving.
         return;
     }
 
@@ -212,6 +235,19 @@ fn track_task_recovery(
             .get("affected_files")
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty());
+    let execution_started = output.get("execution_started").and_then(Value::as_bool);
+    if !workspace_mutated && execution_started == Some(false) {
+        // No child process and no workspace mutation means there is nothing durable
+        // to recover, even when the caller supplied a retry/verification identity.
+        return;
+    }
+    if matches!(
+        args.get("verification_level").and_then(Value::as_str),
+        Some("diagnostic") | Some("informational")
+    ) && !workspace_mutated
+    {
+        return;
+    }
     let explicit_retry_identity = has_explicit_recovery_identity(args);
     let non_mutating_input_rejection = !workspace_mutated
         && !explicit_retry_identity
@@ -923,6 +959,26 @@ fn call_tool_impl(
             .as_object_mut()
             .expect("facade arguments are schema-validated objects")
             .remove("operation");
+        let delegated_schema = crate::tools::registry::input_schema(delegated_tool);
+        let delegated_properties = delegated_schema
+            .get("properties")
+            .and_then(Value::as_object);
+        let facade_schema = crate::tools::registry::input_schema(name);
+        let facade_properties = facade_schema.get("properties").and_then(Value::as_object);
+        let mut ignored_facade_arguments = Vec::new();
+        if let Some(object) = delegated_args.as_object_mut() {
+            let keys = object.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                let is_public_facade_argument =
+                    facade_properties.is_some_and(|properties| properties.contains_key(&key));
+                let accepted_by_operation =
+                    delegated_properties.is_some_and(|properties| properties.contains_key(&key));
+                if is_public_facade_argument && !accepted_by_operation {
+                    object.remove(&key);
+                    ignored_facade_arguments.push(key);
+                }
+            }
+        }
         let mut validation_args = delegated_args.clone();
         if delegated_tool == "session_open" {
             validation_args
@@ -976,6 +1032,12 @@ fn call_tool_impl(
         if let Some(object) = output.as_object_mut() {
             object.insert("facade".into(), Value::String(name.to_string()));
             object.insert("operation".into(), Value::String(operation.to_string()));
+            if !ignored_facade_arguments.is_empty() {
+                object.insert(
+                    "ignored_arguments".into(),
+                    serde_json::to_value(&ignored_facade_arguments).unwrap_or_else(|_| json!([])),
+                );
+            }
         }
         return output;
     }

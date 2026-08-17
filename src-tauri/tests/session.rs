@@ -20,6 +20,151 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
     (workspace, harness, ctx)
 }
 
+#[test]
+fn get_exposes_latest_canonical_snapshot_while_history_remains_append_only() {
+    let (_workspace, _harness, ctx) = test_context();
+    let opened = open_session(&ctx, "chat-snapshot", "snapshot");
+    for (turn_id, runtime, issue, next) in [
+        ("old", "task_status=active", "old issue", "old action"),
+        ("new", "task_status=completed", "new issue", "new action"),
+    ] {
+        let saved = invoke(
+            &ctx,
+            "session_checkpoint",
+            json!({
+                "session_id": opened["session_id"],
+                "expected_path": opened["session_path"],
+                "turn_id": turn_id,
+                "runtime_state": [runtime],
+                "remaining_issues": [issue],
+                "next_actions": [next]
+            }),
+        );
+        assert_ok(&saved);
+    }
+
+    let fetched = invoke(
+        &ctx,
+        "session_get",
+        json!({"session_id": opened["session_id"], "max_bytes": 131072}),
+    );
+    let fetched = assert_ok(&fetched);
+    assert_eq!(fetched["checkpoint_count"], 2);
+    assert_eq!(fetched["snapshot"]["turn_id"], "new");
+    assert_eq!(
+        fetched["snapshot"]["runtime_state"],
+        json!(["task_status=completed"])
+    );
+    assert_eq!(
+        fetched["snapshot"]["remaining_issues"],
+        json!(["new issue"])
+    );
+    assert_eq!(fetched["snapshot"]["next_actions"], json!(["new action"]));
+
+    let current_sections = fetched["content"]
+        .as_str()
+        .expect("content")
+        .split("## 本轮检查点")
+        .next()
+        .expect("current sections");
+    assert!(!current_sections.contains("task_status=active"));
+    assert!(!current_sections.contains("old issue"));
+    assert!(!current_sections.contains("old action"));
+    assert!(current_sections.contains("task_status=completed"));
+    assert!(current_sections.contains("new issue"));
+    assert!(current_sections.contains("new action"));
+}
+
+#[test]
+fn completed_session_creates_a_continuation_instead_of_reactivating_implicitly() {
+    let (workspace, _harness, ctx) = test_context();
+    let first = open_session(&ctx, "chat-continuation", "first phase");
+    let first_id = first["session_id"].as_str().expect("first id").to_string();
+    let first_path = first["session_path"]
+        .as_str()
+        .expect("first path")
+        .to_string();
+
+    let completed = invoke(
+        &ctx,
+        "session_checkpoint",
+        json!({
+            "session_id": first_id,
+            "expected_path": first_path,
+            "turn_id": "final-first-phase",
+            "session_status": "completed",
+            "remaining_issues": [],
+            "next_actions": []
+        }),
+    );
+    assert_eq!(assert_ok(&completed)["session_status"], "completed");
+
+    let next = open_session(&ctx, "chat-continuation", "second phase");
+    assert_ne!(next["session_id"], first["session_id"]);
+    assert_eq!(next["created"], true);
+    assert_eq!(next["resumed"], false);
+    assert_eq!(next["reactivated"], false);
+    assert_eq!(next["continuation_created"], true);
+    assert_eq!(next["parent_session_id"], first["session_id"]);
+
+    let original = invoke(
+        &ctx,
+        "session_get",
+        json!({"session_id": first["session_id"]}),
+    );
+    assert_eq!(assert_ok(&original)["status"], "completed");
+    let original_text = fs::read_to_string(workspace.path().join(first_path)).expect("first file");
+    assert!(original_text.contains("**Status:** completed"));
+
+    let validated = invoke(&ctx, "session_validate", json!({"repair": false}));
+    let validated = assert_ok(&validated);
+    assert_eq!(validated["valid"], true);
+    assert_eq!(validated["duplicate_host_session_keys"], json!([]));
+}
+
+#[test]
+fn completed_session_requires_explicit_resume_when_creation_is_forbidden() {
+    let (_workspace, _harness, ctx) = test_context();
+    let first = open_session(&ctx, "chat-explicit-resume", "immutable");
+    let completed = invoke(
+        &ctx,
+        "session_checkpoint",
+        json!({
+            "session_id": first["session_id"],
+            "expected_path": first["session_path"],
+            "turn_id": "done",
+            "session_status": "completed"
+        }),
+    );
+    assert_ok(&completed);
+
+    let denied = session::open(
+        &ctx,
+        &json!({
+            "_host_session_key": "chat-explicit-resume",
+            "session_id": first["session_id"],
+            "create_if_missing": false
+        }),
+    )
+    .expect_err("completed session must remain immutable by default")
+    .to_error_value();
+    assert_eq!(denied["code"], "SESSION_COMPLETED_IMMUTABLE");
+
+    let explicit = session::open(
+        &ctx,
+        &json!({
+            "_host_session_key": "chat-explicit-resume",
+            "session_id": first["session_id"],
+            "create_if_missing": false,
+            "resume_completed": true
+        }),
+    )
+    .expect("explicit completed resume");
+    let explicit = assert_ok(&explicit);
+    assert_eq!(explicit["session_id"], first["session_id"]);
+    assert_eq!(explicit["reactivated"], true);
+}
+
 fn open_session(ctx: &ToolContext, host_session_key: &str, title: &str) -> Value {
     let result = session::open(
         ctx,

@@ -44,6 +44,136 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn diagnostic_command_failure_does_not_open_task_recovery() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("diagnostic command recovery boundary")
+        .expect("start task");
+
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "raise SystemExit(9)"],
+            "timeout_ms": 10_000,
+            "yield_time_ms": 10_000,
+            "verification_kind": "diagnostic_probe",
+            "verification_level": "diagnostic"
+        }),
+    );
+    let result = assert_err(&result);
+    assert_eq!(result["execution_started"], true);
+    assert_eq!(result["exit_code"], 9);
+    assert!(result.get("task_recovery").is_none(), "{result}");
+    assert!(ctx
+        .harness
+        .task(&task.id)
+        .expect("reload task")
+        .recovery
+        .is_none());
+}
+
+#[test]
+fn running_retry_resolves_recovery_only_after_terminal_success() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("terminal recovery resolution")
+        .expect("start task");
+
+    let failed = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "raise SystemExit(7)"],
+            "timeout_ms": 10_000,
+            "yield_time_ms": 10_000
+        }),
+    );
+    let failed = assert_err(&failed);
+    let recovery_key = failed["task_recovery"]["recovery_key"]
+        .as_str()
+        .expect("recovery key")
+        .to_string();
+
+    let retry = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-u", "-c", "import time; time.sleep(0.2); print('recovered')"],
+            "timeout_ms": 10_000,
+            "yield_time_ms": 0,
+            "recovery_key": recovery_key
+        }),
+    );
+    let retry = assert_ok(&retry);
+    assert_eq!(retry["execution_status"], "running");
+    assert_eq!(
+        ctx.harness
+            .task(&task.id)
+            .expect("running retry task")
+            .recovery
+            .expect("recovery remains open")
+            .status,
+        anchor_lib::harness::model::TaskRecoveryStatus::Open
+    );
+
+    let waited = invoke(
+        &ctx,
+        "wait_command",
+        json!({"session_id": retry["session_id"], "timeout_ms": 2_000}),
+    );
+    let waited = assert_ok(&waited);
+    assert_eq!(waited["execution_status"], "succeeded");
+    assert_eq!(waited["task_recovery"]["status"], "resolved");
+    assert_eq!(
+        ctx.harness
+            .task(&task.id)
+            .expect("terminal retry task")
+            .recovery
+            .expect("resolved recovery")
+            .status,
+        anchor_lib::harness::model::TaskRecoveryStatus::Resolved
+    );
+}
+
+#[test]
+fn preflight_failure_with_verification_identity_still_does_not_open_recovery() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("preflight verification recovery boundary")
+        .expect("start task");
+
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": "which anchor-definitely-missing-program",
+            "verification_kind": "toolchain_probe",
+            "verification_key": "missing-program-probe",
+            "verification_level": "diagnostic"
+        }),
+    );
+    let result = assert_err(&result);
+    assert_eq!(result["execution_started"], false);
+    assert!(result.get("task_recovery").is_none(), "{result}");
+    assert!(ctx
+        .harness
+        .task(&task.id)
+        .expect("reload task")
+        .recovery
+        .is_none());
+}
+
+#[test]
 fn environment_and_cwd_facades_route_to_existing_contracts() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
@@ -155,32 +285,66 @@ fn git_facade_describes_and_reports_operation_specific_arguments() {
 
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    let mismatch = invoke(
+    let filtered = invoke(
         &ctx,
         "git",
         json!({"operation": "status", "include_ignored": false}),
     );
-    let mismatch = assert_err(&mismatch);
-    assert_eq!(mismatch["facade"], "git");
-    assert_eq!(mismatch["operation"], "status");
-    assert_eq!(mismatch["error"]["code"], "INVALID_TOOL_ARGUMENTS");
-    assert_eq!(
-        mismatch["error"]["details"]["stage"],
-        "facade_operation_schema"
+    let filtered = assert_ok(&filtered);
+    assert_eq!(filtered["facade"], "git");
+    assert_eq!(filtered["operation"], "status");
+    assert_eq!(filtered["ignored_arguments"], json!(["include_ignored"]));
+}
+
+#[test]
+fn facade_filters_public_arguments_that_belong_to_other_operations() {
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.tool_profile = "advanced".into();
+
+    let opened = invoke(&ctx, "session", json!({"operation": "open"}));
+    let opened = assert_ok(&opened);
+    let session_id = opened["session_id"].as_str().expect("session id");
+
+    let listed = invoke(
+        &ctx,
+        "session",
+        json!({"operation": "list", "max_bytes": 131072}),
     );
-    assert_eq!(
-        mismatch["error"]["details"]["reason"],
-        "facade_operation_arguments_invalid"
+    let listed = assert_ok(&listed);
+    assert_eq!(listed["ignored_arguments"], json!(["max_bytes"]));
+
+    let fetched = invoke(
+        &ctx,
+        "session",
+        json!({"operation": "get", "session_id": session_id, "limit": 5}),
     );
-    let allowed = mismatch["error"]["details"]["allowed_arguments"]
-        .as_array()
-        .expect("allowed arguments");
-    assert!(!allowed.iter().any(|value| value == "include_ignored"));
-    assert!(allowed.iter().any(|value| value == "include_untracked"));
-    assert_eq!(
-        mismatch["error"]["details"]["canonical_error"]["code"],
-        "INVALID_TOOL_ARGUMENTS"
+    let fetched = assert_ok(&fetched);
+    assert_eq!(fetched["ignored_arguments"], json!(["limit"]));
+
+    let started = invoke(
+        &ctx,
+        "task",
+        json!({"operation": "start", "objective": "facade filter regression"}),
     );
+    let started = assert_ok(&started);
+    let task_id = started["task"]["id"].as_str().expect("task id");
+
+    let status = invoke(
+        &ctx,
+        "task",
+        json!({"operation": "status", "task_id": task_id}),
+    );
+    let status = assert_ok(&status);
+    assert_eq!(status["ignored_arguments"], json!(["task_id"]));
+
+    let events = invoke(
+        &ctx,
+        "task",
+        json!({"operation": "events", "task_id": task_id, "detail": "full"}),
+    );
+    let events = assert_ok(&events);
+    assert_eq!(events["ignored_arguments"], json!(["detail"]));
 }
 
 #[test]

@@ -480,6 +480,11 @@ pub fn exec_command_with_cancellation(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let recovery_key = args
+        .get("recovery_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let test_file = args
         .get("test_file")
         .and_then(Value::as_str)
@@ -515,6 +520,7 @@ pub fn exec_command_with_cancellation(
             stdin_text,
             verification_kind,
             verification_key,
+            recovery_key,
             test_file,
             test_name,
             workspace_before.clone(),
@@ -740,6 +746,7 @@ async fn run_command(
     stdin_text: &str,
     verification_kind: Option<&str>,
     verification_key: Option<&str>,
+    recovery_key: Option<&str>,
     test_file: Option<&str>,
     test_name: Option<&str>,
     workspace_before: Vec<crate::harness::model::BaselineEntry>,
@@ -797,6 +804,7 @@ async fn run_command(
         .map(|task| SessionHarnessMetadata {
             task_id: task.id,
             command: cmd.to_string(),
+            recovery_key: recovery_key.map(str::to_string),
             verification_kind: verification_kind.map(str::to_string),
             verification_key: verification_key.map(str::to_string),
             test_file: test_file.map(str::to_string),
@@ -989,6 +997,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         16_384,
         false,
         "",
+        None,
         None,
         None,
         None,

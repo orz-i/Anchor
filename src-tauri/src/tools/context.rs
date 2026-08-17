@@ -435,10 +435,27 @@ impl ToolContext {
             if let Some(task) = self.bound_task_for_session(Some(session_id)) {
                 return Some(task);
             }
-            // Real MCP transports are fail-closed: an unbound caller must not inherit
-            // the workspace's presentation-level current/default Task. Reconnects must
-            // re-establish the explicit Session -> Task binding through begin_work_session
-            // or switch_task/resume_task.
+            // A real reconnect can lose the transport-local binding while preserving the
+            // logical host-session scope. In that case, recover only when the workspace has
+            // exactly one writable persisted Session-backed Task; otherwise remain fail-closed.
+            if self
+                .task_binding_scope_key_for_session(session_id)
+                .is_some()
+            {
+                let writable = self
+                    .harness
+                    .list_tasks()
+                    .ok()?
+                    .into_iter()
+                    .filter(|task| task.status.is_writable())
+                    .filter(|task| task.session_id.is_some() && task.session_path.is_some())
+                    .collect::<Vec<_>>();
+                if writable.len() == 1 {
+                    let task = writable.into_iter().next()?;
+                    return self.bind_task_for_session(Some(session_id), &task.id).ok();
+                }
+            }
+            // Unscoped transports and ambiguous multi-writer workspaces remain fail-closed.
             return None;
         }
         self.harness
@@ -689,6 +706,47 @@ mod tests {
 
         ctx.bind_cursor_scope_for_session("transport-c", Some("oauth-principal:same-user"));
         assert!(ctx.task_for_session(Some("transport-c")).is_none());
+    }
+
+    #[test]
+    fn fresh_context_rebinds_unique_session_backed_task_for_host_scope() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        let first = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("first context");
+        let task = first
+            .harness
+            .start_task("persisted reconnect")
+            .expect("task");
+        first
+            .harness
+            .bind_session(
+                &task.id,
+                "ses_0123456789abcdef0123456789abcdef",
+                "docs/session/ses_0123456789abcdef0123456789abcdef.md",
+            )
+            .expect("bind persisted session");
+
+        // New ToolContext models an MCP/gateway reconnect: in-memory transport bindings
+        // are empty, while the Harness Task remains durable on disk.
+        let reconnected = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("reconnected context");
+        reconnected.bind_cursor_scope_for_session(
+            "transport-after-reconnect",
+            Some("host-session:conversation-reconnect"),
+        );
+        assert_eq!(
+            reconnected
+                .task_for_session(Some("transport-after-reconnect"))
+                .map(|task| task.id),
+            Some(task.id)
+        );
     }
 
     #[test]

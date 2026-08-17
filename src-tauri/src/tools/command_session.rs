@@ -895,6 +895,7 @@ pub struct ExecSession {
 pub struct SessionHarnessMetadata {
     pub task_id: String,
     pub command: String,
+    pub recovery_key: Option<String>,
     pub verification_kind: Option<String>,
     pub verification_key: Option<String>,
     pub test_file: Option<String>,

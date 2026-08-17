@@ -71,6 +71,10 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .get("create_if_missing")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let resume_completed = args
+        .get("resume_completed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let timestamp = now_timestamp();
 
     let (
@@ -81,6 +85,7 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         previous_status,
         reactivated,
         checkpoint_count,
+        parent_session_id,
     ) = if let Some(session_id) = selected_session_id {
         let entry = index.sessions.get(session_id).cloned().ok_or_else(|| {
             session_error(
@@ -102,25 +107,106 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 )
             })?;
         let previous_status = normalized_status(markdown::metadata(&content, "Status").as_deref());
-        let reactivated = previous_status != "active";
-        if reactivated {
-            let updated = markdown::update_document_lifecycle(&content, &timestamp, "active");
-            storage::write_markdown(ctx.workspace.root().join(&entry.path).as_path(), &updated)?;
-            if let Some(index_entry) = index.sessions.get_mut(session_id) {
-                index_entry.status = "active".into();
-                index_entry.updated_at = timestamp.clone();
+        if previous_status == "completed" && !resume_completed {
+            if !create_if_missing {
+                return Err(session_error(
+                    "SESSION_COMPLETED_IMMUTABLE",
+                    "The requested Session is completed and immutable. Start a continuation Session or explicitly set resume_completed=true.",
+                    "conflict",
+                    false,
+                    json!({
+                        "session_id": session_id,
+                        "session_path": entry.path,
+                        "resume_completed": false
+                    }),
+                ));
+            }
+            if index.sessions.len() >= storage::MAX_SESSION_DOCUMENTS {
+                return Err(session_error(
+                    "SESSION_CAPACITY_EXCEEDED",
+                    "Session store contains the maximum number of Session documents.",
+                    "validation",
+                    false,
+                    json!({"max_documents": storage::MAX_SESSION_DOCUMENTS}),
+                ));
+            }
+            let parent_session_id = session_id.to_string();
+            let child_session_id = storage::new_session_id();
+            let title = args
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(entry.title.as_str());
+            validate_bounded_text("title", title, MAX_SESSION_TITLE_CHARS)?;
+            let relative_path = format!(
+                "{}/{child_session_id}.md",
+                session_dir_display(ctx, &session_dir)
+            );
+            let child_content = markdown::render_document(
+                &child_session_id,
+                title,
+                host_session_key.as_deref(),
+                Some(parent_session_id.as_str()),
+                &timestamp,
+                &timestamp,
+                "active",
+                &[],
+            );
+            storage::write_markdown(
+                &session_dir.join(format!("{child_session_id}.md")),
+                &child_content,
+            )?;
+            index.sessions.insert(
+                child_session_id.clone(),
+                model::IndexEntry {
+                    path: relative_path.clone(),
+                    title: title.trim().to_string(),
+                    status: "active".into(),
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp.clone(),
+                    parent_session_id: Some(parent_session_id.clone()),
+                },
+            );
+            if let Some(host_session_key) = host_session_key.as_ref() {
+                index
+                    .host_sessions
+                    .insert(host_session_key.clone(), child_session_id.clone());
             }
             storage::write_index(&session_dir, &index)?;
+            (
+                child_session_id,
+                relative_path,
+                true,
+                false,
+                previous_status.to_string(),
+                false,
+                0,
+                Some(parent_session_id),
+            )
+        } else {
+            let reactivated = previous_status != "active";
+            if reactivated {
+                let updated = markdown::update_document_lifecycle(&content, &timestamp, "active");
+                storage::write_markdown(
+                    ctx.workspace.root().join(&entry.path).as_path(),
+                    &updated,
+                )?;
+                if let Some(index_entry) = index.sessions.get_mut(session_id) {
+                    index_entry.status = "active".into();
+                    index_entry.updated_at = timestamp.clone();
+                }
+                storage::write_index(&session_dir, &index)?;
+            }
+            (
+                session_id.to_string(),
+                entry.path,
+                false,
+                true,
+                previous_status.to_string(),
+                reactivated,
+                markdown::parse_checkpoint_records(&content).len(),
+                entry.parent_session_id,
+            )
         }
-        (
-            session_id.to_string(),
-            entry.path,
-            false,
-            true,
-            previous_status.to_string(),
-            reactivated,
-            markdown::parse_checkpoint_records(&content).len(),
-        )
     } else {
         if !create_if_missing {
             return Err(session_error(
@@ -151,6 +237,7 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             &session_id,
             title,
             host_session_key.as_deref(),
+            None,
             &timestamp,
             &timestamp,
             "active",
@@ -165,6 +252,7 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 status: "active".into(),
                 created_at: timestamp.clone(),
                 updated_at: timestamp.clone(),
+                parent_session_id: None,
             },
         );
         if let Some(host_session_key) = host_session_key.as_ref() {
@@ -181,6 +269,7 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "active".to_string(),
             false,
             0,
+            None,
         )
     };
 
@@ -192,6 +281,8 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "session_status": "active",
         "previous_status": previous_status,
         "reactivated": reactivated,
+        "parent_session_id": parent_session_id.clone(),
+        "continuation_created": created && parent_session_id.is_some(),
         "checkpoint_count": checkpoint_count,
         "automatic_history_loading": false,
         "history_injected": false,
@@ -242,7 +333,8 @@ pub fn list(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 "title": entry.title,
                 "status": entry.status,
                 "created_at": entry.created_at,
-                "updated_at": entry.updated_at
+                "updated_at": entry.updated_at,
+                "parent_session_id": entry.parent_session_id
             })
         })
         .collect::<Vec<_>>();
@@ -300,6 +392,8 @@ pub fn get(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_GET_BYTES as u64)
         .clamp(1, MAX_GET_BYTES as u64) as usize;
+    let records = markdown::parse_checkpoint_records(&content);
+    let latest_checkpoint = records.last().cloned();
     let (content, content_truncated) = truncate_utf8_bytes(&content, max_bytes);
     Ok(tool_ok(json!({
         "session_id": session_id,
@@ -308,6 +402,9 @@ pub fn get(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "status": entry.status,
         "created_at": entry.created_at,
         "updated_at": entry.updated_at,
+        "parent_session_id": entry.parent_session_id,
+        "checkpoint_count": records.len(),
+        "snapshot": latest_checkpoint,
         "content": content,
         "content_truncated": content_truncated,
         "max_bytes": max_bytes
@@ -486,6 +583,7 @@ pub fn checkpoint(
             &session_id,
             &markdown::document_title(&document_content),
             markdown::metadata(&document_content, "Host session key").as_deref(),
+            entry.parent_session_id.as_deref(),
             &created_at,
             &timestamp,
             &session_status,

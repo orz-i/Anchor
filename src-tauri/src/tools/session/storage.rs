@@ -262,6 +262,7 @@ pub fn scan(workspace: &Workspace, session_dir: &Path) -> WorkspaceResult<ScanRe
             title: markdown::document_title(&content),
             size_bytes,
             host_session_key: markdown::metadata(&content, "Host session key"),
+            parent_session_id: markdown::metadata(&content, "Parent session id"),
             created_at: markdown::metadata(&content, "Created"),
             updated_at: markdown::metadata(&content, "Updated"),
             status: markdown::metadata(&content, "Status"),
@@ -289,9 +290,47 @@ pub fn scan(workspace: &Workspace, session_dir: &Path) -> WorkspaceResult<ScanRe
         .collect();
     report.duplicate_host_session_keys = host_keys
         .into_iter()
-        .filter_map(|(key, count)| (count > 1).then_some(key))
+        .filter_map(|(key, count)| {
+            (count > 1 && !valid_continuation_chain(&report.documents, &key)).then_some(key)
+        })
         .collect();
     Ok(report)
+}
+
+fn valid_continuation_chain(documents: &[SessionDocument], host_key: &str) -> bool {
+    let members = documents
+        .iter()
+        .filter(|document| document.host_session_key.as_deref() == Some(host_key))
+        .collect::<Vec<_>>();
+    if members.len() <= 1 {
+        return true;
+    }
+    let ids = members
+        .iter()
+        .map(|document| document.session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let roots = members
+        .iter()
+        .filter(|document| document.parent_session_id.is_none())
+        .count();
+    if roots != 1 {
+        return false;
+    }
+    let mut children = BTreeMap::<&str, usize>::new();
+    for document in members {
+        let Some(parent) = document.parent_session_id.as_deref() else {
+            continue;
+        };
+        if parent == document.session_id || !ids.contains(parent) {
+            return false;
+        }
+        let count = children.entry(parent).or_default();
+        *count += 1;
+        if *count > 1 {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn rebuild_index(report: &ScanReport) -> SessionIndex {
@@ -313,10 +352,13 @@ pub fn rebuild_index(report: &ScanReport) -> SessionIndex {
                 status: document.status.clone().unwrap_or_else(|| "active".into()),
                 created_at: document.created_at.clone().unwrap_or_default(),
                 updated_at: document.updated_at.clone().unwrap_or_default(),
+                parent_session_id: document.parent_session_id.clone(),
             },
         );
         if let Some(host_key) = document.host_session_key.as_ref() {
             if !duplicate_hosts.contains(host_key) {
+                // report.documents is ordered oldest -> newest, so a valid continuation
+                // chain naturally leaves the current leaf bound to the host conversation.
                 index
                     .host_sessions
                     .insert(host_key.clone(), document.session_id.clone());

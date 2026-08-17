@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 38;
+pub const CATALOG_VERSION: u32 = 39;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -1154,6 +1154,8 @@ fn session_open_output_properties() -> Value {
         "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
         "previous_status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
         "reactivated": { "type": "boolean" },
+        "parent_session_id": { "type": ["string", "null"] },
+        "continuation_created": { "type": "boolean" },
         "checkpoint_count": { "type": "integer", "minimum": 0 },
         "automatic_history_loading": { "type": "boolean", "const": false },
         "history_injected": { "type": "boolean", "const": false },
@@ -2100,6 +2102,8 @@ pub fn output_schema(name: &str) -> Value {
                 "session_status",
                 "previous_status",
                 "reactivated",
+                "parent_session_id",
+                "continuation_created",
                 "checkpoint_count",
                 "automatic_history_loading",
                 "history_injected",
@@ -2183,6 +2187,9 @@ pub fn output_schema(name: &str) -> Value {
                 "status": { "type": "string", "enum": ["active", "paused", "completed", "unknown"] },
                 "created_at": { "type": "string" },
                 "updated_at": { "type": "string" },
+                "parent_session_id": { "type": ["string", "null"] },
+                "checkpoint_count": { "type": "integer", "minimum": 0 },
+                "snapshot": { "type": ["object", "null"] },
                 "content": { "type": "string" },
                 "content_truncated": { "type": "boolean" },
                 "max_bytes": { "type": "integer", "minimum": 1 }
@@ -2194,6 +2201,9 @@ pub fn output_schema(name: &str) -> Value {
                 "status",
                 "created_at",
                 "updated_at",
+                "parent_session_id",
+                "checkpoint_count",
+                "snapshot",
                 "content",
                 "content_truncated",
                 "max_bytes",
@@ -2991,7 +3001,8 @@ pub fn input_schema(name: &str) -> Value {
                 "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "title": { "type": "string", "maxLength": 200 },
                 "session_dir": { "type": "string", "default": "docs/session" },
-                "create_if_missing": { "type": "boolean", "default": true }
+                "create_if_missing": { "type": "boolean", "default": true },
+                "resume_completed": { "type": "boolean", "default": false, "description": "Explicitly reactivate the selected completed Session instead of creating a continuation Session." }
             },
             "additionalProperties": false
         }),
@@ -3084,6 +3095,7 @@ pub fn input_schema(name: &str) -> Value {
                 "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true, "description": "When false, recover an already-existing Session + writable Harness Task only. Never create a replacement Task or Git worktree; return a structured not-found/conflict error instead." },
+                "resume_completed": { "type": "boolean", "default": false, "description": "Explicitly reactivate the selected completed Session instead of creating a continuation Session." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },

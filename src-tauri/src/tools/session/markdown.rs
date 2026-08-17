@@ -79,6 +79,7 @@ pub fn render_document(
     session_id: &str,
     title: &str,
     host_session_key: Option<&str>,
+    parent_session_id: Option<&str>,
     created_at: &str,
     updated_at: &str,
     status: &str,
@@ -99,12 +100,16 @@ pub fn render_document(
     if let Some(host_session_key) = host_session_key.filter(|value| !value.trim().is_empty()) {
         output.push_str(&format!("**Host session key:** {host_session_key}\n"));
     }
+    if let Some(parent_session_id) = parent_session_id.filter(|value| !value.trim().is_empty()) {
+        output.push_str(&format!("**Parent session id:** {parent_session_id}\n"));
+    }
     output.push('\n');
     push_section(
         &mut output,
         "用户核心目标",
         records
-            .iter()
+            .last()
+            .into_iter()
             .map(|record| record.user_intent.as_str())
             .filter(|value| !value.is_empty()),
     );
@@ -140,21 +145,24 @@ pub fn render_document(
         &mut output,
         "当前运行状态",
         records
-            .iter()
+            .last()
+            .into_iter()
             .flat_map(|record| record.runtime_state.iter().map(String::as_str)),
     );
     push_section(
         &mut output,
         "剩余问题",
         records
-            .iter()
+            .last()
+            .into_iter()
             .flat_map(|record| record.remaining_issues.iter().map(String::as_str)),
     );
     push_section(
         &mut output,
         "下一步",
         records
-            .iter()
+            .last()
+            .into_iter()
             .flat_map(|record| record.next_actions.iter().map(String::as_str)),
     );
     output.push_str(CHECKPOINT_HEADING);
