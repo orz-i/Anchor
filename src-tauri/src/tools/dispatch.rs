@@ -2291,8 +2291,13 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
     if let Some(error) = &boundary_error {
         warnings.push(error.message());
     }
-    let development_environment = crate::tools::environment::diagnose(ctx.workspace.root());
-    let healthy = workspace_exec_available && development_environment["host_healthy"] == true;
+    let docker_execution_allowed = ctx.policy.allowed_commands.contains("docker");
+    let development_environment =
+        crate::tools::environment::diagnose(ctx.workspace.root(), docker_execution_allowed);
+    let actionable_verification_route = development_environment["recommended_verification_route"]
+        .as_str()
+        .is_some_and(|route| matches!(route, "host" | "docker"));
+    let healthy = workspace_exec_available && actionable_verification_route;
     Ok(tool_ok(json!({
         "healthy": healthy,
         "status": if healthy { "healthy" } else { "degraded" },

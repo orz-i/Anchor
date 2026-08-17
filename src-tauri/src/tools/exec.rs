@@ -22,13 +22,244 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None, None)
 }
 
+pub(crate) fn effective_command_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(process_path) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&process_path) {
+            push_unique_path(&mut paths, path, false);
+        }
+    }
+
+    #[cfg(unix)]
+    append_unix_user_toolchain_paths(&mut paths);
+
+    paths
+}
+
+pub(crate) fn effective_command_path() -> Option<std::ffi::OsString> {
+    let paths = effective_command_search_paths();
+    (!paths.is_empty())
+        .then(|| std::env::join_paths(paths).ok())
+        .flatten()
+}
+
+pub(crate) fn effective_command_path_additions() -> Vec<PathBuf> {
+    let inherited = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    effective_command_search_paths()
+        .into_iter()
+        .filter(|path| !inherited.iter().any(|current| current == path))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn resolve_effective_system_program(name: &str) -> Option<PathBuf> {
+    let candidates = system_program_candidates(name);
+    effective_command_search_paths()
+        .into_iter()
+        .flat_map(|directory| {
+            candidates
+                .iter()
+                .map(move |candidate| directory.join(candidate))
+        })
+        .find(|candidate| command_candidate_is_executable(candidate))
+        .map(|path| resolve_system_program_path(&path))
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_effective_system_program(name: &str) -> Option<PathBuf> {
+    which::which(name)
+        .ok()
+        .map(|path| resolve_system_program_path(&path))
+}
+
+#[cfg(not(windows))]
+fn system_program_candidates(name: &str) -> Vec<String> {
+    vec![name.to_string()]
+}
+
+#[cfg(unix)]
+fn command_candidate_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf, require_directory: bool) {
+    if require_directory && !path.is_dir() {
+        return;
+    }
+    if !paths.iter().any(|current| current == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(unix)]
+fn append_unix_user_toolchain_paths(paths: &mut Vec<PathBuf>) {
+    for (name, suffix) in [
+        ("NVM_BIN", None),
+        ("FNM_MULTISHELL_PATH", Some("bin")),
+        ("PNPM_HOME", None),
+        ("CARGO_HOME", Some("bin")),
+        ("VOLTA_HOME", Some("bin")),
+        ("BUN_INSTALL", Some("bin")),
+        ("ASDF_DATA_DIR", Some("shims")),
+        ("MISE_DATA_DIR", Some("shims")),
+        ("GOBIN", None),
+        ("GOROOT", Some("bin")),
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            let mut path = PathBuf::from(value);
+            if let Some(suffix) = suffix {
+                path.push(suffix);
+            }
+            push_unique_path(paths, path, true);
+        }
+    }
+
+    if let Some(gopath) = std::env::var_os("GOPATH") {
+        for path in std::env::split_paths(&gopath) {
+            push_unique_path(paths, path.join("bin"), true);
+        }
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        push_unique_path(paths, PathBuf::from("/usr/local/go/bin"), true);
+        return;
+    };
+
+    let nvm_root = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".nvm"));
+    if let Some(bin) = resolve_nvm_default_bin(&nvm_root) {
+        push_unique_path(paths, bin, true);
+    }
+
+    for path in [
+        home.join(".local/bin"),
+        home.join(".cargo/bin"),
+        home.join(".local/share/pnpm"),
+        home.join(".volta/bin"),
+        home.join(".asdf/shims"),
+        home.join(".local/share/mise/shims"),
+        home.join(".bun/bin"),
+        home.join("go/bin"),
+    ] {
+        push_unique_path(paths, path, true);
+    }
+
+    push_unique_path(paths, PathBuf::from("/usr/local/go/bin"), true);
+}
+
+#[cfg(unix)]
+fn resolve_nvm_default_bin(nvm_root: &Path) -> Option<PathBuf> {
+    let versions_root = nvm_root.join("versions/node");
+    let installed = installed_nvm_versions(&versions_root);
+    if installed.is_empty() {
+        return None;
+    }
+
+    let default_alias = nvm_root.join("alias/default");
+    if let Ok(target) = std::fs::read_to_string(default_alias) {
+        if let Some(version) = resolve_nvm_target(nvm_root, target.trim(), &installed, 0) {
+            return Some(versions_root.join(version).join("bin"));
+        }
+    }
+
+    (installed.len() == 1).then(|| versions_root.join(&installed[0].1).join("bin"))
+}
+
+#[cfg(unix)]
+fn resolve_nvm_target(
+    nvm_root: &Path,
+    target: &str,
+    installed: &[((u64, u64, u64), String)],
+    depth: usize,
+) -> Option<String> {
+    if target.is_empty() || depth >= 8 || target.eq_ignore_ascii_case("system") {
+        return None;
+    }
+    let target = target.trim();
+    if matches!(target, "node" | "stable") {
+        return installed.first().map(|(_, version)| version.clone());
+    }
+
+    let normalized = target.trim_start_matches('v');
+    let numeric_prefix = normalized
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .filter(|parts| !parts.is_empty() && parts.len() <= 3);
+    if let Some(prefix) = numeric_prefix {
+        return installed
+            .iter()
+            .find(|(version, _)| nvm_version_matches_prefix(*version, &prefix))
+            .map(|(_, version)| version.clone());
+    }
+
+    let alias_path = Path::new(target);
+    if alias_path.is_absolute()
+        || alias_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let nested = std::fs::read_to_string(nvm_root.join("alias").join(alias_path)).ok()?;
+    resolve_nvm_target(nvm_root, nested.trim(), installed, depth + 1)
+}
+
+#[cfg(unix)]
+fn installed_nvm_versions(root: &Path) -> Vec<((u64, u64, u64), String)> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut versions = entries
+        .flatten()
+        .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key = parse_nvm_version(&name)?;
+            entry.path().join("bin").is_dir().then_some((key, name))
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    versions
+}
+
+#[cfg(unix)]
+fn parse_nvm_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
+#[cfg(unix)]
+fn nvm_version_matches_prefix(version: (u64, u64, u64), prefix: &[u64]) -> bool {
+    let parts = [version.0, version.1, version.2];
+    prefix
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| parts[index] == *expected)
+}
+
 fn apply_toolchain_path_overlay(
     command: &mut Command,
     toolchain_paths: &[PathBuf],
 ) -> Result<(), WorkspaceError> {
-    if toolchain_paths.is_empty() {
-        return Ok(());
-    }
     let configured_path = command.as_std().get_envs().find_map(|(name, value)| {
         name.eq_ignore_ascii_case("PATH")
             .then(|| value.map(std::ffi::OsStr::to_os_string))
@@ -36,7 +267,15 @@ fn apply_toolchain_path_overlay(
     });
     let mut paths = toolchain_paths.to_vec();
     if let Some(existing) = configured_path.or_else(|| std::env::var_os("PATH")) {
-        paths.extend(std::env::split_paths(&existing));
+        for path in std::env::split_paths(&existing) {
+            push_unique_path(&mut paths, path, false);
+        }
+    }
+    for path in effective_command_path_additions() {
+        push_unique_path(&mut paths, path, true);
+    }
+    if paths.is_empty() {
+        return Ok(());
     }
     let joined = std::env::join_paths(paths).map_err(|error| WorkspaceError::Tool {
         code: "TOOLCHAIN_PATH_INVALID",
@@ -110,22 +349,6 @@ fn apply_standard_user_toolchain_path(command: &mut Command) -> Result<(), Works
     })?;
     command.env("PATH", joined);
     Ok(())
-}
-
-#[cfg(unix)]
-fn resolve_standard_user_toolchain_program(program: &str) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    standard_user_toolchain_paths()
-        .into_iter()
-        .map(|directory| directory.join(program))
-        .find(|candidate| {
-            candidate
-                .metadata()
-                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
 fn validate_toolchain_paths(value: Option<&Value>) -> Result<(), WorkspaceError> {
@@ -839,11 +1062,13 @@ fn run_native_diagnostic(
         "pwd" if parts.len() == 1 => Some(format!("{}\n", cwd.display())),
         "ls" | "dir" => Some(list_directory(ctx, cwd, &parts[1..])?),
         "which" if parts.len() == 2 => {
-            let path = which::which(&parts[1]).map_err(|_| WorkspaceError::Tool {
-                code: "COMMAND_NOT_FOUND",
-                message: format!("Program not found on PATH: {}", parts[1]),
-                category: "runtime",
-                retryable: false,
+            let path = resolve_effective_system_program(&parts[1]).ok_or_else(|| {
+                WorkspaceError::Tool {
+                    code: "COMMAND_NOT_FOUND",
+                    message: format!("Program not found on PATH: {}", parts[1]),
+                    category: "runtime",
+                    retryable: false,
+                }
             })?;
             Some(format!("{}\n", path.display()))
         }
@@ -1519,20 +1744,9 @@ fn resolve_program(
         }
     }
 
-    which::which(trimmed)
-        .map(|p| {
-            resolve_system_program_path(&p)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .or_else(|error| {
-            #[cfg(unix)]
-            if let Some(program) = resolve_standard_user_toolchain_program(trimmed) {
-                return Ok(program);
-            }
-            Err(error)
-        })
-        .map_err(|_| WorkspaceError::Tool {
+    resolve_effective_system_program(trimmed)
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| WorkspaceError::Tool {
             code: "COMMAND_REJECTED",
             message: format!("Program not found on PATH: {trimmed}"),
             category: "runtime",
@@ -1552,6 +1766,55 @@ mod tests {
     use crate::tools::CancellationToken;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn nvm_default_alias_selects_the_configured_installed_version() {
+        let root = tempdir().expect("nvm root");
+        for version in ["v20.18.1", "v24.18.0"] {
+            std::fs::create_dir_all(root.path().join("versions/node").join(version).join("bin"))
+                .expect("nvm version bin");
+        }
+        std::fs::create_dir_all(root.path().join("alias")).expect("alias dir");
+        std::fs::write(root.path().join("alias/default"), "20\n").expect("default alias");
+
+        assert_eq!(
+            resolve_nvm_default_bin(root.path()),
+            Some(root.path().join("versions/node/v20.18.1/bin"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvm_default_alias_can_follow_a_bounded_named_alias() {
+        let root = tempdir().expect("nvm root");
+        std::fs::create_dir_all(root.path().join("versions/node/v24.18.0/bin"))
+            .expect("nvm version bin");
+        std::fs::create_dir_all(root.path().join("alias/lts")).expect("alias dir");
+        std::fs::write(root.path().join("alias/default"), "lts/hydrogen\n").expect("default alias");
+        std::fs::write(root.path().join("alias/lts/hydrogen"), "v24.18.0\n").expect("named alias");
+
+        assert_eq!(
+            resolve_nvm_default_bin(root.path()),
+            Some(root.path().join("versions/node/v24.18.0/bin"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvm_without_default_only_uses_an_unambiguous_single_version() {
+        let root = tempdir().expect("nvm root");
+        std::fs::create_dir_all(root.path().join("versions/node/v22.12.0/bin"))
+            .expect("single version");
+        assert_eq!(
+            resolve_nvm_default_bin(root.path()),
+            Some(root.path().join("versions/node/v22.12.0/bin"))
+        );
+
+        std::fs::create_dir_all(root.path().join("versions/node/v24.18.0/bin"))
+            .expect("second version");
+        assert_eq!(resolve_nvm_default_bin(root.path()), None);
+    }
 
     #[cfg(windows)]
     #[test]

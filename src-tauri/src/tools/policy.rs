@@ -318,7 +318,9 @@ pub fn validate_command_for_workspace(
     if command.trim().is_empty() {
         return Err(PolicyError("exec_command requires a non-empty cmd".into()));
     }
-    if command.len() > 4_000 {
+    let structured_invocation =
+        arguments.get("executable").is_some() || arguments.get("shell").is_some();
+    if !structured_invocation && command.len() > 4_000 {
         return Err(PolicyError("Command is too long".into()));
     }
     let filesystem_scope = arguments
@@ -340,12 +342,20 @@ pub fn validate_command_for_workspace(
             }
         }
     }
-    if has_forbidden_shell_syntax(command) {
+    let structured_direct_parts = structured_direct_command_parts(arguments);
+    let parts = match structured_direct_parts.clone() {
+        Some(parts) => parts,
+        None => split_command_line(command).map_err(PolicyError)?,
+    };
+    let structured_direct_literal_argv = structured_direct_parts
+        .as_ref()
+        .and_then(|parts| parts.first())
+        .is_some_and(|program| !program_uses_shell_syntax(program));
+    if !structured_direct_literal_argv && has_forbidden_shell_syntax(command) {
         return Err(PolicyError(
             "Shell chaining, redirection and expansion are not allowed".into(),
         ));
     }
-    let parts = split_command_line(command).map_err(PolicyError)?;
     if parts.is_empty() {
         return Err(PolicyError("Empty command".into()));
     }
@@ -414,7 +424,12 @@ pub fn validate_command_for_workspace(
             wrapped_command_segments(&parts, &wrapped_command).map_err(PolicyError)?
         {
             let mut nested_arguments = arguments.clone();
-            nested_arguments["cmd"] = Value::String(nested_command);
+            if let Some(object) = nested_arguments.as_object_mut() {
+                object.remove("executable");
+                object.remove("args");
+                object.remove("shell");
+                object.insert("cmd".into(), Value::String(nested_command));
+            }
             validate_command_for_workspace(&nested_arguments, policy, workspace)?;
         }
     }
@@ -430,6 +445,30 @@ pub fn validate_command_for_workspace(
     }
 
     Ok(())
+}
+
+fn structured_direct_command_parts(arguments: &Value) -> Option<Vec<String>> {
+    if arguments
+        .get("shell")
+        .and_then(Value::as_str)
+        .unwrap_or("direct")
+        != "direct"
+    {
+        return None;
+    }
+    let executable = arguments.get("executable")?.as_str()?.to_string();
+    let mut parts = vec![executable];
+    for argument in arguments.get("args").and_then(Value::as_array)? {
+        parts.push(argument.as_str()?.to_string());
+    }
+    Some(parts)
+}
+
+fn program_uses_shell_syntax(program: &str) -> bool {
+    matches!(
+        command_stem(program).as_str(),
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" | "cmd" | "powershell" | "pwsh"
+    )
 }
 
 fn validate_model_environment(environment: &Value) -> Result<(), PolicyError> {
@@ -515,12 +554,16 @@ pub(crate) fn wrapped_command_payload(parts: &[String]) -> Option<String> {
     let switches: &[&str] = match stem {
         "powershell" | "pwsh" => &["-command", "-c"],
         "cmd" => &["/c", "/k"],
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" => &["-c"],
         _ => return None,
     };
     let index = parts.iter().position(|part| {
         switches
             .iter()
             .any(|switch| part.eq_ignore_ascii_case(switch))
+            || (matches!(stem, "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish")
+                && part.starts_with('-')
+                && part[1..].chars().any(|option| option == 'c'))
     })?;
     (index + 1 < parts.len()).then(|| parts[index + 1..].join(" "))
 }
@@ -1129,6 +1172,48 @@ fn command_targets_protected_repository_asset(command: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn structured_direct_arguments_treat_multiline_source_as_literal_argv() {
+        let source = "print('left && right')\nprint('done')".to_string();
+        let command =
+            join_command_tokens(&["python3".to_string(), "-c".to_string(), source.clone()]);
+        assert!(has_forbidden_shell_syntax(&command));
+
+        validate_command(
+            &json!({
+                "cmd": command,
+                "executable": "python3",
+                "args": ["-c", source],
+                "shell": "direct",
+                "filesystem_scope": "workspace"
+            }),
+            &PolicySettings::default(),
+        )
+        .expect("direct argv must not reinterpret literal source as shell syntax");
+    }
+
+    #[test]
+    fn configured_shell_wrapper_still_validates_nested_payload() {
+        let mut policy = PolicySettings::default();
+        policy.allowed_commands.insert("sh".into());
+        let payload = "echo safe && echo chained";
+        let command =
+            join_command_tokens(&["sh".to_string(), "-c".to_string(), payload.to_string()]);
+
+        let error = validate_command(
+            &json!({
+                "cmd": command,
+                "executable": "sh",
+                "args": ["-c", payload],
+                "shell": "direct",
+                "filesystem_scope": "workspace"
+            }),
+            &policy,
+        )
+        .expect_err("shell wrapper payload must remain governed");
+        assert!(error.0.contains("Shell chaining"), "{error}");
+    }
 
     #[test]
     fn strict_workspace_rejects_external_paths_in_commands() {

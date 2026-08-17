@@ -33,6 +33,106 @@ fn initialize_git(root: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn workspace_toolchain_resolution_is_consistent_in_shared_and_worktree_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let bin = workspace.join("tools/bin");
+    fs::create_dir_all(&bin).expect("toolchain bin");
+    fs::write(workspace.join("README.md"), "toolchain routing\n").expect("readme");
+    fs::write(
+        workspace.join(".gitignore"),
+        "/.anchor/worktrees/\n/docs/session/\n",
+    )
+    .expect("gitignore");
+    let fake_node = bin.join("node");
+    let fake_tsc = bin.join("tsc");
+    fs::write(&fake_node, "#!/bin/sh\nexec tsc\n").expect("fake node");
+    fs::write(
+        &fake_tsc,
+        "#!/bin/sh\nprintf 'workspace-toolchain-mode-ok\\n'\n",
+    )
+    .expect("fake tsc");
+    fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o755)).expect("chmod node");
+    fs::set_permissions(&fake_tsc, fs::Permissions::from_mode(0o755)).expect("chmod tsc");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("context");
+
+    let shared = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "shared toolchain routing",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "shared"
+        }),
+        "toolchain-shared-session",
+    );
+    assert_eq!(shared["ok"], true, "{shared}");
+    let shared_exec = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": "node",
+            "toolchain_paths": ["tools/bin"],
+            "yield_time_ms": 10_000,
+            "timeout_ms": 10_000,
+            "verification_level": "diagnostic"
+        }),
+        "toolchain-shared-session",
+    );
+    assert_eq!(shared_exec["ok"], true, "{shared_exec}");
+    assert!(shared_exec["stdout"]
+        .as_str()
+        .is_some_and(|output| output.contains("workspace-toolchain-mode-ok")));
+    assert_eq!(
+        shared_exec["resolved_cwd"],
+        workspace.to_string_lossy().as_ref()
+    );
+
+    let isolated = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "worktree toolchain routing",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": true
+        }),
+        "toolchain-worktree-session",
+    );
+    assert_eq!(isolated["ok"], true, "{isolated}");
+    let worktree_path = std::path::PathBuf::from(
+        isolated["task"]["git_worktree"]["path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    let isolated_exec = call_tool_for_session(
+        &ctx,
+        "exec_command",
+        &json!({
+            "executable": "node",
+            "toolchain_paths": ["tools/bin"],
+            "yield_time_ms": 10_000,
+            "timeout_ms": 10_000,
+            "verification_level": "diagnostic"
+        }),
+        "toolchain-worktree-session",
+    );
+    assert_eq!(isolated_exec["ok"], true, "{isolated_exec}");
+    assert!(isolated_exec["stdout"]
+        .as_str()
+        .is_some_and(|output| output.contains("workspace-toolchain-mode-ok")));
+    assert_eq!(
+        isolated_exec["resolved_cwd"],
+        worktree_path.to_string_lossy().as_ref()
+    );
+}
+
 #[test]
 fn bound_worktree_session_checkpoint_uses_primary_session_store_without_task_baseline_gate() {
     let temp = tempfile::tempdir().expect("创建临时目录");
