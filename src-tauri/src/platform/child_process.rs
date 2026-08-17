@@ -8,6 +8,11 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+/// Keep arbitrary workspace commands below normal priority so they yield CPU
+/// to the desktop, daemon control plane, and other interactive applications.
+#[cfg(windows)]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+
 /// Configure a Tokio child process as an internal background process.
 ///
 /// stdout/stderr pipes continue to work; only the Windows console window is
@@ -18,6 +23,33 @@ pub fn hide_tokio_console(command: &mut tokio::process::Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 
     #[cfg(not(windows))]
+    let _ = command;
+}
+
+/// Configure an arbitrary workspace command for host responsiveness.
+///
+/// This is intentionally separate from supervised daemon children: command
+/// execution should yield CPU to interactive processes, while daemon/tunnel
+/// lifecycle processes keep their existing scheduling behavior.
+pub fn configure_exec_tokio_process(command: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: `setpriority` is an async-signal-safe libc call and the
+        // closure does not allocate or acquire process-global Rust locks.
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                let _ = libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(any(windows, unix)))]
     let _ = command;
 }
 
@@ -92,6 +124,12 @@ mod tests {
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
         assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0000_0200);
         assert_eq!(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, 0x0800_0200);
+    }
+
+    #[test]
+    fn exec_children_use_below_normal_priority_without_a_console() {
+        assert_eq!(BELOW_NORMAL_PRIORITY_CLASS, 0x0000_4000);
+        assert_eq!(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, 0x0800_4000);
     }
 
     #[test]

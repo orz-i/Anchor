@@ -7,6 +7,7 @@ use crate::tools::catalog::EffectiveCatalog;
 use crate::tools::command_cost::CommandCostGuard;
 use crate::tools::command_session::CommandSessionStore;
 use crate::tools::policy::PolicySettings;
+use crate::tools::resource_budget::ExecutionResourceManager;
 use crate::tools::workspace::{relative_display, Workspace};
 use crate::workspace::AuthConfig;
 
@@ -99,6 +100,7 @@ pub struct ToolContext {
     command_output_cursors: Arc<Mutex<HashMap<String, (usize, usize)>>>,
     workspace_mutation_locks: Arc<WorkspaceMutationLocks>,
     pub sessions: Arc<CommandSessionStore>,
+    pub resources: Arc<ExecutionResourceManager>,
     pub command_cost: Arc<CommandCostGuard>,
     published_catalog: Arc<Mutex<Option<EffectiveCatalog>>>,
 }
@@ -157,6 +159,7 @@ impl ToolContext {
             command_output_cursors: self.command_output_cursors.clone(),
             workspace_mutation_locks: self.workspace_mutation_locks.clone(),
             sessions: self.sessions.clone(),
+            resources: self.resources.clone(),
             command_cost: self.command_cost.clone(),
             published_catalog: self.published_catalog.clone(),
         };
@@ -212,6 +215,7 @@ impl ToolContext {
     ) -> Self {
         let root = workspace.root().to_path_buf();
         let command_cost = CommandCostGuard::new(&harness_root, &root);
+        let resources = ExecutionResourceManager::new(&harness_root);
         let context = Self {
             workspace,
             auth,
@@ -234,6 +238,7 @@ impl ToolContext {
             command_output_cursors: Arc::new(Mutex::new(HashMap::new())),
             workspace_mutation_locks: Arc::new(WorkspaceMutationLocks::default()),
             sessions: Arc::new(CommandSessionStore::new()),
+            resources: Arc::new(resources),
             command_cost: Arc::new(command_cost),
             published_catalog: Arc::new(Mutex::new(None)),
         };

@@ -12,6 +12,7 @@ mod image_tool;
 pub mod patch;
 pub mod policy;
 pub mod recovery;
+pub mod resource_budget;
 pub mod registry;
 pub(crate) mod schema;
 pub mod session;
