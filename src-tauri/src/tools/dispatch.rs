@@ -2313,6 +2313,7 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         "external_reads_allowed": !ctx.workspace.strict_read_boundary(),
         "workspace_exec_sandbox_enforced": false,
         "workspace_exec_boundary": "policy_only",
+        "execution_resources": ctx.resources.policy_value(),
         "workspace_link_guard": {
             "safe": workspace_exec_available,
             "scope": "recursive_reparse_points",

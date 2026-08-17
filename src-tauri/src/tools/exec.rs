@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
@@ -871,13 +869,23 @@ async fn run_command(
     if cancellation.is_cancelled() {
         return Err(cancelled_error(None));
     }
-    let (program, args) =
+    let (program, mut args) =
         parse_and_resolve_execution(execution, cmd, cwd, ctx.workspace.root(), &ctx.policy)?;
     let execution_mode = execution_mode(execution);
     let start = Instant::now();
 
+    // Retained-result capacity and live CPU capacity are separate concerns.
+    // Check the former before spawning so an already-full result store cannot
+    // briefly create a child only to kill it after insertion fails.
+    ctx.sessions.ensure_capacity()?;
+    let heavy_command = ctx.resources.is_cpu_intensive(&program, &args);
+    let resource_lease = ctx.resources.acquire(heavy_command, cancellation).await?;
+    let child_parallelism = resource_lease.parallelism();
+    ctx.resources
+        .clamp_parallel_args(&program, &mut args, child_parallelism);
+
     let mut command = command_for_program(&program, &args);
-    crate::platform::hide_tokio_console(&mut command);
+    crate::platform::configure_exec_tokio_process(&mut command);
     command
         .current_dir(platform_command_path(cwd))
         .stdin(std::process::Stdio::piped())
@@ -898,6 +906,8 @@ async fn run_command(
         .env("PYTHONLEGACYWINDOWSSTDIO", "0");
     #[cfg(windows)]
     configure_windows_command_environment(&mut command, &program);
+    ctx.resources
+        .apply_child_environment(&mut command, child_parallelism, &program);
     let toolchain_paths = resolve_toolchain_paths(execution, ctx.workspace.root())?;
     apply_toolchain_path_overlay(&mut command, &toolchain_paths)?;
 
@@ -929,7 +939,7 @@ async fn run_command(
         });
     let session = match ctx
         .sessions
-        .insert(ExecSession::new_with_details_and_encoding(
+        .insert(ExecSession::new_with_details_encoding_and_resources(
             child,
             tty,
             cmd.to_string(),
@@ -937,6 +947,7 @@ async fn run_command(
             harness_metadata,
             ctx.command_owner_scope_for_session(mcp_session_id),
             stream_encoding_for_program(&program),
+            Some(resource_lease),
         )) {
         Ok(session) => session,
         Err(rejected) => {

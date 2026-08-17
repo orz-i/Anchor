@@ -1248,6 +1248,7 @@ fn session_snapshot_output_schema() -> Value {
             "retained_ms": { "type": "integer", "minimum": 0 },
             "finished_at": { "type": ["string", "null"] },
             "result_observed": { "type": "boolean" },
+            "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
             "affected_files": { "type": "array", "items": { "type": "object" } },
             "mutation_attributed": { "type": "boolean" },
             "output_refs": {
@@ -1862,6 +1863,7 @@ pub fn output_schema(name: &str) -> Value {
                 "mutation_attributed": { "type": "boolean" },
                 "verification_skipped": { "type": "boolean" },
                 "verification_skip_reason": { "type": "string" },
+                "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
                 "warnings": warnings_property()
             }),
             &[
@@ -1921,6 +1923,7 @@ pub fn output_schema(name: &str) -> Value {
                 "stdout_complete": { "type": "boolean" },
                 "stderr_complete": { "type": "boolean" },
                 "output_refs": { "type": "object" },
+                "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
                 "stop_pattern_matched": { "type": ["string", "null"] },
                 "wait_timeout_ms": { "type": "integer", "minimum": 0 },
                 "affected_files": { "type": "array", "items": { "type": "object" } },

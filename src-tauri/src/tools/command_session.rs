@@ -10,6 +10,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::harness::model::BaselineEntry;
+use crate::tools::resource_budget::ExecutionLease;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use serde_json::{json, Value};
 
@@ -702,6 +703,20 @@ impl CommandSessionStore {
         Ok(arc)
     }
 
+    pub fn ensure_capacity(&self) -> Result<(), WorkspaceError> {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
+        let consumed = sessions
+            .values()
+            .filter(|session| session_consumes_slot(session, self.terminal_slot_retention))
+            .count();
+        if consumed >= self.max_sessions {
+            Err(self.capacity_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn get(&self, session_id: &str) -> Result<Arc<ExecSession>, WorkspaceError> {
         let mut sessions = self.sessions.lock().expect("sessions lock");
         prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
@@ -892,6 +907,8 @@ pub struct ExecSession {
     owner_scope: Option<String>,
     harness_finalized: AtomicBool,
     terminal_observed: AtomicBool,
+    resource_lease: Mutex<Option<ExecutionLease>>,
+    execution_resources: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -952,7 +969,7 @@ impl ExecSession {
     }
 
     pub fn new_with_details_and_encoding(
-        mut child: Child,
+        child: Child,
         interactive: bool,
         command: String,
         resolved_cwd: String,
@@ -960,10 +977,34 @@ impl ExecSession {
         owner_scope: Option<String>,
         output_encoding: StreamEncoding,
     ) -> Self {
+        Self::new_with_details_encoding_and_resources(
+            child,
+            interactive,
+            command,
+            resolved_cwd,
+            harness_metadata,
+            owner_scope,
+            output_encoding,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_details_encoding_and_resources(
+        mut child: Child,
+        interactive: bool,
+        command: String,
+        resolved_cwd: String,
+        harness_metadata: Option<SessionHarnessMetadata>,
+        owner_scope: Option<String>,
+        output_encoding: StreamEncoding,
+        resource_lease: Option<ExecutionLease>,
+    ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
         let started_at_iso = timestamp();
+        let execution_resources = resource_lease.as_ref().map(ExecutionLease::to_value);
         Self {
             session_id,
             child: AsyncMutex::new(child),
@@ -989,6 +1030,8 @@ impl ExecSession {
             owner_scope,
             harness_finalized: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(false),
+            resource_lease: Mutex::new(resource_lease),
+            execution_resources,
         }
     }
 
@@ -1127,6 +1170,10 @@ impl ExecSession {
         if reason.is_none() {
             *reason = Some("exited".into());
         }
+        self.resource_lease
+            .lock()
+            .expect("resource lease lock")
+            .take();
         self.touch();
     }
 
@@ -1254,7 +1301,8 @@ impl ExecSession {
             "output_refs": {
                 "stdout": format!("session:{}:stdout", self.session_id),
                 "stderr": format!("session:{}:stderr", self.session_id)
-            }
+            },
+            "execution_resources": self.execution_resources
         })
     }
 }
