@@ -1248,7 +1248,25 @@ fn aborted_worktree_task_releases_remove_guard_and_initial_conflict_is_logged() 
         caller,
     );
     assert_eq!(removed["ok"], true, "{removed}");
+    assert_eq!(removed["mutation_attributed"], true, "{removed}");
     assert!(!worktree_path.exists());
+    let cleanup_log = call_tool_for_session(
+        &ctx,
+        "operation_log",
+        &json!({
+            "task_id": task_id,
+            "tool": "git_worktree_remove",
+            "collapse": false,
+            "limit": 20
+        }),
+        caller,
+    );
+    assert_eq!(cleanup_log["ok"], true, "{cleanup_log}");
+    assert!(cleanup_log["operations"]
+        .as_array()
+        .is_some_and(|operations| operations
+            .iter()
+            .any(|operation| { operation["status"] == "completed" })));
 }
 
 #[test]

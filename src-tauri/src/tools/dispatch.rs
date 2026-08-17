@@ -81,6 +81,10 @@ fn task_recovery_trackable(tool: &str) -> bool {
             | "git_worktree_create"
             | "git_worktree_remove"
             | "git_worktree_prune"
+            | "git_merge"
+            | "git_branch_create"
+            | "git_branch_delete"
+            | "git_switch"
             | "stage_commit"
             | "wait_stage_commit"
     )
@@ -1264,6 +1268,11 @@ fn call_tool_impl(
     }
 
     let active_task = selected_task;
+    let worktree_target_task = if name == "git_worktree_remove" {
+        task_for_managed_worktree(ctx, &effective_args)
+    } else {
+        None
+    };
     let retained_session = if matches!(name, "write_stdin" | "kill_session" | "wait_command") {
         effective_args
             .get("session_id")
@@ -1272,7 +1281,20 @@ fn call_tool_impl(
     } else {
         None
     };
-    let task_id = if name == "remove_path" {
+    let task_id = if name == "git_worktree_remove" {
+        if let Some(task) = worktree_target_task.as_ref() {
+            let _ = ctx.harness.record_event(
+                &task.id,
+                "operation_started",
+                Some(name),
+                operation_input(args),
+                json!({"ok": true, "tracking": "managed_worktree_task"}),
+            );
+            Some(task.id.clone())
+        } else {
+            None
+        }
+    } else if name == "remove_path" {
         if let Some(task) = active_task.as_ref() {
             let _ = ctx.harness.record_event(
                 &task.id,
@@ -1314,7 +1336,9 @@ fn call_tool_impl(
         ctx.harness
             .record_operation(
                 None,
-                active_task.as_ref().map(|task| task.id.as_str()),
+                task_id
+                    .as_deref()
+                    .or_else(|| active_task.as_ref().map(|task| task.id.as_str())),
                 session_id,
                 name,
                 "started",
@@ -1384,6 +1408,13 @@ fn call_tool_impl(
                 git::git_worktree_remove(ws, &effective_args, ctx.policy.skip_permission_gates())
             }
             "git_worktree_prune" => git::git_worktree_prune(ws, &effective_args),
+            "git_merge" => git::git_merge(ws, &effective_args),
+            "git_branch_create" => git::git_branch_create(ws, &effective_args),
+            "git_branch_delete" => {
+                git::git_branch_delete(ws, &effective_args, ctx.policy.skip_permission_gates())
+            }
+            "git_is_ancestor" => git::git_is_ancestor(ws, &effective_args),
+            "git_switch" => git::git_switch(ws, &effective_args),
             "git_stage" => git::git_stage(ws, &effective_args),
             "git_commit" => git::git_commit(ws, &effective_args),
             "git_restore" => git::git_restore(ws, &effective_args),
@@ -1426,6 +1457,14 @@ fn call_tool_impl(
     // tools. Once a synchronous mutation returns, preserve its committed result
     // instead of reporting a false cancellation that could trigger a retry.
     output = preserve_completed_result(output, cancellation);
+    if name == "git_worktree_remove"
+        && task_id.is_some()
+        && output.get("ok").and_then(Value::as_bool) == Some(true)
+    {
+        if let Some(object) = output.as_object_mut() {
+            object.insert("mutation_attributed".into(), Value::Bool(true));
+        }
+    }
     if task_id.is_none()
         && standalone_operation(name)
         && output.get("ok") == Some(&Value::Bool(true))
@@ -1578,7 +1617,9 @@ fn call_tool_impl(
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
         let _ = ctx.harness.record_operation(
             Some(&operation.id),
-            active_task.as_ref().map(|task| task.id.as_str()),
+            task_id
+                .as_deref()
+                .or_else(|| active_task.as_ref().map(|task| task.id.as_str())),
             session_id,
             name,
             if succeeded { "completed" } else { "failed" },
@@ -1588,7 +1629,9 @@ fn call_tool_impl(
     } else if output.get("ok").and_then(Value::as_bool) == Some(false) {
         let _ = ctx.harness.record_operation(
             None,
-            active_task.as_ref().map(|task| task.id.as_str()),
+            task_id
+                .as_deref()
+                .or_else(|| active_task.as_ref().map(|task| task.id.as_str())),
             session_id,
             name,
             "failed",
@@ -1601,7 +1644,9 @@ fn call_tool_impl(
         name,
         &effective_args,
         &mut output,
-        active_task.as_ref().map(|task| task.id.as_str()),
+        task_id
+            .as_deref()
+            .or_else(|| active_task.as_ref().map(|task| task.id.as_str())),
     );
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
         output = attach_harness_status(ctx, output, task_id.is_none(), session_id);
@@ -1829,7 +1874,8 @@ fn resolve_task_for_call(
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
         "exec_command" | "stage_commit" | "wait_stage_commit" | "remove_path" | "git_stage"
-        | "git_commit" | "git_restore" | "git_reset" | "git_revert" | "git_clean" => true,
+        | "git_commit" | "git_restore" | "git_reset" | "git_revert" | "git_clean" | "git_merge"
+        | "git_branch_create" | "git_branch_delete" | "git_switch" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -1886,8 +1932,36 @@ fn should_log_operation(name: &str) -> bool {
     standalone_operation(name)
         || matches!(
             name,
-            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" | "session_checkpoint"
+            "git_status"
+                | "git_diff"
+                | "git_log"
+                | "git_show"
+                | "git_blame"
+                | "git_is_ancestor"
+                | "session_checkpoint"
         )
+}
+
+fn task_for_managed_worktree(
+    ctx: &ToolContext,
+    args: &Value,
+) -> Option<crate::harness::model::TaskSession> {
+    let raw_path = args.get("path")?.as_str()?;
+    let target = git::managed_worktree_path(&ctx.workspace, raw_path).ok()?;
+    ctx.harness.list_tasks().ok()?.into_iter().find(|task| {
+        let Some(worktree) = task
+            .git_worktree
+            .as_ref()
+            .filter(|worktree| worktree.managed)
+        else {
+            return false;
+        };
+        let candidate = Path::new(&worktree.path);
+        candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf())
+            == target
+    })
 }
 
 fn operation_input(args: &Value) -> Value {

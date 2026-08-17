@@ -266,6 +266,77 @@ fn git_facade_routes_to_existing_git_contracts() {
         invalid_stage["error"]["details"]["required_arguments"],
         json!(["paths"])
     );
+
+    let original_branch = status["branch"]
+        .as_str()
+        .expect("original branch")
+        .to_string();
+    let initial_head = status["head"].as_str().expect("initial head").to_string();
+    let created = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "branch_create", "name": "feature/structured-git"}),
+    );
+    let created = assert_ok(&created);
+    assert_eq!(created["branch"], "feature/structured-git");
+
+    let switched = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "switch", "target": "feature/structured-git"}),
+    );
+    let switched = assert_ok(&switched);
+    assert_eq!(switched["after_branch"], "feature/structured-git");
+
+    fs::write(workspace.join("feature.txt"), "structured git\n").expect("write feature");
+    assert_ok(&invoke(
+        &ctx,
+        "git",
+        json!({"operation": "stage", "paths": ["feature.txt"]}),
+    ));
+    let committed = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "commit", "message": "feature commit"}),
+    );
+    let committed = assert_ok(&committed);
+    let feature_head = committed["commit_sha"]
+        .as_str()
+        .expect("feature head")
+        .to_string();
+
+    let ancestry = invoke(
+        &ctx,
+        "git",
+        json!({
+            "operation": "is_ancestor",
+            "ancestor": initial_head,
+            "descendant": feature_head
+        }),
+    );
+    assert_eq!(assert_ok(&ancestry)["is_ancestor"], true);
+
+    assert_ok(&invoke(
+        &ctx,
+        "git",
+        json!({"operation": "switch", "target": original_branch}),
+    ));
+    let merged = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "merge", "ref": "feature/structured-git"}),
+    );
+    let merged = assert_ok(&merged);
+    assert_eq!(merged["after_head"], feature_head);
+    assert_eq!(merged["fast_forwarded"], true);
+
+    let deleted = invoke(
+        &ctx,
+        "git",
+        json!({"operation": "branch_delete", "name": "feature/structured-git"}),
+    );
+    let deleted = assert_ok(&deleted);
+    assert_eq!(deleted["deleted_head"], feature_head);
 }
 
 #[test]

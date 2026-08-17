@@ -51,6 +51,234 @@ pub fn git_worktree_list(ws: &Workspace, _args: &Value) -> Result<Value, Workspa
     })))
 }
 
+fn ensure_clean_git_worktree(ws: &Workspace, operation: &str) -> Result<(), WorkspaceError> {
+    let status = run_git(
+        ws.root(),
+        &["status", "--porcelain=v1"],
+        Duration::from_secs(10),
+    )?;
+    if !status.success {
+        return Err(git_error(&status.stderr));
+    }
+    if !status.stdout.trim().is_empty() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_NOT_CLEAN",
+            message: format!("{operation} requires a clean index and working tree."),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "suggestion": "Commit, restore, or clean the current changes before retrying."
+            }),
+        });
+    }
+    Ok(())
+}
+
+fn git_current_branch(cwd: &Path) -> Option<String> {
+    let completed = run_git(
+        cwd,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        Duration::from_secs(10),
+    )
+    .ok()?;
+    completed
+        .success
+        .then(|| completed.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn git_merge(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let reference = validate_git_ref(
+        args.get("ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceError::invalid_argument("ref is required"))?,
+    )?;
+    ensure_clean_git_worktree(ws, "git merge --ff-only")?;
+    let before_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let target_head =
+        git_rev_parse(ws.root(), &format!("{reference}^{{commit}}")).ok_or_else(|| {
+            WorkspaceError::invalid_argument(format!("Unknown commit revision: {reference}"))
+        })?;
+    let completed = run_git(
+        ws.root(),
+        &["merge", "--ff-only", reference],
+        Duration::from_secs(120),
+    )?;
+    if !completed.success {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_FAST_FORWARD_REQUIRED",
+            message: completed.stderr.trim().to_string(),
+            category: "conflict",
+            retryable: true,
+            details: json!({
+                "ref": reference,
+                "before_head": before_head,
+                "target_head": target_head,
+                "suggestion": "Resolve branch divergence explicitly before retrying the structured fast-forward merge."
+            }),
+        });
+    }
+    let after_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    Ok(tool_ok(json!({
+        "ref": reference,
+        "before_head": before_head,
+        "target_head": target_head,
+        "after_head": after_head,
+        "fast_forwarded": before_head != after_head,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_branch_create(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let name = validate_worktree_branch(
+        args.get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceError::invalid_argument("name is required"))?,
+    )?;
+    let start_point = validate_git_ref(
+        args.get("start_point")
+            .and_then(Value::as_str)
+            .unwrap_or("HEAD"),
+    )?;
+    let start_head =
+        git_rev_parse(ws.root(), &format!("{start_point}^{{commit}}")).ok_or_else(|| {
+            WorkspaceError::invalid_argument(format!("Unknown commit revision: {start_point}"))
+        })?;
+    let completed = run_git(
+        ws.root(),
+        &["branch", name, start_head.as_str()],
+        Duration::from_secs(30),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(tool_ok(json!({
+        "branch": name,
+        "start_point": start_point,
+        "head": start_head,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_branch_delete(
+    ws: &Workspace,
+    args: &Value,
+    dangerous_mode: bool,
+) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let name = validate_worktree_branch(
+        args.get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceError::invalid_argument("name is required"))?,
+    )?;
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    if force && !dangerous_mode {
+        return Err(WorkspaceError::ToolDetails {
+            code: "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE",
+            message: "Force-deleting a Git branch requires operator-enabled dangerous mode.".into(),
+            category: "permission",
+            retryable: false,
+            details: json!({
+                "branch": name,
+                "suggestion": "Retry without force, or enable dangerous mode in the trusted control plane."
+            }),
+        });
+    }
+    let head = git_rev_parse(ws.root(), &format!("refs/heads/{name}^{{commit}}"))
+        .ok_or_else(|| WorkspaceError::invalid_argument(format!("Unknown local branch: {name}")))?;
+    let flag = if force { "-D" } else { "-d" };
+    let completed = run_git(ws.root(), &["branch", flag, name], Duration::from_secs(30))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(tool_ok(json!({
+        "branch": name,
+        "deleted_head": head,
+        "force": force,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
+pub fn git_is_ancestor(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let ancestor = validate_git_ref(
+        args.get("ancestor")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceError::invalid_argument("ancestor is required"))?,
+    )?;
+    let descendant = validate_git_ref(
+        args.get("descendant")
+            .and_then(Value::as_str)
+            .unwrap_or("HEAD"),
+    )?;
+    let ancestor_head =
+        git_rev_parse(ws.root(), &format!("{ancestor}^{{commit}}")).ok_or_else(|| {
+            WorkspaceError::invalid_argument(format!("Unknown commit revision: {ancestor}"))
+        })?;
+    let descendant_head = git_rev_parse(ws.root(), &format!("{descendant}^{{commit}}"))
+        .ok_or_else(|| {
+            WorkspaceError::invalid_argument(format!("Unknown commit revision: {descendant}"))
+        })?;
+    let completed = run_git(
+        ws.root(),
+        &[
+            "merge-base",
+            "--is-ancestor",
+            ancestor_head.as_str(),
+            descendant_head.as_str(),
+        ],
+        Duration::from_secs(30),
+    )?;
+    if !completed.success && completed.exit_code != 1 {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(tool_ok(json!({
+        "ancestor": ancestor,
+        "descendant": descendant,
+        "ancestor_head": ancestor_head,
+        "descendant_head": descendant_head,
+        "is_ancestor": completed.success,
+        "warnings": []
+    })))
+}
+
+pub fn git_switch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let target = validate_worktree_branch(
+        args.get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceError::invalid_argument("target is required"))?,
+    )?;
+    ensure_clean_git_worktree(ws, "git switch")?;
+    let before_branch = git_current_branch(ws.root()).unwrap_or_default();
+    let before_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let target_head = git_rev_parse(ws.root(), &format!("refs/heads/{target}^{{commit}}"))
+        .ok_or_else(|| {
+            WorkspaceError::invalid_argument(format!("Unknown local branch: {target}"))
+        })?;
+    let completed = run_git(ws.root(), &["switch", target], Duration::from_secs(60))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let after_branch = git_current_branch(ws.root()).unwrap_or_default();
+    let after_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    Ok(tool_ok(json!({
+        "target": target,
+        "before_branch": before_branch,
+        "before_head": before_head,
+        "target_head": target_head,
+        "after_branch": after_branch,
+        "after_head": after_head,
+        "mutation_attributed": true,
+        "warnings": []
+    })))
+}
+
 pub fn git_worktree_create(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let branch = args.get("branch").and_then(Value::as_str);
     let base_ref = args
@@ -338,7 +566,10 @@ fn validate_worktree_branch(branch: &str) -> Result<&str, WorkspaceError> {
     Ok(branch)
 }
 
-fn managed_worktree_path(ws: &Workspace, raw_path: &str) -> Result<PathBuf, WorkspaceError> {
+pub(crate) fn managed_worktree_path(
+    ws: &Workspace,
+    raw_path: &str,
+) -> Result<PathBuf, WorkspaceError> {
     let managed_root = ws.root().join(MANAGED_WORKTREE_ROOT);
     let candidate = PathBuf::from(raw_path);
     let candidate = if candidate.is_absolute() {

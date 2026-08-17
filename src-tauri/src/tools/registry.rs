@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 39;
+pub const CATALOG_VERSION: u32 = 40;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -44,6 +44,11 @@ pub const GIT_OPERATIONS: &[(&str, &str)] = &[
     ("worktree_create", "git_worktree_create"),
     ("worktree_remove", "git_worktree_remove"),
     ("worktree_prune", "git_worktree_prune"),
+    ("merge", "git_merge"),
+    ("branch_create", "git_branch_create"),
+    ("branch_delete", "git_branch_delete"),
+    ("is_ancestor", "git_is_ancestor"),
+    ("switch", "git_switch"),
     ("stage", "git_stage"),
     ("commit", "git_commit"),
     ("restore", "git_restore"),
@@ -178,6 +183,46 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "session",
         "Session",
         "[anchor-core] Manage the current development Session through one domain tool. Use open once at conversation start; open never injects other Session history. Use list/get only when prior Session history is explicitly needed, checkpoint to persist current progress, and validate for explicit store integrity checks.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "git_merge",
+        "Git fast-forward merge",
+        "Fast-forward the current branch to an explicit Git ref without creating a merge commit.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "git_branch_create",
+        "Git branch create",
+        "Create one local branch at an explicit start point without switching the worktree.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "git_branch_delete",
+        "Git branch delete",
+        "Delete one local branch; force deletion requires operator-enabled dangerous mode.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "git_is_ancestor",
+        "Git ancestry check",
+        "Return whether one explicit commit-ish is an ancestor of another.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "git_switch",
+        "Git switch",
+        "Switch a clean worktree to an existing local branch without invoking a shell.",
         false,
         false,
         false,
@@ -697,7 +742,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "git",
         "Git",
-        "[anchor-core anchor-git] Inspect or mutate Git through one domain tool. Set operation to status, diff, log, show, blame, stage, commit, restore, reset, revert, clean, or a worktree_* operation; operation-specific arguments are validated against the existing Git contracts.",
+        "[anchor-core anchor-git] Inspect or mutate Git through one domain tool. Supports status, structured branch/switch/fast-forward merge/ancestry checks, diff/log/show/blame, stage/commit/restore/reset/revert/clean, and managed worktree operations.",
         false,
         true,
         false,
@@ -876,6 +921,11 @@ pub const CORE_TOOLS: &[&str] = &[
     "git",
     "git_status",
     "git_worktree_list",
+    "git_merge",
+    "git_branch_create",
+    "git_branch_delete",
+    "git_is_ancestor",
+    "git_switch",
     "git_stage",
     "git_commit",
     "git_restore",
@@ -914,6 +964,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "git",
     "git_status",
     "git_worktree_list",
+    "git_is_ancestor",
     "git_diff",
     "git_log",
     "git_show",
@@ -1976,7 +2027,7 @@ pub fn output_schema(name: &str) -> Value {
                 "managed": { "type": "boolean", "const": true },
                 "remove_on_close": { "type": "boolean" },
                 "created_at": { "type": "string", "minLength": 1 },
-                "mutation_attributed": { "type": "boolean", "const": false },
+                "mutation_attributed": { "type": "boolean" },
                 "warnings": warnings_property()
             }),
             &[
@@ -2019,6 +2070,98 @@ pub fn output_schema(name: &str) -> Value {
                 "pruned_count",
                 "remaining_count",
                 "details",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_merge" => success_output_schema(
+            json!({
+                "ref": { "type": "string" },
+                "before_head": { "type": "string" },
+                "target_head": { "type": "string" },
+                "after_head": { "type": "string" },
+                "fast_forwarded": { "type": "boolean" },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "ref",
+                "before_head",
+                "target_head",
+                "after_head",
+                "fast_forwarded",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_branch_create" => success_output_schema(
+            json!({
+                "branch": { "type": "string" },
+                "start_point": { "type": "string" },
+                "head": { "type": "string" },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "branch",
+                "start_point",
+                "head",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_branch_delete" => success_output_schema(
+            json!({
+                "branch": { "type": "string" },
+                "deleted_head": { "type": "string" },
+                "force": { "type": "boolean" },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "branch",
+                "deleted_head",
+                "force",
+                "mutation_attributed",
+                "warnings",
+            ],
+        ),
+        "git_is_ancestor" => success_output_schema(
+            json!({
+                "ancestor": { "type": "string" },
+                "descendant": { "type": "string" },
+                "ancestor_head": { "type": "string" },
+                "descendant_head": { "type": "string" },
+                "is_ancestor": { "type": "boolean" },
+                "warnings": warnings_property()
+            }),
+            &[
+                "ancestor",
+                "descendant",
+                "ancestor_head",
+                "descendant_head",
+                "is_ancestor",
+                "warnings",
+            ],
+        ),
+        "git_switch" => success_output_schema(
+            json!({
+                "target": { "type": "string" },
+                "before_branch": { "type": "string" },
+                "before_head": { "type": "string" },
+                "target_head": { "type": "string" },
+                "after_branch": { "type": "string" },
+                "after_head": { "type": "string" },
+                "mutation_attributed": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "target",
+                "before_branch",
+                "before_head",
+                "target_head",
+                "after_branch",
+                "after_head",
                 "mutation_attributed",
                 "warnings",
             ],
@@ -3584,6 +3727,49 @@ pub fn input_schema(name: &str) -> Value {
                 "force": { "type": "boolean", "default": false }
             },
             "required": ["path"],
+            "additionalProperties": false
+        }),
+        "git_merge" => json!({
+            "type": "object",
+            "properties": {
+                "ref": { "type": "string", "minLength": 1, "maxLength": 255 }
+            },
+            "required": ["ref"],
+            "additionalProperties": false
+        }),
+        "git_branch_create" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "start_point": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "git_branch_delete" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "force": { "type": "boolean", "default": false }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "git_is_ancestor" => json!({
+            "type": "object",
+            "properties": {
+                "ancestor": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "descendant": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" }
+            },
+            "required": ["ancestor"],
+            "additionalProperties": false
+        }),
+        "git_switch" => json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string", "minLength": 1, "maxLength": 255 }
+            },
+            "required": ["target"],
             "additionalProperties": false
         }),
         "git_stage" => json!({
