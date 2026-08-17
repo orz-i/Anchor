@@ -1151,6 +1151,7 @@ fn commit_staged_bytes_with_execution(
     execution: Option<&PatchExecution<'_>>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
+    let mut backup_permissions: HashMap<PathBuf, fs::Permissions> = HashMap::new();
     let mut temporary_files = HashMap::new();
     for (index, (rel, content)) in staged.iter().enumerate() {
         if let Some(execution) = execution {
@@ -1171,6 +1172,9 @@ fn commit_staged_bytes_with_execution(
                 None
             },
         );
+        if let Ok(metadata) = fs::metadata(&path) {
+            backup_permissions.insert(path.clone(), metadata.permissions());
+        }
         if let Some(bytes) = content {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|err| patch_failed(err.to_string()))?;
@@ -1182,7 +1186,7 @@ fn commit_staged_bytes_with_execution(
             ));
             if let Err(err) = fs::write(&temp, bytes) {
                 cleanup_temporary_files(temporary_files.values());
-                restore_backups(&backups);
+                restore_backups(&backups, &backup_permissions);
                 return Err(patch_failed(format!("Failed to stage file: {err}")));
             }
             temporary_files.insert(path.clone(), temp);
@@ -1190,7 +1194,7 @@ fn commit_staged_bytes_with_execution(
         if let Some(execution) = execution {
             if let Err(error) = execution.checkpoint(&format!("stage_file_{}", index + 1)) {
                 cleanup_temporary_files(temporary_files.values());
-                restore_backups(&backups);
+                restore_backups(&backups, &backup_permissions);
                 return Err(error);
             }
         }
@@ -1200,7 +1204,7 @@ fn commit_staged_bytes_with_execution(
         if let Some(execution) = execution {
             if let Err(error) = execution.checkpoint(&format!("commit_file_{}", index + 1)) {
                 cleanup_temporary_files(temporary_files.values());
-                restore_backups(&backups);
+                restore_backups(&backups, &backup_permissions);
                 return Err(error);
             }
         }
@@ -1216,7 +1220,12 @@ fn commit_staged_bytes_with_execution(
                 .cloned()
                 .ok_or_else(|| patch_failed("Staged file is missing"));
             match temp {
-                Ok(temp) => replace_file(&temp, &path),
+                Ok(temp) => replace_file(&temp, &path).and_then(|_| {
+                    if let Some(permissions) = backup_permissions.get(&path) {
+                        fs::set_permissions(&path, permissions.clone())?;
+                    }
+                    Ok(())
+                }),
                 Err(error) => Err(std::io::Error::other(error.to_string())),
             }
         } else if path.exists() && path.is_file() {
@@ -1226,13 +1235,13 @@ fn commit_staged_bytes_with_execution(
         };
         if let Err(err) = result {
             cleanup_temporary_files(temporary_files.values());
-            restore_backups(&backups);
+            restore_backups(&backups, &backup_permissions);
             return Err(patch_failed(format!("Failed to write file: {err}")));
         }
         if let Some(execution) = execution {
             if let Err(error) = execution.checkpoint(&format!("commit_file_{}", index + 1)) {
                 cleanup_temporary_files(temporary_files.values());
-                restore_backups(&backups);
+                restore_backups(&backups, &backup_permissions);
                 return Err(error);
             }
         }
@@ -1241,7 +1250,10 @@ fn commit_staged_bytes_with_execution(
     Ok(backups)
 }
 
-fn restore_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) {
+fn restore_backups(
+    backups: &HashMap<PathBuf, Option<Vec<u8>>>,
+    backup_permissions: &HashMap<PathBuf, fs::Permissions>,
+) {
     for (path, data) in backups {
         match data {
             None => {
@@ -1252,6 +1264,9 @@ fn restore_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) {
                     let _ = fs::create_dir_all(parent);
                 }
                 let _ = fs::write(path, bytes);
+                if let Some(permissions) = backup_permissions.get(path) {
+                    let _ = fs::set_permissions(path, permissions.clone());
+                }
             }
         }
     }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 40;
+pub const CATALOG_VERSION: u32 = 41;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -2428,6 +2428,9 @@ pub fn output_schema(name: &str) -> Value {
                 "observation_token": { "type": ["string", "null"] },
                 "capabilities": { "type": "object" },
                 "journal_health": { "type": "object" },
+                "current_operation": { "type": ["object", "null"] },
+                "running_command_count": { "type": "integer", "minimum": 0 },
+                "pending_terminal_command_count": { "type": "integer", "minimum": 0 },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
                 "reason": { "type": "string" },
                 "recoverable": { "type": "boolean" }
@@ -3583,6 +3586,12 @@ pub fn input_schema(name: &str) -> Value {
                 "executable": { "type": "string", "minLength": 1, "description": "Executable to run directly without shell parsing." },
                 "args": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 32768 }, "description": "Exact argument vector for executable or shell mode." },
                 "env": { "type": "object", "maxProperties": 128, "additionalProperties": { "type": "string", "maxLength": 131072 }, "description": "Environment variables applied only to this command." },
+                "toolchain_paths": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                    "description": "Workspace-relative toolchain directories to prepend to this child process PATH and use when resolving the requested executable. Parent traversal and paths resolving outside the workspace are rejected."
+                },
                 "shell": { "type": "string", "enum": ["direct", "pwsh", "powershell", "cmd"], "description": "Optional explicit Windows shell. Use direct with executable for shell-free execution." },
                 "workdir": { "type": "string", "default": "." },
                 "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 30000 },

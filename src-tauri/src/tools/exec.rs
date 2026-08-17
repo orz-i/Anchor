@@ -24,6 +24,115 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None, None)
 }
 
+fn apply_toolchain_path_overlay(
+    command: &mut Command,
+    toolchain_paths: &[PathBuf],
+) -> Result<(), WorkspaceError> {
+    if toolchain_paths.is_empty() {
+        return Ok(());
+    }
+    let configured_path = command.as_std().get_envs().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("PATH")
+            .then(|| value.map(std::ffi::OsStr::to_os_string))
+            .flatten()
+    });
+    let mut paths = toolchain_paths.to_vec();
+    if let Some(existing) = configured_path.or_else(|| std::env::var_os("PATH")) {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let joined = std::env::join_paths(paths).map_err(|error| WorkspaceError::Tool {
+        code: "TOOLCHAIN_PATH_INVALID",
+        message: format!("Unable to construct workspace-local toolchain PATH: {error}"),
+        category: "validation",
+        retryable: false,
+    })?;
+    command.env("PATH", joined);
+    Ok(())
+}
+
+fn validate_toolchain_paths(value: Option<&Value>) -> Result<(), WorkspaceError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let paths = value.as_array().ok_or_else(|| {
+        WorkspaceError::invalid_argument(
+            "toolchain_paths must be an array of workspace-relative directories",
+        )
+    })?;
+    if paths.len() > 16 {
+        return Err(WorkspaceError::invalid_argument(
+            "toolchain_paths accepts at most 16 directories",
+        ));
+    }
+    for value in paths {
+        let raw = value.as_str().ok_or_else(|| {
+            WorkspaceError::invalid_argument("toolchain_paths must contain only strings")
+        })?;
+        let path = Path::new(raw);
+        if raw.trim().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(WorkspaceError::invalid_argument(
+                "toolchain_paths entries must stay inside the workspace and cannot contain parent traversal",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_toolchain_paths(
+    execution: &Value,
+    workspace_root: &Path,
+) -> Result<Vec<PathBuf>, WorkspaceError> {
+    validate_toolchain_paths(execution.get("toolchain_paths"))?;
+    let Some(paths) = execution.get("toolchain_paths").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .map_err(|_| WorkspaceError::Tool {
+            code: "COMMAND_REJECTED",
+            message: "Workspace root is unavailable".into(),
+            category: "runtime",
+            retryable: true,
+        })?;
+    paths
+        .iter()
+        .map(|value| {
+            let raw = value.as_str().expect("toolchain path already validated");
+            let resolved =
+                workspace_root
+                    .join(raw)
+                    .canonicalize()
+                    .map_err(|_| WorkspaceError::Tool {
+                        code: "TOOLCHAIN_PATH_NOT_FOUND",
+                        message: format!("Workspace-local toolchain directory not found: {raw}"),
+                        category: "runtime",
+                        retryable: true,
+                    })?;
+            if !resolved.starts_with(&canonical_workspace) || !resolved.is_dir() {
+                return Err(WorkspaceError::Tool {
+                    code: "TOOLCHAIN_PATH_OUTSIDE_WORKSPACE",
+                    message: format!(
+                        "Toolchain directory must resolve inside the workspace: {raw}"
+                    ),
+                    category: "security",
+                    retryable: false,
+                });
+            }
+            Ok(resolved)
+        })
+        .collect()
+}
+
 pub(crate) fn apply_preferred_shell(
     args: &mut Value,
     policy: &crate::tools::policy::PolicySettings,
@@ -95,9 +204,10 @@ fn parse_and_resolve_execution(
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
 ) -> Result<(String, Vec<String>), WorkspaceError> {
+    let toolchain_paths = resolve_toolchain_paths(execution, workspace_root)?;
     let structured = execution.get("executable").is_some() || execution.get("shell").is_some();
     if !structured {
-        return parse_and_resolve(cmd, cwd, workspace_root, policy);
+        return parse_and_resolve(cmd, cwd, workspace_root, policy, &toolchain_paths);
     }
     let shell = execution
         .get("shell")
@@ -113,7 +223,7 @@ fn parse_and_resolve_execution(
         "cmd" => "cmd.exe",
         _ => return Err(WorkspaceError::invalid_argument("unsupported shell")),
     };
-    let program = resolve_program(raw_program, cwd, workspace_root, policy)?;
+    let program = resolve_program(raw_program, cwd, workspace_root, policy, &toolchain_paths)?;
     Ok((program, structured_args(execution.get("args"))?))
 }
 
@@ -156,6 +266,7 @@ pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), Workspace
     }
     if cmd.is_some() {
         validate_exec_env(object.get("env"))?;
+        validate_toolchain_paths(object.get("toolchain_paths"))?;
         return Ok(());
     }
 
@@ -197,6 +308,7 @@ pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), Workspace
     };
     let command_args = structured_args(object.get("args"))?;
     validate_exec_env(object.get("env"))?;
+    validate_toolchain_paths(object.get("toolchain_paths"))?;
     let mut tokens = Vec::with_capacity(command_args.len() + 1);
     tokens.push(program.to_string());
     tokens.extend(command_args);
@@ -786,6 +898,8 @@ async fn run_command(
         .env("PYTHONLEGACYWINDOWSSTDIO", "0");
     #[cfg(windows)]
     configure_windows_command_environment(&mut command, &program);
+    let toolchain_paths = resolve_toolchain_paths(execution, ctx.workspace.root())?;
+    apply_toolchain_path_overlay(&mut command, &toolchain_paths)?;
 
     let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
         code: "COMMAND_SPAWN_FAILED",
@@ -1203,6 +1317,7 @@ fn parse_and_resolve(
     cwd: &Path,
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
+    toolchain_paths: &[PathBuf],
 ) -> Result<(String, Vec<String>), WorkspaceError> {
     let parts =
         crate::tools::policy::split_command_line(cmd).map_err(WorkspaceError::invalid_argument)?;
@@ -1210,7 +1325,7 @@ fn parse_and_resolve(
         return Err(WorkspaceError::invalid_argument("Empty command"));
     }
 
-    let program = resolve_program(&parts[0], cwd, workspace_root, policy)?;
+    let program = resolve_program(&parts[0], cwd, workspace_root, policy, toolchain_paths)?;
     Ok((program, parts[1..].to_vec()))
 }
 
@@ -1219,6 +1334,7 @@ fn resolve_program(
     cwd: &Path,
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
+    toolchain_paths: &[PathBuf],
 ) -> Result<String, WorkspaceError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1280,6 +1396,30 @@ fn resolve_program(
             category: "runtime",
             retryable: false,
         });
+    }
+
+    if !toolchain_paths.is_empty() {
+        if !policy.workspace_local_entries {
+            return Err(WorkspaceError::Tool {
+                code: "COMMAND_REJECTED",
+                message: "Workspace-local toolchain entries are disabled by policy".into(),
+                category: "policy",
+                retryable: false,
+            });
+        }
+        for directory in toolchain_paths {
+            let candidate = directory.join(trimmed);
+            if candidate.is_file() {
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+            #[cfg(windows)]
+            for extension in ["exe", "cmd", "bat", "ps1"] {
+                let candidate = directory.join(format!("{trimmed}.{extension}"));
+                if candidate.is_file() {
+                    return Ok(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
     }
 
     which::which(trimmed)

@@ -44,6 +44,140 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn task_status_surfaces_running_command_heartbeat() {
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.tool_profile = "advanced".into();
+    let started = invoke(
+        &ctx,
+        "task",
+        json!({"operation": "start", "objective": "heartbeat regression"}),
+    );
+    let task_id = assert_ok(&started)["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let command = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-u", "-c", "import time; print('started', flush=True); time.sleep(0.4)"],
+            "yield_time_ms": 0,
+            "timeout_ms": 10_000,
+            "verification_level": "diagnostic"
+        }),
+    );
+    let command = assert_ok(&command);
+    assert_eq!(command["execution_status"], "running");
+
+    let status = invoke(
+        &ctx,
+        "task",
+        json!({"operation": "status", "task_id": task_id}),
+    );
+    let status = assert_ok(&status);
+    assert_eq!(status["running_command_count"], 1);
+    assert_eq!(status["current_operation"]["kind"], "command");
+    assert_eq!(
+        status["current_operation"]["session_id"],
+        command["session_id"]
+    );
+    assert_eq!(
+        status["current_operation"]["next_milestone"],
+        "terminal_command_result"
+    );
+
+    let waited = invoke(
+        &ctx,
+        "wait_command",
+        json!({"session_id": command["session_id"], "timeout_ms": 2_000}),
+    );
+    assert_ok(&waited);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_command_uses_workspace_local_toolchain_path_for_resolution_and_children() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = tiny_js_fixture();
+    let bin = fx.root.join(".cache/bin");
+    fs::create_dir_all(&bin).expect("toolchain bin");
+    let fake_make = bin.join("make");
+    let fake_lint = bin.join("golangci-lint");
+    fs::write(&fake_make, "#!/bin/sh\nexec golangci-lint\n").expect("fake make");
+    fs::write(
+        &fake_lint,
+        "#!/bin/sh\nprintf 'workspace-toolchain-ok\\n'\n",
+    )
+    .expect("fake lint");
+    fs::set_permissions(&fake_make, fs::Permissions::from_mode(0o755)).expect("chmod make");
+    fs::set_permissions(&fake_lint, fs::Permissions::from_mode(0o755)).expect("chmod lint");
+    let ctx = ctx_for(&fx.root);
+
+    let executed = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": "make",
+            "toolchain_paths": [".cache/bin"],
+            "yield_time_ms": 10_000,
+            "timeout_ms": 10_000,
+            "cost_intent": "local_only",
+            "network_mode": "disabled"
+        }),
+    );
+    let executed = assert_ok(&executed);
+    assert_eq!(executed["execution_status"], "succeeded");
+    assert!(executed["stdout"]
+        .as_str()
+        .is_some_and(|output| output.contains("workspace-toolchain-ok")));
+
+    let escaped = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": "make",
+            "toolchain_paths": ["../outside"]
+        }),
+    );
+    assert_err(&escaped);
+    assert_eq!(escaped["execution_started"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_patch_preserves_existing_executable_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = tiny_js_fixture();
+    let script = fx.root.join("tool.sh");
+    fs::write(&script, "#!/bin/sh\necho before\n").expect("write executable fixture");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod fixture");
+    let ctx = ctx_for(&fx.root);
+
+    let patched = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "patch": "--- a/tool.sh\n+++ b/tool.sh\n@@\n #!/bin/sh\n-echo before\n+echo after\n"
+        }),
+    );
+    assert_ok(&patched);
+    let mode = fs::metadata(&script)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_ne!(mode & 0o111, 0, "executable bits must be preserved");
+    assert_eq!(
+        fs::read_to_string(&script).unwrap(),
+        "#!/bin/sh\necho after\n"
+    );
+}
+
+#[test]
 fn diagnostic_command_failure_does_not_open_task_recovery() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

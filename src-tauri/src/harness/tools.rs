@@ -1508,12 +1508,44 @@ fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
 
 fn harness_status(ctx: &ToolContext, session_id: Option<&str>) -> Result<Value, WorkspaceError> {
     let selected = ctx.task_for_session(session_id);
-    serde_json::to_value(
+    let selected_task_id = selected.as_ref().map(|task| task.id.clone());
+    let mut value = serde_json::to_value(
         ctx.harness
             .status_for_task(selected.as_ref().map(|task| task.id.as_str()))
             .map_err(map_error)?,
     )
-    .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
+    .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))?;
+    if let Some(object) = value.as_object_mut() {
+        let (running, pending_terminal) = selected_task_id
+            .as_deref()
+            .map(|task_id| ctx.sessions.pending_for_task(task_id, 512))
+            .unwrap_or_default();
+        let current_operation = running.first().map(compact_command_heartbeat);
+        object.insert(
+            "current_operation".into(),
+            current_operation.unwrap_or(Value::Null),
+        );
+        object.insert("running_command_count".into(), json!(running.len()));
+        object.insert(
+            "pending_terminal_command_count".into(),
+            json!(pending_terminal.len()),
+        );
+    }
+    Ok(value)
+}
+
+fn compact_command_heartbeat(snapshot: &Value) -> Value {
+    json!({
+        "kind": "command",
+        "session_id": snapshot.get("session_id").cloned().unwrap_or(Value::Null),
+        "command": snapshot.get("command").cloned().unwrap_or(Value::Null),
+        "execution_status": snapshot.get("execution_status").cloned().unwrap_or_else(|| json!("running")),
+        "started_at": snapshot.get("started_at").cloned().unwrap_or(Value::Null),
+        "elapsed_ms": snapshot.get("execution_duration_ms").or_else(|| snapshot.get("elapsed_ms")).cloned().unwrap_or(Value::Null),
+        "last_output_at": snapshot.get("last_output_at").cloned().unwrap_or(Value::Null),
+        "waiting_reason": "command_running",
+        "next_milestone": "terminal_command_result"
+    })
 }
 
 fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {

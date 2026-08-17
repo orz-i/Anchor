@@ -37,6 +37,7 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "cargo",
     "rustup",
     "go",
+    "golangci-lint",
     "ruff",
     "rg",
     "ripgrep",
