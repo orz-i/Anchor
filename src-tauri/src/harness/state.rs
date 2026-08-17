@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -702,6 +702,8 @@ impl Harness {
         exit_code: Option<i32>,
         passed: bool,
         duration_ms: Option<u64>,
+        terminal_at: Option<&str>,
+        output_refs: Option<Value>,
         change_id: Option<&str>,
         level: &str,
         supersede_previous_failures: bool,
@@ -753,6 +755,8 @@ impl Harness {
                     exit_code,
                     passed,
                     duration_ms,
+                    terminal_at: terminal_at.map(str::to_string),
+                    output_refs,
                     change_id: change_id.map(str::to_string),
                     dispositions: Vec::new(),
                     supersedes,
@@ -3094,6 +3098,8 @@ mod tests {
                 false,
                 Some(10),
                 None,
+                None,
+                None,
                 "diagnostic",
                 true,
             )
@@ -3119,6 +3125,8 @@ mod tests {
                 false,
                 Some(20),
                 None,
+                None,
+                None,
                 "blocking",
                 true,
             )
@@ -3134,6 +3142,8 @@ mod tests {
                 Some(0),
                 true,
                 Some(30),
+                None,
+                None,
                 None,
                 "blocking",
                 true,
@@ -3179,6 +3189,8 @@ mod tests {
                 false,
                 Some(20),
                 None,
+                None,
+                None,
                 "blocking",
                 true,
             )
@@ -3194,6 +3206,8 @@ mod tests {
                 Some(0),
                 true,
                 Some(30),
+                None,
+                None,
                 None,
                 "blocking",
                 true,

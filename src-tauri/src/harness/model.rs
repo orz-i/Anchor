@@ -658,6 +658,10 @@ pub struct VerificationRecord {
     pub passed: bool,
     #[serde(default)]
     pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub terminal_at: Option<String>,
+    #[serde(default)]
+    pub output_refs: Option<Value>,
     pub change_id: Option<String>,
     #[serde(default)]
     pub dispositions: Vec<VerificationDispositionRecord>,

@@ -397,7 +397,13 @@ fn execute_new_workflow(
                     .and_then(Value::as_i64)
                     .and_then(|value| i32::try_from(value).ok()),
                 passed,
-                result.get("duration_ms").and_then(Value::as_u64),
+                result
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .or_else(|| result.get("execution_duration_ms").and_then(Value::as_u64))
+                    .or_else(|| result.get("elapsed_ms").and_then(Value::as_u64)),
+                result.get("finished_at").and_then(Value::as_str),
+                result.get("output_refs").cloned(),
                 None,
                 "blocking",
                 true,
@@ -910,8 +916,11 @@ fn persist_deferred_check_result(
             passed,
             result
                 .get("duration_ms")
+                .or_else(|| result.get("execution_duration_ms"))
                 .or_else(|| result.get("elapsed_ms"))
                 .and_then(Value::as_u64),
+            result.get("finished_at").and_then(Value::as_str),
+            result.get("output_refs").cloned(),
             None,
             "blocking",
             true,

@@ -4094,8 +4094,9 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
     fs::write(workspace.join("README.md"), "contract\n").expect("写入文件");
-    let ctx =
+    let mut ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    ctx.tool_profile = "advanced".into();
     let started = call_tool(
         &ctx,
         "begin_work_session",
@@ -4238,16 +4239,51 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
         }),
     );
     assert_eq!(final_lint["command_ok"], true);
+    let verification_detail = call_tool(
+        &ctx,
+        "task_gate_status",
+        &json!({"task_id": task_id, "detail": "full"}),
+    );
+    let final_lint_record = verification_detail["verification"]
+        .as_array()
+        .expect("verification list")
+        .iter()
+        .find(|record| record["verification_key"] == "final-lint")
+        .expect("final lint verification");
+    assert!(final_lint_record["duration_ms"].is_number());
+    assert!(final_lint_record["terminal_at"].is_string());
+    assert!(final_lint_record["output_refs"].is_object());
+
+    let compact_events = call_tool(
+        &ctx,
+        "task",
+        &json!({"operation": "events", "task_id": task_id}),
+    );
+    assert_eq!(compact_events["ok"], true, "{compact_events}");
+    assert_eq!(compact_events["detail"], "compact", "{compact_events}");
+    assert!(compact_events["events"]
+        .as_array()
+        .is_some_and(|events| !events.is_empty()));
+    assert!(compact_events["events"][0]["affected_file_count"].is_number());
+    assert!(compact_events["events"][0].get("affected_files").is_none());
+    let full_events = call_tool(
+        &ctx,
+        "task",
+        &json!({"operation": "events", "task_id": task_id, "detail": "full"}),
+    );
+    assert_eq!(full_events["ok"], true, "{full_events}");
+    assert_eq!(full_events["detail"], "full", "{full_events}");
+    assert!(full_events["events"][0]["affected_files"].is_array());
+
     let updated = call_tool(
         &ctx,
         "update_task",
         &json!({
             "task_id": task_id,
-            "pending_steps": [],
-            "phase": "ready_to_close"
+            "pending_steps": []
         }),
     );
-    assert_eq!(updated["task"]["phase"], "ready_to_close");
+    assert_eq!(updated["task"]["phase"], "verifying");
 
     let direct_finish = call_tool(&ctx, "finish_task", &json!({"task_id": task_id}));
     assert_eq!(direct_finish["ok"], false);
@@ -4282,9 +4318,20 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
         }),
     );
     assert_eq!(closed["ok"], true);
+    assert_eq!(closed["detail"], "compact");
     assert_eq!(closed["work_session"]["closed"], true);
     assert_eq!(closed["work_session"]["status"], "completed");
     assert_eq!(closed["task"]["phase"], "completed");
+    assert_eq!(
+        closed["finish"]["reconciled_phases"],
+        json!(["cleanup", "ready_to_close"])
+    );
+    assert!(
+        serde_json::to_vec(&closed)
+            .expect("serialize compact close")
+            .len()
+            < 12_000
+    );
 
     let completed_gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task_id}));
     assert_eq!(completed_gate["ok"], true);

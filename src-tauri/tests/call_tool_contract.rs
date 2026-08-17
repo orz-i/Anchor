@@ -41,6 +41,14 @@ fn server_info_returns_workspace_and_tools() {
         payload["running_catalog_digest"],
         payload["current_catalog_digest"]
     );
+    assert_eq!(
+        payload["command_cost_policy"]["workspace_policy_path"],
+        Value::Null
+    );
+    assert_eq!(
+        payload["command_cost_policy"]["policy_identifier"],
+        "trusted_runtime_config"
+    );
 }
 
 #[test]
@@ -549,7 +557,11 @@ fn facade_filters_public_arguments_that_belong_to_other_operations() {
         json!({"operation": "events", "task_id": task_id, "detail": "full"}),
     );
     let events = assert_ok(&events);
-    assert_eq!(events["ignored_arguments"], json!(["detail"]));
+    assert_eq!(events["detail"], "full");
+    assert!(events.get("ignored_arguments").is_none());
+    assert!(events["events"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty()));
 }
 
 #[test]

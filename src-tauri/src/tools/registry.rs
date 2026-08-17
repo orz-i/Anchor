@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 41;
+pub const CATALOG_VERSION: u32 = 42;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -2492,6 +2492,7 @@ pub fn output_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "ok": { "type": "boolean" },
+                "detail": { "type": "string", "enum": ["compact", "full"] },
                 "closed": { "type": "boolean" },
                 "phase": { "type": "string" },
                 "retryable": { "type": "boolean" },
@@ -3290,7 +3291,8 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "task_id": { "type": "string", "minLength": 1 },
                 "summary": { "type": "string", "maxLength": 8000 },
-                "checkpoint": { "type": "object", "additionalProperties": true }
+                "checkpoint": { "type": "object", "additionalProperties": true },
+                "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
             },
             "required": ["task_id"],
             "additionalProperties": false
@@ -3462,7 +3464,8 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "task_id": { "type": "string", "minLength": 1 },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+                "detail": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
             },
             "required": ["task_id"],
             "additionalProperties": false

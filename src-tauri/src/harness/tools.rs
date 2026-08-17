@@ -191,19 +191,23 @@ fn cleanup_closed_task_worktree(
     let Some(worktree) = task.git_worktree.as_ref() else {
         return Ok(json!({"requested": false, "removed": false}));
     };
+    let worktree_exists = Path::new(&worktree.path).exists();
     if !worktree.remove_on_close {
         return Ok(json!({
             "requested": false,
-            "removed": false,
+            "removed": !worktree_exists,
+            "already_absent": !worktree_exists,
+            "preserved": worktree_exists,
             "path": worktree.path,
             "branch": worktree.branch
         }));
     }
-    if !Path::new(&worktree.path).exists() {
+    if !worktree_exists {
         return Ok(json!({
             "requested": true,
             "removed": true,
             "idempotent": true,
+            "already_absent": true,
             "path": worktree.path,
             "branch": worktree.branch
         }));
@@ -1066,6 +1070,10 @@ fn compact_session_view(session: &Value) -> Value {
 
 fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
     if let Some(mut outbox) = ctx.harness.load_close_outbox(task_id).map_err(map_error)? {
         if parse_close_outcome(&outbox.finish_args)? == "incomplete" {
             return Err(tool_error(
@@ -1097,14 +1105,86 @@ fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Works
             outbox.updated_at = harness_timestamp();
             ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
         }
-        return resume_close_outbox(ctx, outbox, true);
+        return resume_close_outbox(ctx, outbox, true)
+            .map(|value| present_complete_work_session(value, detail));
     }
     let mut strict = args.clone();
     strict["allow_unverified"] = Value::Bool(false);
     strict["session_status"] = Value::String("completed".into());
     strict["outcome"] = Value::String("completed".into());
     strict["_completion_via_work_session"] = Value::Bool(true);
-    close_work_session(ctx, &strict)
+    close_work_session(ctx, &strict).map(|value| present_complete_work_session(value, detail))
+}
+
+fn present_complete_work_session(value: Value, detail: &str) -> Value {
+    if detail == "full" || value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return value;
+    }
+    json!({
+        "ok": true,
+        "detail": "compact",
+        "work_session": value.get("work_session").cloned().unwrap_or(Value::Null),
+        "finish": value.get("finish").map(compact_finish_value).unwrap_or(Value::Null),
+        "checkpoint": value.get("checkpoint").cloned().unwrap_or(Value::Null),
+        "worktree_cleanup": value.get("worktree_cleanup").cloned().unwrap_or(Value::Null),
+        "outbox": value.get("outbox").cloned().unwrap_or(Value::Null),
+        "task": value.get("task").map(compact_task_value).unwrap_or(Value::Null),
+        "harness": value.get("harness").map(compact_harness_value).unwrap_or(Value::Null)
+    })
+}
+
+fn compact_finish_value(value: &Value) -> Value {
+    let completion_gate = value.get("completion_gate").map(|gate| {
+        json!({
+            "ready": gate.get("ready").cloned().unwrap_or(Value::Null),
+            "missing_count": gate.get("missing").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            "next_actions": gate.get("next_actions").cloned().unwrap_or_else(|| json!([]))
+        })
+    });
+    json!({
+        "ok": value.get("ok").cloned().unwrap_or(Value::Bool(true)),
+        "closed": value.get("closed").cloned().unwrap_or(Value::Bool(false)),
+        "task_status": value.get("task_status").cloned().unwrap_or(Value::Null),
+        "verification_status": value.get("verification_status").cloned().unwrap_or(Value::Null),
+        "session_status": value.get("session_status").cloned().unwrap_or(Value::Null),
+        "requested_session_status": value.get("requested_session_status").cloned().unwrap_or(Value::Null),
+        "reconciled_phases": value.get("reconciled_phases").cloned().unwrap_or_else(|| json!([])),
+        "completion_gate": completion_gate.unwrap_or(Value::Null),
+        "worktree_cleanup": value.get("worktree_cleanup").cloned().unwrap_or(Value::Null),
+        "truncated": value.get("truncated").cloned().unwrap_or(Value::Bool(false)),
+        "details_tool": value.get("details_tool").cloned().unwrap_or_else(|| json!({"name": "change_summary"}))
+    })
+}
+
+fn compact_task_value(value: &Value) -> Value {
+    json!({
+        "id": value.get("id").cloned().unwrap_or(Value::Null),
+        "status": value.get("status").cloned().unwrap_or(Value::Null),
+        "phase": value.get("phase").cloned().unwrap_or(Value::Null),
+        "session_id": value.get("session_id").cloned().unwrap_or(Value::Null),
+        "workspace_mode": value.get("workspace_mode").cloned().unwrap_or(Value::Null),
+        "current_slice_id": value.get("current_slice_id").cloned().unwrap_or(Value::Null),
+        "latest_change_id": value.get("latest_change_id").cloned().unwrap_or(Value::Null),
+        "latest_verification_id": value.get("latest_verification_id").cloned().unwrap_or(Value::Null),
+        "pending_step_count": value.get("pending_steps").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+        "slice_count": value.get("slices").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+        "recovery_status": value.pointer("/recovery/status").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn compact_harness_value(value: &Value) -> Value {
+    json!({
+        "workspace_id": value.get("workspace_id").cloned().unwrap_or(Value::Null),
+        "task_id": value.get("task_id").cloned().unwrap_or(Value::Null),
+        "task_state": value.get("task_state").cloned().unwrap_or(Value::Null),
+        "session_status": value.get("session_status").cloned().unwrap_or(Value::Null),
+        "active_task_count": value.get("active_task_count").cloned().unwrap_or(Value::Null),
+        "branch": value.get("branch").cloned().unwrap_or(Value::Null),
+        "head": value.get("head").cloned().unwrap_or(Value::Null),
+        "next_actions": value.get("next_actions").cloned().unwrap_or_else(|| json!([])),
+        "reason": value.get("reason").cloned().unwrap_or(Value::Null),
+        "recoverable": value.get("recoverable").cloned().unwrap_or(Value::Null)
+    })
 }
 
 fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -2681,8 +2761,15 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .get("_completion_via_work_session")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
     let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let (task_before, reconciled_phases) = reconcile_completion_phase(
+        ctx,
+        task_before,
+        &verifications,
+        allow_unverified,
+        completion_via_work_session,
+    )?;
     let verification_status = verification_status(&verifications);
     let completion_gate = completion_gate_value(
         ctx,
@@ -2761,6 +2848,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "closed": false,
             "session_status": "active",
             "next_stage_started": false,
+            "reconciled_phases": reconciled_phases,
             "reason": reason,
             "error": {
                 "code": code,
@@ -2810,6 +2898,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         "session_status": workspace_session_status,
         "requested_session_status": session_status,
         "next_stage_started": false,
+        "reconciled_phases": reconciled_phases,
         "completion_gate": completion_gate,
         "task": task_view(&task),
         "worktree_cleanup": worktree_cleanup,
@@ -2823,6 +2912,69 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     });
     bound_finish_response(&mut response);
     Ok(response)
+}
+
+fn reconcile_completion_phase(
+    ctx: &ToolContext,
+    mut task: TaskSession,
+    verifications: &[VerificationRecord],
+    allow_unverified: bool,
+    completion_via_work_session: bool,
+) -> Result<(TaskSession, Vec<String>), WorkspaceError> {
+    if !completion_via_work_session
+        || !task.contract.completion_policy.require_ready_to_close
+        || task.phase == TaskPhase::ReadyToClose
+        || !task.status.is_writable()
+    {
+        return Ok((task, Vec::new()));
+    }
+    let gate = completion_gate_value(
+        ctx,
+        &task,
+        verifications,
+        allow_unverified,
+        completion_via_work_session,
+    );
+    let only_phase_missing = gate["missing"].as_array().is_some_and(|missing| {
+        !missing.is_empty()
+            && missing.iter().all(|item| {
+                item.get("code").and_then(Value::as_str) == Some("ready_to_close_phase_missing")
+            })
+    });
+    if !only_phase_missing {
+        return Ok((task, Vec::new()));
+    }
+    let phases = match task.phase {
+        TaskPhase::Unspecified | TaskPhase::Planning | TaskPhase::Implementing => vec![
+            TaskPhase::Verifying,
+            TaskPhase::Cleanup,
+            TaskPhase::ReadyToClose,
+        ],
+        TaskPhase::Deploying => vec![
+            TaskPhase::Verifying,
+            TaskPhase::Cleanup,
+            TaskPhase::ReadyToClose,
+        ],
+        TaskPhase::BrowserReview => vec![TaskPhase::Cleanup, TaskPhase::ReadyToClose],
+        TaskPhase::Verifying => vec![TaskPhase::Cleanup, TaskPhase::ReadyToClose],
+        TaskPhase::Cleanup => vec![TaskPhase::ReadyToClose],
+        TaskPhase::ReadyToClose
+        | TaskPhase::Completed
+        | TaskPhase::Aborted
+        | TaskPhase::Blocked
+        | TaskPhase::Paused => Vec::new(),
+    };
+    let mut reconciled = Vec::new();
+    for phase in phases {
+        task = ctx
+            .harness
+            .configure_task(&task.id, Some(phase), None, None, None)
+            .map_err(map_error)?;
+        if let Ok(Value::String(label)) = serde_json::to_value(phase) {
+            reconciled.push(label);
+        }
+    }
+    Ok((task, reconciled))
 }
 
 fn task_context(
@@ -2881,6 +3033,10 @@ fn task_context(
 
 fn list_task_events(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
     let offset = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
     let limit = args
         .get("limit")
@@ -2891,7 +3047,20 @@ fn list_task_events(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .harness
         .list_events(task_id, offset, limit)
         .map_err(map_error)?;
-    Ok(json!({"events": events, "next_cursor": offset + events.len()}))
+    let event_count = events.len();
+    let events = if detail == "full" {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+            .collect::<Vec<_>>()
+    } else {
+        events.iter().map(compact_event).collect::<Vec<_>>()
+    };
+    Ok(json!({
+        "events": events,
+        "detail": detail,
+        "next_cursor": offset + event_count
+    }))
 }
 
 fn change_summary(
@@ -3303,6 +3472,8 @@ fn verification_view(record: &VerificationRecord) -> Value {
         "exit_code": record.exit_code,
         "command": bounded_text(&record.command, 4_000),
         "duration_ms": record.duration_ms,
+        "terminal_at": record.terminal_at,
+        "output_refs": record.output_refs,
         "change_id": record.change_id,
         "supersedes": record.supersedes,
         "created_at": record.created_at
@@ -3328,6 +3499,7 @@ fn compact_event(event: &HarnessEvent) -> Value {
         "kind": event.kind,
         "tool_name": event.tool_name,
         "created_at": event.created_at,
+        "affected_file_count": event.affected_files.len(),
         "result": {
             "ok": event.result_summary.get("ok"),
             "status": event.result_summary.get("status"),

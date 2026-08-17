@@ -240,9 +240,15 @@ fn track_task_recovery(
             .and_then(Value::as_array)
             .is_some_and(|files| !files.is_empty());
     let execution_started = output.get("execution_started").and_then(Value::as_bool);
-    if !workspace_mutated && execution_started == Some(false) {
+    let explicit_recovery_request = args.get("recovery_key").and_then(Value::as_str).is_some()
+        || args
+            .get("idempotency_key")
+            .and_then(Value::as_str)
+            .is_some();
+    if !workspace_mutated && execution_started == Some(false) && !explicit_recovery_request {
         // No child process and no workspace mutation means there is nothing durable
-        // to recover, even when the caller supplied a retry/verification identity.
+        // to recover by default. A caller-provided recovery/idempotency identity is
+        // an explicit request to keep this logical step recoverable across correction.
         return;
     }
     if matches!(
@@ -663,7 +669,13 @@ fn record_verification_from_output(
             }
         }
     }
-    let duration_ms = output.get("duration_ms").and_then(Value::as_u64);
+    let duration_ms = output
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| output.get("execution_duration_ms").and_then(Value::as_u64))
+        .or_else(|| output.get("elapsed_ms").and_then(Value::as_u64));
+    let terminal_at = output.get("finished_at").and_then(Value::as_str);
+    let output_refs = output.get("output_refs").cloned();
     if let Ok(verification) = ctx.harness.record_verification(
         task_id,
         identity.kind,
@@ -674,6 +686,8 @@ fn record_verification_from_output(
         exit_code,
         passed,
         duration_ms,
+        terminal_at,
+        output_refs,
         None,
         identity.level,
         supersede_previous_failures,
@@ -2068,7 +2082,8 @@ fn server_info_for_session(
         "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
         "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
         "external_paid_max_duration_seconds": ctx.policy.external_paid_max_duration_seconds,
-        "workspace_policy_path": ".anchor/command-policy.yml",
+        "workspace_policy_path": null,
+        "policy_identifier": "trusted_runtime_config",
         "approval_source": "trusted_runtime_config"
     });
     let build_identity = json!({
