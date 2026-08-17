@@ -15,7 +15,10 @@ use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
-const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::from_secs(60);
+// Once a terminal result has been explicitly consumed it must stop counting
+// against command concurrency immediately. The session can still remain in
+// the store for terminal_log_retention so output refs stay readable.
+const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::ZERO;
 const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
 
 pub struct CommandSessionStore {

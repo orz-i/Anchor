@@ -920,6 +920,58 @@ fn list_command_sessions_separates_execution_duration_from_retention_age() {
 }
 
 #[test]
+fn consumed_terminal_sessions_do_not_exhaust_the_sixty_four_session_limit() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let caller_session = "terminal-capacity-regression";
+
+    for index in 0..70 {
+        let started = call_tool_for_session(
+            &ctx,
+            "exec_command",
+            &json!({
+                "executable": TEST_PYTHON,
+                "args": [
+                    "-u",
+                    "-c",
+                    format!("import time; time.sleep(0.01); print('done-{index}', flush=True)")
+                ],
+                "yield_time_ms": 0,
+                "timeout_ms": 5_000,
+                "verification_level": "diagnostic"
+            }),
+            caller_session,
+        );
+        let started = assert_ok(&started);
+        assert_eq!(started["execution_status"], "running", "iteration {index}");
+        let command_session = started["session_id"]
+            .as_str()
+            .expect("retained command session");
+
+        let waited = call_tool_for_session(
+            &ctx,
+            "wait_command",
+            &json!({"session_id": command_session, "timeout_ms": 5_000}),
+            caller_session,
+        );
+        let waited = assert_ok(&waited);
+        assert_eq!(waited["execution_status"], "succeeded", "iteration {index}");
+        assert_eq!(waited["result_observed"], true, "iteration {index}");
+    }
+
+    let retained = call_tool_for_session(
+        &ctx,
+        "list_command_sessions",
+        &json!({"include_terminal": true, "max_output_bytes": 0}),
+        caller_session,
+    );
+    let retained = assert_ok(&retained);
+    assert_eq!(retained["pending_result_count"], 0);
+    assert_eq!(retained["requires_followup"], false);
+    assert!(retained["session_count"].as_u64().unwrap_or(0) >= 64);
+}
+
+#[test]
 fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
