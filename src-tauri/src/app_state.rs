@@ -2,11 +2,9 @@ use std::sync::Mutex;
 
 use crate::data::DataStore;
 use crate::error::AppResult;
-use crate::runtime::RuntimeSupervisor;
 
 pub struct AppState {
     pub data: Mutex<DataStore>,
-    pub runtime: Mutex<RuntimeSupervisor>,
 }
 
 impl AppState {
@@ -15,7 +13,6 @@ impl AppState {
         store.init_shared_secrets()?;
         Ok(Self {
             data: Mutex::new(store),
-            runtime: Mutex::new(RuntimeSupervisor::default()),
         })
     }
 
@@ -48,17 +45,6 @@ impl AppState {
             .map_err(|_| crate::error::AppError::Message("data store poisoned".into()))?;
         *guard = next;
         Ok(())
-    }
-
-    pub fn with_runtime<R>(
-        &self,
-        f: impl FnOnce(&mut RuntimeSupervisor) -> AppResult<R>,
-    ) -> AppResult<R> {
-        let mut guard = self
-            .runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut guard)
     }
 }
 

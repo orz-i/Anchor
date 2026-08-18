@@ -120,7 +120,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(AppState::new().expect("failed to load app state"));
-            crate::runtime::spawn_desktop_maintenance(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -187,18 +186,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|_app_handle, event| {
-        if matches!(event, tauri::RunEvent::Exit) {
-            crate::async_runtime::block_on(async {
-                let _ = crate::mcp::gateway::stop().await;
-                crate::tunnel::supervisor()
-                    .lock()
-                    .await
-                    .shutdown_all()
-                    .await;
-            });
-        }
-    });
+    app.run(|_app_handle, _event| {});
 }
 
 #[cfg(all(test, feature = "desktop", feature = "cli"))]

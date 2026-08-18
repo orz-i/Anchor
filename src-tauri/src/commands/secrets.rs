@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use tauri::{Manager, State};
+use tauri::State;
 
 use crate::app_state::AppState;
 use crate::error::{AppError, AppResult};
@@ -63,7 +63,6 @@ pub fn set_workspace_secret(
 
 #[tauri::command]
 pub fn regenerate_workspace_secret(
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
     key: String,
@@ -78,7 +77,7 @@ pub fn regenerate_workspace_secret(
             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
     })?;
 
-    schedule_running_services_restart(app, vec![profile], key, false);
+    schedule_running_services_restart(vec![profile], key, false);
     Ok(value)
 }
 
@@ -118,12 +117,7 @@ pub fn get_shared_secret(state: State<'_, AppState>, key: String) -> AppResult<O
 }
 
 #[tauri::command]
-pub fn set_shared_secret(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    key: String,
-    value: String,
-) -> AppResult<()> {
+pub fn set_shared_secret(state: State<'_, AppState>, key: String, value: String) -> AppResult<()> {
     if !SHARED_KEYS.contains(&key.as_str()) {
         return Err(AppError::Message(format!("invalid shared key: {key}")));
     }
@@ -139,38 +133,32 @@ pub fn set_shared_secret(
     })?;
     if changed {
         let workspaces = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
-        schedule_running_services_restart(app, workspaces, key, true);
+        schedule_running_services_restart(workspaces, key, true);
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn regenerate_shared_secret(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    key: String,
-) -> AppResult<String> {
+pub fn regenerate_shared_secret(state: State<'_, AppState>, key: String) -> AppResult<String> {
     if !SHARED_KEYS.contains(&key.as_str()) {
         return Err(AppError::Message(format!("invalid shared key: {key}")));
     }
     let value = state.with_data(|store| store.regenerate_shared_secret(&key))?;
 
     let workspaces = state.with_workspaces(|store| Ok(store.list().to_vec()))?;
-    schedule_running_services_restart(app, workspaces, key, true);
+    schedule_running_services_restart(workspaces, key, true);
 
     Ok(value)
 }
 
 fn schedule_running_services_restart(
-    app: tauri::AppHandle,
     profiles: Vec<crate::workspace::WorkspaceProfile>,
     key: String,
     shared: bool,
 ) {
     crate::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
         for profile in &profiles {
-            restart_running_services(state.inner(), profile, &key, shared).await;
+            restart_running_services(profile, &key, shared).await;
         }
     });
 }
@@ -180,7 +168,6 @@ fn schedule_running_services_restart(
 /// 密钥命令是桌面端和设置页共用的入口，因此重启必须放在后端统一处理。
 /// 前端不再额外调用 restart_*，避免同一次密钥变更触发两次停止/启动竞态。
 async fn restart_running_services(
-    state: &AppState,
     profile: &crate::workspace::WorkspaceProfile,
     key: &str,
     shared: bool,
@@ -226,38 +213,5 @@ async fn restart_running_services(
             );
             return;
         }
-    }
-
-    // Compatibility-only cleanup path for an older desktop session that still
-    // owns process-local listeners. New GUI lifecycle commands never create
-    // these entries.
-    let result = state.with_runtime(|runtime| {
-        if mcp_relevant && runtime.is_running(&profile.id, crate::runtime::ServiceKind::Mcp) {
-            if let Err(error) = runtime.restart_mcp(profile) {
-                eprintln!(
-                    "MCP restart after secret regeneration failed for {}: {error}",
-                    profile.id
-                );
-            }
-        }
-
-        if actions_relevant && runtime.is_running(&profile.id, crate::runtime::ServiceKind::Actions)
-        {
-            if let Err(error) = runtime.restart_actions(profile) {
-                eprintln!(
-                    "Actions restart after secret regeneration failed for {}: {error}",
-                    profile.id
-                );
-            }
-        }
-
-        AppResult::Ok(())
-    });
-
-    if let Err(error) = result {
-        eprintln!(
-            "runtime state unavailable after secret regeneration for {}: {error}",
-            profile.id
-        );
     }
 }

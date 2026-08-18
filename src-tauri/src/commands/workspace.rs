@@ -8,8 +8,6 @@ use crate::auth::validate_redirect_policy;
 use crate::daemon;
 use crate::error::{AppError, AppResult};
 use crate::platform::open_path_in_file_manager;
-use crate::runtime::ServiceKind;
-use crate::tunnel::drop_workspace as drop_tunnel_workspace;
 use crate::workspace::config_apply::plan_workspace_config_apply;
 use crate::workspace::resources::{
     assign_free_workspace_ports_with_reserved, validate_workspace_resources_update,
@@ -58,7 +56,6 @@ async fn apply_live_service_config(
     profile: &WorkspaceProfile,
     service: crate::workspace::resources::WorkspaceService,
     daemon_running: bool,
-    legacy_running: bool,
     listener_reload: bool,
     callback_policy_hot_update: bool,
 ) -> AppResult<bool> {
@@ -68,7 +65,7 @@ async fn apply_live_service_config(
     if !listener_reload && !callback_policy_hot_update {
         return Ok(false);
     }
-    if !daemon_running && !legacy_running {
+    if !daemon_running {
         return Ok(false);
     }
 
@@ -119,11 +116,6 @@ async fn apply_live_service_config(
         }
     }
 
-    if legacy_running {
-        return Err(AppError::Message(format!(
-            "检测到旧桌面进程仍持有 {service_name} process-local listener；为避免双运行权威，配置已拒绝热应用。请先停止旧 listener。"
-        )));
-    }
     Ok(false)
 }
 
@@ -142,8 +134,6 @@ fn restore_workspace_config(
 struct WorkspaceConfigRollbackScope {
     daemon_mcp_running: bool,
     daemon_actions_running: bool,
-    legacy_mcp_running: bool,
-    legacy_actions_running: bool,
     mcp_applied: bool,
     actions_applied: bool,
     gateway_reload: bool,
@@ -169,7 +159,6 @@ async fn rollback_workspace_config(
             previous_profile,
             crate::workspace::resources::WorkspaceService::Mcp,
             scope.daemon_mcp_running,
-            scope.legacy_mcp_running,
             true,
             false,
         )
@@ -183,7 +172,6 @@ async fn rollback_workspace_config(
             previous_profile,
             crate::workspace::resources::WorkspaceService::Actions,
             scope.daemon_actions_running,
-            scope.legacy_actions_running,
             true,
             false,
         )
@@ -318,12 +306,6 @@ pub async fn update_workspace(
     let daemon_actions_running = daemon_state
         .as_ref()
         .is_some_and(|state| state.service.includes_actions());
-    let (legacy_mcp_running, legacy_actions_running) = state.with_runtime(|runtime| {
-        Ok((
-            runtime.is_running(&profile.id, ServiceKind::Mcp),
-            runtime.is_running(&profile.id, ServiceKind::Actions),
-        ))
-    })?;
     let previous_settings = state.with_settings(|store| Ok(store.settings()))?;
     let gateway_inspection = crate::gateway_daemon::inspect()?;
     if gateway_inspection.ambiguous {
@@ -337,8 +319,8 @@ pub async fn update_workspace(
     let gateway_owner_running = gateway_inspection.running
         && previous_settings.mcp_gateway.owner_workspace_id == profile.id;
     let gateway_profile_live = gateway_route_running || gateway_owner_running;
-    let mcp_running = daemon_mcp_running || legacy_mcp_running || gateway_route_running;
-    let actions_running = daemon_actions_running || legacy_actions_running;
+    let mcp_running = daemon_mcp_running || gateway_route_running;
+    let actions_running = daemon_actions_running;
     let (previous_profile, apply_plan) = state.with_workspaces(|store| {
         let current = store
             .get(&profile.id)
@@ -384,7 +366,6 @@ pub async fn update_workspace(
         &profile,
         crate::workspace::resources::WorkspaceService::Mcp,
         daemon_mcp_running,
-        legacy_mcp_running,
         apply_plan.mcp_listener_reload,
         apply_plan.mcp_callback_policy_hot_update,
     )
@@ -399,8 +380,6 @@ pub async fn update_workspace(
                 WorkspaceConfigRollbackScope {
                     daemon_mcp_running,
                     daemon_actions_running,
-                    legacy_mcp_running,
-                    legacy_actions_running,
                     mcp_applied: false,
                     actions_applied: false,
                     gateway_reload: false,
@@ -414,7 +393,6 @@ pub async fn update_workspace(
         &profile,
         crate::workspace::resources::WorkspaceService::Actions,
         daemon_actions_running,
-        legacy_actions_running,
         apply_plan.actions_listener_reload,
         apply_plan.actions_callback_policy_hot_update,
     )
@@ -429,8 +407,6 @@ pub async fn update_workspace(
                 WorkspaceConfigRollbackScope {
                     daemon_mcp_running,
                     daemon_actions_running,
-                    legacy_mcp_running,
-                    legacy_actions_running,
                     mcp_applied,
                     actions_applied: false,
                     gateway_reload: false,
@@ -453,8 +429,6 @@ pub async fn update_workspace(
                 WorkspaceConfigRollbackScope {
                     daemon_mcp_running,
                     daemon_actions_running,
-                    legacy_mcp_running,
-                    legacy_actions_running,
                     mcp_applied,
                     actions_applied,
                     gateway_reload: true,
@@ -537,11 +511,6 @@ pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResu
         true,
     )
     .await?;
-    drop_tunnel_workspace(&id).await?;
-    state.with_runtime(|runtime| {
-        runtime.drop_workspace(&profile);
-        Ok(())
-    })?;
     state.with_workspaces(|store| {
         if store.remove(&id)?.is_some() {
             teardown_workspace(store, &id)?;

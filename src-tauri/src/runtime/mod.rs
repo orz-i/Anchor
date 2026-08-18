@@ -1,11 +1,7 @@
 mod listener_handoff;
-mod maintenance;
 mod port;
 mod public_url;
 mod supervisor;
-
-#[cfg(feature = "desktop")]
-pub use maintenance::spawn_desktop_maintenance;
 
 #[cfg(unix)]
 pub(crate) use listener_handoff::InheritableListener;
