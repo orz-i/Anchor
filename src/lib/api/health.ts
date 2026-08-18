@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invokeAdmin } from "$lib/api/invoke";
 
 export interface HealthItem {
   label: string;
@@ -8,5 +8,5 @@ export interface HealthItem {
 }
 
 export async function runHealthChecks(workspaceId: string): Promise<HealthItem[]> {
-  return invoke<HealthItem[]>("run_health_checks", { id: workspaceId });
+  return invokeAdmin<HealthItem[]>("run_health_checks", { id: workspaceId });
 }

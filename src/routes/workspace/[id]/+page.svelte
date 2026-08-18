@@ -37,7 +37,7 @@
     updateWorkspace,
   } from "$lib/api/workspaces";
   import { listFrpProfiles, setLastWorkspace, type FrpProfileDto } from "$lib/api/settings";
-  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "$lib/platform/dialog";
   import { restartTunnel, stopTunnel } from "$lib/api/tunnel";
   import { runServiceToggle, notifyStartFailure } from "$lib/runtime/service";
   import { showToast } from "$lib/stores/toast";

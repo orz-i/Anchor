@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invokeAdmin } from "$lib/api/invoke";
 
 export interface SoftwareStatus {
   kind: string;
@@ -15,21 +15,21 @@ export interface DownloadConfig {
 }
 
 export async function listSoftware(): Promise<SoftwareStatus[]> {
-  return invoke("list_software");
+  return invokeAdmin("list_software");
 }
 
 export async function installSoftware(kind: string): Promise<SoftwareStatus> {
-  return invoke("install_software", { kind });
+  return invokeAdmin("install_software", { kind });
 }
 
 export async function uninstallSoftware(kind: string): Promise<SoftwareStatus> {
-  return invoke("uninstall_software", { kind });
+  return invokeAdmin("uninstall_software", { kind });
 }
 
 export async function getDownloadConfig(): Promise<DownloadConfig> {
-  return invoke("get_download_config");
+  return invokeAdmin("get_download_config");
 }
 
 export async function setDownloadConfig(config: DownloadConfig): Promise<void> {
-  return invoke("set_download_config", { config });
+  return invokeAdmin("set_download_config", { config });
 }

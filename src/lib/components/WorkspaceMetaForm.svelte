@@ -1,6 +1,6 @@
 <script lang="ts">
   import { FolderInput, FolderOpen } from "@lucide/svelte";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { open } from "$lib/platform/dialog";
   import { openWorkspaceDirectory } from "$lib/api/workspaces";
   import { showToast } from "$lib/stores/toast";
 

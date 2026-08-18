@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invokeAdmin } from "$lib/api/invoke";
 
 export interface LogChunk {
   name: string;
@@ -11,5 +11,5 @@ export async function readWorkspaceLogs(
   workspaceId: string,
   service: LogService,
 ): Promise<LogChunk[]> {
-  return invoke<LogChunk[]>("read_workspace_logs", { id: workspaceId, service });
+  return invokeAdmin<LogChunk[]>("read_workspace_logs", { id: workspaceId, service });
 }

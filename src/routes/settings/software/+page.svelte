@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { message } from "$lib/platform/dialog";
   import type { DownloadConfig, SoftwareStatus } from "$lib/api/software";
   import {
     listSoftware,

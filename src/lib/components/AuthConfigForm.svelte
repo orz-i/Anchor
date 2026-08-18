@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { message } from "$lib/platform/dialog";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
     getWorkspaceSecret,

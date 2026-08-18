@@ -1,5 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
-import { invokeRead } from "$lib/api/invoke";
+import { invokeAdmin, invokeRead } from "$lib/api/invoke";
 import type { GatewayControlStatus } from "$lib/types";
 
 export interface FrpProfileDto {
@@ -25,7 +24,7 @@ export async function saveFrpProfile(
   profile: FrpProfileInput,
   token?: string,
 ): Promise<FrpProfileDto> {
-  return invoke<FrpProfileDto>("save_frp_profile", { profile, token });
+  return invokeAdmin<FrpProfileDto>("save_frp_profile", { profile, token });
 }
 
 export async function getLastWorkspaceId(): Promise<string> {
@@ -33,11 +32,11 @@ export async function getLastWorkspaceId(): Promise<string> {
 }
 
 export async function setLastWorkspace(id: string): Promise<void> {
-  return invoke("set_last_workspace", { id });
+  return invokeAdmin("set_last_workspace", { id });
 }
 
 export async function deleteFrpProfile(id: string): Promise<void> {
-  return invoke("delete_frp_profile", { id });
+  return invokeAdmin("delete_frp_profile", { id });
 }
 
 export interface ProxyConfigDto {
@@ -50,7 +49,7 @@ export async function getProxy(): Promise<ProxyConfigDto> {
 }
 
 export async function setProxy(proxy: ProxyConfigDto): Promise<void> {
-  return invoke("set_proxy", { proxy });
+  return invokeAdmin("set_proxy", { proxy });
 }
 
 export interface McpGatewayConfigDto {
@@ -77,7 +76,7 @@ export async function getMcpGatewayStatus(): Promise<McpGatewayStatusDto> {
 export async function setMcpGateway(
   config: McpGatewayConfigDto,
 ): Promise<McpGatewayStatusDto> {
-  return invoke<McpGatewayStatusDto>("set_mcp_gateway", { config });
+  return invokeAdmin<McpGatewayStatusDto>("set_mcp_gateway", { config });
 }
 
 export interface WindowsWorkspaceAutostartDto {
@@ -130,25 +129,25 @@ export async function getWindowsServiceStatus(): Promise<WindowsScmServiceStatus
 }
 
 export async function installWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invoke<WindowsScmServiceStatusDto>("install_windows_service");
+  return invokeAdmin<WindowsScmServiceStatusDto>("install_windows_service");
 }
 
 export async function uninstallWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invoke<WindowsScmServiceStatusDto>("uninstall_windows_service");
+  return invokeAdmin<WindowsScmServiceStatusDto>("uninstall_windows_service");
 }
 
 export async function startWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invoke<WindowsScmServiceStatusDto>("start_windows_service");
+  return invokeAdmin<WindowsScmServiceStatusDto>("start_windows_service");
 }
 
 export async function stopWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invoke<WindowsScmServiceStatusDto>("stop_windows_service");
+  return invokeAdmin<WindowsScmServiceStatusDto>("stop_windows_service");
 }
 
 export async function restartWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invoke<WindowsScmServiceStatusDto>("restart_windows_service");
+  return invokeAdmin<WindowsScmServiceStatusDto>("restart_windows_service");
 }
 
 export async function syncWindowsServicePlan(): Promise<WindowsScmServiceStatusDto> {
-  return invoke<WindowsScmServiceStatusDto>("sync_windows_service_plan");
+  return invokeAdmin<WindowsScmServiceStatusDto>("sync_windows_service_plan");
 }

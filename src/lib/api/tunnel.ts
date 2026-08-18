@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invokeAdmin } from "$lib/api/invoke";
 
 export type TunnelService = "mcp" | "actions";
 
@@ -9,7 +9,7 @@ export interface TunnelStatus {
 }
 
 export async function stopTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
-  return invoke<TunnelStatus>("stop_tunnel", { id, service });
+  return invokeAdmin<TunnelStatus>("stop_tunnel", { id, service });
 }
 
 export interface TunnelTestResult {
@@ -20,9 +20,9 @@ export interface TunnelTestResult {
 }
 
 export async function testTunnel(id: string, service: TunnelService): Promise<TunnelTestResult> {
-  return invoke<TunnelTestResult>("test_tunnel", { id, service });
+  return invokeAdmin<TunnelTestResult>("test_tunnel", { id, service });
 }
 
 export async function restartTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
-  return invoke<TunnelStatus>("restart_tunnel", { id, service });
+  return invokeAdmin<TunnelStatus>("restart_tunnel", { id, service });
 }

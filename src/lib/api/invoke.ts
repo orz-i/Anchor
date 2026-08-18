@@ -1,4 +1,51 @@
-import { invoke } from "@tauri-apps/api/core";
+import { isTauriRuntime } from "$lib/platform/runtime";
+
+const ADMIN_API_PREFIX = "/api/v1/commands";
+
+interface AdminApiSuccess<T> {
+  ok: true;
+  data: T;
+}
+
+interface AdminApiFailure {
+  ok: false;
+  error: {
+    code?: string;
+    message: string;
+  };
+}
+
+type AdminApiResponse<T> = AdminApiSuccess<T> | AdminApiFailure;
+
+async function invokeTauri<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(command, args);
+}
+
+async function invokeWeb<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`${ADMIN_API_PREFIX}/${encodeURIComponent(command)}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+      "x-anchor-admin-request": "1",
+    },
+    body: JSON.stringify({ args: args ?? {} }),
+  });
+  const payload = (await response.json().catch(() => null)) as AdminApiResponse<T> | null;
+  if (!response.ok || !payload || payload.ok === false) {
+    const detail = payload && payload.ok === false ? payload.error.message : response.statusText;
+    throw new Error(detail || `管理 API 请求失败：HTTP ${response.status}`);
+  }
+  return payload.data;
+}
+
+export async function invokeAdmin<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  return isTauriRuntime() ? invokeTauri<T>(command, args) : invokeWeb<T>(command, args);
+}
 
 interface ReadRetryOptions {
   attempts?: number;
@@ -60,7 +107,7 @@ export async function invokeRead<T>(
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await invoke<T>(command, args);
+      return await invokeAdmin<T>(command, args);
     } catch (error) {
       lastError = error;
       if (attempt >= attempts || !isTransientInvokeError(error)) throw error;
