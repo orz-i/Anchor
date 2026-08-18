@@ -153,6 +153,27 @@ GUI 工作区控制迁移现状：
 
 当前第 1–5 项在 Windows 主路径均已完成：Workspace/Gateway 状态、日志、事件、生命周期、Tunnel、配置应用都走版本化 daemon 控制面；CLI `config get/set/diff/apply` staging/apply 闭环已完成；OAuth Callback 策略是首个无需 listener 重建的字段级 hot reload。Windows Workspace/Gateway daemon 都使用 Named Pipe + protected DACL + state v2/PID image ownership，SCM supervisor 负责按 `windows-service.json` 恢复所选控制域。Windows GUI 中最后的 process-local Server 兼容运行编排已删除；`RuntimeSupervisor` 仅保留给显式前台 `serve`/非 GUI 运行入口等仍需要的场景。下一步优先推进更多字段级 hot reload、统一运维可观察性与升级治理。
 
+### 阶段 3.5：Web 管理面与 Tauri 退役边界
+
+桌面配置壳不是长期管理入口。下一步将同一套 Svelte 管理 UI 迁移为浏览器可直接访问的 Web 管理面，并让 Tauri 仅作为过渡启动壳，最终删除。迁移必须遵守以下边界：
+
+1. **桌面进程不持有运行权威**：Tauri 进程不得创建 `RuntimeSupervisor`、Tunnel Supervisor 或 Gateway listener，也不得在窗口退出时主动关闭 daemon/Gateway/Tunnel。运行资源只归 Workspace/Gateway daemon 或显式前台 CLI `serve` 所有。
+2. **业务 UI 不直接依赖 Tauri**：`src/` 中的业务页面和 API 模块不得直接调用 `@tauri-apps/api` 或 `@tauri-apps/plugin-dialog`。平台差异必须经过统一 transport/dialog 适配层；Tauri adapter 只是迁移期实现。
+3. **Web 管理 API 是可复用控制客户端**：浏览器端通过版本化、本地优先的管理 HTTP API 调用与 CLI/Tauri 相同的 Rust 控制语义，不允许在 HTTP handler 中复制 Workspace、daemon、Tunnel、Gateway 或 secret 业务规则。
+4. **管理 HTTP 默认本机安全**：默认只监听 loopback；写请求必须具备独立管理会话认证，并校验 Origin/CSRF。不得复用 MCP/Actions 对公网暴露的认证入口，也不得把 secrets 放入 URL、日志或静态资源。
+5. **离线配置与运行控制分离**：Web 管理面可以在 daemon 未运行时编辑磁盘配置；启动、停止、重载、Tunnel、Gateway 等运行操作仍必须通过对应 daemon 控制域，禁止 HTTP 层创建第二套运行时。
+
+退役顺序固定为：
+
+1. 删除桌面进程残留的 process-local runtime/maintenance/退出清理；
+2. 将 Svelte 前端切到 transport-neutral API，并提供 Tauri/Web 两个 adapter；
+3. 提供 `anchor admin`（或等价常驻管理入口）承载静态 Web UI 与版本化 `/api`；
+4. Tauri 壳只负责本机安装期引导、打开管理页和必要的系统集成，不再暴露业务 invoke 命令；
+5. Web 管理面、CLI 与系统 service manager 达成功能等价后，停止发布桌面包；
+6. 经过一个明确弃用窗口后删除 `desktop` feature、`commands/`、Tauri 依赖和桌面构建脚本。
+
+在第 5 步之前，桌面包仍属于兼容入口；在第 6 步之前，不得删除用户仍只能通过桌面完成的系统级能力。
+
 ### 阶段 4：运行与升级治理
 
 - daemon 自恢复、崩溃报告和升级前排空；

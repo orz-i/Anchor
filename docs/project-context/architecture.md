@@ -45,10 +45,10 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 ```
 ┌─────────────────────────────────────────┐
 │  UI Layer (Svelte)                      │
-│  Workspace 卡片 / 配置 / 日志 / 健康检查  │
+│  Web 管理面 / 过渡期 Tauri 壳            │
 ├─────────────────────────────────────────┤
-│  GUI 配置壳 / CLI                        │
-│  配置、展示、脚本化运维                   │
+│  Admin Transport / CLI                  │
+│  Web HTTP adapter / Tauri adapter       │
 ├─────────────────────────────────────────┤
 │  Shared Control Plane                   │
 │  版本化状态模型与控制客户端               │
@@ -70,11 +70,18 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
 | 进程管理 | Windows/Linux：Workspace daemon 管理各自 listener + Workspace Tunnel，独立 Gateway daemon 管理全局 Gateway listener/routes/tunnel；Windows 可由配置域级 SCM supervisor 按持久化计划开机恢复这些 daemon |
-| UI | Tauri 2 + SvelteKit 设计系统 |
+| UI | SvelteKit 管理 UI；Tauri 2 作为过渡本机壳，目标入口为 Web 管理面 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | 桌面安装包与独立 `anchor` CLI |
 
-目标方向是按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力，GUI 逐步收缩为配置与状态壳。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
+目标方向是按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力；Svelte 管理 UI 通过 transport-neutral 管理客户端访问同一控制语义，Tauri 仅作为过渡配置壳，后续由本机 Web 管理面取代并最终移除。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
+
+### 管理面传输边界
+
+- `src/` 业务页面不应直接依赖 Tauri IPC；平台调用统一经管理 transport 与 dialog adapter。
+- Tauri adapter 只用于迁移期兼容；Web adapter 对接本机版本化管理 HTTP API。
+- 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
+- 桌面进程不得维护 listener、Tunnel 或 Gateway；退出桌面壳不得影响后台 daemon 运行态。
 
 ## 核心模块
 
