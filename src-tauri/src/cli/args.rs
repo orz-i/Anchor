@@ -10,6 +10,27 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminCommand {
+    Serve { port: u16 },
+}
+
+fn parse_admin_command(args: &mut VecDeque<String>) -> Result<AdminCommand, String> {
+    match args.pop_front().as_deref() {
+        None | Some("serve") => {
+            let mut port = crate::admin::DEFAULT_ADMIN_PORT;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--port" => port = parse_u64(args, "--port", 1, 65_535)? as u16,
+                    other => return Err(format!("admin serve 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::Serve { port })
+        }
+        Some(other) => Err(format!("未知 admin 命令：{other}\n\n{}", admin_usage())),
+    }
+}
+
 fn parse_upgrade(args: &mut VecDeque<String>) -> Result<UpgradeOptions, String> {
     let mut workspaces = Vec::new();
     let mut all = false;
@@ -1507,6 +1528,7 @@ pub enum Command {
     Plugin(PluginCommand),
     Gateway(GatewayCommand),
     Service(ServiceCommand),
+    Admin(AdminCommand),
     ServiceRun {
         config_dir: PathBuf,
         owner_sid: Option<String>,
@@ -1599,6 +1621,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("plugin") => Command::Plugin(parse_plugin_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
         Some("service" | "svc") => Command::Service(parse_service_command(&mut args)?),
+        Some("admin") => Command::Admin(parse_admin_command(&mut args)?),
         Some("service-run") => parse_service_run(&mut args)?,
         Some("service-admin-run") => parse_service_admin_run(&mut args)?,
         Some("gateway-daemon-run") => parse_gateway_daemon_run(&mut args)?,
@@ -1674,8 +1697,15 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
   anchor [--config-dir PATH] [--json] service <command>\n\n\
+  anchor [--config-dir PATH] [--json] admin [serve] [--port PORT]\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
-不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。upgrade 将已运行 daemon 有界排空并切换到当前 CLI 构建，默认要求可自动回滚；它不下载或替换 CLI 本体。CLI 不会接管 GUI 或其他进程占用的端口。"
+不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。admin serve 仅绑定 127.0.0.1，并在当前迁移阶段只开放只读 Web Admin bootstrap 命令。upgrade 将已运行 daemon 有界排空并切换到当前 CLI 构建，默认要求可自动回滚；它不下载或替换 CLI 本体。CLI 不会接管 GUI 或其他进程占用的端口。"
+}
+
+pub fn admin_usage() -> &'static str {
+    "Web Admin 命令：\n\
+  anchor admin serve [--port PORT]\n\n\
+当前阶段仅在 127.0.0.1 提供版本化只读 bootstrap API；写配置、密钥和生命周期操作尚未开放，后续需要独立管理会话认证与 CSRF 防护后再逐项迁移。"
 }
 
 pub fn frp_usage() -> &'static str {
@@ -1759,6 +1789,22 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_loopback_admin_server() {
+        assert_eq!(
+            parse(strings(&["admin"])).expect("admin default").command,
+            Command::Admin(AdminCommand::Serve {
+                port: crate::admin::DEFAULT_ADMIN_PORT,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["admin", "serve", "--port", "29000"]))
+                .expect("admin port")
+                .command,
+            Command::Admin(AdminCommand::Serve { port: 29_000 })
+        );
     }
 
     #[test]

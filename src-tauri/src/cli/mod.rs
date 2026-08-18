@@ -37,10 +37,10 @@ use crate::workspace::config_apply::plan_workspace_config_apply;
 use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 
 use args::{
-    CliArgs, Command, EventsOptions, EventsTarget, GatewayCommand, GatewayConfigureOptions,
-    GatewayEventsOptions, GatewayLogsOptions, GatewayStartOptions, GatewayStopOptions,
-    LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceCommand, ServiceSelection,
-    StatusOptions, StopOptions,
+    AdminCommand, CliArgs, Command, EventsOptions, EventsTarget, GatewayCommand,
+    GatewayConfigureOptions, GatewayEventsOptions, GatewayLogsOptions, GatewayStartOptions,
+    GatewayStopOptions, LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceCommand,
+    ServiceSelection, StatusOptions, StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -2536,6 +2536,9 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::Service(command) => execute_service(command, cli.json),
+        Command::Admin(AdminCommand::Serve { port }) => {
+            crate::admin::serve(port, cli.json).await.map(|_| 0)
+        }
         Command::ServiceRun { config_dir, .. } => {
             let _ = config_dir;
             Err(AppError::Message(

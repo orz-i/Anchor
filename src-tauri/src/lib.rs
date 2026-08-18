@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", allow(linker_messages))]
 
 mod actions;
+#[cfg(feature = "cli")]
+pub mod admin;
 #[cfg(feature = "desktop")]
 mod app_state;
 mod async_runtime;
