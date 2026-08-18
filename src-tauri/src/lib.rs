@@ -25,6 +25,7 @@ pub mod harness;
 #[cfg(feature = "desktop")]
 mod health;
 mod logging;
+mod management;
 mod mcp;
 mod platform;
 pub mod rollout;

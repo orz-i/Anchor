@@ -44,15 +44,15 @@ fn tunnel_configured_for_service(
 }
 
 #[tauri::command]
-pub fn get_mcp_gateway(state: State<'_, AppState>) -> AppResult<McpGatewayConfig> {
-    state.with_settings(|store| Ok(store.settings().mcp_gateway))
+pub fn get_mcp_gateway(_state: State<'_, AppState>) -> AppResult<McpGatewayConfig> {
+    crate::management::get_mcp_gateway()
 }
 
 #[tauri::command]
 pub async fn get_mcp_gateway_status(
     _state: State<'_, AppState>,
 ) -> AppResult<GatewayControlStatus> {
-    gateway_control::status_via_daemon_or_local().await
+    crate::management::get_mcp_gateway_status().await
 }
 
 #[tauri::command]
@@ -76,7 +76,7 @@ pub async fn get_gateway_control_events(
     cursor: Option<GatewayEventCursor>,
     wait_ms: u32,
 ) -> AppResult<Option<GatewayEventBatch>> {
-    map_gateway_events(gateway_control::request_events(cursor, 32, wait_ms).await)
+    crate::management::get_gateway_control_events(cursor, wait_ms).await
 }
 
 fn map_gateway_events(
@@ -711,22 +711,20 @@ pub async fn start_runtime(state: State<'_, AppState>, id: String) -> AppResult<
 
 #[tauri::command]
 pub async fn get_workspace_control_status(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     id: String,
 ) -> AppResult<WorkspaceControlStatus> {
-    let profile = profile_by_id(&state, &id)?;
-    control::workspace_status_via_daemon_or_local(&profile).await
+    crate::management::workspace_control_status(&id).await
 }
 
 #[tauri::command]
 pub async fn get_workspace_control_events(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     id: String,
     cursor: Option<control::ControlEventCursor>,
     wait_ms: u32,
 ) -> AppResult<Option<control::ControlEventBatch>> {
-    let profile = profile_by_id(&state, &id)?;
-    map_control_events(control::request_events(&profile, cursor, 64, wait_ms).await)
+    crate::management::workspace_control_events(&id, cursor, wait_ms).await
 }
 
 fn map_control_events(
@@ -748,17 +746,10 @@ pub async fn stop_runtime(state: State<'_, AppState>, id: String) -> AppResult<R
 #[tauri::command]
 
 pub async fn get_runtime_status(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-    #[cfg(windows)]
-    if state.with_settings(|store| Ok(store.settings().mcp_gateway.enabled))?
-        && gateway_daemon::supported()
-    {
-        return gateway_route_runtime_status(&state, &profile).await;
-    }
-    daemon_runtime_status(&state, &profile, WorkspaceService::Mcp).await
+    crate::management::runtime_status(&id, WorkspaceService::Mcp).await
 }
 
 #[tauri::command]
@@ -784,12 +775,11 @@ pub async fn stop_actions_runtime(
 #[tauri::command]
 
 pub async fn get_actions_runtime_status(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 
     id: String,
 ) -> AppResult<RuntimeStatusDto> {
-    let profile = profile_by_id(&state, &id)?;
-    daemon_runtime_status(&state, &profile, WorkspaceService::Actions).await
+    crate::management::runtime_status(&id, WorkspaceService::Actions).await
 }
 
 #[tauri::command]

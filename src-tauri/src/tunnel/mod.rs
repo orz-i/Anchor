@@ -24,7 +24,7 @@ pub use frp::resolve_frpc;
 #[cfg(feature = "cli")]
 pub(crate) use frp::validate_workspace_frp_config;
 #[cfg(all(feature = "cli", not(feature = "desktop")))]
-pub(crate) use software::{install_software, list_software, uninstall_software};
+pub(crate) use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 #[cfg(feature = "desktop")]
 pub use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 pub use supervisor::{

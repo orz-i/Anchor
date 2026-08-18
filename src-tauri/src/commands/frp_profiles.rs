@@ -3,50 +3,16 @@ use tauri::State;
 use crate::app_state::AppState;
 
 use crate::error::{AppError, AppResult};
+use crate::management;
 
 use crate::settings::{AppSettings, FrpProfile, FrpProfileInput, ProxyConfig};
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FrpProfileDto {
-    pub id: String,
-
-    pub name: String,
-
-    pub server: String,
-
-    pub server_port: u16,
-
-    pub has_token: bool,
-}
+pub use crate::management::FrpProfileDto;
 
 #[tauri::command]
 
-pub fn list_frp_profiles(state: State<'_, AppState>) -> AppResult<Vec<FrpProfileDto>> {
-    state.with_settings(|store| {
-        Ok(store
-            .data()
-            .frp_profiles
-            .iter()
-            .map(|profile| {
-                let has_token = store
-                    .get_app_secret("frp_profile_token", &profile.id)
-                    .is_some_and(|value| !value.trim().is_empty());
-
-                FrpProfileDto {
-                    id: profile.id.clone(),
-
-                    name: profile.name.clone(),
-
-                    server: profile.server.clone(),
-
-                    server_port: profile.server_port,
-
-                    has_token,
-                }
-            })
-            .collect())
-    })
+pub fn list_frp_profiles(_state: State<'_, AppState>) -> AppResult<Vec<FrpProfileDto>> {
+    management::list_frp_profiles()
 }
 
 #[tauri::command]
@@ -135,36 +101,24 @@ pub fn get_app_settings(state: State<'_, AppState>) -> AppResult<AppSettings> {
 
 #[tauri::command]
 
-pub fn get_proxy(state: State<'_, AppState>) -> AppResult<ProxyConfig> {
-    state.with_settings(|store| Ok(store.settings().proxy))
+pub fn get_proxy(_state: State<'_, AppState>) -> AppResult<ProxyConfig> {
+    management::get_proxy()
 }
 
 #[tauri::command]
 
-pub fn set_proxy(state: State<'_, AppState>, proxy: ProxyConfig) -> AppResult<()> {
-    state.with_settings(|store| {
-        let mut settings = store.settings();
-
-        settings.proxy = proxy;
-
-        store.update_settings(settings)
-    })
+pub fn set_proxy(_state: State<'_, AppState>, proxy: ProxyConfig) -> AppResult<()> {
+    management::set_proxy(proxy)
 }
 
 #[tauri::command]
 
-pub fn set_last_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.with_settings(|store| {
-        let mut settings = store.settings();
-
-        settings.last_workspace_id = id;
-
-        store.update_settings(settings)
-    })
+pub fn set_last_workspace(_state: State<'_, AppState>, id: String) -> AppResult<()> {
+    management::set_last_workspace(id)
 }
 
 #[tauri::command]
 
-pub fn get_last_workspace_id(state: State<'_, AppState>) -> AppResult<String> {
-    state.with_settings(|store| Ok(store.settings().last_workspace_id))
+pub fn get_last_workspace_id(_state: State<'_, AppState>) -> AppResult<String> {
+    management::get_last_workspace_id()
 }

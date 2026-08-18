@@ -17,22 +17,79 @@ interface AdminApiFailure {
 
 type AdminApiResponse<T> = AdminApiSuccess<T> | AdminApiFailure;
 
+interface AdminSessionBootstrap {
+  csrfToken: string;
+  idleTimeoutSeconds: number;
+}
+
+let webAdminSession: AdminSessionBootstrap | null = null;
+let webAdminSessionPromise: Promise<AdminSessionBootstrap> | null = null;
+
 async function invokeTauri<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(command, args);
 }
 
-async function invokeWeb<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+async function createWebAdminSession(): Promise<AdminSessionBootstrap> {
+  const response = await fetch("/api/v1/session", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "x-anchor-admin-request": "1",
+    },
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | AdminApiResponse<AdminSessionBootstrap>
+    | null;
+  if (!response.ok || !payload || payload.ok === false) {
+    const detail = payload && payload.ok === false ? payload.error.message : response.statusText;
+    throw new Error(detail || `创建管理会话失败：HTTP ${response.status}`);
+  }
+  return payload.data;
+}
+
+async function ensureWebAdminSession(): Promise<AdminSessionBootstrap> {
+  if (webAdminSession) return webAdminSession;
+  if (!webAdminSessionPromise) {
+    webAdminSessionPromise = createWebAdminSession()
+      .then((session) => {
+        webAdminSession = session;
+        return session;
+      })
+      .finally(() => {
+        webAdminSessionPromise = null;
+      });
+  }
+  return webAdminSessionPromise;
+}
+
+async function invokeWebOnce<T>(
+  command: string,
+  args: Record<string, unknown> | undefined,
+  session: AdminSessionBootstrap,
+): Promise<{ response: Response; payload: AdminApiResponse<T> | null }> {
   const response = await fetch(`${ADMIN_API_PREFIX}/${encodeURIComponent(command)}`, {
     method: "POST",
     credentials: "same-origin",
     headers: {
       "content-type": "application/json",
       "x-anchor-admin-request": "1",
+      "x-anchor-admin-csrf": session.csrfToken,
     },
     body: JSON.stringify({ args: args ?? {} }),
   });
   const payload = (await response.json().catch(() => null)) as AdminApiResponse<T> | null;
+  return { response, payload };
+}
+
+async function invokeWeb<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  let session = await ensureWebAdminSession();
+  let { response, payload } = await invokeWebOnce<T>(command, args, session);
+  if (response.status === 401) {
+    webAdminSession = null;
+    session = await ensureWebAdminSession();
+    ({ response, payload } = await invokeWebOnce<T>(command, args, session));
+  }
   if (!response.ok || !payload || payload.ok === false) {
     const detail = payload && payload.ok === false ? payload.error.message : response.statusText;
     throw new Error(detail || `管理 API 请求失败：HTTP ${response.status}`);

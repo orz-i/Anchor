@@ -14,27 +14,7 @@ async fn run_elevated(action: &'static str) -> AppResult<()> {
 
 #[tauri::command]
 pub fn get_windows_service_status() -> AppResult<serde_json::Value> {
-    #[cfg(windows)]
-    {
-        Ok(serde_json::to_value(crate::windows_service::scm_status()?)?)
-    }
-    #[cfg(not(windows))]
-    Ok(serde_json::json!({
-        "supported": false,
-        "serviceName": "",
-        "installed": false,
-        "state": "unsupported",
-        "autoStart": false,
-        "configDir": "",
-        "planPath": "",
-        "plan": {
-            "schemaVersion": 1,
-            "ownerSid": "",
-            "ownerUsername": "",
-            "workspaces": [],
-            "gatewayWorkspaceIds": []
-        }
-    }))
+    crate::management::windows_service_status()
 }
 
 #[tauri::command]

@@ -83,9 +83,15 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
 - 桌面进程不得维护 listener、Tunnel 或 Gateway；退出桌面壳不得影响后台 daemon 运行态。
 
-当前实现已经建立 `/api/v1` Web Admin bootstrap。`anchor admin serve` 仅绑定 loopback，现阶段只迁移工作区列表、控制面状态/事件和最近工作区四个只读查询；写操作和 secret 读取默认不在 HTTP allowlist 中。前端的 Web transport 已对齐该协议，因此后续扩展只需要在共享 Rust 管理边界逐项增加能力，而不需要再次改写页面调用方式。
+当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 仅绑定 loopback，并同源托管嵌入 CLI 的生产 Svelte 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。
 
-Web Admin 目前仍属于迁移基础设施，不是完整替代桌面端的生产管理面：尚需增加独立管理会话认证、CSRF/Origin 完整策略、静态 Svelte UI 托管，以及剩余 Tauri command 到共享管理操作的迁移。完成这些条件前，Tauri 作为兼容配置壳继续发布。
+`management.rs` 是 Web/Tauri 共用的管理语义边界。当前已共享工作区 runtime/control 读取、Workspace/Gateway 日志与事件、Gateway 配置/状态读取、FRP/software 状态、secret 读取，以及最近工作区/代理/下载设置三类低风险写入。HTTP handler 只负责安全校验、参数反序列化和调用该共享层，不持有 daemon/Tunnel/Gateway 运行权威。高权限写操作仍未迁移，因此 Web Admin 尚未达到桌面端完整功能等价；Tauri 作为兼容配置壳继续发布。
+
+### management.rs
+- **职责**: Tauri adapter、Web Admin 与后续其他管理客户端共用的配置/状态/日志读取和受控配置写语义。
+- **边界**: 不创建 listener、Tunnel 或 Gateway；运行态读取委托 `control` / `gateway_control`，低风险磁盘写入复用 `DataStore::update_file` 原子持久化。
+- **安全**: secret key allowlist 在共享层统一校验；Web 传输层只在独立管理 session 校验后才能调用。
+- **迁移原则**: 新管理能力先进入共享层，再分别由 Tauri/Web adapter 暴露，禁止直接在 HTTP handler 复制桌面 command 业务逻辑。
 
 ## 核心模块
 

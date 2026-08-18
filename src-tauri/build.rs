@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,6 +29,84 @@ fn watch_git_path(root: &Path, path: &str) {
     if let Some(path) = git_path(root, path) {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+fn admin_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn collect_admin_assets(root: &Path, current: &Path, assets: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_admin_assets(root, &path, assets);
+        } else if file_type.is_file() {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let key = relative.to_string_lossy().replace('\\', "/");
+            assets.push((key, path));
+        }
+    }
+}
+
+fn generate_admin_assets(repository: &Path) {
+    let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let build_dir = repository.join("build");
+    println!("cargo:rerun-if-changed={}", build_dir.display());
+
+    let mut assets = Vec::new();
+    if build_dir.is_dir() {
+        collect_admin_assets(&build_dir, &build_dir, &mut assets);
+        assets.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+
+    let mut generated = String::new();
+    generated.push_str(&format!(
+        "const ADMIN_UI_EMBEDDED: bool = {};\n",
+        !assets.is_empty()
+    ));
+    generated.push_str(
+        "fn embedded_admin_asset(path: &str) -> Option<AdminStaticAsset> {\n    match path {\n",
+    );
+    for (key, path) in assets {
+        let source = format!("{:?}", path.to_string_lossy().as_ref());
+        let content_type = admin_content_type(&path);
+        generated.push_str(&format!(
+            "        {key:?} => Some(AdminStaticAsset {{ content_type: {content_type:?}, body: include_bytes!({source}) }}),\n"
+        ));
+    }
+    generated.push_str("        _ => None,\n    }\n}\n");
+    fs::write(out_dir.join("admin_assets.rs"), generated)
+        .expect("failed to generate embedded Web Admin assets");
 }
 
 fn main() {
@@ -71,6 +150,7 @@ fn main() {
         watch_git_path(repository, &head_ref);
     }
     watch_git_path(repository, "packed-refs");
+    generate_admin_assets(repository);
     if std::env::var_os("CARGO_FEATURE_DESKTOP").is_some() {
         tauri_build::build();
     }

@@ -9,7 +9,7 @@
     "desktop": "node scripts/run-with-rust-toolchain.mjs tauri dev",
     "desktop:build": "node scripts/prepare-desktop-build.mjs && node scripts/run-with-rust-toolchain.mjs tauri build && node scripts/finalize-desktop-build.mjs",
     "desktop:manifest": "node scripts/finalize-desktop-build.mjs",
-    "cli:build": "node scripts/run-with-rust-toolchain.mjs cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
+    "cli:build": "pnpm build && node scripts/run-with-rust-toolchain.mjs cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
     "start": "node scripts/run-with-rust-toolchain.mjs tauri dev",
     "build": "vite build",
     "preview": "vite preview",

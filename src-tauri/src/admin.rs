@@ -1,19 +1,108 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use axum::extract::Path as AxumPath;
-use axum::http::{HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::extract::{OriginalUri, Path as AxumPath, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::control::{self, ControlPlaneEventCursor};
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
+use crate::management;
+use crate::settings::{DownloadConfig, ProxyConfig};
+use crate::workspace::resources::WorkspaceService;
 
 pub const ADMIN_API_VERSION: u16 = 1;
 pub const DEFAULT_ADMIN_PORT: u16 = 28_769;
+const ADMIN_SESSION_COOKIE: &str = "anchor_admin_session";
+const ADMIN_SESSION_IDLE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_ADMIN_SESSIONS: usize = 64;
+
+struct AdminStaticAsset {
+    content_type: &'static str,
+    body: &'static [u8],
+}
+
+#[derive(Debug, Deserialize)]
+struct IdArgs {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceEventsArgs {
+    id: String,
+    #[serde(default)]
+    cursor: Option<control::ControlEventCursor>,
+    #[serde(default = "default_event_wait_ms")]
+    wait_ms: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyArgs {
+    proxy: ProxyConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadConfigArgs {
+    config: DownloadConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretArgs {
+    id: String,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SharedSecretArgs {
+    key: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GatewayEventsArgs {
+    #[serde(default)]
+    cursor: Option<crate::gateway_control::GatewayEventCursor>,
+    #[serde(default = "default_event_wait_ms")]
+    wait_ms: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinesArgs {
+    #[serde(default = "default_log_lines")]
+    lines: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceLogsArgs {
+    id: String,
+    service: String,
+}
+
+include!(concat!(env!("OUT_DIR"), "/admin_assets.rs"));
+
+#[derive(Clone)]
+struct AdminState {
+    origin: Arc<str>,
+    authority: Arc<str>,
+    sessions: Arc<Mutex<HashMap<String, AdminSession>>>,
+}
+
+struct AdminSession {
+    csrf_token: String,
+    created_at: Instant,
+    last_seen: Instant,
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct AdminCommandRequest {
@@ -34,6 +123,10 @@ fn default_event_wait_ms() -> u32 {
     15_000
 }
 
+fn default_log_lines() -> u32 {
+    100
+}
+
 pub async fn serve(port: u16, as_json: bool) -> AppResult<()> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = tokio::net::TcpListener::bind(address)
@@ -48,25 +141,35 @@ pub async fn serve(port: u16, as_json: bool) -> AppResult<()> {
             serde_json::to_string(&json!({
                 "event": "admin_started",
                 "apiVersion": ADMIN_API_VERSION,
-                "mode": "read_only_bootstrap",
+                "mode": "authenticated_web_admin",
+                "uiEmbedded": ADMIN_UI_EMBEDDED,
                 "url": format!("http://{actual}")
             }))?
         );
     } else {
         println!(
-            "Web Admin bootstrap 已启动：http://{actual}（API v{ADMIN_API_VERSION}，当前仅开放只读迁移命令）"
+            "Web Admin 已启动：http://{actual}（API v{ADMIN_API_VERSION}，UI embedded={ADMIN_UI_EMBEDDED}）"
         );
     }
 
-    axum::serve(listener, router())
+    axum::serve(listener, router(actual))
         .await
         .map_err(|error| AppError::Message(format!("Web Admin 服务异常：{error}")))
 }
 
-fn router() -> Router {
+fn router(address: SocketAddr) -> Router {
+    let authority = address.to_string();
+    let state = AdminState {
+        origin: Arc::from(format!("http://{authority}")),
+        authority: Arc::from(authority),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/session", post(create_session))
         .route("/api/v1/commands/{command}", post(command))
+        .fallback(get(static_ui))
+        .with_state(state)
 }
 
 async fn health() -> Json<Value> {
@@ -75,21 +178,168 @@ async fn health() -> Json<Value> {
         "data": {
             "apiVersion": ADMIN_API_VERSION,
             "buildVersion": env!("CARGO_PKG_VERSION"),
-            "mode": "read_only_bootstrap",
-            "mutationsEnabled": false
+            "mode": "authenticated_bootstrap",
+            "mutationsEnabled": true,
+            "sessionRequired": true,
+            "uiEmbedded": ADMIN_UI_EMBEDDED,
+            "mutationCommands": ["set_last_workspace", "set_proxy", "set_download_config"]
         }
     }))
 }
 
+async fn static_ui(OriginalUri(uri): OriginalUri) -> Response {
+    serve_static_uri(&uri)
+}
+
+fn serve_static_uri(uri: &Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    if requested.starts_with("api/") || requested.contains("..") || requested.contains('\\') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let asset = embedded_admin_asset(path).or_else(|| {
+        (!path.contains('.'))
+            .then(|| embedded_admin_asset("index.html"))
+            .flatten()
+    });
+    let Some(asset) = asset else {
+        if !ADMIN_UI_EMBEDDED && (path == "index.html" || !path.contains('.')) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Web Admin UI 未嵌入当前二进制；请使用 `pnpm cli:build` 构建正式 CLI。",
+            )
+                .into_response();
+        }
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    static_asset_response(path, asset)
+}
+
+fn static_asset_response(path: &str, asset: AdminStaticAsset) -> Response {
+    let mut response = Response::new(Body::from(asset.body));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(asset.content_type));
+    let cache = if path.starts_with("_app/immutable/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache));
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
+}
+
+async fn create_session(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if let Err(message) = validate_browser_request(&state, &headers) {
+        return error_response(StatusCode::FORBIDDEN, "ADMIN_REQUEST_REJECTED", message);
+    }
+    let session_id = match random_token() {
+        Ok(token) => token,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ADMIN_SESSION_CREATE_FAILED",
+                error.to_string(),
+            )
+        }
+    };
+    let csrf_token = match random_token() {
+        Ok(token) => token,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ADMIN_SESSION_CREATE_FAILED",
+                error.to_string(),
+            )
+        }
+    };
+    let now = Instant::now();
+    let mut sessions = match state.sessions.lock() {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ADMIN_SESSION_STORE_UNAVAILABLE",
+                "Web Admin session store poisoned",
+            )
+        }
+    };
+    purge_expired_sessions(&mut sessions, now);
+    if sessions.len() >= MAX_ADMIN_SESSIONS {
+        if let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.created_at)
+            .map(|(id, _)| id.clone())
+        {
+            sessions.remove(&oldest);
+        }
+    }
+    sessions.insert(
+        session_id.clone(),
+        AdminSession {
+            csrf_token: csrf_token.clone(),
+            created_at: now,
+            last_seen: now,
+        },
+    );
+    drop(sessions);
+
+    let mut response = (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "data": {
+                "csrfToken": csrf_token,
+                "idleTimeoutSeconds": ADMIN_SESSION_IDLE_TTL.as_secs()
+            }
+        })),
+    )
+        .into_response();
+    let cookie = format!(
+        "{ADMIN_SESSION_COOKIE}={session_id}; Path=/api/v1; HttpOnly; SameSite=Strict; Max-Age={}",
+        ADMIN_SESSION_IDLE_TTL.as_secs()
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 async fn command(
+    State(state): State<AdminState>,
     headers: HeaderMap,
     AxumPath(command): AxumPath<String>,
     Json(request): Json<AdminCommandRequest>,
 ) -> Response {
-    if let Err(message) = validate_headers(&headers) {
+    if let Err(message) = validate_browser_request(&state, &headers) {
         return error_response(StatusCode::FORBIDDEN, "ADMIN_REQUEST_REJECTED", message);
     }
-    match dispatch_read_command(&command, request.args).await {
+    if let Err(error) = authenticate_session(&state, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, error.code(), error.message());
+    }
+    match dispatch_command(&command, request.args).await {
         Ok(data) => (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response(),
         Err(AdminDispatchError::NotMigrated) => error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -104,25 +354,105 @@ async fn command(
     }
 }
 
-fn validate_headers(headers: &HeaderMap) -> Result<(), String> {
+fn validate_browser_request(state: &AdminState, headers: &HeaderMap) -> Result<(), String> {
     let marker = headers
         .get("x-anchor-admin-request")
         .and_then(|value| value.to_str().ok());
     if marker != Some("1") {
         return Err("缺少 Web Admin 请求标记。".into());
     }
-    if let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) {
-        let loopback = origin == "http://127.0.0.1"
-            || origin.starts_with("http://127.0.0.1:")
-            || origin == "http://localhost"
-            || origin.starts_with("http://localhost:")
-            || origin == "http://[::1]"
-            || origin.starts_with("http://[::1]:");
-        if !loopback {
-            return Err(format!("拒绝非 loopback Origin：{origin}"));
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "缺少 Web Admin Host。".to_string())?;
+    if host != state.authority.as_ref() {
+        return Err(format!("拒绝非 canonical Web Admin Host：{host}"));
+    }
+    let origin = headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "缺少 Web Admin Origin。".to_string())?;
+    if origin != state.origin.as_ref() {
+        return Err(format!("拒绝非同源 Web Admin Origin：{origin}"));
+    }
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+    {
+        if site != "same-origin" {
+            return Err(format!("拒绝非 same-origin Fetch：{site}"));
         }
     }
     Ok(())
+}
+
+enum AdminAuthError {
+    Missing,
+    Expired,
+    Csrf,
+}
+
+impl AdminAuthError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Missing => "ADMIN_SESSION_REQUIRED",
+            Self::Expired => "ADMIN_SESSION_EXPIRED",
+            Self::Csrf => "ADMIN_CSRF_REJECTED",
+        }
+    }
+
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Missing => "缺少有效 Web Admin 管理会话。",
+            Self::Expired => "Web Admin 管理会话已过期。",
+            Self::Csrf => "Web Admin CSRF token 无效。",
+        }
+    }
+}
+
+fn authenticate_session(state: &AdminState, headers: &HeaderMap) -> Result<(), AdminAuthError> {
+    let session_id = cookie_value(headers, ADMIN_SESSION_COOKIE).ok_or(AdminAuthError::Missing)?;
+    let csrf = headers
+        .get("x-anchor-admin-csrf")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AdminAuthError::Csrf)?;
+    let now = Instant::now();
+    let mut sessions = state.sessions.lock().map_err(|_| AdminAuthError::Missing)?;
+    let expired = sessions
+        .get(&session_id)
+        .is_some_and(|session| now.duration_since(session.last_seen) > ADMIN_SESSION_IDLE_TTL);
+    if expired {
+        sessions.remove(&session_id);
+        return Err(AdminAuthError::Expired);
+    }
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or(AdminAuthError::Missing)?;
+    if session.csrf_token != csrf {
+        return Err(AdminAuthError::Csrf);
+    }
+    session.last_seen = now;
+    Ok(())
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get(COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+fn purge_expired_sessions(sessions: &mut HashMap<String, AdminSession>, now: Instant) {
+    sessions.retain(|_, session| now.duration_since(session.last_seen) <= ADMIN_SESSION_IDLE_TTL);
+}
+
+fn random_token() -> AppResult<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        AppError::Message(format!("生成 Web Admin session token 失败：{error}"))
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 enum AdminDispatchError {
@@ -136,7 +466,7 @@ impl From<AppError> for AdminDispatchError {
     }
 }
 
-async fn dispatch_read_command(command: &str, args: Value) -> Result<Value, AdminDispatchError> {
+async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDispatchError> {
     match command {
         "list_workspaces" => {
             let store = DataStore::load()?;
@@ -165,9 +495,106 @@ async fn dispatch_read_command(command: &str, args: Value) -> Result<Value, Admi
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
-        "get_last_workspace_id" => {
-            let store = DataStore::load()?;
-            Ok(Value::String(store.settings().last_workspace_id))
+        "get_last_workspace_id" => Ok(Value::String(management::get_last_workspace_id()?)),
+        "set_last_workspace" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::set_last_workspace(input.id)?;
+            Ok(Value::Null)
+        }
+        "list_frp_profiles" => serde_json::to_value(management::list_frp_profiles()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "get_runtime_status" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::runtime_status(&input.id, WorkspaceService::Mcp).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "get_actions_runtime_status" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::runtime_status(&input.id, WorkspaceService::Actions).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "get_workspace_control_status" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::workspace_control_status(&input.id).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_workspace_control_events" => {
+            let input: WorkspaceEventsArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::workspace_control_events(&input.id, input.cursor, input.wait_ms)
+                    .await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "get_workspace_secret" => {
+            let input: SecretArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_workspace_secret(&input.id, &input.key)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_shared_secret" => {
+            let input: SharedSecretArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_shared_secret(&input.key)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_mcp_gateway" => serde_json::to_value(management::get_mcp_gateway()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "get_mcp_gateway_status" => {
+            serde_json::to_value(management::get_mcp_gateway_status().await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_gateway_control_events" => {
+            let input: GatewayEventsArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::get_gateway_control_events(input.cursor, input.wait_ms).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "read_gateway_logs" => {
+            let input: LinesArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::read_gateway_logs(input.lines).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "read_workspace_logs" => {
+            let input: WorkspaceLogsArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::read_workspace_logs(&input.id, &input.service).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_windows_service_status" => management::windows_service_status().map_err(Into::into),
+        "list_software" => serde_json::to_value(management::list_software()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "get_proxy" => serde_json::to_value(management::get_proxy()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "set_proxy" => {
+            let input: ProxyArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::set_proxy(input.proxy)?;
+            Ok(Value::Null)
+        }
+        "get_download_config" => serde_json::to_value(management::get_download_config()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "set_download_config" => {
+            let input: DownloadConfigArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::set_download_config(input.config)?;
+            Ok(Value::Null)
         }
         _ => Err(AdminDispatchError::NotMigrated),
     }
@@ -192,25 +619,109 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
-    #[test]
-    fn admin_header_guard_accepts_loopback_and_rejects_remote_origin() {
+    fn browser_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("x-anchor-admin-request", HeaderValue::from_static("1"));
-        headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:28769"));
-        assert!(validate_headers(&headers).is_ok());
+        headers.insert(HOST, HeaderValue::from_static("127.0.0.1:28769"));
+        headers.insert(ORIGIN, HeaderValue::from_static("http://127.0.0.1:28769"));
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers
+    }
+
+    #[test]
+    fn admin_header_guard_requires_exact_host_and_origin() {
+        let state = AdminState {
+            origin: Arc::from("http://127.0.0.1:28769"),
+            authority: Arc::from("127.0.0.1:28769"),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let mut headers = browser_headers();
+        assert!(validate_browser_request(&state, &headers).is_ok());
 
         headers.insert("origin", HeaderValue::from_static("https://example.com"));
-        assert!(validate_headers(&headers).is_err());
+        assert!(validate_browser_request(&state, &headers).is_err());
+
+        headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:28769"));
+        headers.insert(HOST, HeaderValue::from_static("localhost:28769"));
+        assert!(validate_browser_request(&state, &headers).is_err());
+    }
+
+    #[test]
+    fn admin_session_requires_cookie_and_matching_csrf() {
+        let state = AdminState {
+            origin: Arc::from("http://127.0.0.1:28769"),
+            authority: Arc::from("127.0.0.1:28769"),
+            sessions: Arc::new(Mutex::new(HashMap::from([(
+                "session-1".into(),
+                AdminSession {
+                    csrf_token: "csrf-1".into(),
+                    created_at: Instant::now(),
+                    last_seen: Instant::now(),
+                },
+            )]))),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("anchor_admin_session=session-1"),
+        );
+        headers.insert("x-anchor-admin-csrf", HeaderValue::from_static("csrf-1"));
+        assert!(authenticate_session(&state, &headers).is_ok());
+
+        headers.insert("x-anchor-admin-csrf", HeaderValue::from_static("wrong"));
+        assert!(matches!(
+            authenticate_session(&state, &headers),
+            Err(AdminAuthError::Csrf)
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_session_cookie_is_http_only_and_strict_same_site() {
+        let state = AdminState {
+            origin: Arc::from("http://127.0.0.1:28769"),
+            authority: Arc::from("127.0.0.1:28769"),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let response = create_session(State(state), browser_headers()).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("session cookie");
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Path=/api/v1"));
+    }
+
+    #[test]
+    fn embedded_admin_root_serves_svelte_with_security_headers() {
+        assert!(
+            ADMIN_UI_EMBEDDED,
+            "pnpm build must run before CLI verification"
+        );
+        let response = serve_static_uri(&Uri::from_static("/"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .expect("content security policy");
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
     }
 
     #[tokio::test]
     async fn unimplemented_command_never_falls_through_to_mutation() {
         assert!(matches!(
-            dispatch_read_command("set_proxy", json!({})).await,
-            Err(AdminDispatchError::NotMigrated)
-        ));
-        assert!(matches!(
-            dispatch_read_command("get_shared_secret", json!({})).await,
+            dispatch_command("set_shared_secret", json!({})).await,
             Err(AdminDispatchError::NotMigrated)
         ));
     }
