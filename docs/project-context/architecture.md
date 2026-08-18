@@ -83,6 +83,10 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
 - 桌面进程不得维护 listener、Tunnel 或 Gateway；退出桌面壳不得影响后台 daemon 运行态。
 
+当前实现已经建立 `/api/v1` Web Admin bootstrap。`anchor admin serve` 仅绑定 loopback，现阶段只迁移工作区列表、控制面状态/事件和最近工作区四个只读查询；写操作和 secret 读取默认不在 HTTP allowlist 中。前端的 Web transport 已对齐该协议，因此后续扩展只需要在共享 Rust 管理边界逐项增加能力，而不需要再次改写页面调用方式。
+
+Web Admin 目前仍属于迁移基础设施，不是完整替代桌面端的生产管理面：尚需增加独立管理会话认证、CSRF/Origin 完整策略、静态 Svelte UI 托管，以及剩余 Tauri command 到共享管理操作的迁移。完成这些条件前，Tauri 作为兼容配置壳继续发布。
+
 ## 核心模块
 
 ### workspace/

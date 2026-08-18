@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};

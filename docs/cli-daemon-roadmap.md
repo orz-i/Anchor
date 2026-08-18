@@ -174,6 +174,16 @@ GUI 工作区控制迁移现状：
 
 在第 5 步之前，桌面包仍属于兼容入口；在第 6 步之前，不得删除用户仍只能通过桌面完成的系统级能力。
 
+截至 2026-08-18，本阶段已完成第一轮基础拆分：
+
+- Tauri `AppState` 已不再持有 `RuntimeSupervisor`；desktop maintenance 与窗口退出时的 Gateway/Tunnel 清理已删除，桌面进程退出不再影响 daemon 所有的运行资源；
+- Svelte 业务页面/API 已不再直接依赖 Tauri 包，统一经 `invokeAdmin` 与 platform dialog adapter；Tauri 依赖只允许存在于这两个适配边界内，并由架构守卫测试约束；
+- CLI 新增 `anchor admin serve [--port PORT]`，首版固定绑定 `127.0.0.1`，提供 `/api/v1` Web Admin bootstrap；
+- bootstrap 当前只开放 `list_workspaces`、`get_control_plane_status`、`get_control_plane_events`、`get_last_workspace_id` 四个只读命令。其余命令返回 `ADMIN_COMMAND_NOT_MIGRATED`，因此在独立管理会话认证、Origin/CSRF 和写操作审计完成前不会通过 HTTP 提前开放配置、secret 或生命周期修改；
+- Web adapter 已按 `/api/v1/commands/<command>` 协议接线，但目前尚未达到完整页面功能等价，也尚未由 `anchor admin` 托管生产静态 UI。Tauri 仍需保留为兼容入口，不能在此阶段删除。
+
+下一轮迁移应按风险而不是页面顺序推进：先补独立管理会话认证与静态 UI 托管，再迁只读诊断/状态，随后迁配置 staging/apply，最后迁 secret、软件安装与 service lifecycle 等高权限操作。只有全部管理能力达到 Web/CLI 等价后，才进入停止桌面发布和删除 Tauri 依赖的阶段。
+
 ### 阶段 4：运行与升级治理
 
 - daemon 自恢复、崩溃报告和升级前排空；
