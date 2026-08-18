@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
