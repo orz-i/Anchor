@@ -9,6 +9,12 @@ mod tunnel;
 mod upgrade;
 mod workspace;
 
+pub(crate) use args::ConfigApplyOptions;
+pub(crate) use config::{
+    apply_staged_config, preview_profile_config, stage_profile_config, ConfigApplyReport,
+    ConfigSetReport,
+};
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};

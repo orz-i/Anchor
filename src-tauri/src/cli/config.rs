@@ -291,6 +291,56 @@ pub(crate) fn preview_config(
     Ok((active, candidate))
 }
 
+pub(crate) fn preview_profile_config(
+    base: &WorkspaceProfile,
+    candidate: &WorkspaceProfile,
+) -> AppResult<ConfigSetReport> {
+    let store = DataStore::load()?;
+    let active = store
+        .get(&base.id)
+        .cloned()
+        .ok_or_else(|| AppError::Message(format!("workspace not found: {}", base.id)))?;
+    if !profiles_equal(&active, base)? {
+        return Err(AppError::Message(
+            "workspace 配置已被其他入口修改；请刷新后重新保存，当前请求不会覆盖新配置".into(),
+        ));
+    }
+    validate_candidate(&store, &active, candidate)?;
+    let changed = !profiles_equal(candidate, &active)?;
+    let report = diff_report("config_preview", &active, candidate, changed);
+    Ok(ConfigSetReport {
+        event: "config_preview",
+        workspace_id: active.id,
+        staged: changed,
+        changes: report.changes,
+        apply_plan: report.apply_plan,
+    })
+}
+
+pub(crate) fn stage_profile_config(
+    base: &WorkspaceProfile,
+    candidate: &WorkspaceProfile,
+) -> AppResult<ConfigSetReport> {
+    let output = preview_profile_config(base, candidate)?;
+    if !output.staged {
+        remove_pending(&base.id)?;
+        return Ok(ConfigSetReport {
+            event: "config_set",
+            ..output
+        });
+    }
+    write_pending(&PendingWorkspaceConfig {
+        schema_version: PENDING_SCHEMA_VERSION,
+        workspace_id: base.id.clone(),
+        base: base.clone(),
+        candidate: candidate.clone(),
+    })?;
+    Ok(ConfigSetReport {
+        event: "config_set",
+        ..output
+    })
+}
+
 pub(crate) fn pending_candidate(active: &WorkspaceProfile) -> AppResult<Option<WorkspaceProfile>> {
     Ok(load_pending_for_active(active)?.map(|pending| pending.candidate))
 }

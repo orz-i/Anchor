@@ -20,6 +20,7 @@ use crate::error::{AppError, AppResult};
 use crate::management;
 use crate::settings::{DownloadConfig, ProxyConfig};
 use crate::workspace::resources::WorkspaceService;
+use crate::workspace::WorkspaceProfile;
 
 pub const ADMIN_API_VERSION: u16 = 1;
 pub const DEFAULT_ADMIN_PORT: u16 = 28_769;
@@ -89,6 +90,21 @@ struct WorkspaceLogsArgs {
     service: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceConfigArgs {
+    base_profile: WorkspaceProfile,
+    profile: WorkspaceProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyWorkspaceConfigArgs {
+    id: String,
+    #[serde(default = "default_config_wait_seconds")]
+    wait_seconds: u64,
+}
+
 include!(concat!(env!("OUT_DIR"), "/admin_assets.rs"));
 
 #[derive(Clone)]
@@ -125,6 +141,10 @@ fn default_event_wait_ms() -> u32 {
 
 fn default_log_lines() -> u32 {
     100
+}
+
+fn default_config_wait_seconds() -> u64 {
+    20
 }
 
 pub async fn serve(port: u16, as_json: bool) -> AppResult<()> {
@@ -575,6 +595,35 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
             serde_json::to_value(management::read_workspace_logs(&input.id, &input.service).await?)
                 .map_err(AppError::from)
                 .map_err(Into::into)
+        }
+        "preview_workspace_config" => {
+            let input: WorkspaceConfigArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::preview_workspace_config(
+                &input.base_profile,
+                &input.profile,
+            )?)
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "stage_workspace_config" => {
+            let input: WorkspaceConfigArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::stage_workspace_config(
+                &input.base_profile,
+                &input.profile,
+            )?)
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "apply_workspace_config" => {
+            let input: ApplyWorkspaceConfigArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::apply_workspace_config(input.id, input.wait_seconds).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
         }
         "get_windows_service_status" => management::windows_service_status().map_err(Into::into),
         "list_software" => serde_json::to_value(management::list_software()?)

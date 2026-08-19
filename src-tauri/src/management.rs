@@ -13,6 +13,34 @@ use crate::settings::{AppSettings, DownloadConfig, ProxyConfig};
 use crate::workspace::resources::WorkspaceService;
 use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
 
+#[cfg(feature = "cli")]
+pub(crate) fn preview_workspace_config(
+    base: &WorkspaceProfile,
+    candidate: &WorkspaceProfile,
+) -> AppResult<crate::cli::ConfigSetReport> {
+    crate::cli::preview_profile_config(base, candidate)
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn stage_workspace_config(
+    base: &WorkspaceProfile,
+    candidate: &WorkspaceProfile,
+) -> AppResult<crate::cli::ConfigSetReport> {
+    crate::cli::stage_profile_config(base, candidate)
+}
+
+#[cfg(feature = "cli")]
+pub(crate) async fn apply_workspace_config(
+    workspace_id: String,
+    wait_seconds: u64,
+) -> AppResult<crate::cli::ConfigApplyReport> {
+    crate::cli::apply_staged_config(crate::cli::ConfigApplyOptions {
+        workspace: workspace_id,
+        wait_seconds,
+    })
+    .await
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrpProfileDto {
