@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -211,6 +212,12 @@ pub struct WindowsServiceRuntimeState {
     pub started_at_unix: u64,
     pub executable_path: String,
     pub build_identity: BuildIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsServicePrivilegedTarget {
+    pub service_name: String,
+    pub revision: String,
 }
 
 #[derive(Debug)]
@@ -1029,7 +1036,7 @@ pub fn set_gateway_desired(workspace_ids: &[String]) -> AppResult<WindowsService
     })
 }
 
-pub fn sync_plan_from_running() -> AppResult<WindowsServicePlan> {
+fn running_plan_snapshot() -> AppResult<(Vec<WindowsWorkspaceAutostart>, Vec<String>)> {
     let store = crate::data::DataStore::load_profiles_only()?;
     let profiles = store.list().to_vec();
     drop(store);
@@ -1053,10 +1060,86 @@ pub fn sync_plan_from_running() -> AppResult<WindowsServicePlan> {
         .filter(|_| gateway_inspection.running && gateway_inspection.pid_matches)
         .map(|state| state.workspace_ids)
         .unwrap_or_default();
+    Ok((workspaces, gateway_workspace_ids))
+}
+
+pub fn sync_plan_from_running() -> AppResult<WindowsServicePlan> {
+    let (workspaces, gateway_workspace_ids) = running_plan_snapshot()?;
     mutate_plan(|plan| {
         plan.workspaces = workspaces;
         plan.gateway_workspace_ids = gateway_workspace_ids;
         Ok(())
+    })
+}
+
+pub fn privileged_action_target(action: &str) -> AppResult<WindowsServicePrivilegedTarget> {
+    if !matches!(
+        action,
+        "install_windows_service"
+            | "uninstall_windows_service"
+            | "start_windows_service"
+            | "stop_windows_service"
+            | "restart_windows_service"
+            | "sync_windows_service_plan"
+    ) {
+        return Err(AppError::Message(format!(
+            "未知 Windows Service privileged action：{action}"
+        )));
+    }
+
+    let config_dir = platform().app_config_dir()?;
+    let service_name = service_name_for_dir(&config_dir);
+    let status = scm_status()?;
+    let registered_executable = if status.installed {
+        let query = run_sc(&["qc", &service_name])?;
+        if !query.success {
+            return Err(sc_error("读取 Windows SCM service 注册配置", &query));
+        }
+        parse_scm_binary_executable(&query.stdout)
+    } else {
+        None
+    };
+    let current_executable = std::env::current_exe()?.display().to_string();
+
+    // Elevated lifecycle actions capture the unelevated config owner before
+    // UAC. Bind that identity into the opaque revision without ever exposing
+    // the SID/username through the Web Admin confirmation payload or audit.
+    let owner = if action == "sync_windows_service_plan" {
+        None
+    } else {
+        Some((current_user_sid()?, current_user_name()?))
+    };
+
+    // sync always derives a new plan from the running control-plane snapshot.
+    // install/update does the same only when no desired plan exists yet.
+    let running_snapshot = if action == "sync_windows_service_plan"
+        || (action == "install_windows_service"
+            && status.plan.workspaces.is_empty()
+            && status.plan.gateway_workspace_ids.is_empty())
+    {
+        let (workspaces, gateway_workspace_ids) = running_plan_snapshot()?;
+        Some(serde_json::json!({
+            "workspaces": workspaces,
+            "gatewayWorkspaceIds": gateway_workspace_ids,
+        }))
+    } else {
+        None
+    };
+
+    let revision_source = serde_json::json!({
+        "action": action,
+        "serviceName": service_name.clone(),
+        "configDir": config_dir.display().to_string(),
+        "currentExecutable": current_executable,
+        "registeredExecutable": registered_executable,
+        "status": status,
+        "owner": owner,
+        "runningSnapshot": running_snapshot,
+    });
+    let revision = URL_SAFE_NO_PAD.encode(Sha256::digest(serde_json::to_vec(&revision_source)?));
+    Ok(WindowsServicePrivilegedTarget {
+        service_name,
+        revision,
     })
 }
 

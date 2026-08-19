@@ -1011,6 +1011,107 @@ pub(crate) fn windows_service_status() -> AppResult<serde_json::Value> {
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowsServicePrivilegedTarget {
+    pub service_name: String,
+    pub revision: String,
+}
+
+pub(crate) fn windows_service_privileged_target(
+    action: &str,
+) -> AppResult<WindowsServicePrivilegedTarget> {
+    #[cfg(windows)]
+    {
+        let target = crate::windows_service::privileged_action_target(action)?;
+        Ok(WindowsServicePrivilegedTarget {
+            service_name: target.service_name,
+            revision: target.revision,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        Err(AppError::Message(
+            "Windows SCM Service 仅支持 Windows".into(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+async fn run_windows_service_elevated(action: &'static str) -> AppResult<serde_json::Value> {
+    tokio::task::spawn_blocking(move || crate::windows_service::run_elevated_admin_action(action))
+        .await
+        .map_err(|error| AppError::Message(format!("Windows UAC helper task failed: {error}")))??;
+    Ok(serde_json::to_value(crate::windows_service::scm_status()?)?)
+}
+
+pub(crate) async fn install_windows_service() -> AppResult<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        run_windows_service_elevated("install").await
+    }
+    #[cfg(not(windows))]
+    Err(AppError::Message(
+        "Windows SCM Service 仅支持 Windows".into(),
+    ))
+}
+
+pub(crate) async fn uninstall_windows_service() -> AppResult<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        run_windows_service_elevated("uninstall").await
+    }
+    #[cfg(not(windows))]
+    Err(AppError::Message(
+        "Windows SCM Service 仅支持 Windows".into(),
+    ))
+}
+
+pub(crate) async fn start_windows_service() -> AppResult<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        run_windows_service_elevated("start").await
+    }
+    #[cfg(not(windows))]
+    Err(AppError::Message(
+        "Windows SCM Service 仅支持 Windows".into(),
+    ))
+}
+
+pub(crate) async fn stop_windows_service() -> AppResult<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        run_windows_service_elevated("stop").await
+    }
+    #[cfg(not(windows))]
+    Err(AppError::Message(
+        "Windows SCM Service 仅支持 Windows".into(),
+    ))
+}
+
+pub(crate) async fn restart_windows_service() -> AppResult<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        run_windows_service_elevated("restart").await
+    }
+    #[cfg(not(windows))]
+    Err(AppError::Message(
+        "Windows SCM Service 仅支持 Windows".into(),
+    ))
+}
+
+pub(crate) fn sync_windows_service_plan() -> AppResult<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        let _ = crate::windows_service::sync_plan_from_running()?;
+        Ok(serde_json::to_value(crate::windows_service::scm_status()?)?)
+    }
+    #[cfg(not(windows))]
+    Err(AppError::Message(
+        "Windows SCM Service 仅支持 Windows".into(),
+    ))
+}
+
 fn control_log_service(service: &str) -> AppResult<ControlLogSelection> {
     Ok(match service {
         "mcp" => ControlLogSelection::Mcp,
