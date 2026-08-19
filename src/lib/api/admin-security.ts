@@ -1,5 +1,4 @@
 import { invokeAdmin, invokeRead } from "$lib/api/invoke";
-import { isTauriRuntime } from "$lib/platform/runtime";
 
 export interface PrivilegedActionBinding {
   id?: string;
@@ -92,9 +91,6 @@ export async function invokePrivilegedAdmin<T>(
   args: Record<string, unknown>,
   binding: PrivilegedActionBinding,
 ): Promise<T> {
-  if (isTauriRuntime()) {
-    return invokeAdmin<T>(action, args);
-  }
   const grantId = await requestPrivilegedGrant(action, binding);
   return invokeAdmin<T>(action, { ...args, grantId });
 }

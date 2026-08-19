@@ -1,5 +1,3 @@
-import { isTauriRuntime } from "$lib/platform/runtime";
-
 const ADMIN_API_PREFIX = "/api/v1/commands";
 
 interface AdminApiSuccess<T> {
@@ -26,11 +24,6 @@ interface AdminSessionBootstrap {
 
 let webAdminSession: AdminSessionBootstrap | null = null;
 let webAdminSessionPromise: Promise<AdminSessionBootstrap> | null = null;
-
-async function invokeTauri<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(command, args);
-}
 
 async function createWebAdminSession(): Promise<AdminSessionBootstrap> {
   const response = await fetch("/api/v1/session", {
@@ -111,11 +104,10 @@ export async function invokeAdmin<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
-  return isTauriRuntime() ? invokeTauri<T>(command, args) : invokeWeb<T>(command, args);
+  return invokeWeb<T>(command, args);
 }
 
 export async function supportsAdminCommand(command: string): Promise<boolean> {
-  if (isTauriRuntime()) return true;
   const session = await ensureWebAdminSession();
   return session.supportedCommands?.includes(command) === true;
 }

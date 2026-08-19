@@ -1,7 +1,7 @@
 {
-  "name": "anchor-desktop",
+  "name": "anchor",
   "version": "0.1.23",
-  "description": "Anchor Web Admin and CLI with a deprecated legacy desktop shell",
+  "description": "Anchor Web Admin and CLI workspace gateway",
   "packageManager": "pnpm@11.18.0",
   "type": "module",
   "scripts": {
@@ -12,21 +12,11 @@
     "start": "pnpm admin:serve",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "legacy:desktop": "node scripts/run-with-rust-toolchain.mjs tauri dev",
-    "legacy:desktop:build": "node scripts/prepare-desktop-build.mjs && node scripts/run-with-rust-toolchain.mjs tauri build && node scripts/finalize-desktop-build.mjs",
-    "legacy:desktop:manifest": "node scripts/finalize-desktop-build.mjs",
-    "legacy:tauri": "node scripts/run-with-rust-toolchain.mjs tauri",
-    "desktop": "node scripts/deprecated-desktop.mjs dev",
-    "desktop:build": "node scripts/deprecated-desktop.mjs build",
-    "desktop:manifest": "node scripts/deprecated-desktop.mjs manifest",
-    "tauri": "node scripts/deprecated-desktop.mjs tauri"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
   },
   "license": "Apache-2.0",
   "dependencies": {
     "@lucide/svelte": "^0.487.0",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-dialog": "^2",
     "chrome-devtools-mcp": "^1.6.0"
   },
   "devDependencies": {
@@ -34,7 +24,6 @@
     "@sveltejs/kit": "^2.9.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tailwindcss/vite": "^4.0.0",
-    "@tauri-apps/cli": "^2",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "tailwindcss": "^4.0.0",

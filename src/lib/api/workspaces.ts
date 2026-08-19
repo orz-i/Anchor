@@ -1,5 +1,4 @@
 import { invokeAdmin, invokeRead } from "$lib/api/invoke";
-import { isTauriRuntime } from "$lib/platform/runtime";
 import type {
   ControlPlaneEventBatch,
   ControlPlaneEventCursor,
@@ -105,10 +104,6 @@ export async function updateWorkspace(
   profile: WorkspaceProfile,
   baseProfile: WorkspaceProfile,
 ): Promise<void> {
-  if (isTauriRuntime()) {
-    await invokeAdmin("update_workspace", { profile });
-    return;
-  }
   await stageWorkspaceConfig(baseProfile, profile);
   await applyWorkspaceConfig(profile.id);
 }
