@@ -4,6 +4,8 @@ mod actions;
 #[cfg(feature = "cli")]
 pub mod admin;
 #[cfg(feature = "cli")]
+mod admin_daemon;
+#[cfg(feature = "cli")]
 mod admin_security;
 #[cfg(feature = "desktop")]
 mod app_state;
