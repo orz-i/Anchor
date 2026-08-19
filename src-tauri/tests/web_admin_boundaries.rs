@@ -263,12 +263,10 @@ fn web_admin_keeps_only_unreviewed_privileged_mutations_outside_dispatcher() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
 
-    for command in ["save_frp_profile"] {
-        assert!(
-            !admin.contains(&format!("\"{command}\" =>")),
-            "privileged Web Admin mutation was exposed unexpectedly: {command}"
-        );
-    }
+    assert!(
+        !admin.contains("\"save_frp_profile\" =>"),
+        "unreviewed save_frp_profile Web Admin mutation was exposed unexpectedly"
+    );
 
     for command in [
         "set_workspace_secret",
