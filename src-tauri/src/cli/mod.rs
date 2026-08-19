@@ -55,6 +55,150 @@ struct CliTunnelRetry {
     next_attempt: tokio::time::Instant,
 }
 
+fn normalize_gateway_route_ids(workspace_ids: Vec<String>) -> AppResult<Vec<String>> {
+    let mut normalized = Vec::with_capacity(workspace_ids.len());
+    for workspace_id in workspace_ids {
+        let workspace_id = workspace_id.trim();
+        if workspace_id.is_empty() {
+            return Err(AppError::Message(
+                "Gateway route workspace id 不能为空".into(),
+            ));
+        }
+        normalized.push(workspace_id.to_string());
+    }
+    normalized.sort();
+    normalized.dedup();
+    if normalized.is_empty() {
+        return Err(AppError::Message(
+            "Gateway set_routes 至少需要一个 workspace；零 route 请使用 shutdown".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn resolve_gateway_route_profiles(
+    profiles: &[WorkspaceProfile],
+    workspace_ids: &[String],
+) -> AppResult<Vec<WorkspaceProfile>> {
+    let mut selected = Vec::with_capacity(workspace_ids.len());
+    for workspace_id in workspace_ids {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.id == *workspace_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Message(format!("Gateway route workspace 不存在：{workspace_id}"))
+            })?;
+        ensure_workspace_directory(&profile)?;
+        selected.push(profile);
+    }
+    Ok(selected)
+}
+
+async fn apply_gateway_routes(
+    runtime: &mut RuntimeSupervisor,
+    started: &mut Vec<WorkspaceProfile>,
+    selected: &mut Vec<WorkspaceProfile>,
+    config: &mut McpGatewayConfig,
+    all_profiles: &mut Vec<WorkspaceProfile>,
+    workspace_ids: Vec<String>,
+) -> AppResult<()> {
+    let desired_ids = normalize_gateway_route_ids(workspace_ids)?;
+    let mut previous_ids = selected
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+    previous_ids.sort();
+    previous_ids.dedup();
+    if desired_ids == previous_ids {
+        gateway_daemon::update_state(&previous_ids, config.local_port)?;
+        return Ok(());
+    }
+
+    let previous = GatewayRuntimeSnapshot {
+        config: config.clone(),
+        profiles: all_profiles.clone(),
+        selected: selected.clone(),
+    };
+    let store = DataStore::load()?;
+    let latest_profiles = store.list().to_vec();
+    let mut latest_config = store.settings().mcp_gateway;
+    drop(store);
+    if !latest_config.enabled {
+        return Err(AppError::Message(
+            "Gateway 配置已禁用；不能修改运行 route".into(),
+        ));
+    }
+    gateway::validate_config(&latest_config, &latest_profiles)?;
+    let latest_selected = resolve_gateway_route_profiles(&latest_profiles, &desired_ids)?;
+
+    shutdown_gateway_services(runtime, started, config, all_profiles).await?;
+    started.clear();
+    match start_gateway_services(
+        runtime,
+        &latest_selected,
+        &mut latest_config,
+        &latest_profiles,
+    )
+    .await
+    {
+        Ok(next_started) => {
+            *started = next_started;
+            *selected = latest_selected;
+            *config = latest_config;
+            *all_profiles = latest_profiles;
+            if let Err(state_error) = gateway_daemon::update_state(&desired_ids, config.local_port)
+            {
+                let cleanup =
+                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                if let Err(cleanup_error) = cleanup {
+                    return Err(AppError::Message(format!(
+                        "Gateway route 已切换但 daemon state 更新失败：{state_error}；清理新运行态也失败：{cleanup_error}"
+                    )));
+                }
+                started.clear();
+                return match restore_gateway_runtime(
+                    runtime,
+                    started,
+                    selected,
+                    config,
+                    all_profiles,
+                    previous,
+                    &previous_ids,
+                )
+                .await
+                {
+                    Ok(()) => Err(AppError::Message(format!(
+                        "Gateway route state 更新失败，已恢复旧 routes：{state_error}"
+                    ))),
+                    Err(rollback_error) => Err(AppError::Message(format!(
+                        "Gateway route state 更新失败：{state_error}；恢复旧 routes 也失败：{rollback_error}"
+                    ))),
+                };
+            }
+            Ok(())
+        }
+        Err(error) => match restore_gateway_runtime(
+            runtime,
+            started,
+            selected,
+            config,
+            all_profiles,
+            previous,
+            &previous_ids,
+        )
+        .await
+        {
+            Ok(()) => Err(AppError::Message(format!(
+                "Gateway route 切换失败，已恢复旧 routes：{error}"
+            ))),
+            Err(rollback_error) => Err(AppError::Message(format!(
+                "Gateway route 切换失败：{error}；恢复旧 routes 也失败：{rollback_error}"
+            ))),
+        },
+    }
+}
+
 struct DaemonOwnership {
     guard: Option<daemon::DaemonGuard>,
     control_server: Option<control::ControlServer>,
@@ -1389,7 +1533,37 @@ async fn serve_gateway(
                                 error.to_string(),
                             ),
                         }
-                        gateway_control::finish_reload_operation(&operation_id, result);
+                        gateway_control::finish_operation(&operation_id, result);
+                    }
+                    Some(gateway_control::GatewayControlCommand::SetRoutes {
+                        operation_id,
+                        workspace_ids,
+                    }) => {
+                        gateway_control::mark_operation_running(&operation_id);
+                        let result = apply_gateway_routes(
+                            &mut runtime,
+                            &mut started,
+                            &mut selected,
+                            &mut config,
+                            &mut all_profiles,
+                            workspace_ids,
+                        )
+                        .await;
+                        match &result {
+                            Ok(()) => publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::RouteState,
+                                "succeeded",
+                                format!("Gateway routes 已切换，routes={}", selected.len()),
+                            ),
+                            Err(error) => publish_gateway_runtime_event(
+                                event_scope,
+                                gateway_control::GatewayEventKind::RouteState,
+                                "failed",
+                                error.to_string(),
+                            ),
+                        }
+                        gateway_control::finish_operation(&operation_id, result);
                     }
                     Some(gateway_control::GatewayControlCommand::ApplyConfig {
                         operation_id,
@@ -1423,7 +1597,7 @@ async fn serve_gateway(
                                 error.to_string(),
                             ),
                         }
-                        gateway_control::finish_reload_operation(&operation_id, result);
+                        gateway_control::finish_operation(&operation_id, result);
                     }
                     None => {
                         terminal_error = Some(AppError::Message(

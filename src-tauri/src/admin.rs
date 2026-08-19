@@ -14,6 +14,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::admin_security::{read_admin_audit_events, PrivilegedConfirmationStore};
 use crate::control::{self, ControlPlaneEventCursor};
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
@@ -102,6 +103,12 @@ struct GatewayConfigArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct GatewayRouteArgs {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceConfigArgs {
     base_profile: WorkspaceProfile,
@@ -116,6 +123,24 @@ struct ApplyWorkspaceConfigArgs {
     wait_seconds: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct PrivilegedPrepareArgs {
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrivilegedConfirmArgs {
+    confirmation_id: String,
+    confirmation_text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditEventsArgs {
+    #[serde(default = "default_audit_event_limit")]
+    limit: usize,
+}
+
 include!(concat!(env!("OUT_DIR"), "/admin_assets.rs"));
 
 #[derive(Clone)]
@@ -123,6 +148,7 @@ struct AdminState {
     origin: Arc<str>,
     authority: Arc<str>,
     sessions: Arc<Mutex<HashMap<String, AdminSession>>>,
+    privileged_confirmations: Arc<Mutex<PrivilegedConfirmationStore>>,
 }
 
 struct AdminSession {
@@ -156,6 +182,10 @@ fn default_log_lines() -> u32 {
 
 fn default_config_wait_seconds() -> u64 {
     20
+}
+
+fn default_audit_event_limit() -> usize {
+    50
 }
 
 pub async fn serve(port: u16, as_json: bool) -> AppResult<()> {
@@ -194,6 +224,7 @@ fn router(address: SocketAddr) -> Router {
         origin: Arc::from(format!("http://{authority}")),
         authority: Arc::from(authority),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        privileged_confirmations: Arc::new(Mutex::new(PrivilegedConfirmationStore::default())),
     };
     Router::new()
         .route("/api/v1/health", get(health))
@@ -214,6 +245,8 @@ async fn health() -> Json<Value> {
             "sessionRequired": true,
             "uiEmbedded": ADMIN_UI_EMBEDDED,
             "mutationCommands": [
+                "prepare_privileged_action",
+                "confirm_privileged_action",
                 "set_last_workspace",
                 "set_proxy",
                 "set_download_config",
@@ -225,10 +258,13 @@ async fn health() -> Json<Value> {
                 "start_actions_runtime",
                 "stop_actions_runtime",
                 "restart_actions_runtime",
+                "start_tunnel",
                 "restart_tunnel",
                 "stop_tunnel",
+                "test_tunnel",
                 "set_mcp_gateway",
-                "reload_mcp_gateway"
+                "reload_mcp_gateway",
+                "set_mcp_gateway_route"
             ]
         }
     }))
@@ -383,15 +419,23 @@ async fn command(
     if let Err(message) = validate_browser_request(&state, &headers) {
         return error_response(StatusCode::FORBIDDEN, "ADMIN_REQUEST_REJECTED", message);
     }
-    if let Err(error) = authenticate_session(&state, &headers) {
-        return error_response(StatusCode::UNAUTHORIZED, error.code(), error.message());
-    }
-    match dispatch_command(&command, request.args).await {
+    let session_id = match authenticate_session(&state, &headers) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return error_response(StatusCode::UNAUTHORIZED, error.code(), error.message())
+        }
+    };
+    match dispatch_command(&state, &session_id, &command, request.args).await {
         Ok(data) => (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response(),
         Err(AdminDispatchError::NotMigrated) => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "ADMIN_COMMAND_NOT_MIGRATED",
             format!("Web Admin 命令尚未迁移：{command}"),
+        ),
+        Err(AdminDispatchError::Rejected(error)) => error_response(
+            StatusCode::FORBIDDEN,
+            "ADMIN_PRIVILEGED_CONFIRMATION_REJECTED",
+            error.to_string(),
         ),
         Err(AdminDispatchError::Failed(error)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -457,7 +501,7 @@ impl AdminAuthError {
     }
 }
 
-fn authenticate_session(state: &AdminState, headers: &HeaderMap) -> Result<(), AdminAuthError> {
+fn authenticate_session(state: &AdminState, headers: &HeaderMap) -> Result<String, AdminAuthError> {
     let session_id = cookie_value(headers, ADMIN_SESSION_COOKIE).ok_or(AdminAuthError::Missing)?;
     let csrf = headers
         .get("x-anchor-admin-csrf")
@@ -479,7 +523,7 @@ fn authenticate_session(state: &AdminState, headers: &HeaderMap) -> Result<(), A
         return Err(AdminAuthError::Csrf);
     }
     session.last_seen = now;
-    Ok(())
+    Ok(session_id)
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -504,6 +548,7 @@ fn random_token() -> AppResult<String> {
 
 enum AdminDispatchError {
     NotMigrated,
+    Rejected(AppError),
     Failed(AppError),
 }
 
@@ -513,8 +558,45 @@ impl From<AppError> for AdminDispatchError {
     }
 }
 
-async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDispatchError> {
+async fn dispatch_command(
+    state: &AdminState,
+    session_id: &str,
+    command: &str,
+    args: Value,
+) -> Result<Value, AdminDispatchError> {
     match command {
+        "prepare_privileged_action" => {
+            let input: PrivilegedPrepareArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let prepared = state
+                .privileged_confirmations
+                .lock()
+                .map_err(|_| AppError::Message("privileged confirmation store poisoned".into()))?
+                .prepare(session_id, &input.action)
+                .map_err(AdminDispatchError::Rejected)?;
+            serde_json::to_value(prepared)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "confirm_privileged_action" => {
+            let input: PrivilegedConfirmArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let grant = state
+                .privileged_confirmations
+                .lock()
+                .map_err(|_| AppError::Message("privileged confirmation store poisoned".into()))?
+                .confirm(session_id, &input.confirmation_id, &input.confirmation_text)
+                .map_err(AdminDispatchError::Rejected)?;
+            serde_json::to_value(grant)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "list_admin_audit_events" => {
+            let input: AuditEventsArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(read_admin_audit_events(input.limit)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "list_workspaces" => {
             let store = DataStore::load()?;
             serde_json::to_value(store.list())
@@ -555,6 +637,14 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
                 management::runtime_status(&input.id, WorkspaceService::Mcp).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "test_tunnel" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::test_workspace_tunnel(&input.id, &input.service).await?,
             )
             .map_err(AppError::from)
             .map_err(Into::into)
@@ -660,6 +750,14 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
         "reload_mcp_gateway" => serde_json::to_value(management::reload_mcp_gateway().await?)
             .map_err(AppError::from)
             .map_err(Into::into),
+        "set_mcp_gateway_route" => {
+            let input: GatewayRouteArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::set_gateway_workspace_route(&input.id, input.enabled).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
         "get_gateway_control_events" => {
             let input: GatewayEventsArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
@@ -684,6 +782,14 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
             let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
                 management::restart_workspace_tunnel(&input.id, &input.service).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "start_tunnel" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::start_workspace_tunnel(&input.id, &input.service).await?,
             )
             .map_err(AppError::from)
             .map_err(Into::into)
@@ -777,13 +883,18 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn admin_header_guard_requires_exact_host_and_origin() {
-        let state = AdminState {
+    fn test_state(sessions: HashMap<String, AdminSession>) -> AdminState {
+        AdminState {
             origin: Arc::from("http://127.0.0.1:28769"),
             authority: Arc::from("127.0.0.1:28769"),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        };
+            sessions: Arc::new(Mutex::new(sessions)),
+            privileged_confirmations: Arc::new(Mutex::new(PrivilegedConfirmationStore::default())),
+        }
+    }
+
+    #[test]
+    fn admin_header_guard_requires_exact_host_and_origin() {
+        let state = test_state(HashMap::new());
         let mut headers = browser_headers();
         assert!(validate_browser_request(&state, &headers).is_ok());
 
@@ -797,18 +908,14 @@ mod tests {
 
     #[test]
     fn admin_session_requires_cookie_and_matching_csrf() {
-        let state = AdminState {
-            origin: Arc::from("http://127.0.0.1:28769"),
-            authority: Arc::from("127.0.0.1:28769"),
-            sessions: Arc::new(Mutex::new(HashMap::from([(
-                "session-1".into(),
-                AdminSession {
-                    csrf_token: "csrf-1".into(),
-                    created_at: Instant::now(),
-                    last_seen: Instant::now(),
-                },
-            )]))),
-        };
+        let state = test_state(HashMap::from([(
+            "session-1".into(),
+            AdminSession {
+                csrf_token: "csrf-1".into(),
+                created_at: Instant::now(),
+                last_seen: Instant::now(),
+            },
+        )]));
         let mut headers = HeaderMap::new();
         headers.insert(
             COOKIE,
@@ -826,11 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_session_cookie_is_http_only_and_strict_same_site() {
-        let state = AdminState {
-            origin: Arc::from("http://127.0.0.1:28769"),
-            authority: Arc::from("127.0.0.1:28769"),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        };
+        let state = test_state(HashMap::new());
         let response = create_session(State(state), browser_headers()).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let cookie = response
@@ -869,8 +972,9 @@ mod tests {
 
     #[tokio::test]
     async fn unimplemented_command_never_falls_through_to_mutation() {
+        let state = test_state(HashMap::new());
         assert!(matches!(
-            dispatch_command("set_shared_secret", json!({})).await,
+            dispatch_command(&state, "session", "set_shared_secret", json!({})).await,
             Err(AdminDispatchError::NotMigrated)
         ));
     }

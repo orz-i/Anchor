@@ -12,11 +12,7 @@ use crate::error::{AppError, AppResult};
 
 use crate::runtime::{port_busy_message, try_reclaim_previous_macos_app_port, wait_for_port_free};
 
-use crate::gateway_control::{
-    self, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor, GatewayOperation,
-};
-use crate::gateway_daemon;
-use crate::mcp::gateway;
+use crate::gateway_control::{self, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor};
 
 use crate::platform::platform;
 
@@ -339,97 +335,11 @@ async fn gateway_route_runtime_status(
 
 #[cfg(windows)]
 async fn set_windows_gateway_route(
-    state: &AppState,
+    _state: &AppState,
     workspace_id: &str,
     enabled: bool,
 ) -> AppResult<()> {
-    let (config, profiles) =
-        state.with_settings(|store| Ok((store.settings().mcp_gateway, store.list().to_vec())))?;
-    if !config.enabled {
-        return Err(AppError::Message("MCP Gateway 尚未启用".into()));
-    }
-    gateway::validate_config(&config, &profiles)?;
-    if enabled && !profiles.iter().any(|profile| profile.id == workspace_id) {
-        return Err(AppError::Message(format!(
-            "Gateway route workspace 不存在：{workspace_id}"
-        )));
-    }
-    if enabled {
-        let profile = profiles
-            .iter()
-            .find(|profile| profile.id == workspace_id)
-            .expect("validated workspace route");
-        let direct = crate::daemon::inspect(profile)?;
-        if direct
-            .state
-            .as_ref()
-            .filter(|_| direct.running && direct.pid_matches)
-            .is_some_and(|state| state.service.includes_mcp())
-        {
-            control::set_daemon_service(
-                profile,
-                WorkspaceService::Mcp,
-                false,
-                false,
-                DESKTOP_DAEMON_TIMEOUT,
-                true,
-            )
-            .await?;
-        }
-    }
-
-    let inspection = gateway_daemon::inspect()?;
-    if inspection.ambiguous {
-        return Err(AppError::Message(inspection.detail));
-    }
-    let current_state = inspection
-        .state
-        .filter(|_| inspection.running && inspection.pid_matches);
-    let mut routes = current_state
-        .as_ref()
-        .map(|state| state.workspace_ids.clone())
-        .unwrap_or_default();
-    routes.retain(|id| id != workspace_id);
-    if enabled {
-        routes.push(workspace_id.to_string());
-    }
-    routes.sort();
-    routes.dedup();
-
-    if let Some(current) = current_state {
-        if current.workspace_ids == routes {
-            gateway_control::ping()
-                .await
-                .map_err(|error| AppError::Message(error.to_string()))?;
-            #[cfg(windows)]
-            crate::windows_service::set_gateway_desired(&routes)?;
-            return Ok(());
-        }
-        let operation = if routes.is_empty() {
-            GatewayOperation::Shutdown
-        } else {
-            GatewayOperation::Restart
-        };
-        let accepted_pid = gateway_control::request_exit(operation)
-            .await
-            .map_err(|error| AppError::Message(error.to_string()))?;
-        if accepted_pid != current.pid {
-            return Err(AppError::Message(format!(
-                "Gateway route transition PID mismatch: state={}, response={accepted_pid}",
-                current.pid
-            )));
-        }
-        gateway_daemon::wait_for_exit(current.pid, DESKTOP_DAEMON_TIMEOUT, true).await?;
-    }
-
-    if !routes.is_empty() {
-        let pid = gateway_daemon::spawn(&routes)?;
-        if let Err(error) = gateway_daemon::wait_ready(pid, DESKTOP_DAEMON_TIMEOUT).await {
-            let _ = gateway_daemon::terminate_spawned(pid).await;
-            return Err(error);
-        }
-    }
-    crate::windows_service::set_gateway_desired(&routes)?;
+    crate::management::set_gateway_workspace_route(workspace_id, enabled).await?;
     Ok(())
 }
 

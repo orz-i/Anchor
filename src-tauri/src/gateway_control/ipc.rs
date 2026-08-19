@@ -153,6 +153,10 @@ pub enum GatewayControlCommand {
     Reload {
         operation_id: String,
     },
+    SetRoutes {
+        operation_id: String,
+        workspace_ids: Vec<String>,
+    },
     ApplyConfig {
         operation_id: String,
         config: Box<McpGatewayConfig>,
@@ -400,7 +404,7 @@ pub(crate) fn mark_operation_running(operation_id: &str) {
 }
 
 #[cfg(any(feature = "cli", test))]
-pub(crate) fn finish_reload_operation(operation_id: &str, result: AppResult<()>) {
+pub(crate) fn finish_operation(operation_id: &str, result: AppResult<()>) {
     let mut operations = operation_store()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -501,6 +505,50 @@ pub async fn request_reload(timeout: Duration) -> Result<(), GatewayControlClien
     if daemon_pid != state.pid {
         return Err(GatewayControlClientError::Protocol(format!(
             "Gateway reload PID mismatch: status file={}, response={daemon_pid}",
+            state.pid
+        )));
+    }
+    wait_for_operation(&operation_id, timeout).await
+}
+
+pub async fn request_set_routes(
+    workspace_ids: Vec<String>,
+    timeout: Duration,
+) -> Result<(), GatewayControlClientError> {
+    if workspace_ids.is_empty() {
+        return Err(GatewayControlClientError::Protocol(
+            "Gateway set_routes requires at least one workspace; use shutdown for zero routes"
+                .into(),
+        ));
+    }
+    let inspection = gateway_daemon::inspect().map_err(|error| {
+        GatewayControlClientError::Protocol(format!(
+            "cannot inspect Gateway daemon before route update: {error}"
+        ))
+    })?;
+    let state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .ok_or_else(|| {
+            GatewayControlClientError::Protocol(
+                "Gateway daemon is not running; set_routes requires its control plane".into(),
+            )
+        })?;
+    let (operation_id, daemon_pid) =
+        match request(GatewayMethod::SetRoutes { workspace_ids }).await? {
+            GatewayResult::OperationAccepted {
+                operation_id,
+                daemon_pid,
+            } => (operation_id, daemon_pid),
+            other => {
+                return Err(GatewayControlClientError::Protocol(format!(
+                    "Gateway daemon returned unexpected set_routes result: {other:?}"
+                )))
+            }
+        };
+    if daemon_pid != state.pid {
+        return Err(GatewayControlClientError::Protocol(format!(
+            "Gateway set_routes PID mismatch: status file={}, response={daemon_pid}",
             state.pid
         )));
     }
@@ -982,13 +1030,14 @@ where
     if let Some(command) = handled.command {
         let async_operation = match &command {
             GatewayControlCommand::Reload { operation_id }
+            | GatewayControlCommand::SetRoutes { operation_id, .. }
             | GatewayControlCommand::ApplyConfig { operation_id, .. } => Some(operation_id.clone()),
             GatewayControlCommand::Shutdown { .. } => None,
         };
         if command_sender.send(command).is_err() {
             let error = AppError::Message("Gateway control receiver is unavailable".into());
             if let Some(operation_id) = async_operation {
-                finish_reload_operation(&operation_id, Err(AppError::Message(error.to_string())));
+                finish_operation(&operation_id, Err(AppError::Message(error.to_string())));
             }
             return Err(error);
         }
@@ -1118,6 +1167,42 @@ async fn handle_request(request: GatewayRequest, command_available: bool) -> Han
                     },
                 ),
                 command: Some(GatewayControlCommand::Reload { operation_id }),
+            }
+        }
+        GatewayMethod::SetRoutes { workspace_ids } => {
+            if !command_available {
+                return handled(GatewayResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    "Gateway set_routes receiver is unavailable",
+                ));
+            }
+            if workspace_ids.is_empty() {
+                return handled(GatewayResponse::error(
+                    request_id,
+                    ERROR_OPERATION_FAILED,
+                    "Gateway set_routes requires at least one workspace; use shutdown for zero routes",
+                ));
+            }
+            let Some(operation_id) = create_operation(&expected_scope) else {
+                return handled(GatewayResponse::error(
+                    request_id,
+                    ERROR_CONTROL_COMMAND_UNAVAILABLE,
+                    format!("Gateway already has {MAX_OPERATIONS} retained control operations"),
+                ));
+            };
+            HandledRequest {
+                response: GatewayResponse::success(
+                    request_id,
+                    GatewayResult::OperationAccepted {
+                        operation_id: operation_id.clone(),
+                        daemon_pid: std::process::id(),
+                    },
+                ),
+                command: Some(GatewayControlCommand::SetRoutes {
+                    operation_id,
+                    workspace_ids,
+                }),
             }
         }
         GatewayMethod::ApplyConfig { config } => {
@@ -1351,7 +1436,7 @@ mod tests {
         );
 
         mark_operation_running(&operation_id);
-        finish_reload_operation(&operation_id, Ok(()));
+        finish_operation(&operation_id, Ok(()));
         let completed = handle_request(
             GatewayRequest {
                 protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
@@ -1372,6 +1457,49 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_routes_is_a_daemon_command_and_rejects_empty_route_sets() {
+        let scope = gateway_daemon::config_scope().expect("scope");
+        let handled = handle_request(
+            GatewayRequest {
+                protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+                request_id: "set-routes".into(),
+                config_scope: scope.clone(),
+                method: GatewayMethod::SetRoutes {
+                    workspace_ids: vec!["workspace-b".into(), "workspace-a".into()],
+                },
+            },
+            true,
+        )
+        .await;
+        assert!(handled.response.ok);
+        match handled.command.expect("set routes command") {
+            GatewayControlCommand::SetRoutes { workspace_ids, .. } => {
+                assert_eq!(workspace_ids, vec!["workspace-b", "workspace-a"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let rejected = handle_request(
+            GatewayRequest {
+                protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+                request_id: "set-routes-empty".into(),
+                config_scope: scope,
+                method: GatewayMethod::SetRoutes {
+                    workspace_ids: Vec::new(),
+                },
+            },
+            true,
+        )
+        .await;
+        assert!(!rejected.response.ok);
+        assert!(rejected.command.is_none());
+        assert_eq!(
+            rejected.response.error.expect("error").code,
+            ERROR_OPERATION_FAILED
+        );
     }
 
     #[tokio::test]

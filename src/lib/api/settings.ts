@@ -79,6 +79,13 @@ export async function setMcpGateway(
   return invokeAdmin<McpGatewayStatusDto>("set_mcp_gateway", { config });
 }
 
+export async function setMcpGatewayRoute(
+  id: string,
+  enabled: boolean,
+): Promise<McpGatewayStatusDto> {
+  return invokeAdmin<McpGatewayStatusDto>("set_mcp_gateway_route", { id, enabled });
+}
+
 export interface WindowsWorkspaceAutostartDto {
   workspaceId: string;
   service: "mcp" | "actions" | "all";

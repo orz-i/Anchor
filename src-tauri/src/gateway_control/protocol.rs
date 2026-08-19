@@ -65,6 +65,10 @@ pub enum GatewayMethod {
     Shutdown,
     PrepareRestart,
     Reload,
+    SetRoutes {
+        #[serde(rename = "workspaceIds")]
+        workspace_ids: Vec<String>,
+    },
     ApplyConfig {
         config: Box<McpGatewayConfig>,
     },
@@ -340,6 +344,22 @@ mod tests {
         assert_eq!(value["configScope"], "scope-1");
         assert_eq!(value["config"]["enabled"], true);
         assert_eq!(value["config"]["localPort"], 31_234);
+    }
+
+    #[test]
+    fn set_routes_request_has_a_stable_tagged_shape() {
+        let request = GatewayRequest {
+            protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
+            request_id: "request-routes".into(),
+            config_scope: "scope-1".into(),
+            method: GatewayMethod::SetRoutes {
+                workspace_ids: vec!["workspace-a".into(), "workspace-b".into()],
+            },
+        };
+        let value = serde_json::to_value(request).expect("serialize set routes");
+        assert_eq!(value["method"], "set_routes");
+        assert_eq!(value["workspaceIds"][0], "workspace-a");
+        assert_eq!(value["workspaceIds"][1], "workspace-b");
     }
 
     #[test]

@@ -8,6 +8,10 @@ export interface TunnelStatus {
   tunnelPid: number | null;
 }
 
+export async function startTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
+  return invokeAdmin<TunnelStatus>("start_tunnel", { id, service });
+}
+
 export async function stopTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
   return invokeAdmin<TunnelStatus>("stop_tunnel", { id, service });
 }

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::control::{
     self, ControlEventBatch, ControlEventCursor, ControlLogChunk, ControlLogSelection,
-    WorkspaceControlStatus,
+    DaemonLaunchSpec, WorkspaceControlStatus,
 };
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
@@ -24,6 +24,199 @@ enum GatewayConfigWriteAction {
     PersistLocally,
     ApplyViaDaemon { pid: u32 },
     ShutdownThenPersist { pid: u32 },
+}
+
+fn desired_gateway_routes(current: &[String], workspace_id: &str, enabled: bool) -> Vec<String> {
+    let mut routes = current
+        .iter()
+        .filter(|id| id.as_str() != workspace_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if enabled {
+        routes.push(workspace_id.to_string());
+    }
+    routes.sort();
+    routes.dedup();
+    routes
+}
+
+async fn restore_direct_workspace_after_gateway_failure(
+    profile: &WorkspaceProfile,
+    previous: Option<DaemonLaunchSpec>,
+    primary: AppError,
+) -> AppError {
+    let Some(previous) = previous else {
+        return primary;
+    };
+    match control::reconcile_daemon(profile, Some(previous), MANAGEMENT_DAEMON_TIMEOUT, true).await
+    {
+        Ok(_) => {
+            #[cfg(windows)]
+            if let Err(plan_error) =
+                crate::windows_service::set_workspace_desired(&profile.id, Some(previous))
+            {
+                return AppError::Message(format!(
+                    "{primary}；已恢复 Workspace daemon，但恢复 Windows Service 计划失败：{plan_error}"
+                ));
+            }
+            AppError::Message(format!(
+                "{primary}；已恢复该 Workspace 原有 MCP daemon 运行态"
+            ))
+        }
+        Err(rollback_error) => AppError::Message(format!(
+            "{primary}；恢复该 Workspace 原有 MCP daemon 运行态也失败：{rollback_error}"
+        )),
+    }
+}
+
+pub(crate) async fn set_gateway_workspace_route(
+    workspace_id: &str,
+    enabled: bool,
+) -> AppResult<GatewayControlStatus> {
+    let store = DataStore::load()?;
+    let config = store.settings().mcp_gateway;
+    let profiles = store.list().to_vec();
+    if !config.enabled {
+        return Err(AppError::Message("MCP Gateway 尚未启用".into()));
+    }
+    crate::mcp::gateway::validate_config(&config, &profiles)?;
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.id == workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Message(format!("Gateway route workspace 不存在：{workspace_id}"))
+        })?;
+    if enabled {
+        validate_service_start(&profiles, workspace_id, WorkspaceService::Mcp)?;
+        if !std::path::Path::new(&profile.path).is_dir() {
+            return Err(AppError::Message(format!(
+                "Workspace 目录不存在或不可用：{}",
+                profile.path
+            )));
+        }
+    }
+    drop(store);
+
+    let inspection = crate::gateway_daemon::inspect()?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    if inspection.running && !inspection.pid_matches {
+        return Err(AppError::Message(
+            "Gateway daemon reports running but PID ownership does not match".into(),
+        ));
+    }
+    let current_state = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches);
+    let current_routes = current_state
+        .as_ref()
+        .map(|state| state.workspace_ids.clone())
+        .unwrap_or_default();
+    let desired_routes = desired_gateway_routes(&current_routes, workspace_id, enabled);
+
+    if desired_routes == current_routes {
+        if current_state.is_some() {
+            gateway_control::ping()
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+        }
+        #[cfg(windows)]
+        crate::windows_service::set_gateway_desired(&desired_routes)?;
+        return gateway_control::status_via_daemon_or_local().await;
+    }
+
+    let direct_inspection = crate::daemon::inspect(&profile)?;
+    if direct_inspection.ambiguous {
+        return Err(AppError::Message(direct_inspection.detail));
+    }
+    let direct_previous = direct_inspection
+        .state
+        .as_ref()
+        .filter(|_| direct_inspection.running && direct_inspection.pid_matches)
+        .filter(|state| state.service.includes_mcp())
+        .map(|state| DaemonLaunchSpec {
+            service: state.service,
+            tunnels: state.managed_tunnels(),
+        });
+    if enabled && direct_previous.is_some() {
+        control::set_daemon_service(
+            &profile,
+            WorkspaceService::Mcp,
+            false,
+            false,
+            MANAGEMENT_DAEMON_TIMEOUT,
+            true,
+        )
+        .await?;
+    }
+
+    let transition = async {
+        match current_state {
+            Some(current) if desired_routes.is_empty() => {
+                let accepted_pid =
+                    gateway_control::request_exit(gateway_control::GatewayOperation::Shutdown)
+                        .await
+                        .map_err(|error| AppError::Message(error.to_string()))?;
+                if accepted_pid != current.pid {
+                    return Err(AppError::Message(format!(
+                        "Gateway route shutdown PID mismatch: state={}, response={accepted_pid}",
+                        current.pid
+                    )));
+                }
+                crate::gateway_daemon::wait_for_exit(
+                    current.pid,
+                    MANAGEMENT_DAEMON_TIMEOUT,
+                    false,
+                )
+                .await?;
+            }
+            Some(_) => {
+                gateway_control::request_set_routes(
+                    desired_routes.clone(),
+                    MANAGEMENT_DAEMON_TIMEOUT,
+                )
+                .await
+                .map_err(|error| AppError::Message(error.to_string()))?;
+            }
+            None if !desired_routes.is_empty() => {
+                let pid = crate::gateway_daemon::spawn(&desired_routes)?;
+                if let Err(error) =
+                    crate::gateway_daemon::wait_ready(pid, MANAGEMENT_DAEMON_TIMEOUT).await
+                {
+                    let cleanup = crate::gateway_daemon::terminate_spawned(pid).await;
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(AppError::Message(format!(
+                            "Gateway route 启动失败：{error}；清理 PID {pid} 也失败：{cleanup_error}"
+                        ))),
+                    };
+                }
+            }
+            None => {
+                crate::gateway_daemon::cleanup()?;
+            }
+        }
+        Ok::<(), AppError>(())
+    }
+    .await;
+
+    if let Err(error) = transition {
+        if enabled && direct_previous.is_some() {
+            return Err(restore_direct_workspace_after_gateway_failure(
+                &profile,
+                direct_previous,
+                error,
+            )
+            .await);
+        }
+        return Err(error);
+    }
+
+    #[cfg(windows)]
+    crate::windows_service::set_gateway_desired(&desired_routes)?;
+    gateway_control::status_via_daemon_or_local().await
 }
 
 fn gateway_config_write_action(
@@ -362,7 +555,13 @@ fn persist_tunnel_public_url(id: &str, kind: TunnelServiceKind, public_url: &str
             TunnelServiceKind::Actions => profile.actions.public_url = public_url.to_string(),
         }
         Ok(())
-    })
+    })?;
+    let service = match kind {
+        TunnelServiceKind::Mcp => "mcp",
+        TunnelServiceKind::Actions => "actions",
+    };
+    crate::runtime::update_public_url(id, service, public_url);
+    Ok(())
 }
 
 async fn daemon_tunnel_status(
@@ -401,17 +600,38 @@ fn load_tunnel_workspace(
     Ok(profile)
 }
 
+fn tunnel_is_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+    match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type != "none",
+        TunnelServiceKind::Actions => profile.actions.tunnel_type != "none",
+    }
+}
+
+pub(crate) async fn start_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelStatus> {
+    let kind = TunnelServiceKind::parse(service)?;
+    let profile = load_tunnel_workspace(id, kind, true)?;
+    if !tunnel_is_configured(&profile, kind) {
+        return configured_tunnel_status(&profile, kind);
+    }
+    let status = control::request_tunnel_operation(
+        &profile,
+        kind,
+        control::ControlTunnelAction::Start,
+        MANAGEMENT_TUNNEL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| AppError::Message(format!("daemon 隧道启动失败：{error}")))?;
+    persist_tunnel_public_url(id, kind, &status.public_url)?;
+    Ok(status)
+}
+
 pub(crate) async fn restart_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelStatus> {
     let kind = TunnelServiceKind::parse(service)?;
     let profile = load_tunnel_workspace(id, kind, true)?;
     if !crate::daemon::inspect(&profile)?.running {
         return configured_tunnel_status(&profile, kind);
     }
-    let configured = match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type != "none",
-        TunnelServiceKind::Actions => profile.actions.tunnel_type != "none",
-    };
-    if !configured {
+    if !tunnel_is_configured(&profile, kind) {
         return configured_tunnel_status(&profile, kind);
     }
     let current = daemon_tunnel_status(&profile, kind).await?;
@@ -442,6 +662,164 @@ pub(crate) async fn stop_workspace_tunnel(id: &str, service: &str) -> AppResult<
     )
     .await
     .map_err(|error| AppError::Message(format!("daemon 隧道停止失败：{error}")))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelTestResult {
+    pub success: bool,
+    pub public_url: String,
+    pub kept_running: bool,
+    pub message: String,
+}
+
+async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppResult<()> {
+    let base = public_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(AppError::Message("隧道未返回公网 URL。".into()));
+    }
+    let endpoint = match kind {
+        TunnelServiceKind::Mcp => format!("{base}/mcp"),
+        TunnelServiceKind::Actions => format!("{base}/openapi.json"),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .map_err(|error| AppError::Message(format!("创建公网探测客户端失败：{error}")))?;
+    let mut last_error = String::new();
+    for attempt in 0..5 {
+        match client.get(&endpoint).send().await {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = error.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
+    }
+    Err(AppError::Message(format!(
+        "frpc 已建立代理，但公网地址仍不可访问：{last_error}。若使用 FRP HTTPS→HTTP，请确认服务端字段为 vhostHTTPSPort。"
+    )))
+}
+
+async fn restore_tunnel_test_runtime(
+    profile: &WorkspaceProfile,
+    previous: Option<DaemonLaunchSpec>,
+) -> AppResult<()> {
+    control::reconcile_daemon(profile, previous, MANAGEMENT_TUNNEL_TIMEOUT, true)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn test_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelTestResult> {
+    let kind = TunnelServiceKind::parse(service)?;
+    let target_service = workspace_service_for_tunnel(kind);
+    let profile = load_tunnel_workspace(id, kind, true)?;
+    if !tunnel_is_configured(&profile, kind) {
+        return Err(AppError::Message("当前服务未配置隧道。".into()));
+    }
+    let inspection = crate::daemon::inspect(&profile)?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    if inspection.running && !inspection.pid_matches {
+        return Err(AppError::Message(
+            "Workspace daemon reports running but PID ownership does not match".into(),
+        ));
+    }
+    let previous = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+        .map(|state| DaemonLaunchSpec {
+            service: state.service,
+            tunnels: state.managed_tunnels(),
+        });
+    let service_was_running =
+        previous.is_some_and(|spec| control::service_is_selected(spec.service, target_service));
+
+    if !service_was_running {
+        let desired_service = control::desired_service_selection(
+            previous.map(|spec| spec.service),
+            target_service,
+            true,
+        )
+        .expect("enabling a service always yields a daemon selection");
+        control::reconcile_daemon(
+            &profile,
+            Some(DaemonLaunchSpec {
+                service: desired_service,
+                tunnels: previous.and_then(|spec| spec.tunnels),
+            }),
+            MANAGEMENT_TUNNEL_TIMEOUT,
+            true,
+        )
+        .await?;
+    }
+
+    let before = daemon_tunnel_status(&profile, kind).await?;
+    let action = if before.state == "running" {
+        control::ControlTunnelAction::Restart
+    } else {
+        control::ControlTunnelAction::Start
+    };
+    let status =
+        match control::request_tunnel_operation(&profile, kind, action, MANAGEMENT_TUNNEL_TIMEOUT)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                if !service_was_running {
+                    let _ = restore_tunnel_test_runtime(&profile, previous).await;
+                }
+                return Err(AppError::Message(format!(
+                    "daemon 隧道测试启动失败：{error}"
+                )));
+            }
+        };
+
+    let public_url = status.public_url.clone();
+    if let Err(error) = probe_public_tunnel(&public_url, kind).await {
+        if !service_was_running {
+            let _ = control::request_tunnel_operation(
+                &profile,
+                kind,
+                control::ControlTunnelAction::Stop,
+                MANAGEMENT_TUNNEL_TIMEOUT,
+            )
+            .await;
+            let _ = restore_tunnel_test_runtime(&profile, previous).await;
+        }
+        return Err(error);
+    }
+
+    if service_was_running {
+        persist_tunnel_public_url(id, kind, &public_url)?;
+        return Ok(TunnelTestResult {
+            success: !public_url.is_empty() || status.state == "running",
+            public_url,
+            kept_running: true,
+            message: "隧道测试成功，已保持连接（服务运行中）。".into(),
+        });
+    }
+
+    control::request_tunnel_operation(
+        &profile,
+        kind,
+        control::ControlTunnelAction::Stop,
+        MANAGEMENT_TUNNEL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| AppError::Message(format!("测试后停止 daemon 隧道失败：{error}")))?;
+    restore_tunnel_test_runtime(&profile, previous).await?;
+
+    Ok(TunnelTestResult {
+        success: !public_url.is_empty(),
+        public_url: public_url.clone(),
+        kept_running: false,
+        message: if public_url.is_empty() {
+            "隧道进程已退出，未获取到公网地址。".into()
+        } else {
+            "隧道配置验证通过。本地服务未运行，测试连接已自动断开。".into()
+        },
+    })
 }
 
 pub(crate) async fn read_gateway_logs(lines: u32) -> AppResult<gateway_control::GatewayLogChunk> {
@@ -982,6 +1360,23 @@ mod tests {
         settings.mcp_gateway.enabled = true;
         assert!(reject_gateway_managed_mcp(&settings, WorkspaceService::Mcp).is_err());
         assert!(reject_gateway_managed_mcp(&settings, WorkspaceService::Actions).is_ok());
+    }
+
+    #[test]
+    fn gateway_route_selection_is_sorted_deduplicated_and_idempotent() {
+        let current = vec!["workspace-b".into(), "workspace-a".into()];
+        assert_eq!(
+            desired_gateway_routes(&current, "workspace-a", true),
+            vec!["workspace-a", "workspace-b"]
+        );
+        assert_eq!(
+            desired_gateway_routes(&current, "workspace-c", true),
+            vec!["workspace-a", "workspace-b", "workspace-c"]
+        );
+        assert_eq!(
+            desired_gateway_routes(&current, "workspace-b", false),
+            vec!["workspace-a"]
+        );
     }
 }
 

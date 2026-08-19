@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listFrpProfiles, type FrpProfileDto } from "$lib/api/settings";
-  import { testTunnel as invokeTunnelTest } from "$lib/api/tunnel";
+  import {
+    startTunnel as invokeTunnelStart,
+    testTunnel as invokeTunnelTest,
+  } from "$lib/api/tunnel";
   import SecretTokenField from "$lib/components/SecretTokenField.svelte";
   import { showToast } from "$lib/stores/toast";
 
@@ -17,6 +20,28 @@
     frp_key_path: string;
     cloudflare_mode: string;
     use_proxy: boolean;
+  }
+
+  async function startTunnelConnection() {
+    if (!canTest || starting) return;
+    starting = true;
+    try {
+      if (dirty) {
+        await saveDraft({ skipTunnelRestart: true, skipServicePrompt: true });
+      }
+      const result = await invokeTunnelStart(workspaceId, service);
+      if (result.publicUrl && draft.cloudflare_mode === "quick") {
+        draft.public_url = result.publicUrl;
+      }
+      showToast(
+        result.publicUrl ? `隧道已启动。\n${result.publicUrl}` : `隧道状态：${result.state}`,
+        { title: "隧道已启动", kind: "success", duration: 7000 },
+      );
+    } catch (error) {
+      showToast(String(error), { title: "启动隧道失败", kind: "error", duration: 8000 });
+    } finally {
+      starting = false;
+    }
   }
 
   export interface SaveTunnelOptions {
@@ -47,6 +72,7 @@
     use_proxy: true,
   });
   let saving = $state(false);
+  let starting = $state(false);
   let testing = $state(false);
   let tokenField = $state<SecretTokenField | null>(null);
   let tokenPending = $state(false);
@@ -383,7 +409,15 @@
       <button
         type="button"
         class="tx-btn-ghost px-3 py-1.5 text-sm disabled:opacity-50"
-        disabled={testing || saving}
+        disabled={starting || testing || saving}
+        onclick={() => void startTunnelConnection()}
+      >
+        {starting ? "启动中…" : "启动隧道"}
+      </button>
+      <button
+        type="button"
+        class="tx-btn-ghost px-3 py-1.5 text-sm disabled:opacity-50"
+        disabled={starting || testing || saving}
         onclick={() => void testTunnelConnection()}
       >
         {testing ? "测试中…" : "测试连接"}
@@ -392,7 +426,7 @@
     <button
       type="submit"
       class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-      disabled={saving || testing || !dirty}
+      disabled={saving || starting || testing || !dirty}
     >
       {saving ? "保存中…" : "保存配置"}
     </button>

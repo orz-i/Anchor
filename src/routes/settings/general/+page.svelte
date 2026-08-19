@@ -9,6 +9,7 @@
     installWindowsService,
     restartWindowsService,
     setMcpGateway,
+    setMcpGatewayRoute,
     setProxy,
     startWindowsService,
     stopWindowsService,
@@ -43,6 +44,7 @@
   let gatewayStatus = $state<McpGatewayStatusDto | null>(null);
   let gatewayChanged = $state(false);
   let gatewaySaving = $state(false);
+  let gatewayRouteBusy = $state<Record<string, boolean>>({});
   let gatewayRefreshing = false;
   let gatewayEventFault = $state("");
   let gatewayLog = $state<GatewayLogChunk | null>(null);
@@ -66,6 +68,23 @@
       }
     } finally {
       gatewayRefreshing = false;
+    }
+  }
+
+  async function toggleGatewayRoute(workspace: WorkspaceProfile, enabled: boolean) {
+    if (gatewayRouteBusy[workspace.id] || gatewayChanged || gatewaySaving) return;
+    gatewayRouteBusy[workspace.id] = true;
+    try {
+      gatewayStatus = await setMcpGatewayRoute(workspace.id, enabled);
+      await refreshGatewayLog();
+      await message(
+        enabled ? `${workspace.name} 已加入 Gateway routes。` : `${workspace.name} 已移出 Gateway routes。`,
+        { title: "Gateway route", kind: "info" },
+      );
+    } catch (e) {
+      await message(String(e), { title: "Gateway route 操作失败", kind: "error" });
+    } finally {
+      gatewayRouteBusy[workspace.id] = false;
     }
   }
 
@@ -492,16 +511,31 @@
             <p class="text-xs font-medium">ChatGPT 工作区连接地址</p>
             <div class="mt-2 grid max-h-48 gap-2 overflow-auto">
               {#each workspaces as workspace}
-                <div class="grid gap-0.5 text-xs">
-                  <span class="flex flex-wrap items-center gap-2 text-[var(--text-muted)]">
-                    <span>{workspace.name}</span>
-                    <span>
-                      {gatewayRouteActive(workspace.id)
-                        ? "路由已注册"
-                        : "未启动 · 当前返回 404"}
+                <div class="flex items-start justify-between gap-3 rounded-md border border-[var(--border)] bg-[var(--page-bg)] p-2">
+                  <div class="grid min-w-0 gap-0.5 text-xs">
+                    <span class="flex flex-wrap items-center gap-2 text-[var(--text-muted)]">
+                      <span>{workspace.name}</span>
+                      <span>
+                        {gatewayRouteActive(workspace.id)
+                          ? "路由已注册"
+                          : "未启动 · 当前返回 404"}
+                      </span>
                     </span>
-                  </span>
-                  <code class="break-all">{gatewayWorkspaceUrl(workspace.id)}</code>
+                    <code class="break-all">{gatewayWorkspaceUrl(workspace.id)}</code>
+                  </div>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded-md border border-[var(--border)] px-2.5 py-1 text-xs disabled:opacity-50"
+                    disabled={gatewayChanged || gatewaySaving || gatewayRouteBusy[workspace.id]}
+                    onclick={() => void toggleGatewayRoute(workspace, !gatewayRouteActive(workspace.id))}
+                    title={gatewayChanged ? "请先保存 Gateway 配置" : undefined}
+                  >
+                    {gatewayRouteBusy[workspace.id]
+                      ? "处理中…"
+                      : gatewayRouteActive(workspace.id)
+                        ? "停止路由"
+                        : "启动路由"}
+                  </button>
                 </div>
               {/each}
             </div>
