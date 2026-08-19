@@ -179,6 +179,9 @@ GUI 工作区控制迁移现状：
 - Tauri `AppState` 已不再持有 `RuntimeSupervisor`；desktop maintenance 与窗口退出时的 Gateway/Tunnel 清理已删除，桌面进程退出不再影响 daemon 所有的运行资源；
 - Svelte 业务页面/API 已不再直接依赖 Tauri 包，统一经 `invokeAdmin` 与 platform dialog adapter；Tauri 依赖只允许存在于这两个适配边界内，并由架构守卫测试约束；
 - `anchor admin serve [--port PORT]` 仍固定绑定 `127.0.0.1`，现在由同一进程同时托管版本化 `/api/v1` 与生产 Svelte 静态站点；`pnpm cli:build` 会先执行 adapter-static 构建，再把 `build/` 作为只读资源嵌入 CLI 二进制，因此运行时不依赖单独的 Node/Vite 服务；
+- Web Admin 已新增独立的 persistent Admin daemon/service 层：`anchor admin start|stop|restart|status` 管理后台 Admin daemon，内部 `admin daemon-run` 只托管 loopback Web Admin HTTP/UI，不持有 Workspace、Gateway、Tunnel 或 RuntimeSupervisor。daemon 使用独立 `admin.lock/admin.pid/admin.json` 与 `logs/admin/daemon.log`，状态发布 PID、port、config scope、executable 和 `BuildIdentity`；启动前检查端口所有者，绝不接管其他进程监听；
+- `anchor admin install|uninstall|enable|disable|upgrade` 提供 OS autostart 治理。Linux 使用按 config scope 隔离的 `systemd --user` unit，并要求当前用户 linger 可用以保证重启后启动；Windows 使用当前用户 Task Scheduler、InteractiveToken/LeastPrivilege。两端 crash recovery 都限定为 5 秒间隔、最多 3 次，避免无限 crash loop。`admin upgrade` 使用当前 CLI executable/build 重建 OS 注册并重启，`status` 在运行态和停止态都能识别 build drift；本地 service config 与 OS 注册不一致时 fail closed，要求 upgrade/install 修复，不静默降级为非托管进程；
+- Admin daemon 对状态文件丢失/陈旧 PID 有受控恢复：Linux 可通过 `/proc` 的完整 `--config-dir ... admin daemon-run` 命令行重建同 config-scope 运行态；已注册服务还可通过 loopback 监听 PID + 注册 executable identity 恢复缺失状态。恢复来源无法证明 build identity 时显式报告 `unknown`，不会伪造 current。Linux 本轮已用隔离 config dir live 验证 start → 删除 pid/state → `/proc` 恢复 status → stop；OS autostart install 未在开发主机上做副作用型 live install，Windows Task Scheduler 实机启动/重启仍属于发布验收；
 - 浏览器必须先 `POST /api/v1/session` 建立进程内独立管理会话。会话 ID 只通过 `HttpOnly; SameSite=Strict` cookie 发送，CSRF token 单独返回给同源页面；所有管理 command 都要求精确 `Host`、精确 `Origin`、same-origin Fetch 标记、有效 session 与 CSRF token，不复用 MCP/Actions 的公网认证凭据；
 - Web Admin 已迁移工作区/控制面状态与事件、MCP/Actions runtime 状态、Workspace/Gateway 日志、Gateway 状态/事件、FRP profile 列表、software 状态、secret **读取**和 Windows Service 状态读取，用于现有管理 UI 的首屏和诊断展示；
 - 普通管理能力已继续补齐：Workspace 创建/删除、目录打开、Skill inspection、Health checks、Canvs snapshot/task、FRP 非敏感 metadata 保存与 profile 删除均进入共享 `management.rs` 并由 Web dispatcher 暴露；FRP metadata 与 Token 写入已经拆成两个独立权限域，浏览器先持久化非敏感 metadata，再对稳定 profile ID 单独执行高权限 Token 确认；
@@ -192,7 +195,7 @@ GUI 工作区控制迁移现状：
 - 当前仍保留 unavailable 的旧高权限兼容命令主要是 `save_frp_profile`，避免重新把 FRP metadata 与 Token 合并为单一权限面。Web Admin session/health 按平台发布 `supportedCommands`、`mutationCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 与 `unavailableCommands`；
 - Web adapter 会自动建立/缓存管理 session，并在 401 后最多重新 bootstrap 一次。业务页面仍无需感知 Tauri/Web transport 差异；架构守卫会扫描前端 API command，要求每个调用要么存在于正向 Web manifest，要么明确列入 privileged 集合。
 
-下一轮重点转向持久化 `anchor admin` 的 service/autostart/status/upgrade/recovery 治理，以及桌面停止发布/弃用门槛复核。Windows Service Web executor 的真实 UAC/SCM 行为仍属于 Windows 发布验收项；当前 Linux 验证主机未安装 Windows Rust target，也无法替代真实 SCM/UAC live test。
+至此 Web 管理能力、全部已评审 privileged executor 与 persistent Admin service 的代码迁移门槛已基本闭合。下一轮应进入**桌面停止发布/弃用门槛复核**：盘点仍仅由 Tauri 提供的能力、构建/发布依赖和兼容入口，先停止把 desktop 作为必需管理入口，再分阶段删除 Tauri feature/dependencies/scripts。Windows Service Web executor 的真实 UAC/SCM 行为，以及 Windows Admin Task Scheduler 的真实 logon/restart 行为，仍属于 Windows 发布验收项；当前 Linux 验证主机不能替代这些实机 smoke。
 
 ### 阶段 4：运行与升级治理
 
@@ -202,6 +205,7 @@ GUI 工作区控制迁移现状：
 - Workspace/Gateway daemon state 与 `version` 已发布 additive `buildIdentity`；CLI doctor 可比较当前客户端构建与活动 Workspace daemon；Gateway canonical status 也携带 build identity；
 - 协议兼容严格限制在只读 `version` 与稳定 lifecycle drain：Workspace 仅允许新客户端对 v2+ 旧 daemon 发送 `shutdown/prepare_restart`，Gateway 下限为 v1；其他写操作仍精确版本 fail-closed；
 - Windows SCM 发布经过 PID/image 校验的 runtime build identity；`service status` 区分 current/different/unknown，显式 `service install` 更新已有 Service 时会等待旧 supervisor 停止后启动当前二进制；
+- Web Admin 自身的持久运行权已独立于 desktop：Admin daemon 使用单独 lock/PID/state/build identity，OS autostart 仅负责拉起 `admin daemon-run`。Linux systemd user 与 Windows Task Scheduler 均使用 bounded restart policy；Admin service 不进入 Workspace/Gateway supervisor，也不会在自身退出时清理业务 runtime；
 - 服务安装状态、日志轮转和资源限制；
 - 可重复的跨平台安装、升级、降级和卸载测试；Linux runtime rollout 自动回滚链已进入代码与回归范围，Windows SCM 安装包升级后的真实管理员/重启 smoke 仍属于发布验收项。
 

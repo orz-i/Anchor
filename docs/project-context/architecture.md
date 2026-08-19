@@ -83,7 +83,9 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 - 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
 - 桌面进程不得维护 listener、Tunnel 或 Gateway；退出桌面壳不得影响后台 daemon 运行态。
 
-当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 仅绑定 loopback，并同源托管嵌入 CLI 的生产 Svelte 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
+当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 保留为前台调试入口；生产持久运行由独立 `admin daemon-run` 承担，两者都只绑定 loopback 并同源托管嵌入 CLI 的生产 Svelte 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
+
+Persistent Admin daemon 是单独的**管理面托管域**，不是新的业务运行 supervisor。它使用独立 `admin.lock/admin.pid/admin.json` 与 Admin log；状态包含 config scope、PID、port、executable 和 build identity。Linux 通过 systemd user + linger 注册 autostart，Windows 通过当前用户 Task Scheduler 注册；两端失败重启均有固定次数/时间窗上限。Admin service 只负责让 Web Admin 在 desktop 不存在时持续可达，不允许调用 Workspace/Gateway/Tunnel supervisor 的内部运行编排。状态文件丢失时只允许通过受验证的 config-scope 命令行或监听 PID + executable identity 恢复；无法证明 build identity 时状态为 unknown。OS 注册丢失而本地 service config 尚在时 fail closed，要求 `anchor admin upgrade/install` 修复。
 
 `management.rs` 是 Web/Tauri 共用的管理语义边界。除读取能力外，Workspace 创建/删除、目录打开、Skill inspection、Health、Canvs、FRP 非敏感 metadata CRUD 已从 desktop command 提升到共享层；Workspace 配置通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP/Actions runtime 与 Tunnel start/restart/stop/test 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层；per-workspace route selector 使用 Gateway control protocol 的 additive `set_routes`，运行中的 Gateway 在同一 daemon PID 内切换 route 集合并在失败时恢复旧运行态，不允许 HTTP/Tauri 直接写 Gateway runtime。HTTP handler 只负责安全校验、参数反序列化和调用共享层，不持有 daemon/Tunnel/Gateway 运行权威。
 
@@ -96,6 +98,13 @@ Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；�
 - **边界**: 自身不创建 listener、RuntimeSupervisor、Tunnel Supervisor 或 Gateway runtime；运行读写委托 `control` / `gateway_control`，配置事务复用 CLI config engine，必要磁盘持久化继续使用原子 `DataStore`/Gateway config 路径。
 - **安全**: secret key allowlist 在共享层统一校验；Web 传输层只在独立管理 session 校验后才能调用。Secret/FRP Token、Software 和 Windows Service lifecycle 均必须经过 `admin_security.rs` 的 target-bound 一次性 grant；Service 仅在 Windows 发布 executor，非 Windows fail closed。
 - **迁移原则**: 新管理能力先进入共享层，再分别由 Tauri/Web adapter 暴露，禁止直接在 HTTP handler 复制桌面 command 业务逻辑。
+
+### admin_daemon.rs / admin_service.rs
+- **职责**: 独立托管 loopback Web Admin，并提供 `admin start/stop/restart/status/install/uninstall/enable/disable/upgrade` 的进程与 OS autostart 治理。
+- **运行权边界**: Admin daemon 不持有 Workspace listener、RuntimeSupervisor、Tunnel Supervisor 或 Gateway runtime；业务生命周期仍只由既有 Workspace/Gateway daemon/control 域负责。
+- **状态与恢复**: Admin daemon 使用独立 lock/PID/state/build identity；端口冲突拒绝接管。Linux 可从 `/proc` 恢复同 config-scope daemon；已注册服务可按 listener PID + executable identity 恢复缺失状态。恢复证据不足时 fail closed/unknown。
+- **OS 管理**: Linux 为 config-scope 独立 systemd user unit，并要求 linger 以覆盖机器重启；Windows 为当前用户 Task Scheduler。两端 restart-on-failure 都限制为 5 秒间隔、最多 3 次。service config 记录注册时 current executable/build，`admin upgrade` 用当前 CLI 重新注册并重启。
+- **与 Tauri 的关系**: persistent Admin 完全由 CLI/OS service manager 管理，不依赖 desktop 窗口或 Tauri 生命周期；这是停止 desktop 作为必需管理入口的前置条件。
 
 ## 核心模块
 
