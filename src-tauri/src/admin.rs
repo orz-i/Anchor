@@ -15,7 +15,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::admin_security::{
-    privileged_actions, read_admin_audit_events, PrivilegedConfirmationStore,
+    available_privileged_executors, privileged_actions, read_admin_audit_events,
+    unavailable_privileged_actions, PrivilegedActionBinding, PrivilegedConfirmationStore,
 };
 use crate::control::{self, ControlPlaneEventCursor};
 use crate::data::DataStore;
@@ -49,6 +50,7 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "set_last_workspace",
     "list_frp_profiles",
     "save_frp_profile_metadata",
+    "set_frp_profile_token",
     "delete_frp_profile",
     "get_runtime_status",
     "test_tunnel",
@@ -62,7 +64,11 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_workspace_control_status",
     "get_workspace_control_events",
     "get_workspace_secret",
+    "set_workspace_secret",
+    "regenerate_workspace_secret",
     "get_shared_secret",
+    "set_shared_secret",
+    "regenerate_shared_secret",
     "get_mcp_gateway",
     "get_mcp_gateway_status",
     "set_mcp_gateway",
@@ -157,6 +163,54 @@ struct SharedSecretArgs {
     key: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetWorkspaceSecretArgs {
+    id: String,
+    key: String,
+    value: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegenerateWorkspaceSecretArgs {
+    id: String,
+    key: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetSharedSecretArgs {
+    key: String,
+    value: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegenerateSharedSecretArgs {
+    key: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetFrpProfileTokenArgs {
+    id: String,
+    token: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteFrpProfileArgs {
+    id: String,
+    #[serde(default)]
+    grant_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct GatewayEventsArgs {
@@ -213,6 +267,7 @@ struct ApplyWorkspaceConfigArgs {
 #[derive(Debug, Deserialize)]
 struct PrivilegedPrepareArgs {
     action: String,
+    binding: PrivilegedActionBinding,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,7 +387,9 @@ async fn health() -> Json<Value> {
             "sessionRequired": true,
             "uiEmbedded": ADMIN_UI_EMBEDDED,
             "supportedCommands": WEB_ADMIN_SUPPORTED_COMMANDS,
-            "unavailableCommands": privileged_actions(),
+            "privilegedCommands": privileged_actions(),
+            "privilegedExecutors": available_privileged_executors(),
+            "unavailableCommands": unavailable_privileged_actions(),
             "mutationCommands": [
                 "create_workspace",
                 "open_workspace_directory",
@@ -341,7 +398,12 @@ async fn health() -> Json<Value> {
                 "confirm_privileged_action",
                 "set_last_workspace",
                 "save_frp_profile_metadata",
+                "set_frp_profile_token",
                 "delete_frp_profile",
+                "set_workspace_secret",
+                "regenerate_workspace_secret",
+                "set_shared_secret",
+                "regenerate_shared_secret",
                 "set_proxy",
                 "set_download_config",
                 "stage_workspace_config",
@@ -488,7 +550,9 @@ async fn create_session(State(state): State<AdminState>, headers: HeaderMap) -> 
                 "csrfToken": csrf_token,
                 "idleTimeoutSeconds": ADMIN_SESSION_IDLE_TTL.as_secs(),
                 "supportedCommands": WEB_ADMIN_SUPPORTED_COMMANDS,
-                "unavailableCommands": privileged_actions()
+                "privilegedCommands": privileged_actions(),
+                "privilegedExecutors": available_privileged_executors(),
+                "unavailableCommands": unavailable_privileged_actions()
             }
         })),
     )
@@ -654,6 +718,49 @@ impl From<AppError> for AdminDispatchError {
     }
 }
 
+fn consume_privileged_grant(
+    state: &AdminState,
+    session_id: &str,
+    grant_id: &str,
+    action: &str,
+    binding: &PrivilegedActionBinding,
+) -> Result<(), AdminDispatchError> {
+    state
+        .privileged_confirmations
+        .lock()
+        .map_err(|_| {
+            AdminDispatchError::Failed(AppError::Message(
+                "privileged confirmation store poisoned".into(),
+            ))
+        })?
+        .consume_grant(session_id, grant_id, action, binding)
+        .map_err(AdminDispatchError::Rejected)
+}
+
+fn finish_privileged_execution<T>(
+    state: &AdminState,
+    session_id: &str,
+    action: &str,
+    result: AppResult<T>,
+) -> Result<T, AdminDispatchError> {
+    let succeeded = result.is_ok();
+    let audit = state
+        .privileged_confirmations
+        .lock()
+        .map_err(|_| AppError::Message("privileged confirmation store poisoned".into()))
+        .and_then(|store| store.record_execution_outcome(session_id, action, succeeded));
+    match (result, audit) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(AdminDispatchError::Failed(error)),
+        (Ok(_), Err(audit_error)) => Err(AdminDispatchError::Failed(AppError::Message(format!(
+            "高权限操作已执行，但审计结果写入失败：{audit_error}"
+        )))),
+        (Err(error), Err(audit_error)) => Err(AdminDispatchError::Failed(AppError::Message(
+            format!("{error}；审计结果写入也失败：{audit_error}"),
+        ))),
+    }
+}
+
 async fn dispatch_command(
     state: &AdminState,
     session_id: &str,
@@ -668,7 +775,7 @@ async fn dispatch_command(
                 .privileged_confirmations
                 .lock()
                 .map_err(|_| AppError::Message("privileged confirmation store poisoned".into()))?
-                .prepare(session_id, &input.action)
+                .prepare(session_id, &input.action, &input.binding)
                 .map_err(AdminDispatchError::Rejected)?;
             serde_json::to_value(prepared)
                 .map_err(AppError::from)
@@ -782,9 +889,50 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "set_frp_profile_token" => {
+            let input: SetFrpProfileTokenArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::frp_profile(&input.id);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "set_frp_profile_token",
+                &binding,
+            )?;
+            let result = management::set_frp_profile_token(&input.id, &input.token);
+            let saved =
+                finish_privileged_execution(state, session_id, "set_frp_profile_token", result)?;
+            serde_json::to_value(saved)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "delete_frp_profile" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            management::delete_frp_profile(&input.id)?;
+            let input: DeleteFrpProfileArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let has_token = management::frp_profile_has_token(&input.id)?;
+            if let Some(grant_id) = input.grant_id.as_deref() {
+                let binding = PrivilegedActionBinding::frp_profile(&input.id);
+                consume_privileged_grant(
+                    state,
+                    session_id,
+                    grant_id,
+                    "delete_frp_profile",
+                    &binding,
+                )?;
+                finish_privileged_execution(
+                    state,
+                    session_id,
+                    "delete_frp_profile",
+                    management::delete_frp_profile(&input.id),
+                )?;
+            } else if has_token {
+                return Err(AdminDispatchError::Rejected(AppError::Message(
+                    "删除含 FRP Token 的 profile 需要高权限确认。".into(),
+                )));
+            } else {
+                management::delete_frp_profile(&input.id)?;
+            }
             Ok(Value::Null)
         }
         "get_runtime_status" => {
@@ -881,11 +1029,87 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "set_workspace_secret" => {
+            let input: SetWorkspaceSecretArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::workspace_secret(&input.id, &input.key);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "set_workspace_secret",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "set_workspace_secret",
+                management::set_workspace_secret(&input.id, &input.key, &input.value),
+            )?;
+            Ok(Value::Null)
+        }
+        "regenerate_workspace_secret" => {
+            let input: RegenerateWorkspaceSecretArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::workspace_secret(&input.id, &input.key);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "regenerate_workspace_secret",
+                &binding,
+            )?;
+            let value = finish_privileged_execution(
+                state,
+                session_id,
+                "regenerate_workspace_secret",
+                management::regenerate_workspace_secret(&input.id, &input.key),
+            )?;
+            Ok(Value::String(value))
+        }
         "get_shared_secret" => {
             let input: SharedSecretArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(management::get_shared_secret(&input.key)?)
                 .map_err(AppError::from)
                 .map_err(Into::into)
+        }
+        "set_shared_secret" => {
+            let input: SetSharedSecretArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::shared_secret(&input.key);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "set_shared_secret",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "set_shared_secret",
+                management::set_shared_secret(&input.key, &input.value),
+            )?;
+            Ok(Value::Null)
+        }
+        "regenerate_shared_secret" => {
+            let input: RegenerateSharedSecretArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::shared_secret(&input.key);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "regenerate_shared_secret",
+                &binding,
+            )?;
+            let value = finish_privileged_execution(
+                state,
+                session_id,
+                "regenerate_shared_secret",
+                management::regenerate_shared_secret(&input.key),
+            )?;
+            Ok(Value::String(value))
         }
         "get_mcp_gateway" => serde_json::to_value(management::get_mcp_gateway()?)
             .map_err(AppError::from)
@@ -1128,8 +1352,27 @@ mod tests {
     async fn unimplemented_command_never_falls_through_to_mutation() {
         let state = test_state(HashMap::new());
         assert!(matches!(
-            dispatch_command(&state, "session", "set_shared_secret", json!({})).await,
+            dispatch_command(&state, "session", "install_software", json!({})).await,
             Err(AdminDispatchError::NotMigrated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn privileged_secret_executor_requires_a_valid_grant_before_mutation() {
+        let state = test_state(HashMap::new());
+        assert!(matches!(
+            dispatch_command(
+                &state,
+                "session",
+                "set_shared_secret",
+                json!({
+                    "key": "bearer_token",
+                    "value": "test-secret-value",
+                    "grantId": "missing-grant"
+                }),
+            )
+            .await,
+            Err(AdminDispatchError::Rejected(_))
         ));
     }
 }

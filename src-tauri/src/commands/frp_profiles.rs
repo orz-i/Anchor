@@ -26,11 +26,9 @@ pub fn save_frp_profile(
 ) -> AppResult<FrpProfileDto> {
     let mut saved = management::save_frp_profile_metadata(profile)?;
     if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
-        state.with_settings(|store| {
-            store.set_app_secret("frp_profile_token", &saved.id, token.trim())
-        })?;
-        saved.has_token = true;
+        saved = management::set_frp_profile_token(&saved.id, token.trim())?;
     }
+    state.reload_data_from_disk()?;
     Ok(saved)
 }
 

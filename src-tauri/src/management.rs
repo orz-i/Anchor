@@ -266,6 +266,39 @@ fn workspace_profile(id: &str) -> AppResult<WorkspaceProfile> {
     })
 }
 
+pub(crate) fn frp_profile_has_token(id: &str) -> AppResult<bool> {
+    DataStore::read_file(|data| {
+        if !data.frp_profiles.iter().any(|profile| profile.id == id) {
+            return Err(AppError::Message(format!("FRP profile not found: {id}")));
+        }
+        Ok(data
+            .app_secrets
+            .get("frp_profile_token")
+            .and_then(|tokens| tokens.get(id))
+            .is_some_and(|value| !value.trim().is_empty()))
+    })
+}
+
+pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfileDto> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(AppError::Message("FRP Token 不能为空。".into()));
+    }
+    DataStore::update_file(|data| {
+        let profile = data
+            .frp_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
+        data.app_secrets
+            .entry("frp_profile_token".into())
+            .or_default()
+            .insert(id.to_string(), token.to_string());
+        Ok(frp_profile_dto(data, &profile))
+    })
+}
+
 fn workspace_path(id: &str) -> AppResult<PathBuf> {
     workspace_profile(id).map(|profile| PathBuf::from(profile.path))
 }
@@ -1079,6 +1112,145 @@ pub(crate) fn get_workspace_secret(id: &str, key: &str) -> AppResult<Option<Stri
 pub(crate) fn get_shared_secret(key: &str) -> AppResult<Option<String>> {
     validate_shared_secret_key(key)?;
     DataStore::read_file(|data| Ok(data.shared_secrets.get(key).cloned()))
+}
+
+fn generated_secret() -> String {
+    format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "")
+}
+
+const MCP_SHARED_SECRET_KEYS: &[&str] = &[
+    "oauth_client_id",
+    "bearer_token",
+    "oauth_client_secret",
+    "oauth_password",
+    "oauth_token_secret",
+];
+
+const ACTIONS_SHARED_SECRET_KEYS: &[&str] = &[
+    "actions_api_key",
+    "actions_oauth_client_secret",
+    "actions_oauth_password",
+    "actions_oauth_token_secret",
+];
+
+fn schedule_secret_restart(profiles: Vec<WorkspaceProfile>, key: String, shared: bool) {
+    crate::async_runtime::spawn(async move {
+        for profile in &profiles {
+            restart_running_service_after_secret_change(profile, &key, shared).await;
+        }
+    });
+}
+
+async fn restart_running_service_after_secret_change(
+    profile: &WorkspaceProfile,
+    key: &str,
+    shared: bool,
+) {
+    let mcp_relevant =
+        MCP_SHARED_SECRET_KEYS.contains(&key) && profile.auth.use_shared_secrets == shared;
+    let actions_relevant =
+        ACTIONS_SHARED_SECRET_KEYS.contains(&key) && profile.actions.use_shared_secrets == shared;
+    match crate::daemon::inspect(profile) {
+        Ok(inspection) if inspection.running => {
+            let Some(daemon_state) = inspection.state else {
+                return;
+            };
+            let service = if mcp_relevant && daemon_state.service.includes_mcp() {
+                Some(WorkspaceService::Mcp)
+            } else if actions_relevant && daemon_state.service.includes_actions() {
+                Some(WorkspaceService::Actions)
+            } else {
+                None
+            };
+            if let Some(service) = service {
+                if let Err(error) = crate::control::restart_daemon_service(
+                    profile,
+                    service,
+                    daemon_state.tunnel,
+                    MANAGEMENT_DAEMON_TIMEOUT,
+                    true,
+                )
+                .await
+                {
+                    eprintln!(
+                        "daemon restart after secret mutation failed for {}: {error}",
+                        profile.id
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "daemon inspection after secret mutation failed for {}: {error}",
+                profile.id
+            );
+        }
+    }
+}
+
+pub(crate) fn set_workspace_secret(id: &str, key: &str, value: &str) -> AppResult<()> {
+    validate_workspace_secret_key(key)?;
+    DataStore::update_file(|data| {
+        if !data.profiles.iter().any(|profile| profile.id == id) {
+            return Err(AppError::Message(format!("workspace not found: {id}")));
+        }
+        data.workspace_secrets
+            .entry(id.to_string())
+            .or_default()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    })
+}
+
+pub(crate) fn regenerate_workspace_secret(id: &str, key: &str) -> AppResult<String> {
+    validate_workspace_secret_key(key)?;
+    let value = generated_secret();
+    let profile = DataStore::update_file(|data| {
+        let profile = data
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+        data.workspace_secrets
+            .entry(id.to_string())
+            .or_default()
+            .insert(key.to_string(), value.clone());
+        Ok(profile)
+    })?;
+    schedule_secret_restart(vec![profile], key.to_string(), false);
+    Ok(value)
+}
+
+pub(crate) fn set_shared_secret(key: &str, value: &str) -> AppResult<()> {
+    validate_shared_secret_key(key)?;
+    if value.is_empty() {
+        return Err(AppError::Message("密钥不能为空。".into()));
+    }
+    let profiles = DataStore::update_file(|data| {
+        if data
+            .shared_secrets
+            .get(key)
+            .is_some_and(|current| current == value)
+        {
+            return Ok(None);
+        }
+        data.shared_secrets
+            .insert(key.to_string(), value.to_string());
+        Ok(Some(data.profiles.clone()))
+    })?;
+    if let Some(profiles) = profiles {
+        schedule_secret_restart(profiles, key.to_string(), true);
+    }
+    Ok(())
+}
+
+pub(crate) fn regenerate_shared_secret(key: &str) -> AppResult<String> {
+    validate_shared_secret_key(key)?;
+    let value = generated_secret();
+    set_shared_secret(key, &value)?;
+    Ok(value)
 }
 
 pub(crate) fn list_frp_profiles() -> AppResult<Vec<FrpProfileDto>> {
