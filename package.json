@@ -1,20 +1,26 @@
 {
   "name": "anchor-desktop",
   "version": "0.1.23",
-  "description": "Anchor desktop workspace gateway",
+  "description": "Anchor Web Admin and CLI with a deprecated legacy desktop shell",
   "packageManager": "pnpm@11.18.0",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "desktop": "node scripts/run-with-rust-toolchain.mjs tauri dev",
-    "desktop:build": "node scripts/prepare-desktop-build.mjs && node scripts/run-with-rust-toolchain.mjs tauri build && node scripts/finalize-desktop-build.mjs",
-    "desktop:manifest": "node scripts/finalize-desktop-build.mjs",
+    "admin:serve": "pnpm build && node scripts/run-with-rust-toolchain.mjs cargo run --manifest-path src-tauri/Cargo.toml --bin anchor -- admin serve",
+    "release:build": "pnpm cli:build",
     "cli:build": "pnpm build && node scripts/run-with-rust-toolchain.mjs cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features cli --bin anchor",
-    "start": "node scripts/run-with-rust-toolchain.mjs tauri dev",
+    "start": "pnpm admin:serve",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "tauri": "node scripts/run-with-rust-toolchain.mjs tauri"
+    "legacy:desktop": "node scripts/run-with-rust-toolchain.mjs tauri dev",
+    "legacy:desktop:build": "node scripts/prepare-desktop-build.mjs && node scripts/run-with-rust-toolchain.mjs tauri build && node scripts/finalize-desktop-build.mjs",
+    "legacy:desktop:manifest": "node scripts/finalize-desktop-build.mjs",
+    "legacy:tauri": "node scripts/run-with-rust-toolchain.mjs tauri",
+    "desktop": "node scripts/deprecated-desktop.mjs dev",
+    "desktop:build": "node scripts/deprecated-desktop.mjs build",
+    "desktop:manifest": "node scripts/deprecated-desktop.mjs manifest",
+    "tauri": "node scripts/deprecated-desktop.mjs tauri"
   },
   "license": "Apache-2.0",
   "dependencies": {
