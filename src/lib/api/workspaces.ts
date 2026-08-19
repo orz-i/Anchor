@@ -1,4 +1,5 @@
 import { invokeAdmin, invokeRead } from "$lib/api/invoke";
+import { isTauriRuntime } from "$lib/platform/runtime";
 import type {
   ControlPlaneEventBatch,
   ControlPlaneEventCursor,
@@ -53,8 +54,63 @@ export async function createWorkspace(
   return invokeAdmin<WorkspaceProfile>("create_workspace", { path, name });
 }
 
-export async function updateWorkspace(profile: WorkspaceProfile): Promise<void> {
-  return invokeAdmin("update_workspace", { profile });
+export interface WorkspaceConfigChange {
+  path: string;
+  before: unknown;
+  after: unknown;
+}
+
+export interface WorkspaceConfigApplyPlan {
+  mcpListenerReload: boolean;
+  actionsListenerReload: boolean;
+  mcpCallbackPolicyHotUpdate: boolean;
+  actionsCallbackPolicyHotUpdate: boolean;
+  mcpTunnelChanged: boolean;
+  actionsTunnelChanged: boolean;
+}
+
+export interface WorkspaceConfigPreview {
+  event: string;
+  workspaceId: string;
+  staged: boolean;
+  changes: WorkspaceConfigChange[];
+  applyPlan: WorkspaceConfigApplyPlan;
+}
+
+export async function previewWorkspaceConfig(
+  baseProfile: WorkspaceProfile,
+  profile: WorkspaceProfile,
+): Promise<WorkspaceConfigPreview> {
+  return invokeAdmin<WorkspaceConfigPreview>("preview_workspace_config", {
+    baseProfile,
+    profile,
+  });
+}
+
+export async function stageWorkspaceConfig(
+  baseProfile: WorkspaceProfile,
+  profile: WorkspaceProfile,
+): Promise<WorkspaceConfigPreview> {
+  return invokeAdmin<WorkspaceConfigPreview>("stage_workspace_config", {
+    baseProfile,
+    profile,
+  });
+}
+
+export async function applyWorkspaceConfig(id: string, waitSeconds = 20): Promise<void> {
+  await invokeAdmin("apply_workspace_config", { id, waitSeconds });
+}
+
+export async function updateWorkspace(
+  profile: WorkspaceProfile,
+  baseProfile: WorkspaceProfile,
+): Promise<void> {
+  if (isTauriRuntime()) {
+    await invokeAdmin("update_workspace", { profile });
+    return;
+  }
+  await stageWorkspaceConfig(baseProfile, profile);
+  await applyWorkspaceConfig(profile.id);
 }
 
 export async function inspectWorkspaceSkills(

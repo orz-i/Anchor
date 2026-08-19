@@ -537,7 +537,7 @@
       ...profile,
       runtime: { ...profile.runtime, local_port: port },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     mcpLocal = mcpLocalEndpoint(port);
     await load();
@@ -551,7 +551,7 @@
       ...profile,
       actions: { ...current, local_port: port },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     actionsLocal = actionsLocalEndpoint(port);
     await load();
@@ -619,7 +619,7 @@
         use_proxy: config.use_proxy,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     if (!options?.skipTunnelRestart) {
       await restartTunnelIfConfigured(targetWorkspaceId, config, "mcp");
     }
@@ -654,7 +654,7 @@
         use_proxy: config.use_proxy,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     if (!options?.skipTunnelRestart) {
       await restartTunnelIfConfigured(targetWorkspaceId, config, "actions");
     }
@@ -684,7 +684,7 @@
         external_paid_max_duration_seconds: draft.externalPaidMaxDurationSeconds,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     await load();
   }
@@ -699,7 +699,7 @@
         skill_roots: config.roots,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     await load();
   }
@@ -713,7 +713,7 @@
         mcp_config: config,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     await load();
   }
@@ -730,7 +730,7 @@
         permission_mode: draft.permissionMode,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     await load();
   }
@@ -741,7 +741,7 @@
   ) {
     if (!profile || !workspaceId) return;
     const next: WorkspaceProfile = { ...profile, auth };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     if (mcpStatus === "running" && options.callbackPolicyOnly) {
       showToast("OAuth Callback 信任策略已热更新，当前授权流程不会中断", { kind: "success" });
@@ -766,7 +766,7 @@
         use_shared_secrets: draft.useSharedSecrets,
       },
     };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     if (actionsStatus === "running" && options.callbackPolicyOnly) {
       showToast("Actions OAuth Callback 信任策略已热更新，当前授权流程不会中断", { kind: "success" });
@@ -776,7 +776,7 @@
   async function saveWorkspaceName(name: string) {
     if (!profile || profile.name === name) return;
     const next: WorkspaceProfile = { ...profile, name };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     workspaces.update((items) =>
       items.map((item) => (item.id === next.id ? { ...item, name: next.name } : item)),
@@ -786,7 +786,7 @@
   async function saveWorkspacePath(path: string) {
     if (!profile || profile.path === path) return;
     const next: WorkspaceProfile = { ...profile, path };
-    await updateWorkspace(next);
+    await updateWorkspace(next, profile);
     profile = next;
     showToast("工作区目录已更新", { kind: "success" });
     await load();
