@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { supportsAdminCommand } from "$lib/api/invoke";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import { message } from "$lib/platform/dialog";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import SecretInput from "$lib/components/SecretInput.svelte";
@@ -236,7 +237,9 @@
       apiKey = draftUseShared
         ? await regenerateSharedSecret("actions_api_key")
         : await regenerateWorkspaceSecret(workspaceId, "actions_api_key");
+      loadedApiKey = apiKey;
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
       regenerating = false;
@@ -250,7 +253,9 @@
       oauthClientSecret = draftUseShared
         ? await regenerateSharedSecret("actions_oauth_client_secret")
         : await regenerateWorkspaceSecret(workspaceId, "actions_oauth_client_secret");
+      loadedOauthClientSecret = oauthClientSecret;
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
       regeneratingOAuthSecret = false;
@@ -264,7 +269,9 @@
       oauthPassword = draftUseShared
         ? await regenerateSharedSecret("actions_oauth_password")
         : await regenerateWorkspaceSecret(workspaceId, "actions_oauth_password");
+      loadedOauthPassword = oauthPassword;
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
       regeneratingOAuthPassword = false;
@@ -278,7 +285,9 @@
       oauthTokenSecret = draftUseShared
         ? await regenerateSharedSecret("actions_oauth_token_secret")
         : await regenerateWorkspaceSecret(workspaceId, "actions_oauth_token_secret");
+      loadedOauthTokenSecret = oauthTokenSecret;
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
       regeneratingOAuthTokenSecret = false;
@@ -310,6 +319,10 @@
   {#if !secretMutationSupported}
     <p class="text-xs text-[var(--text-muted)]">
       Web 管理面当前允许修改认证配置，但 Secret 仅可查看；重新生成将在高权限确认执行器接入后开放。
+    </p>
+  {:else}
+    <p class="text-xs text-[var(--text-muted)]">
+      Web 管理面重新生成 Actions Secret 时会要求一次目标绑定的二次确认。
     </p>
   {/if}
 

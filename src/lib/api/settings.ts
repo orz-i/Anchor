@@ -1,4 +1,5 @@
 import { invokeAdmin, invokeRead, supportsAdminCommand } from "$lib/api/invoke";
+import { invokePrivilegedAdmin } from "$lib/api/admin-security";
 import type { GatewayControlStatus } from "$lib/types";
 
 export interface FrpProfileDto {
@@ -27,10 +28,17 @@ export async function saveFrpProfile(
   if (await supportsAdminCommand("save_frp_profile")) {
     return invokeAdmin<FrpProfileDto>("save_frp_profile", { profile, token });
   }
-  if (token?.trim()) {
-    throw new Error("Web 管理面尚未开放 FRP Token 写入；请先保存非敏感配置。");
+  const tokenValue = token?.trim();
+  if (tokenValue && !(await supportsAdminCommand("set_frp_profile_token"))) {
+    throw new Error("Web 管理面尚未开放 FRP Token 写入。");
   }
-  return invokeAdmin<FrpProfileDto>("save_frp_profile_metadata", { profile });
+  const saved = await invokeAdmin<FrpProfileDto>("save_frp_profile_metadata", { profile });
+  if (!tokenValue) return saved;
+  return invokePrivilegedAdmin<FrpProfileDto>(
+    "set_frp_profile_token",
+    { id: saved.id, token: tokenValue },
+    { id: saved.id },
+  );
 }
 
 export async function getLastWorkspaceId(): Promise<string> {
@@ -42,7 +50,10 @@ export async function setLastWorkspace(id: string): Promise<void> {
 }
 
 export async function deleteFrpProfile(id: string): Promise<void> {
-  return invokeAdmin("delete_frp_profile", { id });
+  if (await supportsAdminCommand("save_frp_profile")) {
+    return invokeAdmin("delete_frp_profile", { id });
+  }
+  return invokePrivilegedAdmin("delete_frp_profile", { id }, { id });
 }
 
 export interface ProxyConfigDto {

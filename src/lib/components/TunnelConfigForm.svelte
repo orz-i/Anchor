@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listFrpProfiles, type FrpProfileDto } from "$lib/api/settings";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import {
     startTunnel as invokeTunnelStart,
     testTunnel as invokeTunnelTest,
@@ -142,6 +143,7 @@
       await saveDraft();
       showToast("隧道配置已保存。", { title: "保存成功", kind: "success" });
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       showToast(String(error), { title: "保存失败", kind: "error", duration: 8000 });
     } finally {
       saving = false;
@@ -172,6 +174,7 @@
         showToast(result.message, { title: "测试未完成", kind: "warning", duration: 7000 });
       }
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       showToast(String(error), { title: "测试失败", kind: "error", duration: 8000 });
     } finally {
       testing = false;

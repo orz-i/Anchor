@@ -74,7 +74,7 @@
 
 <label class="grid gap-1">
   <span class="text-xs text-[var(--text-muted)]">
-    {label}{mutationSupported ? "" : "（Web 当前只读）"}
+    {label}{mutationSupported ? "（Web 写入需二次确认）" : "（Web 当前只读）"}
   </span>
   <SecretInput
     bind:value={draft}

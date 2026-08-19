@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { supportsAdminCommand } from "$lib/api/invoke";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import { message } from "$lib/platform/dialog";
   import {
     deleteFrpProfile,
@@ -64,6 +65,7 @@
       resetForm();
       await refresh();
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "保存失败", kind: "error" });
     } finally {
       saving = false;
@@ -78,13 +80,14 @@
       }
       await refresh();
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "删除失败", kind: "error" });
     }
   }
 
   onMount(() => {
     void (async () => {
-      tokenMutationSupported = await supportsAdminCommand("save_frp_profile");
+      tokenMutationSupported = await supportsAdminCommand("set_frp_profile_token");
       await refresh();
     })();
   });
@@ -142,7 +145,7 @@
           <span class="text-xs text-[var(--text-muted)]">
             Token
             {#if tokenMutationSupported}
-              {editingId ? "（留空则保持不变）" : ""}
+              {editingId ? "（留空则保持不变；写入需二次确认）" : "（写入需二次确认）"}
             {:else}
               （Web 管理面当前只允许编辑非敏感 FRP 配置）
             {/if}

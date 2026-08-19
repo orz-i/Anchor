@@ -1,4 +1,5 @@
 import { invokeAdmin } from "$lib/api/invoke";
+import { invokePrivilegedAdmin } from "$lib/api/admin-security";
 
 export type WorkspaceSecretKey =
   | "oauth_client_secret"
@@ -26,14 +27,18 @@ export async function setWorkspaceSecret(
   key: WorkspaceSecretKey,
   value: string,
 ): Promise<void> {
-  return invokeAdmin("set_workspace_secret", { id, key, value });
+  return invokePrivilegedAdmin("set_workspace_secret", { id, key, value }, { id, key });
 }
 
 export async function regenerateWorkspaceSecret(
   id: string,
   key: WorkspaceSecretKey,
 ): Promise<string> {
-  return invokeAdmin<string>("regenerate_workspace_secret", { id, key });
+  return invokePrivilegedAdmin<string>(
+    "regenerate_workspace_secret",
+    { id, key },
+    { id, key },
+  );
 }
 
 // ── Shared secrets ───────────────────────────────────────────────────────
@@ -54,11 +59,11 @@ export async function getSharedSecret(key: SharedSecretKey): Promise<string | nu
 }
 
 export async function setSharedSecret(key: SharedSecretKey, value: string): Promise<void> {
-  return invokeAdmin("set_shared_secret", { key, value });
+  return invokePrivilegedAdmin("set_shared_secret", { key, value }, { key });
 }
 
 export async function regenerateSharedSecret(key: SharedSecretKey): Promise<string> {
-  return invokeAdmin<string>("regenerate_shared_secret", { key });
+  return invokePrivilegedAdmin<string>("regenerate_shared_secret", { key }, { key });
 }
 
 export async function secretIsSet(id: string, key: WorkspaceSecretKey): Promise<boolean> {

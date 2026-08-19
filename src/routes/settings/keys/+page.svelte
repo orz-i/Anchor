@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { supportsAdminCommand } from "$lib/api/invoke";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import { message } from "$lib/platform/dialog";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
@@ -66,10 +67,9 @@
     try {
       const value = await regenerateSharedSecret(key);
       secrets[key] = value;
-      // Keep originals stale so the "保存更改" button lights up,
-      // giving the user visible confirmation before we navigate away.
-      // saveAll will write the same value (idempotent) and update originals.
+      originals[key] = value;
     } catch (e) {
+      if (isPrivilegedActionCancelled(e)) return;
       await message(String(e), { title: "重新生成失败", kind: "error" });
     } finally {
       regenerating = null;
@@ -87,6 +87,7 @@
         }
       }
     } catch (e) {
+      if (isPrivilegedActionCancelled(e)) return;
       await message(String(e), { title: "保存失败", kind: "error" });
     } finally {
       saving = false;
@@ -116,6 +117,10 @@
     {#if !mutationsSupported}
       <p class="mt-2 max-w-2xl text-xs text-[var(--text-muted)]">
         Web 管理面当前仅允许查看共享密钥；写入和重新生成将在高权限确认执行器接入后开放。
+      </p>
+    {:else}
+      <p class="mt-2 max-w-2xl text-xs text-[var(--text-muted)]">
+        Web 管理面写入或重新生成共享密钥时会要求一次目标绑定的二次确认。
       </p>
     {/if}
   </header>

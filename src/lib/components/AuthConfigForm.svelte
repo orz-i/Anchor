@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { supportsAdminCommand } from "$lib/api/invoke";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import { message } from "$lib/platform/dialog";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
@@ -192,6 +193,7 @@
       // Auth save only persists profile fields; secrets are already stored by regenerate.
       loadedSecrets = { ...secrets };
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "认证配置保存失败", kind: "error" });
     } finally {
       suppressSecretsReload = false;
@@ -207,7 +209,9 @@
         ? await regenerateSharedSecret(key as SharedSecretKey)
         : await regenerateWorkspaceSecret(workspaceId, key);
       secrets = { ...secrets, [key]: value };
+      loadedSecrets = { ...loadedSecrets, [key]: value };
     } catch (error) {
+      if (isPrivilegedActionCancelled(error)) return;
       await message(String(error), { title: "重新生成失败", kind: "error" });
     } finally {
       regenerating = null;
@@ -240,6 +244,10 @@
   {#if !secretMutationSupported}
     <p class="text-xs text-[var(--text-muted)]">
       Web 管理面当前允许修改认证配置，但 Secret 仅可查看；重新生成将在高权限确认执行器接入后开放。
+    </p>
+  {:else}
+    <p class="text-xs text-[var(--text-muted)]">
+      Web 管理面写入共享 Client ID 或重新生成 Secret 时会要求一次目标绑定的二次确认。
     </p>
   {/if}
 
