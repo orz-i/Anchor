@@ -8,10 +8,7 @@ use crate::actions;
 use crate::error::AppResult;
 use crate::mcp;
 use crate::platform::platform;
-use crate::runtime::port::{
-    is_own_process, port_busy_message, try_reclaim_previous_macos_app_port,
-    wait_for_port_free_blocking,
-};
+use crate::runtime::port::{is_own_process, port_busy_message, wait_for_port_free_blocking};
 use crate::secret::SecretStore;
 use crate::settings::AppSettings;
 use crate::tools::policy::PolicySettings;
@@ -181,39 +178,12 @@ impl RuntimeSupervisor {
         }
     }
 
-    #[cfg(feature = "desktop")]
-    pub fn restart_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.restart(profile, ServiceKind::Mcp)
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn restart_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.restart(profile, ServiceKind::Actions)
-    }
-
-    /// True when the service for this workspace is currently running.
-    #[cfg(feature = "desktop")]
-    pub fn is_running(&self, workspace_id: &str, kind: ServiceKind) -> bool {
-        matches!(
-            self.entries
-                .get(&(workspace_id.to_string(), kind))
-                .map(|entry| &entry.phase),
-            Some(RuntimePhase::Running)
-        )
-    }
-
     pub fn maintain_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.maintain(profile, ServiceKind::Mcp)
     }
 
     pub fn maintain_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.maintain(profile, ServiceKind::Actions)
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn drop_workspace(&mut self, profile: &WorkspaceProfile) {
-        self.sync_stop_and_wait(profile, ServiceKind::Mcp);
-        self.sync_stop_and_wait(profile, ServiceKind::Actions);
     }
 
     pub fn active_mcp_workspace_ids(&self) -> HashSet<String> {
@@ -452,10 +422,6 @@ impl RuntimeSupervisor {
             if let Some(pid) = platform().find_pid_listening_on_port(port)? {
                 if is_own_process(pid) {
                     wait_for_port_free_blocking(port, Duration::from_secs(3));
-                }
-                if try_reclaim_previous_macos_app_port(port) {
-                    // A previous source-built or installed instance of this macOS
-                    // app released the port; continue with the current listener.
                 }
                 if let Some(pid) = platform().find_pid_listening_on_port(port)? {
                     let message = port_busy_message(port, service_label(kind).trim(), pid);
@@ -700,41 +666,6 @@ impl RuntimeSupervisor {
                 recovered_count,
             },
         );
-    }
-
-    /// Stop the current service (if running), then immediately start a new one.
-    /// This is the canonical "restart" — used when the user regenerates a key or
-    /// toggles the shared-secret switch, so the listener picks up the new value.
-    ///
-    /// stop_internal sends the graceful-shutdown signal but the OS port may not
-    /// be freed instantly (the old listener's socket is closed on the tokio
-    /// event loop). We retry `start` with a short back-off to smooth over this
-    /// window.
-    #[cfg(feature = "desktop")]
-    fn restart(
-        &mut self,
-        profile: &WorkspaceProfile,
-        kind: ServiceKind,
-    ) -> AppResult<RuntimeStatusDto> {
-        self.sync_stop_and_wait(profile, kind);
-        self.start(profile, kind)
-    }
-
-    #[cfg(feature = "desktop")]
-    fn sync_stop_and_wait(&mut self, profile: &WorkspaceProfile, kind: ServiceKind) {
-        let port = port_for(profile, kind);
-        let handle = self.begin_stop(&profile.id, kind);
-        if handle.is_some() {
-            crate::runtime::port::await_listener_shutdown_blocking(handle, port);
-        } else if platform()
-            .find_pid_listening_on_port(port)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            wait_for_port_free_blocking(port, Duration::from_secs(3));
-        }
-        self.finish_stop(&profile.id, kind);
     }
 
     fn maintain(

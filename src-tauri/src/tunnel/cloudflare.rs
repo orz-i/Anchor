@@ -41,16 +41,7 @@ pub async fn ensure_cloudflared() -> AppResult<PathBuf> {
     if let Ok(path) = resolve_cloudflared() {
         return Ok(path);
     }
-    #[cfg(any(feature = "desktop", feature = "cli"))]
-    {
-        download_cloudflared_to_cache().await
-    }
-    #[cfg(not(any(feature = "desktop", feature = "cli")))]
-    {
-        Err(AppError::Message(
-            "未找到 cloudflared，当前构建也不包含自动下载能力。".into(),
-        ))
-    }
+    download_cloudflared_to_cache().await
 }
 
 /// Path where the app caches a self-managed cloudflared binary.
@@ -73,7 +64,6 @@ pub(crate) fn cloudflared_binary_name() -> &'static str {
 }
 
 /// GitHub release asset name for the current platform.
-#[cfg(any(feature = "desktop", feature = "cli"))]
 fn cloudflared_release_asset() -> AppResult<&'static str> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
@@ -115,13 +105,11 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
 }
 
 /// Latest cloudflared release. Pinned for reproducibility; bump as needed.
-#[cfg(any(feature = "desktop", feature = "cli"))]
 pub(crate) const VERSION: &str = "2025.6.1";
 
 /// Download cloudflared into the app cache `bin/` directory, honoring the
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
 /// assets are `.tgz` archives that need extraction.
-#[cfg(any(feature = "desktop", feature = "cli"))]
 pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     let settings = crate::settings::AppSettings::load()?;
     let asset = cloudflared_release_asset()?;
@@ -159,7 +147,7 @@ pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     }
 }
 
-#[cfg(all(any(feature = "desktop", feature = "cli"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn extract_cloudflared_from_tar_gz(bytes: &[u8], dest: &Path) -> AppResult<()> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
@@ -185,7 +173,7 @@ fn extract_cloudflared_from_tar_gz(bytes: &[u8], dest: &Path) -> AppResult<()> {
     ))
 }
 
-#[cfg(all(any(feature = "desktop", feature = "cli"), not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 fn extract_cloudflared_from_tar_gz(_bytes: &[u8], _dest: &Path) -> AppResult<()> {
     Err(AppError::Message(
         "当前平台的 cloudflared 无需解压。".into(),

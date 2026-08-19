@@ -157,8 +157,4 @@ fn main() {
     }
     watch_git_path(repository, "packed-refs");
     generate_admin_assets(repository);
-    #[cfg(feature = "desktop")]
-    {
-        tauri_build::build();
-    }
 }

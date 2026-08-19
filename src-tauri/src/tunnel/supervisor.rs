@@ -77,45 +77,6 @@ impl TunnelSupervisor {
         }
     }
 
-    /// Best-effort shutdown for desktop process exit.
-    ///
-    /// Normal start/stop paths retain transactional rollback semantics. Process
-    /// exit is different: no route should survive the owning GUI process, so
-    /// every child is terminated and in-memory ownership is cleared even if a
-    /// later cleanup step reports an error.
-    #[cfg(feature = "desktop")]
-    pub async fn shutdown_all(&mut self) {
-        let workspace_ids = self
-            .frp_routes
-            .keys()
-            .map(|(workspace_id, _)| workspace_id.clone())
-            .chain(self.frpc.keys().cloned())
-            .collect::<HashSet<_>>();
-
-        self.frp_routes.clear();
-
-        for (_, mut session) in self.sessions.drain() {
-            if let Some(child) = session.child.take() {
-                let _ = cloudflare::stop_child(child, session.pid).await;
-            } else if let Some(pid) = session.pid {
-                let _ = platform().terminate_process_tree(pid);
-            }
-        }
-
-        for (workspace_id, process) in self.frpc.drain() {
-            let pid = process.pid;
-            let _ = cloudflare::stop_child(process.child, pid).await;
-            frp::clear_managed_frpc_pid(&workspace_id);
-        }
-
-        // Also recover a recorded managed frpc whose in-memory Child was lost
-        // before exit. PID/image validation inside this helper prevents killing
-        // unrelated user processes.
-        for workspace_id in workspace_ids {
-            let _ = frp::stop_recorded_frpc_instance(&workspace_id).await;
-        }
-    }
-
     pub fn status(
         &self,
         profile: &WorkspaceProfile,
@@ -379,29 +340,6 @@ impl TunnelSupervisor {
         Ok(())
     }
 
-    /// Terminate a supervised tunnel when the local runtime is not listening.
-    #[cfg(feature = "desktop")]
-    pub async fn cleanup_orphan(
-        &mut self,
-        profile: &WorkspaceProfile,
-        kind: TunnelServiceKind,
-        runtime_listening: bool,
-    ) -> AppResult<()> {
-        if runtime_listening {
-            return Ok(());
-        }
-        let settings = AppSettings::load()?;
-        let key = (profile.id.clone(), kind);
-        if self.frp_routes.contains_key(&key)
-            && !self.frp_route_matches(&key, profile, kind, &settings)
-        {
-            // 清理任务携带的是旧 runtime/profile；当前 route 已被新的端口、
-            // subdomain 或配置替换，不能按相同 workspace key 删除新线路。
-            return Ok(());
-        }
-        self.stop_internal(&profile.id, kind, &settings).await
-    }
-
     fn validate_frp_route_compatibility(
         &self,
         workspace_id: &str,
@@ -608,23 +546,6 @@ impl TunnelSupervisor {
         if let Some(session) = session {
             self.sessions.insert(key.clone(), session);
         }
-    }
-
-    #[cfg(feature = "desktop")]
-    fn frp_route_matches(
-        &self,
-        key: &(String, TunnelServiceKind),
-        profile: &WorkspaceProfile,
-        kind: TunnelServiceKind,
-        settings: &AppSettings,
-    ) -> bool {
-        let Some(route) = self.frp_routes.get(key) else {
-            return false;
-        };
-        let existing = frp::frp_server_config(&route.profile, route.kind, settings, None);
-        let requested = frp::frp_server_config(profile, kind, settings, None);
-        existing == requested
-            && tunnel_use_proxy(&route.profile, route.kind) == tunnel_use_proxy(profile, kind)
     }
 
     fn session_is_running(&self, key: &(String, TunnelServiceKind)) -> bool {
@@ -921,26 +842,6 @@ mod tests {
         assert!(supervisor
             .validate_frp_route_compatibility(&second.id, &config, &settings)
             .is_ok());
-    }
-
-    #[cfg(feature = "desktop")]
-    #[test]
-    fn stale_profile_does_not_match_a_replaced_route() {
-        let settings = AppSettings::default();
-        let current = frp_profile("demo", "aa");
-        let mut stale = current.clone();
-        stale.tunnel.frp_subdomain = "a".into();
-        let key = (current.id.clone(), TunnelServiceKind::Mcp);
-        let mut supervisor = TunnelSupervisor::new();
-        supervisor.frp_routes.insert(
-            key.clone(),
-            FrpRoute {
-                profile: current,
-                kind: TunnelServiceKind::Mcp,
-            },
-        );
-
-        assert!(!supervisor.frp_route_matches(&key, &stale, TunnelServiceKind::Mcp, &settings));
     }
 
     #[test]

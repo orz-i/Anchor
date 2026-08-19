@@ -67,19 +67,6 @@ impl Drop for DataFileGuard {
     }
 }
 
-#[cfg(feature = "desktop")]
-const SHARED_KEYS: &[&str] = &[
-    "oauth_client_id",
-    "bearer_token",
-    "oauth_client_secret",
-    "oauth_password",
-    "oauth_token_secret",
-    "actions_api_key",
-    "actions_oauth_client_secret",
-    "actions_oauth_password",
-    "actions_oauth_token_secret",
-];
-
 #[derive(Debug)]
 pub struct DataStore {
     data: AppData,
@@ -136,11 +123,6 @@ impl DataStore {
         let _guard = lock_data_file()?;
         validate_data(&data)?;
         save(&data)
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn data(&self) -> &AppData {
-        &self.data
     }
 
     pub fn save(&self) -> AppResult<()> {
@@ -209,23 +191,6 @@ impl DataStore {
         Ok(Some(removed))
     }
 
-    #[cfg(feature = "desktop")]
-    pub fn init_shared_secrets(&mut self) -> AppResult<()> {
-        let mut changed = false;
-        for key in SHARED_KEYS {
-            if !self.data.shared_secrets.contains_key(*key) {
-                self.data
-                    .shared_secrets
-                    .insert(key.to_string(), shared_value_for_key(key));
-                changed = true;
-            }
-        }
-        if changed {
-            self.save()?;
-        }
-        Ok(())
-    }
-
     pub fn get_workspace_secret(&self, profile_id: &str, key: &str) -> AppResult<Option<String>> {
         Ok(self
             .data
@@ -236,86 +201,8 @@ impl DataStore {
             .cloned())
     }
 
-    #[cfg(feature = "desktop")]
-    pub fn set_workspace_secret(
-        &mut self,
-        profile_id: &str,
-        key: &str,
-        value: &str,
-    ) -> AppResult<()> {
-        self.data
-            .workspace_secrets
-            .entry(profile_id.to_string())
-            .or_default()
-            .insert(key.to_string(), value.to_string());
-        self.save()
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn regenerate_workspace_secret(
-        &mut self,
-        profile_id: &str,
-        key: &str,
-    ) -> AppResult<String> {
-        let value = shared_value_for_key(key);
-        self.set_workspace_secret(profile_id, key, &value)?;
-        Ok(value)
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn remove_workspace_secrets(&mut self, profile_id: &str) -> AppResult<()> {
-        self.data.workspace_secrets.remove(profile_id);
-        self.save()
-    }
-
     pub fn get_shared_secret(&self, key: &str) -> Option<String> {
         self.data.shared_secrets.get(key).cloned()
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn set_shared_secret(&mut self, key: &str, value: &str) -> AppResult<()> {
-        self.data
-            .shared_secrets
-            .insert(key.to_string(), value.to_string());
-        self.save()
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn regenerate_shared_secret(&mut self, key: &str) -> AppResult<String> {
-        let value = random_secret();
-        self.set_shared_secret(key, &value)?;
-        Ok(value)
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn get_app_secret(&self, scope: &str, item_id: &str) -> Option<String> {
-        self.data
-            .app_secrets
-            .get(scope)
-            .and_then(|items| items.get(item_id))
-            .filter(|value| !value.is_empty())
-            .cloned()
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn set_app_secret(&mut self, scope: &str, item_id: &str, value: &str) -> AppResult<()> {
-        self.data
-            .app_secrets
-            .entry(scope.to_string())
-            .or_default()
-            .insert(item_id.to_string(), value.to_string());
-        self.save()
-    }
-
-    #[cfg(feature = "desktop")]
-    pub fn delete_app_secret(&mut self, scope: &str, item_id: &str) -> AppResult<()> {
-        if let Some(items) = self.data.app_secrets.get_mut(scope) {
-            items.remove(item_id);
-            if items.is_empty() {
-                self.data.app_secrets.remove(scope);
-            }
-        }
-        self.save()
     }
 }
 
@@ -348,15 +235,6 @@ fn random_secret() -> String {
     format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "")
 }
 
-#[cfg(feature = "desktop")]
-fn shared_value_for_key(key: &str) -> String {
-    if key == "oauth_client_id" {
-        format!("chatgpt-client-{}", &uuid::Uuid::new_v4().to_string()[..12])
-    } else {
-        random_secret()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,14 +255,6 @@ mod tests {
             .get_workspace_secret(&id, "oauth_client_secret")
             .expect("get");
         assert_eq!(loaded.as_deref(), Some("roundtrip-secret"));
-    }
-
-    #[cfg(feature = "desktop")]
-    #[test]
-    fn shared_oauth_client_id_uses_client_id_format() {
-        let value = shared_value_for_key("oauth_client_id");
-        assert!(value.starts_with("chatgpt-client-"));
-        assert_eq!(value.len(), "chatgpt-client-".len() + 12);
     }
 
     #[test]
