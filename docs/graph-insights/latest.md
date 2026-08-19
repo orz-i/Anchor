@@ -1,104 +1,70 @@
 # 项目图谱洞察
 
-更新时间：2026-08-01（UTC+8）
+更新时间：2026-08-19（UTC+8）
 
-## 分析状态
+## 当前定位
 
-- 本次结论来自当前 Rust/Tauri/Svelte 源码、工具目录快照、全量测试、严格 Clippy、前端生产构建和正式桌面打包。
-- 未依赖历史 Python 参考实现；仓库中的 `old/` 归档已删除。
-- GitNexus 旧索引数据不再作为当前结构事实来源；需要代码关系时以当前源码和 Rust 合约测试为准。
-
-## 项目定位
-
-Anchor 是 Rust + Tauri 2 + SvelteKit 桌面应用，同时提供独立 `anchor` CLI。每个 WorkspaceProfile 可运行 MCP Streamable HTTP、ChatGPT Actions、OAuth/Bearer 认证和 FRP/Cloudflare 隧道；单一 Gateway 可按路径隔离多个工作区。
+Anchor 是 **Rust CLI/daemon + SvelteKit Web Admin** 的本地 Workspace/MCP 控制平面。`anchor` CLI 是唯一 Rust 产品可执行目标；Web Admin 由 `anchor admin` 在 loopback 托管并嵌入生产静态资源。Tauri desktop、IPC adapter、desktop bin、bundle 配置和安装包构建链已经物理删除。
 
 ## 主执行链路
 
 ```text
-SvelteKit 页面
-  → src/lib/api/* 的 Tauri invoke
-  → src-tauri/src/commands/*
-  → AppState
-      ├─ DataStore：当前 profiles / protected secrets
-      ├─ RuntimeSupervisor：MCP / Actions / tunnel 生命周期
-      └─ HarnessStore：Task / baseline / verification / journal / outbox
-  → tools registry / dispatcher
-      ├─ MCP Streamable HTTP
-      ├─ Actions OpenAPI
-      └─ downstream MCP proxy
+Browser SvelteKit Web Admin
+  → /api/v1 management HTTP
+  → admin security / shared management
+  → Workspace / Gateway control protocol
+  → daemon-owned MCP / Actions / Tunnel runtime
+
+anchor CLI
+  → shared management / control / config engine
+  → Workspace / Gateway daemon
 ```
 
-## 核心模块
+MCP 工具执行仍由 Rust 工具目录、dispatcher 与 Harness 统一治理；Web Admin HTTP handler 不复制 Workspace、Gateway、Tunnel、Secret 或 Windows Service 业务规则。
 
-### 数据与配置
+## 当前关键边界
 
-- `src-tauri/src/data/storage.rs` 只加载当前 `data/profiles.json` 和受保护的 `data/secrets.json`。
-- 配置根目录只接受当前平台的 `anchor` 目录或显式 `ANCHOR_CONFIG_DIR`。
-- 明文 secrets、内联 secrets、根目录 `profiles.json` / `app_settings.json`、旧品牌目录和旧 Python 桌面配置均不再导入。
-- 配置与凭据写入保留原子替换、备份恢复和平台保护；Windows 使用当前用户 DPAPI。
+- `src/`：SvelteKit Web Admin，零 `@tauri-apps` 依赖。
+- `src-tauri/src/bin/anchor.rs`：唯一产品 CLI 入口。
+- `src-tauri/src/admin.rs` / `admin_daemon.rs` / `admin_service.rs`：本机 Web 管理 API 与持久托管。
+- `src-tauri/src/management.rs`：CLI/Web Admin 共用管理语义。
+- `src-tauri/src/daemon.rs` / `control/`：Workspace runtime 权威。
+- `src-tauri/src/gateway_daemon.rs` / `gateway_control/`：Gateway runtime 权威。
+- `src-tauri/src/windows_service.rs`：Windows SCM supervisor 与 owner-token 启动边界。
+- `src-tauri/src/tools/` / `harness/`：开发工具、安全策略、Task/verification/journal。
 
-### Workspace 与运行时
+## Tauri physical removal
 
-- `src-tauri/src/workspace/` 定义当前 WorkspaceProfile、资源冲突规则和默认配置，不再包含旧配置导入模块。
-- `src-tauri/src/runtime/supervisor.rs` 管理 MCP/Actions 的启动、停止、恢复、活动度和隧道联动。
-- Windows 单实例锁、macOS Bundle 归属和 Linux daemon 目录只识别 Anchor 当前标识。
+以下内容已经删除：
 
-### MCP、Actions 与工具目录
+- Cargo `desktop` feature、`anchor-desktop` bin、`tauri`/plugin/build dependencies。
+- `tauri.conf.json`、Tauri capabilities 和 bundle icons。
+- `main.rs` desktop bootstrap、`legacy_desktop.rs`、`AppState` 和 `commands/` IPC adapter。
+- 前端 Tauri runtime detector、Tauri invoke/dialog adapter 与 npm `@tauri-apps/*`。
+- desktop/legacy desktop npm scripts、desktop build manifest/installer helpers、`dev-desktop.cmd`。
+- macOS desktop bundle reclaim 和 Windows `anchor-desktop.exe` runtime identity fixtures。
 
-- `src-tauri/src/mcp/` 只接受 MCP 2025-11-25，并实现 OAuth、Session、Gateway 和 downstream proxy；旧协议版本初始化会明确返回 `-32602`。
-- `src-tauri/src/tools/registry.rs` 是 MCP、server_info 与 Actions OpenAPI 的统一工具目录事实源。
-- core 目录当前为 28 个工具；文本搜索只公开 `search_text`，不再保留 `grep` / `grep_text` 服务端别名。
-- `glob` 参数别名、`allowed_commands` 输出别名和 `session:<id>:full` 输出引用均已移除。
+`src-tauri/tests/no_tauri_boundaries.rs` 对 active source、package/Cargo manifest、锁文件和应删除路径做机器验证。
 
-### Harness 与 History
+## 分发与验证
 
-- 源码使用 Harness Schema 5，默认存储根为系统数据目录 `anchor/harness-v5`。
-- Task 必须保存单一 `expected_state`；旧 `expected_fingerprint` 回退字段不再读取。
-- Baseline 使用内容寻址对象；operation/event journal 带 sequence 和 checksum；close_work_session 使用持久 outbox 恢复 History checkpoint。
-- 旧 Schema 4 或未标记 Harness Store 明确返回不兼容错误，不迁移、不桥接。
+默认且唯一 release 构建：
 
-### 前端
+```bash
+pnpm release:build
+```
 
-- `src/app.css` 只定义当前 canonical design tokens，例如 `--page-bg`、`--card-bg`、`--text-main`、`--primary`。
-- 组件不再通过 `--color-*` 别名访问设计系统。
-- Workspace 页面、设置页、健康检查、日志、OAuth、隧道和 Skill 表单已通过 Svelte 静态检查与生产构建。
+它产出 Svelte Web Admin 静态资源和 `anchor` CLI，不生成 MSI/NSIS/DMG/Tauri bundle。
 
-## 已完成的硬切与精炼
+发布门禁覆盖 Rust library/integration、Web Admin/privileged boundary、persistent Admin service、no-Tauri boundary、严格 Clippy、前端 check/build、release build、rustfmt 与 diff check。
 
-1. 删除旧 `coding-tools-mcp` CLI 二进制、旧 daemon 路径、旧 mutex 和旧 macOS App Bundle 识别。
-2. 删除旧品牌环境变量、配置目录扫描、目录复制和 Python 配置导入。
-3. 删除旧配置文件布局、内联/明文凭据迁移、Gateway URL 版本迁移和旧 Tool Profile 映射。
-4. 删除完整旧 Python/Coding Tools 归档，仅将仍需要的最小测试 fixture 移入 `src-tauri/tests/fixtures/`。
-5. 删除 MCP 工具名、参数、响应和输出引用兼容桥接。
-6. 完成 Harness Schema 5 Task 状态结构硬切。
-7. 删除前端 CSS Token 和失效文档兼容层。
-8. 删除旧 MCP 协议版本协商，只接受当前 2025-11-25。
-9. 将 `AppData` 与严格 `ProfilesData` / `SecretsData` 磁盘模型分离；未知字段、内联秘密和缺失字段不再静默接受。
-10. 删除 Workspace 配置缺失字段默认、`serverPort` 持久化别名、Actions 内联 Cloudflare Token 和未知工具档位回落 `core`。
-11. 将误导性的 `keyring_store` 改为真实的受保护 `secret/store`，并把秘密与 Tunnel 测试从真实用户配置目录改为显式内存状态。
-12. 删除 `AppSettings::load_or_default()`；Runtime、Tunnel、下载、CLI 和健康检查在配置损坏时 fail closed。
-13. 删除无引用门面、未读取 Cloudflare 握手字段、无职责 CLI 脱敏包装和多余 dead-code 抑制；CLI 专用 Gateway helper 不再进入桌面默认构建。
+## 剩余平台验收
 
-## 有意保留的兼容性
+代码迁移与 Tauri 删除已完成。仍需在 Windows 发布环境验证：
 
-- downstream MCP 缺少 outputSchema 时的安全结果规范化属于协议防护，不是旧配置迁移。
-- 对旧 SSE transport 的明确拒绝用于安全诊断，不表示继续支持该 transport。
-- Harness 对旧 Schema、未标记 Store 和损坏配置的明确拒绝属于 fail-closed 诊断，不表示存在迁移桥接。
-- README 中 `mybolide/coding-tools-mcp` 仅是当前远端仓库与 Release 地址；本轮按要求未改远端仓库。
+- `anchor` CLI 安装/升级后的 SCM owner-token 与 UAC Service lifecycle。
+- persistent Admin Task Scheduler 的 logon/autostart、bounded restart、upgrade/recovery。
+- 旧 desktop 安装环境迁移到 CLI/Web Admin 后沿用现有配置和注册信息。
+- CLI 的正式安装/分发/卸载体验。
 
-## 验证结果
-
-- Rust 全量测试：库测试 321 passed、1 ignored；全部 integration、contract、security、History、Harness 和 outputSchema 目标通过。
-- `cargo clippy --all-targets --all-features -- -D warnings`：通过。
-- 独立 CLI：`cargo check --no-default-features --features cli --bin anchor` 通过。
-- Svelte：0 errors、0 warnings；Vite/SvelteKit 生产构建通过。
-- Tauri 正式构建通过，生成 release EXE、MSI 和 NSIS 安装包。
-
-## 当前边界
-
-- 这是有意的硬切：旧目录、旧配置文件、明文凭据和旧工具别名不会自动恢复，需在当前 Anchor 中重新注册配置。
-- 当前正在运行的 Anchor listener 仍是安装前的旧二进制；新行为需要安装本次构建并重启后生效。
-- 未执行 Git push，也未修改远端仓库配置。
-
----
-*来源：当前源码、工具目录、Git 提交、全量自动化验证与桌面打包结果。*
+历史 `docs/specs/` 与 `docs/verification/` 中的 Tauri/desktop 字样保留为当时的规格和验证证据，不代表当前产品架构。

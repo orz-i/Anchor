@@ -54,16 +54,9 @@ pnpm dev
 pnpm build
 ```
 
-Tauri desktop 已停止作为默认发布目标。仅在 legacy compatibility 验证时使用：
+Tauri desktop、安装包配置和 legacy desktop 构建脚本已经物理删除。不要再新增 desktop-only 入口；管理能力必须进入 shared management / CLI / Web Admin。
 
-```bash
-pnpm legacy:desktop
-pnpm legacy:desktop:build
-```
-
-## 安装包版本与发布规则（硬性）
-
-默认 release 不再生成桌面安装包。只有显式要求构建 legacy desktop 安装包时，才适用本节桌面版本/安装包规则：包含功能或缺陷修复且需要交付 desktop 安装包的变更，**必须先递增应用版本，再构建**。不得用旧版本号覆盖安装包，也不得只改 DMG、NSIS 等产物文件名。
+## 版本与发布规则
 
 ### 版本递增
 
@@ -78,8 +71,7 @@ pnpm legacy:desktop:build
 1. `package.json`
 2. `package-lock.json` 的根 `version` 和根包 `version`
 3. `src-tauri/Cargo.toml`
-4. `src-tauri/Cargo.lock` 中 `anchor-desktop` 包的 `version`
-5. `src-tauri/tauri.conf.json`
+4. `src-tauri/Cargo.lock` 中 `anchor` 包的 `version`
 
 不要修改依赖自身恰好相同的版本号；只更新本项目包的版本字段。
 
@@ -91,29 +83,13 @@ pnpm legacy:desktop:build
 2. 运行 `npm run check`、`cargo check`；修复类变更还需运行相关 Rust 测试。
 3. 提交版本升级与功能/修复代码，再从该提交构建。
 
-构建后必须：
-
-1. 校验 App 内部版本（macOS 为 `CFBundleShortVersionString`）。
-2. 校验安装包文件名包含当前版本，例如 `Anchor_<version>_aarch64.dmg`。
-3. 校验已安装应用显示的版本与安装包一致；不得把旧包误报为新包。
-4. 清理同一构建目录中旧版本的安装包和临时构建日志，但保留当前版本产物。
-
-若移动了 macOS 源码目录，Rust/Tauri 的 `target` 缓存会保留旧绝对路径；首次在新目录构建前必须执行 `cd src-tauri && cargo clean`，再重新构建。
-
-macOS GitHub Actions 仍仅允许在用户明确要求后通过 `workflow_dispatch` 手动触发，不因版本提交自动触发。
+构建后校验 `anchor --version` / build identity 与当前提交一致，并确保 `pnpm release:build` 只生成 Web Admin + `anchor` CLI 产物。
 
 ## Rust 后端开发约定
 
-### Legacy Tauri Command 模式
+### 管理能力边界
 
-Tauri command 只允许作为迁移期 adapter；新业务能力不得新增到 desktop-only command 层，必须先进入 shared management / CLI / Web Admin。
-
-```rust
-#[tauri::command]
-async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<WorkspaceProfile>, String> {
-    state.workspace_store.list().map_err(|e| e.to_string())
-}
-```
+新业务能力先进入共享 Rust management/control 层，再由 CLI 和 Web Admin 调用；不得恢复 desktop-only command/AppState 层。
 
 ### 状态机模式
 

@@ -261,7 +261,7 @@ The project uses a Workspace-first permission model:
 
 ## Local development
 
-The default development path requires Node.js 20+ and Rust stable. Tauri system prerequisites are required only when explicitly validating the legacy desktop shell.
+The default development path requires Node.js 20+ and Rust stable. Tauri has been removed from the current product and build dependencies.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -281,11 +281,11 @@ cd src-tauri && cargo test
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
-On Windows, `dev-desktop.cmd` remains as a deprecated compatibility launcher. The Tauri desktop shell is no longer a default development or release target. When legacy validation is required, install the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) and explicitly run `pnpm legacy:desktop` or `pnpm legacy:desktop:build`; the older `pnpm desktop*` aliases print a deprecation warning. See [Desktop / Tauri retirement gates](docs/desktop-retirement.md).
+The desktop/Tauri shell, installer scripts, and Tauri dependencies have been physically removed. Browser Web Admin is the management UI and `anchor` CLI/daemon owns runtime operations. See [Desktop / Tauri retirement record](docs/desktop-retirement.md).
 
 ### Headless Linux CLI
 
-Linux servers can build `anchor` without the Tauri desktop feature. It reads the same one-workspace/one-profile configuration as the GUI and runs MCP or Actions in the foreground:
+Linux servers can build `anchor` directly. It reads the unified workspace/profile configuration and runs MCP or Actions in the foreground:
 
 ```bash
 pnpm cli:build

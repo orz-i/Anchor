@@ -1,75 +1,34 @@
 {
-  "updated_at": "2026-08-01T09:43:00+08:00",
+  "updated_at": "2026-08-19T21:27:00+08:00",
   "project": "anchor",
   "analysis_status": "verified",
-  "source_of_truth": [
-    "current Rust/Tauri/Svelte source",
-    "tool catalog snapshots",
-    "Rust contract and security tests",
-    "frontend and desktop production builds"
-  ],
   "architecture": {
-    "frontend": "SvelteKit + Tauri invoke",
-    "backend": "Rust + Tauri 2",
-    "cli": "anchor",
-    "state": ["AppState", "DataStore", "RuntimeSupervisor", "HarnessStore"],
-    "services": ["MCP Streamable HTTP", "ChatGPT Actions OpenAPI", "MCP Gateway"],
+    "frontend": "SvelteKit Web Admin",
+    "backend": "Rust CLI/daemon + axum management and MCP HTTP",
+    "product_binary": "anchor",
+    "runtime_owners": ["Workspace daemon", "Gateway daemon"],
+    "management": ["anchor CLI", "persistent Web Admin"],
     "tunnels": ["FRP", "Cloudflare"]
   },
-  "hard_cut": {
-    "brand_runtime_bridges_removed": true,
-    "legacy_config_paths_removed": true,
-    "legacy_config_formats_removed": true,
-    "legacy_python_archive_removed": true,
-    "legacy_mcp_api_aliases_removed": true,
-    "legacy_mcp_protocol_versions_removed": true,
-    "harness_schema": 5,
-    "harness_legacy_task_fallback_removed": true,
-    "legacy_css_token_aliases_removed": true,
-    "settings_fail_open_removed": true,
-    "dead_compatibility_surfaces_removed": true
+  "tauri_retirement": {
+    "physical_removal_complete": true,
+    "desktop_feature_present": false,
+    "desktop_binary_present": false,
+    "tauri_dependencies_present": false,
+    "tauri_config_present": false,
+    "desktop_installer_scripts_present": false,
+    "guard": "src-tauri/tests/no_tauri_boundaries.rs"
   },
-  "configuration": {
-    "environment_override": "ANCHOR_CONFIG_DIR",
-    "profiles": "data/profiles.json",
-    "secrets": "data/secrets.json protected envelope",
-    "plaintext_secrets_accepted": false,
-    "legacy_directory_import": false,
-    "unknown_fields_accepted": false,
-    "missing_persisted_fields_defaulted": false,
-    "invalid_tool_profile_normalized": false,
-    "settings_load_failure_uses_defaults": false
+  "release": {
+    "default_command": "pnpm release:build",
+    "artifacts": ["Svelte Web Admin static assets", "src-tauri/target/release/anchor"],
+    "desktop_installers": false
   },
-  "protocol": {
-    "required_mcp_version": "2025-11-25",
-    "older_versions_negotiated": false
-  },
-  "catalog": {
-    "catalog_version_in_source": 10,
-    "core_tool_count": 28,
-    "public_text_search_tool": "search_text",
-    "server_side_search_aliases": []
-  },
-  "verification": {
-    "rust_library_tests": "321 passed, 1 ignored",
-    "rust_integration_contract_security_tests": "passed",
-    "clippy_all_targets_all_features_deny_warnings": "passed",
-    "cli_check": "passed",
-    "svelte_check": "0 errors, 0 warnings",
-    "frontend_build": "passed",
-    "desktop_build": "passed",
-    "artifacts": [
-      "src-tauri/target/release/anchor-desktop.exe",
-      "src-tauri/target/release/bundle/msi/Anchor_0.1.23_x64_en-US.msi",
-      "src-tauri/target/release/bundle/nsis/Anchor_0.1.23_x64-setup.exe"
-    ]
-  },
-  "intentional_remaining_references": [
-    "README release links retain the current remote repository slug mybolide/coding-tools-mcp"
+  "remaining_platform_acceptance": [
+    "Windows SCM owner-token and UAC lifecycle using anchor.exe",
+    "Windows persistent Admin Task Scheduler logon/autostart/recovery",
+    "migration from previously installed desktop environments without regenerating configuration or registration",
+    "CLI installation/distribution/uninstallation workflow"
   ],
-  "runtime_notes": [
-    "Old configuration is intentionally not migrated or bridged.",
-    "The running installed listener must be replaced and restarted before the new behavior is active.",
-    "No Git push or remote repository modification was performed."
-  ]
+  "historical_document_policy": "docs/specs and docs/verification may retain Tauri/desktop strings as historical evidence"
 }

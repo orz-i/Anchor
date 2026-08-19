@@ -4,7 +4,7 @@
 
 ## 概述
 
-测试分为 Rust 单元测试、工具/MCP 合约测试、安全测试、Harness/History 持久化测试、Web Admin 构建与 desktop retirement boundary 验证。Tauri desktop 构建仅属于显式 legacy compatibility 验收。
+测试分为 Rust 单元测试、工具/MCP 合约测试、安全测试、Harness/History 持久化测试、Web Admin 构建与 no-Tauri architecture boundary 验证。
 
 ## 测试框架
 
@@ -28,7 +28,7 @@
 ### 合规测试运行
 
 ```bash
-# 运行默认 CLI Rust 测试目标（不会启用 Tauri）
+# 运行 CLI Rust 测试目标
 cargo test --tests -- --test-threads=1
 
 # 运行工具合约和安全套件
@@ -62,14 +62,12 @@ mod tests {
 
 ```bash
 cargo test
-cargo test --test desktop_retirement_boundaries
+cargo test --test no_tauri_boundaries
 cargo clippy --all-targets -- -D warnings
 pnpm check
 pnpm build
 pnpm release:build
 ```
-
-需要验证 deprecated desktop 时，在具备 Tauri 系统依赖的平台额外运行 `pnpm legacy:desktop:build`；它不属于默认 release gate。
 
 ---
 *返回索引: [../project-context.md](../project-context.md)*

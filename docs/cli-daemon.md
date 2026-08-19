@@ -393,11 +393,11 @@ anchor events --control-plane --follow --wait 15
 
 聚合事件保留 Gateway cursor 与每个 Workspace cursor，最多返回 64 个按时间合并的事件；aggregate truncation 只推进实际返回事件对应的 source cursor，避免跨源丢事件。每次底层 long-poll slice 最长 1 秒；所有 endpoint 都 unavailable 时仍遵守该 cadence，避免 idle busy-loop。endpoint unavailable 只表示该 source 本轮没有事件；protocol/remote 错误直接终止聚合请求。
 
-桌面全局 layout 使用一次 `get_control_plane_status` 代替原先每个 Workspace 的 MCP/Actions 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
+Web Admin 全局 layout 使用一次 `get_control_plane_status` 代替每个 Workspace 的 MCP/Actions 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
 
-Windows Workspace 已使用真实后台 daemon：GUI 的 MCP/Actions 状态、启停、重启、Workspace Tunnel 和配置应用都走同一 Named Pipe 控制面，Workspace 进程内 `RuntimeSupervisor` 不再是 Windows 主路径。桌面二进制自身支持内部 `daemon-run` 分流，子进程会在进入 Tauri 单实例锁/窗口前直接执行 daemon 主循环，因此安装版 GUI 也能作为 per-user Workspace daemon 的启动镜像。
+Windows Workspace 使用真实后台 daemon：Web Admin/CLI 的 MCP/Actions 状态、启停、重启、Workspace Tunnel 和配置应用都走同一 Named Pipe 控制面。`anchor.exe` 自身承载内部 `daemon-run` / Gateway / Service 子命令，因此不依赖任何 desktop 启动镜像。
 
-Windows Gateway 也使用独立后台 daemon 与 Named Pipe 控制面。Gateway 开启时，选中的 Workspace MCP listener 由 Gateway daemon PID 直接持有，Workspace 独立 daemon 不再同时持有同一 MCP route；Actions 仍可由 Workspace daemon 独立运行。GUI 的 MCP 启停在 Gateway 模式下变成 route 集合更新，并通过受控 restart/reload 完成，不再依赖 process-local GUI Server。
+Windows Gateway 也使用独立后台 daemon 与 Named Pipe 控制面。Gateway 开启时，选中的 Workspace MCP listener 由 Gateway daemon PID 直接持有，Workspace 独立 daemon 不再同时持有同一 MCP route；Actions 仍可由 Workspace daemon 独立运行。Web Admin 的 MCP 启停在 Gateway 模式下变成 route 集合更新，并通过受控 reload 完成。
 
 Windows 还提供配置域级 SCM Service，用于开机自动恢复已选择的 Workspace/Gateway 运行计划：
 
@@ -469,7 +469,7 @@ anchor --json service sync
 - Workspace 与 Gateway 后台 daemon 都支持 Windows/Linux；Windows 不再需要 process-local Gateway Server 作为正常运行路径；
 - Windows Workspace/Gateway Named Pipe 拒绝远程客户端，并使用 owner/System protected DACL；SCM supervisor 本身保持 LocalSystem。安装/更新 Service 时会把配置 owner SID/username 固定到管理员保护的 SCM `ImagePath`，service-run 再以该可信身份匹配 Active Windows 登录会话，并通过 owner primary token + 用户环境启动 Workspace/Gateway daemon。用户可写的 `windows-service.json` 只保存 desired state/展示元数据，不能选择要 impersonate 的 Windows 用户。owner 未登录时 fail closed 并等待后续 reconcile，绝不以 LocalSystem 身份承载 Workspace 命令执行；旧 Service registration 未携带可信 owner 时也会 fail closed，必须先执行 service install/update；Unix UDS 继续使用私有目录/socket 权限；
 - PID 所有权校验失败时拒绝生命周期写操作；Windows additionally 校验 state v2 `executablePath` 与实际 PID 镜像；
-- Windows daemon state 还校验实际进程创建时间必须早于且接近 state 的 `startedAtUnix`，避免跨系统重启后旧 PID 被新的 `anchor-desktop.exe` 实例复用时误判为原 daemon；
+- Windows daemon state 还校验实际进程创建时间必须早于且接近 state 的 `startedAtUnix`，避免跨系统重启后旧 PID 被新的 `anchor.exe` 实例复用时误判为原 daemon；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
 - 端口被 GUI 或外部进程占用时拒绝启动；
 - `daemon-run` 是内部命令，不应直接调用；

@@ -6,15 +6,15 @@
 
 ```
 anchor/
-├── src-tauri/              # Tauri Rust 后端
+├── src-tauri/              # Rust CLI / daemon / Web Admin 后端（历史目录名）
 │   ├── src/
-│   │   ├── main.rs         # 入口
-│   │   ├── lib.rs          # 库入口
-│   │   ├── commands/       # Tauri IPC 命令
+│   │   ├── bin/anchor.rs   # CLI 入口
+│   │   ├── lib.rs          # 共享 Rust 库入口
 │   │   ├── workspace/      # Workspace 配置存储
 │   │   ├── data/           # profiles / protected secrets 持久化
 │   │   ├── runtime/        # Runtime 状态机
 │   │   ├── mcp/            # 内嵌 MCP 协议 + 工具
+│   │   ├── admin*.rs       # Web Admin HTTP / daemon / service
 │   │   ├── harness/        # Task / baseline / verification / journal
 │   │   ├── tools/          # 共享开发工具内核
 │   │   ├── tunnel/         # FRP / Cloudflare 隧道管理
@@ -30,13 +30,13 @@ anchor/
 │   ├── specs/              # 功能规格
 │   ├── project-context/    # 项目上下文
 │   └── graph-insights/     # 代码图谱
-├── scripts/                # 构建、验证与桌面打包辅助脚本
+├── scripts/                # CLI/Web 构建与验证辅助脚本
 └── AGENTS.md               # Agent 入口
 ```
 
 ## 当前状态
 
-Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Actions 服务、Gateway、隧道监督、Agent Skills 和持久 Harness。当前实现与测试均以 Rust 源码为权威，不依赖外部参考实现。
+Anchor 当前是 Rust CLI/daemon + SvelteKit Web Admin 产品，并提供 MCP/Actions 服务、Gateway、隧道监督、Agent Skills 和持久 Harness。Tauri desktop 已物理删除；当前实现与测试均以 Rust 源码和 Web 管理契约为权威。
 
 ## 架构模式
 
@@ -45,10 +45,10 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 ```
 ┌─────────────────────────────────────────┐
 │  UI Layer (Svelte)                      │
-│  Web 管理面 / 过渡期 Tauri 壳            │
+│  Browser Web Admin                      │
 ├─────────────────────────────────────────┤
 │  Admin Transport / CLI                  │
-│  Web HTTP adapter / Tauri adapter       │
+│  Web HTTP adapter / anchor CLI          │
 ├─────────────────────────────────────────┤
 │  Shared Control Plane                   │
 │  版本化状态模型与控制客户端               │
@@ -70,43 +70,43 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
 | 进程管理 | Windows/Linux：Workspace daemon 管理各自 listener + Workspace Tunnel，独立 Gateway daemon 管理全局 Gateway listener/routes/tunnel；Windows 可由配置域级 SCM supervisor 按持久化计划开机恢复这些 daemon |
-| UI | SvelteKit 管理 UI；Tauri 2 作为过渡本机壳，目标入口为 Web 管理面 |
+| UI | SvelteKit Web Admin，由 `anchor admin` 在 loopback 托管 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
-| 分发 | 桌面安装包与独立 `anchor` CLI |
+| 分发 | `anchor` CLI + 嵌入式 Web Admin 静态资源 |
 
-目标方向是按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力；Svelte 管理 UI 通过 transport-neutral 管理客户端访问同一控制语义，Tauri 仅作为过渡配置壳，后续由本机 Web 管理面取代并最终移除。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
+当前按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力；Svelte Web Admin 通过版本化本机 HTTP 管理 API 访问同一控制语义。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
 
 ### 管理面传输边界
 
-- `src/` 业务页面不应直接依赖 Tauri IPC；平台调用统一经管理 transport 与 dialog adapter。
-- Tauri adapter 只用于迁移期兼容；Web adapter 对接本机版本化管理 HTTP API。
+- `src/` 业务页面只经 Web Admin transport 与 browser dialog adapter，不存在 desktop IPC。
+- Svelte 前端仅使用 Web adapter，对接本机版本化管理 HTTP API；Tauri adapter 已删除。
 - 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
-- 桌面进程不得维护 listener、Tunnel 或 Gateway；退出桌面壳不得影响后台 daemon 运行态。
+- 不存在桌面进程运行所有权；listener、Tunnel 与 Gateway 只归 daemon/CLI 控制域。
 
 当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 保留为前台调试入口；生产持久运行由独立 `admin daemon-run` 承担，两者都只绑定 loopback 并同源托管嵌入 CLI 的生产 Svelte 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
 
 Persistent Admin daemon 是单独的**管理面托管域**，不是新的业务运行 supervisor。它使用独立 `admin.lock/admin.pid/admin.json` 与 Admin log；状态包含 config scope、PID、port、executable 和 build identity。Linux 通过 systemd user + linger 注册 autostart，Windows 通过当前用户 Task Scheduler 注册；两端失败重启均有固定次数/时间窗上限。Admin service 只负责让 Web Admin 在 desktop 不存在时持续可达，不允许调用 Workspace/Gateway/Tunnel supervisor 的内部运行编排。状态文件丢失时只允许通过受验证的 config-scope 命令行或监听 PID + executable identity 恢复；无法证明 build identity 时状态为 unknown。OS 注册丢失而本地 service config 尚在时 fail closed，要求 `anchor admin upgrade/install` 修复。
 
-`management.rs` 是 Web/Tauri 共用的管理语义边界。除读取能力外，Workspace 创建/删除、目录打开、Skill inspection、Health、Canvs、FRP 非敏感 metadata CRUD 已从 desktop command 提升到共享层；Workspace 配置通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP/Actions runtime 与 Tunnel start/restart/stop/test 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层；per-workspace route selector 使用 Gateway control protocol 的 additive `set_routes`，运行中的 Gateway 在同一 daemon PID 内切换 route 集合并在失败时恢复旧运行态，不允许 HTTP/Tauri 直接写 Gateway runtime。HTTP handler 只负责安全校验、参数反序列化和调用共享层，不持有 daemon/Tunnel/Gateway 运行权威。
+`management.rs` 是 CLI/Web Admin 共用的管理语义边界。除读取能力外，Workspace 创建/删除、目录打开、Skill inspection、Health、Canvs、FRP 非敏感 metadata CRUD 均由共享层提供；Workspace 配置通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP/Actions runtime 与 Tunnel start/restart/stop/test 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层；per-workspace route selector 使用 Gateway control protocol 的 additive `set_routes`，运行中的 Gateway 在同一 daemon PID 内切换 route 集合并在失败时恢复旧运行态，不允许 HTTP 直接写 Gateway runtime。HTTP handler 只负责安全校验、参数反序列化和调用共享层，不持有 daemon/Tunnel/Gateway 运行权威。
 
-Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；对应运行权只能通过 Gateway route selector 变更。首 route 可启动 Gateway daemon，最后 route 移除走受控 shutdown，普通非空 route 变更使用 `set_routes` 而不是进程重启。Secret/FRP、Software 以及 Windows Service lifecycle 均已成为已评审 Web privileged executor；Service executor 只在 Windows capability manifest 中发布，非 Windows 明确 unavailable。Tauri 已停止作为默认发布目标，只保留显式 legacy 配置壳；其中 Service command 也已只做代理到共享 `management.rs`。
+Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；对应运行权只能通过 Gateway route selector 变更。首 route 可启动 Gateway daemon，最后 route 移除走受控 shutdown，普通非空 route 变更使用 `set_routes` 而不是进程重启。Secret/FRP、Software 以及 Windows Service lifecycle 均已成为已评审 Web privileged executor；Service executor 只在 Windows capability manifest 中发布，非 Windows 明确 unavailable。Tauri desktop 已物理删除，Windows Service 与其余管理语义统一复用 `management.rs`。
 
-Desktop stop-publish 已生效：Cargo 默认 feature 是 `cli`，npm 默认 `start/release:build` 只走 Web Admin + CLI；Tauri desktop 只能通过显式 `legacy:desktop*` target 构建。Tauri bootstrap、single-instance 与 invoke handler 已隔离到 `legacy_desktop.rs`，`lib.rs` 不直接创建 Tauri runtime。legacy desktop 在弃用窗口内只允许作为 transport/dialog/installer compatibility shell，不得新增业务语义或运行所有权；完整删除门槛由 `desktop_retirement_boundaries` 与 `docs/desktop-retirement.md` 固定。
+Tauri physical removal 已完成：Cargo 只保留 `anchor` CLI target；Svelte 前端是 Web-only；desktop bootstrap、AppState/commands adapter、Tauri bundle 配置/资产、npm/Cargo Tauri dependency 和 installer/build scripts 均不存在。`no_tauri_boundaries` 同时检查 active frontend/Rust source、package/Cargo manifest、锁文件和物理路径，防止 Tauri 或 `anchor-desktop` 运行身份回流。
 
 高权限 Web 管理采用独立安全层 `admin_security.rs`：prepare/confirm ticket 绑定当前管理 session、allowlisted action 与 action-specific 非敏感 target fingerprint，批准后生成短 TTL 的一次性 grant；executor 必须用服务端可信状态重建 target 并在业务写入前消费 grant。Secret/FRP 使用 `id/key`，Software 使用 `kind`/pinned version；Windows Service 则由服务端生成 `serviceName + opaque revision`，revision 覆盖当前构建、配置域、SCM 注册/状态、配置 owner 和 action 所需的 plan/running snapshot，浏览器不能自行指定这些可信字段。audit journal 仍只允许 `sessionFingerprint/action/phase/outcome`，不得新增 path/target/owner/revision 等字段。Windows 的最终 SCM mutation 继续经过既有 UAC helper。
 
 ### management.rs
-- **职责**: Tauri adapter、Web Admin 与后续其他管理客户端共用的配置/状态/日志读取、配置 staging/apply 与受控 daemon 生命周期语义。
+- **职责**: CLI、Web Admin 与后续其他管理客户端共用的配置/状态/日志读取、配置 staging/apply 与受控 daemon 生命周期语义。
 - **边界**: 自身不创建 listener、RuntimeSupervisor、Tunnel Supervisor 或 Gateway runtime；运行读写委托 `control` / `gateway_control`，配置事务复用 CLI config engine，必要磁盘持久化继续使用原子 `DataStore`/Gateway config 路径。
 - **安全**: secret key allowlist 在共享层统一校验；Web 传输层只在独立管理 session 校验后才能调用。Secret/FRP Token、Software 和 Windows Service lifecycle 均必须经过 `admin_security.rs` 的 target-bound 一次性 grant；Service 仅在 Windows 发布 executor，非 Windows fail closed。
-- **迁移原则**: 新管理能力先进入共享层，再分别由 Tauri/Web adapter 暴露，禁止直接在 HTTP handler 复制桌面 command 业务逻辑。
+- **扩展原则**: 新管理能力先进入共享层，再由 CLI/Web adapter 暴露，禁止直接在 HTTP handler 复制业务编排，也禁止恢复 desktop-only command 层。
 
 ### admin_daemon.rs / admin_service.rs
 - **职责**: 独立托管 loopback Web Admin，并提供 `admin start/stop/restart/status/install/uninstall/enable/disable/upgrade` 的进程与 OS autostart 治理。
 - **运行权边界**: Admin daemon 不持有 Workspace listener、RuntimeSupervisor、Tunnel Supervisor 或 Gateway runtime；业务生命周期仍只由既有 Workspace/Gateway daemon/control 域负责。
 - **状态与恢复**: Admin daemon 使用独立 lock/PID/state/build identity；端口冲突拒绝接管。Linux 可从 `/proc` 恢复同 config-scope daemon；已注册服务可按 listener PID + executable identity 恢复缺失状态。恢复证据不足时 fail closed/unknown。
 - **OS 管理**: Linux 为 config-scope 独立 systemd user unit，并要求 linger 以覆盖机器重启；Windows 为当前用户 Task Scheduler。两端 restart-on-failure 都限制为 5 秒间隔、最多 3 次。service config 记录注册时 current executable/build，`admin upgrade` 用当前 CLI 重新注册并重启。
-- **与 Tauri 的关系**: persistent Admin 完全由 CLI/OS service manager 管理，不依赖 desktop 窗口或 Tauri 生命周期；这是停止 desktop 作为必需管理入口的前置条件。
+- **产品边界**: persistent Admin 完全由 CLI/OS service manager 管理，不依赖任何桌面窗口生命周期。
 
 ## 核心模块
 
@@ -144,7 +144,7 @@ Desktop stop-publish 已生效：Cargo 默认 feature 是 `cli`，npm 默认 `st
 - **职责**: 配置域级开机恢复与操作系统 supervisor；desired state 保存于 `windows-service.json`
 - **权限边界**: SCM supervisor 自身以 LocalSystem 运行，但不再把该令牌继承给 Workspace/Gateway daemon。安装/更新 Service 时将配置 owner SID/username 固定在管理员保护的 SCM `ImagePath`；supervisor 只信任该 registration identity，而不信任用户可写 plan 的 owner 元数据来选择 token。它选择 SID 匹配的 Active Windows 登录会话，使用该用户 primary token 与用户环境启动受管 daemon；owner 未登录或 registration 仍是旧格式时 fail closed，禁止回退为 SYSTEM child
 - **运行身份**: `windows-service-runtime.json` 保存 supervisor PID、启动时间、实际 executable path 与 build identity；状态读取再以 SCM `queryex` PID、存活性和进程镜像路径交叉校验
-- **升级语义**: `service install` 对已运行 Service 是显式 update：先等待旧 supervisor `STOPPED`（其间优雅排空受管 Workspace/Gateway daemon），再从已更新 binPath 启动当前构建并等待 `RUNNING`。GUI “更新服务版本”使用同一路径；普通 GUI/CLI 操作不隐式升级 Service
+- **升级语义**: `service install` 对已运行 Service 是显式 update：先等待旧 supervisor `STOPPED`（其间优雅排空受管 Workspace/Gateway daemon），再从已更新 binPath 启动当前构建并等待 `RUNNING`；普通 CLI/Web 管理操作不隐式升级 Service
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport
@@ -156,7 +156,6 @@ Desktop stop-publish 已生效：Cargo 默认 feature 是 `cli`，npm 默认 `st
 
 ## 入口文件
 
-- **Tauri 入口**: `src-tauri/src/main.rs`
 - **CLI 入口**: `src-tauri/src/bin/anchor.rs`
 - **前端入口**: `src/routes/+page.svelte`
 - **Agent 入口**: `AGENTS.md`

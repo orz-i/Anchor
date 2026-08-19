@@ -4,7 +4,7 @@
 
 ## 构建
 
-CLI 构建不启用 Tauri desktop feature：
+当前 Rust 产品只有 CLI/Web Admin 路径，不再包含 Tauri desktop feature：
 
 ```bash
 cargo build \

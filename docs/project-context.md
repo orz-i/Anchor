@@ -9,9 +9,9 @@
 | 项目名称 | Anchor Rust |
 | 版本 | 0.1.23 |
 | 语言 | Rust + TypeScript |
-| 框架 | Tauri 2 + Svelte |
-| 类型 | 桌面客户端 + 内嵌 MCP 运行时 |
-| 描述 | 用 Rust/Tauri 重构 Anchor 桌面客户端，内嵌 MCP 核心，单二进制分发 |
+| 框架 | Rust + SvelteKit Web Admin |
+| 类型 | CLI / daemon + 本机 Web 管理面 + MCP/Actions Gateway |
+| 描述 | 以 `anchor` CLI/daemon 为运行权威，并通过 persistent Web Admin 提供浏览器管理面 |
 
 ## 文档导航
 
@@ -45,7 +45,7 @@
 1. 阅读 [技术栈](./project-context/tech-stack.md) 了解项目使用的技术
 2. 阅读 [架构设计](./project-context/architecture.md) 了解项目结构
 3. 阅读 [代码图谱洞察](./graph-insights/latest.md) 理解模块边界
-4. 查看 `docs/specs/rust-desktop-client/` 了解当前功能规格
+4. 查看 `docs/cli-daemon-roadmap.md` 与 `docs/desktop-retirement.md` 了解当前运行/管理架构与 Tauri 退役状态
 
 ## 开发时查看对应文档
 
@@ -64,5 +64,4 @@
 - `src-tauri/tests/` — 当前回归基线
 
 ---
-*生成时间: 2026-07-10*
-*生成工具: MCP Probe Kit - init_project_context*
+*当前状态更新: 2026-08-19*

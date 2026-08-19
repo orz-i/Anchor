@@ -155,11 +155,11 @@ GUI 工作区控制迁移现状：
 
 ### 阶段 3.5：Web 管理面与 Tauri 退役边界
 
-桌面配置壳不是长期管理入口。下一步将同一套 Svelte 管理 UI 迁移为浏览器可直接访问的 Web 管理面，并让 Tauri 仅作为过渡启动壳，最终删除。迁移必须遵守以下边界：
+桌面配置壳不是长期管理入口。本阶段已经把同一套 Svelte 管理 UI 迁移为浏览器 Web Admin，并完成 Tauri 物理删除。当前边界为：
 
-1. **桌面进程不持有运行权威**：Tauri 进程不得创建 `RuntimeSupervisor`、Tunnel Supervisor 或 Gateway listener，也不得在窗口退出时主动关闭 daemon/Gateway/Tunnel。运行资源只归 Workspace/Gateway daemon 或显式前台 CLI `serve` 所有。
-2. **业务 UI 不直接依赖 Tauri**：`src/` 中的业务页面和 API 模块不得直接调用 `@tauri-apps/api` 或 `@tauri-apps/plugin-dialog`。平台差异必须经过统一 transport/dialog 适配层；Tauri adapter 只是迁移期实现。
-3. **Web 管理 API 是可复用控制客户端**：浏览器端通过版本化、本地优先的管理 HTTP API 调用与 CLI/Tauri 相同的 Rust 控制语义，不允许在 HTTP handler 中复制 Workspace、daemon、Tunnel、Gateway 或 secret 业务规则。
+1. **运行权威只属于 daemon/CLI**：不存在 desktop 进程运行所有权；Workspace/Gateway/Tunnel 只归对应 daemon 或显式前台 CLI `serve` 所有。
+2. **业务 UI 是 Web-only**：`src/` 不依赖 Tauri，transport/dialog 均使用浏览器与 Web Admin HTTP API。
+3. **Web 管理 API 是可复用控制客户端**：浏览器端通过版本化、本地优先的管理 HTTP API 调用与 CLI 相同的 Rust 控制语义，不允许在 HTTP handler 中复制 Workspace、daemon、Tunnel、Gateway 或 secret 业务规则。
 4. **管理 HTTP 默认本机安全**：默认只监听 loopback；写请求必须具备独立管理会话认证，并校验 Origin/CSRF。不得复用 MCP/Actions 对公网暴露的认证入口，也不得把 secrets 放入 URL、日志或静态资源。
 5. **离线配置与运行控制分离**：Web 管理面可以在 daemon 未运行时编辑磁盘配置；启动、停止、重载、Tunnel、Gateway 等运行操作仍必须通过对应 daemon 控制域，禁止 HTTP 层创建第二套运行时。
 
@@ -176,8 +176,8 @@ GUI 工作区控制迁移现状：
 
 截至 2026-08-19，本阶段已完成第四轮 Web Admin 实用化：
 
-- Tauri `AppState` 已不再持有 `RuntimeSupervisor`；desktop maintenance 与窗口退出时的 Gateway/Tunnel 清理已删除，桌面进程退出不再影响 daemon 所有的运行资源；
-- Svelte 业务页面/API 已不再直接依赖 Tauri 包，统一经 `invokeAdmin` 与 platform dialog adapter；Tauri 依赖只允许存在于这两个适配边界内，并由架构守卫测试约束；
+- 原 Tauri `AppState`、commands adapter、desktop maintenance 与窗口退出清理已经全部删除；
+- Svelte 业务页面/API 已切为 Web-only，统一经 `invokeAdmin` 与 browser dialog adapter；前端依赖和锁文件中不存在 `@tauri-apps/*`；
 - `anchor admin serve [--port PORT]` 仍固定绑定 `127.0.0.1`，现在由同一进程同时托管版本化 `/api/v1` 与生产 Svelte 静态站点；`pnpm cli:build` 会先执行 adapter-static 构建，再把 `build/` 作为只读资源嵌入 CLI 二进制，因此运行时不依赖单独的 Node/Vite 服务；
 - Web Admin 已新增独立的 persistent Admin daemon/service 层：`anchor admin start|stop|restart|status` 管理后台 Admin daemon，内部 `admin daemon-run` 只托管 loopback Web Admin HTTP/UI，不持有 Workspace、Gateway、Tunnel 或 RuntimeSupervisor。daemon 使用独立 `admin.lock/admin.pid/admin.json` 与 `logs/admin/daemon.log`，状态发布 PID、port、config scope、executable 和 `BuildIdentity`；启动前检查端口所有者，绝不接管其他进程监听；
 - `anchor admin install|uninstall|enable|disable|upgrade` 提供 OS autostart 治理。Linux 使用按 config scope 隔离的 `systemd --user` unit，并要求当前用户 linger 可用以保证重启后启动；Windows 使用当前用户 Task Scheduler、InteractiveToken/LeastPrivilege。两端 crash recovery 都限定为 5 秒间隔、最多 3 次，避免无限 crash loop。`admin upgrade` 使用当前 CLI executable/build 重建 OS 注册并重启，`status` 在运行态和停止态都能识别 build drift；本地 service config 与 OS 注册不一致时 fail closed，要求 upgrade/install 修复，不静默降级为非托管进程；
@@ -185,17 +185,17 @@ GUI 工作区控制迁移现状：
 - 浏览器必须先 `POST /api/v1/session` 建立进程内独立管理会话。会话 ID 只通过 `HttpOnly; SameSite=Strict` cookie 发送，CSRF token 单独返回给同源页面；所有管理 command 都要求精确 `Host`、精确 `Origin`、same-origin Fetch 标记、有效 session 与 CSRF token，不复用 MCP/Actions 的公网认证凭据；
 - Web Admin 已迁移工作区/控制面状态与事件、MCP/Actions runtime 状态、Workspace/Gateway 日志、Gateway 状态/事件、FRP profile 列表、software 状态、secret **读取**和 Windows Service 状态读取，用于现有管理 UI 的首屏和诊断展示；
 - 普通管理能力已继续补齐：Workspace 创建/删除、目录打开、Skill inspection、Health checks、Canvs snapshot/task、FRP 非敏感 metadata 保存与 profile 删除均进入共享 `management.rs` 并由 Web dispatcher 暴露；FRP metadata 与 Token 写入已经拆成两个独立权限域，浏览器先持久化非敏感 metadata，再对稳定 profile ID 单独执行高权限 Token 确认；
-- Workspace 配置更新已切换为共享 `preview/stage/apply` 事务：浏览器提交时携带加载时的 `baseProfile`，服务端在 staging 前要求它仍与 active 配置一致，防止旧页面覆盖 CLI/Tauri 的并发修改；pending/apply 继续复用 CLI 既有字段级 diff、资源校验、apply plan、daemon hot reload 与 stale-base 保护；
+- Workspace 配置更新已切换为共享 `preview/stage/apply` 事务：浏览器提交时携带加载时的 `baseProfile`，服务端在 staging 前要求它仍与 active 配置一致，防止旧页面覆盖 CLI 的并发修改；pending/apply 继续复用 CLI 既有字段级 diff、资源校验、apply plan、daemon hot reload 与 stale-base 保护；
 - Web Admin 已迁移 Workspace MCP/Actions daemon 启停/重启和 Tunnel start/restart/stop/test，全部经 `management.rs` 委托现有 `control` daemon 协议；Tunnel test 的临时服务运行态用 `reconcile_daemon` 恢复，不会把探测动作写成持久化 autostart desired-state；Web HTTP handler 不直接拥有 listener、RuntimeSupervisor 或 Tunnel Supervisor；
 - Gateway 配置保存继续使用共享热应用/关闭语义。Gateway protocol v1 以 additive `set_routes` 增加 per-workspace route 生命周期：已有 Gateway daemon 在同一 PID 内重建内部 Workspace MCP/routes/tunnel 并使用 accepted → operation status 反馈；失败会恢复旧 route 集合。首个 route 在 daemon 停止时可启动 Gateway，最后一个 route 移除走受控 shutdown。Web 管理页可逐 Workspace 启停 route，存在未保存 Gateway 配置草稿时禁止 route mutation；
-- Gateway 启用时，Web Admin 仍不允许绕过 Gateway 控制域直接启停单 Workspace MCP daemon/Tunnel；Tauri 的 Windows route helper 也已改为调用同一 `management.rs` 语义，不再维护第二套 route restart 编排；
+- Gateway 启用时，Web Admin 仍不允许绕过 Gateway 控制域直接启停单 Workspace MCP daemon/Tunnel；共享 `management.rs` 是唯一 route mutation 业务语义；
 - Web Admin 高权限确认已进入 Secret/FRP、Software 与 Windows Service 三个真实执行域：prepare ticket 绑定当前 HttpOnly session + allowlisted action + 非敏感 target fingerprint，批准后得到短 TTL、一次性 grant。Windows Service 的浏览器请求不提供可信 target；服务端会按 action 重建 `serviceName + opaque revision`，revision 哈希当前构建/可执行文件、配置域、SCM 注册与状态、配置 owner，以及 install/sync 需要的 desired/running plan 快照。执行前再次重建，任一相关状态漂移都会要求重新确认；
-- Windows Service install/uninstall/start/stop/restart/sync 仅在 Windows capability manifest 中发布；Web 二次确认是 Anchor 应用级前置门槛，实际 SCM 变更仍使用既有 Windows UAC helper，未绕过操作系统提权。非 Windows 平台继续在 `unavailableCommands` 中 fail closed。Tauri command 已收缩为共享 `management.rs` adapter，不再维护第二套 Service lifecycle；
+- Windows Service install/uninstall/start/stop/restart/sync 仅在 Windows capability manifest 中发布；Web 二次确认是 Anchor 应用级前置门槛，实际 SCM 变更仍使用既有 Windows UAC helper，未绕过操作系统提权。非 Windows 平台继续在 `unavailableCommands` 中 fail closed；
 - 结构化 audit journal 仍只记录 session 指纹、action、phase/outcome，并使用有界大小/轮转与私有文件权限；不写 command args、payload、Secret/Token、下载 URL、owner、路径、target 或 opaque revision。grant 消费及 executor 成功/失败都会进入审计；
 - 当前仍保留 unavailable 的旧高权限兼容命令主要是 `save_frp_profile`，避免重新把 FRP metadata 与 Token 合并为单一权限面。Web Admin session/health 按平台发布 `supportedCommands`、`mutationCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 与 `unavailableCommands`；
-- Web adapter 会自动建立/缓存管理 session，并在 401 后最多重新 bootstrap 一次。业务页面仍无需感知 Tauri/Web transport 差异；架构守卫会扫描前端 API command，要求每个调用要么存在于正向 Web manifest，要么明确列入 privileged 集合。
+- Web adapter 会自动建立/缓存管理 session，并在 401 后最多重新 bootstrap 一次；架构守卫会扫描前端 API command，要求每个调用要么存在于正向 Web manifest，要么明确列入 privileged 集合。
 
-至此 Web 管理能力、全部已评审 privileged executor 与 persistent Admin service 的代码迁移门槛已闭合，并已完成 **desktop stop-publish**：Cargo 默认 feature 改为 `cli`，`tauri-build` 仅在显式 desktop feature 下启用；`pnpm start` / `release:build` 分别指向 Web Admin/CLI，Tauri 只保留 `legacy:desktop*` 显式目标；旧 desktop scripts 仅作为带弃用提示的兼容别名。Tauri bootstrap/handler 已集中到 `legacy_desktop.rs`，核心 `lib.rs` 不再直接承载 Tauri Builder。`desktop_retirement_boundaries` 会机器验证默认发布入口、Tauri import adapter 与 runtime ownership 边界。后续进入**彻底删除 Tauri 的弃用窗口/清理阶段**，清单见 `docs/desktop-retirement.md`。Windows Service Web executor 的真实 UAC/SCM 行为，以及 Windows Admin Task Scheduler 的真实 logon/restart 行为，仍属于 Windows 发布验收项；当前 Linux 验证主机不能替代这些实机 smoke。
+至此 Web 管理能力、全部已评审 privileged executor 与 persistent Admin service 的代码迁移门槛已闭合，并已完成 **Tauri physical removal**：Cargo 只保留 `anchor` CLI target；前端为 Web-only；desktop feature/bin、Tauri Rust/npm 依赖、bootstrap/AppState/commands、bundle config/capabilities/icons 与 desktop build/installer scripts 均已删除。`no_tauri_boundaries` 会机器验证 active source、manifest/lockfile 和物理路径，防止 Tauri/desktop ownership 回流。后续只剩 Windows Service Web executor 的真实 UAC/SCM 行为、Windows Admin Task Scheduler logon/restart，以及 CLI 分发/旧安装迁移的发布验收；当前 Linux 验证主机不能替代这些实机 smoke。
 
 ### 阶段 4：运行与升级治理
 
@@ -205,15 +205,15 @@ GUI 工作区控制迁移现状：
 - Workspace/Gateway daemon state 与 `version` 已发布 additive `buildIdentity`；CLI doctor 可比较当前客户端构建与活动 Workspace daemon；Gateway canonical status 也携带 build identity；
 - 协议兼容严格限制在只读 `version` 与稳定 lifecycle drain：Workspace 仅允许新客户端对 v2+ 旧 daemon 发送 `shutdown/prepare_restart`，Gateway 下限为 v1；其他写操作仍精确版本 fail-closed；
 - Windows SCM 发布经过 PID/image 校验的 runtime build identity；`service status` 区分 current/different/unknown，显式 `service install` 更新已有 Service 时会等待旧 supervisor 停止后启动当前二进制；
-- Web Admin 自身的持久运行权已独立于 desktop：Admin daemon 使用单独 lock/PID/state/build identity，OS autostart 仅负责拉起 `admin daemon-run`。Linux systemd user 与 Windows Task Scheduler 均使用 bounded restart policy；Admin service 不进入 Workspace/Gateway supervisor，也不会在自身退出时清理业务 runtime；
+- Web Admin 的持久运行权由独立 Admin daemon 承担：使用单独 lock/PID/state/build identity，OS autostart 仅负责拉起 `admin daemon-run`。Linux systemd user 与 Windows Task Scheduler 均使用 bounded restart policy；Admin service 不进入 Workspace/Gateway supervisor，也不会在自身退出时清理业务 runtime；
 - 服务安装状态、日志轮转和资源限制；
 - 可重复的跨平台安装、升级、降级和卸载测试；Linux runtime rollout 自动回滚链已进入代码与回归范围，Windows SCM 安装包升级后的真实管理员/重启 smoke 仍属于发布验收项。
 
-## 第一阶段完成标准
+## 当前基础完成标准
 
-- CLI 与 Tauri 返回相同的 Workspace 控制状态 JSON；
+- CLI 与 Web Admin 使用同一 Workspace 控制状态/management 语义；
 - `anchor status`、`anchor status --all` 和 `anchor status <workspace>` 行为稳定；
 - daemon 模型不再依赖 CLI 参数模块；
-- desktop-only、cli-only 和 all-features 构建全部通过；
-- 原 GUI 启停功能无回归；
-- 文档明确后续不得向 GUI 新增运行编排逻辑。
+- Cargo/package/active source 无 Tauri dependency 或 desktop target；
+- Web Admin 管理能力与 CLI/shared management 回归通过；
+- 文档明确不得恢复 desktop-only 业务编排或运行所有权。

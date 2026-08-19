@@ -269,7 +269,7 @@ Harness Task 默认继续使用当前 Workspace；需要并行隔离分支、索
 
 ## 本地开发
 
-默认开发环境只要求 Node.js 20+ 与 Rust stable；Tauri 系统依赖仅在显式验证 legacy desktop 时需要。
+默认开发环境只要求 Node.js 20+ 与 Rust stable。Tauri 已从当前产品和构建依赖中移除。
 
 ```bash
 pnpm install --frozen-lockfile
@@ -289,13 +289,11 @@ cd src-tauri && cargo test
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
-Windows 也可以双击 `dev-desktop.cmd`。不要只用 `npm run dev` 验证桌面应用，它只启动 Vite，不会启动 Tauri 外壳。
-
-> Tauri desktop 已进入弃用期，不再是默认开发或发布目标。确需兼容性验证时安装 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) 并显式运行 `pnpm legacy:desktop` 或 `pnpm legacy:desktop:build`；旧 `pnpm desktop*` 别名会打印弃用提示。退役门槛见 [Desktop / Tauri 退役门槛](docs/desktop-retirement.md)。
+桌面/Tauri 外壳、安装包脚本与对应依赖已物理删除。当前管理入口是浏览器 Web Admin，运行与运维入口是 `anchor` CLI/daemon；退役记录见 [Desktop / Tauri 退役记录](docs/desktop-retirement.md)。
 
 ### Linux 无界面 CLI
 
-Linux 服务器可以构建不含桌面壳的 `anchor`，直接读取桌面端相同的 workspace/profile 配置，并以前台模式运行 MCP 或 Actions：
+Linux 服务器可以直接构建 `anchor`，读取统一的 workspace/profile 配置，并以前台模式运行 MCP 或 Actions：
 
 ```bash
 pnpm cli:build
