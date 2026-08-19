@@ -83,7 +83,7 @@ pub fn validate_workspace_resources_update(
     validate_changed_candidate_subdomains(&existing_claims, &candidate_claims, current, candidate)
 }
 
-#[cfg(any(feature = "desktop", test))]
+#[cfg(any(feature = "desktop", feature = "cli", test))]
 pub fn validate_service_start(
     profiles: &[WorkspaceProfile],
     workspace_id: &str,

@@ -18,7 +18,7 @@ use crate::control::{self, ControlPlaneEventCursor};
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::management;
-use crate::settings::{DownloadConfig, ProxyConfig};
+use crate::settings::{DownloadConfig, McpGatewayConfig, ProxyConfig};
 use crate::workspace::resources::WorkspaceService;
 use crate::workspace::WorkspaceProfile;
 
@@ -88,6 +88,17 @@ struct LinesArgs {
 struct WorkspaceLogsArgs {
     id: String,
     service: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TunnelArgs {
+    id: String,
+    service: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayConfigArgs {
+    config: McpGatewayConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,7 +213,23 @@ async fn health() -> Json<Value> {
             "mutationsEnabled": true,
             "sessionRequired": true,
             "uiEmbedded": ADMIN_UI_EMBEDDED,
-            "mutationCommands": ["set_last_workspace", "set_proxy", "set_download_config"]
+            "mutationCommands": [
+                "set_last_workspace",
+                "set_proxy",
+                "set_download_config",
+                "stage_workspace_config",
+                "apply_workspace_config",
+                "start_runtime",
+                "stop_runtime",
+                "restart_runtime",
+                "start_actions_runtime",
+                "stop_actions_runtime",
+                "restart_actions_runtime",
+                "restart_tunnel",
+                "stop_tunnel",
+                "set_mcp_gateway",
+                "reload_mcp_gateway"
+            ]
         }
     }))
 }
@@ -532,10 +559,58 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
             .map_err(AppError::from)
             .map_err(Into::into)
         }
+        "start_runtime" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::start_workspace_service(&input.id, WorkspaceService::Mcp).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "stop_runtime" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::stop_workspace_service(&input.id, WorkspaceService::Mcp).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "restart_runtime" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::restart_workspace_service(&input.id, WorkspaceService::Mcp).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
         "get_actions_runtime_status" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
                 management::runtime_status(&input.id, WorkspaceService::Actions).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "start_actions_runtime" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::start_workspace_service(&input.id, WorkspaceService::Actions).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "stop_actions_runtime" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::stop_workspace_service(&input.id, WorkspaceService::Actions).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "restart_actions_runtime" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::restart_workspace_service(&input.id, WorkspaceService::Actions).await?,
             )
             .map_err(AppError::from)
             .map_err(Into::into)
@@ -576,6 +651,15 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "set_mcp_gateway" => {
+            let input: GatewayConfigArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::set_mcp_gateway(input.config).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "reload_mcp_gateway" => serde_json::to_value(management::reload_mcp_gateway().await?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
         "get_gateway_control_events" => {
             let input: GatewayEventsArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
@@ -595,6 +679,22 @@ async fn dispatch_command(command: &str, args: Value) -> Result<Value, AdminDisp
             serde_json::to_value(management::read_workspace_logs(&input.id, &input.service).await?)
                 .map_err(AppError::from)
                 .map_err(Into::into)
+        }
+        "restart_tunnel" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::restart_workspace_tunnel(&input.id, &input.service).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "stop_tunnel" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::stop_workspace_tunnel(&input.id, &input.service).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
         }
         "preview_workspace_config" => {
             let input: WorkspaceConfigArgs =
