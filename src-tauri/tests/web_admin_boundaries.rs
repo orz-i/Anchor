@@ -101,7 +101,7 @@ fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
 }
 
 #[test]
-fn privileged_confirmation_exposes_only_the_reviewed_secret_executors() {
+fn privileged_confirmation_exposes_only_reviewed_executors() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
     let security =
@@ -115,6 +115,8 @@ fn privileged_confirmation_exposes_only_the_reviewed_secret_executors() {
     assert!(admin.contains("PrivilegedActionBinding::workspace_secret"));
     assert!(admin.contains("PrivilegedActionBinding::shared_secret"));
     assert!(admin.contains("PrivilegedActionBinding::frp_profile"));
+    assert!(admin.contains("PrivilegedActionBinding::software_install"));
+    assert!(admin.contains("PrivilegedActionBinding::software_uninstall"));
     assert!(security.contains("binding_fingerprint"));
     assert!(security.contains("record_execution_outcome"));
 
@@ -213,6 +215,8 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "management::set_shared_secret",
         "management::regenerate_shared_secret",
         "management::set_frp_profile_token",
+        "management::install_software",
+        "management::uninstall_software",
     ] {
         assert!(
             admin.contains(delegated),
@@ -242,8 +246,6 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
 
     for command in [
         "save_frp_profile",
-        "install_software",
-        "uninstall_software",
         "install_windows_service",
         "uninstall_windows_service",
         "start_windows_service",
@@ -263,6 +265,8 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
         "set_shared_secret",
         "regenerate_shared_secret",
         "set_frp_profile_token",
+        "install_software",
+        "uninstall_software",
     ] {
         assert!(
             admin.contains(&format!("\"{command}\" =>")),
@@ -271,8 +275,6 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
     }
 
     for command in [
-        "install_software",
-        "uninstall_software",
         "install_windows_service",
         "uninstall_windows_service",
         "start_windows_service",
