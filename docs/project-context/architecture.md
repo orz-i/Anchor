@@ -85,11 +85,13 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 
 当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 仅绑定 loopback，并同源托管嵌入 CLI 的生产 Svelte 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。
 
-`management.rs` 是 Web/Tauri 共用的管理语义边界。当前已共享工作区 runtime/control 读取、Workspace/Gateway 日志与事件、Gateway 配置/状态读取、FRP/software 状态、secret 读取，以及最近工作区/代理/下载设置三类低风险写入。HTTP handler 只负责安全校验、参数反序列化和调用该共享层，不持有 daemon/Tunnel/Gateway 运行权威。高权限写操作仍未迁移，因此 Web Admin 尚未达到桌面端完整功能等价；Tauri 作为兼容配置壳继续发布。
+`management.rs` 是 Web/Tauri 共用的管理语义边界。除读取能力外，Workspace 配置现在通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP/Actions runtime 与 Tunnel restart/stop 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层，运行中的 daemon 禁止静默回退到本地写。HTTP handler 只负责安全校验、参数反序列化和调用该共享层，不持有 daemon/Tunnel/Gateway 运行权威。
+
+当前 Web Admin 对 Gateway 的边界仍然是“配置与 daemon 控制”，不是“route 所有权”。启用 Gateway 时，单 Workspace MCP 启停会 fail closed，禁止绕过 Gateway 创建并行 Workspace MCP daemon；per-workspace route selector 仍属于下一迁移阶段。Secret 写入/重新生成、软件安装/卸载以及 Windows Service 生命周期也继续留在高权限边界之外，因此 Tauri 仍作为兼容配置壳发布。
 
 ### management.rs
-- **职责**: Tauri adapter、Web Admin 与后续其他管理客户端共用的配置/状态/日志读取和受控配置写语义。
-- **边界**: 不创建 listener、Tunnel 或 Gateway；运行态读取委托 `control` / `gateway_control`，低风险磁盘写入复用 `DataStore::update_file` 原子持久化。
+- **职责**: Tauri adapter、Web Admin 与后续其他管理客户端共用的配置/状态/日志读取、配置 staging/apply 与受控 daemon 生命周期语义。
+- **边界**: 自身不创建 listener、RuntimeSupervisor、Tunnel Supervisor 或 Gateway runtime；运行读写委托 `control` / `gateway_control`，配置事务复用 CLI config engine，必要磁盘持久化继续使用原子 `DataStore`/Gateway config 路径。
 - **安全**: secret key allowlist 在共享层统一校验；Web 传输层只在独立管理 session 校验后才能调用。
 - **迁移原则**: 新管理能力先进入共享层，再分别由 Tauri/Web adapter 暴露，禁止直接在 HTTP handler 复制桌面 command 业务逻辑。
 
