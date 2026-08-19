@@ -14,12 +14,14 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::admin_security::{read_admin_audit_events, PrivilegedConfirmationStore};
+use crate::admin_security::{
+    privileged_actions, read_admin_audit_events, PrivilegedConfirmationStore,
+};
 use crate::control::{self, ControlPlaneEventCursor};
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::management;
-use crate::settings::{DownloadConfig, McpGatewayConfig, ProxyConfig};
+use crate::settings::{DownloadConfig, FrpProfileInput, McpGatewayConfig, ProxyConfig};
 use crate::workspace::resources::WorkspaceService;
 use crate::workspace::WorkspaceProfile;
 
@@ -28,6 +30,60 @@ pub const DEFAULT_ADMIN_PORT: u16 = 28_769;
 const ADMIN_SESSION_COOKIE: &str = "anchor_admin_session";
 const ADMIN_SESSION_IDLE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_ADMIN_SESSIONS: usize = 64;
+const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
+    "prepare_privileged_action",
+    "confirm_privileged_action",
+    "list_admin_audit_events",
+    "list_workspaces",
+    "create_workspace",
+    "inspect_workspace_skills",
+    "open_workspace_directory",
+    "delete_workspace",
+    "run_health_checks",
+    "get_canvs_snapshot",
+    "list_canvs_tasks",
+    "get_canvs_task_snapshot",
+    "get_control_plane_status",
+    "get_control_plane_events",
+    "get_last_workspace_id",
+    "set_last_workspace",
+    "list_frp_profiles",
+    "save_frp_profile_metadata",
+    "delete_frp_profile",
+    "get_runtime_status",
+    "test_tunnel",
+    "start_runtime",
+    "stop_runtime",
+    "restart_runtime",
+    "get_actions_runtime_status",
+    "start_actions_runtime",
+    "stop_actions_runtime",
+    "restart_actions_runtime",
+    "get_workspace_control_status",
+    "get_workspace_control_events",
+    "get_workspace_secret",
+    "get_shared_secret",
+    "get_mcp_gateway",
+    "get_mcp_gateway_status",
+    "set_mcp_gateway",
+    "reload_mcp_gateway",
+    "set_mcp_gateway_route",
+    "get_gateway_control_events",
+    "read_gateway_logs",
+    "read_workspace_logs",
+    "restart_tunnel",
+    "start_tunnel",
+    "stop_tunnel",
+    "preview_workspace_config",
+    "stage_workspace_config",
+    "apply_workspace_config",
+    "get_windows_service_status",
+    "list_software",
+    "get_proxy",
+    "set_proxy",
+    "get_download_config",
+    "set_download_config",
+];
 
 struct AdminStaticAsset {
     content_type: &'static str,
@@ -37,6 +93,37 @@ struct AdminStaticAsset {
 #[derive(Debug, Deserialize)]
 struct IdArgs {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateWorkspaceArgs {
+    path: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsArgs {
+    id: String,
+    enabled: bool,
+    roots: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspacePathArgs {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CanvsTaskArgs {
+    id: String,
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FrpProfileMetadataArgs {
+    profile: FrpProfileInput,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,10 +331,17 @@ async fn health() -> Json<Value> {
             "mutationsEnabled": true,
             "sessionRequired": true,
             "uiEmbedded": ADMIN_UI_EMBEDDED,
+            "supportedCommands": WEB_ADMIN_SUPPORTED_COMMANDS,
+            "unavailableCommands": privileged_actions(),
             "mutationCommands": [
+                "create_workspace",
+                "open_workspace_directory",
+                "delete_workspace",
                 "prepare_privileged_action",
                 "confirm_privileged_action",
                 "set_last_workspace",
+                "save_frp_profile_metadata",
+                "delete_frp_profile",
                 "set_proxy",
                 "set_download_config",
                 "stage_workspace_config",
@@ -392,7 +486,9 @@ async fn create_session(State(state): State<AdminState>, headers: HeaderMap) -> 
             "ok": true,
             "data": {
                 "csrfToken": csrf_token,
-                "idleTimeoutSeconds": ADMIN_SESSION_IDLE_TTL.as_secs()
+                "idleTimeoutSeconds": ADMIN_SESSION_IDLE_TTL.as_secs(),
+                "supportedCommands": WEB_ADMIN_SUPPORTED_COMMANDS,
+                "unavailableCommands": privileged_actions()
             }
         })),
     )
@@ -597,11 +693,57 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
-        "list_workspaces" => {
-            let store = DataStore::load()?;
-            serde_json::to_value(store.list())
+        "list_workspaces" => serde_json::to_value(management::list_workspaces()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "create_workspace" => {
+            let input: CreateWorkspaceArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::create_workspace(input.path, input.name)?)
                 .map_err(AppError::from)
                 .map_err(Into::into)
+        }
+        "inspect_workspace_skills" => {
+            let input: SkillsArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::inspect_workspace_skills(&input.id, input.enabled, &input.roots)
+                .map_err(Into::into)
+        }
+        "open_workspace_directory" => {
+            let input: WorkspacePathArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::open_workspace_directory(&input.path)?;
+            Ok(Value::Null)
+        }
+        "delete_workspace" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::delete_workspace(&input.id).await?;
+            Ok(Value::Null)
+        }
+        "run_health_checks" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::run_health_checks(&input.id).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_canvs_snapshot" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_canvs_snapshot(&input.id)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "list_canvs_tasks" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::list_canvs_tasks(&input.id)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_canvs_task_snapshot" => {
+            let input: CanvsTaskArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_canvs_task_snapshot(
+                &input.id,
+                &input.task_id,
+            )?)
+            .map_err(AppError::from)
+            .map_err(Into::into)
         }
         "get_control_plane_status" => {
             let store = DataStore::load()?;
@@ -633,6 +775,18 @@ async fn dispatch_command(
         "list_frp_profiles" => serde_json::to_value(management::list_frp_profiles()?)
             .map_err(AppError::from)
             .map_err(Into::into),
+        "save_frp_profile_metadata" => {
+            let input: FrpProfileMetadataArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::save_frp_profile_metadata(input.profile)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "delete_frp_profile" => {
+            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::delete_frp_profile(&input.id)?;
+            Ok(Value::Null)
+        }
         "get_runtime_status" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(

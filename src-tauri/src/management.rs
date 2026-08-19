@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -10,10 +10,14 @@ use crate::control::{
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::gateway_control::{self, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor};
-use crate::platform::platform;
-use crate::settings::{AppSettings, DownloadConfig, McpGatewayConfig, ProxyConfig};
+use crate::platform::{open_path_in_file_manager, platform};
+use crate::settings::{
+    AppSettings, DownloadConfig, FrpProfile, FrpProfileInput, McpGatewayConfig, ProxyConfig,
+};
 use crate::tunnel::{TunnelServiceKind, TunnelStatus};
-use crate::workspace::resources::{validate_service_start, WorkspaceService};
+use crate::workspace::resources::{
+    assign_free_workspace_ports_with_reserved, validate_service_start, WorkspaceService,
+};
 use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
 
 const MANAGEMENT_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
@@ -246,6 +250,118 @@ fn gateway_config_write_action(
     } else {
         Ok(GatewayConfigWriteAction::ShutdownThenPersist { pid })
     }
+}
+
+pub(crate) fn list_workspaces() -> AppResult<Vec<WorkspaceProfile>> {
+    DataStore::read_file(|data| Ok(data.profiles.clone()))
+}
+
+fn workspace_profile(id: &str) -> AppResult<WorkspaceProfile> {
+    DataStore::read_file(|data| {
+        data.profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
+    })
+}
+
+fn workspace_path(id: &str) -> AppResult<PathBuf> {
+    workspace_profile(id).map(|profile| PathBuf::from(profile.path))
+}
+
+pub(crate) fn inspect_workspace_skills(
+    id: &str,
+    enabled: bool,
+    roots: &str,
+) -> AppResult<serde_json::Value> {
+    let profile = workspace_profile(id)?;
+    let catalog = crate::skills::SkillCatalog::new(PathBuf::from(profile.path));
+    catalog.configure(crate::skills::SkillSettings::from_text(enabled, roots));
+    Ok(serde_json::to_value(catalog.list(None, 200))?)
+}
+
+pub(crate) fn create_workspace(path: String, name: Option<String>) -> AppResult<WorkspaceProfile> {
+    let mut store = DataStore::load()?;
+    let mut profile = WorkspaceProfile::new(path, name);
+    let gateway = store.settings().mcp_gateway;
+    let reserved = if gateway.enabled {
+        std::collections::HashSet::from([gateway.local_port])
+    } else {
+        std::collections::HashSet::new()
+    };
+    assign_free_workspace_ports_with_reserved(store.list(), &mut profile, &reserved)?;
+    store.register_workspace(profile.clone())?;
+    Ok(profile)
+}
+
+pub(crate) fn open_workspace_directory(path: &str) -> AppResult<()> {
+    open_path_in_file_manager(&PathBuf::from(path.trim()))
+}
+
+pub(crate) async fn delete_workspace(id: &str) -> AppResult<()> {
+    let store = DataStore::load()?;
+    crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, id)?;
+    let profile = store
+        .get(id)
+        .cloned()
+        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+    drop(store);
+
+    let gateway_inspection = crate::gateway_daemon::inspect()?;
+    if gateway_inspection.ambiguous {
+        return Err(AppError::Message(gateway_inspection.detail));
+    }
+    if gateway_inspection.running
+        && gateway_inspection
+            .state
+            .as_ref()
+            .is_some_and(|gateway_state| gateway_state.workspace_ids.iter().any(|item| item == id))
+    {
+        return Err(AppError::Message(
+            "该 Workspace 正由 Gateway daemon 提供路由。请先关闭对应 Gateway route，再删除 Workspace。"
+                .into(),
+        ));
+    }
+
+    control::request_daemon_exit_and_wait(
+        &profile,
+        control::ControlOperation::Shutdown,
+        MANAGEMENT_DAEMON_TIMEOUT,
+        true,
+    )
+    .await?;
+
+    let mut store = DataStore::load()?;
+    crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, id)?;
+    if store.remove(id)?.is_some() {
+        crate::secret::SecretStore::clear_refresh_replay_state(id)?;
+    }
+    #[cfg(windows)]
+    crate::windows_service::forget_workspace(id)?;
+    Ok(())
+}
+
+pub(crate) async fn run_health_checks(id: &str) -> AppResult<Vec<crate::health::HealthItem>> {
+    crate::health::run_health_checks(&workspace_profile(id)?).await
+}
+
+pub(crate) fn get_canvs_snapshot(id: &str) -> AppResult<crate::canvs::CanvsSnapshot> {
+    crate::canvs::current_workspace_snapshot(&workspace_path(id)?)
+        .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
+}
+
+pub(crate) fn list_canvs_tasks(id: &str) -> AppResult<crate::canvs::CanvsTaskList> {
+    crate::canvs::list_workspace_tasks(&workspace_path(id)?)
+        .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
+}
+
+pub(crate) fn get_canvs_task_snapshot(
+    id: &str,
+    task_id: &str,
+) -> AppResult<crate::canvs::CanvsSnapshot> {
+    crate::canvs::workspace_task_snapshot(&workspace_path(id)?, task_id)
+        .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
 }
 
 #[cfg(feature = "cli")]
@@ -970,21 +1086,62 @@ pub(crate) fn list_frp_profiles() -> AppResult<Vec<FrpProfileDto>> {
         Ok(data
             .frp_profiles
             .iter()
-            .map(|profile| {
-                let has_token = data
-                    .app_secrets
-                    .get("frp_profile_token")
-                    .and_then(|tokens| tokens.get(&profile.id))
-                    .is_some_and(|value| !value.trim().is_empty());
-                FrpProfileDto {
-                    id: profile.id.clone(),
-                    name: profile.name.clone(),
-                    server: profile.server.clone(),
-                    server_port: profile.server_port,
-                    has_token,
-                }
-            })
+            .map(|profile| frp_profile_dto(data, profile))
             .collect())
+    })
+}
+
+fn frp_profile_dto(data: &crate::data::AppData, profile: &FrpProfile) -> FrpProfileDto {
+    let has_token = data
+        .app_secrets
+        .get("frp_profile_token")
+        .and_then(|tokens| tokens.get(&profile.id))
+        .is_some_and(|value| !value.trim().is_empty());
+    FrpProfileDto {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        server: profile.server.clone(),
+        server_port: profile.server_port,
+        has_token,
+    }
+}
+
+pub(crate) fn save_frp_profile_metadata(profile: FrpProfileInput) -> AppResult<FrpProfileDto> {
+    if profile.name.trim().is_empty() || profile.server.trim().is_empty() {
+        return Err(AppError::Message("FRP 配置名称和服务器不能为空。".into()));
+    }
+
+    let mut saved = FrpProfile::from(profile);
+    saved.name = saved.name.trim().to_string();
+    saved.server = saved.server.trim().to_string();
+    if saved.id.trim().is_empty() {
+        saved.id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    }
+
+    DataStore::update_file(|data| {
+        if let Some(existing) = data
+            .frp_profiles
+            .iter_mut()
+            .find(|item| item.id == saved.id)
+        {
+            *existing = saved.clone();
+        } else {
+            data.frp_profiles.push(saved.clone());
+        }
+        Ok(frp_profile_dto(data, &saved))
+    })
+}
+
+pub(crate) fn delete_frp_profile(id: &str) -> AppResult<()> {
+    DataStore::update_file(|data| {
+        data.frp_profiles.retain(|profile| profile.id != id);
+        if let Some(tokens) = data.app_secrets.get_mut("frp_profile_token") {
+            tokens.remove(id);
+            if tokens.is_empty() {
+                data.app_secrets.remove("frp_profile_token");
+            }
+        }
+        Ok(())
     })
 }
 

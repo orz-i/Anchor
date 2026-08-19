@@ -24,7 +24,6 @@ mod error;
 pub mod gateway_control;
 pub mod gateway_daemon;
 pub mod harness;
-#[cfg(feature = "desktop")]
 mod health;
 mod logging;
 mod management;

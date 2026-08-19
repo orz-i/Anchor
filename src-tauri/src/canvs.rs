@@ -138,7 +138,6 @@ fn task_list(harness: &Harness) -> HarnessResult<CanvsTaskList> {
     })
 }
 
-#[cfg(feature = "desktop")]
 pub fn current_workspace_snapshot(workspace_path: &Path) -> HarnessResult<CanvsSnapshot> {
     let harness = workspace_harness(workspace_path)?;
     let Some(task) = harness.current_task()? else {
@@ -168,7 +167,6 @@ fn workspace_harness(workspace_path: &Path) -> HarnessResult<Harness> {
     Harness::new(PathBuf::from(workspace_path), Harness::default_root()?)
 }
 
-#[cfg(feature = "desktop")]
 fn empty_snapshot(harness: &Harness) -> CanvsSnapshot {
     CanvsSnapshot {
         workspace_id: harness.workspace_id().to_string(),

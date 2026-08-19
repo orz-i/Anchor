@@ -17,7 +17,6 @@ impl SecretStore {
         })
     }
 
-    #[cfg(feature = "desktop")]
     pub fn clear_refresh_replay_state(workspace_id: &str) -> AppResult<()> {
         DataStore::update_file(|data| {
             clear_refresh_replay_state_in(data, workspace_id);
@@ -82,7 +81,6 @@ fn consume_refresh_token_in(
     Ok(true)
 }
 
-#[cfg(any(feature = "desktop", test))]
 fn clear_refresh_replay_state_in(data: &mut AppData, workspace_id: &str) {
     let Some(items) = data.app_secrets.get_mut(OAUTH_REFRESH_REPLAY_SCOPE) else {
         return;

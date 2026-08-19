@@ -2,10 +2,10 @@ use tauri::State;
 
 use crate::app_state::AppState;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::management;
 
-use crate::settings::{AppSettings, FrpProfile, FrpProfileInput, ProxyConfig};
+use crate::settings::{AppSettings, FrpProfileInput, ProxyConfig};
 
 pub use crate::management::FrpProfileDto;
 
@@ -24,73 +24,21 @@ pub fn save_frp_profile(
 
     token: Option<String>,
 ) -> AppResult<FrpProfileDto> {
-    if profile.name.trim().is_empty() || profile.server.trim().is_empty() {
-        return Err(AppError::Message("FRP 配置名称和服务器不能为空。".into()));
+    let mut saved = management::save_frp_profile_metadata(profile)?;
+    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
+        state.with_settings(|store| {
+            store.set_app_secret("frp_profile_token", &saved.id, token.trim())
+        })?;
+        saved.has_token = true;
     }
-
-    let mut saved = FrpProfile::from(profile);
-
-    saved.name = saved.name.trim().to_string();
-
-    saved.server = saved.server.trim().to_string();
-
-    if saved.id.trim().is_empty() {
-        saved.id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    }
-
-    state.with_settings(|store| {
-        let mut settings = store.settings();
-
-        if let Some(existing) = settings
-            .frp_profiles
-            .iter_mut()
-            .find(|item| item.id == saved.id)
-        {
-            *existing = saved.clone();
-        } else {
-            settings.frp_profiles.push(saved.clone());
-        }
-
-        store.update_settings(settings)?;
-
-        if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
-            store.set_app_secret("frp_profile_token", &saved.id, token.trim())?;
-        }
-
-        Ok(())
-    })?;
-
-    let has_token = state.with_settings(|store| {
-        Ok(store
-            .get_app_secret("frp_profile_token", &saved.id)
-            .is_some_and(|value| !value.trim().is_empty()))
-    })?;
-
-    Ok(FrpProfileDto {
-        id: saved.id.clone(),
-
-        name: saved.name,
-
-        server: saved.server,
-
-        server_port: saved.server_port,
-
-        has_token,
-    })
+    Ok(saved)
 }
 
 #[tauri::command]
 
 pub fn delete_frp_profile(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.with_settings(|store| {
-        let mut settings = store.settings();
-
-        settings.frp_profiles.retain(|profile| profile.id != id);
-
-        store.update_settings(settings)?;
-
-        store.delete_app_secret("frp_profile_token", &id)
-    })
+    management::delete_frp_profile(&id)?;
+    state.reload_data_from_disk()
 }
 
 #[tauri::command]

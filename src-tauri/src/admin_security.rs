@@ -35,6 +35,10 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
     "sync_windows_service_plan",
 ];
 
+pub(crate) fn privileged_actions() -> &'static [&'static str] {
+    PRIVILEGED_ACTIONS
+}
+
 static AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

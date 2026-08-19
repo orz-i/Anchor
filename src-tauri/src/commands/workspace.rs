@@ -1,24 +1,21 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use tauri::State;
 
-use crate::app_state::{teardown_workspace, AppState};
+use crate::app_state::AppState;
 use crate::auth::validate_redirect_policy;
 use crate::daemon;
 use crate::error::{AppError, AppResult};
-use crate::platform::open_path_in_file_manager;
+use crate::management;
 use crate::workspace::config_apply::plan_workspace_config_apply;
-use crate::workspace::resources::{
-    assign_free_workspace_ports_with_reserved, validate_workspace_resources_update,
-};
+use crate::workspace::resources::validate_workspace_resources_update;
 use crate::workspace::WorkspaceProfile;
 
 const WORKSPACE_CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[tauri::command]
-pub fn list_workspaces(state: State<'_, AppState>) -> AppResult<Vec<WorkspaceProfile>> {
-    state.with_workspaces(|store| Ok(store.list().to_vec()))
+pub fn list_workspaces(_state: State<'_, AppState>) -> AppResult<Vec<WorkspaceProfile>> {
+    management::list_workspaces()
 }
 
 fn control_service(
@@ -203,20 +200,12 @@ async fn rollback_workspace_config(
 
 #[tauri::command]
 pub fn inspect_workspace_skills(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     id: String,
     enabled: bool,
     roots: String,
 ) -> AppResult<serde_json::Value> {
-    let profile = state.with_workspaces(|store| {
-        store
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
-    })?;
-    let catalog = crate::skills::SkillCatalog::new(PathBuf::from(profile.path));
-    catalog.configure(crate::skills::SkillSettings::from_text(enabled, &roots));
-    Ok(serde_json::to_value(catalog.list(None, 200))?)
+    management::inspect_workspace_skills(&id, enabled, &roots)
 }
 
 #[tauri::command]
@@ -225,20 +214,9 @@ pub fn create_workspace(
     path: String,
     name: Option<String>,
 ) -> AppResult<WorkspaceProfile> {
-    state.with_workspaces(|store| {
-        let mut profile = WorkspaceProfile::new(path, name);
-        // Create should not fail just because default ports are already claimed.
-        // Pick free ports now; start/update still enforce conflict checks.
-        let gateway = store.settings().mcp_gateway;
-        let reserved = if gateway.enabled {
-            std::collections::HashSet::from([gateway.local_port])
-        } else {
-            std::collections::HashSet::new()
-        };
-        assign_free_workspace_ports_with_reserved(store.list(), &mut profile, &reserved)?;
-        store.register_workspace(profile.clone())?;
-        Ok(profile)
-    })
+    let profile = management::create_workspace(path, name)?;
+    state.reload_data_from_disk()?;
+    Ok(profile)
 }
 
 #[cfg(test)]
@@ -474,50 +452,11 @@ fn validate_live_port_change(
 
 #[tauri::command]
 pub fn open_workspace_directory(path: String) -> AppResult<()> {
-    let path = PathBuf::from(path.trim());
-    open_path_in_file_manager(&path)
+    management::open_workspace_directory(&path)
 }
 
 #[tauri::command]
 pub async fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.with_settings(|store| {
-        crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &id)
-    })?;
-    let gateway_inspection = crate::gateway_daemon::inspect()?;
-    if gateway_inspection.ambiguous {
-        return Err(AppError::Message(gateway_inspection.detail));
-    }
-    if gateway_inspection.running
-        && gateway_inspection
-            .state
-            .as_ref()
-            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&id))
-    {
-        return Err(AppError::Message(
-            "该 Workspace 正由 Gateway daemon 提供路由。请先执行 `anchor gateway stop`，再删除 Workspace；GUI 不会在后台静默改写 Gateway route 集合。"
-                .into(),
-        ));
-    }
-    let profile = state.with_workspaces(|store| {
-        store
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
-    })?;
-    crate::control::request_daemon_exit_and_wait(
-        &profile,
-        crate::control::ControlOperation::Shutdown,
-        Duration::from_secs(15),
-        true,
-    )
-    .await?;
-    state.with_workspaces(|store| {
-        if store.remove(&id)?.is_some() {
-            teardown_workspace(store, &id)?;
-        }
-        Ok(())
-    })?;
-    #[cfg(windows)]
-    crate::windows_service::forget_workspace(&id)?;
-    Ok(())
+    management::delete_workspace(&id).await?;
+    state.reload_data_from_disk()
 }

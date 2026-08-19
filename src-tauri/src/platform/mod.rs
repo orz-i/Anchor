@@ -51,7 +51,6 @@ mod macos;
 mod windows;
 
 mod child_process;
-#[cfg(feature = "desktop")]
 mod open;
 mod paths;
 
@@ -59,7 +58,6 @@ pub(crate) use child_process::{
     configure_exec_tokio_process, configure_supervised_tokio_process, hide_std_console,
     hide_tokio_console, lower_exec_child_priority,
 };
-#[cfg(feature = "desktop")]
 pub use open::open_path_in_file_manager;
 
 #[cfg(target_os = "linux")]
