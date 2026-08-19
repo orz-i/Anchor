@@ -7,8 +7,8 @@ edition = "2021"
 autobins = false
 
 [features]
-default = ["desktop"]
-desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "cli"]
+default = ["cli"]
+desktop = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-build", "cli"]
 cli = ["tokio/signal"]
 
 [[bin]]
@@ -26,7 +26,7 @@ name = "anchor_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
 tauri = { version = "2", features = [], optional = true }

@@ -157,7 +157,8 @@ fn main() {
     }
     watch_git_path(repository, "packed-refs");
     generate_admin_assets(repository);
-    if std::env::var_os("CARGO_FEATURE_DESKTOP").is_some() {
+    #[cfg(feature = "desktop")]
+    {
         tauri_build::build();
     }
 }
