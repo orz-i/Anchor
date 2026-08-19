@@ -85,6 +85,8 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "apply_workspace_config",
     "get_windows_service_status",
     "list_software",
+    "install_software",
+    "uninstall_software",
     "get_proxy",
     "set_proxy",
     "get_download_config",
@@ -94,6 +96,13 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
 struct AdminStaticAsset {
     content_type: &'static str,
     body: &'static [u8],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SoftwareMutationArgs {
+    kind: String,
+    grant_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +413,8 @@ async fn health() -> Json<Value> {
                 "regenerate_workspace_secret",
                 "set_shared_secret",
                 "regenerate_shared_secret",
+                "install_software",
+                "uninstall_software",
                 "set_proxy",
                 "set_download_config",
                 "stage_workspace_config",
@@ -1213,6 +1224,50 @@ async fn dispatch_command(
         "list_software" => serde_json::to_value(management::list_software()?)
             .map_err(AppError::from)
             .map_err(Into::into),
+        "install_software" => {
+            let input: SoftwareMutationArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let version = management::software_target_version(&input.kind)?;
+            let binding = PrivilegedActionBinding::software_install(&input.kind, version);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "install_software",
+                &binding,
+            )?;
+            let installed = finish_privileged_execution(
+                state,
+                session_id,
+                "install_software",
+                management::install_software(&input.kind).await,
+            )?;
+            serde_json::to_value(installed)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "uninstall_software" => {
+            let input: SoftwareMutationArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            management::software_target_version(&input.kind)?;
+            let binding = PrivilegedActionBinding::software_uninstall(&input.kind);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "uninstall_software",
+                &binding,
+            )?;
+            let uninstalled = finish_privileged_execution(
+                state,
+                session_id,
+                "uninstall_software",
+                management::uninstall_software(&input.kind),
+            )?;
+            serde_json::to_value(uninstalled)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "get_proxy" => serde_json::to_value(management::get_proxy()?)
             .map_err(AppError::from)
             .map_err(Into::into),
@@ -1352,7 +1407,7 @@ mod tests {
     async fn unimplemented_command_never_falls_through_to_mutation() {
         let state = test_state(HashMap::new());
         assert!(matches!(
-            dispatch_command(&state, "session", "install_software", json!({})).await,
+            dispatch_command(&state, "session", "install_windows_service", json!({})).await,
             Err(AdminDispatchError::NotMigrated)
         ));
     }

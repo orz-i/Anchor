@@ -44,12 +44,12 @@ const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
     "regenerate_shared_secret",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "install_software",
+    "uninstall_software",
 ];
 
 const UNAVAILABLE_PRIVILEGED_ACTIONS: &[&str] = &[
     "save_frp_profile",
-    "install_software",
-    "uninstall_software",
     "install_windows_service",
     "uninstall_windows_service",
     "start_windows_service",
@@ -124,6 +124,8 @@ pub struct PrivilegedActionBinding {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 impl PrivilegedActionBinding {
@@ -132,6 +134,7 @@ impl PrivilegedActionBinding {
             id: Some(id.to_string()),
             key: Some(key.to_string()),
             kind: None,
+            version: None,
         }
     }
 
@@ -140,6 +143,7 @@ impl PrivilegedActionBinding {
             id: None,
             key: Some(key.to_string()),
             kind: None,
+            version: None,
         }
     }
 
@@ -148,6 +152,25 @@ impl PrivilegedActionBinding {
             id: Some(id.to_string()),
             key: None,
             kind: None,
+            version: None,
+        }
+    }
+
+    pub fn software_install(kind: &str, version: &str) -> Self {
+        Self {
+            id: None,
+            key: None,
+            kind: Some(kind.to_string()),
+            version: Some(version.to_string()),
+        }
+    }
+
+    pub fn software_uninstall(kind: &str) -> Self {
+        Self {
+            id: None,
+            key: None,
+            kind: Some(kind.to_string()),
+            version: None,
         }
     }
 }
@@ -182,20 +205,48 @@ fn normalize_binding(
         .as_deref()
         .map(|value| normalize_selector(value, "kind", 64))
         .transpose()?;
-    let normalized = PrivilegedActionBinding { id, key, kind };
+    let version = binding
+        .version
+        .as_deref()
+        .map(|value| normalize_selector(value, "version", 64))
+        .transpose()?;
+    let normalized = PrivilegedActionBinding {
+        id,
+        key,
+        kind,
+        version,
+    };
 
     let valid_shape = match action {
         "set_workspace_secret" | "regenerate_workspace_secret" => {
-            normalized.id.is_some() && normalized.key.is_some() && normalized.kind.is_none()
+            normalized.id.is_some()
+                && normalized.key.is_some()
+                && normalized.kind.is_none()
+                && normalized.version.is_none()
         }
         "set_shared_secret" | "regenerate_shared_secret" => {
-            normalized.id.is_none() && normalized.key.is_some() && normalized.kind.is_none()
+            normalized.id.is_none()
+                && normalized.key.is_some()
+                && normalized.kind.is_none()
+                && normalized.version.is_none()
         }
         "save_frp_profile" | "set_frp_profile_token" | "delete_frp_profile" => {
-            normalized.id.is_some() && normalized.key.is_none() && normalized.kind.is_none()
+            normalized.id.is_some()
+                && normalized.key.is_none()
+                && normalized.kind.is_none()
+                && normalized.version.is_none()
         }
-        "install_software" | "uninstall_software" => {
-            normalized.id.is_none() && normalized.key.is_none() && normalized.kind.is_some()
+        "install_software" => {
+            normalized.id.is_none()
+                && normalized.key.is_none()
+                && normalized.kind.is_some()
+                && normalized.version.is_some()
+        }
+        "uninstall_software" => {
+            normalized.id.is_none()
+                && normalized.key.is_none()
+                && normalized.kind.is_some()
+                && normalized.version.is_none()
         }
         "install_windows_service"
         | "uninstall_windows_service"
@@ -203,7 +254,10 @@ fn normalize_binding(
         | "stop_windows_service"
         | "restart_windows_service"
         | "sync_windows_service_plan" => {
-            normalized.id.is_none() && normalized.key.is_none() && normalized.kind.is_none()
+            normalized.id.is_none()
+                && normalized.key.is_none()
+                && normalized.kind.is_none()
+                && normalized.version.is_none()
         }
         _ => false,
     };
@@ -235,7 +289,12 @@ fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> Ap
         "save_frp_profile" | "set_frp_profile_token" | "delete_frp_profile" => {
             format!("FRP profile {}", binding.id.as_deref().unwrap_or_default())
         }
-        "install_software" | "uninstall_software" => {
+        "install_software" => format!(
+            "软件 {} · 版本 {}",
+            binding.kind.as_deref().unwrap_or_default(),
+            binding.version.as_deref().unwrap_or_default()
+        ),
+        "uninstall_software" => {
             format!("软件 {}", binding.kind.as_deref().unwrap_or_default())
         }
         _ => "Windows Service".into(),
@@ -774,5 +833,35 @@ mod tests {
 
         assert_ne!(first.confirmation_text, second.confirmation_text);
         assert!(!first.confirmation_text.contains("secret-value"));
+    }
+
+    #[test]
+    fn software_install_grant_is_bound_to_the_pinned_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = PrivilegedConfirmationStore::for_test(temp.path().to_path_buf());
+        let target = PrivilegedActionBinding::software_install("frpc", "0.61.2");
+        let prepared = store
+            .prepare("session-a", "install_software", &target)
+            .expect("prepare");
+        assert!(prepared.target_summary.contains("0.61.2"));
+        let grant = store
+            .confirm(
+                "session-a",
+                &prepared.confirmation_id,
+                &prepared.confirmation_text,
+            )
+            .expect("confirm");
+
+        assert!(store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "install_software",
+                &PrivilegedActionBinding::software_install("frpc", "0.61.3"),
+            )
+            .is_err());
+        store
+            .consume_grant("session-a", &grant.grant_id, "install_software", &target)
+            .expect("matching version remains consumable");
     }
 }
