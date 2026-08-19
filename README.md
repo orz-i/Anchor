@@ -269,12 +269,14 @@ Harness Task 默认继续使用当前 Workspace；需要并行隔离分支、索
 
 ## 本地开发
 
-环境要求：Node.js 20+、Rust stable，以及当前系统的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
+默认开发环境只要求 Node.js 20+ 与 Rust stable；Tauri 系统依赖仅在显式验证 legacy desktop 时需要。
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm desktop
+pnpm start
 ```
+
+`pnpm start` 会构建 Svelte Web Admin，并通过默认 CLI target 启动本机 `anchor admin serve`。发布构建使用 `pnpm release:build` / `pnpm cli:build`，不再要求生成桌面安装包。
 
 仓库使用 `pnpm@11.18.0` 作为依赖解析和锁文件的唯一来源。Windows 下采用 hoisted `node_modules`，避免启用 RedirectionGuard 时 pnpm 的 isolated 符号链接无法遍历。安装完成后，`npm run ...`、`npm exec`、`npx` 和 `pnpm exec` 均可正常使用；`.npmrc` 会阻止 npm 生成第二份锁文件。
 
@@ -288,6 +290,8 @@ cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
 Windows 也可以双击 `dev-desktop.cmd`。不要只用 `npm run dev` 验证桌面应用，它只启动 Vite，不会启动 Tauri 外壳。
+
+> Tauri desktop 已进入弃用期，不再是默认开发或发布目标。确需兼容性验证时安装 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) 并显式运行 `pnpm legacy:desktop` 或 `pnpm legacy:desktop:build`；旧 `pnpm desktop*` 别名会打印弃用提示。退役门槛见 [Desktop / Tauri 退役门槛](docs/desktop-retirement.md)。
 
 ### Linux 无界面 CLI
 

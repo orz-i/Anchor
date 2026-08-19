@@ -195,7 +195,7 @@ GUI 工作区控制迁移现状：
 - 当前仍保留 unavailable 的旧高权限兼容命令主要是 `save_frp_profile`，避免重新把 FRP metadata 与 Token 合并为单一权限面。Web Admin session/health 按平台发布 `supportedCommands`、`mutationCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 与 `unavailableCommands`；
 - Web adapter 会自动建立/缓存管理 session，并在 401 后最多重新 bootstrap 一次。业务页面仍无需感知 Tauri/Web transport 差异；架构守卫会扫描前端 API command，要求每个调用要么存在于正向 Web manifest，要么明确列入 privileged 集合。
 
-至此 Web 管理能力、全部已评审 privileged executor 与 persistent Admin service 的代码迁移门槛已基本闭合。下一轮应进入**桌面停止发布/弃用门槛复核**：盘点仍仅由 Tauri 提供的能力、构建/发布依赖和兼容入口，先停止把 desktop 作为必需管理入口，再分阶段删除 Tauri feature/dependencies/scripts。Windows Service Web executor 的真实 UAC/SCM 行为，以及 Windows Admin Task Scheduler 的真实 logon/restart 行为，仍属于 Windows 发布验收项；当前 Linux 验证主机不能替代这些实机 smoke。
+至此 Web 管理能力、全部已评审 privileged executor 与 persistent Admin service 的代码迁移门槛已闭合，并已完成 **desktop stop-publish**：Cargo 默认 feature 改为 `cli`，`tauri-build` 仅在显式 desktop feature 下启用；`pnpm start` / `release:build` 分别指向 Web Admin/CLI，Tauri 只保留 `legacy:desktop*` 显式目标；旧 desktop scripts 仅作为带弃用提示的兼容别名。Tauri bootstrap/handler 已集中到 `legacy_desktop.rs`，核心 `lib.rs` 不再直接承载 Tauri Builder。`desktop_retirement_boundaries` 会机器验证默认发布入口、Tauri import adapter 与 runtime ownership 边界。后续进入**彻底删除 Tauri 的弃用窗口/清理阶段**，清单见 `docs/desktop-retirement.md`。Windows Service Web executor 的真实 UAC/SCM 行为，以及 Windows Admin Task Scheduler 的真实 logon/restart 行为，仍属于 Windows 发布验收项；当前 Linux 验证主机不能替代这些实机 smoke。
 
 ### 阶段 4：运行与升级治理
 

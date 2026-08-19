@@ -261,12 +261,14 @@ The project uses a Workspace-first permission model:
 
 ## Local development
 
-Requirements: Node.js 20+, Rust stable, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
+The default development path requires Node.js 20+ and Rust stable. Tauri system prerequisites are required only when explicitly validating the legacy desktop shell.
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm desktop
+pnpm start
 ```
+
+`pnpm start` builds the Svelte Web Admin and launches local `anchor admin serve` through the default CLI target. Release builds use `pnpm release:build` / `pnpm cli:build` and no longer require a desktop installer.
 
 The repository uses `pnpm@11.18.0` as the single dependency-resolution and lockfile authority. On Windows it uses a hoisted `node_modules` layout so pnpm's isolated symlinks are not blocked when RedirectionGuard is enabled. After installation, `npm run ...`, `npm exec`, `npx`, and `pnpm exec` remain supported; `.npmrc` prevents npm from generating a second lockfile.
 
@@ -279,7 +281,7 @@ cd src-tauri && cargo test
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
-On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone to validate the desktop application; it starts Vite without the Tauri shell.
+On Windows, `dev-desktop.cmd` remains as a deprecated compatibility launcher. The Tauri desktop shell is no longer a default development or release target. When legacy validation is required, install the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) and explicitly run `pnpm legacy:desktop` or `pnpm legacy:desktop:build`; the older `pnpm desktop*` aliases print a deprecation warning. See [Desktop / Tauri retirement gates](docs/desktop-retirement.md).
 
 ### Headless Linux CLI
 

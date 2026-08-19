@@ -37,25 +37,33 @@
 2. 实现后对照验收标准核验
 3. 单文件不超过 500 行，超出需拆分
 
-## Tauri 开发命令（工程创建后）
+## 默认开发命令
 
 ```bash
-# 开发模式（热重载）
-cargo tauri dev
+# Web Admin + CLI 默认入口
+pnpm start
 
-# 构建发布版
-cargo tauri build
+# 默认发布产物：CLI + 嵌入式 Web Admin
+pnpm release:build
 
-# 仅构建 Rust 后端
+# Rust 默认 feature 已是 cli
 cd src-tauri && cargo build
 
-# 仅构建前端
+# 前端开发/构建
 pnpm dev
+pnpm build
+```
+
+Tauri desktop 已停止作为默认发布目标。仅在 legacy compatibility 验证时使用：
+
+```bash
+pnpm legacy:desktop
+pnpm legacy:desktop:build
 ```
 
 ## 安装包版本与发布规则（硬性）
 
-凡是包含功能或缺陷修复、且需要构建、安装、交付或发布桌面安装包的变更，**必须先递增应用版本，再构建**。不得用旧版本号覆盖安装包，也不得只改 DMG、NSIS 等产物文件名。
+默认 release 不再生成桌面安装包。只有显式要求构建 legacy desktop 安装包时，才适用本节桌面版本/安装包规则：包含功能或缺陷修复且需要交付 desktop 安装包的变更，**必须先递增应用版本，再构建**。不得用旧版本号覆盖安装包，也不得只改 DMG、NSIS 等产物文件名。
 
 ### 版本递增
 
@@ -96,7 +104,9 @@ macOS GitHub Actions 仍仅允许在用户明确要求后通过 `workflow_dispat
 
 ## Rust 后端开发约定
 
-### Tauri Command 模式
+### Legacy Tauri Command 模式
+
+Tauri command 只允许作为迁移期 adapter；新业务能力不得新增到 desktop-only command 层，必须先进入 shared management / CLI / Web Admin。
 
 ```rust
 #[tauri::command]
