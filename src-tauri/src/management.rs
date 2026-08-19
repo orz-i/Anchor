@@ -1450,6 +1450,24 @@ pub(crate) async fn workspace_control_status(id: &str) -> AppResult<WorkspaceCon
     control::workspace_status_via_daemon_or_local(&profile).await
 }
 
+pub(crate) async fn workspace_control_events(
+    id: &str,
+    cursor: Option<ControlEventCursor>,
+    wait_ms: u32,
+) -> AppResult<Option<ControlEventBatch>> {
+    let store = DataStore::load()?;
+    let profile = store
+        .get(id)
+        .cloned()
+        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+    drop(store);
+    match control::request_events(&profile, cursor, 64, wait_ms).await {
+        Ok(batch) => Ok(Some(batch)),
+        Err(error) if error.is_unavailable() => Ok(None),
+        Err(error) => Err(AppError::Message(error.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,23 +1552,5 @@ mod tests {
             desired_gateway_routes(&current, "workspace-b", false),
             vec!["workspace-a"]
         );
-    }
-}
-
-pub(crate) async fn workspace_control_events(
-    id: &str,
-    cursor: Option<ControlEventCursor>,
-    wait_ms: u32,
-) -> AppResult<Option<ControlEventBatch>> {
-    let store = DataStore::load()?;
-    let profile = store
-        .get(id)
-        .cloned()
-        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
-    drop(store);
-    match control::request_events(&profile, cursor, 64, wait_ms).await {
-        Ok(batch) => Ok(Some(batch)),
-        Err(error) if error.is_unavailable() => Ok(None),
-        Err(error) => Err(AppError::Message(error.to_string())),
     }
 }

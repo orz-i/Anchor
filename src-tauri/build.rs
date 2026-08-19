@@ -91,20 +91,26 @@ fn generate_admin_assets(repository: &Path) {
 
     let mut generated = String::new();
     generated.push_str(&format!(
-        "const ADMIN_UI_EMBEDDED: bool = {};\n",
+        "static ADMIN_UI_EMBEDDED: bool = {};\n",
         !assets.is_empty()
     ));
-    generated.push_str(
-        "fn embedded_admin_asset(path: &str) -> Option<AdminStaticAsset> {\n    match path {\n",
-    );
-    for (key, path) in assets {
-        let source = format!("{:?}", path.to_string_lossy().as_ref());
-        let content_type = admin_content_type(&path);
-        generated.push_str(&format!(
-            "        {key:?} => Some(AdminStaticAsset {{ content_type: {content_type:?}, body: include_bytes!({source}) }}),\n"
-        ));
+    if assets.is_empty() {
+        generated.push_str(
+            "fn embedded_admin_asset(_path: &str) -> Option<AdminStaticAsset> {\n    None\n}\n",
+        );
+    } else {
+        generated.push_str(
+            "fn embedded_admin_asset(path: &str) -> Option<AdminStaticAsset> {\n    match path {\n",
+        );
+        for (key, path) in assets {
+            let source = format!("{:?}", path.to_string_lossy().as_ref());
+            let content_type = admin_content_type(&path);
+            generated.push_str(&format!(
+                "        {key:?} => Some(AdminStaticAsset {{ content_type: {content_type:?}, body: include_bytes!({source}) }}),\n"
+            ));
+        }
+        generated.push_str("        _ => None,\n    }\n}\n");
     }
-    generated.push_str("        _ => None,\n    }\n}\n");
     fs::write(out_dir.join("admin_assets.rs"), generated)
         .expect("failed to generate embedded Web Admin assets");
 }
