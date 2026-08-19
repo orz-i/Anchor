@@ -55,6 +55,54 @@ struct CliTunnelRetry {
     next_attempt: tokio::time::Instant,
 }
 
+async fn execute_admin(command: AdminCommand, as_json: bool) -> AppResult<i32> {
+    match command {
+        AdminCommand::Serve { port } => crate::admin::serve(port, as_json).await.map(|_| 0),
+        AdminCommand::DaemonRun { port } => {
+            crate::admin_daemon::run(port, as_json).await.map(|_| 0)
+        }
+        AdminCommand::Start { port } => {
+            print_admin_service_status(crate::admin_service::start(port).await?, as_json)
+        }
+        AdminCommand::Stop { force } => {
+            print_admin_service_status(crate::admin_service::stop(force).await?, as_json)
+        }
+        AdminCommand::Restart { port, force } => {
+            print_admin_service_status(crate::admin_service::restart(port, force).await?, as_json)
+        }
+        AdminCommand::Status => {
+            print_admin_service_status(crate::admin_service::status().await?, as_json)
+        }
+        AdminCommand::Install { port } => {
+            print_admin_service_status(crate::admin_service::install(port).await?, as_json)
+        }
+        AdminCommand::Uninstall { force } => {
+            print_admin_service_status(crate::admin_service::uninstall(force).await?, as_json)
+        }
+        AdminCommand::Enable => {
+            print_admin_service_status(crate::admin_service::enable().await?, as_json)
+        }
+        AdminCommand::Disable => {
+            print_admin_service_status(crate::admin_service::disable().await?, as_json)
+        }
+        AdminCommand::Upgrade => {
+            print_admin_service_status(crate::admin_service::upgrade().await?, as_json)
+        }
+    }
+}
+
+fn print_admin_service_status(
+    status: crate::admin_service::AdminServiceStatus,
+    as_json: bool,
+) -> AppResult<i32> {
+    if as_json {
+        print_json(&status)?;
+    } else {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    }
+    Ok(0)
+}
+
 fn normalize_gateway_route_ids(workspace_ids: Vec<String>) -> AppResult<Vec<String>> {
     let mut normalized = Vec::with_capacity(workspace_ids.len());
     for workspace_id in workspace_ids {
@@ -2642,6 +2690,7 @@ pub fn run() -> i32 {
         &parsed.command,
         Command::DaemonRun { .. }
             | Command::GatewayDaemonRun { .. }
+            | Command::Admin(AdminCommand::DaemonRun { .. })
             | Command::ServiceRun { .. }
             | Command::ServiceAdminRun { .. }
     );
@@ -2716,9 +2765,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::Service(command) => execute_service(command, cli.json),
-        Command::Admin(AdminCommand::Serve { port }) => {
-            crate::admin::serve(port, cli.json).await.map(|_| 0)
-        }
+        Command::Admin(command) => execute_admin(command, cli.json).await,
         Command::ServiceRun { config_dir, .. } => {
             let _ = config_dir;
             Err(AppError::Message(

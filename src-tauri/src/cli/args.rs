@@ -13,6 +13,16 @@ pub struct CliArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminCommand {
     Serve { port: u16 },
+    Start { port: Option<u16> },
+    Stop { force: bool },
+    Restart { port: Option<u16>, force: bool },
+    Status,
+    Install { port: u16 },
+    Uninstall { force: bool },
+    Enable,
+    Disable,
+    Upgrade,
+    DaemonRun { port: u16 },
 }
 
 fn parse_admin_command(args: &mut VecDeque<String>) -> Result<AdminCommand, String> {
@@ -26,6 +36,84 @@ fn parse_admin_command(args: &mut VecDeque<String>) -> Result<AdminCommand, Stri
                 }
             }
             Ok(AdminCommand::Serve { port })
+        }
+        Some("start") => {
+            let mut port = None;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--port" => port = Some(parse_u64(args, "--port", 1, 65_535)? as u16),
+                    other => return Err(format!("admin start 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::Start { port })
+        }
+        Some("stop") => {
+            let mut force = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--force" => force = true,
+                    other => return Err(format!("admin stop 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::Stop { force })
+        }
+        Some("restart") => {
+            let mut port = None;
+            let mut force = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--port" => port = Some(parse_u64(args, "--port", 1, 65_535)? as u16),
+                    "--force" => force = true,
+                    other => return Err(format!("admin restart 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::Restart { port, force })
+        }
+        Some("status") => {
+            ensure_empty(args, "admin status")?;
+            Ok(AdminCommand::Status)
+        }
+        Some("install") => {
+            let mut port = crate::admin::DEFAULT_ADMIN_PORT;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--port" => port = parse_u64(args, "--port", 1, 65_535)? as u16,
+                    other => return Err(format!("admin install 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::Install { port })
+        }
+        Some("uninstall") => {
+            let mut force = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--force" => force = true,
+                    other => return Err(format!("admin uninstall 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::Uninstall { force })
+        }
+        Some("enable") => {
+            ensure_empty(args, "admin enable")?;
+            Ok(AdminCommand::Enable)
+        }
+        Some("disable") => {
+            ensure_empty(args, "admin disable")?;
+            Ok(AdminCommand::Disable)
+        }
+        Some("upgrade") => {
+            ensure_empty(args, "admin upgrade")?;
+            Ok(AdminCommand::Upgrade)
+        }
+        Some("daemon-run") => {
+            let mut port = crate::admin::DEFAULT_ADMIN_PORT;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--port" => port = parse_u64(args, "--port", 1, 65_535)? as u16,
+                    other => return Err(format!("admin daemon-run 不支持参数：{other}")),
+                }
+            }
+            Ok(AdminCommand::DaemonRun { port })
         }
         Some(other) => Err(format!("未知 admin 命令：{other}\n\n{}", admin_usage())),
     }
@@ -1697,15 +1785,23 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
   anchor [--config-dir PATH] [--json] service <command>\n\n\
-  anchor [--config-dir PATH] [--json] admin [serve] [--port PORT]\n\n\
+  anchor [--config-dir PATH] [--json] admin <serve|start|stop|restart|status|install|uninstall|enable|disable|upgrade> ...\n\n\
 workspace 可使用 profile ID、唯一名称或项目路径。\n\
-不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。admin serve 仅绑定 127.0.0.1，并在当前迁移阶段只开放只读 Web Admin bootstrap 命令。upgrade 将已运行 daemon 有界排空并切换到当前 CLI 构建，默认要求可自动回滚；它不下载或替换 CLI 本体。CLI 不会接管 GUI 或其他进程占用的端口。"
+不指定 workspace 的 status 会显示全部工作区。serve 为前台调试模式；start/stop/restart 管理 Windows/Linux 每工作区后台 daemon。admin serve 仅绑定 127.0.0.1；admin install 在 Linux 注册 systemd user unit，在 Windows 注册当前用户 Task Scheduler autostart，实际 Web Admin 仍是独立 CLI daemon。upgrade 将已运行 daemon 有界排空并切换到当前 CLI 构建，默认要求可自动回滚；它不下载或替换 CLI 本体。CLI 不会接管 GUI 或其他进程占用的端口。"
 }
 
 pub fn admin_usage() -> &'static str {
     "Web Admin 命令：\n\
   anchor admin serve [--port PORT]\n\n\
-当前阶段仅在 127.0.0.1 提供版本化只读 bootstrap API；写配置、密钥和生命周期操作尚未开放，后续需要独立管理会话认证与 CSRF 防护后再逐项迁移。"
+  anchor admin start [--port PORT]\n\
+  anchor admin stop [--force]\n\
+  anchor admin restart [--port PORT] [--force]\n\
+  anchor admin status\n\
+  anchor admin install [--port PORT]\n\
+  anchor admin uninstall [--force]\n\
+  anchor admin enable|disable\n\
+  anchor admin upgrade\n\n\
+serve 是前台调试入口。start 在未安装 OS autostart 时启动独立后台 Admin daemon；install 会注册并立即启动 OS 管理的持久服务。Linux 使用 systemd --user，Windows 使用当前用户 Task Scheduler。所有 Web Admin 仅绑定 127.0.0.1，运行状态与 Workspace/Gateway daemon 完全独立。"
 }
 
 pub fn frp_usage() -> &'static str {
@@ -1804,6 +1900,55 @@ mod tests {
                 .expect("admin port")
                 .command,
             Command::Admin(AdminCommand::Serve { port: 29_000 })
+        );
+    }
+
+    #[test]
+    fn parses_persistent_admin_service_commands() {
+        assert_eq!(
+            parse(strings(&["admin", "install", "--port", "29001"]))
+                .expect("admin install")
+                .command,
+            Command::Admin(AdminCommand::Install { port: 29_001 })
+        );
+        assert_eq!(
+            parse(strings(&["admin", "restart", "--port", "29001", "--force"]))
+                .expect("admin restart")
+                .command,
+            Command::Admin(AdminCommand::Restart {
+                port: Some(29_001),
+                force: true,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["admin", "stop", "--force"]))
+                .expect("admin stop")
+                .command,
+            Command::Admin(AdminCommand::Stop { force: true })
+        );
+        assert_eq!(
+            parse(strings(&["admin", "enable"]))
+                .expect("admin enable")
+                .command,
+            Command::Admin(AdminCommand::Enable)
+        );
+        assert_eq!(
+            parse(strings(&["admin", "disable"]))
+                .expect("admin disable")
+                .command,
+            Command::Admin(AdminCommand::Disable)
+        );
+        assert_eq!(
+            parse(strings(&["admin", "upgrade"]))
+                .expect("admin upgrade")
+                .command,
+            Command::Admin(AdminCommand::Upgrade)
+        );
+        assert_eq!(
+            parse(strings(&["admin", "daemon-run", "--port", "29002"]))
+                .expect("admin daemon-run")
+                .command,
+            Command::Admin(AdminCommand::DaemonRun { port: 29_002 })
         );
     }
 

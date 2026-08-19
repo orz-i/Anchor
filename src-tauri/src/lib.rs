@@ -7,6 +7,8 @@ pub mod admin;
 mod admin_daemon;
 #[cfg(feature = "cli")]
 mod admin_security;
+#[cfg(feature = "cli")]
+mod admin_service;
 #[cfg(feature = "desktop")]
 mod app_state;
 mod async_runtime;
