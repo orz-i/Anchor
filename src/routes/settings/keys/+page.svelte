@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import { message } from "$lib/platform/dialog";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
@@ -31,6 +32,7 @@
   let loading = $state(true);
   let saving = $state(false);
   let regenerating = $state<string | null>(null);
+  let mutationsSupported = $state(false);
 
   const dirty = $derived(ALL_KEYS.some(({ key }) => secrets[key] !== undefined && secrets[key] !== originals[key]));
 
@@ -59,7 +61,7 @@
   }
 
   async function regenerate(key: SharedSecretKey) {
-    if (regenerating) return;
+    if (!mutationsSupported || regenerating) return;
     regenerating = key;
     try {
       const value = await regenerateSharedSecret(key);
@@ -75,6 +77,7 @@
   }
 
   async function saveAll() {
+    if (!mutationsSupported) return;
     saving = true;
     try {
       for (const { key } of ALL_KEYS) {
@@ -90,7 +93,16 @@
     }
   }
 
-  onMount(loadAll);
+  onMount(() => {
+    void (async () => {
+      const [canSet, canRegenerate] = await Promise.all([
+        supportsAdminCommand("set_shared_secret"),
+        supportsAdminCommand("regenerate_shared_secret"),
+      ]);
+      mutationsSupported = canSet && canRegenerate;
+      await loadAll();
+    })();
+  });
 </script>
 
 <section class="page-scroll">
@@ -101,6 +113,11 @@
       在此统一管理所有共享密钥。各工作区可以选择使用共享密钥或自己的密钥，这样 GPT 只需配置一次
       Bearer/API Key，即可访问所有工作区。重新生成或修改密钥后，正在运行的对应服务将自动重启以生效。
     </p>
+    {#if !mutationsSupported}
+      <p class="mt-2 max-w-2xl text-xs text-[var(--text-muted)]">
+        Web 管理面当前仅允许查看共享密钥；写入和重新生成将在高权限确认执行器接入后开放。
+      </p>
+    {/if}
   </header>
 
   <div class="page-body flex flex-col gap-6">
@@ -117,8 +134,8 @@
                 <span class="text-xs text-[var(--text-muted)]">{label}</span>
                 <SecretInput
                   bind:value={secrets[key]}
-                  disabled={loading}
-                  onRegenerate={() => regenerate(key)}
+                  disabled={loading || !mutationsSupported}
+                  onRegenerate={mutationsSupported ? () => regenerate(key) : undefined}
                   regenerating={regenerating === key}
                 />
               </div>
@@ -139,8 +156,8 @@
                 <span class="text-xs text-[var(--text-muted)]">{label}</span>
                 <SecretInput
                   bind:value={secrets[key]}
-                  disabled={loading}
-                  onRegenerate={() => regenerate(key)}
+                  disabled={loading || !mutationsSupported}
+                  onRegenerate={mutationsSupported ? () => regenerate(key) : undefined}
                   regenerating={regenerating === key}
                 />
               </div>
@@ -154,7 +171,7 @@
       <button
         type="button"
         class="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-        disabled={!dirty || saving}
+        disabled={!mutationsSupported || !dirty || saving}
         onclick={() => saveAll()}
       >
         {saving ? "保存中…" : "保存更改"}

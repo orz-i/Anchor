@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import { message } from "$lib/platform/dialog";
   import {
     deleteFrpProfile,
@@ -17,6 +18,7 @@
   let server = $state("");
   let serverPort = $state(7000);
   let token = $state("");
+  let tokenMutationSupported = $state(false);
 
   async function refresh() {
     loading = true;
@@ -80,7 +82,12 @@
     }
   }
 
-  onMount(refresh);
+  onMount(() => {
+    void (async () => {
+      tokenMutationSupported = await supportsAdminCommand("save_frp_profile");
+      await refresh();
+    })();
+  });
 </script>
 
 <section class="page-scroll">
@@ -133,12 +140,18 @@
         </label>
         <label class="grid gap-1">
           <span class="text-xs text-[var(--text-muted)]">
-            Token {editingId ? "（留空则保持不变）" : ""}
+            Token
+            {#if tokenMutationSupported}
+              {editingId ? "（留空则保持不变）" : ""}
+            {:else}
+              （Web 管理面当前只允许编辑非敏感 FRP 配置）
+            {/if}
           </span>
           <SecretInput
             bind:value={token}
             placeholder="frp auth token"
             showCopy={false}
+            disabled={!tokenMutationSupported}
           />
         </label>
         <div class="flex gap-2 pt-1">

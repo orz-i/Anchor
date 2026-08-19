@@ -20,6 +20,8 @@ type AdminApiResponse<T> = AdminApiSuccess<T> | AdminApiFailure;
 interface AdminSessionBootstrap {
   csrfToken: string;
   idleTimeoutSeconds: number;
+  supportedCommands?: string[];
+  unavailableCommands?: string[];
 }
 
 let webAdminSession: AdminSessionBootstrap | null = null;
@@ -84,6 +86,14 @@ async function invokeWebOnce<T>(
 
 async function invokeWeb<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   let session = await ensureWebAdminSession();
+  if (session.supportedCommands?.includes(command) !== true) {
+    const privileged = session.unavailableCommands?.includes(command) ?? false;
+    throw new Error(
+      privileged
+        ? `当前 Web 管理面尚未开放高权限操作：${command}`
+        : `当前 Web 管理面不支持操作：${command}`,
+    );
+  }
   let { response, payload } = await invokeWebOnce<T>(command, args, session);
   if (response.status === 401) {
     webAdminSession = null;
@@ -102,6 +112,12 @@ export async function invokeAdmin<T>(
   args?: Record<string, unknown>,
 ): Promise<T> {
   return isTauriRuntime() ? invokeTauri<T>(command, args) : invokeWeb<T>(command, args);
+}
+
+export async function supportsAdminCommand(command: string): Promise<boolean> {
+  if (isTauriRuntime()) return true;
+  const session = await ensureWebAdminSession();
+  return session.supportedCommands?.includes(command) === true;
 }
 
 interface ReadRetryOptions {

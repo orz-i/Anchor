@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import { message } from "$lib/platform/dialog";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
@@ -73,6 +75,12 @@
   let regenerating = $state<WorkspaceSecretKey | null>(null);
   let secretsLoadSeq = 0;
   let suppressSecretsReload = $state(false);
+  let workspaceSecretMutationSupported = $state(false);
+  let sharedSecretMutationSupported = $state(false);
+
+  const secretMutationSupported = $derived(
+    draft.use_shared_secrets ? sharedSecretMutationSupported : workspaceSecretMutationSupported,
+  );
 
   const secretsDirty = $derived(
     (Object.keys(secrets) as WorkspaceSecretKey[]).some(
@@ -162,8 +170,13 @@
       if (draft.type === "oauth" && draft.use_shared_secrets) {
         const clientId = draft.oauth_client_id.trim();
         if (!clientId) throw new Error("OAuth Client ID 不能为空");
-        await setSharedSecret("oauth_client_id", clientId);
-        loadedSharedOauthClientId = clientId;
+        if (clientIdChanged) {
+          if (!sharedSecretMutationSupported) {
+            throw new Error("Web 管理面尚未开放共享 Secret 写入。");
+          }
+          await setSharedSecret("oauth_client_id", clientId);
+          loadedSharedOauthClientId = clientId;
+        }
       }
       const callbackPolicyChanged =
         (draft.oauth_redirect_uris ?? "") !== (auth.oauth_redirect_uris ?? "") ||
@@ -187,7 +200,7 @@
   }
 
   async function regenerate(key: WorkspaceSecretKey) {
-    if (regenerating) return;
+    if (!secretMutationSupported || regenerating) return;
     regenerating = key;
     try {
       const value = draft.use_shared_secrets
@@ -200,6 +213,18 @@
       regenerating = null;
     }
   }
+
+  onMount(() => {
+    void (async () => {
+      const [canWorkspaceRegenerate, canSharedRegenerate, canSharedWrite] = await Promise.all([
+        supportsAdminCommand("regenerate_workspace_secret"),
+        supportsAdminCommand("regenerate_shared_secret"),
+        supportsAdminCommand("set_shared_secret"),
+      ]);
+      workspaceSecretMutationSupported = canWorkspaceRegenerate;
+      sharedSecretMutationSupported = canSharedRegenerate && canSharedWrite;
+    })();
+  });
 </script>
 
 <form
@@ -212,6 +237,11 @@
   <p class="text-xs text-[var(--text-muted)]">
     复制 Client ID / 密钥等请用上方「GPT 配置」卡片；此处可修改认证类型与重新生成密钥。
   </p>
+  {#if !secretMutationSupported}
+    <p class="text-xs text-[var(--text-muted)]">
+      Web 管理面当前允许修改认证配置，但 Secret 仅可查看；重新生成将在高权限确认执行器接入后开放。
+    </p>
+  {/if}
 
   <label class="grid gap-1">
     <span class="text-xs text-[var(--text-muted)]">认证类型</span>
@@ -289,7 +319,7 @@
         value={secrets.oauth_client_secret ?? ""}
         placeholder="加载中…"
         readonly
-        onRegenerate={() => void regenerate("oauth_client_secret")}
+        onRegenerate={secretMutationSupported ? () => void regenerate("oauth_client_secret") : undefined}
         regenerating={regenerating === "oauth_client_secret"}
       />
     </div>
@@ -300,7 +330,7 @@
         value={secrets.oauth_password ?? ""}
         placeholder="ChatGPT 首次授权时输入这个口令"
         readonly
-        onRegenerate={() => void regenerate("oauth_password")}
+        onRegenerate={secretMutationSupported ? () => void regenerate("oauth_password") : undefined}
         regenerating={regenerating === "oauth_password"}
       />
     </div>
@@ -313,7 +343,7 @@
         value={secrets.bearer_token ?? ""}
         placeholder="加载中…"
         readonly
-        onRegenerate={() => void regenerate("bearer_token")}
+        onRegenerate={secretMutationSupported ? () => void regenerate("bearer_token") : undefined}
         regenerating={regenerating === "bearer_token"}
       />
     </div>

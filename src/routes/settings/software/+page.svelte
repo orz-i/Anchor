@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import { message } from "$lib/platform/dialog";
   import type { DownloadConfig, SoftwareStatus } from "$lib/api/software";
   import {
@@ -14,6 +15,7 @@
   let loading = $state(true);
   let installing = $state<string | null>(null);
   let uninstalling = $state<string | null>(null);
+  let softwareMutationSupported = $state(false);
 
   let downloadConfig = $state<DownloadConfig>({
     githubMirror: "https://gh-proxy.com",
@@ -34,6 +36,7 @@
   }
 
   async function install(kind: string) {
+    if (!softwareMutationSupported) return;
     installing = kind;
     try {
       await installSoftware(kind);
@@ -46,6 +49,7 @@
   }
 
   async function uninstall(kind: string) {
+    if (!softwareMutationSupported) return;
     uninstalling = kind;
     try {
       await uninstallSoftware(kind);
@@ -67,7 +71,16 @@
     }
   }
 
-  onMount(refresh);
+  onMount(() => {
+    void (async () => {
+      const [canInstall, canUninstall] = await Promise.all([
+        supportsAdminCommand("install_software"),
+        supportsAdminCommand("uninstall_software"),
+      ]);
+      softwareMutationSupported = canInstall && canUninstall;
+      await refresh();
+    })();
+  });
 </script>
 
 <section class="page-scroll">
@@ -83,6 +96,11 @@
     <!-- Binary status -->
     <div class="tx-card p-4">
       <h3 class="text-sm font-semibold">状态</h3>
+      {#if !softwareMutationSupported}
+        <p class="mt-2 text-xs text-[var(--text-muted)]">
+          Web 管理面当前提供软件状态查看；安装/卸载将在高权限确认执行器接入后开放。
+        </p>
+      {/if}
       {#if loading}
         <p class="mt-4 text-sm text-[var(--text-muted)]">加载中…</p>
       {:else if software.length === 0}
@@ -104,7 +122,7 @@
                     <button
                       type="button"
                       class="text-xs text-red-400 hover:underline disabled:opacity-50"
-                      disabled={uninstalling === s.kind}
+                      disabled={!softwareMutationSupported || uninstalling === s.kind}
                       onclick={() => uninstall(s.kind)}
                     >
                       {uninstalling === s.kind ? "卸载中…" : "卸载"}
@@ -116,7 +134,7 @@
                   <button
                     type="button"
                     class="text-xs text-[var(--primary)] hover:underline disabled:opacity-50"
-                    disabled={installing === s.kind}
+                    disabled={!softwareMutationSupported || installing === s.kind}
                     onclick={() => install(s.kind)}
                   >
                     {installing === s.kind ? "安装中…" : "安装"}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import {
     secretIsSet,
     setWorkspaceSecret,
@@ -25,6 +26,7 @@
   let draft = $state("");
   let saved = $state(false);
   let loading = $state(true);
+  let mutationSupported = $state(false);
 
   const placeholder = $derived(saved && !draft ? "已保存（点击更新）" : "粘贴 Tunnel Token");
 
@@ -42,7 +44,12 @@
     loading = true;
     try {
       draft = "";
-      saved = await secretIsSet(workspaceId, secretKey);
+      const [nextSaved, canMutate] = await Promise.all([
+        secretIsSet(workspaceId, secretKey),
+        supportsAdminCommand("set_workspace_secret"),
+      ]);
+      saved = nextSaved;
+      mutationSupported = canMutate;
     } finally {
       loading = false;
     }
@@ -50,6 +57,9 @@
 
   export async function saveIfDirty(): Promise<boolean> {
     if (!draft.trim()) return false;
+    if (!mutationSupported) {
+      throw new Error("Web 管理面尚未开放 Secret 写入。");
+    }
     await setWorkspaceSecret(workspaceId, secretKey, draft.trim());
     saved = true;
     draft = "";
@@ -63,11 +73,13 @@
 </script>
 
 <label class="grid gap-1">
-  <span class="text-xs text-[var(--text-muted)]">{label}</span>
+  <span class="text-xs text-[var(--text-muted)]">
+    {label}{mutationSupported ? "" : "（Web 当前只读）"}
+  </span>
   <SecretInput
     bind:value={draft}
     {placeholder}
-    disabled={loading}
+    disabled={loading || !mutationSupported}
     showCopy={false}
   />
 </label>

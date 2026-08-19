@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import { message } from "$lib/platform/dialog";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import SecretInput from "$lib/components/SecretInput.svelte";
@@ -106,6 +108,12 @@
   let saving = $state(false);
   let secretsLoadSeq = 0;
   let suppressSecretsReload = $state(false);
+  let workspaceSecretMutationSupported = $state(false);
+  let sharedSecretMutationSupported = $state(false);
+
+  const secretMutationSupported = $derived(
+    draftUseShared ? sharedSecretMutationSupported : workspaceSecretMutationSupported,
+  );
 
   const secretsDirty = $derived(
     apiKey !== loadedApiKey ||
@@ -222,7 +230,7 @@
   }
 
   async function regenerate() {
-    if (regenerating) return;
+    if (!secretMutationSupported || regenerating) return;
     regenerating = true;
     try {
       apiKey = draftUseShared
@@ -236,7 +244,7 @@
   }
 
   async function regenerateOAuthSecret() {
-    if (regeneratingOAuthSecret) return;
+    if (!secretMutationSupported || regeneratingOAuthSecret) return;
     regeneratingOAuthSecret = true;
     try {
       oauthClientSecret = draftUseShared
@@ -250,7 +258,7 @@
   }
 
   async function regenerateOAuthPassword() {
-    if (regeneratingOAuthPassword) return;
+    if (!secretMutationSupported || regeneratingOAuthPassword) return;
     regeneratingOAuthPassword = true;
     try {
       oauthPassword = draftUseShared
@@ -264,7 +272,7 @@
   }
 
   async function regenerateOAuthTokenSecret() {
-    if (regeneratingOAuthTokenSecret) return;
+    if (!secretMutationSupported || regeneratingOAuthTokenSecret) return;
     regeneratingOAuthTokenSecret = true;
     try {
       oauthTokenSecret = draftUseShared
@@ -276,6 +284,17 @@
       regeneratingOAuthTokenSecret = false;
     }
   }
+
+  onMount(() => {
+    void (async () => {
+      const [canWorkspaceRegenerate, canSharedRegenerate] = await Promise.all([
+        supportsAdminCommand("regenerate_workspace_secret"),
+        supportsAdminCommand("regenerate_shared_secret"),
+      ]);
+      workspaceSecretMutationSupported = canWorkspaceRegenerate;
+      sharedSecretMutationSupported = canSharedRegenerate;
+    })();
+  });
 </script>
 
 <form
@@ -288,6 +307,11 @@
   <p class="text-xs text-[var(--text-muted)]">
     复制 OpenAPI、密钥等请用上方「GPT 配置」卡片；此处仅修改认证方式与密钥。
   </p>
+  {#if !secretMutationSupported}
+    <p class="text-xs text-[var(--text-muted)]">
+      Web 管理面当前允许修改认证配置，但 Secret 仅可查看；重新生成将在高权限确认执行器接入后开放。
+    </p>
+  {/if}
 
   <label class="grid gap-1">
     <span class="text-xs text-[var(--text-muted)]">认证方式</span>
@@ -318,7 +342,7 @@
         readonly
         disabled={loadingKey}
         showCopy={!!apiKey}
-        onRegenerate={() => void regenerate()}
+        onRegenerate={secretMutationSupported ? () => void regenerate() : undefined}
         regenerating={regenerating}
       />
     </label>
@@ -381,7 +405,7 @@
         readonly
         disabled={loadingOAuthSecret}
         showCopy={!!oauthClientSecret}
-        onRegenerate={() => void regenerateOAuthSecret()}
+        onRegenerate={secretMutationSupported ? () => void regenerateOAuthSecret() : undefined}
         regenerating={regeneratingOAuthSecret}
       />
     </label>
@@ -392,7 +416,7 @@
         readonly
         disabled={loadingOAuthPassword}
         showCopy={!!oauthPassword}
-        onRegenerate={() => void regenerateOAuthPassword()}
+        onRegenerate={secretMutationSupported ? () => void regenerateOAuthPassword() : undefined}
         regenerating={regeneratingOAuthPassword}
       />
     </label>
@@ -403,7 +427,7 @@
         readonly
         disabled={loadingOAuthTokenSecret}
         showCopy={!!oauthTokenSecret}
-        onRegenerate={() => void regenerateOAuthTokenSecret()}
+        onRegenerate={secretMutationSupported ? () => void regenerateOAuthTokenSecret() : undefined}
         regenerating={regeneratingOAuthTokenSecret}
       />
     </label>

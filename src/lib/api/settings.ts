@@ -1,4 +1,4 @@
-import { invokeAdmin, invokeRead } from "$lib/api/invoke";
+import { invokeAdmin, invokeRead, supportsAdminCommand } from "$lib/api/invoke";
 import type { GatewayControlStatus } from "$lib/types";
 
 export interface FrpProfileDto {
@@ -24,7 +24,13 @@ export async function saveFrpProfile(
   profile: FrpProfileInput,
   token?: string,
 ): Promise<FrpProfileDto> {
-  return invokeAdmin<FrpProfileDto>("save_frp_profile", { profile, token });
+  if (await supportsAdminCommand("save_frp_profile")) {
+    return invokeAdmin<FrpProfileDto>("save_frp_profile", { profile, token });
+  }
+  if (token?.trim()) {
+    throw new Error("Web 管理面尚未开放 FRP Token 写入；请先保存非敏感配置。");
+  }
+  return invokeAdmin<FrpProfileDto>("save_frp_profile_metadata", { profile });
 }
 
 export async function getLastWorkspaceId(): Promise<string> {

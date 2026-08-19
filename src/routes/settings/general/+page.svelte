@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { supportsAdminCommand } from "$lib/api/invoke";
   import { message } from "$lib/platform/dialog";
   import {
     getMcpGateway,
@@ -51,6 +52,7 @@
   let gatewayLogError = $state("");
   let windowsService = $state<WindowsScmServiceStatusDto | null>(null);
   let windowsServiceBusy = $state(false);
+  let windowsServiceMutationsSupported = $state(false);
 
   async function refreshGatewayRuntimeStatus() {
     if (gatewayRefreshing) return;
@@ -92,6 +94,7 @@
     action: () => Promise<WindowsScmServiceStatusDto>,
     success: string,
   ) {
+    if (!windowsServiceMutationsSupported) return;
     windowsServiceBusy = true;
     try {
       windowsService = await action();
@@ -229,6 +232,16 @@
   onMount(() => {
     let cancelled = false;
     void (async () => {
+      const serviceCommands = [
+        "install_windows_service",
+        "uninstall_windows_service",
+        "start_windows_service",
+        "stop_windows_service",
+        "restart_windows_service",
+        "sync_windows_service_plan",
+      ];
+      const supported = await Promise.all(serviceCommands.map(supportsAdminCommand));
+      windowsServiceMutationsSupported = supported.every(Boolean);
       await refresh();
       if (!cancelled) void observeGateway(() => cancelled);
     })();
@@ -356,7 +369,9 @@
               {windowsService.processId ? ` · PID ${windowsService.processId}` : ""}
             </p>
             <p class="mt-1">
-              安装、卸载和服务启停会触发标准 Windows UAC，仅提升该次 SCM 操作。
+              {windowsServiceMutationsSupported
+                ? "安装、卸载和服务启停会触发标准 Windows UAC，仅提升该次 SCM 操作。"
+                : "Web 管理面当前仅提供 Service 状态查看；生命周期操作将在高权限确认执行器接入后开放。"}
             </p>
           </div>
         </div>
@@ -365,48 +380,48 @@
           <button
             type="button"
             class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
-            disabled={windowsServiceBusy}
+            disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
             onclick={() => void runWindowsServiceAction(syncWindowsServicePlan, "已将当前 daemon/Gateway 运行态同步为开机启动计划。")}
           >同步当前运行态</button>
           {#if !windowsService.installed}
             <button
               type="button"
               class="rounded-md bg-[var(--primary)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-              disabled={windowsServiceBusy}
+              disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
               onclick={() => void runWindowsServiceAction(installWindowsService, "Windows SCM Service 已安装并设置为自动启动。")}
             >安装并自动启动</button>
           {:else}
             <button
               type="button"
               class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
-              disabled={windowsServiceBusy}
+              disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
               onclick={() => void runWindowsServiceAction(installWindowsService, "Windows SCM Service 已更新到当前构建并完成重启。")}
             >更新服务版本</button>
             {#if windowsService.state === "running"}
               <button
                 type="button"
                 class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
-                disabled={windowsServiceBusy}
+                disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
                 onclick={() => void runWindowsServiceAction(stopWindowsService, "Windows SCM Service 已停止。")}
               >停止</button>
             {:else}
               <button
                 type="button"
                 class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
-                disabled={windowsServiceBusy}
+                disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
                 onclick={() => void runWindowsServiceAction(startWindowsService, "Windows SCM Service 已启动。")}
               >启动</button>
             {/if}
             <button
               type="button"
               class="rounded-md border border-[var(--border)] px-3 py-1.5 text-sm disabled:opacity-50"
-              disabled={windowsServiceBusy}
+              disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
               onclick={() => void runWindowsServiceAction(restartWindowsService, "Windows SCM Service 已重启。")}
             >重启</button>
             <button
               type="button"
               class="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-600 disabled:opacity-50"
-              disabled={windowsServiceBusy}
+              disabled={!windowsServiceMutationsSupported || windowsServiceBusy}
               onclick={() => void runWindowsServiceAction(uninstallWindowsService, "Windows SCM Service 已卸载；启动计划配置仍保留，可再次安装。")}
             >卸载</button>
           {/if}
