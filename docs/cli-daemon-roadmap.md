@@ -174,7 +174,7 @@ GUI 工作区控制迁移现状：
 
 在第 5 步之前，桌面包仍属于兼容入口；在第 6 步之前，不得删除用户仍只能通过桌面完成的系统级能力。
 
-截至 2026-08-19，本阶段已完成第三轮 Web Admin 实用化：
+截至 2026-08-19，本阶段已完成第四轮 Web Admin 实用化：
 
 - Tauri `AppState` 已不再持有 `RuntimeSupervisor`；desktop maintenance 与窗口退出时的 Gateway/Tunnel 清理已删除，桌面进程退出不再影响 daemon 所有的运行资源；
 - Svelte 业务页面/API 已不再直接依赖 Tauri 包，统一经 `invokeAdmin` 与 platform dialog adapter；Tauri 依赖只允许存在于这两个适配边界内，并由架构守卫测试约束；
@@ -182,12 +182,14 @@ GUI 工作区控制迁移现状：
 - 浏览器必须先 `POST /api/v1/session` 建立进程内独立管理会话。会话 ID 只通过 `HttpOnly; SameSite=Strict` cookie 发送，CSRF token 单独返回给同源页面；所有管理 command 都要求精确 `Host`、精确 `Origin`、same-origin Fetch 标记、有效 session 与 CSRF token，不复用 MCP/Actions 的公网认证凭据；
 - Web Admin 已迁移工作区/控制面状态与事件、MCP/Actions runtime 状态、Workspace/Gateway 日志、Gateway 状态/事件、FRP profile 列表、software 状态、secret **读取**和 Windows Service 状态读取，用于现有管理 UI 的首屏和诊断展示；
 - Workspace 配置更新已切换为共享 `preview/stage/apply` 事务：浏览器提交时携带加载时的 `baseProfile`，服务端在 staging 前要求它仍与 active 配置一致，防止旧页面覆盖 CLI/Tauri 的并发修改；pending/apply 继续复用 CLI 既有字段级 diff、资源校验、apply plan、daemon hot reload 与 stale-base 保护；
-- Web Admin 已迁移 Workspace MCP/Actions daemon 启停/重启和 Tunnel restart/stop，全部经 `management.rs` 委托现有 `control` daemon 协议；Web HTTP handler 不直接拥有 listener、RuntimeSupervisor 或 Tunnel Supervisor。Gateway 配置保存也改为共享热应用/关闭语义，并开放 daemon reload；保存配置不会隐式创建 routes；
-- Gateway 启用时，Web Admin 不允许绕过 Gateway 控制域直接启停单 Workspace MCP daemon。Per-workspace Gateway route selector 仍未迁移，等待单独的 route 生命周期 API；
+- Web Admin 已迁移 Workspace MCP/Actions daemon 启停/重启和 Tunnel start/restart/stop/test，全部经 `management.rs` 委托现有 `control` daemon 协议；Tunnel test 的临时服务运行态用 `reconcile_daemon` 恢复，不会把探测动作写成持久化 autostart desired-state；Web HTTP handler 不直接拥有 listener、RuntimeSupervisor 或 Tunnel Supervisor；
+- Gateway 配置保存继续使用共享热应用/关闭语义。Gateway protocol v1 以 additive `set_routes` 增加 per-workspace route 生命周期：已有 Gateway daemon 在同一 PID 内重建内部 Workspace MCP/routes/tunnel 并使用 accepted → operation status 反馈；失败会恢复旧 route 集合。首个 route 在 daemon 停止时可启动 Gateway，最后一个 route 移除走受控 shutdown。Web 管理页可逐 Workspace 启停 route，存在未保存 Gateway 配置草稿时禁止 route mutation；
+- Gateway 启用时，Web Admin 仍不允许绕过 Gateway 控制域直接启停单 Workspace MCP daemon/Tunnel；Tauri 的 Windows route helper 也已改为调用同一 `management.rs` 语义，不再维护第二套 route restart 编排；
+- Web Admin 已加入高权限操作的两步确认基础设施：prepare ticket 绑定当前 HttpOnly session + allowlisted action，要求精确确认文本；批准后得到短 TTL、一次性 grant。结构化 audit journal 只记录 session 指纹、action、phase/outcome，并使用有界大小/轮转与私有文件权限。**当前没有任何 privileged command 消费 grant**，因此确认票据本身不会开放 secret/software/service mutation；
 - 继续 fail closed 的高权限写操作包括 secret 写入/重新生成、软件安装/卸载以及 Windows Service install/uninstall/start/stop/restart/sync。它们仍只能经现有 CLI/Tauri/系统管理入口执行；
 - Web adapter 会自动建立/缓存管理 session，并在 401 后最多重新 bootstrap 一次。业务页面仍无需感知 Tauri/Web transport 差异。
 
-下一轮继续按权限域推进：先完成 Gateway per-workspace route selector 与剩余 tunnel test/start 体验，再为 secret 写入、软件安装和 service lifecycle 设计显式确认、权限分级与审计语义。只有全部管理能力达到 Web/CLI 等价后，才进入停止桌面发布和删除 Tauri 依赖的阶段。
+下一轮继续按权限域推进：在已经落地的一次性 grant/audit 基础上，为 secret 写入、软件安装和 service lifecycle 分别定义参数绑定、权限分级、二次确认 UI 与真正的 grant consumer；每类 privileged executor 必须单独评审并保持审计不落敏感参数。只有全部管理能力达到 Web/CLI 等价后，才进入停止桌面发布和删除 Tauri 依赖的阶段。
 
 ### 阶段 4：运行与升级治理
 

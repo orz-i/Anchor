@@ -13,6 +13,51 @@ fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
 }
 
 #[test]
+fn privileged_confirmation_is_infrastructure_not_an_executor() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
+    let security =
+        fs::read_to_string(manifest.join("src/admin_security.rs")).expect("admin security source");
+
+    assert!(admin.contains("\"prepare_privileged_action\" =>"));
+    assert!(admin.contains("\"confirm_privileged_action\" =>"));
+    assert!(admin.contains("\"list_admin_audit_events\" =>"));
+    assert!(security.contains("pub fn consume_grant"));
+    assert!(
+        !admin.contains("consume_grant("),
+        "current Web Admin dispatcher must not consume privileged grants"
+    );
+
+    let event_shape = security
+        .split("pub struct AdminAuditEvent")
+        .nth(1)
+        .expect("audit event struct")
+        .split("}\n\npub fn session_fingerprint")
+        .next()
+        .expect("audit event fields");
+    for forbidden_field in ["pub args:", "pub payload:", "pub secret:", "pub token:"] {
+        assert!(
+            !event_shape.contains(forbidden_field),
+            "audit event exposes sensitive field: {forbidden_field}"
+        );
+    }
+}
+
+#[test]
+fn running_gateway_route_changes_use_the_gateway_control_domain() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let management =
+        fs::read_to_string(manifest.join("src/management.rs")).expect("management source");
+    let protocol = fs::read_to_string(manifest.join("src/gateway_control/protocol.rs"))
+        .expect("Gateway protocol source");
+    let cli = fs::read_to_string(manifest.join("src/cli/mod.rs")).expect("CLI source");
+
+    assert!(management.contains("gateway_control::request_set_routes"));
+    assert!(protocol.contains("SetRoutes"));
+    assert!(cli.contains("GatewayControlCommand::SetRoutes"));
+}
+
+#[test]
 fn frontend_tauri_dependencies_are_confined_to_platform_adapters() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let frontend = manifest.parent().expect("repo root").join("src");
@@ -66,10 +111,13 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "management::start_workspace_service",
         "management::stop_workspace_service",
         "management::restart_workspace_service",
+        "management::start_workspace_tunnel",
         "management::restart_workspace_tunnel",
         "management::stop_workspace_tunnel",
+        "management::test_workspace_tunnel",
         "management::set_mcp_gateway",
         "management::reload_mcp_gateway",
+        "management::set_gateway_workspace_route",
     ] {
         assert!(
             admin.contains(delegated),
@@ -82,6 +130,7 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "control::restart_daemon_service(",
         "control::request_tunnel_operation(",
         "gateway_control::request_apply_config(",
+        "gateway_control::request_set_routes(",
         "gateway_control::request_exit(",
     ] {
         assert!(
@@ -101,6 +150,7 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
         "regenerate_workspace_secret",
         "set_shared_secret",
         "regenerate_shared_secret",
+        "save_frp_profile",
         "install_software",
         "uninstall_software",
         "install_windows_service",
