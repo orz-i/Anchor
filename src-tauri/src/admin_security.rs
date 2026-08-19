@@ -25,6 +25,29 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
     "set_shared_secret",
     "regenerate_shared_secret",
     "save_frp_profile",
+    "set_frp_profile_token",
+    "delete_frp_profile",
+    "install_software",
+    "uninstall_software",
+    "install_windows_service",
+    "uninstall_windows_service",
+    "start_windows_service",
+    "stop_windows_service",
+    "restart_windows_service",
+    "sync_windows_service_plan",
+];
+
+const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
+    "set_workspace_secret",
+    "regenerate_workspace_secret",
+    "set_shared_secret",
+    "regenerate_shared_secret",
+    "set_frp_profile_token",
+    "delete_frp_profile",
+];
+
+const UNAVAILABLE_PRIVILEGED_ACTIONS: &[&str] = &[
+    "save_frp_profile",
     "install_software",
     "uninstall_software",
     "install_windows_service",
@@ -37,6 +60,14 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
 
 pub(crate) fn privileged_actions() -> &'static [&'static str] {
     PRIVILEGED_ACTIONS
+}
+
+pub(crate) fn available_privileged_executors() -> &'static [&'static str] {
+    AVAILABLE_PRIVILEGED_EXECUTORS
+}
+
+pub(crate) fn unavailable_privileged_actions() -> &'static [&'static str] {
+    UNAVAILABLE_PRIVILEGED_ACTIONS
 }
 
 static AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -71,6 +102,7 @@ fn validate_privileged_action(action: &str) -> AppResult<()> {
 pub struct PreparedPrivilegedAction {
     pub confirmation_id: String,
     pub action: String,
+    pub target_summary: String,
     pub confirmation_text: String,
     pub expires_in_seconds: u64,
 }
@@ -83,10 +115,138 @@ pub struct ApprovedPrivilegedGrant {
     pub expires_in_seconds: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrivilegedActionBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl PrivilegedActionBinding {
+    pub fn workspace_secret(id: &str, key: &str) -> Self {
+        Self {
+            id: Some(id.to_string()),
+            key: Some(key.to_string()),
+            kind: None,
+        }
+    }
+
+    pub fn shared_secret(key: &str) -> Self {
+        Self {
+            id: None,
+            key: Some(key.to_string()),
+            kind: None,
+        }
+    }
+
+    pub fn frp_profile(id: &str) -> Self {
+        Self {
+            id: Some(id.to_string()),
+            key: None,
+            kind: None,
+        }
+    }
+}
+
+fn normalize_selector(value: &str, field: &str, max_len: usize) -> AppResult<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
+        return Err(AppError::Message(format!(
+            "Web Admin privileged binding has invalid {field}"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_binding(
+    action: &str,
+    binding: &PrivilegedActionBinding,
+) -> AppResult<PrivilegedActionBinding> {
+    validate_privileged_action(action)?;
+    let id = binding
+        .id
+        .as_deref()
+        .map(|value| normalize_selector(value, "id", 256))
+        .transpose()?;
+    let key = binding
+        .key
+        .as_deref()
+        .map(|value| normalize_selector(value, "key", 128))
+        .transpose()?;
+    let kind = binding
+        .kind
+        .as_deref()
+        .map(|value| normalize_selector(value, "kind", 64))
+        .transpose()?;
+    let normalized = PrivilegedActionBinding { id, key, kind };
+
+    let valid_shape = match action {
+        "set_workspace_secret" | "regenerate_workspace_secret" => {
+            normalized.id.is_some() && normalized.key.is_some() && normalized.kind.is_none()
+        }
+        "set_shared_secret" | "regenerate_shared_secret" => {
+            normalized.id.is_none() && normalized.key.is_some() && normalized.kind.is_none()
+        }
+        "save_frp_profile" | "set_frp_profile_token" | "delete_frp_profile" => {
+            normalized.id.is_some() && normalized.key.is_none() && normalized.kind.is_none()
+        }
+        "install_software" | "uninstall_software" => {
+            normalized.id.is_none() && normalized.key.is_none() && normalized.kind.is_some()
+        }
+        "install_windows_service"
+        | "uninstall_windows_service"
+        | "start_windows_service"
+        | "stop_windows_service"
+        | "restart_windows_service"
+        | "sync_windows_service_plan" => {
+            normalized.id.is_none() && normalized.key.is_none() && normalized.kind.is_none()
+        }
+        _ => false,
+    };
+    if !valid_shape {
+        return Err(AppError::Message(format!(
+            "Web Admin privileged binding does not match action: {action}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn binding_fingerprint(action: &str, binding: &PrivilegedActionBinding) -> AppResult<String> {
+    let normalized = normalize_binding(action, binding)?;
+    let bytes = serde_json::to_vec(&(action, normalized))?;
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(bytes)))
+}
+
+fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> AppResult<String> {
+    let binding = normalize_binding(action, binding)?;
+    Ok(match action {
+        "set_workspace_secret" | "regenerate_workspace_secret" => format!(
+            "Workspace {} · {}",
+            binding.id.as_deref().unwrap_or_default(),
+            binding.key.as_deref().unwrap_or_default()
+        ),
+        "set_shared_secret" | "regenerate_shared_secret" => {
+            format!("共享密钥 {}", binding.key.as_deref().unwrap_or_default())
+        }
+        "save_frp_profile" | "set_frp_profile_token" | "delete_frp_profile" => {
+            format!("FRP profile {}", binding.id.as_deref().unwrap_or_default())
+        }
+        "install_software" | "uninstall_software" => {
+            format!("软件 {}", binding.kind.as_deref().unwrap_or_default())
+        }
+        _ => "Windows Service".into(),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct PrivilegedConfirmation {
     session_id: String,
     action: String,
+    binding_fingerprint: String,
     confirmation_text: String,
     created_at: Instant,
     approved_at: Option<Instant>,
@@ -142,13 +302,17 @@ impl PrivilegedConfirmationStore {
         &mut self,
         session_id: &str,
         action: &str,
+        binding: &PrivilegedActionBinding,
     ) -> AppResult<PreparedPrivilegedAction> {
         validate_privileged_action(action)?;
+        let binding_fingerprint = binding_fingerprint(action, binding)?;
+        let target_summary = binding_target_summary(action, binding)?;
         let now = Instant::now();
         self.purge_expired(now);
         self.make_room();
         let confirmation_id = uuid::Uuid::new_v4().to_string();
-        let confirmation_text = format!("CONFIRM {action}");
+        let binding_tag = binding_fingerprint.chars().take(12).collect::<String>();
+        let confirmation_text = format!("CONFIRM {action} {binding_tag}");
         self.append_audit(&AdminAuditEvent::new(
             session_fingerprint(session_id),
             action,
@@ -160,6 +324,7 @@ impl PrivilegedConfirmationStore {
             PrivilegedConfirmation {
                 session_id: session_id.to_string(),
                 action: action.to_string(),
+                binding_fingerprint,
                 confirmation_text: confirmation_text.clone(),
                 created_at: now,
                 approved_at: None,
@@ -169,6 +334,7 @@ impl PrivilegedConfirmationStore {
         Ok(PreparedPrivilegedAction {
             confirmation_id,
             action: action.to_string(),
+            target_summary,
             confirmation_text,
             expires_in_seconds: PRIVILEGED_CONFIRMATION_TTL.as_secs(),
         })
@@ -227,26 +393,36 @@ impl PrivilegedConfirmationStore {
         })
     }
 
-    /// Reserved for the future privileged command dispatcher. No current Web
-    /// Admin command consumes a grant, so creating/approving a ticket cannot
-    /// itself unlock secret/software/service mutations.
-    #[allow(dead_code)]
     pub fn consume_grant(
         &mut self,
         session_id: &str,
         grant_id: &str,
         action: &str,
+        binding: &PrivilegedActionBinding,
     ) -> AppResult<()> {
         validate_privileged_action(action)?;
+        let actual_binding_fingerprint = binding_fingerprint(action, binding)?;
         let now = Instant::now();
         self.purge_expired(now);
         let audit_root = self.audit_root.clone();
         let record = self.records.get_mut(grant_id).ok_or_else(|| {
             AppError::Message("Web Admin privileged grant is missing or expired".into())
         })?;
-        if record.session_id != session_id || record.action != action {
+        if record.session_id != session_id
+            || record.action != action
+            || record.binding_fingerprint != actual_binding_fingerprint
+        {
+            append_confirmation_audit(
+                audit_root.as_deref(),
+                &AdminAuditEvent::new(
+                    session_fingerprint(session_id),
+                    action,
+                    "grant_rejected",
+                    "rejected",
+                ),
+            )?;
             return Err(AppError::Message(
-                "Web Admin privileged grant does not match this session/action".into(),
+                "Web Admin privileged grant does not match this session/action/target".into(),
             ));
         }
         let approved_at = record.approved_at.ok_or_else(|| {
@@ -268,6 +444,21 @@ impl PrivilegedConfirmationStore {
         )?;
         record.consumed = true;
         Ok(())
+    }
+
+    pub fn record_execution_outcome(
+        &self,
+        session_id: &str,
+        action: &str,
+        succeeded: bool,
+    ) -> AppResult<()> {
+        validate_privileged_action(action)?;
+        self.append_audit(&AdminAuditEvent::new(
+            session_fingerprint(session_id),
+            action,
+            "execution_completed",
+            if succeeded { "succeeded" } else { "failed" },
+        ))
     }
 }
 
@@ -423,6 +614,29 @@ pub fn read_admin_audit_events(limit: usize) -> AppResult<Vec<AdminAuditEvent>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn privileged_manifests_are_complete_and_disjoint() {
+        let all = PRIVILEGED_ACTIONS.iter().copied().collect::<HashSet<_>>();
+        let available = AVAILABLE_PRIVILEGED_EXECUTORS
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let unavailable = UNAVAILABLE_PRIVILEGED_ACTIONS
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+
+        assert!(available.is_disjoint(&unavailable));
+        assert_eq!(
+            all,
+            available
+                .union(&unavailable)
+                .copied()
+                .collect::<HashSet<_>>()
+        );
+    }
 
     #[test]
     fn audit_round_trip_is_bounded_and_contains_no_argument_payload() {
@@ -449,8 +663,9 @@ mod tests {
     fn confirmation_is_session_bound_exact_and_one_time() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut store = PrivilegedConfirmationStore::for_test(temp.path().to_path_buf());
+        let binding = PrivilegedActionBinding::workspace_secret("workspace-a", "bearer_token");
         let prepared = store
-            .prepare("session-a", "set_workspace_secret")
+            .prepare("session-a", "set_workspace_secret", &binding)
             .expect("prepare");
         assert!(store
             .confirm(
@@ -474,10 +689,90 @@ mod tests {
             )
             .expect("confirm");
         store
-            .consume_grant("session-a", &grant.grant_id, "set_workspace_secret")
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_workspace_secret",
+                &binding,
+            )
             .expect("consume once");
         assert!(store
-            .consume_grant("session-a", &grant.grant_id, "set_workspace_secret")
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_workspace_secret",
+                &binding,
+            )
             .is_err());
+    }
+
+    #[test]
+    fn grant_is_bound_to_the_exact_non_sensitive_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = PrivilegedConfirmationStore::for_test(temp.path().to_path_buf());
+        let original = PrivilegedActionBinding::workspace_secret("workspace-a", "bearer_token");
+        let different_workspace =
+            PrivilegedActionBinding::workspace_secret("workspace-b", "bearer_token");
+        let different_key =
+            PrivilegedActionBinding::workspace_secret("workspace-a", "oauth_password");
+
+        let prepared = store
+            .prepare("session-a", "set_workspace_secret", &original)
+            .expect("prepare");
+        let grant = store
+            .confirm(
+                "session-a",
+                &prepared.confirmation_id,
+                &prepared.confirmation_text,
+            )
+            .expect("confirm");
+
+        assert!(store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_workspace_secret",
+                &different_workspace,
+            )
+            .is_err());
+        assert!(store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_workspace_secret",
+                &different_key,
+            )
+            .is_err());
+        store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_workspace_secret",
+                &original,
+            )
+            .expect("matching target remains consumable");
+    }
+
+    #[test]
+    fn confirmation_text_changes_with_target_binding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = PrivilegedConfirmationStore::for_test(temp.path().to_path_buf());
+        let first = store
+            .prepare(
+                "session-a",
+                "set_shared_secret",
+                &PrivilegedActionBinding::shared_secret("bearer_token"),
+            )
+            .expect("first prepare");
+        let second = store
+            .prepare(
+                "session-a",
+                "set_shared_secret",
+                &PrivilegedActionBinding::shared_secret("oauth_password"),
+            )
+            .expect("second prepare");
+
+        assert_ne!(first.confirmation_text, second.confirmation_text);
+        assert!(!first.confirmation_text.contains("secret-value"));
     }
 }
