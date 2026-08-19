@@ -297,8 +297,6 @@ fn windows_service_executor_is_platform_gated_and_server_bound() {
         fs::read_to_string(manifest.join("src/admin_security.rs")).expect("admin security source");
     let management =
         fs::read_to_string(manifest.join("src/management.rs")).expect("management source");
-    let commands = fs::read_to_string(manifest.join("src/commands/windows_service.rs"))
-        .expect("Windows Service command source");
     let windows_service = fs::read_to_string(manifest.join("src/windows_service.rs"))
         .expect("Windows Service source");
 
@@ -330,7 +328,9 @@ fn windows_service_executor_is_platform_gated_and_server_bound() {
     assert!(windows_service.contains("\"runningSnapshot\""));
     assert!(windows_service.contains("\"currentExecutable\""));
 
-    assert!(commands.contains("management::install_windows_service().await"));
-    assert!(commands.contains("management::sync_windows_service_plan()"));
-    assert!(!commands.contains("run_elevated_admin_action"));
+    assert!(!manifest.join("src/commands").exists());
+    assert!(management.contains("pub(crate) async fn install_windows_service()"));
+    assert!(management.contains("pub(crate) fn sync_windows_service_plan()"));
+    assert!(management.contains("crate::windows_service::run_elevated_admin_action(action)"));
+    assert!(!admin.contains("run_elevated_admin_action"));
 }
