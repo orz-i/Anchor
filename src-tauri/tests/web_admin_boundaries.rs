@@ -39,6 +39,7 @@ fn web_admin_supported_manifest_matches_dispatcher() {
     assert!(admin.contains("\"privilegedCommands\": privileged_actions()"));
     assert!(admin.contains("\"privilegedExecutors\": available_privileged_executors()"));
     assert!(admin.contains("\"unavailableCommands\": unavailable_privileged_actions()"));
+    assert!(admin.contains("\"mutationCommands\": WEB_ADMIN_MUTATION_COMMANDS"));
 }
 
 #[test]
@@ -117,6 +118,9 @@ fn privileged_confirmation_exposes_only_reviewed_executors() {
     assert!(admin.contains("PrivilegedActionBinding::frp_profile"));
     assert!(admin.contains("PrivilegedActionBinding::software_install"));
     assert!(admin.contains("PrivilegedActionBinding::software_uninstall"));
+    assert!(admin.contains("PrivilegedActionBinding::windows_service"));
+    assert!(admin.contains("canonical_privileged_binding"));
+    assert!(admin.contains("windows_service_privileged_binding"));
     assert!(security.contains("binding_fingerprint"));
     assert!(security.contains("record_execution_outcome"));
 
@@ -127,7 +131,16 @@ fn privileged_confirmation_exposes_only_reviewed_executors() {
         .split("}\n\npub fn session_fingerprint")
         .next()
         .expect("audit event fields");
-    for forbidden_field in ["pub args:", "pub payload:", "pub secret:", "pub token:"] {
+    for forbidden_field in [
+        "pub args:",
+        "pub payload:",
+        "pub secret:",
+        "pub token:",
+        "pub path:",
+        "pub target:",
+        "pub owner:",
+        "pub revision:",
+    ] {
         assert!(
             !event_shape.contains(forbidden_field),
             "audit event exposes sensitive field: {forbidden_field}"
@@ -217,6 +230,12 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "management::set_frp_profile_token",
         "management::install_software",
         "management::uninstall_software",
+        "management::install_windows_service",
+        "management::uninstall_windows_service",
+        "management::start_windows_service",
+        "management::stop_windows_service",
+        "management::restart_windows_service",
+        "management::sync_windows_service_plan",
     ] {
         assert!(
             admin.contains(delegated),
@@ -240,19 +259,11 @@ fn web_admin_writes_delegate_to_shared_management_services() {
 }
 
 #[test]
-fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
+fn web_admin_keeps_only_unreviewed_privileged_mutations_outside_dispatcher() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
 
-    for command in [
-        "save_frp_profile",
-        "install_windows_service",
-        "uninstall_windows_service",
-        "start_windows_service",
-        "stop_windows_service",
-        "restart_windows_service",
-        "sync_windows_service_plan",
-    ] {
+    for command in ["save_frp_profile"] {
         assert!(
             !admin.contains(&format!("\"{command}\" =>")),
             "privileged Web Admin mutation was exposed unexpectedly: {command}"
@@ -267,12 +278,32 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
         "set_frp_profile_token",
         "install_software",
         "uninstall_software",
+        "install_windows_service",
+        "uninstall_windows_service",
+        "start_windows_service",
+        "stop_windows_service",
+        "restart_windows_service",
+        "sync_windows_service_plan",
     ] {
         assert!(
             admin.contains(&format!("\"{command}\" =>")),
             "reviewed privileged executor is missing: {command}"
         );
     }
+}
+
+#[test]
+fn windows_service_executor_is_platform_gated_and_server_bound() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
+    let security =
+        fs::read_to_string(manifest.join("src/admin_security.rs")).expect("admin security source");
+    let management =
+        fs::read_to_string(manifest.join("src/management.rs")).expect("management source");
+    let commands = fs::read_to_string(manifest.join("src/commands/windows_service.rs"))
+        .expect("Windows Service command source");
+    let windows_service = fs::read_to_string(manifest.join("src/windows_service.rs"))
+        .expect("Windows Service source");
 
     for command in [
         "install_windows_service",
@@ -283,8 +314,26 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
         "sync_windows_service_plan",
     ] {
         assert!(
-            !admin.contains(&format!("consume_privileged_grant(\n                state,\n                session_id,\n                &input.grant_id,\n                \"{command}\"")),
-            "unreviewed privileged action consumes a grant: {command}"
+            admin.contains(&format!("\"{command}\" =>")),
+            "Windows Service executor missing dispatcher arm: {command}"
         );
+        assert!(security.contains(&format!("\"{command}\"")));
     }
+
+    assert!(admin.contains("#[cfg(windows)]\n    \"install_windows_service\""));
+    assert!(security.contains("#[cfg(windows)]\n    \"install_windows_service\""));
+    assert!(security.contains("#[cfg(not(windows))]\n    \"install_windows_service\""));
+    assert!(admin.contains("canonical_privileged_binding(&input.action"));
+    assert!(admin.contains("management::windows_service_privileged_target"));
+    assert!(management.contains("crate::windows_service::privileged_action_target"));
+    assert!(windows_service.contains("pub fn privileged_action_target"));
+    assert!(windows_service.contains("fn running_plan_snapshot"));
+    assert!(windows_service.contains("current_user_sid()?"));
+    assert!(windows_service.contains("\"registeredExecutable\""));
+    assert!(windows_service.contains("\"runningSnapshot\""));
+    assert!(windows_service.contains("\"currentExecutable\""));
+
+    assert!(commands.contains("management::install_windows_service().await"));
+    assert!(commands.contains("management::sync_windows_service_plan()"));
+    assert!(!commands.contains("run_elevated_admin_action"));
 }

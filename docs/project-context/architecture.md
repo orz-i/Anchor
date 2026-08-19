@@ -87,14 +87,14 @@ Anchor 已形成可构建的 Rust/Tauri 桌面应用、独立 Linux CLI、MCP/Ac
 
 `management.rs` 是 Web/Tauri 共用的管理语义边界。除读取能力外，Workspace 创建/删除、目录打开、Skill inspection、Health、Canvs、FRP 非敏感 metadata CRUD 已从 desktop command 提升到共享层；Workspace 配置通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP/Actions runtime 与 Tunnel start/restart/stop/test 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层；per-workspace route selector 使用 Gateway control protocol 的 additive `set_routes`，运行中的 Gateway 在同一 daemon PID 内切换 route 集合并在失败时恢复旧运行态，不允许 HTTP/Tauri 直接写 Gateway runtime。HTTP handler 只负责安全校验、参数反序列化和调用共享层，不持有 daemon/Tunnel/Gateway 运行权威。
 
-Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；对应运行权只能通过 Gateway route selector 变更。首 route 可启动 Gateway daemon，最后 route 移除走受控 shutdown，普通非空 route 变更使用 `set_routes` 而不是进程重启。Secret 写入/重新生成、FRP Token 写入以及 Software install/uninstall 已成为 Web privileged executor；Windows Service 生命周期仍留在不可执行的高权限边界，因此 Tauri 仍作为兼容配置壳发布。浏览器 UI 会依据 capability manifest 只开放已评审 executor，并继续将 service 控制切为只读/禁用；前端 API 架构守卫要求每个 command 要么由 Web 正向支持，要么显式属于 privileged 集合。
+Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；对应运行权只能通过 Gateway route selector 变更。首 route 可启动 Gateway daemon，最后 route 移除走受控 shutdown，普通非空 route 变更使用 `set_routes` 而不是进程重启。Secret/FRP、Software 以及 Windows Service lifecycle 均已成为已评审 Web privileged executor；Service executor 只在 Windows capability manifest 中发布，非 Windows 明确 unavailable。Tauri 仍作为兼容配置壳发布，但 Service command 已只做代理到共享 `management.rs`。
 
-高权限 Web 管理采用独立安全层 `admin_security.rs`：prepare/confirm ticket 绑定当前管理 session、allowlisted action 与 action-specific 非敏感 target fingerprint，批准后生成短 TTL 的一次性 grant；executor 必须用服务端可信参数重建 target 并在业务写入前消费 grant。Secret/FRP 使用 `id/key`，Software install 使用 `kind + pinned target version`，Software uninstall 使用 `kind`；因此前端缓存旧版本时也会在执行阶段 fail closed。跨 session/action/target、版本漂移、过期和 replay 均拒绝，executor 失败也不能复用旧 grant。audit journal 只允许 `sessionFingerprint/action/phase/outcome`，不接受 command args、payload、secret、token、下载 URL 或 target 字段。未评审的 Windows Service action 仍位于 unavailable manifest，不能因为确认基础设施存在而自动获得 Web 暴露资格。
+高权限 Web 管理采用独立安全层 `admin_security.rs`：prepare/confirm ticket 绑定当前管理 session、allowlisted action 与 action-specific 非敏感 target fingerprint，批准后生成短 TTL 的一次性 grant；executor 必须用服务端可信状态重建 target 并在业务写入前消费 grant。Secret/FRP 使用 `id/key`，Software 使用 `kind`/pinned version；Windows Service 则由服务端生成 `serviceName + opaque revision`，revision 覆盖当前构建、配置域、SCM 注册/状态、配置 owner 和 action 所需的 plan/running snapshot，浏览器不能自行指定这些可信字段。audit journal 仍只允许 `sessionFingerprint/action/phase/outcome`，不得新增 path/target/owner/revision 等字段。Windows 的最终 SCM mutation 继续经过既有 UAC helper。
 
 ### management.rs
 - **职责**: Tauri adapter、Web Admin 与后续其他管理客户端共用的配置/状态/日志读取、配置 staging/apply 与受控 daemon 生命周期语义。
 - **边界**: 自身不创建 listener、RuntimeSupervisor、Tunnel Supervisor 或 Gateway runtime；运行读写委托 `control` / `gateway_control`，配置事务复用 CLI config engine，必要磁盘持久化继续使用原子 `DataStore`/Gateway config 路径。
-- **安全**: secret key allowlist 在共享层统一校验；Web 传输层只在独立管理 session 校验后才能调用。Secret/FRP Token 与 Software install/uninstall 必须经过 `admin_security.rs` 的 target-bound 一次性 grant；Windows Service lifecycle 继续 fail closed。
+- **安全**: secret key allowlist 在共享层统一校验；Web 传输层只在独立管理 session 校验后才能调用。Secret/FRP Token、Software 和 Windows Service lifecycle 均必须经过 `admin_security.rs` 的 target-bound 一次性 grant；Service 仅在 Windows 发布 executor，非 Windows fail closed。
 - **迁移原则**: 新管理能力先进入共享层，再分别由 Tauri/Web adapter 暴露，禁止直接在 HTTP handler 复制桌面 command 业务逻辑。
 
 ## 核心模块

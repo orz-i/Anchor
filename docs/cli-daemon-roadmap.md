@@ -186,13 +186,13 @@ GUI 工作区控制迁移现状：
 - Web Admin 已迁移 Workspace MCP/Actions daemon 启停/重启和 Tunnel start/restart/stop/test，全部经 `management.rs` 委托现有 `control` daemon 协议；Tunnel test 的临时服务运行态用 `reconcile_daemon` 恢复，不会把探测动作写成持久化 autostart desired-state；Web HTTP handler 不直接拥有 listener、RuntimeSupervisor 或 Tunnel Supervisor；
 - Gateway 配置保存继续使用共享热应用/关闭语义。Gateway protocol v1 以 additive `set_routes` 增加 per-workspace route 生命周期：已有 Gateway daemon 在同一 PID 内重建内部 Workspace MCP/routes/tunnel 并使用 accepted → operation status 反馈；失败会恢复旧 route 集合。首个 route 在 daemon 停止时可启动 Gateway，最后一个 route 移除走受控 shutdown。Web 管理页可逐 Workspace 启停 route，存在未保存 Gateway 配置草稿时禁止 route mutation；
 - Gateway 启用时，Web Admin 仍不允许绕过 Gateway 控制域直接启停单 Workspace MCP daemon/Tunnel；Tauri 的 Windows route helper 也已改为调用同一 `management.rs` 语义，不再维护第二套 route restart 编排；
-- Web Admin 高权限确认已进入多个真实执行域：prepare ticket 绑定当前 HttpOnly session + allowlisted action + 非敏感 target fingerprint，精确确认文本带目标指纹短标签；批准后得到短 TTL、一次性 grant。Secret/FRP mutation 按服务端重建的 `id/key` target 校验；Software install 额外绑定软件 `kind + pinned target version`，卸载绑定 `kind`。跨 session/action/target、版本漂移、过期或 replay 均 fail closed；executor 失败后同一 grant 也不能复用；
-- 结构化 audit journal 仍只记录 session 指纹、action、phase/outcome，并使用有界大小/轮转与私有文件权限；不写 command args、payload、Secret/Token 明文、下载 URL 或 target 内容。grant 消费以及 executor 成功/失败都会进入审计。Tauri 兼容入口不经过 Web grant，而是与 Web executor 共用 `management.rs` Secret/FRP/Software mutation 语义；
-- 继续 fail closed 的高权限写操作已进一步收缩为 Windows Service install/uninstall/start/stop/restart/sync；旧 `save_frp_profile` Web command 也继续 unavailable，避免重新把 metadata 与 Token 合并成一个权限面；
-- Web Admin session/health 现在发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 与显式 `unavailableCommands` capability manifest。Web adapter 只执行服务端明确声明支持的命令；Software 页面已按 capability 开放带版本绑定的二次确认安装/卸载，Windows Service 控制仍保持只读/禁用；
+- Web Admin 高权限确认已进入 Secret/FRP、Software 与 Windows Service 三个真实执行域：prepare ticket 绑定当前 HttpOnly session + allowlisted action + 非敏感 target fingerprint，批准后得到短 TTL、一次性 grant。Windows Service 的浏览器请求不提供可信 target；服务端会按 action 重建 `serviceName + opaque revision`，revision 哈希当前构建/可执行文件、配置域、SCM 注册与状态、配置 owner，以及 install/sync 需要的 desired/running plan 快照。执行前再次重建，任一相关状态漂移都会要求重新确认；
+- Windows Service install/uninstall/start/stop/restart/sync 仅在 Windows capability manifest 中发布；Web 二次确认是 Anchor 应用级前置门槛，实际 SCM 变更仍使用既有 Windows UAC helper，未绕过操作系统提权。非 Windows 平台继续在 `unavailableCommands` 中 fail closed。Tauri command 已收缩为共享 `management.rs` adapter，不再维护第二套 Service lifecycle；
+- 结构化 audit journal 仍只记录 session 指纹、action、phase/outcome，并使用有界大小/轮转与私有文件权限；不写 command args、payload、Secret/Token、下载 URL、owner、路径、target 或 opaque revision。grant 消费及 executor 成功/失败都会进入审计；
+- 当前仍保留 unavailable 的旧高权限兼容命令主要是 `save_frp_profile`，避免重新把 FRP metadata 与 Token 合并为单一权限面。Web Admin session/health 按平台发布 `supportedCommands`、`mutationCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 与 `unavailableCommands`；
 - Web adapter 会自动建立/缓存管理 session，并在 401 后最多重新 bootstrap 一次。业务页面仍无需感知 Tauri/Web transport 差异；架构守卫会扫描前端 API command，要求每个调用要么存在于正向 Web manifest，要么明确列入 privileged 集合。
 
-下一轮继续按权限域推进 Windows Service lifecycle：复用已经落地的 target-bound grant/audit 机制，为 install/uninstall/start/stop/restart/sync 分别定义必要的参数绑定、二次确认和真实 executor。该权限域完成并通过跨平台/Windows 实机验收后，再评估停止桌面发布和删除 Tauri 依赖。
+下一轮重点转向持久化 `anchor admin` 的 service/autostart/status/upgrade/recovery 治理，以及桌面停止发布/弃用门槛复核。Windows Service Web executor 的真实 UAC/SCM 行为仍属于 Windows 发布验收项；当前 Linux 验证主机未安装 Windows Rust target，也无法替代真实 SCM/UAC live test。
 
 ### 阶段 4：运行与升级治理
 
