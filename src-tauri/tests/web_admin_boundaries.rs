@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
+
 fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root).expect("read source directory") {
         let path = entry.expect("source entry").path();
@@ -10,6 +12,87 @@ fn collect_files(root: &Path, output: &mut Vec<PathBuf>) {
             output.push(path);
         }
     }
+}
+
+#[test]
+fn web_admin_supported_manifest_matches_dispatcher() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
+    let supported = admin
+        .split("const WEB_ADMIN_SUPPORTED_COMMANDS")
+        .nth(1)
+        .expect("supported command manifest")
+        .split("];\n")
+        .next()
+        .expect("supported command manifest body");
+    let command = Regex::new(r#"\"([a-z0-9_]+)\""#).expect("command regex");
+
+    for capture in command.captures_iter(supported) {
+        let name = capture.get(1).expect("command name").as_str();
+        assert!(
+            admin.contains(&format!("\"{name}\" =>")),
+            "supported Web Admin command has no dispatcher arm: {name}"
+        );
+    }
+
+    assert!(admin.contains("\"supportedCommands\": WEB_ADMIN_SUPPORTED_COMMANDS"));
+    assert!(admin.contains("\"unavailableCommands\": privileged_actions()"));
+}
+
+#[test]
+fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo = manifest.parent().expect("repo root");
+    let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
+    let security =
+        fs::read_to_string(manifest.join("src/admin_security.rs")).expect("admin security source");
+    let supported = admin
+        .split("const WEB_ADMIN_SUPPORTED_COMMANDS")
+        .nth(1)
+        .expect("supported command manifest")
+        .split("];\n")
+        .next()
+        .expect("supported command manifest body");
+    let privileged = security
+        .split("const PRIVILEGED_ACTIONS")
+        .nth(1)
+        .expect("privileged action manifest")
+        .split("];\n")
+        .next()
+        .expect("privileged action manifest body");
+    let invocation = Regex::new(r#"(?s)invoke(?:Admin|Read)(?:<[^>]+>)?\s*\(\s*\"([a-z0-9_]+)\""#)
+        .expect("frontend invocation regex");
+
+    let api_root = repo.join("src/lib/api");
+    let mut files = Vec::new();
+    collect_files(&api_root, &mut files);
+    let mut uncovered = Vec::new();
+    for path in files {
+        if path.extension().and_then(|value| value.to_str()) != Some("ts") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("frontend api source");
+        for capture in invocation.captures_iter(&source) {
+            let name = capture.get(1).expect("command name").as_str();
+            // update_workspace is an explicit Tauri compatibility alias. The
+            // browser path for the same public API uses stage/apply instead.
+            if name == "update_workspace" {
+                continue;
+            }
+            let quoted = format!("\"{name}\"");
+            if !supported.contains(&quoted) && !privileged.contains(&quoted) {
+                uncovered.push(format!("{}: {name}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        uncovered.is_empty(),
+        "frontend Admin commands are neither supported nor explicitly privileged: {uncovered:?}"
+    );
+    assert!(supported.contains("\"save_frp_profile_metadata\""));
+    assert!(!supported.contains("\"save_frp_profile\""));
+    assert!(privileged.contains("\"save_frp_profile\""));
 }
 
 #[test]
