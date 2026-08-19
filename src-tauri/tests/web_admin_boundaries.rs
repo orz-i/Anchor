@@ -36,7 +36,9 @@ fn web_admin_supported_manifest_matches_dispatcher() {
     }
 
     assert!(admin.contains("\"supportedCommands\": WEB_ADMIN_SUPPORTED_COMMANDS"));
-    assert!(admin.contains("\"unavailableCommands\": privileged_actions()"));
+    assert!(admin.contains("\"privilegedCommands\": privileged_actions()"));
+    assert!(admin.contains("\"privilegedExecutors\": available_privileged_executors()"));
+    assert!(admin.contains("\"unavailableCommands\": unavailable_privileged_actions()"));
 }
 
 #[test]
@@ -60,8 +62,10 @@ fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
         .split("];\n")
         .next()
         .expect("privileged action manifest body");
-    let invocation = Regex::new(r#"(?s)invoke(?:Admin|Read)(?:<[^>]+>)?\s*\(\s*\"([a-z0-9_]+)\""#)
-        .expect("frontend invocation regex");
+    let invocation = Regex::new(
+        r#"(?s)invoke(?:Admin|Read|PrivilegedAdmin)(?:<[^>]+>)?\s*\(\s*\"([a-z0-9_]+)\""#,
+    )
+    .expect("frontend invocation regex");
 
     let api_root = repo.join("src/lib/api");
     let mut files = Vec::new();
@@ -91,12 +95,13 @@ fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
         "frontend Admin commands are neither supported nor explicitly privileged: {uncovered:?}"
     );
     assert!(supported.contains("\"save_frp_profile_metadata\""));
+    assert!(supported.contains("\"set_frp_profile_token\""));
     assert!(!supported.contains("\"save_frp_profile\""));
     assert!(privileged.contains("\"save_frp_profile\""));
 }
 
 #[test]
-fn privileged_confirmation_is_infrastructure_not_an_executor() {
+fn privileged_confirmation_exposes_only_the_reviewed_secret_executors() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
     let security =
@@ -106,10 +111,12 @@ fn privileged_confirmation_is_infrastructure_not_an_executor() {
     assert!(admin.contains("\"confirm_privileged_action\" =>"));
     assert!(admin.contains("\"list_admin_audit_events\" =>"));
     assert!(security.contains("pub fn consume_grant"));
-    assert!(
-        !admin.contains("consume_grant("),
-        "current Web Admin dispatcher must not consume privileged grants"
-    );
+    assert!(admin.contains("consume_privileged_grant("));
+    assert!(admin.contains("PrivilegedActionBinding::workspace_secret"));
+    assert!(admin.contains("PrivilegedActionBinding::shared_secret"));
+    assert!(admin.contains("PrivilegedActionBinding::frp_profile"));
+    assert!(security.contains("binding_fingerprint"));
+    assert!(security.contains("record_execution_outcome"));
 
     let event_shape = security
         .split("pub struct AdminAuditEvent")
@@ -201,6 +208,11 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "management::set_mcp_gateway",
         "management::reload_mcp_gateway",
         "management::set_gateway_workspace_route",
+        "management::set_workspace_secret",
+        "management::regenerate_workspace_secret",
+        "management::set_shared_secret",
+        "management::regenerate_shared_secret",
+        "management::set_frp_profile_token",
     ] {
         assert!(
             admin.contains(delegated),
@@ -229,10 +241,6 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
     let admin = fs::read_to_string(manifest.join("src/admin.rs")).expect("admin source");
 
     for command in [
-        "set_workspace_secret",
-        "regenerate_workspace_secret",
-        "set_shared_secret",
-        "regenerate_shared_secret",
         "save_frp_profile",
         "install_software",
         "uninstall_software",
@@ -246,6 +254,35 @@ fn web_admin_keeps_privileged_mutations_outside_the_http_allowlist() {
         assert!(
             !admin.contains(&format!("\"{command}\" =>")),
             "privileged Web Admin mutation was exposed unexpectedly: {command}"
+        );
+    }
+
+    for command in [
+        "set_workspace_secret",
+        "regenerate_workspace_secret",
+        "set_shared_secret",
+        "regenerate_shared_secret",
+        "set_frp_profile_token",
+    ] {
+        assert!(
+            admin.contains(&format!("\"{command}\" =>")),
+            "reviewed privileged executor is missing: {command}"
+        );
+    }
+
+    for command in [
+        "install_software",
+        "uninstall_software",
+        "install_windows_service",
+        "uninstall_windows_service",
+        "start_windows_service",
+        "stop_windows_service",
+        "restart_windows_service",
+        "sync_windows_service_plan",
+    ] {
+        assert!(
+            !admin.contains(&format!("consume_privileged_grant(\n                state,\n                session_id,\n                &input.grant_id,\n                \"{command}\"")),
+            "unreviewed privileged action consumes a grant: {command}"
         );
     }
 }
