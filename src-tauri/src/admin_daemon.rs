@@ -303,6 +303,11 @@ pub(crate) fn spawn_from_executable(port: u16, executable: &Path) -> AppResult<u
     if inspection.state.is_some() && !inspection.pid_matches {
         cleanup()?;
     }
+    if let Some(pid) = platform().find_pid_listening_on_port(port)? {
+        return Err(AppError::Message(format!(
+            "Admin daemon 无法启动：127.0.0.1:{port} 已由 PID {pid} 监听；不会接管其他进程端口"
+        )));
+    }
 
     let log_path = daemon_log_path()?;
     if let Some(parent) = log_path.parent() {
