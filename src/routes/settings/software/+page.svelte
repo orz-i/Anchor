@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { supportsAdminCommand } from "$lib/api/invoke";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import { message } from "$lib/platform/dialog";
   import type { DownloadConfig, SoftwareStatus } from "$lib/api/software";
   import {
@@ -35,13 +36,14 @@
     }
   }
 
-  async function install(kind: string) {
+  async function install(kind: string, targetVersion: string) {
     if (!softwareMutationSupported) return;
     installing = kind;
     try {
-      await installSoftware(kind);
+      await installSoftware(kind, targetVersion);
       await refresh();
     } catch (e) {
+      if (isPrivilegedActionCancelled(e)) return;
       await message(String(e), { title: "安装失败", kind: "error" });
     } finally {
       installing = null;
@@ -55,6 +57,7 @@
       await uninstallSoftware(kind);
       await refresh();
     } catch (e) {
+      if (isPrivilegedActionCancelled(e)) return;
       await message(String(e), { title: "卸载失败", kind: "error" });
     } finally {
       uninstalling = null;
@@ -100,6 +103,10 @@
         <p class="mt-2 text-xs text-[var(--text-muted)]">
           Web 管理面当前提供软件状态查看；安装/卸载将在高权限确认执行器接入后开放。
         </p>
+      {:else}
+        <p class="mt-2 text-xs text-[var(--text-muted)]">
+          安装和卸载会显示二次确认；安装确认会绑定当前代码固定的软件目标版本。
+        </p>
       {/if}
       {#if loading}
         <p class="mt-4 text-sm text-[var(--text-muted)]">加载中…</p>
@@ -114,6 +121,9 @@
                 <p class="font-mono text-xs text-[var(--text-muted)]">
                   {s.installed ? s.path : "未安装"}
                   · {s.managed ? "可管理" : "系统安装"}
+                </p>
+                <p class="mt-0.5 text-xs text-[var(--text-muted)]">
+                  管理安装目标版本：{s.targetVersion}
                 </p>
               </div>
               <div class="flex shrink-0 gap-2">
@@ -135,7 +145,7 @@
                     type="button"
                     class="text-xs text-[var(--primary)] hover:underline disabled:opacity-50"
                     disabled={!softwareMutationSupported || installing === s.kind}
-                    onclick={() => install(s.kind)}
+                    onclick={() => install(s.kind, s.targetVersion)}
                   >
                     {installing === s.kind ? "安装中…" : "安装"}
                   </button>

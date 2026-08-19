@@ -1,4 +1,5 @@
 import { invokeAdmin } from "$lib/api/invoke";
+import { invokePrivilegedAdmin } from "$lib/api/admin-security";
 
 export interface SoftwareStatus {
   kind: string;
@@ -6,6 +7,7 @@ export interface SoftwareStatus {
   installed: boolean;
   path: string;
   managed: boolean;
+  targetVersion: string;
 }
 
 export interface DownloadConfig {
@@ -18,12 +20,12 @@ export async function listSoftware(): Promise<SoftwareStatus[]> {
   return invokeAdmin("list_software");
 }
 
-export async function installSoftware(kind: string): Promise<SoftwareStatus> {
-  return invokeAdmin("install_software", { kind });
+export async function installSoftware(kind: string, targetVersion: string): Promise<SoftwareStatus> {
+  return invokePrivilegedAdmin("install_software", { kind }, { kind, version: targetVersion });
 }
 
 export async function uninstallSoftware(kind: string): Promise<SoftwareStatus> {
-  return invokeAdmin("uninstall_software", { kind });
+  return invokePrivilegedAdmin("uninstall_software", { kind }, { kind });
 }
 
 export async function getDownloadConfig(): Promise<DownloadConfig> {

@@ -5,6 +5,7 @@ export interface PrivilegedActionBinding {
   id?: string;
   key?: string;
   kind?: string;
+  version?: string;
 }
 
 export interface PreparedPrivilegedAction {
@@ -71,7 +72,7 @@ async function requestPrivilegedGrant(
   }
   const entered = window.prompt(
     [
-      "此操作会修改本机高权限配置，需要再次确认。",
+      "此操作会修改本机高权限状态，需要再次确认。",
       `目标：${prepared.targetSummary}`,
       `请输入以下确认文本（${prepared.expiresInSeconds} 秒内有效）：`,
       prepared.confirmationText,
