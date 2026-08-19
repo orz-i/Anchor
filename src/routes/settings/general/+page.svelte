@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { supportsAdminCommand } from "$lib/api/invoke";
+  import { isPrivilegedActionCancelled } from "$lib/api/admin-security";
   import { message } from "$lib/platform/dialog";
   import {
     getMcpGateway,
@@ -100,6 +101,7 @@
       windowsService = await action();
       await message(success, { title: "Windows Service", kind: "info" });
     } catch (e) {
+      if (isPrivilegedActionCancelled(e)) return;
       await message(String(e), { title: "Windows Service 操作失败", kind: "error" });
     } finally {
       windowsServiceBusy = false;

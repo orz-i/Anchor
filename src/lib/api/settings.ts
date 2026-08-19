@@ -153,25 +153,25 @@ export async function getWindowsServiceStatus(): Promise<WindowsScmServiceStatus
 }
 
 export async function installWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invokeAdmin<WindowsScmServiceStatusDto>("install_windows_service");
+  return invokePrivilegedAdmin<WindowsScmServiceStatusDto>("install_windows_service", {}, {});
 }
 
 export async function uninstallWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invokeAdmin<WindowsScmServiceStatusDto>("uninstall_windows_service");
+  return invokePrivilegedAdmin<WindowsScmServiceStatusDto>("uninstall_windows_service", {}, {});
 }
 
 export async function startWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invokeAdmin<WindowsScmServiceStatusDto>("start_windows_service");
+  return invokePrivilegedAdmin<WindowsScmServiceStatusDto>("start_windows_service", {}, {});
 }
 
 export async function stopWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invokeAdmin<WindowsScmServiceStatusDto>("stop_windows_service");
+  return invokePrivilegedAdmin<WindowsScmServiceStatusDto>("stop_windows_service", {}, {});
 }
 
 export async function restartWindowsService(): Promise<WindowsScmServiceStatusDto> {
-  return invokeAdmin<WindowsScmServiceStatusDto>("restart_windows_service");
+  return invokePrivilegedAdmin<WindowsScmServiceStatusDto>("restart_windows_service", {}, {});
 }
 
 export async function syncWindowsServicePlan(): Promise<WindowsScmServiceStatusDto> {
-  return invokeAdmin<WindowsScmServiceStatusDto>("sync_windows_service_plan");
+  return invokePrivilegedAdmin<WindowsScmServiceStatusDto>("sync_windows_service_plan", {}, {});
 }
