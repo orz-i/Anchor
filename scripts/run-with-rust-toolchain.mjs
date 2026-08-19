@@ -7,7 +7,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const [requestedProgram, ...requestedArgs] = process.argv.slice(2);
 
 if (!requestedProgram) {
-  console.error('Usage: node scripts/run-with-rust-toolchain.mjs <tauri|cargo|program> [...args]');
+  console.error('Usage: node scripts/run-with-rust-toolchain.mjs <cargo|program> [...args]');
   process.exit(2);
 }
 
@@ -45,14 +45,7 @@ if (process.platform === 'win32') {
 let program = requestedProgram;
 let args = requestedArgs;
 
-if (requestedProgram === 'tauri') {
-  const tauriEntry = join(repoRoot, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');
-  if (!existsSync(tauriEntry)) {
-    throw new Error(`Tauri CLI entrypoint not found: ${tauriEntry}`);
-  }
-  program = process.execPath;
-  args = [tauriEntry, ...requestedArgs];
-} else if (rustTools[requestedProgram]) {
+if (rustTools[requestedProgram]) {
   program = rustTools[requestedProgram];
 }
 

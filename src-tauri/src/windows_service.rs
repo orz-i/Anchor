@@ -2036,18 +2036,17 @@ mod tests {
         let quoted = concat!(
             "SERVICE_NAME: Anchor\r\n",
             "        START_TYPE         : 2   AUTO_START\r\n",
-            "        BINARY_PATH_NAME   : \"D:\\Program Files\\Anchor\\anchor-desktop.exe\" service-run C:\\config SID user\r\n",
+            "        BINARY_PATH_NAME   : \"D:\\Program Files\\Anchor\\anchor.exe\" service-run C:\\config SID user\r\n",
         );
         assert_eq!(
             parse_scm_binary_executable(quoted).as_deref(),
-            Some(r"D:\Program Files\Anchor\anchor-desktop.exe")
+            Some(r"D:\Program Files\Anchor\anchor.exe")
         );
 
-        let unquoted =
-            "BINARY_PATH_NAME : D:\\anchor\\anchor-desktop.exe service-run C:\\config\r\n";
+        let unquoted = "BINARY_PATH_NAME : D:\\anchor\\anchor.exe service-run C:\\config\r\n";
         assert_eq!(
             parse_scm_binary_executable(unquoted).as_deref(),
-            Some(r"D:\anchor\anchor-desktop.exe")
+            Some(r"D:\anchor\anchor.exe")
         );
     }
 
@@ -2057,19 +2056,19 @@ mod tests {
             schema_version: SERVICE_RUNTIME_SCHEMA_VERSION,
             pid: u32::MAX - 7,
             started_at_unix: 1,
-            executable_path: r"D:\Program Files\Anchor\anchor-desktop.exe".into(),
+            executable_path: r"D:\Program Files\Anchor\anchor.exe".into(),
             build_identity: BuildIdentity::current(),
         };
         assert!(validate_service_runtime_state(
             runtime.clone(),
             Some(runtime.pid),
-            Some(r"D:\Program Files\Anchor\anchor-desktop.exe")
+            Some(r"D:\Program Files\Anchor\anchor.exe")
         )
         .is_ok());
         let issue = validate_service_runtime_state(
             runtime.clone(),
             Some(runtime.pid),
-            Some(r"D:\Other\anchor-desktop.exe"),
+            Some(r"D:\Other\anchor.exe"),
         )
         .expect_err("registered executable mismatch must fail");
         assert!(issue.starts_with("executable_mismatch:"));
@@ -2087,7 +2086,7 @@ mod tests {
             schema_version: SERVICE_RUNTIME_SCHEMA_VERSION,
             pid: 42,
             started_at_unix: 1,
-            executable_path: r"D:\Program Files\Anchor\anchor-desktop.exe".into(),
+            executable_path: r"D:\Program Files\Anchor\anchor.exe".into(),
             build_identity: BuildIdentity {
                 package_version: "0.1.23".into(),
                 git_sha: "bbbbbbbb".into(),
@@ -2116,21 +2115,21 @@ mod tests {
     #[test]
     fn service_binary_path_persists_config_owner_identity() {
         let binary = service_binary_path(
-            Path::new(r"C:\Program Files\Anchor\anchor-desktop.exe"),
+            Path::new(r"C:\Program Files\Anchor\anchor.exe"),
             Path::new(r"C:\Users\Demo User\AppData\Roaming\anchor"),
             "S-1-5-21-100-200-300-1001",
             "Demo User",
         );
         assert_eq!(
             binary,
-            r#""C:\Program Files\Anchor\anchor-desktop.exe" service-run "C:\Users\Demo User\AppData\Roaming\anchor" S-1-5-21-100-200-300-1001 "Demo User""#
+            r#""C:\Program Files\Anchor\anchor.exe" service-run "C:\Users\Demo User\AppData\Roaming\anchor" S-1-5-21-100-200-300-1001 "Demo User""#
         );
     }
 
     #[test]
     fn owner_child_command_line_uses_windows_argument_quoting() {
         let command_line = owner_child_command_line(
-            Path::new(r"C:\Program Files\Anchor\anchor-desktop.exe"),
+            Path::new(r"C:\Program Files\Anchor\anchor.exe"),
             &[
                 "--config-dir".into(),
                 r"C:\Users\Demo User\AppData\Roaming\anchor".into(),
@@ -2140,7 +2139,7 @@ mod tests {
         );
         assert_eq!(
             command_line,
-            r#""C:\Program Files\Anchor\anchor-desktop.exe" --config-dir "C:\Users\Demo User\AppData\Roaming\anchor" daemon-run workspace-a"#
+            r#""C:\Program Files\Anchor\anchor.exe" --config-dir "C:\Users\Demo User\AppData\Roaming\anchor" daemon-run workspace-a"#
         );
         assert_eq!(quote_windows_arg(""), "\"\"");
         assert_eq!(quote_windows_arg("plain"), "plain");

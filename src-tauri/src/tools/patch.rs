@@ -1301,7 +1301,6 @@ fn is_critical_file(path: &str) -> bool {
         || name == "package.json"
         || name == "package-lock.json"
         || name == "pnpm-lock.yaml"
-        || name == "tauri.conf.json"
         || name.starts_with("README")
         || name.starts_with("LICENSE")
         || name.starts_with("vite.config.")
