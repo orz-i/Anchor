@@ -439,6 +439,18 @@ pub(crate) fn list_software() -> AppResult<Vec<crate::tunnel::SoftwareStatus>> {
     Ok(crate::tunnel::list_software())
 }
 
+pub(crate) fn software_target_version(kind: &str) -> AppResult<&'static str> {
+    crate::tunnel::software_target_version(kind)
+}
+
+pub(crate) async fn install_software(kind: &str) -> AppResult<crate::tunnel::SoftwareStatus> {
+    crate::tunnel::install_software(kind).await
+}
+
+pub(crate) fn uninstall_software(kind: &str) -> AppResult<crate::tunnel::SoftwareStatus> {
+    crate::tunnel::uninstall_software(kind)
+}
+
 pub(crate) fn get_mcp_gateway() -> AppResult<crate::settings::McpGatewayConfig> {
     DataStore::read_file(|data| Ok(data.mcp_gateway.clone()))
 }

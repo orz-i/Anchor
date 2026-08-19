@@ -23,6 +23,8 @@ pub use cloudflare::resolve_cloudflared;
 pub use frp::resolve_frpc;
 #[cfg(feature = "cli")]
 pub(crate) use frp::validate_workspace_frp_config;
+#[cfg(any(feature = "desktop", feature = "cli"))]
+pub(crate) use software::target_version as software_target_version;
 #[cfg(all(feature = "cli", not(feature = "desktop")))]
 pub(crate) use software::{install_software, list_software, uninstall_software, SoftwareStatus};
 #[cfg(feature = "desktop")]

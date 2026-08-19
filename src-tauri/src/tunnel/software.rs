@@ -29,6 +29,16 @@ pub struct SoftwareStatus {
     pub path: String,
     /// True when the resolved binary lives in the app cache dir (uninstallable).
     pub managed: bool,
+    /// Pinned version used by managed installs for this software kind.
+    pub target_version: String,
+}
+
+pub fn target_version(kind: &str) -> AppResult<&'static str> {
+    match kind {
+        "frpc" => Ok(crate::tunnel::frp::VERSION),
+        "cloudflared" => Ok(crate::tunnel::cloudflare::VERSION),
+        other => Err(AppError::Message(format!("未知软件: {other}"))),
+    }
 }
 
 fn frpc_status() -> SoftwareStatus {
@@ -46,6 +56,7 @@ fn frpc_status() -> SoftwareStatus {
         installed,
         path: path.to_string_lossy().to_string(),
         managed,
+        target_version: crate::tunnel::frp::VERSION.into(),
     }
 }
 
@@ -63,6 +74,7 @@ fn cloudflared_status() -> SoftwareStatus {
         installed,
         path: path.to_string_lossy().to_string(),
         managed,
+        target_version: crate::tunnel::cloudflare::VERSION.into(),
     }
 }
 
@@ -135,7 +147,12 @@ mod tests {
     fn software_catalog_contains_both_supported_tunnel_binaries() {
         let statuses = list_software();
         assert_eq!(statuses.len(), 2);
-        assert!(statuses.iter().any(|status| status.kind == "frpc"));
-        assert!(statuses.iter().any(|status| status.kind == "cloudflared"));
+        assert!(statuses.iter().any(|status| {
+            status.kind == "frpc" && status.target_version == crate::tunnel::frp::VERSION
+        }));
+        assert!(statuses.iter().any(|status| {
+            status.kind == "cloudflared"
+                && status.target_version == crate::tunnel::cloudflare::VERSION
+        }));
     }
 }

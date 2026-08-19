@@ -4,9 +4,7 @@ use crate::app_state::AppState;
 use crate::error::AppResult;
 use crate::management;
 use crate::settings::DownloadConfig;
-use crate::tunnel::{
-    install_software as install_binary, uninstall_software as uninstall_binary, SoftwareStatus,
-};
+use crate::tunnel::SoftwareStatus;
 
 /// List install status for frpc and cloudflared.
 #[tauri::command]
@@ -17,13 +15,13 @@ pub fn list_software() -> AppResult<Vec<SoftwareStatus>> {
 /// Download-install the requested binary ("frpc" | "cloudflared").
 #[tauri::command]
 pub async fn install_software(kind: String) -> AppResult<SoftwareStatus> {
-    install_binary(&kind).await
+    management::install_software(&kind).await
 }
 
 /// Remove a cache-managed binary ("frpc" | "cloudflared").
 #[tauri::command]
 pub fn uninstall_software(kind: String) -> AppResult<SoftwareStatus> {
-    uninstall_binary(&kind)
+    management::uninstall_software(&kind)
 }
 
 /// Read the download config (mirror + proxy).

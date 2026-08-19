@@ -116,7 +116,7 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
 
 /// Latest cloudflared release. Pinned for reproducibility; bump as needed.
 #[cfg(any(feature = "desktop", feature = "cli"))]
-const CLOUDFLARED_VERSION: &str = "2025.6.1";
+pub(crate) const VERSION: &str = "2025.6.1";
 
 /// Download cloudflared into the app cache `bin/` directory, honoring the
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
@@ -125,9 +125,8 @@ const CLOUDFLARED_VERSION: &str = "2025.6.1";
 pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     let settings = crate::settings::AppSettings::load()?;
     let asset = cloudflared_release_asset()?;
-    let url = format!(
-        "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/{asset}"
-    );
+    let url =
+        format!("https://github.com/cloudflare/cloudflared/releases/download/{VERSION}/{asset}");
     let dest =
         cached_cloudflared_path().ok_or_else(|| AppError::Message("无法解析缓存目录。".into()))?;
     if let Some(parent) = dest.parent() {
