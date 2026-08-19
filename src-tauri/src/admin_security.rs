@@ -46,15 +46,33 @@ const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
     "delete_frp_profile",
     "install_software",
     "uninstall_software",
+    #[cfg(windows)]
+    "install_windows_service",
+    #[cfg(windows)]
+    "uninstall_windows_service",
+    #[cfg(windows)]
+    "start_windows_service",
+    #[cfg(windows)]
+    "stop_windows_service",
+    #[cfg(windows)]
+    "restart_windows_service",
+    #[cfg(windows)]
+    "sync_windows_service_plan",
 ];
 
 const UNAVAILABLE_PRIVILEGED_ACTIONS: &[&str] = &[
     "save_frp_profile",
+    #[cfg(not(windows))]
     "install_windows_service",
+    #[cfg(not(windows))]
     "uninstall_windows_service",
+    #[cfg(not(windows))]
     "start_windows_service",
+    #[cfg(not(windows))]
     "stop_windows_service",
+    #[cfg(not(windows))]
     "restart_windows_service",
+    #[cfg(not(windows))]
     "sync_windows_service_plan",
 ];
 
@@ -173,6 +191,15 @@ impl PrivilegedActionBinding {
             version: None,
         }
     }
+
+    pub fn windows_service(service_name: &str, revision: &str) -> Self {
+        Self {
+            id: Some(service_name.to_string()),
+            key: None,
+            kind: None,
+            version: Some(revision.to_string()),
+        }
+    }
 }
 
 fn normalize_selector(value: &str, field: &str, max_len: usize) -> AppResult<String> {
@@ -254,10 +281,10 @@ fn normalize_binding(
         | "stop_windows_service"
         | "restart_windows_service"
         | "sync_windows_service_plan" => {
-            normalized.id.is_none()
+            normalized.id.is_some()
                 && normalized.key.is_none()
                 && normalized.kind.is_none()
-                && normalized.version.is_none()
+                && normalized.version.is_some()
         }
         _ => false,
     };
@@ -297,7 +324,16 @@ fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> Ap
         "uninstall_software" => {
             format!("软件 {}", binding.kind.as_deref().unwrap_or_default())
         }
-        _ => "Windows Service".into(),
+        "install_windows_service"
+        | "uninstall_windows_service"
+        | "start_windows_service"
+        | "stop_windows_service"
+        | "restart_windows_service"
+        | "sync_windows_service_plan" => format!(
+            "Windows Service {}",
+            binding.id.as_deref().unwrap_or_default()
+        ),
+        _ => unreachable!("validated privileged action must have a target summary"),
     })
 }
 
@@ -695,6 +731,10 @@ mod tests {
                 .copied()
                 .collect::<HashSet<_>>()
         );
+        #[cfg(windows)]
+        assert!(available.contains("install_windows_service"));
+        #[cfg(not(windows))]
+        assert!(unavailable.contains("install_windows_service"));
     }
 
     #[test]
@@ -863,5 +903,58 @@ mod tests {
         store
             .consume_grant("session-a", &grant.grant_id, "install_software", &target)
             .expect("matching version remains consumable");
+    }
+
+    #[test]
+    fn windows_service_grant_is_bound_to_service_scope_and_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = PrivilegedConfirmationStore::for_test(temp.path().to_path_buf());
+        let original =
+            PrivilegedActionBinding::windows_service("AnchorControlPlane-abcd1234", "revision-a");
+        let different_revision =
+            PrivilegedActionBinding::windows_service("AnchorControlPlane-abcd1234", "revision-b");
+        let different_service =
+            PrivilegedActionBinding::windows_service("AnchorControlPlane-efgh5678", "revision-a");
+
+        let prepared = store
+            .prepare("session-a", "restart_windows_service", &original)
+            .expect("prepare");
+        assert_eq!(
+            prepared.target_summary,
+            "Windows Service AnchorControlPlane-abcd1234"
+        );
+        assert!(!prepared.target_summary.contains("revision-a"));
+        let grant = store
+            .confirm(
+                "session-a",
+                &prepared.confirmation_id,
+                &prepared.confirmation_text,
+            )
+            .expect("confirm");
+
+        assert!(store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "restart_windows_service",
+                &different_revision,
+            )
+            .is_err());
+        assert!(store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "restart_windows_service",
+                &different_service,
+            )
+            .is_err());
+        store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "restart_windows_service",
+                &original,
+            )
+            .expect("matching service target remains consumable");
     }
 }

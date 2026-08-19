@@ -84,6 +84,18 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "stage_workspace_config",
     "apply_workspace_config",
     "get_windows_service_status",
+    #[cfg(windows)]
+    "install_windows_service",
+    #[cfg(windows)]
+    "uninstall_windows_service",
+    #[cfg(windows)]
+    "start_windows_service",
+    #[cfg(windows)]
+    "stop_windows_service",
+    #[cfg(windows)]
+    "restart_windows_service",
+    #[cfg(windows)]
+    "sync_windows_service_plan",
     "list_software",
     "install_software",
     "uninstall_software",
@@ -91,6 +103,53 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "set_proxy",
     "get_download_config",
     "set_download_config",
+];
+
+const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
+    "create_workspace",
+    "open_workspace_directory",
+    "delete_workspace",
+    "prepare_privileged_action",
+    "confirm_privileged_action",
+    "set_last_workspace",
+    "save_frp_profile_metadata",
+    "set_frp_profile_token",
+    "delete_frp_profile",
+    "set_workspace_secret",
+    "regenerate_workspace_secret",
+    "set_shared_secret",
+    "regenerate_shared_secret",
+    "install_software",
+    "uninstall_software",
+    #[cfg(windows)]
+    "install_windows_service",
+    #[cfg(windows)]
+    "uninstall_windows_service",
+    #[cfg(windows)]
+    "start_windows_service",
+    #[cfg(windows)]
+    "stop_windows_service",
+    #[cfg(windows)]
+    "restart_windows_service",
+    #[cfg(windows)]
+    "sync_windows_service_plan",
+    "set_proxy",
+    "set_download_config",
+    "stage_workspace_config",
+    "apply_workspace_config",
+    "start_runtime",
+    "stop_runtime",
+    "restart_runtime",
+    "start_actions_runtime",
+    "stop_actions_runtime",
+    "restart_actions_runtime",
+    "start_tunnel",
+    "restart_tunnel",
+    "stop_tunnel",
+    "test_tunnel",
+    "set_mcp_gateway",
+    "reload_mcp_gateway",
+    "set_mcp_gateway_route",
 ];
 
 struct AdminStaticAsset {
@@ -102,6 +161,12 @@ struct AdminStaticAsset {
 #[serde(rename_all = "camelCase")]
 struct SoftwareMutationArgs {
     kind: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrivilegedGrantArgs {
     grant_id: String,
 }
 
@@ -399,40 +464,7 @@ async fn health() -> Json<Value> {
             "privilegedCommands": privileged_actions(),
             "privilegedExecutors": available_privileged_executors(),
             "unavailableCommands": unavailable_privileged_actions(),
-            "mutationCommands": [
-                "create_workspace",
-                "open_workspace_directory",
-                "delete_workspace",
-                "prepare_privileged_action",
-                "confirm_privileged_action",
-                "set_last_workspace",
-                "save_frp_profile_metadata",
-                "set_frp_profile_token",
-                "delete_frp_profile",
-                "set_workspace_secret",
-                "regenerate_workspace_secret",
-                "set_shared_secret",
-                "regenerate_shared_secret",
-                "install_software",
-                "uninstall_software",
-                "set_proxy",
-                "set_download_config",
-                "stage_workspace_config",
-                "apply_workspace_config",
-                "start_runtime",
-                "stop_runtime",
-                "restart_runtime",
-                "start_actions_runtime",
-                "stop_actions_runtime",
-                "restart_actions_runtime",
-                "start_tunnel",
-                "restart_tunnel",
-                "stop_tunnel",
-                "test_tunnel",
-                "set_mcp_gateway",
-                "reload_mcp_gateway",
-                "set_mcp_gateway_route"
-            ]
+            "mutationCommands": WEB_ADMIN_MUTATION_COMMANDS
         }
     }))
 }
@@ -748,6 +780,37 @@ fn consume_privileged_grant(
         .map_err(AdminDispatchError::Rejected)
 }
 
+fn is_windows_service_action(action: &str) -> bool {
+    matches!(
+        action,
+        "install_windows_service"
+            | "uninstall_windows_service"
+            | "start_windows_service"
+            | "stop_windows_service"
+            | "restart_windows_service"
+            | "sync_windows_service_plan"
+    )
+}
+
+fn windows_service_privileged_binding(action: &str) -> AppResult<PrivilegedActionBinding> {
+    let target = management::windows_service_privileged_target(action)?;
+    Ok(PrivilegedActionBinding::windows_service(
+        &target.service_name,
+        &target.revision,
+    ))
+}
+
+fn canonical_privileged_binding(
+    action: &str,
+    requested: PrivilegedActionBinding,
+) -> AppResult<PrivilegedActionBinding> {
+    if is_windows_service_action(action) {
+        windows_service_privileged_binding(action)
+    } else {
+        Ok(requested)
+    }
+}
+
 fn finish_privileged_execution<T>(
     state: &AdminState,
     session_id: &str,
@@ -782,11 +845,13 @@ async fn dispatch_command(
         "prepare_privileged_action" => {
             let input: PrivilegedPrepareArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = canonical_privileged_binding(&input.action, input.binding)
+                .map_err(AdminDispatchError::Rejected)?;
             let prepared = state
                 .privileged_confirmations
                 .lock()
                 .map_err(|_| AppError::Message("privileged confirmation store poisoned".into()))?
-                .prepare(session_id, &input.action, &input.binding)
+                .prepare(session_id, &input.action, &binding)
                 .map_err(AdminDispatchError::Rejected)?;
             serde_json::to_value(prepared)
                 .map_err(AppError::from)
@@ -1221,6 +1286,114 @@ async fn dispatch_command(
             .map_err(Into::into)
         }
         "get_windows_service_status" => management::windows_service_status().map_err(Into::into),
+        "install_windows_service" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = windows_service_privileged_binding("install_windows_service")?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "install_windows_service",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "install_windows_service",
+                management::install_windows_service().await,
+            )
+        }
+        "uninstall_windows_service" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = windows_service_privileged_binding("uninstall_windows_service")?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "uninstall_windows_service",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "uninstall_windows_service",
+                management::uninstall_windows_service().await,
+            )
+        }
+        "start_windows_service" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = windows_service_privileged_binding("start_windows_service")?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "start_windows_service",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "start_windows_service",
+                management::start_windows_service().await,
+            )
+        }
+        "stop_windows_service" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = windows_service_privileged_binding("stop_windows_service")?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "stop_windows_service",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "stop_windows_service",
+                management::stop_windows_service().await,
+            )
+        }
+        "restart_windows_service" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = windows_service_privileged_binding("restart_windows_service")?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "restart_windows_service",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "restart_windows_service",
+                management::restart_windows_service().await,
+            )
+        }
+        "sync_windows_service_plan" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = windows_service_privileged_binding("sync_windows_service_plan")?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "sync_windows_service_plan",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "sync_windows_service_plan",
+                management::sync_windows_service_plan(),
+            )
+        }
         "list_software" => serde_json::to_value(management::list_software()?)
             .map_err(AppError::from)
             .map_err(Into::into),
@@ -1407,9 +1580,30 @@ mod tests {
     async fn unimplemented_command_never_falls_through_to_mutation() {
         let state = test_state(HashMap::new());
         assert!(matches!(
-            dispatch_command(&state, "session", "install_windows_service", json!({})).await,
+            dispatch_command(&state, "session", "save_frp_profile", json!({})).await,
             Err(AdminDispatchError::NotMigrated)
         ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_service_privileged_binding_is_fail_closed_off_windows() {
+        assert!(canonical_privileged_binding(
+            "install_windows_service",
+            PrivilegedActionBinding::default(),
+        )
+        .is_err());
+        for command in [
+            "install_windows_service",
+            "uninstall_windows_service",
+            "start_windows_service",
+            "stop_windows_service",
+            "restart_windows_service",
+            "sync_windows_service_plan",
+        ] {
+            assert!(!WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
+            assert!(!WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
+        }
     }
 
     #[tokio::test]
