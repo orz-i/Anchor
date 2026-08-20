@@ -1,4 +1,4 @@
-import { invokeAdmin, invokeRead } from "$lib/api/invoke";
+import { invokeAdmin, invokeRead } from "@/lib/api/invoke";
 import type {
   ControlPlaneEventBatch,
   ControlPlaneEventCursor,
@@ -12,7 +12,7 @@ import type {
   SkillInspection,
   WorkspaceControlStatus,
   WorkspaceProfile,
-} from "$lib/types";
+} from "@/lib/types";
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");

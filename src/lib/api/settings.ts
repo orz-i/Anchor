@@ -1,6 +1,6 @@
-import { invokeAdmin, invokeRead, supportsAdminCommand } from "$lib/api/invoke";
-import { invokePrivilegedAdmin } from "$lib/api/admin-security";
-import type { GatewayControlStatus } from "$lib/types";
+import { invokeAdmin, invokeRead, supportsAdminCommand } from "@/lib/api/invoke";
+import { invokePrivilegedAdmin } from "@/lib/api/admin-security";
+import type { GatewayControlStatus } from "@/lib/types";
 
 export interface FrpProfileDto {
   id: string;

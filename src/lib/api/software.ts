@@ -1,5 +1,5 @@
-import { invokeAdmin } from "$lib/api/invoke";
-import { invokePrivilegedAdmin } from "$lib/api/admin-security";
+import { invokeAdmin } from "@/lib/api/invoke";
+import { invokePrivilegedAdmin } from "@/lib/api/admin-security";
 
 export interface SoftwareStatus {
   kind: string;

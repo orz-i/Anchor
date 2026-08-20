@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="src-tauri/icons/128x128.png" width="96" alt="Anchor icon">
-</p>
-
 <h1 align="center">Anchor</h1>
 
 <p align="center">
@@ -19,19 +15,20 @@
   <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest">Download latest</a>
 </p>
 
-Anchor is a Rust + Tauri 2 desktop application. Select a project directory and start the service; an AI agent can then read files, edit code, run commands and tests, inspect Git, and preserve development progress inside the project through MCP. It behaves like an AI opening an IDE workspace that remembers where the last conversation stopped.
+Anchor is a **Rust CLI/daemon + browser Web Admin** workspace gateway. The management frontend uses pnpm, Vite, React, React Router, shadcn/ui, and Tailwind CSS; runtime ownership stays in the `anchor` CLI/daemons. After registering a project and starting its service, an AI agent can read files, edit code, run commands and tests, inspect Git, and preserve development progress through MCP Sessions.
 
 Anchor reads only the current configuration directory and current configuration format. It no longer imports earlier product directories or compatibility formats automatically. Back up existing configuration and re-register any workspaces that must be retained.
 
 ![Anchor workspace overview](docs/images/workspace-overview.png)
 
-*One desktop app manages workspaces, MCP services, connection details, and the session-recovery prompt.*
+*One browser Web Admin manages workspaces, MCP services, connection details, and the session-recovery prompt.*
 
 ## Understand the workflow in 30 seconds
 
 ```text
-Install the desktop app
-  → add a project directory
+Build or install the anchor CLI
+  → start anchor admin
+  → add a project directory in the browser Web Admin
   → start MCP and a public tunnel
   → copy the Public MCP URL
   → enable ChatGPT developer mode
@@ -39,27 +36,28 @@ Install the desktop app
   → authorize it and start developing in a new conversation
 ```
 
-For a first connection, remember only this: **the desktop app turns the project into an MCP workspace, and ChatGPT connects to it through the public `/mcp` URL.**
+For a first connection, remember only this: **the Anchor CLI/daemons own runtime services, the browser Web Admin manages them, and ChatGPT connects through the public `/mcp` URL.**
 
-- [See the complete desktop setup](#get-started-in-five-minutes)
+- [See the complete Web Admin setup](#get-started-in-five-minutes)
 - [Go directly to the ChatGPT plugin setup](#mcp-connector)
 
 ## Get started in five minutes
 
-### 1. Install the desktop client
+### 1. Build and start Anchor
 
-Open [Releases](https://github.com/mybolide/coding-tools-mcp/releases/latest) and download the package for your platform:
+The current product no longer ships a Tauri desktop installer. Build from source with pnpm and Rust stable:
 
-| Platform | Package |
-| --- | --- |
-| Windows 10/11 x64 | `Anchor_*_x64-setup.exe` |
-| macOS Apple Silicon | `Anchor_*_aarch64.dmg` |
+```bash
+pnpm install --frozen-lockfile
+pnpm cli:build
+./crates/anchor/target/release/anchor admin serve
+```
 
-The macOS build is currently unsigned. If macOS blocks the first launch, allow it from System Settings → Privacy & Security.
+On Windows the executable is `crates/anchor/target/release/anchor.exe`. `anchor admin serve` binds only to loopback and hosts both the same-origin Web Admin and management API.
 
 ### 2. Add a project workspace
 
-1. Click **Add workspace** in the sidebar.
+1. Open the local management URL printed by `anchor admin serve`, then click **Add workspace** in the sidebar.
 2. Select the project root directory.
 3. Configure the workspace name, MCP port, and authentication mode.
 4. Save it. The workspace remains available in the sidebar across conversations and restarts.
@@ -76,11 +74,11 @@ When the AI client is not running on the same machine, expose MCP through HTTPS:
 
 *FRP server profiles are stored centrally; each workspace only selects a profile and supplies its own subdomain.*
 
-If you do not have an FRPS server yet, follow this [FRPS server installation guide (Chinese, WeChat)](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q). After deployment, enter the server address, port, and token under **FRP settings** in the desktop client.
+If you do not have an FRPS server yet, follow this [FRPS server installation guide (Chinese, WeChat)](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q). After deployment, enter the server address, port, and token under **FRP settings** in the Web Admin.
 
 ### 4. Start MCP
 
-Open the workspace and click **Start** in the MCP panel. The desktop client shows:
+Open the workspace and click **Start** in the MCP panel. The Web Admin shows:
 
 - a local MCP URL such as `http://127.0.0.1:28766/mcp`;
 - the public HTTPS MCP URL;
@@ -89,13 +87,13 @@ Open the workspace and click **Start** in the MCP panel. The desktop client show
 
 ![Local, public, and ChatGPT MCP connection details](docs/images/workspace-connection.png)
 
-The desktop app can verify the local and public endpoints, OAuth metadata, and the MCP protected-resource document:
+The Web Admin can verify the local and public endpoints, OAuth metadata, and the MCP protected-resource document:
 
 ![MCP health-check results](docs/images/health-check.png)
 
 *Each connectivity and authentication check reports its result separately.*
 
-When a connection fails, inspect recent MCP requests without leaving the desktop app:
+When a connection fails, inspect recent MCP requests without leaving the Web Admin:
 
 ![MCP runtime logs](docs/images/runtime-logs.png)
 
@@ -103,7 +101,7 @@ When a connection fails, inspect recent MCP requests without leaving the desktop
 
 ### 5. Connect an AI client
 
-Use the public MCP URL shown by the app. With OAuth enabled, the client follows the server metadata into the authorization flow; authorization codes, Client IDs, and secrets can be generated and managed from the desktop client. This release uses preconfigured OAuth clients, so select static/manual OAuth credentials when creating a ChatGPT plugin; CIMD is not required.
+Use the public MCP URL shown by the Web Admin. With OAuth enabled, the client follows the server metadata into the authorization flow; authorization codes, Client IDs, and secrets can be generated and managed from the Web Admin. This release uses preconfigured OAuth clients, so select static/manual OAuth credentials when creating a ChatGPT plugin; CIMD is not required.
 
 For a first connection, ask the agent to initialize history before inspecting the workspace:
 
@@ -129,8 +127,8 @@ This gives the agent explicit project and capability state instead of guessing f
 Before configuring ChatGPT, make sure that:
 
 1. The workspace MCP service and public tunnel are both running.
-2. The public MCP endpoint passes the desktop health check. If OAuth is enabled, also verify the protected-resource document and authorization metadata.
-3. You have copied the **Public MCP URL** from the desktop **GPT configuration** card. For OAuth, also have the OAuth Client ID, OAuth Client Secret, and authorization password ready.
+2. The public MCP endpoint passes the Web Admin health check. If OAuth is enabled, also verify the protected-resource document and authorization metadata.
+3. You have copied the **Public MCP URL** from the Web Admin **GPT configuration** card. For OAuth, also have the OAuth Client ID, OAuth Client Secret, and authorization password ready.
 
 > ChatGPT must use the public HTTPS `/mcp` URL. A local address such as `http://127.0.0.1:28766/mcp` is not reachable from ChatGPT. Menu names may vary slightly by ChatGPT version and language.
 
@@ -150,14 +148,14 @@ Open **Plugins** from the ChatGPT sidebar, click the `+` button, select the MCP 
 | --- | --- |
 | Name | A recognizable name such as `Anchor` |
 | Description | A short description of the connected project or purpose |
-| Connection | The public MCP URL from the desktop **GPT configuration** card; it should end in `/mcp` |
-| Authentication | The same mode configured in the desktop app; the screenshot uses OAuth |
+| Connection | The public MCP URL from the Web Admin **GPT configuration** card; it should end in `/mcp` |
+| Authentication | The same mode configured in the Web Admin; the screenshot uses OAuth |
 
 ![Create an MCP plugin and enter its connection details](docs/images/gpt-config-2-detail.png)
 
-For OAuth, open the advanced OAuth settings, select static/manual OAuth credentials, and enter the Client ID and Client Secret shown by the desktop app. CIMD is not required. When ChatGPT opens the authorization page, enter the authorization password from the desktop **GPT configuration** card.
+For OAuth, open the advanced OAuth settings, select static/manual OAuth credentials, and enter the Client ID and Client Secret shown by the Web Admin. CIMD is not required. When ChatGPT opens the authorization page, enter the authorization password from the Web Admin **GPT configuration** card.
 
-> Client Secrets, authorization passwords, and Bearer tokens are sensitive. Never paste them into chats, issues, or public screenshots. If the desktop app uses Bearer or no authentication, select the matching option currently offered by ChatGPT.
+> Client Secrets, authorization passwords, and Bearer tokens are sensitive. Never paste them into chats, issues, or public screenshots. If the Web Admin is configured for Bearer or no authentication, select the matching option currently offered by ChatGPT.
 
 #### 3. Verify the connection
 
@@ -168,7 +166,7 @@ Use Anchor to call server_info, get_default_cwd, and git_status.
 Tell me which workspace is connected, its default directory, and its Git status.
 ```
 
-If ChatGPT returns information from the current project, the desktop app, public tunnel, authentication, ChatGPT, and MCP tool chain are connected end to end. Before real development, call `history_session_bootstrap` to initialize or restore project history.
+If ChatGPT returns information from the current project, the Anchor runtime, public tunnel, authentication, ChatGPT, and MCP tool chain are connected end to end. Before real development, call `history_session_bootstrap` to initialize or restore project history.
 
 If ChatGPT still shows an old tool list, disconnect and reconnect the plugin or verify again in a new conversation.
 
@@ -179,14 +177,14 @@ If ChatGPT still shows an old tool list, disconnect and reconnect the plugin or 
 | ChatGPT cannot connect | Confirm that the URL is the public HTTPS `/mcp` endpoint rather than `127.0.0.1`, and that the public MCP health check passes |
 | OAuth authorization fails | Confirm that the Client ID, Client Secret, and authorization password come from the same workspace, and check the OAuth metadata results |
 | New tools are missing | Disconnect and reconnect the plugin, then start a new conversation |
-| A tool call fails | Open **Logs** and **Health checks** in the desktop app and confirm that the request reached the MCP service |
+| A tool call fails | Open **Logs** and **Health checks** in the Web Admin and confirm that the request reached the MCP service |
 
 ### GPT Actions
 
 1. Start the workspace Actions service.
 2. Copy the OpenAPI URL from the Actions panel.
 3. Import the URL in the GPT editor's Actions page.
-4. Select None, API Key, or OAuth to match the desktop configuration.
+4. Select None, API Key, or OAuth to match the Web Admin configuration.
 
 MCP and Actions can run together for the same workspace, with separate ports and subdomains when needed.
 
@@ -195,7 +193,7 @@ MCP and Actions can run together for the same workspace, with separate ports and
 - **Built for real development**: files, commands, Git, tests, and retained processes live in one Workspace.
 - **Cross-conversation continuity**: a new conversation can recover the complete history summary and the latest detailed handoff.
 - **Auditable progress**: structured checkpoints preserve decisions, changed files, test results, remaining issues, and next steps inside the project.
-- **Multiple workspaces**: one desktop client stores multiple projects and manages their MCP, Actions, and public endpoints.
+- **Multiple workspaces**: one browser Web Admin stores multiple projects and manages their MCP, Actions, and public endpoints.
 - **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, FRP, and Cloudflare are built in.
 - **A focused default tool surface**: stable core tools are available by default; advanced Harness capabilities are opt-in.
 
@@ -217,7 +215,7 @@ Three tools work together:
 
 History uses readable Markdown that can be backed up or committed with the project. Every new file starts with a bounded inherited summary that is not recursively copied into later summaries. Checkpoints are idempotent, and progress should only be reported as saved after the tool returns `ok=true` with the same session target.
 
-> History persistence is performed when the AI calls the MCP tools; the desktop app does not record chat content in the background. If the client does not invoke a tool, the server cannot infer that a new conversation or task has happened.
+> History persistence is performed when the AI calls the MCP tools; the Web Admin does not record chat content in the background. If the client does not invoke a tool, the server cannot infer that a new conversation or task has happened.
 
 ## What an agent can do
 
@@ -268,17 +266,17 @@ pnpm install --frozen-lockfile
 pnpm start
 ```
 
-`pnpm start` builds the Svelte Web Admin and launches local `anchor admin serve` through the default CLI target. Release builds use `pnpm release:build` / `pnpm cli:build` and no longer require a desktop installer.
+`pnpm start` builds the Vite + React Web Admin and launches local `anchor admin serve` through the default CLI target. Release builds use `pnpm release:build` / `pnpm cli:build` and no longer require a desktop installer.
 
-The repository uses `pnpm@11.18.0` as the single dependency-resolution and lockfile authority. On Windows it uses a hoisted `node_modules` layout so pnpm's isolated symlinks are not blocked when RedirectionGuard is enabled. After installation, `npm run ...`, `npm exec`, `npx`, and `pnpm exec` remain supported; `.npmrc` prevents npm from generating a second lockfile.
+The repository uses `pnpm@11.18.0` as its only Node package manager and lockfile authority. Do not run `npm install` / `npm ci` to create a second dependency state; development, checks, tests, and builds use `pnpm ...` consistently.
 
 Useful verification commands:
 
 ```bash
-npm run check
-npm run build
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy --all-targets -- -D warnings
+pnpm check
+pnpm build
+cd crates/anchor && cargo test
+cd crates/anchor && cargo clippy --all-targets -- -D warnings
 ```
 
 The desktop/Tauri shell, installer scripts, and Tauri dependencies have been physically removed. Browser Web Admin is the management UI and `anchor` CLI/daemon owns runtime operations. See [Desktop / Tauri retirement record](docs/desktop-retirement.md).
@@ -289,8 +287,8 @@ Linux servers can build `anchor` directly. It reads the unified workspace/profil
 
 ```bash
 pnpm cli:build
-./src-tauri/target/release/anchor list
-./src-tauri/target/release/anchor serve <workspace> --service mcp
+./crates/anchor/target/release/anchor list
+./crates/anchor/target/release/anchor serve <workspace> --service mcp
 ```
 
 The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. It will not take over a port already used by the GUI. For production boot-time supervision, systemd should still run `serve` directly. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).
@@ -309,7 +307,7 @@ The default roots are `.agents/skills`, `.codex/skills`, and `skills`. Configure
 
 ### Reconnection and OAuth renewal
 
-The desktop app and Linux CLI detect MCP, Actions, and tunnel disconnects and recover them with bounded exponential backoff. OAuth now supports one-hour access tokens and rotating 90-day refresh tokens. Read-only status calls may retry automatically; writes and potentially side-effecting tool calls are never replayed blindly.
+Anchor daemons and CLI detect MCP, Actions, and tunnel disconnects and recover them with bounded exponential backoff. OAuth now supports one-hour access tokens and rotating 90-day refresh tokens. Read-only status calls may retry automatically; writes and potentially side-effecting tool calls are never replayed blindly.
 
 See [Connection recovery, retries, and OAuth renewal](docs/reliability.md) for behavior and current limitations.
 
@@ -317,12 +315,12 @@ See [Connection recovery, retries, and OAuth renewal](docs/reliability.md) for b
 
 | Path | Purpose |
 | --- | --- |
-| `src-tauri/src/tools/` | Shared file, Patch, Exec, and Git tool kernel |
-| `src-tauri/src/mcp/` | MCP Streamable HTTP server |
-| `src-tauri/src/actions/` | ChatGPT Actions OpenAPI gateway |
-| `src-tauri/src/tunnel/` | FRP / Cloudflare tunnel and process management |
-| `src-tauri/tests/` | Rust contract, security, output-schema, and integration tests |
-| `src/` | SvelteKit desktop UI |
+| `crates/anchor/src/tools/` | Shared file, Patch, Exec, and Git tool kernel |
+| `crates/anchor/src/mcp/` | MCP Streamable HTTP server |
+| `crates/anchor/src/actions/` | ChatGPT Actions OpenAPI gateway |
+| `crates/anchor/src/tunnel/` | FRP / Cloudflare tunnel and process management |
+| `crates/anchor/tests/` | Rust contract, security, output-schema, and integration tests |
+| `src/` | Vite + React + React Router + shadcn/ui + Tailwind CSS Web Admin |
 | `docs/` | Product, protocol, architecture, and verification documentation |
 
 ## License

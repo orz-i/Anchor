@@ -9,14 +9,14 @@
 | 项目名称 | Anchor Rust |
 | 版本 | 0.1.23 |
 | 语言 | Rust / TypeScript |
-| 框架 | Rust + SvelteKit Web Admin |
+| 框架 | Rust + Vite/React Web Admin |
 
 ## 核心技术
 
 | 类别 | 技术 | 用途 |
 |------|------|------|
 | 后端语言 | Rust | CLI/daemon、MCP、管理 API、进程管理、状态机 |
-| 前端 | SvelteKit + TypeScript | 浏览器 Web Admin |
+| 前端 | React + TypeScript + React Router | 浏览器 Web Admin |
 | 异步运行时 | tokio | 异步 I/O、进程监督 |
 | HTTP 服务 | axum | MCP Streamable HTTP 与本机 Web Admin API |
 | Git 操作 | 系统 Git + 受控临时索引 | 状态、差异、提交与阶段工作流 |
@@ -35,7 +35,7 @@
 
 ## 主要依赖
 
-### Rust (src-tauri/Cargo.toml)
+### Rust (crates/anchor/Cargo.toml)
 
 - `tokio` — 异步运行时
 - `axum` — HTTP server
@@ -45,7 +45,9 @@
 
 ### 前端 (package.json)
 
-- `svelte` — UI 框架
+- `react` / `react-dom` — UI 框架
+- `react-router-dom` — 浏览器路由
+- `shadcn` / `@base-ui/react` — UI 组件基础
 - `vite` — 前端构建
 - `tailwindcss` — 样式
 

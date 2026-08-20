@@ -3,7 +3,7 @@
   "project": "anchor",
   "analysis_status": "verified",
   "architecture": {
-    "frontend": "SvelteKit Web Admin",
+    "frontend": "Vite/React Web Admin",
     "backend": "Rust CLI/daemon + axum management and MCP HTTP",
     "product_binary": "anchor",
     "runtime_owners": ["Workspace daemon", "Gateway daemon"],
@@ -17,11 +17,11 @@
     "tauri_dependencies_present": false,
     "tauri_config_present": false,
     "desktop_installer_scripts_present": false,
-    "guard": "src-tauri/tests/no_tauri_boundaries.rs"
+    "guard": "crates/anchor/tests/no_tauri_boundaries.rs"
   },
   "release": {
     "default_command": "pnpm release:build",
-    "artifacts": ["Svelte Web Admin static assets", "src-tauri/target/release/anchor"],
+    "artifacts": ["Vite/React Web Admin static assets", "crates/anchor/target/release/anchor"],
     "desktop_installers": false
   },
   "remaining_platform_acceptance": [

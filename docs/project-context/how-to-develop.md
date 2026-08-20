@@ -47,7 +47,7 @@ pnpm start
 pnpm release:build
 
 # Rust 默认 feature 已是 cli
-cd src-tauri && cargo build
+cd crates/anchor && cargo build
 
 # 前端开发/构建
 pnpm dev
@@ -69,9 +69,8 @@ Tauri desktop、安装包配置和 legacy desktop 构建脚本已经物理删除
 每次递增时，以下位置必须保持为同一版本：
 
 1. `package.json`
-2. `package-lock.json` 的根 `version` 和根包 `version`
-3. `src-tauri/Cargo.toml`
-4. `src-tauri/Cargo.lock` 中 `anchor` 包的 `version`
+2. `crates/anchor/Cargo.toml`
+3. `crates/anchor/Cargo.lock` 中 `anchor` 包的 `version`
 
 不要修改依赖自身恰好相同的版本号；只更新本项目包的版本字段。
 
@@ -80,7 +79,7 @@ Tauri desktop、安装包配置和 legacy desktop 构建脚本已经物理删除
 构建前必须：
 
 1. 搜索上述版本源，确认没有旧的项目版本残留。
-2. 运行 `npm run check`、`cargo check`；修复类变更还需运行相关 Rust 测试。
+2. 运行 `pnpm check`、`cargo check`；修复类变更还需运行相关 Rust 测试。
 3. 提交版本升级与功能/修复代码，再从该提交构建。
 
 构建后校验 `anchor --version` / build identity 与当前提交一致，并确保 `pnpm release:build` 只生成 Web Admin + `anchor` CLI 产物。
@@ -107,7 +106,7 @@ enum RuntimeState {
 
 ## 当前行为契约
 
-开发 MCP 工具时，以 `src-tauri/src/tools/registry.rs` 发布的 Schema、`src-tauri/src/mcp/protocol.rs` 的协议约束和 `src-tauri/tests/` 的合约/安全测试为准。修改目录或结果结构时，必须同步更新 snapshot 与 outputSchema 测试。
+开发 MCP 工具时，以 `crates/anchor/src/tools/registry.rs` 发布的 Schema、`crates/anchor/src/mcp/protocol.rs` 的协议约束和 `crates/anchor/tests/` 的合约/安全测试为准。修改目录或结果结构时，必须同步更新 snapshot 与 outputSchema 测试。
 
 ---
 *返回索引: [../project-context.md](../project-context.md)*

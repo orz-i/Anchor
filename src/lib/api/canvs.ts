@@ -1,4 +1,4 @@
-import { invokeRead } from "$lib/api/invoke";
+import { invokeRead } from "@/lib/api/invoke";
 
 export type CanvsTaskStatus =
   | "active"

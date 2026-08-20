@@ -9,7 +9,7 @@
 | 项目名称 | Anchor Rust |
 | 版本 | 0.1.23 |
 | 语言 | Rust + TypeScript |
-| 框架 | Rust + SvelteKit Web Admin |
+| 框架 | Rust + Vite/React Web Admin |
 | 类型 | CLI / daemon + 本机 Web 管理面 + MCP/Actions Gateway |
 | 描述 | 以 `anchor` CLI/daemon 为运行权威，并通过 persistent Web Admin 提供浏览器管理面 |
 
@@ -35,9 +35,9 @@
 
 ## 权威实现与契约
 
-- `src-tauri/src/mcp/` — MCP Streamable HTTP、OAuth、Session 与代理聚合
-- `src-tauri/src/tools/` — 文件、Patch、Exec、Git、History 与 Skill 工具内核
-- `src-tauri/tests/` — 工具结果契约、安全边界、输出 Schema 与 Harness 集成测试
+- `crates/anchor/src/mcp/` — MCP Streamable HTTP、OAuth、Session 与代理聚合
+- `crates/anchor/src/tools/` — 文件、Patch、Exec、Git、History 与 Skill 工具内核
+- `crates/anchor/tests/` — 工具结果契约、安全边界、输出 Schema 与 Harness 集成测试
 - `docs/verification/` — 发布候选、协议、OAuth、远程连接与回归验证证据
 
 ## 快速开始
@@ -55,13 +55,13 @@
 - 使用 `stage_commit` 完成检查、分段提交和验证证据绑定
 
 ### 理解 MCP 协议行为
-- `src-tauri/src/mcp/protocol.rs` — 协议版本与消息结构
-- `src-tauri/src/tools/registry.rs` — 工具目录、inputSchema 与 outputSchema
-- `src-tauri/tests/call_tool_contract.rs` — 工具行为契约
+- `crates/anchor/src/mcp/protocol.rs` — 协议版本与消息结构
+- `crates/anchor/src/tools/registry.rs` — 工具目录、inputSchema 与 outputSchema
+- `crates/anchor/tests/call_tool_contract.rs` — 工具行为契约
 
 ### 编写测试
 - [how-to-test.md](./project-context/how-to-test.md)
-- `src-tauri/tests/` — 当前回归基线
+- `crates/anchor/tests/` — 当前回归基线
 
 ---
 *当前状态更新: 2026-08-19*

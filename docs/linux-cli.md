@@ -8,7 +8,7 @@
 
 ```bash
 cargo build \
-  --manifest-path src-tauri/Cargo.toml \
+  --manifest-path crates/anchor/Cargo.toml \
   --release \
   --no-default-features \
   --features cli \
@@ -18,14 +18,14 @@ cargo build \
 产物位于：
 
 ```text
-src-tauri/target/release/anchor
+crates/anchor/target/release/anchor
 ```
 
 安装到系统路径：
 
 ```bash
 sudo install -m 0755 \
-  src-tauri/target/release/anchor \
+  crates/anchor/target/release/anchor \
   /usr/local/bin/anchor
 ```
 

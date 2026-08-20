@@ -1,4 +1,4 @@
-import { invokeAdmin } from "$lib/api/invoke";
+import { invokeAdmin } from "@/lib/api/invoke";
 
 export interface LogChunk {
   name: string;

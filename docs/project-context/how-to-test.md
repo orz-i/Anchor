@@ -10,14 +10,14 @@
 
 | 层级 | 框架 | 位置 |
 |------|------|------|
-| Rust 单元测试 | cargo test | `src-tauri/src/**` 内 `#[cfg(test)]` |
-| Rust 集成测试 | cargo test | `src-tauri/tests/` |
-| 工具与 MCP 合约测试 | cargo test | `src-tauri/tests/call_tool_contract.rs` 等 |
-| 前端静态检查 | svelte-check | `src/**/*.svelte` / `src/**/*.ts` |
+| Rust 单元测试 | cargo test | `crates/anchor/src/**` 内 `#[cfg(test)]` |
+| Rust 集成测试 | cargo test | `crates/anchor/tests/` |
+| 工具与 MCP 合约测试 | cargo test | `crates/anchor/tests/call_tool_contract.rs` 等 |
+| 前端静态检查 | `pnpm check`（TypeScript + ESLint） | `src/**/*.ts` / `src/**/*.tsx` |
 
 ## MCP 合规测试（核心）
 
-当前 `src-tauri/tests/` 覆盖：
+当前 `crates/anchor/tests/` 覆盖：
 
 - MCP 协议契约（initialize, tools/list, tools/call）
 - 工具行为 golden test（read_file, apply_patch, exec_command 等）

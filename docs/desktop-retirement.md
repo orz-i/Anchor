@@ -4,7 +4,7 @@
 
 ## 已完成的 physical removal
 
-- Svelte 管理 UI 只通过 Web Admin HTTP API 工作；`invokeAdmin` 不再包含 Tauri transport 分支。
+- React 管理 UI 只通过 Web Admin HTTP API 工作；`invokeAdmin` 不再包含 Tauri transport 分支。
 - privileged mutation 始终经过 Web prepare/confirm/one-time grant；不再存在 Tauri 直通 bypass。
 - Workspace 更新统一使用 Web `stage/apply` 并发保护，不再存在 desktop 直接写配置分支。
 - dialog adapter 只使用浏览器能力，不再依赖 `@tauri-apps/plugin-dialog`。
@@ -14,7 +14,7 @@
 - 已删除 desktop installer/build helpers 与 `dev-desktop.cmd`。
 - runtime 已删除 macOS app bundle reclaim、desktop process shutdown/restart helpers 等 desktop-only ownership 逻辑。
 - Windows SCM 测试与注册语义统一使用 `anchor.exe`，不再要求 `anchor-desktop.exe`。
-- `src-tauri/tests/no_tauri_boundaries.rs` 会机器校验 active source、package/Cargo manifest、锁文件和已删除路径，防止 Tauri 回流。
+- `crates/anchor/tests/no_tauri_boundaries.rs` 会机器校验 active source、package/Cargo manifest、锁文件和已删除路径，防止 Tauri 回流。
 
 因此，默认和唯一 release 路径是：
 
@@ -22,7 +22,7 @@
 pnpm release:build
 ```
 
-该命令构建 Svelte Web Admin，并产出嵌入静态资源的 `anchor` CLI；不生成 MSI/NSIS/DMG 或桌面 bundle。
+该命令构建 Vite/React Web Admin，并产出嵌入静态资源的 `anchor` CLI；不生成 MSI/NSIS/DMG 或桌面 bundle。
 
 ## 兼容性边界
 

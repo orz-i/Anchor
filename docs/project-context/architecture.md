@@ -6,7 +6,7 @@
 
 ```
 anchor/
-├── src-tauri/              # Rust CLI / daemon / Web Admin 后端（历史目录名）
+├── crates/anchor/          # Rust CLI / daemon / Web Admin 后端
 │   ├── src/
 │   │   ├── bin/anchor.rs   # CLI 入口
 │   │   ├── lib.rs          # 共享 Rust 库入口
@@ -21,11 +21,12 @@ anchor/
 │   │   ├── auth/           # OAuth / Bearer 认证
 │   │   └── health/         # 健康检查
 │   └── Cargo.toml
-├── src/                    # Svelte 前端
-│   ├── lib/
-│   │   ├── components/     # UI 组件
-│   │   └── stores/         # 状态管理
-│   └── routes/             # 页面路由
+├── src/                    # Vite + React Web Admin
+│   ├── components/         # shadcn/ui 与管理面组件
+│   ├── lib/                # API transport、types 与通用逻辑
+│   ├── pages/              # React Router 页面
+│   ├── App.tsx             # 路由树
+│   └── main.tsx            # 浏览器入口
 ├── docs/                   # 项目文档
 │   ├── specs/              # 功能规格
 │   ├── project-context/    # 项目上下文
@@ -36,7 +37,7 @@ anchor/
 
 ## 当前状态
 
-Anchor 当前是 Rust CLI/daemon + SvelteKit Web Admin 产品，并提供 MCP/Actions 服务、Gateway、隧道监督、Agent Skills 和持久 Harness。Tauri desktop 已物理删除；当前实现与测试均以 Rust 源码和 Web 管理契约为权威。
+Anchor 当前是 Rust CLI/daemon + Vite/React Web Admin 产品，并提供 MCP/Actions 服务、Gateway、隧道监督、Agent Skills 和持久 Harness。Tauri desktop 与 SvelteKit 均已物理删除；当前实现与测试均以 Rust 源码和 Web 管理契约为权威。
 
 ## 架构模式
 
@@ -44,7 +45,7 @@ Anchor 当前是 Rust CLI/daemon + SvelteKit Web Admin 产品，并提供 MCP/Ac
 
 ```
 ┌─────────────────────────────────────────┐
-│  UI Layer (Svelte)                      │
+│  UI Layer (React + React Router)        │
 │  Browser Web Admin                      │
 ├─────────────────────────────────────────┤
 │  Admin Transport / CLI                  │
@@ -70,20 +71,20 @@ Anchor 当前是 Rust CLI/daemon + SvelteKit Web Admin 产品，并提供 MCP/Ac
 |------|----------|
 | MCP 运行时 | 内嵌 Rust + axum Streamable HTTP |
 | 进程管理 | Windows/Linux：Workspace daemon 管理各自 listener + Workspace Tunnel，独立 Gateway daemon 管理全局 Gateway listener/routes/tunnel；Windows 可由配置域级 SCM supervisor 按持久化计划开机恢复这些 daemon |
-| UI | SvelteKit Web Admin，由 `anchor admin` 在 loopback 托管 |
+| UI | Vite/React Web Admin，由 `anchor admin` 在 loopback 托管；shadcn/ui + Tailwind CSS 提供组件与样式层 |
 | 密钥 | 受保护凭据封装；Windows 使用当前用户 DPAPI |
 | 分发 | `anchor` CLI + 嵌入式 Web Admin 静态资源 |
 
-当前按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力；Svelte Web Admin 通过版本化本机 HTTP 管理 API 访问同一控制语义。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
+当前按运行控制域建立唯一权威：每个 Workspace daemon 管理该 Workspace 的 listener 与 Tunnel；跨 Workspace Gateway 使用独立全局控制域。CLI 提供完整运维能力；React Web Admin 通过版本化本机 HTTP 管理 API 访问同一控制语义。渐进路线见 [../cli-daemon-roadmap.md](../cli-daemon-roadmap.md)。
 
 ### 管理面传输边界
 
 - `src/` 业务页面只经 Web Admin transport 与 browser dialog adapter，不存在 desktop IPC。
-- Svelte 前端仅使用 Web adapter，对接本机版本化管理 HTTP API；Tauri adapter 已删除。
+- React 前端仅使用 Web adapter，对接本机版本化管理 HTTP API；不存在 desktop IPC/Tauri adapter。
 - 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
 - 不存在桌面进程运行所有权；listener、Tunnel 与 Gateway 只归 daemon/CLI 控制域。
 
-当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 保留为前台调试入口；生产持久运行由独立 `admin daemon-run` 承担，两者都只绑定 loopback 并同源托管嵌入 CLI 的生产 Svelte 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
+当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 保留为前台调试入口；生产持久运行由独立 `admin daemon-run` 承担，两者都只绑定 loopback 并同源托管嵌入 CLI 的生产 Vite/React 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
 
 Persistent Admin daemon 是单独的**管理面托管域**，不是新的业务运行 supervisor。它使用独立 `admin.lock/admin.pid/admin.json` 与 Admin log；状态包含 config scope、PID、port、executable 和 build identity。Linux 通过 systemd user + linger 注册 autostart，Windows 通过当前用户 Task Scheduler 注册；两端失败重启均有固定次数/时间窗上限。Admin service 只负责让 Web Admin 在 desktop 不存在时持续可达，不允许调用 Workspace/Gateway/Tunnel supervisor 的内部运行编排。状态文件丢失时只允许通过受验证的 config-scope 命令行或监听 PID + executable identity 恢复；无法证明 build identity 时状态为 unknown。OS 注册丢失而本地 service config 尚在时 fail closed，要求 `anchor admin upgrade/install` 修复。
 
@@ -91,7 +92,7 @@ Persistent Admin daemon 是单独的**管理面托管域**，不是新的业务�
 
 Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；对应运行权只能通过 Gateway route selector 变更。首 route 可启动 Gateway daemon，最后 route 移除走受控 shutdown，普通非空 route 变更使用 `set_routes` 而不是进程重启。Secret/FRP、Software 以及 Windows Service lifecycle 均已成为已评审 Web privileged executor；Service executor 只在 Windows capability manifest 中发布，非 Windows 明确 unavailable。Tauri desktop 已物理删除，Windows Service 与其余管理语义统一复用 `management.rs`。
 
-Tauri physical removal 已完成：Cargo 只保留 `anchor` CLI target；Svelte 前端是 Web-only；desktop bootstrap、AppState/commands adapter、Tauri bundle 配置/资产、npm/Cargo Tauri dependency 和 installer/build scripts 均不存在。`no_tauri_boundaries` 同时检查 active frontend/Rust source、package/Cargo manifest、锁文件和物理路径，防止 Tauri 或 `anchor-desktop` 运行身份回流。
+Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；Web Admin 使用 Vite + React + React Router + shadcn/ui + Tailwind CSS；desktop bootstrap、SvelteKit routes/stores、Tauri bundle 配置/资产、npm/Cargo Tauri/Svelte dependency 和 installer/build scripts 均不存在。`no_tauri_boundaries` 同时检查 active frontend/Rust source、package/Cargo manifest、锁文件和物理路径，防止旧运行身份或前端栈回流。
 
 高权限 Web 管理采用独立安全层 `admin_security.rs`：prepare/confirm ticket 绑定当前管理 session、allowlisted action 与 action-specific 非敏感 target fingerprint，批准后生成短 TTL 的一次性 grant；executor 必须用服务端可信状态重建 target 并在业务写入前消费 grant。Secret/FRP 使用 `id/key`，Software 使用 `kind`/pinned version；Windows Service 则由服务端生成 `serviceName + opaque revision`，revision 覆盖当前构建、配置域、SCM 注册/状态、配置 owner 和 action 所需的 plan/running snapshot，浏览器不能自行指定这些可信字段。audit journal 仍只允许 `sessionFingerprint/action/phase/outcome`，不得新增 path/target/owner/revision 等字段。Windows 的最终 SCM mutation 继续经过既有 UAC helper。
 
@@ -112,11 +113,11 @@ Tauri physical removal 已完成：Cargo 只保留 `anchor` CLI target；Svelte 
 
 ### workspace/
 - **职责**: Workspace 配置的 CRUD、持久化、密钥分离存储
-- **实现**: `src-tauri/src/workspace/` 与 `src-tauri/src/data/`
+- **实现**: `crates/anchor/src/workspace/` 与 `crates/anchor/src/data/`
 
 ### runtime/
 - **职责**: MCP 运行时生命周期状态机（Stopped → Starting → Running → Stopping → Error）
-- **实现**: `src-tauri/src/runtime/`
+- **实现**: `crates/anchor/src/runtime/`
 
 ### control/ 与 daemon.rs
 - **职责**: CLI/GUI 共用的 Workspace 控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal、单服务配置 reload，以及跨 Workspace/Gateway 的纯只读聚合
@@ -131,7 +132,7 @@ Tauri physical removal 已完成：Cargo 只保留 `anchor` CLI target；Svelte 
 ### Gateway 控制域
 - **职责**: 多 Workspace 共享 MCP Gateway listener、路由集合和唯一公网 Gateway tunnel
 - **后台运行入口**: `anchor gateway start <workspace ...>`；`status/stop/restart/reload` 使用专用 Gateway control client；`gateway serve` 保留前台调试/外部 supervisor 模式
-- **实现**: `src-tauri/src/gateway_daemon.rs` + `src-tauri/src/gateway_control/`，与 Workspace `daemon.rs` / `control/` 分离
+- **实现**: `crates/anchor/src/gateway_daemon.rs` + `crates/anchor/src/gateway_control/`，与 Workspace `daemon.rs` / `control/` 分离
 - **协议**: Gateway protocol v1；请求包含配置域 `configScope`，使用全局 `gateway.sock`/PID/state/lock，reload 与 apply_config 使用 accepted → operation status；v1 通过 additive tags 提供有界 logs/events，不破坏已有 v1 方法
 - **可观察性**: daemon log tail/cursor 单响应正文最多 8 KiB；事件 journal 保留 256 条、单批 32 条、最长 25 秒 long-poll，使用独立 `streamId + sequence` 游标
 - **配置事务**: 运行中配置由 daemon 先切换运行态、更新 state，再持久化；失败停止新运行态并恢复旧运行态；禁用则先 shutdown 后持久化
@@ -148,16 +149,16 @@ Tauri physical removal 已完成：Cargo 只保留 `anchor` CLI target；Svelte 
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport
-- **实现**: `src-tauri/src/mcp/` 与 `src-tauri/src/tools/`
+- **实现**: `crates/anchor/src/mcp/` 与 `crates/anchor/src/tools/`
 
 ### tunnel/
 - **职责**: FRP 配置生成、Cloudflare 隧道进程监督；Workspace live supervisor 由对应 daemon 持有
-- **实现**: `src-tauri/src/tunnel/`
+- **实现**: `crates/anchor/src/tunnel/`
 
 ## 入口文件
 
-- **CLI 入口**: `src-tauri/src/bin/anchor.rs`
-- **前端入口**: `src/routes/+page.svelte`
+- **CLI 入口**: `crates/anchor/src/bin/anchor.rs`
+- **前端入口**: `src/main.tsx` / `src/App.tsx`
 - **Agent 入口**: `AGENTS.md`
 
 ---

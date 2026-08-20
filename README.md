@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="src-tauri/icons/128x128.png" width="96" alt="Anchor 图标">
-</p>
-
 <h1 align="center">Anchor</h1>
 
 <p align="center">
@@ -19,19 +15,20 @@
   <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest">下载最新版</a>
 </p>
 
-Anchor 是一个 Rust + Tauri 2 桌面应用。选择项目目录并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存为项目内的历史会话。它更接近“AI 打开一个会记住开发进度的 IDE 工作区”；普通开发工具不要求先创建 Task，历史会话则负责在新对话中恢复上下文。
+Anchor 是一个 **Rust CLI/daemon + 浏览器 Web Admin** 工作区网关。管理面使用 pnpm + Vite + React + React Router + shadcn/ui + Tailwind CSS；运行时由 `anchor` CLI/daemon 承担。注册项目并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存到项目内的 Session。
 
 Anchor 只读取当前配置目录和当前配置格式，不再自动导入早期产品目录或兼容格式。升级前请先备份现有配置，并在 Anchor 中重新注册需要保留的工作区。
 
 ![Anchor 工作区总览](docs/images/workspace-overview.png)
 
-*一个桌面端同时管理工作区、MCP 服务、连接信息与会话恢复提示词。*
+*浏览器 Web Admin 统一管理工作区、MCP 服务、连接信息与会话恢复提示词。*
 
 ## 30 秒看懂怎么用
 
 ```text
-下载安装桌面端
-  → 添加项目目录
+构建或安装 anchor CLI
+  → 启动 anchor admin
+  → 在浏览器 Web Admin 添加项目目录
   → 启动 MCP 和公网隧道
   → 复制“公网 MCP 地址”
   → ChatGPT 开启开发人员模式
@@ -39,27 +36,28 @@ Anchor 只读取当前配置目录和当前配置格式，不再自动导入早�
   → 完成授权，在新对话中开始开发
 ```
 
-第一次使用只需要记住两件事：**桌面端负责把项目变成 MCP 工作区，ChatGPT 负责通过公网 `/mcp` 地址连接它。**
+第一次使用只需要记住两件事：**Anchor CLI/daemon 负责运行工作区服务，浏览器 Web Admin 负责管理配置；ChatGPT 通过公网 `/mcp` 地址连接它。**
 
-- [查看完整安装和桌面端启动步骤](#五分钟开始使用)
+- [查看完整安装和 Web Admin 启动步骤](#五分钟开始使用)
 - [直接查看 ChatGPT 插件配置](#mcp-connector)
 
 ## 五分钟开始使用
 
-### 1. 安装桌面客户端
+### 1. 构建并启动 Anchor
 
-打开 [Releases](https://github.com/mybolide/coding-tools-mcp/releases/latest) 并下载对应安装包：
+当前产品不再包含 Tauri 桌面安装包。源码构建使用 pnpm 与 Rust stable：
 
-| 系统 | 安装包 |
-| --- | --- |
-| Windows 10/11 x64 | `Anchor_*_x64-setup.exe` |
-| macOS Apple Silicon | `Anchor_*_aarch64.dmg` |
+```bash
+pnpm install --frozen-lockfile
+pnpm cli:build
+./crates/anchor/target/release/anchor admin serve
+```
 
-macOS 安装包目前未签名。如果系统阻止首次打开，请在“系统设置 → 隐私与安全性”中确认打开。
+Windows 对应可执行文件为 `crates/anchor/target/release/anchor.exe`。`anchor admin serve` 只绑定本机 loopback，并托管同源 Web Admin 与管理 API。
 
 ### 2. 添加项目工作区
 
-1. 点击左侧的“添加工作区”。
+1. 在浏览器打开 `anchor admin serve` 输出的本机管理地址，点击左侧“添加工作区”。
 2. 选择项目根目录。
 3. 设置工作区名称、MCP 端口和认证方式。
 4. 保存后，工作区会长期保留在左侧列表中。
@@ -95,7 +93,7 @@ macOS 安装包目前未签名。如果系统阻止首次打开，请在“系�
 
 *健康检查会逐项显示连接和认证元数据是否可用。*
 
-遇到连接问题时，无需离开桌面端即可查看最近的 MCP 请求日志：
+遇到连接问题时，无需离开 Web Admin 即可查看最近的 MCP 请求日志：
 
 ![MCP 运行日志](docs/images/runtime-logs.png)
 
@@ -103,7 +101,7 @@ macOS 安装包目前未签名。如果系统阻止首次打开，请在“系�
 
 ### 5. 连接 AI 客户端
 
-支持 MCP 的客户端使用界面中的公网 MCP URL。使用 OAuth 时，客户端会通过服务端元数据进入授权流程；授权口令、Client ID 和 Secret 均可在桌面端集中生成和管理。当前版本使用预配置 OAuth 客户端，创建 ChatGPT 插件时应选择静态/手动 OAuth 凭据，不需要选择 CIMD。
+支持 MCP 的客户端使用 Web Admin 中的公网 MCP URL。使用 OAuth 时，客户端会通过服务端元数据进入授权流程；授权口令、Client ID 和 Secret 均可在 Web Admin 集中生成和管理。当前版本使用预配置 OAuth 客户端，创建 ChatGPT 插件时应选择静态/手动 OAuth 凭据，不需要选择 CIMD。
 
 首次连接建议先调用历史初始化，再检查工作区：
 
@@ -130,7 +128,7 @@ check_exec_environment
 
 1. 工作区的 MCP 服务和公网隧道均处于运行状态。
 2. “健康检查”中的公网 MCP 检查通过；如果使用 OAuth，再确认 OAuth 受保护资源和授权元数据检查通过。
-3. 从桌面端“GPT 配置”卡片复制“公网 MCP 地址”；如果使用 OAuth，同时准备 OAuth Client ID、OAuth Client Secret 和授权口令。
+3. 从 Web Admin“GPT 配置”卡片复制“公网 MCP 地址”；如果使用 OAuth，同时准备 OAuth Client ID、OAuth Client Secret 和授权口令。
 
 > ChatGPT 必须使用公网 HTTPS `/mcp` 地址，不能使用 `http://127.0.0.1:28766/mcp` 之类的本地地址。ChatGPT 的菜单名称可能随版本和语言设置略有变化。
 
@@ -150,14 +148,14 @@ check_exec_environment
 | --- | --- |
 | 名称 | 自定义一个容易识别的名称，例如 `Anchor` |
 | 描述 | 简要说明它连接的项目或用途 |
-| 连接 | 粘贴桌面端“GPT 配置”中的公网 MCP 地址，URL 应以 `/mcp` 结尾 |
-| 身份验证 | 与桌面端保持一致；截图以 OAuth 为例 |
+| 连接 | 粘贴 Web Admin“GPT 配置”中的公网 MCP 地址，URL 应以 `/mcp` 结尾 |
+| 身份验证 | 与 Web Admin 配置保持一致；截图以 OAuth 为例 |
 
 ![在 ChatGPT 中新建 MCP 插件并填写连接信息](docs/images/gpt-config-2-detail.png)
 
-使用 OAuth 时，展开“高级 OAuth 设置”，选择静态/手动 OAuth 凭据并填写桌面端提供的 Client ID 和 Client Secret，不需要选择 CIMD。保存或连接后，ChatGPT 会打开授权页面；输入桌面端“GPT 配置”卡片中的授权口令完成首次授权。
+使用 OAuth 时，展开“高级 OAuth 设置”，选择静态/手动 OAuth 凭据并填写 Web Admin 提供的 Client ID 和 Client Secret，不需要选择 CIMD。保存或连接后，ChatGPT 会打开授权页面；输入 Web Admin“GPT 配置”卡片中的授权口令完成首次授权。
 
-> Client Secret、授权口令和 Bearer Token 都属于敏感信息，不要粘贴到对话、Issue 或公开截图中。若桌面端使用 Bearer 或不启用认证，请在 ChatGPT 中选择当前界面提供的对应认证方式。
+> Client Secret、授权口令和 Bearer Token 都属于敏感信息，不要粘贴到对话、Issue 或公开截图中。若 Web Admin 配置为 Bearer 或不启用认证，请在 ChatGPT 中选择当前界面提供的对应认证方式。
 
 #### 3. 验证连接
 
@@ -168,7 +166,7 @@ check_exec_environment
 告诉我当前连接的工作区、默认目录和 Git 状态。
 ```
 
-如果能够返回当前项目的信息，说明“桌面端 → 公网隧道 → OAuth → ChatGPT → MCP 工具”链路已经打通。首次正式开发时，再调用 `history_session_bootstrap` 初始化或恢复项目历史。
+如果能够返回当前项目的信息，说明“Anchor runtime → 公网隧道 → OAuth → ChatGPT → MCP 工具”链路已经打通。首次正式开发时，再调用 `history_session_bootstrap` 初始化或恢复项目历史。
 
 如果 ChatGPT 仍显示旧的工具列表，请断开并重新连接插件，或创建一个新对话后再次验证。
 
@@ -176,17 +174,17 @@ check_exec_environment
 
 | 现象 | 优先检查 |
 | --- | --- |
-| ChatGPT 无法连接 | 是否使用公网 HTTPS `/mcp` 地址，而不是 `127.0.0.1`；桌面端公网 MCP 健康检查是否通过 |
+| ChatGPT 无法连接 | 是否使用公网 HTTPS `/mcp` 地址，而不是 `127.0.0.1`；Web Admin 公网 MCP 健康检查是否通过 |
 | OAuth 授权失败 | Client ID、Client Secret 和授权口令是否来自同一个工作区；OAuth 元数据检查是否通过 |
 | 看不到新增工具 | 断开并重新连接插件，然后创建一个新对话 |
-| 工具调用失败 | 打开桌面端“日志”和“健康检查”，确认请求是否到达 MCP 服务 |
+| 工具调用失败 | 打开 Web Admin“日志”和“健康检查”，确认请求是否到达 MCP 服务 |
 
 ### GPT Actions
 
 1. 启动工作区的 Actions 服务。
 2. 复制 Actions 面板中的 OpenAPI URL。
 3. 在 GPT 编辑器的 Actions 页面导入该 URL。
-4. 根据桌面端配置选择 None、API Key 或 OAuth。
+4. 根据 Web Admin 配置选择 None、API Key 或 OAuth。
 
 MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用不同端口和子域名。
 
@@ -195,7 +193,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 - **面向真实开发**：文件、命令、Git、测试和长时间运行的进程都在同一个 Workspace 中。
 - **跨会话持续开发**：新对话可以读取全部历史摘要和最近一次完整交接，不必反复向 AI 解释项目背景和当前进度。
 - **进度可追溯**：每轮任务完成后可保存结构化检查点，决策、修改、测试结果和下一步都留在项目目录中。
-- **多工作区管理**：一个桌面客户端可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
+- **多工作区管理**：一个浏览器 Web Admin 可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
 - **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
 - **默认工具面保持简单**：稳定的核心工具默认可用，高级 Harness 能力按需开启。
 
@@ -225,7 +223,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 历史文件使用可读的 Markdown 格式，可以随项目备份或纳入 Git，也方便开发者直接审阅和修订。每个新文件顶部都带有有长度上限的“继承的历史摘要”，旧摘要不会递归复制；检查点采用幂等写入，并要求返回 `ok=true` 且会话目标一致后才确认保存成功。
 
-> 历史持久化由 AI 调用 MCP 工具完成，并非桌面端在后台录制聊天内容。若客户端未触发工具调用，服务端无法凭空感知新的对话或任务进度。
+> 历史持久化由 AI 调用 MCP 工具完成，并非 Web Admin 在后台录制聊天内容。若客户端未触发工具调用，服务端无法凭空感知新的对话或任务进度。
 
 ## Agent 可以做什么
 
@@ -276,17 +274,17 @@ pnpm install --frozen-lockfile
 pnpm start
 ```
 
-`pnpm start` 会构建 Svelte Web Admin，并通过默认 CLI target 启动本机 `anchor admin serve`。发布构建使用 `pnpm release:build` / `pnpm cli:build`，不再要求生成桌面安装包。
+`pnpm start` 会构建 Vite + React Web Admin，并通过默认 CLI target 启动本机 `anchor admin serve`。发布构建使用 `pnpm release:build` / `pnpm cli:build`，不再要求生成桌面安装包。
 
-仓库使用 `pnpm@11.18.0` 作为依赖解析和锁文件的唯一来源。Windows 下采用 hoisted `node_modules`，避免启用 RedirectionGuard 时 pnpm 的 isolated 符号链接无法遍历。安装完成后，`npm run ...`、`npm exec`、`npx` 和 `pnpm exec` 均可正常使用；`.npmrc` 会阻止 npm 生成第二份锁文件。
+仓库使用 `pnpm@11.18.0` 作为唯一 Node 包管理器与锁文件来源。不要运行 `npm install` / `npm ci` 生成第二份依赖状态；开发、检查、测试与构建统一使用 `pnpm ...`。
 
 常用验证命令：
 
 ```bash
-npm run check
-npm run build
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy --all-targets -- -D warnings
+pnpm check
+pnpm build
+cd crates/anchor && cargo test
+cd crates/anchor && cargo clippy --all-targets -- -D warnings
 ```
 
 桌面/Tauri 外壳、安装包脚本与对应依赖已物理删除。当前管理入口是浏览器 Web Admin，运行与运维入口是 `anchor` CLI/daemon；退役记录见 [Desktop / Tauri 退役记录](docs/desktop-retirement.md)。
@@ -297,8 +295,8 @@ Linux 服务器可以直接构建 `anchor`，读取统一的 workspace/profile �
 
 ```bash
 pnpm cli:build
-./src-tauri/target/release/anchor list
-./src-tauri/target/release/anchor serve <workspace> --service mcp
+./crates/anchor/target/release/anchor list
+./crates/anchor/target/release/anchor serve <workspace> --service mcp
 ```
 
 CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` 运维命令。它不会接管已被 GUI 占用的端口；生产自启动仍建议由 systemd 直接监督 `serve`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。
@@ -317,7 +315,7 @@ Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`�
 
 ### 断联恢复与 OAuth 续约
 
-桌面端和 Linux CLI 会检测 MCP、Actions 与隧道断联，并使用有限次数的指数退避自动恢复。OAuth 支持 1 小时 Access Token 和轮换的 90 天 Refresh Token。只读状态查询可自动重试，保存和可能产生副作用的工具调用不会盲目重放。
+Anchor daemon/CLI 会检测 MCP、Actions 与隧道断联，并使用有限次数的指数退避自动恢复。OAuth 支持 1 小时 Access Token 和轮换的 90 天 Refresh Token。只读状态查询可自动重试，保存和可能产生副作用的工具调用不会盲目重放。
 
 详细策略和当前限制见 [连接恢复、自动重试与 OAuth 续约](docs/reliability.md)。
 
@@ -325,12 +323,12 @@ Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`�
 
 | 路径 | 作用 |
 | --- | --- |
-| `src-tauri/src/tools/` | 文件、Patch、Exec、Git 等共享工具内核 |
-| `src-tauri/src/mcp/` | MCP Streamable HTTP 服务 |
-| `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 网关 |
-| `src-tauri/src/tunnel/` | FRP / Cloudflare 隧道和进程管理 |
-| `src-tauri/tests/` | Rust 合约、安全、输出 Schema 与集成测试 |
-| `src/` | SvelteKit 桌面界面 |
+| `crates/anchor/src/tools/` | 文件、Patch、Exec、Git 等共享工具内核 |
+| `crates/anchor/src/mcp/` | MCP Streamable HTTP 服务 |
+| `crates/anchor/src/actions/` | ChatGPT Actions OpenAPI 网关 |
+| `crates/anchor/src/tunnel/` | FRP / Cloudflare 隧道和进程管理 |
+| `crates/anchor/tests/` | Rust 合约、安全、输出 Schema 与集成测试 |
+| `src/` | Vite + React + React Router + shadcn/ui + Tailwind CSS Web Admin |
 | `docs/` | 产品、协议、架构与验证文档 |
 
 ## 致谢

@@ -1,4 +1,4 @@
-import { invokeAdmin, invokeRead } from "$lib/api/invoke";
+import { invokeAdmin, invokeRead } from "@/lib/api/invoke";
 
 export interface PrivilegedActionBinding {
   id?: string;
