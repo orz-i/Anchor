@@ -833,7 +833,7 @@ fn render_windows_task_xml(config: &AdminServiceConfig, user: &str) -> AppResult
   <RegistrationInfo><Description>Anchor Web Admin ({scope})</Description></RegistrationInfo>\n\
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>\n\
   <Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n\
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT5S</Interval><Count>3</Count></RestartOnFailure></Settings>\n\
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>\n\
   <Actions Context=\"Author\"><Exec><Command>{exe}</Command><Arguments>{args}</Arguments></Exec></Actions>\n\
 </Task>\n",
         scope = xml_escape(&admin_daemon::config_scope()?),
@@ -960,7 +960,7 @@ mod tests {
             installed_build: BuildIdentity::current(),
         };
         let xml = render_windows_task_xml(&config, r"DESKTOP\demo").expect("task xml");
-        assert!(xml.contains("<RestartOnFailure><Interval>PT5S</Interval><Count>3</Count>"));
+        assert!(xml.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>"));
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("admin daemon-run --port 28769"));
