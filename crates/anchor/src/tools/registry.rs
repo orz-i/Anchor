@@ -3260,7 +3260,8 @@ pub fn input_schema(name: &str) -> Value {
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true, "description": "When false, recover an already-existing Session + writable Harness Task only. Never create a replacement Task or Git worktree; return a structured not-found/conflict error instead." },
                 "resume_completed": { "type": "boolean", "default": false, "description": "Explicitly reactivate the selected completed Session instead of creating a continuation Session." },
-                "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or create an isolated managed Git worktree for a new task." },
+                "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or use an isolated Anchor-managed Git worktree for a new task." },
+                "worktree_path": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Bind the new task to an existing registered Anchor-managed worktree under .anchor/worktrees. Valid only with workspace_mode=worktree and mutually exclusive with worktree_branch/worktree_base_ref." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
                 "worktree_remove_on_close": { "type": "boolean", "default": false },
@@ -3358,6 +3359,7 @@ pub fn input_schema(name: &str) -> Value {
                 "completed_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "pending_steps": { "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 2000 } },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared" },
+                "worktree_path": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Bind the new task to an existing registered Anchor-managed worktree under .anchor/worktrees. Valid only with workspace_mode=worktree and mutually exclusive with worktree_branch/worktree_base_ref." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
                 "worktree_remove_on_close": { "type": "boolean", "default": false }

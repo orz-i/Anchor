@@ -473,6 +473,100 @@ pub(crate) fn create_managed_worktree(
     })
 }
 
+pub(crate) fn resolve_existing_managed_worktree(
+    ws: &Workspace,
+    raw_path: &str,
+    remove_on_close: bool,
+) -> Result<TaskGitWorktree, WorkspaceError> {
+    ensure_git_repo(ws)?;
+    let path = managed_worktree_path(ws, raw_path)?;
+    let completed = run_git(
+        ws.root(),
+        &["worktree", "list", "--porcelain", "-z"],
+        Duration::from_secs(15),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let entry = parse_worktree_porcelain(&completed.stdout)
+        .into_iter()
+        .find(|entry| {
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .map(|candidate| candidate.canonicalize().unwrap_or(candidate) == path)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_NOT_REGISTERED",
+            message: "The requested managed path is not registered as a Git worktree.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "path": raw_path,
+                "managed_path": relative_managed_worktree_display(ws, &path),
+                "suggestion": "Run git worktree list/prune and retry with a registered Anchor-managed worktree."
+            }),
+        })?;
+    if entry
+        .get("prunable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_UNAVAILABLE",
+            message: "The requested managed worktree is marked prunable by Git.".into(),
+            category: "conflict",
+            retryable: true,
+            details: json!({
+                "path": raw_path,
+                "reason": entry.get("prunable_reason").cloned().unwrap_or(Value::Null)
+            }),
+        });
+    }
+    if entry
+        .get("detached")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_DETACHED",
+            message: "Harness tasks require an existing managed worktree to be attached to a local branch.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({"path": raw_path}),
+        });
+    }
+    let branch = entry
+        .get("branch")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.trim().is_empty())
+        .ok_or_else(|| WorkspaceError::ToolDetails {
+            code: "GIT_WORKTREE_BRANCH_UNKNOWN",
+            message: "Unable to determine the local branch for the managed worktree.".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({"path": raw_path}),
+        })?
+        .to_string();
+    validate_worktree_branch(&branch)?;
+    let head = entry
+        .get("head")
+        .and_then(Value::as_str)
+        .filter(|head| !head.trim().is_empty())
+        .unwrap_or("HEAD")
+        .to_string();
+    Ok(TaskGitWorktree {
+        path: path.to_string_lossy().into_owned(),
+        branch,
+        base_ref: head,
+        managed: true,
+        remove_on_close,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 pub(crate) fn remove_managed_task_worktree(
     ws: &Workspace,
     worktree: &TaskGitWorktree,

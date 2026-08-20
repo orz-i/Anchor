@@ -1261,6 +1261,185 @@ fn begin_work_session_create_if_missing_false_never_creates_replacement_task_or_
 }
 
 #[test]
+fn new_task_can_bind_existing_managed_worktree_after_previous_task_is_closed() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "reuse managed worktree\n").expect("写入文件");
+    fs::write(
+        workspace.join(".gitignore"),
+        "/.anchor/worktrees/\n/docs/session/\n",
+    )
+    .expect("写入 ignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let first = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "创建并保留 managed worktree",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_remove_on_close": false
+        }),
+        "reuse-managed-worktree-first",
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["work_session"]["worktree_reused"], false);
+    let first_task_id = first["task"]["id"].as_str().expect("first task id");
+    let worktree_path = first["task"]["git_worktree"]["path"]
+        .as_str()
+        .expect("worktree path")
+        .to_string();
+    let branch = first["task"]["git_worktree"]["branch"]
+        .as_str()
+        .expect("worktree branch")
+        .to_string();
+
+    let still_owned = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "不能接管仍被活动 Task 占用的 worktree",
+            "workspace_mode": "worktree",
+            "worktree_path": worktree_path
+        }),
+        "reuse-managed-worktree-blocked",
+    );
+    assert_eq!(still_owned["ok"], false, "{still_owned}");
+    assert_eq!(still_owned["error"]["code"], "GIT_WORKTREE_IN_USE");
+    assert!(still_owned["error"]["details"]["blocking_task_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == first_task_id)));
+
+    let aborted = call_tool_for_session(
+        &ctx,
+        "abort_task",
+        &json!({
+            "task_id": first_task_id,
+            "reason": "fixture closes old owner but preserves managed worktree",
+            "session_status": "paused"
+        }),
+        "reuse-managed-worktree-first",
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    assert!(std::path::Path::new(&worktree_path).is_dir());
+
+    let second = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "新 Task 接管已保留 managed worktree",
+            "workspace_root": workspace.to_string_lossy(),
+            "workspace_mode": "worktree",
+            "worktree_path": worktree_path,
+            "worktree_remove_on_close": false
+        }),
+        "reuse-managed-worktree-second",
+    );
+    assert_eq!(second["ok"], true, "{second}");
+    let second_task_id = second["task"]["id"].as_str().expect("second task id");
+    assert_ne!(second_task_id, first_task_id);
+    assert_eq!(second["task"]["git_worktree"]["path"], worktree_path);
+    assert_eq!(second["task"]["git_worktree"]["branch"], branch);
+    assert_eq!(second["task"]["git_worktree"]["managed"], true);
+    assert_eq!(second["work_session"]["worktree_reused"], true);
+
+    let worktrees = call_tool(&ctx, "git_worktree_list", &json!({}));
+    assert_eq!(worktrees["ok"], true, "{worktrees}");
+    assert_eq!(
+        worktrees["count"], 2,
+        "reuse must not create another worktree"
+    );
+
+    let patched = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: rebound.txt\n+rebound\n*** End Patch\n"
+        }),
+        "reuse-managed-worktree-second",
+    );
+    assert_eq!(patched["ok"], true, "{patched}");
+    assert!(std::path::Path::new(&worktree_path)
+        .join("rebound.txt")
+        .is_file());
+    assert!(!workspace.join("rebound.txt").exists());
+
+    let second_aborted = call_tool_for_session(
+        &ctx,
+        "abort_task",
+        &json!({
+            "task_id": second_task_id,
+            "reason": "fixture releases reused worktree for direct start_task",
+            "session_status": "paused"
+        }),
+        "reuse-managed-worktree-second",
+    );
+    assert_eq!(second_aborted["ok"], true, "{second_aborted}");
+
+    let direct = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "start_task 直接接管已保留 managed worktree",
+            "workspace_mode": "worktree",
+            "worktree_path": worktree_path,
+            "worktree_remove_on_close": false
+        }),
+        "reuse-managed-worktree-direct",
+    );
+    assert_eq!(direct["ok"], true, "{direct}");
+    assert_eq!(direct["worktree_reused"], true);
+    assert_eq!(direct["git_worktree"]["path"], worktree_path);
+    assert_eq!(direct["git_worktree"]["branch"], branch);
+
+    let unmanaged = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "不得接管普通仓库路径",
+            "workspace_mode": "worktree",
+            "worktree_path": workspace.to_string_lossy()
+        }),
+        "reuse-managed-worktree-unmanaged",
+    );
+    assert_eq!(unmanaged["ok"], false, "{unmanaged}");
+    assert_eq!(unmanaged["error"]["code"], "GIT_WORKTREE_PATH_NOT_MANAGED");
+
+    let unregistered_path = workspace.join(".anchor/worktrees/not-registered");
+    fs::create_dir_all(&unregistered_path).expect("创建未注册 managed 目录");
+    let unregistered = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "不得接管未被 Git 注册的 managed 目录",
+            "workspace_mode": "worktree",
+            "worktree_path": unregistered_path.to_string_lossy()
+        }),
+        "reuse-managed-worktree-unregistered",
+    );
+    assert_eq!(unregistered["ok"], false, "{unregistered}");
+    assert_eq!(unregistered["error"]["code"], "GIT_WORKTREE_NOT_REGISTERED");
+
+    let conflicting_options = call_tool_for_session(
+        &ctx,
+        "start_task",
+        &json!({
+            "objective": "复用路径不得同时要求新分支",
+            "workspace_mode": "worktree",
+            "worktree_path": worktree_path,
+            "worktree_branch": "anchor/task/should-not-be-created"
+        }),
+        "reuse-managed-worktree-conflicting-options",
+    );
+    assert_eq!(conflicting_options["ok"], false, "{conflicting_options}");
+    assert_eq!(conflicting_options["error"]["code"], "INVALID_ARGUMENT");
+}
+
+#[test]
 fn aborted_worktree_task_releases_remove_guard_and_initial_conflict_is_logged() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
@@ -4643,12 +4822,23 @@ fn catalog_v34_exposes_task_governance_facades_and_schemas() {
         .iter()
         .find(|tool| tool["name"] == "begin_work_session")
         .expect("begin_work_session schema");
-    for property in ["contract", "phase", "slices", "working_set"] {
+    for property in [
+        "contract",
+        "phase",
+        "slices",
+        "working_set",
+        "worktree_path",
+    ] {
         assert!(
             begin["inputSchema"]["properties"].get(property).is_some(),
             "begin_work_session 缺少 {property} schema"
         );
     }
+    let start_schema = anchor_lib::tools::registry::input_schema("start_task");
+    assert!(
+        start_schema["properties"].get("worktree_path").is_some(),
+        "start_task 缺少 worktree_path schema"
+    );
     let verification_branches = begin["inputSchema"]["properties"]["contract"]["properties"]
         ["required_verifications"]["items"]["anyOf"]
         .as_array()

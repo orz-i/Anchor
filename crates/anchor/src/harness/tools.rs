@@ -917,7 +917,7 @@ fn begin_work_session(
     let selected_task = session_task.or(explicit_task);
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
-            validate_requested_workspace_mode(args, &task)?;
+            validate_requested_workspace_mode(ctx, args, &task)?;
             if task.objective != objective {
                 if !create_if_missing {
                     return Err(WorkspaceError::ToolDetails {
@@ -1042,6 +1042,7 @@ fn begin_work_session(
             "auto_paused_previous_task_ids": auto_paused_previous_task_ids,
             "parallel": task.git_worktree.is_some(),
             "workspace_mode": task_workspace_mode(&task),
+            "worktree_reused": task_created && args.get("worktree_path").is_some(),
             "writer_mode": if task.git_worktree.is_some() { "isolated_worktree" } else { "single_shared_writer" },
             "git_worktree": task.git_worktree,
             "baseline": baseline_view(&task),
@@ -2015,6 +2016,7 @@ fn start_task(
         "session_task_id": task.id,
         "parallel": task.git_worktree.is_some(),
         "workspace_mode": task_workspace_mode(&task),
+        "worktree_reused": task.git_worktree.is_some() && args.get("worktree_path").is_some(),
         "writer_mode": if task.git_worktree.is_some() { "isolated_worktree" } else { "single_shared_writer" },
         "git_worktree": task.git_worktree,
         "next": ["project_state", "task_context"]
@@ -2031,27 +2033,60 @@ fn start_task_for_workspace_mode(
         .and_then(Value::as_str)
         .unwrap_or("shared");
     match mode {
-        "shared" => ctx.harness.start_task(objective).map_err(map_error),
+        "shared" => {
+            if args.get("worktree_path").is_some() {
+                return Err(tool_error(
+                    "INVALID_ARGUMENT",
+                    "worktree_path is valid only when workspace_mode=worktree",
+                ));
+            }
+            ctx.harness.start_task(objective).map_err(map_error)
+        }
         "worktree" => {
             let task_id = Uuid::new_v4().simple().to_string();
-            let branch = args.get("worktree_branch").and_then(Value::as_str);
-            let base_ref = args
-                .get("worktree_base_ref")
+            let existing_path = args
+                .get("worktree_path")
                 .and_then(Value::as_str)
-                .unwrap_or("HEAD");
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            let branch = args.get("worktree_branch").and_then(Value::as_str);
             let remove_on_close = args
                 .get("worktree_remove_on_close")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let worktree = crate::tools::git::create_managed_worktree(
-                &ctx.workspace,
-                &task_id,
-                branch,
-                base_ref,
-                remove_on_close,
-            )?;
+            let (worktree, created_now) = if let Some(path) = existing_path {
+                if branch.is_some() || args.get("worktree_base_ref").is_some() {
+                    return Err(tool_error(
+                        "INVALID_ARGUMENT",
+                        "worktree_path cannot be combined with worktree_branch or worktree_base_ref",
+                    ));
+                }
+                let worktree = crate::tools::git::resolve_existing_managed_worktree(
+                    &ctx.workspace,
+                    path,
+                    remove_on_close,
+                )?;
+                ensure_existing_managed_worktree_attachable(ctx, &worktree.path)?;
+                (worktree, false)
+            } else {
+                let base_ref = args
+                    .get("worktree_base_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or("HEAD");
+                let worktree = crate::tools::git::create_managed_worktree(
+                    &ctx.workspace,
+                    &task_id,
+                    branch,
+                    base_ref,
+                    remove_on_close,
+                )?;
+                (worktree, true)
+            };
             if let Err(error) = ensure_writer_handoff_available(ctx, None, Some(&worktree.path)) {
-                let _ = crate::tools::git::remove_managed_task_worktree(&ctx.workspace, &worktree);
+                if created_now {
+                    let _ =
+                        crate::tools::git::remove_managed_task_worktree(&ctx.workspace, &worktree);
+                }
                 return Err(error);
             }
             match ctx
@@ -2060,8 +2095,12 @@ fn start_task_for_workspace_mode(
             {
                 Ok(task) => Ok(task),
                 Err(error) => {
-                    let _ =
-                        crate::tools::git::remove_managed_task_worktree(&ctx.workspace, &worktree);
+                    if created_now {
+                        let _ = crate::tools::git::remove_managed_task_worktree(
+                            &ctx.workspace,
+                            &worktree,
+                        );
+                    }
                     Err(map_error(error))
                 }
             }
@@ -2073,7 +2112,60 @@ fn start_task_for_workspace_mode(
     }
 }
 
+fn ensure_existing_managed_worktree_attachable(
+    ctx: &ToolContext,
+    raw_path: &str,
+) -> Result<(), WorkspaceError> {
+    let target = crate::tools::git::managed_worktree_path(&ctx.workspace, raw_path)?;
+    let blocking_tasks = ctx
+        .harness
+        .list_tasks()
+        .map_err(map_error)?
+        .into_iter()
+        .filter(|task| task.status.is_writable())
+        .filter(|task| {
+            task.git_worktree
+                .as_ref()
+                .filter(|worktree| worktree.managed)
+                .map(|worktree| {
+                    let candidate = std::path::PathBuf::from(&worktree.path);
+                    candidate.canonicalize().unwrap_or(candidate) == target
+                })
+                .unwrap_or(false)
+        })
+        .map(|task| {
+            json!({
+                "task_id": task.id,
+                "status": task.status,
+                "phase": task.phase,
+                "objective": task.objective,
+                "session_id": task.session_id
+            })
+        })
+        .collect::<Vec<_>>();
+    if blocking_tasks.is_empty() {
+        return Ok(());
+    }
+    let blocking_task_ids = blocking_tasks
+        .iter()
+        .filter_map(|task| task.get("task_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    Err(WorkspaceError::ToolDetails {
+        code: "GIT_WORKTREE_IN_USE",
+        message: "The managed worktree is still attached to a writable Harness Task.".into(),
+        category: "conflict",
+        retryable: true,
+        details: json!({
+            "path": raw_path,
+            "blocking_task_ids": blocking_task_ids,
+            "blocking_tasks": blocking_tasks,
+            "required_action": "Complete or abort the existing writable task before binding this managed worktree to a new task."
+        }),
+    })
+}
+
 fn validate_requested_workspace_mode(
+    ctx: &ToolContext,
     args: &Value,
     task: &TaskSession,
 ) -> Result<(), WorkspaceError> {
@@ -2092,6 +2184,42 @@ fn validate_requested_workspace_mode(
                 "task_id": task.id
             }),
         });
+    }
+    if let Some(raw_path) = args
+        .get("worktree_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let requested_path = crate::tools::git::managed_worktree_path(&ctx.workspace, raw_path)?;
+        let Some(worktree) = task.git_worktree.as_ref() else {
+            return Err(WorkspaceError::ToolDetails {
+                code: "TASK_WORKTREE_PATH_CONFLICT",
+                message: "The existing task is not attached to a Git worktree.".into(),
+                category: "conflict",
+                retryable: false,
+                details: json!({
+                    "requested_worktree_path": raw_path,
+                    "task_id": task.id,
+                    "task_workspace_mode": task_workspace_mode(task)
+                }),
+            });
+        };
+        let current = std::path::PathBuf::from(&worktree.path);
+        let current = current.canonicalize().unwrap_or(current);
+        if requested_path != current {
+            return Err(WorkspaceError::ToolDetails {
+                code: "TASK_WORKTREE_PATH_CONFLICT",
+                message: "The existing task is attached to a different managed worktree.".into(),
+                category: "conflict",
+                retryable: false,
+                details: json!({
+                    "requested_worktree_path": requested_path,
+                    "task_worktree_path": current,
+                    "task_id": task.id
+                }),
+            });
+        }
     }
     Ok(())
 }
