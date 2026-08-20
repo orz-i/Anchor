@@ -300,20 +300,84 @@ fn deleting_git_assets_is_always_rejected() {
 }
 
 #[test]
-fn patch_check_rejects_all_git_and_github_writes() {
+fn patch_keeps_git_immutable_and_allows_audited_github_writes_in_trusted_mode() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    for path in [".git/probe.txt", ".github/probe.yml"] {
-        let out = invoke(
-            &ctx,
-            "apply_patch",
-            json!({
-                "dry_run": true,
-                "patch": format!("*** Begin Patch\n*** Add File: {path}\n+probe\n*** End Patch\n")
-            }),
-        );
-        assert_eq!(out["error"]["code"], "PROTECTED_REPOSITORY_ASSET");
-    }
+    let git = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "dry_run": true,
+            "patch": "*** Begin Patch\n*** Add File: .git/probe.txt\n+probe\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(git["error"]["code"], "PROTECTED_REPOSITORY_ASSET");
+
+    let github_allowed = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Add File: .github/workflows/probe.yml\n+name: probe\n*** End Patch\n"
+        }),
+    );
+    assert_ok(&github_allowed);
+    assert_eq!(
+        fs::read_to_string(fx.root.join(".github/workflows/probe.yml")).expect("read workflow"),
+        "name: probe\n"
+    );
+
+    let delete_github = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Delete File: .github/workflows/probe.yml\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(
+        delete_github["error"]["code"],
+        "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
+    );
+
+    let git_still_blocked = invoke(
+        &ctx,
+        "apply_patch",
+        json!({
+            "dry_run": true,
+            "patch": "*** Begin Patch\n*** Add File: .git/dangerous-probe.txt\n+probe\n*** End Patch\n"
+        }),
+    );
+    assert_eq!(
+        git_still_blocked["error"]["code"],
+        "PROTECTED_REPOSITORY_ASSET"
+    );
+
+    let generic_remove = invoke(
+        &ctx,
+        "remove_path",
+        json!({"path": ".github/workflows/probe.yml"}),
+    );
+    assert_eq!(generic_remove["error"]["code"], "PROTECTED_PATH");
+    assert!(fx.root.join(".github/workflows/probe.yml").is_file());
+
+    let mut dangerous_ctx = ctx_for(&fx.root);
+    dangerous_ctx.permission_mode = "dangerous".into();
+    dangerous_ctx.policy.permission_mode = "dangerous".into();
+    let dangerous_generic_remove = invoke(
+        &dangerous_ctx,
+        "remove_path",
+        json!({"path": ".github/workflows/probe.yml"}),
+    );
+    assert_eq!(dangerous_generic_remove["error"]["code"], "PROTECTED_PATH");
+
+    let dangerous_patch_delete = invoke(
+        &dangerous_ctx,
+        "apply_patch",
+        json!({
+            "patch": "*** Begin Patch\n*** Delete File: .github/workflows/probe.yml\n*** End Patch\n"
+        }),
+    );
+    assert_ok(&dangerous_patch_delete);
+    assert!(!fx.root.join(".github/workflows/probe.yml").exists());
 }
 
 #[test]

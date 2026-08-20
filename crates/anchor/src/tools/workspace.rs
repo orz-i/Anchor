@@ -240,6 +240,20 @@ impl Workspace {
         Ok(())
     }
 
+    pub fn reject_git_metadata_write_path(&self, raw_path: &str) -> WorkspaceResult<()> {
+        let normalized = raw_path.replace('\\', "/");
+        let first = normalized.split('/').next().unwrap_or("");
+        if first == ".git" {
+            return Err(WorkspaceError::Tool {
+                code: "PROTECTED_PATH",
+                message: format!("禁止写入 Git 内部元数据目录: {raw_path}"),
+                category: "security",
+                retryable: false,
+            });
+        }
+        Ok(())
+    }
+
     pub fn resolve_existing(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
         self.resolve_existing_at(&self.root, raw_path)
     }
@@ -409,8 +423,30 @@ impl Workspace {
     }
 
     pub fn resolve_for_write(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
+        self.resolve_for_write_with_repository_config(raw_path, false)
+    }
+
+    /// Resolve a write target for the transactional patch engine after it has
+    /// already enforced the operator permission gate for repository config.
+    /// Git's own metadata remains unconditionally protected.
+    pub fn resolve_for_repository_config_write(
+        &self,
+        raw_path: &str,
+    ) -> WorkspaceResult<ResolvedPath> {
+        self.resolve_for_write_with_repository_config(raw_path, true)
+    }
+
+    fn resolve_for_write_with_repository_config(
+        &self,
+        raw_path: &str,
+        allow_repository_config: bool,
+    ) -> WorkspaceResult<ResolvedPath> {
         self.reject_unsafe_text(raw_path)?;
-        self.reject_protected_write_path(raw_path)?;
+        if allow_repository_config {
+            self.reject_git_metadata_write_path(raw_path)?;
+        } else {
+            self.reject_protected_write_path(raw_path)?;
+        }
         let pure = Path::new(raw_path);
         if pure.file_name().is_none() || raw_path == "." || raw_path == ".." {
             return Err(WorkspaceError::invalid_argument("Invalid write target"));

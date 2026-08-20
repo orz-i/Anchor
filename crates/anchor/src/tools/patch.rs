@@ -161,7 +161,7 @@ fn apply_patch_with_execution(
         .map(|file| file.path.as_str())
     {
         return Err(protected_repository_asset(format!(
-            "禁止删除仓库保护资产: {path}"
+            "禁止修改 Git 内部元数据: {path}"
         )));
     }
     if !ctx.policy.skip_permission_gates() {
@@ -196,7 +196,7 @@ fn apply_patch_with_execution(
         let first = sections[0];
         ws.reject_unsafe_text(&first.path)?;
         let resolved = if first.is_new_file {
-            ws.resolve_for_write(&first.path)?
+            ws.resolve_for_repository_config_write(&first.path)?
         } else {
             ws.resolve_existing(&first.path)?
         };
@@ -1157,11 +1157,11 @@ fn commit_staged_bytes_with_execution(
         if let Some(execution) = execution {
             execution.checkpoint(&format!("stage_file_{}", index + 1))?;
         }
-        ws.reject_protected_write_path(rel)?;
+        ws.reject_git_metadata_write_path(rel)?;
         let resolved = if content.is_none() {
             ws.resolve_existing(rel)?
         } else {
-            ws.resolve_for_write(rel)?
+            ws.resolve_for_repository_config_write(rel)?
         };
         let path = resolved.path.clone();
         backups.insert(
@@ -1211,7 +1211,7 @@ fn commit_staged_bytes_with_execution(
         let resolved = if content.is_none() {
             ws.resolve_existing(rel)?
         } else {
-            ws.resolve_for_write(rel)?
+            ws.resolve_for_repository_config_write(rel)?
         };
         let path = resolved.path;
         let result = if content.is_some() {
@@ -1310,7 +1310,7 @@ fn is_critical_file(path: &str) -> bool {
 fn is_protected_repository_asset(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let first = normalized.split('/').next().unwrap_or("");
-    matches!(first, ".git" | ".github")
+    first == ".git"
 }
 
 fn dangerous_operation(message: impl Into<String>) -> WorkspaceError {
