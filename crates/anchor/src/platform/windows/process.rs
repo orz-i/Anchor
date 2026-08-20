@@ -174,10 +174,6 @@ fn collect_child_pids(root_pid: u32) -> AppResult<Vec<u32>> {
         TH32CS_SNAPPROCESS,
     };
 
-    let mut pending = vec![root_pid];
-    let mut seen = std::collections::HashSet::from([root_pid]);
-    let mut ordered = Vec::new();
-
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
             .map_err(|err| AppError::Message(format!("CreateToolhelp32Snapshot failed: {err}")))?;
@@ -190,23 +186,38 @@ fn collect_child_pids(root_pid: u32) -> AppResult<Vec<u32>> {
             ..Default::default()
         };
 
+        let mut children_by_parent: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let parent = entry.th32ParentProcessID;
                 let pid = entry.th32ProcessID;
-                if pending.contains(&parent) && seen.insert(pid) {
-                    ordered.push(pid);
-                    pending.push(pid);
-                }
+                children_by_parent.entry(parent).or_default().push(pid);
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
                 }
             }
         }
         let _ = CloseHandle(snapshot);
-    }
 
-    Ok(ordered)
+        let mut pending = vec![root_pid];
+        let mut seen = std::collections::HashSet::from([root_pid]);
+        let mut ordered = Vec::new();
+
+        while let Some(parent) = pending.pop() {
+            if let Some(children) = children_by_parent.get(&parent) {
+                for &child in children {
+                    if seen.insert(child) {
+                        ordered.push(child);
+                        pending.push(child);
+                    }
+                }
+            }
+        }
+
+        Ok(ordered)
+    }
 }
 
 fn terminate_pid(pid: u32) -> AppResult<()> {
