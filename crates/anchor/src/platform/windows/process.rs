@@ -5,32 +5,56 @@ use std::path::Path;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::error::{AppError, AppResult};
 
 pub fn is_process_alive(pid: u32) -> bool {
     unsafe {
-        // Prefer synchronize access so we can tell a zombie/exiting process
-        // from a truly live one. OpenProcess can succeed briefly after exit.
-        let handle = OpenProcess(
+        // Prefer a synchronizable handle so an exited process is observed via
+        // its signaled process object. The previous implementation fell back
+        // to a query-only handle and still called WaitForSingleObject on it;
+        // that produces WAIT_FAILED and was incorrectly treated as alive.
+        if let Ok(handle) = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
             false,
             pid,
-        )
-        .or_else(|_| OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid));
-        let Ok(handle) = handle else {
-            return false;
+        ) {
+            if handle == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let still_running = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+            let _ = CloseHandle(handle);
+            return still_running;
+        }
+
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            // Protected processes can deny OpenProcess while still appearing
+            // in the process snapshot. Conservatively keep those PIDs alive so
+            // a listener owned by a system process is never treated as free.
+            return process_ids()
+                .map(|pids| pids.contains(&pid))
+                .unwrap_or(false);
         };
         if handle == INVALID_HANDLE_VALUE {
             return false;
         }
-        // WAIT_OBJECT_0 means the process object is already signaled (exited).
-        let still_running = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+
+        let mut exit_code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut exit_code).is_ok();
         let _ = CloseHandle(handle);
-        still_running
+        if queried {
+            // Win32 STILL_ACTIVE is 259. This branch is only used when the OS
+            // denied synchronization access but allowed limited query access.
+            exit_code == 259
+        } else {
+            process_ids()
+                .map(|pids| pids.contains(&pid))
+                .unwrap_or(false)
+        }
     }
 }
 

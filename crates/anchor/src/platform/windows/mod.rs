@@ -18,7 +18,13 @@ impl Platform for WindowsPlatform {
     }
 
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>> {
-        net::find_pid_listening_on_port(port)
+        // GetExtendedTcpTable can briefly retain a LISTEN row after its owner
+        // exits. Never surface that stale owner as an active external process:
+        // callers use this primitive as the authoritative port-ownership check.
+        Ok(super::filter_live_pid(
+            net::find_pid_listening_on_port(port)?,
+            process::is_process_alive,
+        ))
     }
 
     fn reclaim_listening_port(&self, port: u16) -> AppResult<bool> {

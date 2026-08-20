@@ -9,6 +9,20 @@ use serde::{Deserialize, Serialize};
 use crate::admin_daemon::{self, AdminDaemonInspection, AdminDaemonState};
 use crate::build_identity::BuildIdentity;
 use crate::error::{AppError, AppResult};
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetOEMCP() -> u32;
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        source: *const u8,
+        source_len: i32,
+        destination: *mut u16,
+        destination_len: i32,
+    ) -> i32;
+}
 use crate::platform::platform;
 
 const SERVICE_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -464,6 +478,75 @@ fn unit_name() -> AppResult<String> {
     ))
 }
 
+#[cfg(any(windows, test))]
+fn encode_windows_task_xml(xml: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(2 + xml.len() * 2);
+    // schtasks /Create /XML is not reliably compatible with UTF-8 task files
+    // on all supported Windows installations. Task Scheduler's native export
+    // format is UTF-16 LE with a BOM, so emit that exact representation.
+    encoded.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in xml.encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    encoded
+}
+
+#[cfg(windows)]
+fn decode_windows_command_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        if payload.len().is_multiple_of(2) {
+            let units = payload
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+            if let Ok(text) = String::from_utf16(&units.collect::<Vec<_>>()) {
+                return text;
+            }
+        }
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.contains('\0') {
+            return text.to_string();
+        }
+    }
+
+    let Ok(source_len) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    let code_page = unsafe { GetOEMCP() };
+    let required = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            source_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if required <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; required as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            source_len,
+            wide.as_mut_ptr(),
+            required,
+        )
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    wide.truncate(written as usize);
+    String::from_utf16_lossy(&wide)
+}
+
 #[cfg(target_os = "linux")]
 fn unit_path() -> AppResult<PathBuf> {
     let config = dirs::config_dir()
@@ -601,7 +684,7 @@ fn platform_registered(_config: Option<&AdminServiceConfig>) -> AppResult<bool> 
 #[cfg(windows)]
 fn platform_enabled() -> AppResult<bool> {
     let output = run_schtasks(&["/Query", "/TN", &task_name()?, "/XML"], false)?;
-    Ok(String::from_utf8_lossy(&output.stdout).contains("<Enabled>true</Enabled>"))
+    Ok(decode_windows_command_output(&output.stdout).contains("<Enabled>true</Enabled>"))
 }
 
 #[cfg(windows)]
@@ -611,7 +694,7 @@ fn platform_install(config: &AdminServiceConfig) -> AppResult<()> {
     let xml_path = PathBuf::from(&config.config_dir)
         .join("admin")
         .join(format!("task-{}.xml", std::process::id()));
-    fs::write(&xml_path, xml)?;
+    fs::write(&xml_path, encode_windows_task_xml(&xml))?;
     let xml_arg = xml_path.display().to_string();
     let create = run_schtasks(
         &["/Create", "/TN", &task_name()?, "/XML", &xml_arg, "/F"],
@@ -670,7 +753,7 @@ fn run_schtasks(args: &[&str], allow_nonzero: bool) -> AppResult<Output> {
         return Err(AppError::Message(format!(
             "schtasks {} 失败：{}",
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_windows_command_output(&output.stderr).trim()
         )));
     }
     Ok(output)
@@ -686,10 +769,12 @@ fn current_windows_task_user() -> AppResult<String> {
     if !output.status.success() {
         return Err(AppError::Message(format!(
             "whoami.exe 执行失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            decode_windows_command_output(&output.stderr).trim()
         )));
     }
-    let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let user = decode_windows_command_output(&output.stdout)
+        .trim()
+        .to_string();
     if user.is_empty() || user.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n')) {
         return Err(AppError::Message("当前 Windows 用户标识无效".into()));
     }
@@ -743,7 +828,7 @@ fn render_windows_task_xml(config: &AdminServiceConfig, user: &str) -> AppResult
     ]
     .join(" ");
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
 <Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
   <RegistrationInfo><Description>Anchor Web Admin ({scope})</Description></RegistrationInfo>\n\
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>\n\
@@ -880,5 +965,17 @@ mod tests {
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("admin daemon-run --port 28769"));
         assert!(xml.contains("DESKTOP\\demo"));
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
+
+        let encoded = encode_windows_task_xml(&xml);
+        assert!(encoded.starts_with(&[0xFF, 0xFE]));
+        let decoded = String::from_utf16(
+            &encoded[2..]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .expect("utf-16 task xml");
+        assert_eq!(decoded, xml);
     }
 }

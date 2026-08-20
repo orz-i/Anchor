@@ -37,6 +37,14 @@ pub trait Platform: Send + Sync {
     fn frpc_candidates(&self) -> Vec<PathBuf>;
 }
 
+#[cfg(any(windows, test))]
+fn filter_live_pid<F>(pid: Option<u32>, is_alive: F) -> Option<u32>
+where
+    F: Fn(u32) -> bool,
+{
+    pid.filter(|pid| is_alive(*pid))
+}
+
 pub(crate) fn app_config_dir_override() -> Option<PathBuf> {
     std::env::var_os(crate::brand::CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
@@ -117,5 +125,20 @@ fn create_platform() -> Box<dyn Platform> {
             }
         }
         Box::new(Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_live_pid;
+
+    #[test]
+    fn stale_listener_owner_is_discarded() {
+        assert_eq!(filter_live_pid(Some(1956), |_| false), None);
+        assert_eq!(filter_live_pid(Some(1956), |_| true), Some(1956));
+        assert_eq!(
+            filter_live_pid(None, |_| panic!("no PID must not be probed")),
+            None
+        );
     }
 }
