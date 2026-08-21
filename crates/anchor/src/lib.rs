@@ -25,6 +25,8 @@ pub mod gateway_control;
 pub mod gateway_daemon;
 pub mod harness;
 mod health;
+#[cfg(all(feature = "cli", target_os = "linux"))]
+pub mod linux_service;
 mod logging;
 mod management;
 mod mcp;

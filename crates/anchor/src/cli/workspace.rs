@@ -218,6 +218,8 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
         .ok_or_else(|| AppError::Message(format!("workspace 已不存在：{}", profile.id)))?;
     #[cfg(windows)]
     crate::windows_service::forget_workspace(&profile.id)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::forget_workspace(&profile.id)?;
     print_mutation("unregistered", &removed, false, warnings, as_json)?;
     Ok(0)
 }

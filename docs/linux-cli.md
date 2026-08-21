@@ -109,48 +109,33 @@ anchor gateway serve PROJECT_A PROJECT_B PROJECT_C
 
 ## systemd 用户服务
 
-推荐由 systemd 负责后台化、重启和日志收集。先通过 `anchor list` 获取稳定的 profile ID，然后创建：
-
-```text
-~/.config/systemd/user/anchor.service
-```
-
-内容示例：
-
-```ini
-[Unit]
-Description=Anchor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/anchor serve PROFILE_ID --service mcp
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-```
-
-加载并启动：
+Linux 现在由 Anchor 原生维护配置域专属的 systemd user control-plane service。先按需要启动 Workspace/Gateway，让 desired state 写入 service plan，然后安装：
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now anchor.service
-systemctl --user status anchor.service
-journalctl --user -u anchor.service -f
+anchor start Anchor --service mcp --tunnel
+anchor service install
+anchor service status
 ```
 
-systemd 必须直接运行前台 `serve` 或 `gateway serve`，不要使用 `start`；内置 daemon 适合人工 SSH 运维，不替代 systemd 的开机自启和进程监督。
+`anchor service install` 会：
 
-不要在 `/etc/profile`、`~/.profile` 或 shell rc 文件中无条件执行 `anchor restart <workspace>` 来实现开机启动。这些文件按登录/交互 shell 加载，而不是“每次系统启动只执行一次”；SSH、多终端或自动化登录可能在很短时间内并发触发多次 restart。需要随系统/用户会话启动时应使用上面的 systemd unit；若只做人工恢复，使用显式的 `anchor start` / `anchor restart`。Anchor 的 daemon 生命周期会对并发启动、旧 PID 状态和 Unix 控制 socket 缺失做安全恢复，但 shell profile 仍不应承担进程监督职责。
+- 捕获当前 Workspace/Gateway 后台运行计划；
+- 在 `~/.config/systemd/user/` 写入当前配置域专属 unit；
+- `enable` 并启动该 unit；
+- 自动启用当前 Linux 用户的 `linger`，使退出登录及节点重启后 user manager 仍可启动；
+- 由一个长期 control-plane service 按 plan 恢复并监督 Workspace/Gateway daemon，而不是在 shell profile 中重复执行 `restart`。
 
-`serve`/`gateway serve` 运行在 systemd 等非交互环境时不会读取 shell 启动脚本。Anchor 的命令执行层会在继承的 `PATH` 之后补充当前用户常见的稳定工具链目录，包括 `~/.local/bin`、`~/.cargo/bin`、`~/.local/share/pnpm`、Volta/asdf/mise/Bun、Go，并尊重已继承的 `NVM_BIN`、fnm multishell、`PNPM_HOME`、`CARGO_HOME`、`GOBIN`/`GOROOT` 等环境变量；当 `NVM_BIN` 未继承时，还会解析 `NVM_DIR`（默认 `~/.nvm`）中的 `alias/default`，只选择该默认别名明确指向的已安装 Node 版本；没有 default alias 时，仅在本机只安装了一个 NVM Node 版本时使用该唯一版本。不会在多个未指定版本之间自行挑选。相同的有效 `PATH` 也用于未显式覆盖 `PATH` 的 stdio 下游 MCP 子进程，避免 `npx`/`node` 等启动器只因 daemon 环境较窄而整组失效。对于无法由上述确定性规则解析的 fnm/NVM 自定义选择或其他安装位置，仍应通过 service 的 `Environment=PATH=...` 显式固定。
+以后通过 `anchor start` / `anchor stop` / `anchor restart`、Gateway route/config 管理或 Workspace 注销产生的 desired state 会同步到同一 plan。若需要把“当前实际正在运行的集合”覆盖为下一次启动计划，可显式执行 `anchor service sync`。
+
+`anchor service status` 会同时报告 unit 是否 installed/enabled/running、plan、注册时的 build identity 和当前 CLI build。**更新源码并不等于更新已安装的 `/usr/local/bin/anchor`。** 如果 service/status 显示 build 不一致，应先完成二进制替换/升级，再用新二进制执行一次 `anchor service install`，刷新 unit 与 build registration；否则重启后仍可能由旧安装映像拉起旧 Catalog/行为。
+
+不要在 `/etc/profile`、`~/.profile` 或 shell rc 文件中无条件执行 `anchor restart <workspace>` 来实现开机启动。这些文件按登录/交互 shell 加载，而不是“每次系统启动只执行一次”；SSH、多终端或自动化登录可能在很短时间内并发触发多次 restart。需要随节点启动时使用 `anchor service install`；若只做人工恢复，使用显式的 `anchor start` / `anchor restart`。
+
+control-plane service 与它拉起的 daemon 运行在 systemd 非交互环境，不会读取 shell 启动脚本。Anchor 的命令执行层会在继承的 `PATH` 之后补充当前用户常见的稳定工具链目录，包括 `~/.local/bin`、`~/.cargo/bin`、`~/.local/share/pnpm`、Volta/asdf/mise/Bun、Go，并尊重已继承的 `NVM_BIN`、fnm multishell、`PNPM_HOME`、`CARGO_HOME`、`GOBIN`/`GOROOT` 等环境变量；当 `NVM_BIN` 未继承时，还会解析 `NVM_DIR`（默认 `~/.nvm`）中的 `alias/default`，只选择该默认别名明确指向的已安装 Node 版本；没有 default alias 时，仅在本机只安装了一个 NVM Node 版本时使用该唯一版本。不会在多个未指定版本之间自行挑选。
 
 环境诊断只会在 Docker daemon 健康、项目存在 Docker/Compose 配置且当前 runtime 命令白名单明确允许 `docker` 时推荐 Docker 验证链路。默认不会因为“检测到 Docker”就推荐一个随后会被 `exec_command` 策略拒绝的路径；需要启用 Docker 命令时，应由操作者在 Workspace runtime 的 `allowed_commands` 中显式加入并接受 Docker daemon 带来的额外宿主机信任边界。
 
-需要在退出登录后继续运行时，可为该 Linux 用户启用 linger：
+`anchor service install` 会自动处理 linger；如需人工复核：
 
 ```bash
 sudo loginctl enable-linger "$USER"

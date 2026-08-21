@@ -290,6 +290,8 @@ pub async fn set_daemon_service(
     let result = reconcile_daemon(profile, desired, timeout, force).await?;
     #[cfg(windows)]
     crate::windows_service::set_workspace_desired(&profile.id, desired)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_workspace_desired(&profile.id, desired)?;
     Ok(result)
 }
 

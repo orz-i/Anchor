@@ -63,6 +63,14 @@ async fn restore_direct_workspace_after_gateway_failure(
                     "{primary}；已恢复 Workspace daemon，但恢复 Windows Service 计划失败：{plan_error}"
                 ));
             }
+            #[cfg(target_os = "linux")]
+            if let Err(plan_error) =
+                crate::linux_service::set_workspace_desired(&profile.id, Some(previous))
+            {
+                return AppError::Message(format!(
+                    "{primary}；已恢复 Workspace daemon，但恢复 Linux Service 计划失败：{plan_error}"
+                ));
+            }
             AppError::Message(format!(
                 "{primary}；已恢复该 Workspace 原有 MCP daemon 运行态"
             ))
@@ -128,6 +136,8 @@ pub(crate) async fn set_gateway_workspace_route(
         }
         #[cfg(windows)]
         crate::windows_service::set_gateway_desired(&desired_routes)?;
+        #[cfg(target_os = "linux")]
+        crate::linux_service::set_gateway_desired(&desired_routes)?;
         return gateway_control::status_via_daemon_or_local().await;
     }
 
@@ -220,6 +230,8 @@ pub(crate) async fn set_gateway_workspace_route(
 
     #[cfg(windows)]
     crate::windows_service::set_gateway_desired(&desired_routes)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_gateway_desired(&desired_routes)?;
     gateway_control::status_via_daemon_or_local().await
 }
 
@@ -372,6 +384,8 @@ pub(crate) async fn delete_workspace(id: &str) -> AppResult<()> {
     }
     #[cfg(windows)]
     crate::windows_service::forget_workspace(id)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::forget_workspace(id)?;
     Ok(())
 }
 
@@ -524,6 +538,10 @@ pub(crate) async fn set_mcp_gateway(
     #[cfg(windows)]
     if !enabled {
         crate::windows_service::set_gateway_desired(&[])?;
+    }
+    #[cfg(target_os = "linux")]
+    if !enabled {
+        crate::linux_service::set_gateway_desired(&[])?;
     }
     gateway_control::status_via_daemon_or_local().await
 }

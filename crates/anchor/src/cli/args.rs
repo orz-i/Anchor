@@ -1856,7 +1856,7 @@ gateway start/stop/restart 管理独立全局 Gateway daemon；gateway serve 保
 }
 
 pub fn service_usage() -> &'static str {
-    "Windows SCM Service 命令：\n\
+    "Control Plane Service 命令（Windows SCM / Linux systemd user）：\n\
   anchor service status\n\
   anchor service install\n\
   anchor service uninstall\n\
@@ -1864,7 +1864,7 @@ pub fn service_usage() -> &'static str {
   anchor service stop\n\
   anchor service restart\n\
   anchor service sync\n\n\
-install 会创建当前配置域专属的自动启动 SCM service，并保留/捕获当前 Workspace/Gateway 后台运行计划；sync 将当前运行态刷新为下次开机自动启动计划。install/uninstall 通常需要管理员权限。"
+install 会创建当前配置域专属的自动启动 service，并保留/捕获当前 Workspace/Gateway 后台运行计划；sync 将当前运行态刷新为下次开机自动启动计划。Linux 使用 systemd --user 并启用当前用户 linger；Windows 使用 SCM。"
 }
 
 pub fn workspace_usage() -> &'static str {

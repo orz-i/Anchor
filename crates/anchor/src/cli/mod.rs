@@ -300,11 +300,33 @@ fn execute_service(command: ServiceCommand, as_json: bool) -> AppResult<i32> {
         Ok(0)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let status = match command {
+            ServiceCommand::Status => crate::linux_service::service_status()?,
+            ServiceCommand::Install => crate::linux_service::install_service()?,
+            ServiceCommand::Uninstall => crate::linux_service::uninstall_service()?,
+            ServiceCommand::Start => crate::linux_service::start_service()?,
+            ServiceCommand::Stop => crate::linux_service::stop_service()?,
+            ServiceCommand::Restart => crate::linux_service::restart_service()?,
+            ServiceCommand::Sync => {
+                let _ = crate::linux_service::sync_plan_from_running()?;
+                crate::linux_service::service_status()?
+            }
+        };
+        if as_json {
+            print_json(&status)?;
+        } else {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Ok(0)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (command, as_json);
         Err(AppError::Message(
-            "Windows SCM Service 命令仅支持 Windows".into(),
+            "Control Plane Service 当前仅支持 Windows 和 Linux".into(),
         ))
     }
 }
@@ -1208,6 +1230,8 @@ async fn start_gateway_daemon(options: GatewayStartOptions, as_json: bool) -> Ap
         .map_err(|error| AppError::Message(error.to_string()))?;
     #[cfg(windows)]
     crate::windows_service::set_gateway_desired(&workspace_ids)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_gateway_desired(&workspace_ids)?;
     if as_json {
         print_json(&json!({
             "event": "gateway_started",
@@ -1237,6 +1261,10 @@ async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppR
     }
     let Some(state) = inspection.state else {
         gateway_daemon::cleanup()?;
+        #[cfg(windows)]
+        crate::windows_service::set_gateway_desired(&[])?;
+        #[cfg(target_os = "linux")]
+        crate::linux_service::set_gateway_desired(&[])?;
         if as_json {
             print_json(&json!({ "event": "gateway_stopped", "alreadyStopped": true }))?;
         } else {
@@ -1246,6 +1274,10 @@ async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppR
     };
     if !inspection.running || !inspection.pid_matches {
         gateway_daemon::cleanup()?;
+        #[cfg(windows)]
+        crate::windows_service::set_gateway_desired(&[])?;
+        #[cfg(target_os = "linux")]
+        crate::linux_service::set_gateway_desired(&[])?;
         if as_json {
             print_json(&json!({ "event": "gateway_stopped", "alreadyStopped": true }))?;
         } else {
@@ -1270,6 +1302,8 @@ async fn stop_gateway_daemon(options: GatewayStopOptions, as_json: bool) -> AppR
     .await?;
     #[cfg(windows)]
     crate::windows_service::set_gateway_desired(&[])?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_gateway_desired(&[])?;
     if as_json {
         print_json(&json!({ "event": "gateway_stopped", "pid": state.pid }))?;
     } else {
@@ -1441,6 +1475,10 @@ async fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> A
     #[cfg(windows)]
     if !config.enabled {
         crate::windows_service::set_gateway_desired(&[])?;
+    }
+    #[cfg(target_os = "linux")]
+    if !config.enabled {
+        crate::linux_service::set_gateway_desired(&[])?;
     }
     let applied_config = DataStore::load()?.settings().mcp_gateway;
     if as_json {
@@ -1923,6 +1961,14 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
             tunnels: tunnel.then_some(service),
         }),
     )?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_workspace_desired(
+        &profile.id,
+        Some(control::DaemonLaunchSpec {
+            service,
+            tunnels: tunnel.then_some(service),
+        }),
+    )?;
     print_daemon_result(
         if already_running {
             "already_running"
@@ -1949,6 +1995,8 @@ async fn stop_daemon(options: StopOptions, as_json: bool) -> AppResult<()> {
     .await?;
     #[cfg(windows)]
     crate::windows_service::set_workspace_desired(&profile.id, None)?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_workspace_desired(&profile.id, None)?;
     if as_json {
         print_json(&json!({
             "event": if stopped.is_some() { "stopped" } else { "already_stopped" },
@@ -2442,6 +2490,11 @@ async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         &profile.id,
         Some(control::DaemonLaunchSpec { service, tunnels }),
     )?;
+    #[cfg(target_os = "linux")]
+    crate::linux_service::set_workspace_desired(
+        &profile.id,
+        Some(control::DaemonLaunchSpec { service, tunnels }),
+    )?;
     print_daemon_result(
         "started",
         &profile,
@@ -2583,6 +2636,18 @@ fn print_daemon_result(
             service.as_str()
         );
         println!("日志：{}", daemon::daemon_log_path(&profile.id).display());
+        #[cfg(target_os = "linux")]
+        if let Ok(service_status) = crate::linux_service::service_status() {
+            if !service_status.installed || !service_status.enabled {
+                println!(
+                    "提示：节点重启自动恢复尚未启用；运行 `anchor service install` 注册并启用当前配置域的 systemd user service。"
+                );
+            } else if service_status.build_state == "different" {
+                println!(
+                    "警告：systemd service 记录的 Anchor build 与当前 CLI 不一致；完成二进制更新后再次运行 `anchor service install` 刷新 service 注册。"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2654,10 +2719,26 @@ pub fn run() -> i32 {
                 }
             };
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (owner_sid, owner_username);
+            return match crate::async_runtime::block_on(crate::linux_service::run_service(
+                config_dir.clone(),
+            )) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        crate::logging::timestamped_line(&format!("错误：{error}"))
+                    );
+                    1
+                }
+            };
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (config_dir, owner_sid, owner_username);
-            eprintln!("错误：service-run 仅支持 Windows");
+            eprintln!("错误：service-run 当前仅支持 Windows 和 Linux");
             return 1;
         }
     }
@@ -2779,7 +2860,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::ServiceRun { config_dir, .. } => {
             let _ = config_dir;
             Err(AppError::Message(
-                "service-run 必须由 Windows Service Control Manager 入口直接分派".into(),
+                "service-run 必须由 OS service manager 入口直接分派".into(),
             ))
         }
         Command::ServiceAdminRun {
