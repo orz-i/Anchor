@@ -30,6 +30,7 @@ pub mod linux_service;
 mod logging;
 mod management;
 mod mcp;
+mod notifications;
 mod platform;
 pub mod rollout;
 mod runtime;

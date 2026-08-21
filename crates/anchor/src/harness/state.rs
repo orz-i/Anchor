@@ -1017,7 +1017,8 @@ impl Harness {
         verified: bool,
         session_status: HarnessSessionStatus,
     ) -> HarnessResult<TaskSession> {
-        self.store
+        let task = self
+            .store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;
                 if !task.status.is_writable() {
@@ -1080,7 +1081,9 @@ impl Harness {
                     json!({"ok": true, "closed": true}),
                 ))?;
                 Ok(task)
-            })
+            })?;
+        crate::notifications::task_completed(self, &task, verified);
+        Ok(task)
     }
 
     pub fn abort_task(
