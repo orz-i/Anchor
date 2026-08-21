@@ -2463,6 +2463,16 @@ async fn run_daemon(
     // owner-token startup/config failures remain observable in daemon.log.
     #[cfg(windows)]
     crate::logging::redirect_stdio_to_file(&daemon::daemon_log_path(selector))?;
+    #[cfg(windows)]
+    if let Err(error) = crate::platform::install_windows_kill_on_close_job() {
+        crate::tunnel::append_profile_log(
+            selector,
+            "daemon.log",
+            &format!(
+                "[daemon] warning: failed to install Windows kill-on-close process job: {error}"
+            ),
+        );
+    }
     let store = DataStore::load()?;
     let profile = resolve_workspace(store.list(), selector)?.clone();
 

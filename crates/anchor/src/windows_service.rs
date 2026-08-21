@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::build_identity::BuildIdentity;
 use crate::control::{self, DaemonLaunchSpec};
-use crate::daemon::ServiceSelection;
+use crate::daemon::{self, ServiceSelection};
 use crate::error::{AppError, AppResult};
 use crate::gateway_control::{self, GatewayOperation};
 use crate::gateway_daemon;
@@ -1278,6 +1278,8 @@ pub fn uninstall_scm_service() -> AppResult<WindowsScmServiceStatus> {
     }
     if status.state != "stopped" {
         stop_scm_service()?;
+    } else {
+        cleanup_stopped_service_managed_processes()?;
     }
     let deleted = run_sc(&["delete", &service_name])?;
     if !deleted.success && !contains_sc_error(&deleted, 1060) {
@@ -1307,7 +1309,88 @@ pub fn stop_scm_service() -> AppResult<WindowsScmServiceStatus> {
         return Err(sc_error("停止 Windows SCM service", &stopped));
     }
     wait_for_scm_state(&service_name, "stopped", SERVICE_OPERATION_TIMEOUT)?;
+    cleanup_stopped_service_managed_processes()?;
     scm_status()
+}
+
+fn cleanup_stopped_service_managed_processes() -> AppResult<()> {
+    let plan = load_plan()?;
+    if plan.workspaces.is_empty() {
+        return Ok(());
+    }
+    let store = crate::data::DataStore::load_profiles_only()?;
+    let profiles = store
+        .list()
+        .iter()
+        .map(|profile| (profile.id.clone(), profile.clone()))
+        .collect::<BTreeMap<_, _>>();
+    drop(store);
+
+    let mut errors = Vec::new();
+    for entry in &plan.workspaces {
+        let Some(profile) = profiles.get(&entry.workspace_id) else {
+            continue;
+        };
+        let inspection = match daemon::inspect(profile) {
+            Ok(inspection) => inspection,
+            Err(error) => {
+                errors.push(format!("Workspace {} inspect: {error}", profile.name));
+                continue;
+            }
+        };
+        if inspection.ambiguous {
+            errors.push(format!("Workspace {}: {}", profile.name, inspection.detail));
+            continue;
+        }
+        let Some(state) = inspection
+            .state
+            .filter(|_| inspection.running && inspection.pid_matches)
+        else {
+            if inspection.stale {
+                if let Err(error) = daemon::cleanup(profile) {
+                    errors.push(format!("Workspace {} stale cleanup: {error}", profile.name));
+                }
+            }
+            continue;
+        };
+
+        append_service_log(&format!(
+            "[service-admin] SCM is stopped but managed Workspace {} PID {} is still alive; terminating verified process tree",
+            profile.name, state.pid
+        ));
+        if let Err(error) = platform().terminate_process_tree(state.pid) {
+            errors.push(format!(
+                "Workspace {} orphan tree PID {}: {error}",
+                profile.name, state.pid
+            ));
+            continue;
+        }
+        for _ in 0..60 {
+            if !platform().is_process_alive(state.pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if platform().is_process_alive(state.pid) {
+            errors.push(format!(
+                "Workspace {} orphan tree PID {} remained alive after termination",
+                profile.name, state.pid
+            ));
+            continue;
+        }
+        if let Err(error) = daemon::cleanup_after_pid_exit(profile, state.pid) {
+            errors.push(format!(
+                "Workspace {} runtime cleanup: {error}",
+                profile.name
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Message(errors.join("；")))
+    }
 }
 
 pub fn restart_scm_service() -> AppResult<WindowsScmServiceStatus> {
@@ -1807,28 +1890,11 @@ async fn reconcile_service_plan(
                 Err(error) => errors.push(format!("Workspace {}: {error}", profile.name)),
             }
         } else if managed_workspaces.contains(&profile.id) {
-            match crate::daemon::inspect(profile) {
-                Ok(inspection) if inspection.running => {
-                    match control::request_daemon_exit_and_wait(
-                        profile,
-                        control::ControlOperation::Shutdown,
-                        SERVICE_OPERATION_TIMEOUT,
-                        true,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            managed_workspaces.remove(&profile.id);
-                        }
-                        Err(error) => {
-                            errors.push(format!("Workspace {} stop: {error}", profile.name))
-                        }
-                    }
-                }
-                Ok(_) => {
+            match stop_workspace_for_service(profile, control::ControlOperation::Shutdown).await {
+                Ok(()) => {
                     managed_workspaces.remove(&profile.id);
                 }
-                Err(error) => errors.push(format!("Workspace {} inspect: {error}", profile.name)),
+                Err(error) => errors.push(format!("Workspace {} stop: {error}", profile.name)),
             }
         }
     }
@@ -1873,7 +1939,7 @@ async fn reconcile_service_plan(
 async fn ensure_workspace_process_owner(
     profile: &crate::workspace::WorkspaceProfile,
 ) -> AppResult<()> {
-    let inspection = crate::daemon::inspect(profile)?;
+    let inspection = daemon::inspect(profile)?;
     let Some(state) = inspection
         .state
         .filter(|_| inspection.running && inspection.pid_matches)
@@ -1890,14 +1956,46 @@ async fn ensure_workspace_process_owner(
         "[service] Workspace {} PID {} owner mismatch: expected={}, actual={}; restarting under config owner",
         profile.name, state.pid, expected_sid, actual_sid
     ));
-    control::request_daemon_exit_and_wait(
-        profile,
-        control::ControlOperation::Restart,
-        SERVICE_OPERATION_TIMEOUT,
-        true,
-    )
-    .await?;
+    stop_workspace_for_service(profile, control::ControlOperation::Restart).await?;
     Ok(())
+}
+
+async fn stop_workspace_for_service(
+    profile: &crate::workspace::WorkspaceProfile,
+    operation: control::ControlOperation,
+) -> AppResult<()> {
+    let inspection = daemon::inspect(profile)?;
+    if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+    let Some(state) = inspection
+        .state
+        .filter(|_| inspection.running && inspection.pid_matches)
+    else {
+        if inspection.stale {
+            daemon::cleanup(profile)?;
+        }
+        return Ok(());
+    };
+
+    match control::request_daemon_exit_and_wait(profile, operation, SERVICE_OPERATION_TIMEOUT, true)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(control_error) => {
+            append_service_log(&format!(
+                "[service] Workspace {} PID {} {:?} control shutdown failed: {}; falling back to verified process-tree termination",
+                profile.name, state.pid, operation, control_error
+            ));
+            daemon::wait_for_controlled_exit(profile, state.pid, Duration::ZERO, true)
+                .await
+                .map_err(|fallback_error| {
+                    AppError::Message(format!(
+                        "control shutdown failed: {control_error}; verified process-tree fallback failed: {fallback_error}"
+                    ))
+                })
+        }
+    }
 }
 
 async fn ensure_gateway_running(workspace_ids: &[String]) -> AppResult<()> {
@@ -1948,9 +2046,22 @@ async fn stop_gateway_if_running() -> AppResult<()> {
     else {
         return Ok(());
     };
-    let accepted = gateway_control::request_exit(GatewayOperation::Shutdown)
-        .await
-        .map_err(|error| AppError::Message(error.to_string()))?;
+    let accepted = match gateway_control::request_exit(GatewayOperation::Shutdown).await {
+        Ok(accepted) => accepted,
+        Err(control_error) => {
+            append_service_log(&format!(
+                "[service] Gateway PID {} control shutdown failed: {}; falling back to verified process-tree termination",
+                state.pid, control_error
+            ));
+            return gateway_daemon::wait_for_exit(state.pid, Duration::ZERO, true)
+                .await
+                .map_err(|fallback_error| {
+                    AppError::Message(format!(
+                        "Gateway control shutdown failed: {control_error}; process-tree fallback failed: {fallback_error}"
+                    ))
+                });
+        }
+    };
     if accepted != state.pid {
         return Err(AppError::Message(format!(
             "Gateway shutdown PID mismatch: state={}, response={accepted}",
@@ -1965,7 +2076,9 @@ async fn shutdown_managed_control_plane(
     gateway_managed: &mut bool,
 ) {
     if *gateway_managed {
-        let _ = stop_gateway_if_running().await;
+        if let Err(error) = stop_gateway_if_running().await {
+            append_service_log(&format!("[service] Gateway shutdown failed: {error}"));
+        }
         *gateway_managed = false;
     }
     let Ok(store) = crate::data::DataStore::load_profiles_only() else {
@@ -1975,13 +2088,14 @@ async fn shutdown_managed_control_plane(
     drop(store);
     for profile in profiles.iter().rev() {
         if managed_workspaces.contains(&profile.id) {
-            let _ = control::request_daemon_exit_and_wait(
-                profile,
-                control::ControlOperation::Shutdown,
-                SERVICE_OPERATION_TIMEOUT,
-                true,
-            )
-            .await;
+            if let Err(error) =
+                stop_workspace_for_service(profile, control::ControlOperation::Shutdown).await
+            {
+                append_service_log(&format!(
+                    "[service] Workspace {} shutdown failed: {error}",
+                    profile.name
+                ));
+            }
         }
     }
     managed_workspaces.clear();

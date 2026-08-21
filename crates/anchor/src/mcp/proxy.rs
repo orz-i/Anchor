@@ -5278,13 +5278,24 @@ for raw in sys.stdin:
         let temp = tempfile::tempdir().expect("tempdir");
         let script = temp.path().join("process_tree_mcp.py");
         let child_pid_path = temp.path().join("child.pid");
+        let grandchild_pid_path = temp.path().join("grandchild.pid");
         fs::write(
             &script,
             r#"import json
 import subprocess
 import sys
 
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+child_code = '''
+import subprocess
+import sys
+import time
+
+grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(sys.argv[1], "w", encoding="utf-8") as marker:
+    marker.write(str(grandchild.pid))
+time.sleep(60)
+'''
+child = subprocess.Popen([sys.executable, "-c", child_code, sys.argv[2]])
 with open(sys.argv[1], "w", encoding="utf-8") as marker:
     marker.write(str(child.pid))
 
@@ -5310,6 +5321,7 @@ for raw in sys.stdin:
         spec.args = vec![
             script.display().to_string(),
             child_pid_path.display().to_string(),
+            grandchild_pid_path.display().to_string(),
         ];
         spec.cwd = temp.path().to_path_buf();
         spec.name = "tree".into();
@@ -5320,16 +5332,30 @@ for raw in sys.stdin:
             .expect("read child pid")
             .parse::<u32>()
             .expect("child pid number");
+        for _ in 0..20 {
+            if grandchild_pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let grandchild_pid = fs::read_to_string(&grandchild_pid_path)
+            .expect("read grandchild pid")
+            .parse::<u32>()
+            .expect("grandchild pid number");
         assert!(crate::platform::platform().is_process_alive(child_pid));
+        assert!(crate::platform::platform().is_process_alive(grandchild_pid));
 
         client.terminate().await;
         for _ in 0..20 {
-            if !crate::platform::platform().is_process_alive(child_pid) {
+            if !crate::platform::platform().is_process_alive(child_pid)
+                && !crate::platform::platform().is_process_alive(grandchild_pid)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!crate::platform::platform().is_process_alive(child_pid));
+        assert!(!crate::platform::platform().is_process_alive(grandchild_pid));
     }
 
     #[test]

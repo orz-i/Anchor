@@ -72,7 +72,7 @@ fn admin_service_restart_policy_is_bounded_on_linux_and_windows() {
         );
     }
     for windows_guard in [
-        "<RestartOnFailure><Interval>PT5S</Interval><Count>3</Count>",
+        "<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count>",
         "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
         "<LogonType>InteractiveToken</LogonType>",
         "<RunLevel>LeastPrivilege</RunLevel>",

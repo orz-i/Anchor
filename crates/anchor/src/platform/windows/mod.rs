@@ -9,6 +9,10 @@ use crate::platform::Platform;
 
 pub struct WindowsPlatform;
 
+pub(crate) fn install_kill_on_close_job() -> AppResult<()> {
+    process::install_kill_on_close_job()
+}
+
 impl Platform for WindowsPlatform {
     fn app_config_dir(&self) -> AppResult<PathBuf> {
         if let Some(path) = crate::platform::app_config_dir_override() {

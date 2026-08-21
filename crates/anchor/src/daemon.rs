@@ -744,7 +744,7 @@ pub(crate) fn spawn_with_tunnels_from_executable(
             profile.name
         )));
     }
-    if inspection.state.is_some() && !inspection.pid_matches {
+    if should_cleanup_before_spawn(&inspection) {
         cleanup(profile)?;
     }
 
@@ -803,6 +803,10 @@ pub(crate) fn spawn_with_tunnels_from_executable(
         .spawn()
         .map_err(|error| AppError::Message(format!("启动 daemon 子进程失败：{error}")))?;
     Ok(child.id())
+}
+
+fn should_cleanup_before_spawn(inspection: &DaemonInspection) -> bool {
+    inspection.stale || (inspection.state.is_some() && !inspection.pid_matches)
 }
 
 #[cfg(unix)]
@@ -1059,7 +1063,7 @@ pub async fn wait_for_controlled_exit(
     cleanup_after_pid_exit(profile, pid)
 }
 
-fn cleanup_after_pid_exit(profile: &WorkspaceProfile, exited_pid: u32) -> AppResult<()> {
+pub(crate) fn cleanup_after_pid_exit(profile: &WorkspaceProfile, exited_pid: u32) -> AppResult<()> {
     let paths = daemon_paths(&profile.id)?;
     cleanup_after_pid_exit_in(&paths, exited_pid)
 }
@@ -1552,6 +1556,27 @@ mod tests {
         assert!(!paths.state.exists());
         assert!(!paths.pid.exists());
         assert!(!paths.control.exists());
+    }
+
+    #[test]
+    fn stale_runtime_metadata_is_cleaned_before_spawn_even_without_parsed_state() {
+        let stale_without_state = DaemonInspection {
+            supported: true,
+            running: false,
+            stale: true,
+            ambiguous: false,
+            pid_matches: false,
+            state: None,
+            detail: "stale state file could not be trusted".into(),
+        };
+        assert!(should_cleanup_before_spawn(&stale_without_state));
+
+        let clean_without_state = DaemonInspection {
+            stale: false,
+            detail: "not running".into(),
+            ..stale_without_state
+        };
+        assert!(!should_cleanup_before_spawn(&clean_without_state));
     }
 
     #[cfg(windows)]
