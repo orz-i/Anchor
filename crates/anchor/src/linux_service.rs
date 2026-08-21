@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::time::Duration;
 
 use fs2::FileExt;
@@ -302,20 +302,8 @@ fn ensure_linux_linger() -> AppResult<()> {
     Ok(())
 }
 
-fn run_systemctl(args: &[&str], allow_nonzero: bool) -> AppResult<Output> {
-    let output = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .map_err(|error| AppError::Message(format!("无法执行 systemctl --user：{error}")))?;
-    if !allow_nonzero && !output.status.success() {
-        return Err(AppError::Message(format!(
-            "systemctl --user {} 失败：{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(output)
+fn run_systemctl(args: &[&str], allow_nonzero: bool) -> AppResult<std::process::Output> {
+    crate::platform::run_user_systemctl(args, allow_nonzero)
 }
 
 fn systemd_quote(value: &str) -> AppResult<String> {
@@ -408,6 +396,10 @@ pub fn install_service() -> AppResult<LinuxServiceStatus> {
         Ok(())
     })?;
     ensure_linux_linger()?;
+    // Validate the user-manager transport before writing/replacing the unit so
+    // a missing SSH session environment cannot leave a misleading partial
+    // installation behind. run_systemctl supplies the canonical runtime dir.
+    run_systemctl(&["show-environment"], false)?;
     let path = unit_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

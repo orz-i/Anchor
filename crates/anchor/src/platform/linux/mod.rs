@@ -1,11 +1,14 @@
 mod net;
 mod paths;
 mod process;
+mod systemd;
 
 use std::path::PathBuf;
 
 use crate::error::AppResult;
 use crate::platform::Platform;
+
+pub(crate) use systemd::run_user_systemctl;
 
 pub struct LinuxPlatform;
 

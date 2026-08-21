@@ -69,6 +69,8 @@ pub(crate) use child_process::{
 pub use open::open_path_in_file_manager;
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux::run_user_systemctl;
+#[cfg(target_os = "linux")]
 pub use linux::LinuxPlatform;
 #[cfg(target_os = "macos")]
 pub use macos::MacPlatform;

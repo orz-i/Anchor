@@ -624,19 +624,7 @@ fn platform_disable() -> AppResult<()> {
 
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[&str], allow_nonzero: bool) -> AppResult<Output> {
-    let output = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .map_err(|error| AppError::Message(format!("无法执行 systemctl --user：{error}")))?;
-    if !allow_nonzero && !output.status.success() {
-        return Err(AppError::Message(format!(
-            "systemctl --user {} 失败：{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(output)
+    crate::platform::run_user_systemctl(args, allow_nonzero)
 }
 
 #[cfg(target_os = "linux")]

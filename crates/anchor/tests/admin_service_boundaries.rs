@@ -2,8 +2,12 @@ use std::fs;
 use std::path::PathBuf;
 
 fn source(name: &str) -> String {
+    source_path(name)
+}
+
+fn source_path(path: &str) -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    fs::read_to_string(manifest.join("src").join(name)).expect("source file")
+    fs::read_to_string(manifest.join("src").join(path)).expect("source file")
 }
 
 #[test]
@@ -57,6 +61,7 @@ fn persistent_admin_recovery_is_identity_checked_and_fail_closed() {
 #[test]
 fn admin_service_restart_policy_is_bounded_on_linux_and_windows() {
     let service = source("admin_service.rs");
+    let systemd = source_path("platform/linux/systemd.rs");
 
     for linux_guard in [
         "Restart=on-failure",
@@ -64,11 +69,23 @@ fn admin_service_restart_policy_is_bounded_on_linux_and_windows() {
         "StartLimitIntervalSec=60",
         "StartLimitBurst=3",
         "enable-linger",
-        "systemctl\")\n        .arg(\"--user\")",
+        "crate::platform::run_user_systemctl",
     ] {
         assert!(
             service.contains(linux_guard),
             "missing Linux Admin service recovery guard: {linux_guard}"
+        );
+    }
+    for user_bus_guard in [
+        ".arg(\"--user\")",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "/run/user",
+        "Failed to connect to bus",
+    ] {
+        assert!(
+            systemd.contains(user_bus_guard),
+            "missing shared systemd user-bus guard: {user_bus_guard}"
         );
     }
     for windows_guard in [

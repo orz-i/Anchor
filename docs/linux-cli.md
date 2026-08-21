@@ -129,6 +129,8 @@ anchor service status
 
 `anchor service status` 会同时报告 unit 是否 installed/enabled/running、plan、注册时的 build identity 和当前 CLI build。**更新源码并不等于更新已安装的 `/usr/local/bin/anchor`。** 如果 service/status 显示 build 不一致，应先完成二进制替换/升级，再用新二进制执行一次 `anchor service install`，刷新 unit 与 build registration；否则重启后仍可能由旧安装映像拉起旧 Catalog/行为。
 
+在 SSH、自动化 shell 或 root 登录中，PAM 可能没有注入 `XDG_RUNTIME_DIR`，即使 `user@<uid>.service` 已运行，裸 `systemctl --user` 也会报 `Failed to connect to bus: No medium found`。Anchor 会按当前有效 UID 显式使用 `/run/user/<uid>` 连接 systemd user manager，并忽略可能陈旧的 `DBUS_SESSION_BUS_ADDRESS`，因此正常情况下无需手工 `export XDG_RUNTIME_DIR=/run/user/0`。如果 user manager 本身不可用，错误会报告 UID、期望 runtime dir，并提示检查 `systemd-logind` / `user@<uid>.service`。
+
 不要在 `/etc/profile`、`~/.profile` 或 shell rc 文件中无条件执行 `anchor restart <workspace>` 来实现开机启动。这些文件按登录/交互 shell 加载，而不是“每次系统启动只执行一次”；SSH、多终端或自动化登录可能在很短时间内并发触发多次 restart。需要随节点启动时使用 `anchor service install`；若只做人工恢复，使用显式的 `anchor start` / `anchor restart`。
 
 control-plane service 与它拉起的 daemon 运行在 systemd 非交互环境，不会读取 shell 启动脚本。Anchor 的命令执行层会在继承的 `PATH` 之后补充当前用户常见的稳定工具链目录，包括 `~/.local/bin`、`~/.cargo/bin`、`~/.local/share/pnpm`、Volta/asdf/mise/Bun、Go，并尊重已继承的 `NVM_BIN`、fnm multishell、`PNPM_HOME`、`CARGO_HOME`、`GOBIN`/`GOROOT` 等环境变量；当 `NVM_BIN` 未继承时，还会解析 `NVM_DIR`（默认 `~/.nvm`）中的 `alias/default`，只选择该默认别名明确指向的已安装 Node 版本；没有 default alias 时，仅在本机只安装了一个 NVM Node 版本时使用该唯一版本。不会在多个未指定版本之间自行挑选。
