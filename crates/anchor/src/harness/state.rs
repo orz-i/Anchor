@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -297,6 +297,82 @@ impl Harness {
                 ))?;
                 Ok(task)
             })
+    }
+
+    pub fn reclaim_session(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        path: &str,
+    ) -> HarnessResult<TaskSession> {
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能重新绑定 Session",
+                    ));
+                }
+                let previous_session_id = task.session_id.clone();
+                let previous_session_path = task.session_path.clone();
+                if previous_session_id.as_deref() == Some(session_id)
+                    && previous_session_path.as_deref() == Some(path)
+                {
+                    return Ok(task);
+                }
+                task.session_id = Some(session_id.to_string());
+                task.session_path = Some(path.to_string());
+                let rebound_at = timestamp();
+                task.updated_at = rebound_at.clone();
+                task.last_activity_at = Some(rebound_at);
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "session_reclaimed",
+                    Some("begin_work_session"),
+                    json!({
+                        "previous_session_id": previous_session_id,
+                        "previous_session_path": previous_session_path,
+                        "session_id": session_id,
+                        "path": path
+                    }),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
+    }
+
+    pub fn pause_stale_active_tasks(
+        &self,
+        protected_task_ids: &HashSet<String>,
+    ) -> HarnessResult<Vec<String>> {
+        let now_ms = current_millis();
+        let candidates = self
+            .store
+            .list_tasks(&self.workspace_id)?
+            .into_iter()
+            .filter(|task| matches!(task.status, TaskStatus::Active | TaskStatus::Verifying))
+            .filter(|task| !protected_task_ids.contains(&task.id))
+            .filter(|task| {
+                let last_activity = task
+                    .last_activity_at
+                    .as_deref()
+                    .unwrap_or(task.updated_at.as_str())
+                    .parse::<u64>()
+                    .unwrap_or(now_ms);
+                now_ms.saturating_sub(last_activity) >= STALE_ACTIVE_TASK_AFTER_MS
+            })
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        let mut paused = Vec::new();
+        for task_id in candidates {
+            if self.transition(&task_id, TaskStatus::Paused).is_ok() {
+                paused.push(task_id);
+            }
+        }
+        Ok(paused)
     }
 
     pub fn all_operations(&self, limit: usize) -> HarnessResult<Vec<OperationRecord>> {
@@ -3221,5 +3297,56 @@ mod tests {
             .find(|record| record.id == failed.id)
             .expect("previous verification");
         assert_eq!(verification_effective_disposition(previous), "superseded");
+    }
+
+    #[test]
+    fn stale_active_task_is_paused_when_no_execution_requires_followup() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let mut task = harness.start_task("stale writer").expect("start");
+        task.last_activity_at = Some("0".into());
+        task.updated_at = "0".into();
+        harness.store.save_task(&task).expect("persist stale task");
+
+        let paused = harness
+            .pause_stale_active_tasks(&HashSet::new())
+            .expect("pause stale tasks");
+        assert_eq!(paused, vec![task.id.clone()]);
+        assert_eq!(
+            harness.task(&task.id).expect("task after gc").status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[test]
+    fn stale_active_task_is_preserved_when_execution_requires_followup() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let mut task = harness.start_task("protected stale writer").expect("start");
+        task.last_activity_at = Some("0".into());
+        task.updated_at = "0".into();
+        harness.store.save_task(&task).expect("persist stale task");
+        let protected = HashSet::from([task.id.clone()]);
+
+        let paused = harness
+            .pause_stale_active_tasks(&protected)
+            .expect("preserve protected task");
+        assert!(paused.is_empty());
+        assert_eq!(
+            harness.task(&task.id).expect("task after gc").status,
+            TaskStatus::Active
+        );
     }
 }

@@ -3260,6 +3260,9 @@ pub fn input_schema(name: &str) -> Value {
                 "title": { "type": "string", "maxLength": 200 },
                 "create_if_missing": { "type": "boolean", "default": true, "description": "When false, recover an already-existing Session + writable Harness Task only. Never create a replacement Task or Git worktree; return a structured not-found/conflict error instead." },
                 "resume_completed": { "type": "boolean", "default": false, "description": "Explicitly reactivate the selected completed Session instead of creating a continuation Session." },
+                "task_id": { "type": "string", "minLength": 1, "description": "Explicit durable Harness Task to attach to instead of selecting by the current Session binding." },
+                "reclaim_session": { "type": "boolean", "default": false, "description": "Explicitly transfer a durable Task from its previous Session lease to the opened Session. Reclaim is rejected while the Task owns running or unconsumed command sessions." },
+                "expected_head": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Caller-observed Git HEAD required when reclaim_session=true; must match the durable Task expected HEAD." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or use an isolated Anchor-managed Git worktree for a new task." },
                 "worktree_path": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Bind the new task to an existing registered Anchor-managed worktree under .anchor/worktrees. Valid only with workspace_mode=worktree and mutually exclusive with worktree_branch/worktree_base_ref." },
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
@@ -3621,6 +3624,21 @@ pub fn input_schema(name: &str) -> Value {
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
                 "stdin": { "type": "string", "default": "" },
+                "expected_exit_codes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": { "type": "integer" },
+                    "default": [0],
+                    "description": "Exit codes that should be treated as successful command completion. Transport, spawn, timeout, cancellation, and kill failures remain failures."
+                },
+                "allowed_exit_codes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": { "type": "integer" },
+                    "description": "Alias for expected_exit_codes. Do not provide both fields with different values."
+                },
                 "cost_intent": {
                     "type": "string",
                     "enum": ["auto", "local_only", "external_paid"],

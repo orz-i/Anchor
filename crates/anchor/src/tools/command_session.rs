@@ -833,6 +833,27 @@ impl CommandSessionStore {
         task_ids
     }
 
+    pub fn task_ids_requiring_followup(&self) -> Vec<String> {
+        let sessions = {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        let mut task_ids = sessions
+            .into_iter()
+            .filter_map(|session| {
+                crate::async_runtime::block_on(session.refresh_status());
+                let requires_followup = !session.has_exited() || !session.terminal_observed();
+                requires_followup
+                    .then(|| session.harness_metadata().map(|metadata| metadata.task_id))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        task_ids.sort_unstable();
+        task_ids.dedup();
+        task_ids
+    }
+
     pub(crate) fn prepare_daemon_handoff(
         &self,
         initiator_pid: u32,
@@ -1007,6 +1028,7 @@ pub struct ExecSession {
     externally_retained: AtomicBool,
     resource_lease: Mutex<Option<ExecutionLease>>,
     execution_resources: Option<Value>,
+    expected_exit_codes: Vec<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1134,7 +1156,18 @@ impl ExecSession {
             externally_retained: AtomicBool::new(false),
             resource_lease: Mutex::new(resource_lease),
             execution_resources,
+            expected_exit_codes: vec![0],
         }
+    }
+
+    pub fn with_expected_exit_codes(mut self, mut expected_exit_codes: Vec<i32>) -> Self {
+        expected_exit_codes.sort_unstable();
+        expected_exit_codes.dedup();
+        if expected_exit_codes.is_empty() {
+            expected_exit_codes.push(0);
+        }
+        self.expected_exit_codes = expected_exit_codes;
+        self
     }
 
     pub fn harness_metadata(&self) -> Option<SessionHarnessMetadata> {
@@ -1344,7 +1377,9 @@ impl ExecSession {
         };
         let reason = termination_reason.as_deref().unwrap_or("running");
         let command_ok = match reason {
-            "exited" => Some(exit_code.is_some_and(|code| code == 0)),
+            "exited" => {
+                Some(exit_code.is_some_and(|code| self.expected_exit_codes.contains(&code)))
+            }
             "running" => None,
             _ => Some(false),
         };

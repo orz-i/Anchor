@@ -62,6 +62,12 @@ pub fn call(
     cancellation: &CancellationToken,
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
+    if matches!(
+        name,
+        "harness_status" | "begin_work_session" | "project_state" | "start_task" | "switch_task"
+    ) {
+        auto_pause_stale_tasks(ctx)?;
+    }
     let recovered_outboxes = if matches!(name, "close_work_session" | "complete_work_session")
         || !ctx.is_primary_workspace()
     {
@@ -110,6 +116,65 @@ pub fn call(
     }
 
     Ok(tool_ok(value))
+}
+
+fn ensure_session_reclaim_safe(
+    ctx: &ToolContext,
+    task: &TaskSession,
+    args: &Value,
+) -> Result<(), WorkspaceError> {
+    let expected_head = args
+        .get("expected_head")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            tool_error(
+                "WORK_SESSION_RECLAIM_HEAD_REQUIRED",
+                "expected_head is required when reclaim_session=true",
+            )
+        })?;
+    let durable_head = task.expected_state.head.as_deref().unwrap_or_default();
+    if durable_head != expected_head {
+        return Err(WorkspaceError::ToolDetails {
+            code: "WORK_SESSION_RECLAIM_HEAD_MISMATCH",
+            message: "The observed HEAD does not match the durable Task expected HEAD.".into(),
+            category: "conflict",
+            retryable: true,
+            details: json!({
+                "task_id": task.id,
+                "expected_head": durable_head,
+                "observed_head": expected_head
+            }),
+        });
+    }
+    let (running, unobserved_terminal) = ctx.sessions.pending_for_task(&task.id, 4096);
+    if !running.is_empty() || !unobserved_terminal.is_empty() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "WORK_SESSION_RECLAIM_BUSY",
+            message: "The prior Task lease still owns a running command or an unconsumed terminal result.".into(),
+            category: "conflict",
+            retryable: true,
+            details: json!({
+                "task_id": task.id,
+                "running_sessions": running,
+                "unobserved_terminal_sessions": unobserved_terminal,
+                "required_action": "Wait for/consume or terminate the retained command session before reclaiming the Task."
+            }),
+        });
+    }
+    ensure_writer_handoff_available(ctx, Some(&task.id), None)
+}
+
+fn auto_pause_stale_tasks(ctx: &ToolContext) -> Result<Vec<String>, WorkspaceError> {
+    let protected = ctx
+        .sessions
+        .task_ids_requiring_followup()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    ctx.harness
+        .pause_stale_active_tasks(&protected)
+        .map_err(map_error)
 }
 
 fn resolve_recovery(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -884,6 +949,28 @@ fn begin_work_session(
         .ok_or_else(|| tool_error("SESSION_INVALID", "Session 缺少 session_path"))?;
 
     let tasks = ctx.harness.list_tasks().map_err(map_error)?;
+    let requested_task_id = args
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let requested_task = requested_task_id
+        .map(|task_id| {
+            tasks
+                .iter()
+                .find(|task| task.id == task_id && task.status.is_writable())
+                .cloned()
+                .ok_or_else(|| WorkspaceError::ToolDetails {
+                    code: "WORK_SESSION_TASK_NOT_FOUND",
+                    message:
+                        "The requested durable Harness Task does not exist or is not writable."
+                            .into(),
+                    category: "not_found",
+                    retryable: false,
+                    details: json!({"task_id": task_id}),
+                })
+        })
+        .transpose()?;
     let explicit_task = ctx.bound_task_for_session(mcp_session_id).filter(|task| {
         task.session_id.as_deref() == Some(session_id)
             && task.session_path.as_deref() == Some(session_path)
@@ -914,11 +1001,25 @@ fn begin_work_session(
             })
         })
         .collect::<Vec<_>>();
-    let selected_task = session_task.or(explicit_task);
+    let selected_task = requested_task.or(session_task).or(explicit_task);
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
             validate_requested_workspace_mode(ctx, args, &task)?;
             if task.objective != objective {
+                if requested_task_id.is_some() {
+                    return Err(WorkspaceError::ToolDetails {
+                        code: "WORK_SESSION_TASK_CONFLICT",
+                        message: "The requested durable Harness Task has a different objective."
+                            .into(),
+                        category: "conflict",
+                        retryable: false,
+                        details: json!({
+                            "task_id": task.id,
+                            "requested_objective": objective,
+                            "existing_objective": task.objective
+                        }),
+                    });
+                }
                 if !create_if_missing {
                     return Err(WorkspaceError::ToolDetails {
                         code: "WORK_SESSION_TASK_CONFLICT",
@@ -971,10 +1072,42 @@ fn begin_work_session(
             )
         }
     };
-    let mut task = ctx
-        .harness
-        .bind_session(&task.id, session_id, session_path)
-        .map_err(map_error)?;
+    let session_changed = task
+        .session_id
+        .as_deref()
+        .is_some_and(|value| value != session_id)
+        || task
+            .session_path
+            .as_deref()
+            .is_some_and(|value| value != session_path);
+    let mut task = if session_changed {
+        let reclaim = args
+            .get("reclaim_session")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !reclaim {
+            return Err(WorkspaceError::ToolDetails {
+                code: "WORK_SESSION_RECLAIM_REQUIRED",
+                message: "The durable Harness Task is leased to another Session. Explicit reclaim is required before rebinding it.".into(),
+                category: "conflict",
+                retryable: true,
+                details: json!({
+                    "task_id": task.id,
+                    "current_session_id": task.session_id,
+                    "requested_session_id": session_id,
+                    "required_action": "Retry begin_work_session with task_id, reclaim_session=true, and expected_head after confirming the prior client no longer owns a running command."
+                }),
+            });
+        }
+        ensure_session_reclaim_safe(ctx, &task, args)?;
+        ctx.harness
+            .reclaim_session(&task.id, session_id, session_path)
+            .map_err(map_error)?
+    } else {
+        ctx.harness
+            .bind_session(&task.id, session_id, session_path)
+            .map_err(map_error)?
+    };
     if task_created && !configuration.is_empty() {
         task = ctx
             .harness

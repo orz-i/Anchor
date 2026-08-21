@@ -24,6 +24,40 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None, None)
 }
 
+fn parse_expected_exit_codes(args: &Value) -> Result<Vec<i32>, WorkspaceError> {
+    let expected = args.get("expected_exit_codes");
+    let allowed = args.get("allowed_exit_codes");
+    if expected.is_some() && allowed.is_some() && expected != allowed {
+        return Err(WorkspaceError::invalid_argument(
+            "expected_exit_codes and allowed_exit_codes cannot specify different values",
+        ));
+    }
+    let Some(value) = expected.or(allowed) else {
+        return Ok(vec![0]);
+    };
+    let values = value.as_array().ok_or_else(|| {
+        WorkspaceError::invalid_argument("expected_exit_codes must be an array of integers")
+    })?;
+    if values.is_empty() || values.len() > 32 {
+        return Err(WorkspaceError::invalid_argument(
+            "expected_exit_codes must contain between 1 and 32 exit codes",
+        ));
+    }
+    let mut codes = Vec::with_capacity(values.len());
+    for value in values {
+        let code = value.as_i64().ok_or_else(|| {
+            WorkspaceError::invalid_argument("expected_exit_codes must contain only integers")
+        })?;
+        let code = i32::try_from(code).map_err(|_| {
+            WorkspaceError::invalid_argument("expected_exit_codes contains an out-of-range value")
+        })?;
+        codes.push(code);
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    Ok(codes)
+}
+
 pub(crate) fn effective_command_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(process_path) = std::env::var_os("PATH") {
@@ -918,6 +952,7 @@ pub fn exec_command_with_cancellation(
         .get("supersede_previous_failures")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let expected_exit_codes = parse_expected_exit_codes(args)?;
     let workspace_before = capture_baseline_entries(ctx.workspace.root());
 
     ctx.workspace.ensure_child_process_boundary()?;
@@ -939,6 +974,7 @@ pub fn exec_command_with_cancellation(
             test_file,
             test_name,
             workspace_before.clone(),
+            expected_exit_codes.clone(),
             verification_level,
             supersede_previous_failures,
             cancellation,
@@ -1167,6 +1203,7 @@ async fn run_command(
     test_file: Option<&str>,
     test_name: Option<&str>,
     workspace_before: Vec<crate::harness::model::BaselineEntry>,
+    expected_exit_codes: Vec<i32>,
     verification_level: &str,
     supersede_previous_failures: bool,
     cancellation: &CancellationToken,
@@ -1247,9 +1284,8 @@ async fn run_command(
             verification_level: verification_level.to_string(),
             supersede_previous_failures,
         });
-    let session = match ctx
-        .sessions
-        .insert(ExecSession::new_with_details_encoding_and_resources(
+    let session = match ctx.sessions.insert(
+        ExecSession::new_with_details_encoding_and_resources(
             child,
             tty,
             cmd.to_string(),
@@ -1259,7 +1295,9 @@ async fn run_command(
             mcp_session_id.map(str::to_string),
             stream_encoding_for_program(&program),
             Some(resource_lease),
-        )) {
+        )
+        .with_expected_exit_codes(expected_exit_codes),
+    ) {
         Ok(session) => session,
         Err(rejected) => {
             rejected.mark_termination_reason("session_limit");
@@ -1441,6 +1479,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         None,
         None,
         capture_baseline_entries(&cwd),
+        vec![0],
         "blocking",
         true,
         &CancellationToken::default(),
@@ -1612,19 +1651,21 @@ fn merge_exec_result(
         obj.insert("duration_ms".into(), json!(duration_ms));
         obj.insert("elapsed_ms".into(), json!(duration_ms));
         obj.insert("transport_ok".into(), Value::Bool(true));
-        let command_ok = match obj
-            .get("termination_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("running")
-        {
-            "exited" => obj
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                .map(|exit_code| exit_code == 0)
-                .or(Some(false)),
-            "running" => None,
-            _ => Some(false),
-        };
+        let command_ok = obj.get("command_ok").and_then(Value::as_bool).or_else(|| {
+            match obj
+                .get("termination_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("running")
+            {
+                "exited" => obj
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|exit_code| exit_code == 0)
+                    .or(Some(false)),
+                "running" => None,
+                _ => Some(false),
+            }
+        });
         obj.insert(
             "command_ok".into(),
             command_ok.map(Value::Bool).unwrap_or(Value::Null),
@@ -1768,6 +1809,57 @@ mod tests {
     use crate::tools::CancellationToken;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn expected_exit_codes_accept_alias_and_reject_conflicting_aliases() {
+        assert_eq!(
+            parse_expected_exit_codes(&json!({})).expect("default exit codes"),
+            vec![0]
+        );
+        assert_eq!(
+            parse_expected_exit_codes(&json!({"expected_exit_codes": [1, 0, 1]}))
+                .expect("expected exit codes"),
+            vec![0, 1]
+        );
+        assert_eq!(
+            parse_expected_exit_codes(&json!({"allowed_exit_codes": [0, 2]}))
+                .expect("allowed exit codes"),
+            vec![0, 2]
+        );
+        assert!(parse_expected_exit_codes(&json!({
+            "expected_exit_codes": [0, 1],
+            "allowed_exit_codes": [0]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn expected_nonzero_exit_code_is_a_successful_command_result() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        #[cfg(windows)]
+        let command = "python -c \"import sys; sys.exit(1)\"";
+        #[cfg(not(windows))]
+        let command = "python3 -c \"import sys; sys.exit(1)\"";
+        let output = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": command,
+                "expected_exit_codes": [0, 1],
+                "timeout_ms": 10_000,
+                "yield_time_ms": 10_000
+            }),
+        );
+        assert_eq!(output["ok"], true, "{output}");
+        assert_eq!(output["command_ok"], true, "{output}");
+        assert_eq!(output["success"], true, "{output}");
+        assert_eq!(output["exit_code"], 1, "{output}");
+        assert!(output.get("error").is_none(), "{output}");
+    }
 
     #[cfg(unix)]
     #[test]

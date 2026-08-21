@@ -33,6 +33,105 @@ fn initialize_git(root: &std::path::Path) {
     }
 }
 
+#[test]
+fn durable_task_can_be_explicitly_reclaimed_by_a_new_session_with_head_cas() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "durable reclaim\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/docs/session/\n").expect("gitignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let first = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "durable task lease reclaim",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+        "reclaim-transport-a",
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    let task_id = first["task"]["id"].as_str().expect("task id").to_string();
+    let old_session_id = first["session"]["session_id"]
+        .as_str()
+        .expect("old session id")
+        .to_string();
+    let expected_head = first["task"]["expected_state"]["head"]
+        .as_str()
+        .expect("expected head")
+        .to_string();
+
+    let second_session = call_tool(
+        &ctx,
+        "session_open",
+        &json!({"workspace_root": workspace.to_string_lossy()}),
+    );
+    assert_eq!(second_session["ok"], true, "{second_session}");
+    let new_session_id = second_session["session_id"]
+        .as_str()
+        .expect("new session id")
+        .to_string();
+    assert_ne!(old_session_id, new_session_id);
+
+    let missing_reclaim = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "durable task lease reclaim",
+            "workspace_root": workspace.to_string_lossy(),
+            "session_id": new_session_id,
+            "task_id": task_id,
+            "expected_head": expected_head
+        }),
+        "reclaim-transport-b",
+    );
+    assert_eq!(missing_reclaim["ok"], false, "{missing_reclaim}");
+    assert_eq!(
+        missing_reclaim["error"]["code"],
+        "WORK_SESSION_RECLAIM_REQUIRED"
+    );
+
+    let wrong_head = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "durable task lease reclaim",
+            "workspace_root": workspace.to_string_lossy(),
+            "session_id": new_session_id,
+            "task_id": task_id,
+            "reclaim_session": true,
+            "expected_head": "0000000000000000000000000000000000000000"
+        }),
+        "reclaim-transport-b",
+    );
+    assert_eq!(wrong_head["ok"], false, "{wrong_head}");
+    assert_eq!(
+        wrong_head["error"]["code"],
+        "WORK_SESSION_RECLAIM_HEAD_MISMATCH"
+    );
+
+    let reclaimed = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "durable task lease reclaim",
+            "workspace_root": workspace.to_string_lossy(),
+            "session_id": new_session_id,
+            "task_id": task_id,
+            "reclaim_session": true,
+            "expected_head": expected_head
+        }),
+        "reclaim-transport-b",
+    );
+    assert_eq!(reclaimed["ok"], true, "{reclaimed}");
+    assert_eq!(reclaimed["task"]["id"], task_id);
+    assert_eq!(reclaimed["task"]["session_id"], new_session_id);
+    assert_eq!(reclaimed["work_session"]["task_created"], false);
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_toolchain_resolution_is_consistent_in_shared_and_worktree_modes() {
@@ -4828,6 +4927,9 @@ fn catalog_v34_exposes_task_governance_facades_and_schemas() {
         "slices",
         "working_set",
         "worktree_path",
+        "task_id",
+        "reclaim_session",
+        "expected_head",
     ] {
         assert!(
             begin["inputSchema"]["properties"].get(property).is_some(),
@@ -4839,6 +4941,13 @@ fn catalog_v34_exposes_task_governance_facades_and_schemas() {
         start_schema["properties"].get("worktree_path").is_some(),
         "start_task 缺少 worktree_path schema"
     );
+    let exec_schema = anchor_lib::tools::registry::input_schema("exec_command");
+    for property in ["expected_exit_codes", "allowed_exit_codes"] {
+        assert!(
+            exec_schema["properties"].get(property).is_some(),
+            "exec_command 缺少 {property} schema"
+        );
+    }
     let verification_branches = begin["inputSchema"]["properties"]["contract"]["properties"]
         ["required_verifications"]["items"]["anyOf"]
         .as_array()
