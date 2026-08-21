@@ -317,4 +317,5 @@ function ConfigCard({ title, description, children }: { title: string; descripti
   return <Card><CardHeader><CardTitle>{title}</CardTitle><CardDescription>{description}</CardDescription></CardHeader><CardContent>{children}</CardContent></Card>;
 }
 
+// 兼容别名
 export const WorkspacePage = WorkspaceDetailPage;

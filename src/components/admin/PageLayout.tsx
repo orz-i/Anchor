@@ -7,7 +7,7 @@ export function PageLayout({
   actions,
   children,
 }: {
-  kicker: string;
+  kicker: ReactNode;
   title: string;
   description?: string;
   actions?: ReactNode;

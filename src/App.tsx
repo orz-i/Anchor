@@ -4,8 +4,11 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { AdminProvider } from "@/components/admin/AdminProvider";
 import { AppShell } from "@/components/admin/AppShell";
 
-const WorkspacePage = lazy(() =>
-  import("@/pages/WorkspacePage").then((module) => ({ default: module.WorkspacePage })),
+const WorkspacesPage = lazy(() =>
+  import("@/pages/WorkspacesPage").then((module) => ({ default: module.WorkspacesPage })),
+);
+const WorkspaceDetailPage = lazy(() =>
+  import("@/pages/WorkspaceDetailPage").then((module) => ({ default: module.WorkspaceDetailPage })),
 );
 const GeneralSettingsPage = lazy(() =>
   import("@/pages/settings/GeneralSettingsPage").then((module) => ({ default: module.GeneralSettingsPage })),
@@ -34,14 +37,24 @@ export function App() {
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route element={<AppShell />}>
-            <Route index element={<Navigate replace to="/workspace" />} />
-            <Route path="workspace" element={<WorkspacePage />} />
-            <Route path="workspace/:id" element={<WorkspacePage />} />
+            <Route index element={<Navigate replace to="/workspaces" />} />
+            
+            {/* 工作区管理路由 */}
+            <Route path="workspaces" element={<WorkspacesPage />} />
+            <Route path="workspaces/:id" element={<WorkspaceDetailPage />} />
+            
+            {/* 兼容旧路由 */}
+            <Route path="workspace" element={<Navigate replace to="/workspaces" />} />
+            <Route path="workspace/:id" element={<WorkspaceDetailPage />} />
+
+            {/* 系统设置路由 */}
             <Route path="settings/general" element={<GeneralSettingsPage />} />
             <Route path="settings/keys" element={<KeysSettingsPage />} />
             <Route path="settings/frp" element={<FrpSettingsPage />} />
             <Route path="settings/software" element={<SoftwareSettingsPage />} />
-            <Route path="*" element={<Navigate replace to="/workspace" />} />
+
+            {/* 回退路由 */}
+            <Route path="*" element={<Navigate replace to="/workspaces" />} />
           </Route>
         </Routes>
       </Suspense>
