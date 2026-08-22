@@ -3,6 +3,7 @@ mod config;
 mod frp;
 #[cfg(unix)]
 mod handoff;
+mod ilink;
 mod plugin;
 mod software;
 mod tunnel;

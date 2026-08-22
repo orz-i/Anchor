@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use crate::skills::SkillCatalog;
 
-pub(crate) const IMAGE_VIEWER_RESOURCE_URI: &str = "ui://anchor/image-viewer/v1.html";
+pub(crate) const IMAGE_VIEWER_RESOURCE_URI: &str = "ui://anchor/image-viewer/v2.html";
 const IMAGE_VIEWER_MIME_TYPE: &str = "text/html;profile=mcp-app";
 
 pub(crate) fn image_viewer_tool_meta(invoking: &str, invoked: &str) -> Value {
@@ -134,7 +134,6 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
       const fullscreen = document.getElementById("fullscreen");
       const pending = new Map();
       let nextRequestId = 1;
-      let objectUrl = null;
       let previewPath = null;
       let previewRequested = false;
 
@@ -175,11 +174,9 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
         return artifact?.workspace_path || null;
       };
 
-      const decodeImage = (item) => {
-        const raw = atob(item.data);
-        const bytes = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
-        return new Blob([bytes], { type: item.mimeType || item.mime_type || "image/png" });
+      const imageSrcOf = (item) => {
+        const mime = item.mimeType || item.mime_type || "image/png";
+        return `data:${mime};base64,${item.data}`;
       };
 
       const describe = (structured, item) => {
@@ -197,13 +194,24 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
       };
 
       const showImage = (item, structured) => {
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
-        objectUrl = URL.createObjectURL(decodeImage(item));
-        image.onload = () => describe(structured, item);
-        image.src = objectUrl;
-        image.hidden = false;
-        empty.hidden = true;
-        fullscreen.hidden = typeof window.openai?.requestDisplayMode !== "function";
+        image.hidden = true;
+        empty.hidden = false;
+        empty.textContent = "Loading image…";
+        fullscreen.hidden = true;
+        image.onload = () => {
+          image.hidden = false;
+          empty.hidden = true;
+          fullscreen.hidden = typeof window.openai?.requestDisplayMode !== "function";
+          describe(structured, item);
+        };
+        image.onerror = () => {
+          image.hidden = true;
+          empty.hidden = false;
+          empty.textContent = "Image preview could not be decoded.";
+          fullscreen.hidden = true;
+          describe(structured, item);
+        };
+        image.src = imageSrcOf(item);
         describe(structured, item);
       };
 
@@ -305,6 +313,10 @@ mod tests {
         assert!(html.contains("ui/notifications/tool-result"));
         assert!(html.contains("toolResponseMetadata"));
         assert!(html.contains("name: \"view_image\""));
+        assert!(html.contains("data:${mime};base64,${item.data}"));
+        assert!(html.contains("image.onerror"));
+        assert!(!html.contains("URL.createObjectURL"));
+        assert!(!html.contains("new Blob"));
     }
 
     #[test]
