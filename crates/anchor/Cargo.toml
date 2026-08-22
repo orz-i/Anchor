@@ -37,6 +37,7 @@ regex = "1"
 glob = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 base64 = "0.22"
+qrcode = { version = "0.14", default-features = false }
 aes-gcm = "0.10"
 argon2 = "0.5"
 getrandom = "0.3"

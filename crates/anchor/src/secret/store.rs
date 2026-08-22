@@ -31,6 +31,15 @@ impl SecretStore {
         })
     }
 
+    pub fn set_many(profile_id: &str, values: &[(&str, &str)]) -> AppResult<()> {
+        DataStore::update_file(|data| {
+            for (key, value) in values {
+                set_workspace_secret_in(data, profile_id, key, value);
+            }
+            Ok(())
+        })
+    }
+
     pub fn get(profile_id: &str, key: &str) -> AppResult<Option<String>> {
         DataStore::read_file(|data| Ok(workspace_secret_from(data, profile_id, key)))
     }

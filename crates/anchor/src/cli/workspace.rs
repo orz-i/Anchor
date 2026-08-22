@@ -114,6 +114,7 @@ pub async fn execute(command: WorkspaceCommand, as_json: bool) -> AppResult<i32>
         WorkspaceCommand::Stop(options) => super::stop_daemon(options, as_json).await.map(|_| 0),
         WorkspaceCommand::GptConfig(options) => show_gpt_config(options, as_json).map(|_| 0),
         WorkspaceCommand::Test(options) => test_workspace(options, as_json).await,
+        WorkspaceCommand::Ilink(command) => super::ilink::execute(command, as_json).await,
     }
 }
 

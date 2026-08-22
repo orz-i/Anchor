@@ -11,6 +11,33 @@ pub struct CliArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ILinkCommand {
+    Login { workspace: String },
+    Start { workspace: String },
+    Stop { workspace: String },
+    Status { workspace: String },
+    Run { workspace: String },
+}
+
+fn parse_ilink_command(args: &mut VecDeque<String>) -> Result<ILinkCommand, String> {
+    let action = args
+        .pop_front()
+        .ok_or_else(|| "workspace ilink 缺少子命令：login|start|stop|status|run".to_string())?;
+    let workspace = pop_value(args, &format!("workspace ilink {action}"))?;
+    ensure_empty(args, &format!("workspace ilink {action}"))?;
+    match action.as_str() {
+        "login" => Ok(ILinkCommand::Login { workspace }),
+        "start" => Ok(ILinkCommand::Start { workspace }),
+        "stop" => Ok(ILinkCommand::Stop { workspace }),
+        "status" => Ok(ILinkCommand::Status { workspace }),
+        "run" => Ok(ILinkCommand::Run { workspace }),
+        other => Err(format!(
+            "未知 workspace ilink 命令：{other}；可选 login|start|stop|status|run"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminCommand {
     Serve { port: u16 },
     Start { port: Option<u16> },
@@ -1177,6 +1204,7 @@ fn parse_workspace_command(args: &mut VecDeque<String>) -> Result<WorkspaceComma
                 timeout_seconds,
             }))
         }
+        Some("ilink") => Ok(WorkspaceCommand::Ilink(parse_ilink_command(args)?)),
         Some(other) => Err(format!(
             "未知 workspace 命令：{other}\n\n{}",
             workspace_usage()
@@ -1270,6 +1298,7 @@ pub enum WorkspaceCommand {
     Stop(StopOptions),
     GptConfig(GptConfigOptions),
     Test(WorkspaceTestOptions),
+    Ilink(ILinkCommand),
 }
 
 fn parse_run_options(args: &mut VecDeque<String>, command: &str) -> Result<RunOptions, String> {
@@ -1875,6 +1904,10 @@ pub fn workspace_usage() -> &'static str {
   anchor workspace show <workspace>\n\
   anchor workspace start <workspace> [--service mcp|actions|all] [--tunnel]\n\
   anchor workspace stop <workspace> [--timeout SECONDS] [--force]\n\
+  anchor workspace ilink login <workspace>\n\
+  anchor workspace ilink start <workspace>\n\
+  anchor workspace ilink stop <workspace>\n\
+  anchor workspace ilink status <workspace>\n\
   anchor workspace gpt-config <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--show-secrets]\n\
   anchor workspace test <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--timeout SECONDS]"
 }
@@ -1885,6 +1918,26 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_workspace_ilink_lifecycle_commands() {
+        assert_eq!(
+            parse(strings(&["workspace", "ilink", "login", "demo"]))
+                .expect("ilink login")
+                .command,
+            Command::Workspace(WorkspaceCommand::Ilink(ILinkCommand::Login {
+                workspace: "demo".into()
+            }))
+        );
+        assert_eq!(
+            parse(strings(&["workspace", "ilink", "status", "demo"]))
+                .expect("ilink status")
+                .command,
+            Command::Workspace(WorkspaceCommand::Ilink(ILinkCommand::Status {
+                workspace: "demo".into()
+            }))
+        );
     }
 
     #[test]

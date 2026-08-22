@@ -1,6 +1,8 @@
 mod ilink;
 mod model;
 mod outbox;
+mod state;
+pub(crate) mod worker;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -54,6 +56,14 @@ pub(crate) fn task_completed(harness: &Harness, task: &TaskSession, verified: bo
             &format!("notification outbox enqueue failed: {error}"),
         ),
     }
+}
+
+pub(crate) use ilink::{
+    poll_qr_status, request_qr_code, LoginCredentials, QrCode, QrStatus, DEFAULT_BASE_URL,
+};
+
+pub(crate) fn reset_ilink_cursor(profile_id: &str) -> Result<(), String> {
+    state::reset_cursor(profile_id)
 }
 
 fn completion_message(task: &TaskSession, verified: bool) -> String {
@@ -179,6 +189,12 @@ fn load_ilink_config(profile_id: &str) -> Result<Option<ILinkConfig>, String> {
         let context_token = value("ilink_context_token");
         let base_url = value("ilink_base_url");
         if bot_token.is_none() && target_user_id.is_none() && context_token.is_none() {
+            return Ok(None);
+        }
+        if bot_token.is_some() && (target_user_id.is_none() || context_token.is_none()) {
+            // Logged in but not bound yet. Completion notifications remain a safe no-op
+            // until the scanner explicitly sends /bind and the inbound worker persists
+            // the target/context pair.
             return Ok(None);
         }
         let mut missing = Vec::new();
