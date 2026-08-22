@@ -1666,37 +1666,54 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &["task", "harness"],
         ),
-        "read_file" => success_output_schema(
+        "list_files" => success_output_schema(
             json!({
                 "path": { "type": "string" },
-                "content": { "type": "string" },
-                "encoding": { "type": "string", "enum": ["utf-8", "utf-16le", "utf-16be"] },
-                "start_line": { "type": "integer", "minimum": 1 },
-                "end_line": { "type": "integer", "minimum": 0 },
-                "total_lines": { "type": "integer", "minimum": 0 },
-                "total_bytes": { "type": "integer", "minimum": 0 },
-                "bytes_read": { "type": "integer", "minimum": 0 },
+                "files": { "type": "array", "items": { "type": "object" } },
+                "cursor": { "type": "integer", "minimum": 0 },
+                "next_cursor": nullable_integer_property(),
+                "total_files": { "type": "integer", "minimum": 0 },
                 "truncated": { "type": "boolean" },
-                "truncated_by": { "type": ["string", "null"] },
+                "scan": { "type": "object" },
                 "warnings": warnings_property()
             }),
             &[
                 "path",
-                "content",
-                "encoding",
-                "start_line",
-                "end_line",
-                "total_lines",
-                "total_bytes",
-                "bytes_read",
+                "files",
+                "cursor",
+                "next_cursor",
+                "total_files",
                 "truncated",
-                "truncated_by",
+                "scan",
                 "warnings",
             ],
+        ),
+        "read_file" => success_output_schema(
+            json!({
+                "mode": { "type": "string", "enum": ["single", "batch"] },
+                "path": { "type": "string" },
+                "content": { "type": "string" },
+                "encoding": { "type": "string", "enum": ["utf-8", "utf-16le", "utf-16be"] },
+                "start_line": { "type": "integer", "minimum": 1 },
+                "start_byte": { "type": "integer", "minimum": 0 },
+                "end_line": { "type": "integer", "minimum": 0 },
+                "total_lines": { "type": "integer", "minimum": 0 },
+                "total_bytes": { "type": "integer", "minimum": 0 },
+                "bytes_read": { "type": "integer", "minimum": 0 },
+                "requested_files": { "type": "integer", "minimum": 0 },
+                "failed_files": { "type": "integer", "minimum": 0 },
+                "files": { "type": "array", "items": { "type": "object" } },
+                "truncated": { "type": "boolean" },
+                "truncated_by": { "type": ["string", "null"] },
+                "next": { "type": ["object", "null"] },
+                "warnings": warnings_property()
+            }),
+            &["mode", "bytes_read", "truncated", "next", "warnings"],
         ),
         "search_text" => success_output_schema(
             json!({
                 "query": { "type": "string" },
+                "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"] },
                 "matches": {
                     "type": "array",
                     "items": {
@@ -1713,11 +1730,30 @@ pub fn output_schema(name: &str) -> Value {
                         "additionalProperties": true
                     }
                 },
+                "files": { "type": "array", "items": { "type": "string" } },
+                "summary": { "type": "array", "items": { "type": "object" } },
                 "total_matches": { "type": "integer", "minimum": 0 },
+                "matched_files": { "type": "integer", "minimum": 0 },
+                "cursor": { "type": "integer", "minimum": 0 },
+                "next_cursor": nullable_integer_property(),
                 "truncated": { "type": "boolean" },
+                "scan": { "type": "object" },
                 "warnings": warnings_property()
             }),
-            &["query", "matches", "total_matches", "truncated", "warnings"],
+            &[
+                "query",
+                "output_mode",
+                "matches",
+                "files",
+                "summary",
+                "total_matches",
+                "matched_files",
+                "cursor",
+                "next_cursor",
+                "truncated",
+                "scan",
+                "warnings",
+            ],
         ),
         "apply_patch" => append_output_condition(
             append_output_condition(
@@ -3513,9 +3549,33 @@ pub fn input_schema(name: &str) -> Value {
                 "path": { "type": "string", "minLength": 1 },
                 "start_line": { "type": "integer", "minimum": 1, "default": 1 },
                 "end_line": { "type": "integer", "minimum": 1 },
+                "start_byte": { "type": "integer", "minimum": 0, "default": 0, "description": "Decoded UTF-8 byte offset within start_line. Normally use only the value returned by next for exact continuation." },
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "description": "Batch read requests sharing max_bytes. Mutually exclusive with path.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "minLength": 1 },
+                            "start_line": { "type": "integer", "minimum": 1, "default": 1 },
+                            "end_line": { "type": "integer", "minimum": 1 },
+                            "start_byte": { "type": "integer", "minimum": 0, "default": 0 }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                },
                 "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 131072 }
             },
-            "required": ["path"],
+            "allOf": [
+                {
+                    "if": { "required": ["path"] },
+                    "then": { "not": { "required": ["files"] } },
+                    "else": { "required": ["files"] }
+                }
+            ],
             "additionalProperties": false
         }),
         "list_dir" => json!({
@@ -3538,6 +3598,7 @@ pub fn input_schema(name: &str) -> Value {
                 "exclude_patterns": { "type": "array", "items": { "type": "string" } },
                 "include_hidden": { "type": "boolean", "default": false },
                 "include_ignored": { "type": "boolean", "default": false },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0, "description": "Stable result offset returned as next_cursor." },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 50000, "default": 5000 }
             },
             "additionalProperties": false
@@ -3552,6 +3613,8 @@ pub fn input_schema(name: &str) -> Value {
                 "regex": { "type": "boolean", "default": false },
                 "case_sensitive": { "type": "boolean", "default": false },
                 "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 0 },
+                "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"], "default": "matches", "description": "Choose detailed matches or compact file/count/summary output." },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0, "description": "Stable offset in the selected output mode; continue with next_cursor." },
                 "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
             },
@@ -4097,6 +4160,20 @@ mod tests {
         assert_eq!(require_tool_profile("advanced").unwrap(), "advanced");
         assert_eq!(require_tool_profile("read-only").unwrap(), "read-only");
         assert!(require_tool_profile("unknown").is_err());
+    }
+
+    #[test]
+    fn read_file_schema_requires_exactly_one_path_source() {
+        let schema = input_schema("read_file");
+        let validator = jsonschema::validator_for(&schema).expect("read_file input schema");
+
+        assert!(validator.is_valid(&json!({"path": "src/lib.rs"})));
+        assert!(validator.is_valid(&json!({"files": [{"path": "src/lib.rs"}]})));
+        assert!(!validator.is_valid(&json!({"max_bytes": 1024})));
+        assert!(!validator.is_valid(&json!({
+            "path": "src/lib.rs",
+            "files": [{"path": "src/lib.rs"}]
+        })));
     }
 
     #[test]

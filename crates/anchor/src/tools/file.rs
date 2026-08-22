@@ -1,13 +1,34 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use regex::Regex;
+use ignore::WalkBuilder;
+use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
-use walkdir::WalkDir;
 
-use crate::tools::workspace::{relative_display, tool_ok, Workspace, WorkspaceError};
+use crate::tools::workspace::{
+    relative_display, tool_ok, Workspace, WorkspaceError, DEFAULT_EXCLUDED_NAMES,
+};
 use crate::tools::CancellationToken;
+
+const DEFAULT_READ_BUDGET: usize = 131_072;
+const MAX_BATCH_READ_FILES: usize = 32;
+
+#[derive(Debug, Clone)]
+struct ReadRequest {
+    path: String,
+    start_line: usize,
+    end_line: Option<usize>,
+    start_byte: usize,
+}
+
+#[derive(Default)]
+struct RepositoryScan {
+    files: Vec<PathBuf>,
+    skipped_entries: usize,
+}
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), WorkspaceError> {
     if cancellation.is_cancelled() {
@@ -74,17 +95,235 @@ fn unsupported_encoding() -> WorkspaceError {
     }
 }
 
+fn repository_files(
+    ws: &Workspace,
+    root: &Path,
+    include_hidden: bool,
+    include_ignored: bool,
+    cancellation: &CancellationToken,
+) -> Result<RepositoryScan, WorkspaceError> {
+    let skipped_entries = Arc::new(AtomicUsize::new(0));
+    let skipped_for_filter = Arc::clone(&skipped_entries);
+    let scope_root = root.to_path_buf();
+    let walk_root = if root.starts_with(ws.root()) {
+        ws.root().to_path_buf()
+    } else {
+        scope_root.clone()
+    };
+    let mut builder = WalkBuilder::new(&walk_root);
+    builder
+        .follow_links(false)
+        .hidden(!include_hidden)
+        .git_ignore(!include_ignored)
+        .git_exclude(!include_ignored)
+        .ignore(!include_ignored)
+        .parents(false)
+        .require_git(false);
+    builder.filter_entry(move |entry| {
+        let path = entry.path();
+        let in_scope =
+            entry.depth() == 0 || path.starts_with(&scope_root) || scope_root.starts_with(path);
+        if !in_scope {
+            return false;
+        }
+        if include_ignored || entry.depth() == 0 {
+            return true;
+        }
+        let is_default_excluded_dir = entry.file_type().is_some_and(|kind| kind.is_dir())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| DEFAULT_EXCLUDED_NAMES.contains(&name));
+        if is_default_excluded_dir {
+            skipped_for_filter.fetch_add(1, Ordering::Relaxed);
+            false
+        } else {
+            true
+        }
+    });
+
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        ensure_not_cancelled(cancellation)?;
+        let Ok(entry) = entry else {
+            skipped_entries.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .is_some_and(|kind| kind.is_file() || kind.is_symlink())
+        {
+            continue;
+        }
+        let path = entry.into_path();
+        if ws.is_safe_read_path(&path) {
+            files.push(path);
+        }
+    }
+    files.sort_by_key(|path| relative_display(ws.root(), path));
+    Ok(RepositoryScan {
+        files,
+        skipped_entries: skipped_entries.load(Ordering::Relaxed),
+    })
+}
+
 pub fn read_file(
     ws: &Workspace,
     args: &Value,
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
     ensure_not_cancelled(cancellation)?;
-    let path = args
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| WorkspaceError::invalid_argument("path is required"))?;
-    let resolved = ws.resolve_read_path(path)?;
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_READ_BUDGET as u64) as usize;
+
+    let path = args.get("path").and_then(Value::as_str);
+    let files = args.get("files").and_then(Value::as_array);
+    match (path, files) {
+        (Some(path), None) => {
+            let request = read_request_from_value(args, Some(path))?;
+            let mut result = read_one(ws, &request, max_bytes, cancellation)?;
+            if let Some(object) = result.as_object_mut() {
+                object.insert("mode".into(), json!("single"));
+            }
+            Ok(tool_ok(result))
+        }
+        (None, Some(files)) => {
+            if files.is_empty() {
+                return Err(WorkspaceError::invalid_argument(
+                    "files must contain at least one read request",
+                ));
+            }
+            if files.len() > MAX_BATCH_READ_FILES {
+                return Err(WorkspaceError::invalid_argument(format!(
+                    "files supports at most {MAX_BATCH_READ_FILES} requests"
+                )));
+            }
+            let requests = files
+                .iter()
+                .map(|value| read_request_from_value(value, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            read_batch(ws, &requests, max_bytes, cancellation)
+        }
+        (Some(_), Some(_)) => Err(WorkspaceError::invalid_argument(
+            "provide either path or files, not both",
+        )),
+        (None, None) => Err(WorkspaceError::invalid_argument(
+            "path or files is required",
+        )),
+    }
+}
+
+fn read_request_from_value(
+    value: &Value,
+    fallback_path: Option<&str>,
+) -> Result<ReadRequest, WorkspaceError> {
+    let path = fallback_path
+        .or_else(|| value.get("path").and_then(Value::as_str))
+        .ok_or_else(|| WorkspaceError::invalid_argument("read request path is required"))?;
+    let start_line = value
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let end_line = value
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|line| line as usize);
+    if end_line.is_some_and(|end| end < start_line) {
+        return Err(WorkspaceError::invalid_argument(
+            "end_line must be greater than or equal to start_line",
+        ));
+    }
+    let start_byte = value.get("start_byte").and_then(Value::as_u64).unwrap_or(0) as usize;
+    Ok(ReadRequest {
+        path: path.to_string(),
+        start_line,
+        end_line,
+        start_byte,
+    })
+}
+
+fn read_batch(
+    ws: &Workspace,
+    requests: &[ReadRequest],
+    max_bytes: usize,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    let mut remaining = max_bytes;
+    let mut results = Vec::new();
+    let mut continuations = Vec::new();
+    let mut failed = 0usize;
+
+    for (index, request) in requests.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        if remaining == 0 {
+            continuations.extend(requests[index..].iter().map(read_request_value));
+            break;
+        }
+        match read_one(ws, request, remaining, cancellation) {
+            Ok(result) => {
+                remaining = remaining.saturating_sub(
+                    result
+                        .get("bytes_read")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                );
+                let continuation = result.get("next").filter(|next| !next.is_null()).cloned();
+                if let Some(next) = continuation {
+                    continuations.push(next.clone());
+                }
+                results.push(json!({"ok": true, "result": result}));
+                if !continuations.is_empty() {
+                    continuations.extend(requests[index + 1..].iter().map(read_request_value));
+                    break;
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                results.push(json!({
+                    "ok": false,
+                    "path": request.path,
+                    "error": {"message": error.to_string()}
+                }));
+            }
+        }
+    }
+
+    let bytes_read = max_bytes.saturating_sub(remaining);
+    let truncated = !continuations.is_empty();
+    Ok(tool_ok(json!({
+        "mode": "batch",
+        "files": results,
+        "bytes_read": bytes_read,
+        "requested_files": requests.len(),
+        "failed_files": failed,
+        "truncated": truncated,
+        "next": if truncated { json!({"files": continuations}) } else { Value::Null },
+        "warnings": if truncated { vec!["shared read budget exhausted or one or more files require continuation"] } else { vec![] }
+    })))
+}
+
+fn read_request_value(request: &ReadRequest) -> Value {
+    json!({
+        "path": request.path,
+        "start_line": request.start_line,
+        "start_byte": request.start_byte,
+        "end_line": request.end_line
+    })
+}
+
+fn read_one(
+    ws: &Workspace,
+    request: &ReadRequest,
+    max_bytes: usize,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    let resolved = ws.resolve_read_path(&request.path)?;
     if resolved.path.is_dir() {
         return Err(WorkspaceError::Tool {
             code: "IS_DIRECTORY",
@@ -93,54 +332,96 @@ pub fn read_file(
             retryable: false,
         });
     }
-    let max_bytes = args
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(131_072) as usize;
-    let start_line = args
-        .get("start_line")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1) as usize;
-    let end_line = args
-        .get("end_line")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize);
-
     let data = fs::read(&resolved.path).map_err(|_| WorkspaceError::not_found("File not found"))?;
     ensure_not_cancelled(cancellation)?;
     let (text, encoding) = decode_text(data)?;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total_lines = lines.len();
-    let end = end_line.unwrap_or(total_lines).min(total_lines);
-    let selected: String = if end < start_line {
-        String::new()
-    } else {
-        lines[(start_line - 1)..end].concat()
-    };
-    let (content, truncated, truncated_by) = truncate_bytes(&selected, max_bytes);
-    let actual_end = if truncated && !content.is_empty() {
-        start_line + content.lines().count().saturating_sub(1)
-    } else {
-        end
-    };
-    let mut warnings = Vec::new();
-    if truncated {
-        warnings.push("content truncated".to_string());
+    let last_line = request.end_line.unwrap_or(total_lines).min(total_lines);
+    let mut line_index = request.start_line.saturating_sub(1);
+    let mut line_byte = request.start_byte;
+    let mut content = String::new();
+    let mut remaining = max_bytes;
+
+    if line_index < lines.len() && line_byte > lines[line_index].len() {
+        return Err(WorkspaceError::invalid_argument(
+            "start_byte exceeds the selected start line length",
+        ));
     }
-    Ok(tool_ok(json!({
+    if line_index < lines.len() && !lines[line_index].is_char_boundary(line_byte) {
+        return Err(WorkspaceError::invalid_argument(
+            "start_byte must point to a UTF-8 character boundary in the decoded line",
+        ));
+    }
+
+    let mut next = None;
+    while line_index < lines.len() && line_index < last_line && remaining > 0 {
+        let line = lines[line_index];
+        let available = &line[line_byte..];
+        if available.len() <= remaining {
+            content.push_str(available);
+            remaining -= available.len();
+            line_index += 1;
+            line_byte = 0;
+            continue;
+        }
+
+        let mut take = remaining;
+        while take > 0 && !available.is_char_boundary(take) {
+            take -= 1;
+        }
+        if take == 0 && !available.is_empty() {
+            next = Some(ReadRequest {
+                path: request.path.clone(),
+                start_line: line_index + 1,
+                end_line: request.end_line,
+                start_byte: line_byte,
+            });
+            break;
+        }
+        content.push_str(&available[..take]);
+        line_byte += take;
+        next = Some(ReadRequest {
+            path: request.path.clone(),
+            start_line: line_index + 1,
+            end_line: request.end_line,
+            start_byte: line_byte,
+        });
+        break;
+    }
+
+    if next.is_none() && line_index < lines.len() && line_index < last_line {
+        next = Some(ReadRequest {
+            path: request.path.clone(),
+            start_line: line_index + 1,
+            end_line: request.end_line,
+            start_byte: line_byte,
+        });
+    }
+    let truncated = next.is_some();
+    let actual_end_line = if content.is_empty() {
+        request.start_line.saturating_sub(1)
+    } else if line_byte > 0 {
+        line_index + 1
+    } else {
+        line_index.min(last_line)
+    };
+
+    Ok(json!({
         "path": resolved.display,
         "content": content,
         "encoding": encoding,
-        "start_line": start_line,
-        "end_line": actual_end,
+        "start_line": request.start_line,
+        "start_byte": request.start_byte,
+        "end_line": actual_end_line,
         "total_lines": total_lines,
         "total_bytes": text.len(),
         "bytes_read": content.len(),
         "truncated": truncated,
-        "truncated_by": truncated_by,
-        "warnings": warnings
-    })))
+        "truncated_by": if truncated { json!("bytes") } else { Value::Null },
+        "next": next.as_ref().map(read_request_value),
+        "warnings": if truncated { vec!["content truncated; use next exactly to continue"] } else { vec![] }
+    }))
 }
 
 pub fn list_dir(
@@ -218,6 +499,7 @@ pub fn list_files(
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(5000) as usize;
+    let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
     let include_hidden = args
         .get("include_hidden")
         .and_then(Value::as_bool)
@@ -227,31 +509,18 @@ pub fn list_files(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let mut files = Vec::new();
-    let mut truncated = false;
-    for entry in WalkDir::new(&resolved.path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        ensure_not_cancelled(cancellation)?;
-        let p = entry.path();
-        if p == resolved.path {
-            continue;
-        }
-        if !ws.is_safe_read_path(p) {
-            continue;
-        }
-        if ws.is_ignored_path(p, include_hidden, include_ignored) {
-            if entry.file_type().is_dir() {
-                continue;
-            }
-            continue;
-        }
-        if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
-            continue;
-        }
-        let rel = relative_display(ws.root(), p);
+    let scan = repository_files(
+        ws,
+        &resolved.path,
+        include_hidden,
+        include_ignored,
+        cancellation,
+    )?;
+    let candidate_files = scan.files.len();
+    let skipped_entries = scan.skipped_entries;
+    let mut all_files = Vec::new();
+    for p in scan.files {
+        let rel = relative_display(ws.root(), &p);
         if !patterns.iter().any(|pat| glob_match(pat, &rel)) {
             continue;
         }
@@ -259,23 +528,32 @@ pub fn list_files(
             continue;
         }
         let meta = p.symlink_metadata().ok();
-        files.push(json!({
+        all_files.push(json!({
             "path": rel,
-            "type": if entry.file_type().is_symlink() { "symlink" } else { "file" },
+            "type": if p.is_symlink() { "symlink" } else { "file" },
             "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
             "modified": meta.and_then(|m| format_mtime(m.modified().ok()))
         }));
-        if files.len() >= max_results {
-            truncated = true;
-            break;
-        }
     }
-    files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    all_files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let total_files = all_files.len();
+    let start = cursor.min(total_files);
+    let end = start.saturating_add(max_results).min(total_files);
+    let files = all_files.drain(start..end).collect::<Vec<_>>();
+    let next_cursor = (end < total_files).then_some(end);
     Ok(tool_ok(json!({
         "path": resolved.display,
         "files": files,
-        "truncated": truncated,
-        "warnings": if truncated { vec!["result limit reached"] } else { vec![] }
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "total_files": total_files,
+        "truncated": next_cursor.is_some(),
+        "scan": {
+            "candidate_files": candidate_files,
+            "skipped_entries": skipped_entries,
+            "ignore_rules": if include_ignored { "disabled" } else { "project_and_default" }
+        },
+        "warnings": if next_cursor.is_some() { vec!["result page limit reached; continue with next_cursor"] } else { vec![] }
     })))
 }
 
@@ -300,6 +578,11 @@ pub fn search_text(
         .get("max_results")
         .and_then(Value::as_u64)
         .unwrap_or(1000) as usize;
+    let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let output_mode = args
+        .get("output_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("matches");
     let max_preview = args
         .get("max_preview_bytes")
         .and_then(Value::as_u64)
@@ -311,51 +594,68 @@ pub fn search_text(
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
     let matcher = build_matcher(query, use_regex, case_sensitive)?;
-
-    let mut file_paths = Vec::<PathBuf>::new();
-    if resolved.path.is_file() {
-        file_paths.push(resolved.path.clone());
-    } else {
-        for entry in WalkDir::new(&resolved.path)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            ensure_not_cancelled(cancellation)?;
-            if entry.file_type().is_file() {
-                file_paths.push(entry.path().to_path_buf());
-            }
-        }
+    if !matches!(output_mode, "matches" | "files" | "count" | "summary") {
+        return Err(WorkspaceError::invalid_argument(
+            "output_mode must be matches, files, count, or summary",
+        ));
     }
 
-    let mut matches = Vec::new();
+    let scan = if resolved.path.is_file() {
+        RepositoryScan {
+            files: vec![resolved.path.clone()],
+            skipped_entries: 0,
+        }
+    } else {
+        repository_files(ws, &resolved.path, false, false, cancellation)?
+    };
+
+    let mut page_matches = Vec::new();
+    let mut file_summaries = Vec::new();
     let mut total = 0usize;
-    for p in file_paths {
+    let mut bytes_scanned = 0usize;
+    let mut skipped_files = 0usize;
+    for p in &scan.files {
         ensure_not_cancelled(cancellation)?;
-        if !ws.is_safe_read_path(&p) {
+        if p.is_symlink() {
+            skipped_files += 1;
             continue;
         }
-        if ws.is_ignored_path(&p, false, false) {
+        if !ws.is_safe_read_path(p) {
             continue;
         }
-        let rel = relative_display(ws.root(), &p);
+        let rel = relative_display(ws.root(), p);
         if !passes_glob_filters(&rel, &include_globs, &exclude_globs) {
             continue;
         }
-        let content = match fs::read(&p).ok().and_then(|data| decode_text(data).ok()) {
-            Some((text, _)) if !text.contains('\0') => text,
-            _ => continue,
+        let data = match fs::read(p) {
+            Ok(data) => data,
+            Err(_) => {
+                skipped_files += 1;
+                continue;
+            }
         };
-        let lines: Vec<String> = content.lines().map(str::to_string).collect();
+        bytes_scanned = bytes_scanned.saturating_add(data.len());
+        let content = match decode_text(data) {
+            Ok((text, _)) if !text.contains('\0') => text,
+            _ => {
+                skipped_files += 1;
+                continue;
+            }
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut file_match_count = 0usize;
         for (idx, line) in lines.iter().enumerate() {
             if idx % 256 == 0 {
                 ensure_not_cancelled(cancellation)?;
             }
-            if !matcher.is_match(line) {
+            let Some(match_byte) = matcher.find(line) else {
                 continue;
-            }
+            };
+            let match_index = total;
             total += 1;
-            if matches.len() >= max_results {
+            file_match_count += 1;
+            if output_mode != "matches" || match_index < cursor || page_matches.len() >= max_results
+            {
                 continue;
             }
             let (preview, truncated, _) = truncate_bytes(line, max_preview);
@@ -367,30 +667,69 @@ pub fn search_text(
             let mut item = json!({
                 "path": rel,
                 "line": idx + 1,
-                "column": 1,
+                "column": line[..match_byte].chars().count() + 1,
                 "preview": preview
             });
             if context_lines > 0 {
                 let start = idx.saturating_sub(context_lines);
                 let end = (idx + 1 + context_lines).min(lines.len());
-                item["before"] = json!(lines[start..idx]
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>());
-                item["after"] = json!(lines[idx + 1..end]
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>());
+                item["before"] = json!(&lines[start..idx]);
+                item["after"] = json!(&lines[idx + 1..end]);
             }
-            matches.push(item);
+            page_matches.push(item);
+        }
+        if file_match_count > 0 {
+            file_summaries.push(json!({"path": rel, "match_count": file_match_count}));
         }
     }
+
+    let matched_files = file_summaries.len();
+    let (matches, files, summary, next_cursor) = match output_mode {
+        "matches" => {
+            let next = (cursor.saturating_add(page_matches.len()) < total)
+                .then_some(cursor.saturating_add(page_matches.len()));
+            (page_matches, Vec::new(), Vec::new(), next)
+        }
+        "files" => {
+            let start = cursor.min(matched_files);
+            let end = start.saturating_add(max_results).min(matched_files);
+            let page = file_summaries[start..end]
+                .iter()
+                .filter_map(|item| item.get("path").cloned())
+                .collect::<Vec<_>>();
+            let next = (end < matched_files).then_some(end);
+            (Vec::new(), page, Vec::new(), next)
+        }
+        "summary" => {
+            let start = cursor.min(matched_files);
+            let end = start.saturating_add(max_results).min(matched_files);
+            let page = file_summaries[start..end].to_vec();
+            let next = (end < matched_files).then_some(end);
+            (Vec::new(), Vec::new(), page, next)
+        }
+        "count" => (Vec::new(), Vec::new(), Vec::new(), None),
+        _ => unreachable!(),
+    };
+
     Ok(tool_ok(json!({
         "query": query,
+        "output_mode": output_mode,
         "matches": matches,
+        "files": files,
+        "summary": summary,
         "total_matches": total,
-        "truncated": total > matches.len(),
-        "warnings": if total > matches.len() { vec!["result limit reached"] } else { vec![] }
+        "matched_files": matched_files,
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "truncated": next_cursor.is_some(),
+        "scan": {
+            "candidate_files": scan.files.len(),
+            "skipped_entries": scan.skipped_entries,
+            "skipped_files": skipped_files,
+            "bytes_scanned": bytes_scanned,
+            "ignore_rules": "project_and_default"
+        },
+        "warnings": if next_cursor.is_some() { vec!["result page limit reached; continue with next_cursor"] } else { vec![] }
     })))
 }
 
@@ -410,7 +749,11 @@ fn build_matcher(
     } else if case_sensitive {
         Ok(Matcher::Literal(query.to_string()))
     } else {
-        Ok(Matcher::Literal(query.to_lowercase()))
+        let pattern = RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| WorkspaceError::invalid_argument(format!("Invalid query: {e}")))?;
+        Ok(Matcher::Regex(pattern))
     }
 }
 
@@ -420,16 +763,10 @@ enum Matcher {
 }
 
 impl Matcher {
-    fn is_match(&self, line: &str) -> bool {
+    fn find(&self, line: &str) -> Option<usize> {
         match self {
-            Matcher::Regex(re) => re.is_match(line),
-            Matcher::Literal(lit) => {
-                if lit.chars().any(|c| c.is_uppercase()) {
-                    line.contains(lit.as_str())
-                } else {
-                    line.to_lowercase().contains(lit)
-                }
-            }
+            Matcher::Regex(re) => re.find(line).map(|matched| matched.start()),
+            Matcher::Literal(lit) => line.find(lit),
         }
     }
 }
@@ -641,5 +978,164 @@ mod tests {
             .expect("ignored entry");
         assert_eq!(hidden["is_hidden"], true);
         assert_eq!(ignored["is_ignored"], true);
+    }
+
+    #[test]
+    fn list_files_respects_project_ignore_rules_and_stable_paging() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join(".gitignore"), "ignored/\n").expect("ignore file");
+        std::fs::create_dir_all(root.path().join("ignored")).expect("ignored dir");
+        std::fs::write(root.path().join("ignored/hidden.txt"), "hidden").expect("ignored file");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.path().join(name), name).expect("fixture file");
+        }
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+
+        let first = list_files(
+            &workspace,
+            &json!({"path": ".", "patterns": ["*.txt"], "max_results": 2}),
+            &cancellation,
+        )
+        .expect("first page");
+        assert_eq!(first["total_files"], 3);
+        assert_eq!(first["next_cursor"], 2);
+        assert_eq!(first["files"][0]["path"], "a.txt");
+        assert_eq!(first["files"][1]["path"], "b.txt");
+
+        let second = list_files(
+            &workspace,
+            &json!({"path": ".", "patterns": ["*.txt"], "max_results": 2, "cursor": 2}),
+            &cancellation,
+        )
+        .expect("second page");
+        assert_eq!(second["files"].as_array().expect("files").len(), 1);
+        assert_eq!(second["files"][0]["path"], "c.txt");
+        assert!(second["next_cursor"].is_null());
+
+        let including_ignored = list_files(
+            &workspace,
+            &json!({"path": ".", "patterns": ["*.txt"], "include_ignored": true}),
+            &cancellation,
+        )
+        .expect("include ignored");
+        assert_eq!(including_ignored["total_files"], 4);
+    }
+
+    #[test]
+    fn subdirectory_scan_inherits_workspace_root_ignore_without_parent_escape() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join(".gitignore"), "sub/ignored.txt\n").expect("ignore file");
+        std::fs::create_dir_all(root.path().join("sub")).expect("subdir");
+        std::fs::write(root.path().join("sub/ignored.txt"), "ignored").expect("ignored file");
+        std::fs::write(root.path().join("sub/kept.txt"), "kept").expect("kept file");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+
+        let listed = list_files(
+            &workspace,
+            &json!({"path": "sub", "patterns": ["*.txt"]}),
+            &CancellationToken::default(),
+        )
+        .expect("subdirectory scan");
+        assert_eq!(listed["total_files"], 1);
+        assert_eq!(listed["files"][0]["path"], "sub/kept.txt");
+    }
+
+    #[test]
+    fn search_text_reports_real_columns_and_compact_modes() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join("a.txt"), "prefix Needle suffix\n").expect("a");
+        std::fs::write(root.path().join("b.txt"), "needle again\n").expect("b");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+
+        let matches = search_text(
+            &workspace,
+            &json!({"query": "needle", "max_results": 1}),
+            &cancellation,
+        )
+        .expect("matches");
+        assert_eq!(matches["total_matches"], 2);
+        assert_eq!(matches["matches"][0]["path"], "a.txt");
+        assert_eq!(matches["matches"][0]["column"], 8);
+        assert_eq!(matches["next_cursor"], 1);
+
+        let files = search_text(
+            &workspace,
+            &json!({"query": "needle", "output_mode": "files"}),
+            &cancellation,
+        )
+        .expect("files mode");
+        assert_eq!(files["files"], json!(["a.txt", "b.txt"]));
+        assert!(files["matches"].as_array().expect("matches").is_empty());
+
+        let count = search_text(
+            &workspace,
+            &json!({"query": "needle", "output_mode": "count"}),
+            &cancellation,
+        )
+        .expect("count mode");
+        assert_eq!(count["total_matches"], 2);
+        assert_eq!(count["matched_files"], 2);
+        assert!(count["summary"].as_array().expect("summary").is_empty());
+    }
+
+    #[test]
+    fn batch_read_uses_shared_budget_and_exact_continuation() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join("unicode.txt"), "αβγ\nsecond\n").expect("unicode");
+        std::fs::write(root.path().join("other.txt"), "other\n").expect("other");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+
+        let first = read_file(
+            &workspace,
+            &json!({
+                "files": [{"path": "unicode.txt"}, {"path": "other.txt"}],
+                "max_bytes": 3
+            }),
+            &cancellation,
+        )
+        .expect("batch read");
+        assert_eq!(first["mode"], "batch");
+        assert_eq!(first["files"][0]["result"]["content"], "α");
+        assert_eq!(first["next"]["files"][0]["path"], "unicode.txt");
+        assert_eq!(first["next"]["files"][0]["start_line"], 1);
+        assert_eq!(first["next"]["files"][0]["start_byte"], 2);
+        assert_eq!(first["next"]["files"][1]["path"], "other.txt");
+
+        let continuation = read_file(
+            &workspace,
+            &json!({
+                "files": first["next"]["files"].clone(),
+                "max_bytes": 64
+            }),
+            &cancellation,
+        )
+        .expect("continuation");
+        assert_eq!(
+            continuation["files"][0]["result"]["content"],
+            "βγ\nsecond\n"
+        );
+        assert_eq!(continuation["files"][1]["result"]["content"], "other\n");
+        assert!(continuation["next"].is_null());
+    }
+
+    #[test]
+    fn batch_read_isolates_per_file_failures() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join("present.txt"), "present\n").expect("fixture");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+
+        let result = read_file(
+            &workspace,
+            &json!({"files": [{"path": "missing.txt"}, {"path": "present.txt"}]}),
+            &CancellationToken::default(),
+        )
+        .expect("batch result");
+        assert_eq!(result["failed_files"], 1);
+        assert_eq!(result["files"][0]["ok"], false);
+        assert_eq!(result["files"][1]["ok"], true);
+        assert_eq!(result["files"][1]["result"]["content"], "present\n");
     }
 }
