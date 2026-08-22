@@ -922,13 +922,38 @@ fn inline_source_contains_external_path(source: &str) -> bool {
     let mut outside = source.as_bytes().to_vec();
     for (start, content_start, content_end, end) in literals {
         outside[start..end].fill(b' ');
-        if text_contains_external_path(&source[content_start..content_end])
+        let literal = &source[content_start..content_end];
+        if !safe_separator_literal(source, start, end, literal)
+            && text_contains_external_path(literal)
             && !safe_diagnostic_path_literal(source, start, end)
         {
             return true;
         }
     }
     text_contains_external_path(&String::from_utf8_lossy(&outside))
+}
+
+fn safe_separator_literal(source: &str, start: usize, end: usize, value: &str) -> bool {
+    if !matches!(value, "/" | "\\" | "\\\\") {
+        return false;
+    }
+    let before = source[..start].trim_end().to_ascii_lowercase();
+    let after = source[end..].trim_start().to_ascii_lowercase();
+    if before.ends_with(".split(") || before.ends_with(".rsplit(") || after.starts_with(".join(") {
+        return true;
+    }
+
+    let Some(replace_start) = source[..start].rfind(".replace(") else {
+        return false;
+    };
+    let body_start = replace_start + ".replace(".len();
+    if source[body_start..start].contains(')') {
+        return false;
+    }
+    let Some(close_offset) = source[end..].find(')') else {
+        return false;
+    };
+    source[body_start..end + close_offset].contains(',')
 }
 
 fn quoted_literal_ranges(source: &str) -> Vec<(usize, usize, usize, usize)> {
@@ -1282,6 +1307,58 @@ mod tests {
                     .expect_err("real external file access must remain blocked");
             assert!(error.0.contains("WORKSPACE_PATH_PROTECTED"), "{error}");
         }
+    }
+
+    #[test]
+    fn strict_workspace_allows_separator_literals_in_structured_inline_source() {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(dir.path().join("crates/anchor/src/tools")).expect("tree");
+        std::fs::write(
+            dir.path().join("crates/anchor/src/tools/registry.rs"),
+            "alpha/beta\n",
+        )
+        .expect("fixture");
+        let workspace = Workspace::new(dir.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(true);
+        let policy = PolicySettings::default();
+        let source = "from pathlib import Path; text=Path('crates/anchor/src/tools/registry.rs').read_text(); print(text.replace('\\\\', '/').split('/'))";
+        let command =
+            join_command_tokens(&["python3".to_string(), "-c".to_string(), source.to_string()]);
+
+        validate_command_for_workspace(
+            &json!({
+                "cmd": command,
+                "executable": "python3",
+                "args": ["-c", source],
+                "shell": "direct",
+                "filesystem_scope": "workspace"
+            }),
+            &policy,
+            Some(&workspace),
+        )
+        .expect("separator syntax must not be mistaken for an absolute path");
+
+        let external_source =
+            "from pathlib import Path; print(Path('/tmp/secret').read_text().split('/'))";
+        let external_command = join_command_tokens(&[
+            "python3".to_string(),
+            "-c".to_string(),
+            external_source.to_string(),
+        ]);
+        let error = validate_command_for_workspace(
+            &json!({
+                "cmd": external_command,
+                "executable": "python3",
+                "args": ["-c", external_source],
+                "shell": "direct",
+                "filesystem_scope": "workspace"
+            }),
+            &policy,
+            Some(&workspace),
+        )
+        .expect_err("actual external path access must remain blocked");
+        assert!(error.0.contains("WORKSPACE_PATH_PROTECTED"), "{error}");
     }
 
     #[cfg(windows)]
