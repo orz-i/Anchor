@@ -18,9 +18,12 @@ fn server_info_returns_workspace_and_tools() {
     let ctx = ctx_for(&fx.root);
     let out = invoke(&ctx, "server_info", json!({}));
     let payload = assert_ok(&out);
+    assert_eq!(payload["detail"], "compact");
+    assert_eq!(payload["full_detail_available"], true);
     assert_eq!(payload["server"], "anchor");
     assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
-    assert!(payload["tools"].is_array());
+    assert!(payload.get("tools").is_none());
+    assert!(payload.get("tool_groups").is_none());
     assert!(payload["tool_count"].as_u64().unwrap_or(0) > 0);
     assert!(payload["build_identity"]["git_sha"]
         .as_str()
@@ -48,6 +51,26 @@ fn server_info_returns_workspace_and_tools() {
     assert_eq!(
         payload["command_cost_policy"]["policy_identifier"],
         "trusted_runtime_config"
+    );
+    assert!(payload["schema_telemetry"]["definition_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
+    assert!(payload["schema_telemetry"]["largest_tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty() && tools.len() <= 8));
+    assert!(payload["response_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
+
+    let full_out = invoke(&ctx, "server_info", json!({"detail": "full"}));
+    let full = assert_ok(&full_out);
+    assert_eq!(full["detail"], "full");
+    assert!(full["tools"].is_array());
+    assert!(full["tool_groups"].is_object());
+    assert!(
+        full["response_bytes"].as_u64().unwrap_or(0)
+            > payload["response_bytes"].as_u64().unwrap_or(u64::MAX),
+        "compact={payload} full={full}"
     );
 }
 
@@ -346,7 +369,17 @@ fn environment_and_cwd_facades_route_to_existing_contracts() {
     let environment = assert_ok(&environment);
     assert_eq!(environment["facade"], "environment");
     assert_eq!(environment["operation"], "check");
+    assert_eq!(environment["detail"], "compact");
     assert!(environment["workspace_exec_available"].is_boolean());
+
+    let full_environment = invoke(
+        &ctx,
+        "environment",
+        json!({"operation": "check", "detail": "full"}),
+    );
+    let full_environment = assert_ok(&full_environment);
+    assert_eq!(full_environment["detail"], "full");
+    assert!(full_environment["development_environment"]["probes"].is_object());
 
     let initial = invoke(&ctx, "cwd", json!({"operation": "get"}));
     let initial = assert_ok(&initial);
@@ -1130,6 +1163,11 @@ fn check_exec_environment_reports_policy_metadata() {
     let ctx = ctx_for(&fx.root);
     let out = invoke(&ctx, "check_exec_environment", json!({}));
     let payload = assert_ok(&out);
+    assert_eq!(payload["detail"], "compact");
+    assert_eq!(payload["full_detail_available"], true);
+    assert!(payload["response_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
     assert_eq!(payload["permission_mode"], "trusted");
     assert!(payload["system_command_allowlist"].is_array());
     assert_eq!(
@@ -1148,6 +1186,16 @@ fn check_exec_environment_reports_policy_metadata() {
         Some("healthy" | "degraded")
     ));
     assert!(payload["retryable"].is_boolean());
+
+    let full_out = invoke(&ctx, "check_exec_environment", json!({"detail": "full"}));
+    let full = assert_ok(&full_out);
+    assert_eq!(full["detail"], "full");
+    assert!(full["development_environment"]["probes"].is_object());
+    assert!(
+        full["response_bytes"].as_u64().unwrap_or(0)
+            > payload["response_bytes"].as_u64().unwrap_or(u64::MAX),
+        "compact={payload} full={full}"
+    );
 }
 
 #[test]

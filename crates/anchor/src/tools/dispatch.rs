@@ -1379,13 +1379,13 @@ fn call_tool_impl(
             "session_list" => session::list(ctx, &effective_args),
             "session_get" => session::get(ctx, &effective_args),
             "session_validate" => session::validate(ctx, &effective_args),
-            "server_info" => server_info_for_session(ctx, session_id),
+            "server_info" => server_info_for_session(ctx, session_id, &effective_args),
             "list_skills" => crate::skills::list_tool(ctx, &effective_args),
             "load_skill" => crate::skills::load_tool(ctx, &effective_args),
             "read_skill_resource" => {
                 crate::skills::read_resource_tool(&ctx.skills, &effective_args)
             }
-            "check_exec_environment" => check_exec_environment(ctx),
+            "check_exec_environment" => check_exec_environment(ctx, &effective_args),
             "exec_health_check" => exec::exec_health_check(ctx),
             "command_cost_explain" => exec::command_cost_explain(ctx, &effective_args),
             "get_default_cwd" => get_default_cwd_for_session(ctx, session_id),
@@ -2049,13 +2049,23 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
 }
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
-    server_info_for_session(ctx, None)
+    server_info_for_session(ctx, None, &json!({}))
 }
 
 fn server_info_for_session(
     ctx: &ToolContext,
     session_id: Option<&str>,
+    args: &Value,
 ) -> Result<Value, WorkspaceError> {
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
+    if !matches!(detail, "compact" | "full") {
+        return Err(WorkspaceError::invalid_argument(
+            "detail must be compact or full",
+        ));
+    }
     let current_catalog = crate::tools::catalog::build_effective_catalog(ctx)?;
     let published_catalog = ctx.published_catalog();
     let running_catalog = published_catalog.as_ref().unwrap_or(&current_catalog);
@@ -2126,11 +2136,11 @@ fn server_info_for_session(
         "downstream_mcp": downstream_mcp.clone()
     });
     let catalog_profile_guidance = if ctx.tool_profile == "advanced"
-        && running_catalog.estimated_tokens >= 24_000
+        && running_catalog.estimated_tokens >= 20_000
     {
         json!({
             "recommended_profile": "core",
-            "reason": "advanced exposes the full Browser proxy surface; use core for normal development and switch to advanced when low-frequency Browser/admin tools are needed",
+            "reason": "advanced catalog size is above the context-efficiency guidance threshold; use core for normal development and switch to advanced only when low-frequency local or proxy tools are needed",
             "current_profile": ctx.tool_profile
         })
     } else {
@@ -2140,7 +2150,8 @@ fn server_info_for_session(
             "current_profile": ctx.tool_profile
         })
     };
-    let mut response = json!({
+    let schema_telemetry = catalog_schema_telemetry(&running_catalog.tools);
+    let mut response = tool_ok(json!({
         "server": crate::brand::SERVER_NAME,
         "title": crate::brand::PRODUCT_NAME,
         "version": env!("CARGO_PKG_VERSION"),
@@ -2184,15 +2195,75 @@ fn server_info_for_session(
         "command_cost_policy": command_cost_policy,
         "downstream_mcp": downstream_mcp.clone(),
         "connection_layers": connection_layers
-    });
+        ,"schema_telemetry": schema_telemetry
+    }));
     if let Some(object) = response.as_object_mut() {
+        object.insert("detail".into(), Value::String(detail.to_string()));
+        object.insert("full_detail_available".into(), Value::Bool(true));
         object.insert(
             "preferred_shell".into(),
             Value::String(ctx.policy.preferred_shell.clone()),
         );
         object.insert("catalog_profile_guidance".into(), catalog_profile_guidance);
+        if detail == "compact" {
+            for key in [
+                "tools",
+                "tool_groups",
+                "current_tools",
+                "current_tool_groups",
+            ] {
+                object.remove(key);
+            }
+        }
     }
-    Ok(tool_ok(response))
+    attach_response_bytes(&mut response);
+    Ok(response)
+}
+
+fn catalog_schema_telemetry(tools: &[Value]) -> Value {
+    let mut sizes = tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?;
+            let bytes = serde_json::to_vec(tool).ok()?.len();
+            Some((name.to_string(), bytes))
+        })
+        .collect::<Vec<_>>();
+    sizes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let total_definition_bytes = sizes.iter().map(|(_, bytes)| *bytes).sum::<usize>();
+    let largest_tools = sizes
+        .into_iter()
+        .take(8)
+        .map(|(name, bytes)| {
+            json!({
+                "name": name,
+                "definition_bytes": bytes,
+                "estimated_tokens": bytes.div_ceil(4)
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "definition_bytes": total_definition_bytes,
+        "estimated_tokens": total_definition_bytes.div_ceil(4),
+        "largest_tools": largest_tools,
+        "largest_tools_limit": 8
+    })
+}
+
+fn attach_response_bytes(value: &mut Value) {
+    if !value.is_object() {
+        return;
+    }
+    value["response_bytes"] = json!(0);
+    for _ in 0..4 {
+        let bytes = serde_json::to_vec(value)
+            .map(|encoded| encoded.len())
+            .unwrap_or(0);
+        if value["response_bytes"].as_u64() == Some(bytes as u64) {
+            break;
+        }
+        value["response_bytes"] = json!(bytes);
+    }
 }
 
 fn tool_group_manifest(tools: &[&str]) -> Value {
@@ -2284,7 +2355,16 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
     })
 }
 
-pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("compact");
+    if !matches!(detail, "compact" | "full") {
+        return Err(WorkspaceError::invalid_argument(
+            "detail must be compact or full",
+        ));
+    }
     let boundary_error = ctx.workspace.ensure_child_process_boundary().err();
     let workspace_exec_available = boundary_error.is_none();
     let mut warnings = vec!["Workspace 子进程尚未启用操作系统级文件系统沙箱".to_string()];
@@ -2292,13 +2372,21 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         warnings.push(error.message());
     }
     let docker_execution_allowed = ctx.policy.allowed_commands.contains("docker");
-    let development_environment =
+    let full_development_environment =
         crate::tools::environment::diagnose(ctx.workspace.root(), docker_execution_allowed);
-    let actionable_verification_route = development_environment["recommended_verification_route"]
+    let actionable_verification_route = full_development_environment
+        ["recommended_verification_route"]
         .as_str()
         .is_some_and(|route| matches!(route, "host" | "docker"));
     let healthy = workspace_exec_available && actionable_verification_route;
-    Ok(tool_ok(json!({
+    let development_environment = if detail == "full" {
+        full_development_environment
+    } else {
+        crate::tools::environment::summarize_diagnosis(&full_development_environment)
+    };
+    let mut response = tool_ok(json!({
+        "detail": detail,
+        "full_detail_available": true,
         "healthy": healthy,
         "status": if healthy { "healthy" } else { "degraded" },
         "retryable": !healthy,
@@ -2334,7 +2422,9 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         },
         "development_environment": development_environment,
         "warnings": warnings
-    })))
+    }));
+    attach_response_bytes(&mut response);
+    Ok(response)
 }
 
 pub fn get_default_cwd(ctx: &ToolContext) -> Result<Value, WorkspaceError> {

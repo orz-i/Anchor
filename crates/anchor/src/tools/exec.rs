@@ -1350,14 +1350,14 @@ async fn run_command(
             session.kill_and_wait().await;
             session.refresh_status().await;
             session.wait_for_readers().await;
+            session.mark_terminal_observed();
             let snapshot = session.snapshot(max_output);
-            ctx.sessions.remove(&session.session_id);
             return Err(cancelled_error(Some(snapshot)));
         }
         if session.has_exited() {
             session.wait_for_readers().await;
+            session.mark_terminal_observed();
             let snapshot = session.snapshot(max_output);
-            ctx.sessions.remove(&session.session_id);
             return Ok(merge_exec_result(
                 snapshot,
                 start,
@@ -1405,8 +1405,8 @@ async fn run_command(
                 }
                 if session.has_exited() {
                     session.wait_for_readers().await;
+                    session.mark_terminal_observed();
                     let snapshot = session.snapshot(max_output);
-                    ctx.sessions.remove(&session.session_id);
                     return Ok(merge_exec_result(
                         snapshot,
                         start,
@@ -1859,6 +1859,61 @@ mod tests {
         assert_eq!(output["success"], true, "{output}");
         assert_eq!(output["exit_code"], 1, "{output}");
         assert!(output.get("error").is_none(), "{output}");
+    }
+
+    #[test]
+    fn immediate_terminal_command_is_observed_but_retains_readable_output_refs() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        #[cfg(windows)]
+        let command = "python -c \"print('terminal-output')\"";
+        #[cfg(not(windows))]
+        let command = "python3 -c \"print('terminal-output')\"";
+
+        let output = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": command,
+                "timeout_ms": 10_000,
+                "yield_time_ms": 10_000
+            }),
+        );
+        assert_eq!(output["ok"], true, "{output}");
+        assert_eq!(output["execution_status"], "succeeded", "{output}");
+        assert_eq!(output["result_observed"], true, "{output}");
+        let session_id = output["session_id"].as_str().expect("session id");
+        let retained = ctx
+            .sessions
+            .get(session_id)
+            .expect("retained terminal session");
+        assert!(retained.terminal_observed());
+
+        let stdout_ref = output["output_refs"]["stdout"]
+            .as_str()
+            .expect("stdout ref");
+        let read = call_tool(
+            &ctx,
+            "read_output",
+            &json!({"output_ref": stdout_ref, "offset": 0, "limit": 1024}),
+        );
+        assert_eq!(read["ok"], true, "{read}");
+        assert!(
+            read["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("terminal-output")),
+            "{read}"
+        );
+
+        let sessions = call_tool(
+            &ctx,
+            "list_command_sessions",
+            &json!({"include_terminal": true, "max_output_bytes": 0}),
+        );
+        assert_eq!(sessions["pending_result_count"], 0, "{sessions}");
     }
 
     #[cfg(unix)]

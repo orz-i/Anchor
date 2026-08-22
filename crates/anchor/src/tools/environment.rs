@@ -299,6 +299,48 @@ pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
     })
 }
 
+pub fn summarize_diagnosis(full: &Value) -> Value {
+    let node_modules = &full["node_modules"];
+    let package_manager = &full["package_manager"];
+    json!({
+        "platform": full["platform"],
+        "checkout_kind": full["checkout_kind"],
+        "project_requirements": full["project_requirements"],
+        "missing_required_tools": full["missing_required_tools"],
+        "package_manager": {
+            "name": package_manager["name"],
+            "version": package_manager["version"],
+            "source": package_manager["source"],
+            "conflicting_lockfiles": package_manager["conflicting_lockfiles"]
+        },
+        "node_modules": {
+            "exists": node_modules["exists"],
+            "traversable": node_modules["traversable"],
+            "direct_packages_healthy": node_modules["direct_packages_healthy"],
+            "required_bins_healthy": node_modules["required_bins_healthy"],
+            "mixed_installer_metadata": node_modules["mixed_installer_metadata"],
+            "redirection_guard_incompatible_layout": node_modules["redirection_guard_incompatible_layout"]
+        },
+        "host_frontend_healthy": full["host_frontend_healthy"],
+        "host_rust_healthy": full["host_rust_healthy"],
+        "host_go_healthy": full["host_go_healthy"],
+        "host_git_healthy": full["host_git_healthy"],
+        "host_powershell_healthy": full["host_powershell_healthy"],
+        "host_toolchains_healthy": full["host_toolchains_healthy"],
+        "host_healthy": full["host_healthy"],
+        "workspace_frontend_dependencies_healthy": full["workspace_frontend_dependencies_healthy"],
+        "workspace_setup_required": full["workspace_setup_required"],
+        "docker_project_detected": full["docker_project_detected"],
+        "docker_execution_allowed": full["docker_execution_allowed"],
+        "docker_verification_healthy": full["docker_verification_healthy"],
+        "recommended_verification_route": full["recommended_verification_route"],
+        "toolchain_search_path": {
+            "effective_additions": full["toolchain_search_path"]["effective_additions"]
+        },
+        "findings": full["findings"]
+    })
+}
+
 fn recommended_verification_route(
     host_healthy: bool,
     workspace_setup_required: bool,

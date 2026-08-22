@@ -1374,6 +1374,22 @@ pub fn output_schema(name: &str) -> Value {
                     "current_proxy_tool_count": { "type": "integer", "minimum": 0 }
                 }),
                 json!({
+                    "detail": { "type": "string", "enum": ["compact", "full"] },
+                    "full_detail_available": { "type": "boolean", "const": true },
+                    "schema_telemetry": {
+                        "type": "object",
+                        "properties": {
+                            "definition_bytes": { "type": "integer", "minimum": 0 },
+                            "estimated_tokens": { "type": "integer", "minimum": 0 },
+                            "largest_tools": { "type": "array", "maxItems": 8, "items": { "type": "object" } },
+                            "largest_tools_limit": { "type": "integer", "const": 8 }
+                        },
+                        "required": ["definition_bytes", "estimated_tokens", "largest_tools", "largest_tools_limit"],
+                        "additionalProperties": false
+                    },
+                    "response_bytes": { "type": "integer", "minimum": 1 }
+                }),
+                json!({
                     "preferred_shell": { "type": "string", "enum": ["auto", "pwsh", "powershell", "cmd"] },
                     "catalog_profile_guidance": {
                         "type": "object",
@@ -1445,12 +1461,8 @@ pub fn output_schema(name: &str) -> Value {
                 "auth_enabled",
                 "auth_type",
                 "endpoint_path",
-                "tools",
                 "tool_count",
-                "tool_groups",
-                "current_tools",
                 "current_tool_count",
-                "current_tool_groups",
                 "catalog_digest",
                 "running_catalog_digest",
                 "current_catalog_digest",
@@ -1467,6 +1479,10 @@ pub fn output_schema(name: &str) -> Value {
                 "current_catalog_estimated_tokens",
                 "current_local_tool_count",
                 "current_proxy_tool_count",
+                "detail",
+                "full_detail_available",
+                "schema_telemetry",
+                "response_bytes",
                 "catalog_profile_guidance",
                 "schema_discovery",
                 "command_cost_policy",
@@ -3599,6 +3615,8 @@ pub fn input_schema(name: &str) -> Value {
                 "include_hidden": { "type": "boolean", "default": false },
                 "include_ignored": { "type": "boolean", "default": false },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0, "description": "Stable result offset returned as next_cursor." },
+                "max_scan_files": { "type": "integer", "minimum": 1, "maximum": 250000, "default": 100000, "description": "Hard candidate-file budget. The scan fails atomically instead of returning an unstable partial page when exceeded." },
+                "scan_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000, "description": "Cooperative repository traversal deadline." },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 50000, "default": 5000 }
             },
             "additionalProperties": false
@@ -3615,6 +3633,9 @@ pub fn input_schema(name: &str) -> Value {
                 "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 0 },
                 "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"], "default": "matches", "description": "Choose detailed matches or compact file/count/summary output." },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0, "description": "Stable offset in the selected output mode; continue with next_cursor." },
+                "max_scan_files": { "type": "integer", "minimum": 1, "maximum": 250000, "default": 100000, "description": "Hard candidate-file budget. Exceeding it returns a retryable budget error rather than unstable partial results." },
+                "max_scan_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824, "default": 134217728, "description": "Hard aggregate source-byte budget for this search." },
+                "scan_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000, "description": "Cooperative repository traversal and search deadline." },
                 "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
             },
@@ -3653,6 +3674,30 @@ pub fn input_schema(name: &str) -> Value {
                 "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 20000 }
             },
             "required": ["patch"],
+            "additionalProperties": false
+        }),
+        "check_exec_environment" => json!({
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": "Compact returns the actionable environment summary; full includes complete probes and dependency diagnostics."
+                }
+            },
+            "additionalProperties": false
+        }),
+        "server_info" => json!({
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "string",
+                    "enum": ["compact", "full"],
+                    "default": "compact",
+                    "description": "Compact omits repeated tool-name/group manifests while retaining counts, digests, connection state, and schema telemetry; full returns the complete manifest."
+                }
+            },
             "additionalProperties": false
         }),
         "command_cost_explain" => json!({

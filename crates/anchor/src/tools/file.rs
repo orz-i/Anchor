@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
@@ -15,6 +15,14 @@ use crate::tools::CancellationToken;
 
 const DEFAULT_READ_BUDGET: usize = 131_072;
 const MAX_BATCH_READ_FILES: usize = 32;
+const DEFAULT_SCAN_MAX_FILES: usize = 100_000;
+const MAX_SCAN_MAX_FILES: usize = 250_000;
+const DEFAULT_SEARCH_MAX_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SEARCH_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_SCAN_TIMEOUT_MS: u64 = 30_000;
+const MAX_SCAN_TIMEOUT_MS: u64 = 120_000;
+
+static REPOSITORY_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ReadRequest {
@@ -28,6 +36,128 @@ struct ReadRequest {
 struct RepositoryScan {
     files: Vec<PathBuf>,
     skipped_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RepositoryScanBudget {
+    started: Instant,
+    max_files: usize,
+    max_bytes: Option<usize>,
+    timeout: Duration,
+}
+
+impl RepositoryScanBudget {
+    fn from_args(args: &Value, include_bytes: bool) -> Self {
+        let max_files = args
+            .get("max_scan_files")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_SCAN_MAX_FILES as u64)
+            .clamp(1, MAX_SCAN_MAX_FILES as u64) as usize;
+        let max_bytes = include_bytes.then(|| {
+            args.get("max_scan_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_SEARCH_MAX_BYTES as u64)
+                .clamp(1, MAX_SEARCH_MAX_BYTES as u64) as usize
+        });
+        let timeout_ms = args
+            .get("scan_timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_SCAN_TIMEOUT_MS)
+            .clamp(1_000, MAX_SCAN_TIMEOUT_MS);
+        Self {
+            started: Instant::now(),
+            max_files,
+            max_bytes,
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    fn checkpoint(
+        &self,
+        candidate_files: usize,
+        bytes_scanned: usize,
+    ) -> Result<(), WorkspaceError> {
+        if candidate_files > self.max_files {
+            return Err(self.exceeded("files", candidate_files, bytes_scanned));
+        }
+        if self
+            .max_bytes
+            .is_some_and(|max_bytes| bytes_scanned > max_bytes)
+        {
+            return Err(self.exceeded("bytes", candidate_files, bytes_scanned));
+        }
+        if self.started.elapsed() > self.timeout {
+            return Err(self.exceeded("time", candidate_files, bytes_scanned));
+        }
+        Ok(())
+    }
+
+    fn exceeded(
+        &self,
+        dimension: &str,
+        candidate_files: usize,
+        bytes_scanned: usize,
+    ) -> WorkspaceError {
+        WorkspaceError::ToolDetails {
+            code: "REPOSITORY_SCAN_BUDGET_EXCEEDED",
+            message: format!("Repository scan exceeded its {dimension} budget."),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "dimension": dimension,
+                "candidate_files": candidate_files,
+                "bytes_scanned": bytes_scanned,
+                "elapsed_ms": self.started.elapsed().as_millis(),
+                "max_scan_files": self.max_files,
+                "max_scan_bytes": self.max_bytes,
+                "scan_timeout_ms": self.timeout.as_millis(),
+                "workspace_modified": false,
+                "suggestion": "Narrow path/globs or retry with a larger bounded scan budget."
+            }),
+        }
+    }
+
+    fn telemetry(&self, candidate_files: usize, bytes_scanned: usize) -> Value {
+        json!({
+            "candidate_files": candidate_files,
+            "bytes_scanned": bytes_scanned,
+            "elapsed_ms": self.started.elapsed().as_millis(),
+            "max_scan_files": self.max_files,
+            "max_scan_bytes": self.max_bytes,
+            "scan_timeout_ms": self.timeout.as_millis(),
+            "admission": "exclusive_process",
+            "budget_complete": true
+        })
+    }
+}
+
+fn acquire_repository_scan(
+    budget: &RepositoryScanBudget,
+    cancellation: &CancellationToken,
+) -> Result<MutexGuard<'static, ()>, WorkspaceError> {
+    let lock = REPOSITORY_SCAN_LOCK.get_or_init(|| Mutex::new(()));
+    loop {
+        ensure_not_cancelled(cancellation)?;
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                budget.checkpoint(0, 0)?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(WorkspaceError::ToolDetails {
+                    code: "REPOSITORY_SCAN_ADMISSION_FAILED",
+                    message: "Repository scan admission state is unavailable.".into(),
+                    category: "runtime",
+                    retryable: true,
+                    details: json!({
+                        "workspace_modified": false,
+                        "admission": "exclusive_process"
+                    }),
+                });
+            }
+        }
+    }
 }
 
 fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<(), WorkspaceError> {
@@ -100,6 +230,7 @@ fn repository_files(
     root: &Path,
     include_hidden: bool,
     include_ignored: bool,
+    budget: &RepositoryScanBudget,
     cancellation: &CancellationToken,
 ) -> Result<RepositoryScan, WorkspaceError> {
     let skipped_entries = Arc::new(AtomicUsize::new(0));
@@ -145,6 +276,7 @@ fn repository_files(
     let mut files = Vec::new();
     for entry in builder.build() {
         ensure_not_cancelled(cancellation)?;
+        budget.checkpoint(files.len(), 0)?;
         let Ok(entry) = entry else {
             skipped_entries.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -161,9 +293,12 @@ fn repository_files(
         let path = entry.into_path();
         if ws.is_safe_read_path(&path) {
             files.push(path);
+            budget.checkpoint(files.len(), 0)?;
         }
     }
+    budget.checkpoint(files.len(), 0)?;
     files.sort_by_key(|path| relative_display(ws.root(), path));
+    budget.checkpoint(files.len(), 0)?;
     Ok(RepositoryScan {
         files,
         skipped_entries: skipped_entries.load(Ordering::Relaxed),
@@ -430,6 +565,8 @@ pub fn list_dir(
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
     ensure_not_cancelled(cancellation)?;
+    let budget = RepositoryScanBudget::from_args(args, false);
+    let _scan_guard = acquire_repository_scan(&budget, cancellation)?;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = ws.resolve_read_path(path)?;
     if !resolved.path.is_dir() {
@@ -488,6 +625,8 @@ pub fn list_files(
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
     ensure_not_cancelled(cancellation)?;
+    let budget = RepositoryScanBudget::from_args(args, false);
+    let _scan_guard = acquire_repository_scan(&budget, cancellation)?;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = ws.resolve_read_path(path)?;
     if !resolved.path.is_dir() {
@@ -514,12 +653,17 @@ pub fn list_files(
         &resolved.path,
         include_hidden,
         include_ignored,
+        &budget,
         cancellation,
     )?;
     let candidate_files = scan.files.len();
     let skipped_entries = scan.skipped_entries;
     let mut all_files = Vec::new();
-    for p in scan.files {
+    for (index, p) in scan.files.into_iter().enumerate() {
+        if index % 256 == 0 {
+            ensure_not_cancelled(cancellation)?;
+            budget.checkpoint(candidate_files, 0)?;
+        }
         let rel = relative_display(ws.root(), &p);
         if !patterns.iter().any(|pat| glob_match(pat, &rel)) {
             continue;
@@ -541,6 +685,18 @@ pub fn list_files(
     let end = start.saturating_add(max_results).min(total_files);
     let files = all_files.drain(start..end).collect::<Vec<_>>();
     let next_cursor = (end < total_files).then_some(end);
+    let mut scan_telemetry = budget.telemetry(candidate_files, 0);
+    if let Some(object) = scan_telemetry.as_object_mut() {
+        object.insert("skipped_entries".into(), json!(skipped_entries));
+        object.insert(
+            "ignore_rules".into(),
+            json!(if include_ignored {
+                "disabled"
+            } else {
+                "project_and_default"
+            }),
+        );
+    }
     Ok(tool_ok(json!({
         "path": resolved.display,
         "files": files,
@@ -548,11 +704,7 @@ pub fn list_files(
         "next_cursor": next_cursor,
         "total_files": total_files,
         "truncated": next_cursor.is_some(),
-        "scan": {
-            "candidate_files": candidate_files,
-            "skipped_entries": skipped_entries,
-            "ignore_rules": if include_ignored { "disabled" } else { "project_and_default" }
-        },
+        "scan": scan_telemetry,
         "warnings": if next_cursor.is_some() { vec!["result page limit reached; continue with next_cursor"] } else { vec![] }
     })))
 }
@@ -563,6 +715,8 @@ pub fn search_text(
     cancellation: &CancellationToken,
 ) -> Result<Value, WorkspaceError> {
     ensure_not_cancelled(cancellation)?;
+    let budget = RepositoryScanBudget::from_args(args, true);
+    let _scan_guard = acquire_repository_scan(&budget, cancellation)?;
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -606,8 +760,9 @@ pub fn search_text(
             skipped_entries: 0,
         }
     } else {
-        repository_files(ws, &resolved.path, false, false, cancellation)?
+        repository_files(ws, &resolved.path, false, false, &budget, cancellation)?
     };
+    budget.checkpoint(scan.files.len(), 0)?;
 
     let mut page_matches = Vec::new();
     let mut file_summaries = Vec::new();
@@ -627,6 +782,13 @@ pub fn search_text(
         if !passes_glob_filters(&rel, &include_globs, &exclude_globs) {
             continue;
         }
+        let anticipated_bytes = p
+            .metadata()
+            .ok()
+            .and_then(|metadata| usize::try_from(metadata.len()).ok())
+            .map(|size| bytes_scanned.saturating_add(size))
+            .unwrap_or(bytes_scanned);
+        budget.checkpoint(scan.files.len(), anticipated_bytes)?;
         let data = match fs::read(p) {
             Ok(data) => data,
             Err(_) => {
@@ -635,6 +797,7 @@ pub fn search_text(
             }
         };
         bytes_scanned = bytes_scanned.saturating_add(data.len());
+        budget.checkpoint(scan.files.len(), bytes_scanned)?;
         let content = match decode_text(data) {
             Ok((text, _)) if !text.contains('\0') => text,
             _ => {
@@ -647,6 +810,7 @@ pub fn search_text(
         for (idx, line) in lines.iter().enumerate() {
             if idx % 256 == 0 {
                 ensure_not_cancelled(cancellation)?;
+                budget.checkpoint(scan.files.len(), bytes_scanned)?;
             }
             let Some(match_byte) = matcher.find(line) else {
                 continue;
@@ -711,6 +875,12 @@ pub fn search_text(
         _ => unreachable!(),
     };
 
+    let mut scan_telemetry = budget.telemetry(scan.files.len(), bytes_scanned);
+    if let Some(object) = scan_telemetry.as_object_mut() {
+        object.insert("skipped_entries".into(), json!(scan.skipped_entries));
+        object.insert("skipped_files".into(), json!(skipped_files));
+        object.insert("ignore_rules".into(), json!("project_and_default"));
+    }
     Ok(tool_ok(json!({
         "query": query,
         "output_mode": output_mode,
@@ -722,13 +892,7 @@ pub fn search_text(
         "cursor": cursor,
         "next_cursor": next_cursor,
         "truncated": next_cursor.is_some(),
-        "scan": {
-            "candidate_files": scan.files.len(),
-            "skipped_entries": scan.skipped_entries,
-            "skipped_files": skipped_files,
-            "bytes_scanned": bytes_scanned,
-            "ignore_rules": "project_and_default"
-        },
+        "scan": scan_telemetry,
         "warnings": if next_cursor.is_some() { vec!["result page limit reached; continue with next_cursor"] } else { vec![] }
     })))
 }
@@ -1039,6 +1203,48 @@ mod tests {
         .expect("subdirectory scan");
         assert_eq!(listed["total_files"], 1);
         assert_eq!(listed["files"][0]["path"], "sub/kept.txt");
+    }
+
+    #[test]
+    fn repository_scan_file_budget_fails_before_returning_an_unstable_partial_page() {
+        let root = tempdir().expect("workspace");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.path().join(name), name).expect("fixture file");
+        }
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let error = list_files(
+            &workspace,
+            &json!({"path": ".", "max_scan_files": 2, "max_results": 1}),
+            &CancellationToken::default(),
+        )
+        .expect_err("hard scan budget must reject the whole scan");
+        assert!(matches!(
+            error,
+            WorkspaceError::ToolDetails {
+                code: "REPOSITORY_SCAN_BUDGET_EXCEEDED",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn search_byte_budget_is_checked_before_reading_an_oversized_candidate() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join("large.txt"), "needle and more data\n").expect("fixture");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let error = search_text(
+            &workspace,
+            &json!({"query": "needle", "max_scan_bytes": 4}),
+            &CancellationToken::default(),
+        )
+        .expect_err("byte budget must reject the whole scan");
+        assert!(matches!(
+            error,
+            WorkspaceError::ToolDetails {
+                code: "REPOSITORY_SCAN_BUDGET_EXCEEDED",
+                ..
+            }
+        ));
     }
 
     #[test]
