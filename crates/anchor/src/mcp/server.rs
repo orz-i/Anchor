@@ -2261,7 +2261,7 @@ mod tests {
             "read_output",
             "wait_command",
             "list_command_sessions",
-            "search_text",
+            "grep",
             "server_info",
             "browser_build_info",
             "browser_wait_for_build",

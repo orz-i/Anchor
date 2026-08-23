@@ -678,9 +678,9 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
-        "search_text",
-        "Search text",
-        "[anchor-core anchor-files] Search UTF-8 or BOM-marked UTF-16 workspace files for text or regex matches.",
+        "grep",
+        "Grep repository",
+        "[anchor-core anchor-files] Search workspace text with structured results; uses ripgrep acceleration when available and falls back to Anchor's built-in scanner.",
         true,
         false,
         false,
@@ -927,7 +927,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
     "list_files",
-    "search_text",
+    "grep",
     "replace_text",
     "apply_patch",
     "remove_path",
@@ -1012,7 +1012,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
     "list_files",
-    "search_text",
+    "grep",
     "read_output",
     "wait_command",
     "list_command_sessions",
@@ -1782,7 +1782,7 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &["mode", "bytes_read", "truncated", "next", "warnings"],
         ),
-        "search_text" => success_output_schema(
+        "grep" | "search_text" => success_output_schema(
             json!({
                 "query": { "type": "string" },
                 "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"] },
@@ -3732,7 +3732,7 @@ pub fn input_schema(name: &str) -> Value {
             },
             "additionalProperties": false
         }),
-        "search_text" => json!({
+        "grep" | "search_text" => json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "minLength": 1 },

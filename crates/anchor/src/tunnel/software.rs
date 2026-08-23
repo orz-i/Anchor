@@ -5,7 +5,8 @@
 //! are "managed" (uninstallable); binaries found on PATH or in system install
 //! locations are reported but cannot be removed from here.
 
-use std::path::PathBuf;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -15,7 +16,11 @@ use crate::tunnel::cloudflare::resolve_cloudflared;
 use crate::tunnel::cloudflare::{cached_cloudflared_path, download_cloudflared_to_cache};
 use crate::tunnel::frp::{cached_frpc_path, download_frpc_to_cache, resolve_frpc};
 
-const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared"];
+// 15.2.0 currently has an open regression in the published x86_64 Linux musl
+// binary. Keep the managed build on the previous release until upstream ships
+// a fixed binary; system-installed newer rg remains usable and is detected.
+const RIPGREP_VERSION: &str = "15.1.0";
+const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared", "ripgrep"];
 
 /// Status of a managed tunnel binary, serialized to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +40,24 @@ pub struct SoftwareStatus {
     pub target_version: String,
 }
 
+fn ripgrep_status() -> SoftwareStatus {
+    let cache = cached_ripgrep_path().filter(|path| path.is_file());
+    let resolved = resolve_ripgrep();
+    let (path, managed, installed) = match (&cache, &resolved) {
+        (Some(cache_path), _) => (cache_path.clone(), true, true),
+        (None, Some(found)) => (found.clone(), false, true),
+        (None, None) => (PathBuf::new(), false, false),
+    };
+    SoftwareStatus {
+        kind: "ripgrep".into(),
+        name: "ripgrep (rg)".into(),
+        installed,
+        path: path.to_string_lossy().to_string(),
+        managed,
+        target_version: RIPGREP_VERSION.into(),
+    }
+}
+
 pub fn is_supported_kind(kind: &str) -> bool {
     SUPPORTED_SOFTWARE_KINDS.contains(&kind)
 }
@@ -47,7 +70,32 @@ pub fn target_version(kind: &str) -> AppResult<&'static str> {
     match kind {
         "frpc" => Ok(crate::tunnel::frp::VERSION),
         "cloudflared" => Ok(crate::tunnel::cloudflare::VERSION),
+        "ripgrep" => Ok(RIPGREP_VERSION),
         other => Err(AppError::Message(format!("未知软件: {other}"))),
+    }
+}
+
+pub(crate) fn cached_ripgrep_path() -> Option<PathBuf> {
+    platform()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join("bin").join(ripgrep_binary_name()))
+}
+
+pub(crate) fn resolve_ripgrep() -> Option<PathBuf> {
+    cached_ripgrep_path()
+        .filter(|path| path.is_file())
+        .or_else(|| which::which("rg").ok())
+}
+
+fn ripgrep_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "rg.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "rg"
     }
 }
 
@@ -88,9 +136,9 @@ fn cloudflared_status() -> SoftwareStatus {
     }
 }
 
-/// Report install status for both binaries.
+/// Report install status for all supported external software.
 pub fn list_software() -> Vec<SoftwareStatus> {
-    vec![frpc_status(), cloudflared_status()]
+    vec![frpc_status(), cloudflared_status(), ripgrep_status()]
 }
 
 /// Install (download into cache) the requested binary.
@@ -110,6 +158,13 @@ pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
             download_cloudflared_to_cache().await?;
             Ok(cloudflared_status())
         }
+        "ripgrep" => {
+            if cached_ripgrep_path().is_some_and(|path| path.is_file()) {
+                return Ok(ripgrep_status());
+            }
+            download_ripgrep_to_cache().await?;
+            Ok(ripgrep_status())
+        }
         other => Err(AppError::Message(format!("未知软件: {other}"))),
     }
 }
@@ -120,6 +175,7 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
     let cache_path = match kind {
         "frpc" => cached_frpc_path(),
         "cloudflared" => cached_cloudflared_path(),
+        "ripgrep" => cached_ripgrep_path(),
         other => return Err(AppError::Message(format!("未知软件: {other}"))),
     };
 
@@ -145,8 +201,111 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
 
     Ok(match kind {
         "frpc" => frpc_status(),
-        _ => cloudflared_status(),
+        "cloudflared" => cloudflared_status(),
+        _ => ripgrep_status(),
     })
+}
+
+fn ripgrep_release_asset() -> AppResult<&'static str> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok("ripgrep-15.1.0-x86_64-pc-windows-msvc.zip");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        return Ok("ripgrep-15.1.0-aarch64-pc-windows-msvc.zip");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Ok("ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Ok("ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Ok("ripgrep-15.1.0-x86_64-apple-darwin.tar.gz");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Ok("ripgrep-15.1.0-aarch64-apple-darwin.tar.gz");
+    }
+    #[allow(unreachable_code)]
+    Err(AppError::Message(
+        "当前平台暂不支持自动下载 ripgrep。".into(),
+    ))
+}
+
+async fn download_ripgrep_to_cache() -> AppResult<PathBuf> {
+    let settings = crate::settings::AppSettings::load()?;
+    let asset = ripgrep_release_asset()?;
+    let url = format!(
+        "https://github.com/BurntSushi/ripgrep/releases/download/{RIPGREP_VERSION}/{asset}"
+    );
+    let bytes = crate::tunnel::download::download_release_asset(&settings, &url, "ripgrep").await?;
+    let dest = cached_ripgrep_path()
+        .ok_or_else(|| AppError::Message("无法解析 ripgrep 缓存目录。".into()))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    extract_ripgrep_binary(&bytes, asset, &dest)?;
+    make_executable(&dest)?;
+    if dest.is_file() {
+        Ok(dest)
+    } else {
+        Err(AppError::Message("ripgrep 自动安装失败。".into()))
+    }
+}
+
+fn extract_ripgrep_binary(bytes: &[u8], asset: &str, dest: &Path) -> AppResult<()> {
+    if asset.ends_with(".zip") {
+        let reader = Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(reader)
+            .map_err(|err| AppError::Message(format!("解压 ripgrep 安装包失败: {err}")))?;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|err| AppError::Message(format!("读取 ripgrep 安装包失败: {err}")))?;
+            if entry.name().replace('\\', "/").ends_with("/rg.exe") {
+                let mut output = std::fs::File::create(dest)?;
+                std::io::copy(&mut entry, &mut output)?;
+                return Ok(());
+            }
+        }
+    } else {
+        let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive
+            .entries()
+            .map_err(|err| AppError::Message(format!("解压 ripgrep 安装包失败: {err}")))?
+        {
+            let mut entry = entry
+                .map_err(|err| AppError::Message(format!("读取 ripgrep 安装包失败: {err}")))?;
+            let path = entry
+                .path()
+                .map_err(|err| AppError::Message(format!("读取 ripgrep 安装路径失败: {err}")))?;
+            if path.to_string_lossy().replace('\\', "/").ends_with("/rg") {
+                let mut output = std::fs::File::create(dest)?;
+                std::io::copy(&mut entry, &mut output)?;
+                return Ok(());
+            }
+        }
+    }
+    Err(AppError::Message(
+        "ripgrep 安装包中未找到 rg 可执行文件。".into(),
+    ))
+}
+
+fn make_executable(path: &Path) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,6 +322,9 @@ mod tests {
         assert!(statuses.iter().any(|status| {
             status.kind == "cloudflared"
                 && status.target_version == crate::tunnel::cloudflare::VERSION
+        }));
+        assert!(statuses.iter().any(|status| {
+            status.kind == "ripgrep" && status.target_version == RIPGREP_VERSION
         }));
     }
 }

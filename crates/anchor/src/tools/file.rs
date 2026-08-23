@@ -492,6 +492,16 @@ where
     })))
 }
 
+/// Compatibility entry point for callers that have not refreshed the renamed
+/// tool catalog yet. New catalogs expose only `grep`.
+pub fn search_text(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    grep(ws, args, cancellation)
+}
+
 #[derive(Default)]
 struct RepositoryScan {
     files: Vec<PathBuf>,
@@ -1206,7 +1216,133 @@ pub fn list_files(
     })))
 }
 
-pub fn search_text(
+struct RipgrepPathOutput {
+    path: PathBuf,
+}
+
+impl Drop for RipgrepPathOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn ripgrep_prefilter(
+    root: &Path,
+    query: &str,
+    use_regex: bool,
+    case_sensitive: bool,
+    include_globs: &[String],
+    exclude_globs: &[String],
+    eligible_files: &[PathBuf],
+    eligible_bytes: usize,
+    budget: &RepositoryScanBudget,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<PathBuf>>, WorkspaceError> {
+    let Some(rg) = crate::tunnel::resolve_ripgrep() else {
+        return Ok(None);
+    };
+
+    let output_path = std::env::temp_dir().join(format!(
+        "anchor-rg-paths-{}-{}.tmp",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let output_guard = RipgrepPathOutput {
+        path: output_path.clone(),
+    };
+    let output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&output_path)
+        .map_err(|error| WorkspaceError::Tool {
+            code: "SEARCH_ACCELERATOR_UNAVAILABLE",
+            message: format!("Unable to create ripgrep result buffer: {error}"),
+            category: "runtime",
+            retryable: true,
+        })?;
+
+    let mut command = std::process::Command::new(rg);
+    command
+        .current_dir(root)
+        .arg("--no-config")
+        .arg("--no-messages")
+        .arg("--color=never")
+        .arg("--files-with-matches")
+        .arg("--null")
+        .arg("--encoding=auto")
+        .stdout(std::process::Stdio::from(output))
+        .stderr(std::process::Stdio::null());
+    if !use_regex {
+        command.arg("--fixed-strings");
+    }
+    if !case_sensitive {
+        command.arg("--ignore-case");
+    }
+    for pattern in include_globs {
+        command.arg("--glob").arg(pattern);
+    }
+    for pattern in exclude_globs {
+        command.arg("--glob").arg(format!("!{pattern}"));
+    }
+    command.arg("--").arg(query).arg(".");
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return Ok(None),
+    };
+    let status = loop {
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = budget.checkpoint(eligible_files.len(), eligible_bytes) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+        }
+    };
+    if !matches!(status.code(), Some(0 | 1)) {
+        return Ok(None);
+    }
+
+    let raw = match fs::read(&output_guard.path) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let mut matched = HashSet::new();
+    for encoded in raw.split(|byte| *byte == 0).filter(|part| !part.is_empty()) {
+        let Ok(relative) = std::str::from_utf8(encoded) else {
+            return Ok(None);
+        };
+        let candidate = root.join(relative.trim_start_matches("./"));
+        if let Ok(canonical) = candidate.canonicalize() {
+            matched.insert(canonical);
+        }
+    }
+    Ok(Some(
+        eligible_files
+            .iter()
+            .filter(|path| {
+                path.canonicalize()
+                    .ok()
+                    .is_some_and(|canonical| matched.contains(&canonical))
+            })
+            .cloned()
+            .collect(),
+    ))
+}
+
+pub fn grep(
     ws: &Workspace,
     args: &Value,
     cancellation: &CancellationToken,
@@ -1261,31 +1397,55 @@ pub fn search_text(
     };
     budget.checkpoint(scan.files.len(), 0)?;
 
-    let mut page_matches = Vec::new();
-    let mut file_summaries = Vec::new();
-    let mut total = 0usize;
-    let mut bytes_scanned = 0usize;
-    let mut skipped_files = 0usize;
-    for p in &scan.files {
+    let mut eligible_files = Vec::new();
+    let mut eligible_bytes = 0usize;
+    for path in &scan.files {
         ensure_not_cancelled(cancellation)?;
-        if p.is_symlink() {
-            skipped_files += 1;
+        if path.is_symlink() || !ws.is_safe_read_path(path) {
             continue;
         }
-        if !ws.is_safe_read_path(p) {
-            continue;
-        }
-        let rel = relative_display(ws.root(), p);
+        let rel = relative_display(ws.root(), path);
         if !passes_glob_filters(&rel, &include_globs, &exclude_globs) {
             continue;
         }
-        let anticipated_bytes = p
-            .metadata()
-            .ok()
-            .and_then(|metadata| usize::try_from(metadata.len()).ok())
-            .map(|size| bytes_scanned.saturating_add(size))
-            .unwrap_or(bytes_scanned);
-        budget.checkpoint(scan.files.len(), anticipated_bytes)?;
+        if let Ok(metadata) = path.metadata() {
+            eligible_bytes = eligible_bytes.saturating_add(metadata.len() as usize);
+        }
+        budget.checkpoint(scan.files.len(), eligible_bytes)?;
+        eligible_files.push(path.clone());
+    }
+
+    let mut accelerator = "anchor";
+    let search_files = if resolved.path.is_dir() {
+        match ripgrep_prefilter(
+            &resolved.path,
+            query,
+            use_regex,
+            case_sensitive,
+            &include_globs,
+            &exclude_globs,
+            &eligible_files,
+            eligible_bytes,
+            &budget,
+            cancellation,
+        )? {
+            Some(files) => {
+                accelerator = "ripgrep+anchor";
+                files
+            }
+            None => eligible_files.clone(),
+        }
+    } else {
+        eligible_files.clone()
+    };
+
+    let mut page_matches = Vec::new();
+    let mut file_summaries = Vec::new();
+    let mut total = 0usize;
+    let mut skipped_files = 0usize;
+    for p in &search_files {
+        ensure_not_cancelled(cancellation)?;
+        let rel = relative_display(ws.root(), p);
         let data = match fs::read(p) {
             Ok(data) => data,
             Err(_) => {
@@ -1293,8 +1453,7 @@ pub fn search_text(
                 continue;
             }
         };
-        bytes_scanned = bytes_scanned.saturating_add(data.len());
-        budget.checkpoint(scan.files.len(), bytes_scanned)?;
+        budget.checkpoint(scan.files.len(), eligible_bytes)?;
         let content = match decode_text(data) {
             Ok((text, _)) if !text.contains('\0') => text,
             _ => {
@@ -1307,7 +1466,7 @@ pub fn search_text(
         for (idx, line) in lines.iter().enumerate() {
             if idx % 256 == 0 {
                 ensure_not_cancelled(cancellation)?;
-                budget.checkpoint(scan.files.len(), bytes_scanned)?;
+                budget.checkpoint(scan.files.len(), eligible_bytes)?;
             }
             let Some(match_byte) = matcher.find(line) else {
                 continue;
@@ -1372,11 +1531,14 @@ pub fn search_text(
         _ => unreachable!(),
     };
 
-    let mut scan_telemetry = budget.telemetry(scan.files.len(), bytes_scanned);
+    let mut scan_telemetry = budget.telemetry(scan.files.len(), eligible_bytes);
     if let Some(object) = scan_telemetry.as_object_mut() {
         object.insert("skipped_entries".into(), json!(scan.skipped_entries));
         object.insert("skipped_files".into(), json!(skipped_files));
         object.insert("ignore_rules".into(), json!("project_and_default"));
+        object.insert("engine".into(), json!(accelerator));
+        object.insert("eligible_files".into(), json!(eligible_files.len()));
+        object.insert("prefiltered_files".into(), json!(search_files.len()));
     }
     Ok(tool_ok(json!({
         "query": query,
@@ -1889,7 +2051,7 @@ mod tests {
         let root = tempdir().expect("workspace");
         std::fs::write(root.path().join("large.txt"), "needle and more data\n").expect("fixture");
         let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
-        let error = search_text(
+        let error = grep(
             &workspace,
             &json!({"query": "needle", "max_scan_bytes": 4}),
             &CancellationToken::default(),
@@ -1905,14 +2067,14 @@ mod tests {
     }
 
     #[test]
-    fn search_text_reports_real_columns_and_compact_modes() {
+    fn grep_reports_real_columns_and_compact_modes() {
         let root = tempdir().expect("workspace");
         std::fs::write(root.path().join("a.txt"), "prefix Needle suffix\n").expect("a");
         std::fs::write(root.path().join("b.txt"), "needle again\n").expect("b");
         let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
         let cancellation = CancellationToken::default();
 
-        let matches = search_text(
+        let matches = grep(
             &workspace,
             &json!({"query": "needle", "max_results": 1}),
             &cancellation,
@@ -1922,8 +2084,12 @@ mod tests {
         assert_eq!(matches["matches"][0]["path"], "a.txt");
         assert_eq!(matches["matches"][0]["column"], 8);
         assert_eq!(matches["next_cursor"], 1);
+        if crate::tunnel::resolve_ripgrep().is_some() {
+            assert_eq!(matches["scan"]["engine"], "ripgrep+anchor");
+            assert_eq!(matches["scan"]["prefiltered_files"], 2);
+        }
 
-        let files = search_text(
+        let files = grep(
             &workspace,
             &json!({"query": "needle", "output_mode": "files"}),
             &cancellation,
@@ -1932,7 +2098,7 @@ mod tests {
         assert_eq!(files["files"], json!(["a.txt", "b.txt"]));
         assert!(files["matches"].as_array().expect("matches").is_empty());
 
-        let count = search_text(
+        let count = grep(
             &workspace,
             &json!({"query": "needle", "output_mode": "count"}),
             &cancellation,
