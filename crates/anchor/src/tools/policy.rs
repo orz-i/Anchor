@@ -41,6 +41,7 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "ruff",
     "rg",
     "ripgrep",
+    "codegraph",
     "mypy",
     "eslint",
     "tsc",
@@ -1233,6 +1234,17 @@ fn command_targets_protected_repository_asset(command: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn default_policy_allows_managed_code_intelligence_commands() {
+        let policy = PolicySettings::default();
+        for command in ["rg", "ripgrep", "codegraph"] {
+            assert!(
+                policy.allowed_commands.contains(command),
+                "{command} must be available to the managed software toolchain"
+            );
+        }
+    }
 
     #[test]
     fn structured_direct_arguments_treat_multiline_source_as_literal_argv() {

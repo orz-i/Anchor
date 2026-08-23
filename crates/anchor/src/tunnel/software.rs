@@ -20,7 +20,8 @@ use crate::tunnel::frp::{cached_frpc_path, download_frpc_to_cache, resolve_frpc}
 // binary. Keep the managed build on the previous release until upstream ships
 // a fixed binary; system-installed newer rg remains usable and is detected.
 const RIPGREP_VERSION: &str = "15.1.0";
-const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared", "ripgrep"];
+const CODEGRAPH_VERSION: &str = "v0.9.6";
+const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared", "ripgrep", "codegraph"];
 
 /// Status of a managed tunnel binary, serialized to the frontend.
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +39,59 @@ pub struct SoftwareStatus {
     pub managed: bool,
     /// Pinned version used by managed installs for this software kind.
     pub target_version: String,
+}
+
+fn codegraph_install_root() -> Option<PathBuf> {
+    platform()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join("software").join("codegraph"))
+}
+
+fn managed_codegraph_version_root() -> Option<PathBuf> {
+    codegraph_install_root().map(|root| root.join(CODEGRAPH_VERSION))
+}
+
+pub(crate) fn cached_codegraph_path() -> Option<PathBuf> {
+    managed_codegraph_version_root().map(|root| {
+        root.join("bin").join(if cfg!(windows) {
+            "codegraph.cmd"
+        } else {
+            "codegraph"
+        })
+    })
+}
+
+pub(crate) fn resolve_codegraph() -> Option<PathBuf> {
+    cached_codegraph_path()
+        .filter(|path| path.is_file())
+        .or_else(|| which::which("codegraph").ok())
+}
+
+pub(crate) fn resolve_managed_software_program(name: &str) -> Option<PathBuf> {
+    match name {
+        "rg" | "ripgrep" => cached_ripgrep_path().filter(|path| path.is_file()),
+        "codegraph" => cached_codegraph_path().filter(|path| path.is_file()),
+        _ => None,
+    }
+}
+
+fn codegraph_status() -> SoftwareStatus {
+    let cache = cached_codegraph_path().filter(|path| path.is_file());
+    let resolved = resolve_codegraph();
+    let (path, managed, installed) = match (&cache, &resolved) {
+        (Some(cache_path), _) => (cache_path.clone(), true, true),
+        (None, Some(found)) => (found.clone(), false, true),
+        (None, None) => (PathBuf::new(), false, false),
+    };
+    SoftwareStatus {
+        kind: "codegraph".into(),
+        name: "CodeGraph".into(),
+        installed,
+        path: path.to_string_lossy().to_string(),
+        managed,
+        target_version: CODEGRAPH_VERSION.into(),
+    }
 }
 
 fn ripgrep_status() -> SoftwareStatus {
@@ -71,6 +125,7 @@ pub fn target_version(kind: &str) -> AppResult<&'static str> {
         "frpc" => Ok(crate::tunnel::frp::VERSION),
         "cloudflared" => Ok(crate::tunnel::cloudflare::VERSION),
         "ripgrep" => Ok(RIPGREP_VERSION),
+        "codegraph" => Ok(CODEGRAPH_VERSION),
         other => Err(AppError::Message(format!("未知软件: {other}"))),
     }
 }
@@ -138,7 +193,12 @@ fn cloudflared_status() -> SoftwareStatus {
 
 /// Report install status for all supported external software.
 pub fn list_software() -> Vec<SoftwareStatus> {
-    vec![frpc_status(), cloudflared_status(), ripgrep_status()]
+    vec![
+        frpc_status(),
+        cloudflared_status(),
+        ripgrep_status(),
+        codegraph_status(),
+    ]
 }
 
 /// Install (download into cache) the requested binary.
@@ -165,6 +225,13 @@ pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
             download_ripgrep_to_cache().await?;
             Ok(ripgrep_status())
         }
+        "codegraph" => {
+            if cached_codegraph_path().is_some_and(|path| path.is_file()) {
+                return Ok(codegraph_status());
+            }
+            download_codegraph_to_cache().await?;
+            Ok(codegraph_status())
+        }
         other => Err(AppError::Message(format!("未知软件: {other}"))),
     }
 }
@@ -172,6 +239,14 @@ pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
 /// Uninstall a cache-managed binary. Refuses if the binary is not in the cache
 /// dir (i.e. it was installed by the system / winget / apt and is not ours).
 pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
+    if kind == "codegraph" {
+        if let Some(root) = codegraph_install_root() {
+            if root.exists() {
+                std::fs::remove_dir_all(root)?;
+            }
+        }
+        return Ok(codegraph_status());
+    }
     let cache_path = match kind {
         "frpc" => cached_frpc_path(),
         "cloudflared" => cached_cloudflared_path(),
@@ -202,7 +277,8 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
     Ok(match kind {
         "frpc" => frpc_status(),
         "cloudflared" => cloudflared_status(),
-        _ => ripgrep_status(),
+        "ripgrep" => ripgrep_status(),
+        _ => unreachable!("validated software kind"),
     })
 }
 
@@ -308,9 +384,181 @@ fn make_executable(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+fn codegraph_release_asset() -> AppResult<&'static str> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok("codegraph-win32-x64.zip");
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        return Ok("codegraph-win32-arm64.zip");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Ok("codegraph-linux-x64.tar.gz");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Ok("codegraph-linux-arm64.tar.gz");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return Ok("codegraph-darwin-x64.tar.gz");
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Ok("codegraph-darwin-arm64.tar.gz");
+    }
+    #[allow(unreachable_code)]
+    Err(AppError::Message(
+        "当前平台暂不支持自动下载 CodeGraph。".into(),
+    ))
+}
+
+async fn download_codegraph_to_cache() -> AppResult<PathBuf> {
+    let settings = crate::settings::AppSettings::load()?;
+    let asset = codegraph_release_asset()?;
+    let url = format!(
+        "https://github.com/colbymchenry/codegraph/releases/download/{CODEGRAPH_VERSION}/{asset}"
+    );
+    let bytes =
+        crate::tunnel::download::download_release_asset(&settings, &url, "CodeGraph").await?;
+    let install_root = codegraph_install_root()
+        .ok_or_else(|| AppError::Message("无法解析 CodeGraph 安装目录。".into()))?;
+    let target = managed_codegraph_version_root()
+        .ok_or_else(|| AppError::Message("无法解析 CodeGraph 版本目录。".into()))?;
+    std::fs::create_dir_all(&install_root)?;
+    let staging = install_root.join(format!(".install-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&staging)?;
+
+    let install_result = (|| -> AppResult<()> {
+        extract_codegraph_bundle(&bytes, asset, &staging)?;
+        let launcher = staging.join("bin").join(if cfg!(windows) {
+            "codegraph.cmd"
+        } else {
+            "codegraph"
+        });
+        if !launcher.is_file() {
+            return Err(AppError::Message(
+                "CodeGraph 安装包中未找到 launcher。".into(),
+            ));
+        }
+        make_executable(&launcher)?;
+        if target.exists() {
+            std::fs::remove_dir_all(&target)?;
+        }
+        std::fs::rename(&staging, &target)?;
+        // The active version is already installed atomically at this point.
+        // Stale-version cleanup is best-effort so a filesystem cleanup issue
+        // cannot turn a successful installation into a reported failure.
+        let _ = prune_old_codegraph_versions(&install_root, &target);
+        Ok(())
+    })();
+    if install_result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    install_result?;
+
+    cached_codegraph_path()
+        .filter(|path| path.is_file())
+        .ok_or_else(|| AppError::Message("CodeGraph 自动安装失败。".into()))
+}
+
+fn safe_bundle_relative(path: &Path) -> AppResult<Option<PathBuf>> {
+    use std::path::Component;
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::Message(
+                    "CodeGraph 安装包包含不安全的路径。".into(),
+                ));
+            }
+        }
+    }
+    if parts.len() <= 1 {
+        return Ok(None);
+    }
+    Ok(Some(parts.into_iter().skip(1).collect()))
+}
+
+fn extract_codegraph_bundle(bytes: &[u8], asset: &str, dest: &Path) -> AppResult<()> {
+    if asset.ends_with(".zip") {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|err| AppError::Message(format!("解压 CodeGraph 安装包失败: {err}")))?;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|err| AppError::Message(format!("读取 CodeGraph 安装包失败: {err}")))?;
+            let enclosed = entry
+                .enclosed_name()
+                .ok_or_else(|| AppError::Message("CodeGraph zip 包含不安全的路径。".into()))?;
+            let Some(relative) = safe_bundle_relative(&enclosed)? else {
+                continue;
+            };
+            let output = dest.join(relative);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&output)?;
+                continue;
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = std::fs::File::create(output)?;
+            std::io::copy(&mut entry, &mut file)?;
+        }
+        return Ok(());
+    }
+
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .map_err(|err| AppError::Message(format!("解压 CodeGraph 安装包失败: {err}")))?
+    {
+        let mut entry =
+            entry.map_err(|err| AppError::Message(format!("读取 CodeGraph 安装包失败: {err}")))?;
+        let original = entry
+            .path()
+            .map_err(|err| AppError::Message(format!("读取 CodeGraph 安装路径失败: {err}")))?;
+        let Some(relative) = safe_bundle_relative(&original)? else {
+            continue;
+        };
+        let output = dest.join(relative);
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            std::fs::create_dir_all(output)?;
+        } else if kind.is_file() {
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry
+                .unpack(output)
+                .map_err(|err| AppError::Message(format!("写入 CodeGraph 文件失败: {err}")))?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_old_codegraph_versions(install_root: &Path, keep: &Path) -> AppResult<()> {
+    for entry in std::fs::read_dir(install_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == keep || !path.is_dir() {
+            continue;
+        }
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn software_catalog_contains_both_supported_tunnel_binaries() {
@@ -326,5 +574,59 @@ mod tests {
         assert!(statuses.iter().any(|status| {
             status.kind == "ripgrep" && status.target_version == RIPGREP_VERSION
         }));
+        assert!(statuses.iter().any(|status| {
+            status.kind == "codegraph" && status.target_version == CODEGRAPH_VERSION
+        }));
+    }
+
+    #[test]
+    fn codegraph_bundle_extracts_after_stripping_release_root() {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let content = b"#!/bin/sh\necho codegraph\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "codegraph-linux-x64/bin/codegraph",
+                &content[..],
+            )
+            .expect("fixture entry");
+        let encoder = archive.into_inner().expect("tar bytes");
+        let bytes = encoder.finish().expect("gzip bytes");
+        let root = tempdir().expect("extract root");
+
+        extract_codegraph_bundle(&bytes, "codegraph-linux-x64.tar.gz", root.path())
+            .expect("extract bundle");
+
+        assert_eq!(
+            std::fs::read(root.path().join("bin/codegraph")).expect("launcher"),
+            content
+        );
+        assert!(!root.path().join("codegraph-linux-x64").exists());
+    }
+
+    #[test]
+    fn codegraph_bundle_rejects_parent_path_components() {
+        let error = safe_bundle_relative(Path::new("codegraph-linux-x64/../../escape"))
+            .expect_err("parent traversal must be rejected");
+        assert!(error.to_string().contains("不安全"));
+    }
+
+    #[test]
+    fn codegraph_version_pruning_keeps_only_active_bundle() {
+        let root = tempdir().expect("install root");
+        let keep = root.path().join(CODEGRAPH_VERSION);
+        let old = root.path().join("v0.9.5");
+        std::fs::create_dir_all(&keep).expect("keep");
+        std::fs::create_dir_all(&old).expect("old");
+
+        prune_old_codegraph_versions(root.path(), &keep).expect("prune");
+
+        assert!(keep.is_dir());
+        assert!(!old.exists());
     }
 }

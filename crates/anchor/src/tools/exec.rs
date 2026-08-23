@@ -151,6 +151,9 @@ pub(crate) fn effective_command_path_additions() -> Vec<PathBuf> {
 
 #[cfg(not(windows))]
 pub(crate) fn resolve_effective_system_program(name: &str) -> Option<PathBuf> {
+    if let Some(path) = crate::tunnel::resolve_managed_software_program(name) {
+        return Some(resolve_system_program_path(&path));
+    }
     let candidates = system_program_candidates(name);
     effective_command_search_paths()
         .into_iter()
@@ -165,6 +168,9 @@ pub(crate) fn resolve_effective_system_program(name: &str) -> Option<PathBuf> {
 
 #[cfg(windows)]
 pub(crate) fn resolve_effective_system_program(name: &str) -> Option<PathBuf> {
+    if let Some(path) = crate::tunnel::resolve_managed_software_program(name) {
+        return Some(resolve_system_program_path(&path));
+    }
     which::which(name)
         .ok()
         .map(|path| resolve_system_program_path(&path))

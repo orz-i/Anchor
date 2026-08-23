@@ -2398,6 +2398,10 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
     } else {
         crate::tools::environment::summarize_diagnosis(&full_development_environment)
     };
+    let managed_rg = crate::tunnel::resolve_managed_software_program("rg");
+    let managed_codegraph = crate::tunnel::resolve_managed_software_program("codegraph");
+    let effective_rg = exec::resolve_effective_system_program("rg");
+    let effective_codegraph = exec::resolve_effective_system_program("codegraph");
     let mut response = tool_ok(json!({
         "detail": detail,
         "full_detail_available": true,
@@ -2433,6 +2437,18 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
             "script_extensions": ctx.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
             "resolution": "workdir_first",
             "allowlist_required": true
+        },
+        "code_intelligence": {
+            "ripgrep": {
+                "available": effective_rg.is_some(),
+                "managed": managed_rg.is_some(),
+                "path": effective_rg.map(|path| path.to_string_lossy().to_string())
+            },
+            "codegraph": {
+                "available": effective_codegraph.is_some(),
+                "managed": managed_codegraph.is_some(),
+                "path": effective_codegraph.map(|path| path.to_string_lossy().to_string())
+            }
         },
         "development_environment": development_environment,
         "warnings": warnings

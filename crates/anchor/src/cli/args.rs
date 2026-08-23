@@ -1867,8 +1867,8 @@ configure 复用 config pending/apply 事务模型；FRP 参数会自动切换�
 pub fn software_usage() -> &'static str {
     "Anchor Software 命令：\n\
   anchor software list\n\
-  anchor software install <frpc|cloudflared|ripgrep>\n\
-  anchor software uninstall <frpc|cloudflared|ripgrep>\n\n\
+  anchor software install <frpc|cloudflared|ripgrep|codegraph>\n\
+  anchor software uninstall <frpc|cloudflared|ripgrep|codegraph>\n\n\
 install 会把指定二进制下载到 Anchor 管理的缓存目录，并复用 download.github_mirror / download.proxy_mode 配置。uninstall 只删除 Anchor 自己缓存的副本，不会删除 PATH、apt、brew、winget 等系统安装。"
 }
 
@@ -2038,10 +2038,18 @@ mod tests {
                 kind: "cloudflared".into()
             })
         );
+        assert_eq!(
+            parse(strings(&["software", "install", "codegraph"]))
+                .expect("codegraph install")
+                .command,
+            Command::Software(SoftwareCommand::Install {
+                kind: "codegraph".into()
+            })
+        );
 
         let error =
             parse(strings(&["software", "install", "other"])).expect_err("unknown software kind");
-        assert!(error.contains("当前支持：frpc, cloudflared, ripgrep"));
+        assert!(error.contains("当前支持：frpc, cloudflared, ripgrep, codegraph"));
     }
 
     #[test]
