@@ -231,7 +231,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 | 类别 | 主要工具 |
 | --- | --- |
-| 文件读取 | `read_file`、`list_dir`、`list_files`、`search_text`、`view_image` |
+| 文件读取 | `read_file`、`list_dir`、`list_files`、`grep`、`view_image` |
 | 文件修改 | `apply_patch` |
 | 命令执行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
@@ -253,12 +253,26 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 Harness Task 默认继续使用当前 Workspace；需要并行隔离分支、索引和文件时，可显式选择可选的 Git worktree 模式。见 [可选 Git worktree 任务](docs/git-worktrees.md)。
 
+### 代码搜索与结构分析
+
+`grep` 是统一的文本/正则搜索工具。Anchor 会优先使用可用的 ripgrep (`rg`) 做候选文件预筛，再由内置实现完成路径边界、文本解码、结果排序、上下文、分页与预算控制；如果 `rg` 不存在或预筛失败，会自动回退到内置扫描器。旧工具名 `search_text` 仅保留为隐藏兼容入口，不再出现在工具目录或 OpenAPI 中。
+
+Anchor 的 `software` 管理同时支持 ripgrep 与 CodeGraph：
+
+```bash
+anchor software install ripgrep
+anchor software install codegraph
+anchor software list
+```
+
+受管版本会被 Anchor 优先解析。CodeGraph 通过既有 `exec_command` 调用，不额外扩张 `codegraph_*` 工具面；`environment check` 会在 `code_intelligence` 中报告 ripgrep 与 CodeGraph 的 `available`、`managed` 和实际路径。
+
 ## 权限与恢复模型
 
 项目采用 Workspace-first 权限模型：
 
 - Workspace 内普通文件可以读取、创建、修改、删除和执行。
-- Workspace 外允许完整只读：`read_file`、`list_dir`、`list_files`、`search_text`、`view_image`。
+- Workspace 外显式路径访问默认拒绝；只有受信任的 operator 配置显式放开后，相关只读工具才可访问外部路径。
 - Workspace 外写入、删除和执行会被阻止。
 - `.git` 和 `.github` 不能被普通文件工具、Patch 或解释器命令破坏。
 - Patch 在单次操作内进行预检和失败恢复；长期恢复统一使用 Git，不创建全量 Workspace Snapshot。

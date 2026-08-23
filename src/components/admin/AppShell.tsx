@@ -27,7 +27,7 @@ const SETTINGS_NAV = [
   { to: "/settings/general", label: "通用设置", icon: Settings2, description: "代理、单一 Gateway 与 Windows 服务" },
   { to: "/settings/keys", label: "共享密钥", icon: KeyRound, description: "MCP 与 Actions 共享认证凭据" },
   { to: "/settings/frp", label: "FRP 配置", icon: Network, description: "服务器端点与 Token 管理" },
-  { to: "/settings/software", label: "软件管理", icon: Wrench, description: "frpc / cloudflared 下载与状态" },
+  { to: "/settings/software", label: "软件管理", icon: Wrench, description: "隧道与代码分析工具下载、状态管理" },
 ];
 
 export function AppShell() {

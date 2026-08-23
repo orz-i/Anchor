@@ -1163,7 +1163,7 @@ fn policy_rejection_returns_safe_structured_alternatives() {
         .expect("alternatives");
     assert!(alternatives
         .iter()
-        .any(|alternative| alternative["name"] == "search_text"));
+        .any(|alternative| alternative["name"] == "grep"));
 }
 
 #[test]
@@ -1353,7 +1353,8 @@ fn core_profile_keeps_default_capabilities_and_exposes_one_session_facade() {
     assert!(names.contains("skill"));
     assert!(names.contains("environment"));
     assert!(names.contains("cwd"));
-    assert!(names.contains("search_text"));
+    assert!(names.contains("grep"));
+    assert!(!names.contains("search_text"));
     assert!(!names.contains("command_cost_explain"));
     assert!(names.contains("session"));
     assert!(!names
@@ -1839,12 +1840,12 @@ fn list_files_filters_with_patterns() {
 }
 
 #[test]
-fn search_text_filters_by_glob() {
+fn grep_filters_by_glob() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let hit = invoke(
         &ctx,
-        "search_text",
+        "grep",
         json!({"query": "function add", "include_globs": ["**/*.js"], "max_results": 10}),
     );
     let hit_payload = assert_ok(&hit);
@@ -1852,7 +1853,7 @@ fn search_text_filters_by_glob() {
 
     let miss = invoke(
         &ctx,
-        "search_text",
+        "grep",
         json!({"query": "function add", "include_globs": ["**/*.py"]}),
     );
     let miss_payload = assert_ok(&miss);
@@ -1860,7 +1861,28 @@ fn search_text_filters_by_glob() {
 }
 
 #[test]
-fn search_text_truncates_multibyte_preview_on_a_utf8_boundary() {
+fn legacy_search_text_name_routes_to_grep_without_catalog_exposure() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "function add", "include_globs": ["**/*.js"]}),
+    );
+    let payload = assert_ok(&result);
+    assert!(payload["total_matches"].as_u64().unwrap_or(0) > 0);
+
+    let tools = anchor_lib::tools::list_tools_for_profile("core");
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(names.contains("grep"));
+    assert!(!names.contains("search_text"));
+}
+
+#[test]
+fn grep_truncates_multibyte_preview_on_a_utf8_boundary() {
     let fx = tiny_js_fixture();
     fs::write(
         fx.root.join("src/multibyte.txt"),
@@ -1869,7 +1891,7 @@ fn search_text_truncates_multibyte_preview_on_a_utf8_boundary() {
     .expect("write multibyte fixture");
     let result = invoke(
         &ctx_for(&fx.root),
-        "search_text",
+        "grep",
         json!({
             "query": "marker",
             "path": "src/multibyte.txt",

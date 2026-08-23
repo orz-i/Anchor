@@ -1869,7 +1869,7 @@ pub fn software_usage() -> &'static str {
   anchor software list\n\
   anchor software install <frpc|cloudflared|ripgrep|codegraph>\n\
   anchor software uninstall <frpc|cloudflared|ripgrep|codegraph>\n\n\
-install 会把指定二进制下载到 Anchor 管理的缓存目录，并复用 download.github_mirror / download.proxy_mode 配置。uninstall 只删除 Anchor 自己缓存的副本，不会删除 PATH、apt、brew、winget 等系统安装。"
+install 会把指定软件安装到 Anchor 管理目录，并复用 download.github_mirror / download.proxy_mode 配置。uninstall 只删除 Anchor 自己管理的副本，不会删除 PATH、apt、brew、winget 等系统安装。"
 }
 
 pub fn plugin_usage() -> &'static str {

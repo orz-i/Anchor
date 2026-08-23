@@ -23,7 +23,7 @@ const RIPGREP_VERSION: &str = "15.1.0";
 const CODEGRAPH_VERSION: &str = "v0.9.6";
 const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared", "ripgrep", "codegraph"];
 
-/// Status of a managed tunnel binary, serialized to the frontend.
+/// Status of Anchor-managed external software, serialized to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoftwareStatus {
@@ -201,7 +201,7 @@ pub fn list_software() -> Vec<SoftwareStatus> {
     ]
 }
 
-/// Install (download into cache) the requested binary.
+/// Install the requested software into Anchor-managed storage.
 pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
     match kind {
         "frpc" => {
@@ -236,8 +236,8 @@ pub async fn install_software(kind: &str) -> AppResult<SoftwareStatus> {
     }
 }
 
-/// Uninstall a cache-managed binary. Refuses if the binary is not in the cache
-/// dir (i.e. it was installed by the system / winget / apt and is not ours).
+/// Uninstall Anchor-managed software. System-managed installations remain
+/// untouched and may still be discovered after the managed copy is removed.
 pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
     if kind == "codegraph" {
         if let Some(root) = codegraph_install_root() {
@@ -282,30 +282,42 @@ pub fn uninstall_software(kind: &str) -> AppResult<SoftwareStatus> {
     })
 }
 
-fn ripgrep_release_asset() -> AppResult<&'static str> {
+fn ripgrep_release_asset() -> AppResult<String> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        return Ok("ripgrep-15.1.0-x86_64-pc-windows-msvc.zip");
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-x86_64-pc-windows-msvc.zip"
+        ));
     }
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     {
-        return Ok("ripgrep-15.1.0-aarch64-pc-windows-msvc.zip");
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-aarch64-pc-windows-msvc.zip"
+        ));
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        return Ok("ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz");
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        ));
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        return Ok("ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz");
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+        ));
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        return Ok("ripgrep-15.1.0-x86_64-apple-darwin.tar.gz");
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-x86_64-apple-darwin.tar.gz"
+        ));
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        return Ok("ripgrep-15.1.0-aarch64-apple-darwin.tar.gz");
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz"
+        ));
     }
     #[allow(unreachable_code)]
     Err(AppError::Message(
@@ -325,7 +337,7 @@ async fn download_ripgrep_to_cache() -> AppResult<PathBuf> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    extract_ripgrep_binary(&bytes, asset, &dest)?;
+    extract_ripgrep_binary(&bytes, &asset, &dest)?;
     make_executable(&dest)?;
     if dest.is_file() {
         Ok(dest)

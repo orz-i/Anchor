@@ -223,7 +223,7 @@ The default `core` profile provides a stable, composable development tool set:
 
 | Category | Main tools |
 | --- | --- |
-| File reading | `read_file`, `list_dir`, `list_files`, `search_text`, `view_image` |
+| File reading | `read_file`, `list_dir`, `list_files`, `grep`, `view_image` |
 | File modification | `apply_patch` |
 | Command execution | `exec_command`, `write_stdin`, `read_output`, `kill_session` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
@@ -245,12 +245,26 @@ The advanced profile retains project-state and operation-history Harness capabil
 
 Harness tasks continue to use the configured Workspace by default. When independent branches, indexes, and files are useful, a task can explicitly opt into Git worktree isolation. See [Optional Git worktree tasks](docs/git-worktrees.md).
 
+### Code search and structural analysis
+
+`grep` is the unified text/regex search tool. Anchor prefers an available ripgrep (`rg`) binary to prefilter candidate files, then keeps path boundaries, text decoding, ordering, context, pagination, and scan budgets under Anchor's structured implementation. If `rg` is unavailable or prefiltering fails, the tool automatically falls back to the built-in scanner. The former `search_text` name remains only as a hidden compatibility entry point and is no longer published in the tool catalog or OpenAPI schema.
+
+Anchor's `software` manager also supports ripgrep and CodeGraph:
+
+```bash
+anchor software install ripgrep
+anchor software install codegraph
+anchor software list
+```
+
+Managed binaries take precedence during resolution. CodeGraph is invoked through the existing `exec_command` surface instead of adding a family of `codegraph_*` tools; `environment check` reports ripgrep and CodeGraph under `code_intelligence`, including `available`, `managed`, and the resolved path.
+
 ## Permission and recovery model
 
 The project uses a Workspace-first permission model:
 
 - Normal files inside the Workspace can be read, created, modified, deleted, and executed.
-- Outside the Workspace, `read_file`, `list_dir`, `list_files`, `search_text`, and `view_image` provide read-only access.
+- Explicit paths outside the Workspace are rejected by default; read-only access outside the Workspace requires an explicit trusted operator override.
 - Writes, deletes, and command execution outside the Workspace are blocked.
 - `.git` and `.github` cannot be damaged through ordinary file tools, Patch, or interpreter commands.
 - Patch performs preflight validation and operation-local recovery; long-term recovery uses Git instead of full Workspace snapshots.

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 43;
+pub const CATALOG_VERSION: u32 = 44;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -4230,8 +4230,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        input_schema, is_facade_operation_tool, list_tools_for_profile, output_schema,
-        require_tool_profile,
+        exposed_tool_names, input_schema, is_facade_operation_tool, list_tools_for_profile,
+        output_schema, require_tool_profile,
     };
 
     #[test]
@@ -4260,7 +4260,8 @@ mod tests {
         assert!(names.contains(&"list_command_sessions"));
         assert!(names.contains(&"browser_build_info"));
         assert!(names.contains(&"browser_wait_for_build"));
-        assert!(names.contains(&"search_text"));
+        assert!(names.contains(&"grep"));
+        assert!(!names.contains(&"search_text"));
         assert!(names.contains(&"replace_text"));
         assert!(!names.contains(&"command_cost_explain"));
         assert!(!names.contains(&"check_exec_environment"));
@@ -4285,6 +4286,14 @@ mod tests {
     }
 
     #[test]
+    fn legacy_search_text_schema_matches_grep_without_public_exposure() {
+        assert_eq!(input_schema("search_text"), input_schema("grep"));
+        assert_eq!(output_schema("search_text"), output_schema("grep"));
+        assert!(!exposed_tool_names("core").contains(&"search_text"));
+        assert!(exposed_tool_names("core").contains(&"grep"));
+    }
+
+    #[test]
     fn lazy_schema_tags_expose_a_bounded_core_workflow_bundle() {
         let tools =
             crate::tools::catalog::build_effective_catalog_from_parts("advanced", true, Vec::new())
@@ -4305,7 +4314,7 @@ mod tests {
             "begin_work_session",
             "close_work_session",
             "read_file",
-            "search_text",
+            "grep",
             "replace_text",
             "apply_patch",
             "exec_command",

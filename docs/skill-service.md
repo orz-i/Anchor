@@ -32,7 +32,7 @@ skills/
 ---
 name: code-review
 description: Review a code change for correctness, security, and regressions.
-allowed-tools: read_file git_diff search_text
+allowed-tools: read_file git_diff grep
 metadata:
   version: "1"
   policy:

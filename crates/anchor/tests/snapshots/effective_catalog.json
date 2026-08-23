@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 43,
+    "catalog_version": 44,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -13,6 +13,7 @@
       "environment",
       "exec_command",
       "git",
+      "grep",
       "kill_session",
       "list_command_sessions",
       "list_dir",
@@ -22,7 +23,6 @@
       "read_output",
       "remove_path",
       "replace_text",
-      "search_text",
       "server_info",
       "session",
       "skill",
@@ -35,7 +35,7 @@
     "tool_count": 29
   },
   "core": {
-    "catalog_version": 43,
+    "catalog_version": 44,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -46,6 +46,7 @@
       "environment",
       "exec_command",
       "git",
+      "grep",
       "kill_session",
       "list_command_sessions",
       "list_dir",
@@ -54,7 +55,6 @@
       "read_output",
       "remove_path",
       "replace_text",
-      "search_text",
       "server_info",
       "session",
       "skill",
@@ -66,18 +66,18 @@
     "tool_count": 25
   },
   "read-only": {
-    "catalog_version": 43,
+    "catalog_version": 44,
     "names": [
       "browser_build_info",
       "cwd",
       "environment",
       "git",
+      "grep",
       "list_command_sessions",
       "list_dir",
       "list_files",
       "read_file",
       "read_output",
-      "search_text",
       "server_info",
       "session",
       "skill",
