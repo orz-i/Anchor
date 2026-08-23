@@ -1,4 +1,4 @@
-//! Software management for the two tunnel binaries: frpc and cloudflared.
+//! Anchor-managed external software.
 //!
 //! Both can be installed into the app cache `bin/` directory (downloaded from
 //! GitHub, honoring the mirror + proxy config). Binaries found in the cache dir
@@ -15,11 +15,13 @@ use crate::tunnel::cloudflare::resolve_cloudflared;
 use crate::tunnel::cloudflare::{cached_cloudflared_path, download_cloudflared_to_cache};
 use crate::tunnel::frp::{cached_frpc_path, download_frpc_to_cache, resolve_frpc};
 
+const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared"];
+
 /// Status of a managed tunnel binary, serialized to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoftwareStatus {
-    /// "frpc" | "cloudflared"
+    /// Stable software kind used by the CLI/admin API.
     pub kind: String,
     /// Human-facing display name.
     pub name: String,
@@ -31,6 +33,14 @@ pub struct SoftwareStatus {
     pub managed: bool,
     /// Pinned version used by managed installs for this software kind.
     pub target_version: String,
+}
+
+pub fn is_supported_kind(kind: &str) -> bool {
+    SUPPORTED_SOFTWARE_KINDS.contains(&kind)
+}
+
+pub fn supported_kinds() -> &'static [&'static str] {
+    SUPPORTED_SOFTWARE_KINDS
 }
 
 pub fn target_version(kind: &str) -> AppResult<&'static str> {
@@ -146,7 +156,7 @@ mod tests {
     #[test]
     fn software_catalog_contains_both_supported_tunnel_binaries() {
         let statuses = list_software();
-        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses.len(), supported_kinds().len());
         assert!(statuses.iter().any(|status| {
             status.kind == "frpc" && status.target_version == crate::tunnel::frp::VERSION
         }));

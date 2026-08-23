@@ -14,7 +14,10 @@ pub use cloudflare::resolve_cloudflared;
 pub use frp::resolve_frpc;
 pub(crate) use frp::validate_workspace_frp_config;
 pub(crate) use software::target_version as software_target_version;
-pub(crate) use software::{install_software, list_software, uninstall_software, SoftwareStatus};
+pub(crate) use software::{
+    install_software, is_supported_kind as is_supported_software_kind, list_software,
+    supported_kinds as supported_software_kinds, uninstall_software, SoftwareStatus,
+};
 pub use supervisor::{
     append_profile_log, log_dir_for_profile, TunnelServiceKind, TunnelStatus, TunnelSupervisor,
 };

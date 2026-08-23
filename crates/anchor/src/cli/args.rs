@@ -657,9 +657,10 @@ pub enum SoftwareCommand {
 
 fn parse_software_kind(args: &mut VecDeque<String>, command: &str) -> Result<String, String> {
     let kind = pop_value(args, command)?;
-    if !matches!(kind.as_str(), "frpc" | "cloudflared") {
+    if !crate::tunnel::is_supported_software_kind(&kind) {
         return Err(format!(
-            "{command} 仅支持 frpc 或 cloudflared，收到：{kind}"
+            "{command} 不支持 {kind}；当前支持：{}",
+            crate::tunnel::supported_software_kinds().join(", ")
         ));
     }
     ensure_empty(args, command)?;
@@ -2040,7 +2041,7 @@ mod tests {
 
         let error =
             parse(strings(&["software", "install", "other"])).expect_err("unknown software kind");
-        assert!(error.contains("frpc 或 cloudflared"));
+        assert!(error.contains("当前支持：frpc, cloudflared"));
     }
 
     #[test]
