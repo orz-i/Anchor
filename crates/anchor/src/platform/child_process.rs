@@ -8,6 +8,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
+/// Permit the durable command supervisor to leave the daemon's kill-on-close
+/// Job Object. The daemon Job explicitly opts into BREAKAWAY_OK; ordinary
+/// workspace children never receive this flag and remain lifecycle-bound.
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
 /// Keep arbitrary workspace commands below normal priority so they yield CPU
 /// to the desktop, daemon control plane, and other interactive applications.
 #[cfg(windows)]
@@ -23,6 +29,20 @@ pub fn hide_tokio_console(command: &mut tokio::process::Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 
     #[cfg(not(windows))]
+    let _ = command;
+}
+
+/// Configure the hidden durable command supervisor so its lifetime is not
+/// coupled to the MCP daemon process. The supervisor, not the daemon, owns the
+/// real workspace child and its output files.
+pub fn configure_durable_supervisor_tokio_process(command: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+
+    #[cfg(unix)]
+    command.process_group(0);
+
+    #[cfg(not(any(windows, unix)))]
     let _ = command;
 }
 
@@ -130,6 +150,15 @@ mod tests {
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
         assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0000_0200);
         assert_eq!(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, 0x0800_0200);
+    }
+
+    #[test]
+    fn durable_supervisor_uses_job_breakaway_flag() {
+        assert_eq!(CREATE_BREAKAWAY_FROM_JOB, 0x0100_0000);
+        assert_eq!(
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+            0x0900_0200
+        );
     }
 
     #[test]

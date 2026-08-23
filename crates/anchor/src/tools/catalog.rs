@@ -534,7 +534,7 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
             .expect("core plus browser catalog");
 
-        assert_eq!(catalog.local_count, 24);
+        assert_eq!(catalog.local_count, 25);
         assert_eq!(catalog.proxy_count, CORE_BROWSER_PROXY_SUFFIXES.len());
         assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
             !tool["name"]
@@ -558,9 +558,9 @@ mod tests {
         let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
             .expect("restricted browser catalog");
 
-        assert_eq!(catalog.local_count, 24);
+        assert_eq!(catalog.local_count, 25);
         assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 32);
+        assert_eq!(catalog.tools.len(), 33);
         assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
         assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
@@ -675,9 +675,9 @@ mod tests {
     fn advanced_with_default_browser_keeps_skill_facade_in_first_64_entries() {
         let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(21))
             .expect("advanced plus default browser catalog");
-        assert_eq!(catalog.local_count, 28);
+        assert_eq!(catalog.local_count, 29);
         assert_eq!(catalog.proxy_count, 21);
-        assert_eq!(catalog.tools.len(), 49);
+        assert_eq!(catalog.tools.len(), 50);
         assert!(catalog.tools[..catalog.tools.len().min(64)]
             .iter()
             .any(|tool| tool["name"] == "skill"));

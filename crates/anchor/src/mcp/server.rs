@@ -2240,7 +2240,7 @@ mod tests {
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
         assert_eq!(first_tools.len(), catalog.tools.len());
-        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 24);
+        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 25);
         assert_eq!(
             first["_meta"]["anchor/catalog"]["proxy_tool_count"],
             catalog.proxy_count

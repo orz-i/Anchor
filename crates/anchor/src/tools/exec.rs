@@ -11,7 +11,8 @@ use tokio::process::Command;
 
 use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::command_session::{
-    finalize_execution_result, ExecSession, SessionHarnessMetadata, StreamEncoding,
+    finalize_execution_result, DurableCommandSpec, ExecSession, SessionHarnessMetadata,
+    StreamEncoding,
 };
 use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
@@ -19,6 +20,65 @@ use crate::tools::CancellationToken;
 
 const COMPLETION_GRACE: Duration = Duration::from_millis(50);
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+fn apply_execution_environment(
+    ctx: &ToolContext,
+    execution: &Value,
+    command: &mut Command,
+    program: &str,
+    child_parallelism: usize,
+) -> Result<(), WorkspaceError> {
+    if let Some(env) = execution.get("env").and_then(Value::as_object) {
+        for (name, value) in env {
+            if let Some(value) = value.as_str() {
+                command.env(name, value);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    command
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONLEGACYWINDOWSSTDIO", "0");
+    #[cfg(windows)]
+    configure_windows_command_environment(command, program);
+    #[cfg(unix)]
+    apply_standard_user_toolchain_path(command)?;
+    ctx.resources
+        .apply_child_environment(command, child_parallelism, program);
+    let toolchain_paths = resolve_toolchain_paths(execution, ctx.workspace.root())?;
+    apply_toolchain_path_overlay(command, &toolchain_paths)?;
+    Ok(())
+}
+
+fn durable_supervisor_executable() -> Result<PathBuf, std::io::Error> {
+    let current = std::env::current_exe()?;
+    let current_name = current
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if current_name == crate::brand::CLI_NAME.to_ascii_lowercase() {
+        return Ok(current);
+    }
+
+    // Cargo integration-test executables live in target/{profile}/deps while
+    // CARGO_BIN_EXE_anchor lives one directory above. Resolving this sibling
+    // keeps durable exec coverage on the real hidden CLI entrypoint instead of
+    // accidentally launching the test harness with CLI arguments.
+    if let Some(profile_dir) = current.parent().and_then(Path::parent) {
+        let candidate = profile_dir.join(format!(
+            "{}{}",
+            crate::brand::CLI_NAME,
+            std::env::consts::EXE_SUFFIX
+        ));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Ok(current)
+}
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     exec_command_with_cancellation(ctx, args, &CancellationToken::default(), None, None)
@@ -1227,48 +1287,9 @@ async fn run_command(
     let child_parallelism = resource_lease.parallelism();
     ctx.resources
         .clamp_parallel_args(&program, &mut args, child_parallelism);
-
-    let mut command = command_for_program(&program, &args);
-    crate::platform::configure_exec_tokio_process(&mut command);
-    command
-        .current_dir(platform_command_path(cwd))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(env) = execution.get("env").and_then(Value::as_object) {
-        for (name, value) in env {
-            if let Some(value) = value.as_str() {
-                command.env(name, value);
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    command
-        .env("PYTHONUTF8", "1")
-        .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONLEGACYWINDOWSSTDIO", "0");
-    #[cfg(windows)]
-    configure_windows_command_environment(&mut command, &program);
-    #[cfg(unix)]
-    apply_standard_user_toolchain_path(&mut command)?;
-    ctx.resources
-        .apply_child_environment(&mut command, child_parallelism, &program);
-    let toolchain_paths = resolve_toolchain_paths(execution, ctx.workspace.root())?;
-    apply_toolchain_path_overlay(&mut command, &toolchain_paths)?;
-
-    let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
-        code: "COMMAND_SPAWN_FAILED",
-        message: format!("Failed to start command: {e}"),
-        category: "runtime",
-        retryable: true,
-        details: json!({
-            "termination_reason": "spawn_failed",
-            "recoverable": true,
-            "suggestion": "检查命令路径、权限和运行时环境后重试"
-        }),
-    })?;
-    crate::platform::lower_exec_child_priority(&child);
+    let execution_start_guard = ctx.sessions.execution_start_guard();
+    ctx.sessions
+        .ensure_execution_capacity(ctx.resources.max_running_commands())?;
 
     let harness_metadata = task_id
         .and_then(|task_id| ctx.harness.task(task_id).ok())
@@ -1284,34 +1305,148 @@ async fn run_command(
             verification_level: verification_level.to_string(),
             supersede_previous_failures,
         });
-    let session = match ctx.sessions.insert(
-        ExecSession::new_with_details_encoding_and_resources(
-            child,
-            tty,
+    let owner_scope = ctx.command_owner_scope_for_session(mcp_session_id);
+    let transport_session_id = mcp_session_id.map(str::to_string);
+    let output_encoding = stream_encoding_for_program(&program);
+    let durable_requested = execution
+        .get("durable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if durable_requested && tty {
+        return Err(WorkspaceError::invalid_argument(
+            "durable commands do not support tty mode",
+        ));
+    }
+
+    let session = if durable_requested && ctx.sessions.durable_enabled() {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let execution_resources = resource_lease.to_value();
+        let spec = DurableCommandSpec {
+            schema_version: 1,
+            session_id,
+            command: cmd.to_string(),
+            program: program.clone(),
+            args: args.clone(),
+            cwd: cwd.display().to_string(),
+            timeout_ms: limit.as_millis().min(u64::MAX as u128) as u64,
+            initial_stdin: stdin_text.to_string(),
+            output_encoding,
+            expected_exit_codes: expected_exit_codes.clone(),
+            harness_metadata: harness_metadata.clone(),
+            owner_scope: owner_scope.clone(),
+            transport_session_id: transport_session_id.clone(),
+            execution_resources: Some(execution_resources),
+            started_at,
+        };
+        let job = ctx.sessions.create_durable_job(spec)?;
+        let executable =
+            durable_supervisor_executable().map_err(|error| WorkspaceError::ToolDetails {
+                code: "DURABLE_COMMAND_LAUNCH_FAILED",
+                message: format!("Failed to resolve durable supervisor executable: {error}"),
+                category: "runtime",
+                retryable: true,
+                details: json!({"session_id": job.session_id()}),
+            })?;
+        let mut supervisor = Command::new(executable);
+        supervisor
+            .arg("exec-supervisor-run")
+            .arg(job.spec_path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::platform::configure_durable_supervisor_tokio_process(&mut supervisor);
+        apply_execution_environment(ctx, execution, &mut supervisor, &program, child_parallelism)?;
+        let supervisor_child = match supervisor.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                job.mark_launcher_failed(&format!("durable supervisor launch failed: {error}\n"));
+                return Err(WorkspaceError::ToolDetails {
+                    code: "DURABLE_COMMAND_LAUNCH_FAILED",
+                    message: format!("Failed to launch durable command supervisor: {error}"),
+                    category: "runtime",
+                    retryable: true,
+                    details: json!({"session_id": job.session_id()}),
+                });
+            }
+        };
+        let session = ExecSession::new_with_details_encoding_and_resources(
+            supervisor_child,
+            false,
             cmd.to_string(),
             cwd.display().to_string(),
-            harness_metadata,
-            ctx.command_owner_scope_for_session(mcp_session_id),
-            mcp_session_id.map(str::to_string),
-            stream_encoding_for_program(&program),
+            harness_metadata.clone(),
+            owner_scope.clone(),
+            transport_session_id.clone(),
+            output_encoding,
             Some(resource_lease),
         )
-        .with_expected_exit_codes(expected_exit_codes),
-    ) {
-        Ok(session) => session,
-        Err(rejected) => {
-            rejected.mark_termination_reason("session_limit");
-            rejected.kill_and_wait().await;
-            return Err(ctx.sessions.capacity_error());
+        .with_expected_exit_codes(expected_exit_codes.clone())
+        .attach_durable_job(job);
+        match ctx.sessions.insert(session) {
+            Ok(session) => session,
+            Err(rejected) => {
+                drop(execution_start_guard);
+                rejected.mark_termination_reason("session_limit");
+                rejected.kill_and_wait().await;
+                return Err(ctx.sessions.capacity_error());
+            }
+        }
+    } else {
+        let mut command = command_for_program(&program, &args);
+        crate::platform::configure_exec_tokio_process(&mut command);
+        command
+            .current_dir(platform_command_path(cwd))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        apply_execution_environment(ctx, execution, &mut command, &program, child_parallelism)?;
+
+        let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
+            code: "COMMAND_SPAWN_FAILED",
+            message: format!("Failed to start command: {e}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "termination_reason": "spawn_failed",
+                "recoverable": true,
+                "suggestion": "检查命令路径、权限和运行时环境后重试"
+            }),
+        })?;
+        crate::platform::lower_exec_child_priority(&child);
+        match ctx.sessions.insert(
+            ExecSession::new_with_details_encoding_and_resources(
+                child,
+                tty,
+                cmd.to_string(),
+                cwd.display().to_string(),
+                harness_metadata,
+                owner_scope,
+                transport_session_id,
+                output_encoding,
+                Some(resource_lease),
+            )
+            .with_expected_exit_codes(expected_exit_codes),
+        ) {
+            Ok(session) => session,
+            Err(rejected) => {
+                drop(execution_start_guard);
+                rejected.mark_termination_reason("session_limit");
+                rejected.kill_and_wait().await;
+                return Err(ctx.sessions.capacity_error());
+            }
         }
     };
+    drop(execution_start_guard);
     session.spawn_readers().await;
     let deadline = start + limit;
 
     if yield_time.is_zero() {
         session.mark_externally_retained();
         let snapshot = session.snapshot(max_output);
-        spawn_timeout_monitor(session.clone(), deadline);
+        if !session.is_durable() {
+            spawn_timeout_monitor(session.clone(), deadline);
+        }
         return Ok(merge_exec_result(
             snapshot,
             start,
@@ -1322,7 +1457,7 @@ async fn run_command(
         ));
     }
 
-    if !tty && !stdin_text.is_empty() {
+    if !session.is_durable() && !tty && !stdin_text.is_empty() {
         let mut stdin_guard = session.stdin.lock().await;
         if let Some(stdin) = stdin_guard.as_mut() {
             use tokio::io::AsyncWriteExt;
@@ -1419,7 +1554,9 @@ async fn run_command(
             }
             session.mark_externally_retained();
             let snapshot = session.snapshot(max_output);
-            spawn_timeout_monitor(session.clone(), deadline);
+            if !session.is_durable() {
+                spawn_timeout_monitor(session.clone(), deadline);
+            }
             return Ok(merge_exec_result(
                 snapshot,
                 start,

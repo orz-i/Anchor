@@ -21,7 +21,7 @@ pub fn install_kill_on_close_job() -> AppResult<()> {
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -29,7 +29,8 @@ pub fn install_kill_on_close_job() -> AppResult<()> {
         let job = CreateJobObjectW(None, PCWSTR::null())
             .map_err(|err| AppError::Message(format!("CreateJobObjectW failed: {err}")))?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         if let Err(err) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,

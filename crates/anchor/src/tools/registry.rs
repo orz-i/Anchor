@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 42;
+pub const CATALOG_VERSION: u32 = 43;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -686,6 +686,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "replace_text",
+        "Replace text",
+        "[anchor-core anchor-files] Replace one literal string across an explicit bounded file set with dry-run, SHA/match preconditions, encoding/mode preservation, and pre-commit CAS.",
+        false,
+        true,
+        false,
+    ),
+    (
         "apply_patch",
         "Apply patch",
         "[anchor-core anchor-files] Apply a patch envelope transactionally with cooperative cancellation, bounded processing time, and atomic rollback inside the workspace.",
@@ -920,6 +928,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_dir",
     "list_files",
     "search_text",
+    "replace_text",
     "apply_patch",
     "remove_path",
     "exec_command",
@@ -947,6 +956,42 @@ pub const CORE_TOOLS: &[&str] = &[
     "git_show",
     "git_blame",
     "view_image",
+];
+
+/// Advanced is an explicit additive profile, not an alias for every registered
+/// local tool. This prevents newly introduced diagnostics/admin helpers from
+/// silently expanding the published ChatGPT catalog.
+pub const ADVANCED_EXTRA_TOOLS: &[&str] = &[
+    "slice",
+    "commit_stage",
+    "complete_work_session",
+    "patch_check",
+    "harness_status",
+    "operation_log",
+    "project_state",
+    "refresh_baseline",
+    "accept_current_baseline",
+    "start_task",
+    "update_task",
+    "task_gate_status",
+    "pause_task",
+    "abort_task",
+    "resume_task",
+    "finish_task",
+    "task_context",
+    "list_task_events",
+    "change_summary",
+    "export_work_session",
+    "start_slice",
+    "update_slice",
+    "complete_slice",
+    "stage_commit",
+    "stage_commit_status",
+    "wait_stage_commit",
+    "exec_health_check",
+    "git_worktree_create",
+    "git_worktree_remove",
+    "git_worktree_prune",
 ];
 
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
@@ -995,6 +1040,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "browser_wait_for_build",
     "close_work_session",
     "cwd",
+    "replace_text",
     "apply_patch",
     "remove_path",
     "exec_command",
@@ -1258,6 +1304,8 @@ fn session_snapshot_output_schema() -> Value {
             "retained_ms": { "type": "integer", "minimum": 0 },
             "finished_at": { "type": ["string", "null"] },
             "result_observed": { "type": "boolean" },
+            "durable": { "type": "boolean" },
+            "process_bound": { "type": "boolean" },
             "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
             "affected_files": { "type": "array", "items": { "type": "object" } },
             "mutation_attributed": { "type": "boolean" },
@@ -1301,6 +1349,8 @@ fn session_snapshot_output_schema() -> Value {
             "retained_ms",
             "finished_at",
             "result_observed",
+            "durable",
+            "process_bound",
             "output_refs",
         ],
     )
@@ -1559,7 +1609,10 @@ pub fn output_schema(name: &str) -> Value {
                 "unobserved_terminal_session_ids": { "type": "array", "items": { "type": "string" } },
                 "requires_followup": { "type": "boolean" },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
-                "process_bound": { "type": "boolean", "const": true },
+                "process_bound": { "type": "boolean" },
+                "process_bound_session_count": { "type": "integer", "minimum": 0 },
+                "durable_session_count": { "type": "integer", "minimum": 0 },
+                "durable_supervisor_available": { "type": "boolean" },
                 "warnings": warnings_property()
             }),
             &[
@@ -1574,6 +1627,9 @@ pub fn output_schema(name: &str) -> Value {
                 "requires_followup",
                 "next_actions",
                 "process_bound",
+                "process_bound_session_count",
+                "durable_session_count",
+                "durable_supervisor_available",
                 "warnings",
             ],
         ),
@@ -1768,6 +1824,39 @@ pub fn output_schema(name: &str) -> Value {
                 "next_cursor",
                 "truncated",
                 "scan",
+                "warnings",
+            ],
+        ),
+        "replace_text" => success_output_schema(
+            json!({
+                "dry_run": { "type": "boolean" },
+                "mode": { "type": "string", "const": "literal" },
+                "change_id": { "type": "string", "minLength": 1 },
+                "files": { "type": "array", "items": { "type": "object" } },
+                "files_modified": { "type": "array", "items": { "type": "string" } },
+                "total_matches": { "type": "integer", "minimum": 1 },
+                "bytes_processed": { "type": "integer", "minimum": 0 },
+                "transaction": {
+                    "type": "object",
+                    "properties": {
+                        "committed": { "type": "boolean" },
+                        "atomic": { "type": "boolean", "const": true },
+                        "cas_verified": { "type": "boolean" }
+                    },
+                    "required": ["committed", "atomic", "cas_verified"],
+                    "additionalProperties": false
+                },
+                "recovery": { "type": "string", "minLength": 1 },
+                "warnings": warnings_property()
+            }),
+            &[
+                "dry_run",
+                "mode",
+                "files",
+                "files_modified",
+                "total_matches",
+                "bytes_processed",
+                "transaction",
                 "warnings",
             ],
         ),
@@ -1982,6 +2071,8 @@ pub fn output_schema(name: &str) -> Value {
                 "retained_ms": { "type": "integer", "minimum": 0 },
                 "finished_at": { "type": ["string", "null"] },
                 "result_observed": { "type": "boolean" },
+                "durable": { "type": "boolean" },
+                "process_bound": { "type": "boolean" },
                 "last_output_at": { "type": "string", "minLength": 1 },
                 "stdin_open": { "type": "boolean" },
                 "stdout": { "type": "object" },
@@ -2016,6 +2107,8 @@ pub fn output_schema(name: &str) -> Value {
                 "retained_ms",
                 "finished_at",
                 "result_observed",
+                "durable",
+                "process_bound",
                 "last_output_at",
                 "stdin_open",
                 "stdout",
@@ -2891,7 +2984,15 @@ pub fn require_tool_profile(profile: &str) -> Result<&'static str, String> {
 fn profile_tool_names(tool_profile: &str) -> Vec<&'static str> {
     match require_tool_profile(tool_profile).expect("tool profile must be validated") {
         "read-only" => CORE_READ_ONLY_TOOLS.to_vec(),
-        "advanced" => P0_TOOLS.iter().map(|(name, ..)| *name).collect(),
+        "advanced" => {
+            let mut tools = CORE_TOOLS.to_vec();
+            for tool in ADVANCED_EXTRA_TOOLS {
+                if !tools.contains(tool) {
+                    tools.push(tool);
+                }
+            }
+            tools
+        }
         _ => CORE_TOOLS.to_vec(),
     }
 }
@@ -2970,6 +3071,20 @@ fn normalized_facade_property_schema(schema: &Value) -> Value {
     normalized
 }
 
+fn published_facade_operation_schema(facade: &str, operation: &str, tool: &str) -> Value {
+    let mut schema = input_schema(tool);
+    if facade == "task" && operation == "update" {
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            // Task plan shape is established by begin_work_session. Runtime
+            // updates stay focused on progress/phase/working-set changes; Slice
+            // mutations use the dedicated slice facade.
+            properties.remove("contract");
+            properties.remove("slices");
+        }
+    }
+    schema
+}
+
 fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
     let mut properties = serde_json::Map::new();
     let mut property_operations = BTreeMap::<String, Vec<String>>::new();
@@ -2978,7 +3093,7 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
         let Some(tool) = facade_tool_for_operation(facade, operation) else {
             continue;
         };
-        let schema = input_schema(tool);
+        let schema = published_facade_operation_schema(facade, operation, tool);
         let required = schema
             .get("required")
             .and_then(Value::as_array)
@@ -2986,11 +3101,9 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
             .flatten()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        contracts.push(if required.is_empty() {
-            format!("{operation}: no required arguments")
-        } else {
-            format!("{operation}: requires {}", required.join(", "))
-        });
+        if !required.is_empty() {
+            contracts.push(format!("{operation}({})", required.join(",")));
+        }
         if let Some(operation_properties) = schema.get("properties").and_then(Value::as_object) {
             for (property, property_schema) in operation_properties {
                 if property == "operation" {
@@ -3024,10 +3137,7 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
         };
         property_schema.insert(
             "description".into(),
-            Value::String(format!(
-                "Valid only for {facade} operation(s): {}.",
-                valid_operations.join(", ")
-            )),
+            Value::String(format!("Only for: {}", valid_operations.join(","))),
         );
     }
 
@@ -3036,10 +3146,11 @@ fn facade_input_schema(facade: &str, operations: &[&str]) -> Value {
         json!({
             "type": "string",
             "enum": operations,
-            "description": format!(
-                "Select the {facade} operation. Do not send arguments that are not valid for the selected operation. Operation-specific required arguments: {}.",
-                contracts.join("; ")
-            )
+            "description": if contracts.is_empty() {
+                format!("Select {facade} operation.")
+            } else {
+                format!("Select {facade} operation. Required: {}", contracts.join(";"))
+            }
         }),
     );
     json!({
@@ -3642,6 +3753,33 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["query"],
             "additionalProperties": false
         }),
+        "replace_text" => json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "minLength": 1 },
+                            "expected_sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+                            "expected_matches": { "type": "integer", "minimum": 0, "maximum": 100000 }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                },
+                "find": { "type": "string", "minLength": 1 },
+                "replace": { "type": "string" },
+                "dry_run": { "type": "boolean", "default": false },
+                "max_matches": { "type": "integer", "minimum": 1, "maximum": 100000, "default": 10000 },
+                "max_total_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456, "default": 67108864 }
+            },
+            "required": ["files", "find", "replace"],
+            "additionalProperties": false
+        }),
         "apply_patch" => json!({
             "type": "object",
             "properties": {
@@ -3731,6 +3869,11 @@ pub fn input_schema(name: &str) -> Value {
                 "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 32768 },
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                 "tty": { "type": "boolean", "default": false },
+                "durable": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Opt in to the detached non-TTY supervisor so wait/read/kill can recover after MCP daemon restart."
+                },
                 "stdin": { "type": "string", "default": "" },
                 "expected_exit_codes": {
                     "type": "array",
@@ -4100,7 +4243,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 24);
+        assert_eq!(tools.len(), 25);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"git"));
         assert!(names.contains(&"task"));
@@ -4118,6 +4261,7 @@ mod tests {
         assert!(names.contains(&"browser_build_info"));
         assert!(names.contains(&"browser_wait_for_build"));
         assert!(names.contains(&"search_text"));
+        assert!(names.contains(&"replace_text"));
         assert!(!names.contains(&"command_cost_explain"));
         assert!(!names.contains(&"check_exec_environment"));
         assert!(!names.contains(&"get_default_cwd"));
@@ -4162,6 +4306,7 @@ mod tests {
             "close_work_session",
             "read_file",
             "search_text",
+            "replace_text",
             "apply_patch",
             "exec_command",
             "wait_command",
@@ -4360,7 +4505,7 @@ mod tests {
         assert!(
             task["inputSchema"]["properties"]["operation"]["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("switch: requires task_id"))
+                .is_some_and(|description| description.contains("switch(task_id)"))
         );
 
         let advanced = list_tools_for_profile("advanced");
@@ -4381,6 +4526,14 @@ mod tests {
             advanced_task["inputSchema"]["properties"]["operation"]["enum"]
                 .as_array()
                 .is_some_and(|operations| operations.iter().any(|operation| operation == "abort"))
+        );
+        assert!(
+            advanced_task["inputSchema"]["properties"]["operation"]["enum"]
+                .as_array()
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| operation == "start")
+                        && operations.iter().any(|operation| operation == "finish")
+                })
         );
         for hidden_leaf in [
             "check_exec_environment",

@@ -1661,6 +1661,9 @@ pub enum Command {
         config_scope: String,
         workspaces: Vec<String>,
     },
+    ExecSupervisorRun {
+        spec: PathBuf,
+    },
     DaemonRun {
         workspace: String,
         service: ServiceSelection,
@@ -1742,6 +1745,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("service-run") => parse_service_run(&mut args)?,
         Some("service-admin-run") => parse_service_admin_run(&mut args)?,
         Some("gateway-daemon-run") => parse_gateway_daemon_run(&mut args)?,
+        Some("exec-supervisor-run") => {
+            let spec = PathBuf::from(pop_value(&mut args, "exec-supervisor-run")?);
+            ensure_empty(&args, "exec-supervisor-run")?;
+            Command::ExecSupervisorRun { spec }
+        }
         Some("daemon-run") => parse_daemon_run(&mut args)?,
         Some(other) => return Err(format!("未知命令：{other}\n\n{}", usage())),
     };
@@ -2533,6 +2541,28 @@ mod tests {
         ]))
         .expect_err("handoff id without predecessor pid must fail");
         assert!(partial.contains("handoff 参数不完整"));
+    }
+
+    #[test]
+    fn parses_internal_exec_supervisor_run_exactly_once() {
+        let parsed = parse(strings(&[
+            "exec-supervisor-run",
+            "/tmp/anchor-command-jobs/session/spec.json",
+        ]))
+        .expect("exec supervisor child");
+        assert_eq!(
+            parsed.command,
+            Command::ExecSupervisorRun {
+                spec: PathBuf::from("/tmp/anchor-command-jobs/session/spec.json")
+            }
+        );
+        let error = parse(strings(&[
+            "exec-supervisor-run",
+            "/tmp/anchor-command-jobs/session/spec.json",
+            "unexpected",
+        ]))
+        .expect_err("extra arguments must be rejected");
+        assert!(error.contains("exec-supervisor-run"));
     }
 
     #[test]

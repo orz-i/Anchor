@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
@@ -21,12 +25,553 @@ const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
 // the store for terminal_log_retention so output refs stay readable.
 const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::ZERO;
 const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
+const DURABLE_COMMAND_SCHEMA_VERSION: u32 = 1;
+const DURABLE_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DURABLE_LOG_RETAIN_BYTES: u64 = 8 * 1024 * 1024;
+const DURABLE_JSON_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 pub struct CommandSessionStore {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
+    execution_admission: Mutex<()>,
     max_sessions: usize,
     terminal_slot_retention: Duration,
     terminal_log_retention: Duration,
+    durable_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct DurableJobPaths {
+    dir: PathBuf,
+    spec: PathBuf,
+    state: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    control: PathBuf,
+    spawned: PathBuf,
+    observed: PathBuf,
+    harness_finalized: PathBuf,
+}
+
+impl DurableJobPaths {
+    fn new(root: &Path, session_id: &str) -> Self {
+        let dir = root.join(session_id);
+        Self {
+            spec: dir.join("spec.json"),
+            state: dir.join("state.json"),
+            stdout: dir.join("stdout.log"),
+            stderr: dir.join("stderr.log"),
+            control: dir.join("control"),
+            spawned: dir.join("spawned.marker"),
+            observed: dir.join("observed.marker"),
+            harness_finalized: dir.join("harness-finalized.marker"),
+            dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DurableCommandSpec {
+    pub(crate) schema_version: u32,
+    pub(crate) session_id: String,
+    pub(crate) command: String,
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) cwd: String,
+    pub(crate) timeout_ms: u64,
+    pub(crate) initial_stdin: String,
+    pub(crate) output_encoding: StreamEncoding,
+    pub(crate) expected_exit_codes: Vec<i32>,
+    pub(crate) harness_metadata: Option<SessionHarnessMetadata>,
+    pub(crate) owner_scope: Option<String>,
+    pub(crate) transport_session_id: Option<String>,
+    pub(crate) execution_resources: Option<Value>,
+    pub(crate) started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableCommandState {
+    schema_version: u32,
+    session_id: String,
+    status: String,
+    termination_reason: String,
+    supervisor_pid: Option<u32>,
+    child_pid: Option<u32>,
+    exit_code: Option<i32>,
+    stdin_open: bool,
+    started_at: String,
+    finished_at: Option<String>,
+    last_output_at: String,
+    stdout_total_bytes: u64,
+    stderr_total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableControl {
+    action: String,
+    chars: Option<String>,
+    signal: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DurableJobHandle {
+    paths: DurableJobPaths,
+    spec: DurableCommandSpec,
+}
+
+impl DurableJobHandle {
+    pub(crate) fn spec_path(&self) -> &Path {
+        &self.paths.spec
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.spec.session_id
+    }
+
+    pub(crate) fn mark_launcher_failed(&self, message: &str) {
+        if let Ok(mut state) = self.read_state() {
+            state.status = "spawn_failed".into();
+            state.termination_reason = "spawn_failed".into();
+            state.stdin_open = false;
+            state.finished_at = Some(timestamp());
+            persist_durable_state(&self.paths, &state);
+        }
+        let _ = append_bounded_log(&self.paths.stderr, message.as_bytes());
+    }
+
+    fn read_state(&self) -> Result<DurableCommandState, WorkspaceError> {
+        read_bounded_json(&self.paths.state).map_err(|error| WorkspaceError::ToolDetails {
+            code: "DURABLE_COMMAND_STATE_UNAVAILABLE",
+            message: format!("Durable command state is unavailable: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({
+                "session_id": self.spec.session_id,
+                "state_path": self.paths.state.display().to_string()
+            }),
+        })
+    }
+
+    fn terminal_observed(&self) -> bool {
+        self.paths.observed.is_file()
+    }
+
+    fn mark_terminal_observed(&self) {
+        let _ = create_marker(&self.paths.observed);
+    }
+
+    fn mark_harness_finalized(&self) -> bool {
+        create_marker(&self.paths.harness_finalized).unwrap_or(false)
+    }
+
+    fn retained_stream_bytes(&self, stream: &str) -> (Vec<u8>, usize) {
+        let state = self.read_state().ok();
+        let (path, total) = if stream == "stderr" {
+            (
+                &self.paths.stderr,
+                state.as_ref().map(|state| state.stderr_total_bytes),
+            )
+        } else {
+            (
+                &self.paths.stdout,
+                state.as_ref().map(|state| state.stdout_total_bytes),
+            )
+        };
+        let data = fs::read(path).unwrap_or_default();
+        let total = total
+            .unwrap_or(data.len() as u64)
+            .max(data.len() as u64)
+            .min(usize::MAX as u64) as usize;
+        (data, total)
+    }
+
+    fn enqueue_control(&self, control: &DurableControl) -> Result<PathBuf, WorkspaceError> {
+        fs::create_dir_all(&self.paths.control).map_err(|error| WorkspaceError::ToolDetails {
+            code: "DURABLE_COMMAND_CONTROL_FAILED",
+            message: format!("Failed to create durable command control directory: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({"session_id": self.spec.session_id}),
+        })?;
+        let sequence = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = self
+            .paths
+            .control
+            .join(format!("{sequence:039}-{}.json", Uuid::new_v4().simple()));
+        write_json_atomic(&path, control).map_err(|error| WorkspaceError::ToolDetails {
+            code: "DURABLE_COMMAND_CONTROL_FAILED",
+            message: format!("Failed to queue durable command control: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({"session_id": self.spec.session_id}),
+        })?;
+        Ok(path)
+    }
+}
+
+fn create_marker(path: &Path) -> std::io::Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            file.write_all(timestamp().as_bytes())?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> std::io::Result<T> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > DURABLE_JSON_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable command JSON exceeds size limit",
+        ));
+    }
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
+        std::process::id(),
+        Uuid::new_v4().simple()
+    ));
+    let payload = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if payload.len() as u64 > DURABLE_JSON_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable command JSON exceeds size limit",
+        ));
+    }
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
+fn append_bounded_log(path: &Path, chunk: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(chunk)?;
+    file.flush()?;
+    let len = file.metadata()?.len();
+    drop(file);
+    if len <= DURABLE_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    let retain = DURABLE_LOG_RETAIN_BYTES.min(len);
+    let mut source = File::open(path)?;
+    source.seek(SeekFrom::Start(len - retain))?;
+    let mut tail = Vec::with_capacity(retain as usize);
+    source.read_to_end(&mut tail)?;
+    let temp = path.with_extension(format!("log-tmp-{}", Uuid::new_v4().simple()));
+    fs::write(&temp, tail)?;
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn persist_durable_state(paths: &DurableJobPaths, state: &DurableCommandState) {
+    let _ = write_json_atomic(&paths.state, state);
+}
+
+async fn durable_log_reader<T>(
+    mut stream: T,
+    path: PathBuf,
+    paths: DurableJobPaths,
+    state: Arc<Mutex<DurableCommandState>>,
+    is_stdout: bool,
+    encoding: StreamEncoding,
+) where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let mut decoder = StreamDecoder::new(encoding);
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stream.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let decoded = decoder.decode(&buffer[..read], false);
+                if decoded.is_empty() {
+                    continue;
+                }
+                let _ = append_bounded_log(&path, &decoded);
+                let mut current = state.lock().expect("durable state lock");
+                if is_stdout {
+                    current.stdout_total_bytes = current
+                        .stdout_total_bytes
+                        .saturating_add(decoded.len() as u64);
+                } else {
+                    current.stderr_total_bytes = current
+                        .stderr_total_bytes
+                        .saturating_add(decoded.len() as u64);
+                }
+                current.last_output_at = timestamp();
+                persist_durable_state(&paths, &current);
+            }
+            Err(_) => break,
+        }
+    }
+    let tail = decoder.decode(&[], true);
+    if !tail.is_empty() {
+        let _ = append_bounded_log(&path, &tail);
+        let mut current = state.lock().expect("durable state lock");
+        if is_stdout {
+            current.stdout_total_bytes =
+                current.stdout_total_bytes.saturating_add(tail.len() as u64);
+        } else {
+            current.stderr_total_bytes =
+                current.stderr_total_bytes.saturating_add(tail.len() as u64);
+        }
+        current.last_output_at = timestamp();
+        persist_durable_state(&paths, &current);
+    }
+}
+
+fn durable_control_files(path: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .is_some_and(|kind| kind.is_file())
+                .then_some(entry.path())
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn validate_durable_spec_location(spec_path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = spec_path;
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    {
+        let harness_root = crate::harness::Harness::default_root()
+            .map_err(|error| format!("resolve Harness root failed: {error}"))?;
+        let harness_root = fs::canonicalize(&harness_root)
+            .map_err(|error| format!("canonicalize Harness root failed: {error}"))?;
+        let spec_path = fs::canonicalize(spec_path)
+            .map_err(|error| format!("canonicalize durable spec failed: {error}"))?;
+        if !spec_path.starts_with(harness_root.join("workspaces")) {
+            return Err("durable command spec is outside the configured Harness store".into());
+        }
+        Ok(())
+    }
+}
+
+/// Internal one-shot entrypoint used by the CLI. Recovery code never calls
+/// this function: it only reads the persisted job state, so a daemon restart
+/// cannot replay a command.
+pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result<i32, String> {
+    validate_durable_spec_location(&spec_path)?;
+    let spec = read_bounded_json::<DurableCommandSpec>(&spec_path)
+        .map_err(|error| format!("read durable command spec failed: {error}"))?;
+    if spec.schema_version != DURABLE_COMMAND_SCHEMA_VERSION {
+        return Err("unsupported durable command spec version".into());
+    }
+    if Uuid::parse_str(&spec.session_id).is_err() {
+        return Err("invalid durable command session id".into());
+    }
+    let root = spec_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "durable command spec path has no job root".to_string())?;
+    let paths = DurableJobPaths::new(root, &spec.session_id);
+    if paths.spec != spec_path {
+        return Err("durable command spec path does not match session id".into());
+    }
+    if !create_marker(&paths.spawned)
+        .map_err(|error| format!("claim durable command failed: {error}"))?
+    {
+        return Err("durable command was already claimed; replay refused".into());
+    }
+    let mut state = read_bounded_json::<DurableCommandState>(&paths.state)
+        .map_err(|error| format!("read durable command state failed: {error}"))?;
+    if state.schema_version != DURABLE_COMMAND_SCHEMA_VERSION || state.session_id != spec.session_id
+    {
+        return Err("durable command state does not match spec".into());
+    }
+    state.supervisor_pid = Some(std::process::id());
+    state.status = "starting".into();
+    state.termination_reason = "running".into();
+    persist_durable_state(&paths, &state);
+
+    let mut command = tokio::process::Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::platform::configure_exec_tokio_process(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            state.status = "spawn_failed".into();
+            state.termination_reason = "spawn_failed".into();
+            state.stdin_open = false;
+            state.finished_at = Some(timestamp());
+            persist_durable_state(&paths, &state);
+            return Err(format!("spawn durable workspace command failed: {error}"));
+        }
+    };
+    crate::platform::lower_exec_child_priority(&child);
+    let child_pid = child.id();
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let state = Arc::new(Mutex::new({
+        state.status = "running".into();
+        state.child_pid = child_pid;
+        state.stdin_open = stdin.is_some();
+        persist_durable_state(&paths, &state);
+        state
+    }));
+    let mut readers = Vec::new();
+    if let Some(stdout) = stdout {
+        readers.push(crate::async_runtime::spawn(durable_log_reader(
+            stdout,
+            paths.stdout.clone(),
+            paths.clone(),
+            Arc::clone(&state),
+            true,
+            spec.output_encoding,
+        )));
+    }
+    if let Some(stderr) = stderr {
+        readers.push(crate::async_runtime::spawn(durable_log_reader(
+            stderr,
+            paths.stderr.clone(),
+            paths.clone(),
+            Arc::clone(&state),
+            false,
+            spec.output_encoding,
+        )));
+    }
+
+    if !spec.initial_stdin.is_empty() {
+        if let Some(input) = stdin.as_mut() {
+            use tokio::io::AsyncWriteExt;
+            let _ = input.write_all(spec.initial_stdin.as_bytes()).await;
+            let _ = input.shutdown().await;
+        }
+        stdin = None;
+        let mut current = state.lock().expect("durable state lock");
+        current.stdin_open = false;
+        persist_durable_state(&paths, &current);
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+    let exit_status = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            {
+                let mut current = state.lock().expect("durable state lock");
+                current.termination_reason = "timeout".into();
+                persist_durable_state(&paths, &current);
+            }
+            if let Some(pid) = child.id() {
+                send_session_signal(pid, "KILL");
+            } else {
+                let _ = child.start_kill();
+            }
+            break child
+                .wait()
+                .await
+                .map_err(|error| format!("wait after durable timeout failed: {error}"))?;
+        }
+
+        for control_path in durable_control_files(&paths.control) {
+            let control = read_bounded_json::<DurableControl>(&control_path);
+            if let Ok(control) = control {
+                match control.action.as_str() {
+                    "stdin" => {
+                        if let (Some(input), Some(chars)) =
+                            (stdin.as_mut(), control.chars.as_deref())
+                        {
+                            use tokio::io::AsyncWriteExt;
+                            let _ = input.write_all(chars.as_bytes()).await;
+                            let _ = input.flush().await;
+                        }
+                    }
+                    "signal" => {
+                        let signal = control.signal.as_deref().unwrap_or("TERM");
+                        {
+                            let mut current = state.lock().expect("durable state lock");
+                            current.termination_reason = "killed".into();
+                            persist_durable_state(&paths, &current);
+                        }
+                        if let Some(pid) = child.id() {
+                            send_session_signal(pid, signal);
+                        } else {
+                            let _ = child.start_kill();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = fs::remove_file(control_path);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    for reader in readers {
+        let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
+    }
+    let mut current = state.lock().expect("durable state lock");
+    current.status = "exited".into();
+    if current.termination_reason == "running" {
+        current.termination_reason = "exited".into();
+    }
+    current.exit_code = exit_status.code();
+    current.stdin_open = false;
+    current.finished_at = Some(timestamp());
+    persist_durable_state(&paths, &current);
+    Ok(exit_status.code().unwrap_or(1))
 }
 
 struct StreamDecoder {
@@ -132,7 +677,8 @@ fn decode_windows_oem(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&wide[..written as usize])
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StreamEncoding {
     #[default]
     Utf8,
@@ -278,6 +824,14 @@ pub fn list_command_sessions(
     let terminal_count = session_count.saturating_sub(running_count);
     let unobserved_terminal_count = unobserved_terminal_session_ids.len();
     let pending_result_count = running_count.saturating_add(unobserved_terminal_count);
+    let durable_session_count = sessions
+        .iter()
+        .filter(|session| session.get("durable") == Some(&Value::Bool(true)))
+        .count();
+    let process_bound_session_count = sessions
+        .iter()
+        .filter(|session| session.get("process_bound") == Some(&Value::Bool(true)))
+        .count();
     Ok(tool_ok(json!({
         "sessions": sessions,
         "session_count": session_count,
@@ -293,7 +847,10 @@ pub fn list_command_sessions(
         } else {
             json!([])
         },
-        "process_bound": true,
+        "process_bound": process_bound_session_count > 0,
+        "process_bound_session_count": process_bound_session_count,
+        "durable_session_count": durable_session_count,
+        "durable_supervisor_available": store.durable_enabled(),
         "warnings": []
     })))
 }
@@ -402,6 +959,8 @@ pub fn wait_command(store: &CommandSessionStore, args: &Value) -> Result<Value, 
         "retained_ms": snapshot["retained_ms"],
         "finished_at": snapshot["finished_at"],
         "result_observed": snapshot["result_observed"],
+        "durable": snapshot["durable"],
+        "process_bound": snapshot["process_bound"],
         "last_output_at": snapshot["last_output_at"],
         "stdin_open": snapshot["stdin_open"],
         "stdout": stdout,
@@ -456,6 +1015,253 @@ impl Default for CommandSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "invoked as a child process by durable supervisor tests"]
+    fn durable_supervisor_output_child() {
+        println!("durable-child-output");
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    #[test]
+    #[ignore = "invoked as a child process by durable supervisor tests"]
+    fn durable_supervisor_stdin_child() {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("read durable stdin");
+        println!("durable-stdin:{}", input.trim());
+    }
+
+    fn durable_child_args(test_name: &str) -> Vec<String> {
+        vec![
+            test_name.to_string(),
+            "--ignored".to_string(),
+            "--exact".to_string(),
+            "--nocapture".to_string(),
+        ]
+    }
+
+    fn durable_test_spec(
+        session_id: String,
+        test_name: &str,
+        timeout_ms: u64,
+    ) -> DurableCommandSpec {
+        DurableCommandSpec {
+            schema_version: DURABLE_COMMAND_SCHEMA_VERSION,
+            session_id,
+            command: format!("test-child {test_name}"),
+            program: std::env::current_exe()
+                .expect("current test exe")
+                .display()
+                .to_string(),
+            args: durable_child_args(test_name),
+            cwd: std::env::current_dir()
+                .expect("current dir")
+                .display()
+                .to_string(),
+            timeout_ms,
+            initial_stdin: String::new(),
+            output_encoding: StreamEncoding::Utf8,
+            expected_exit_codes: vec![0],
+            harness_metadata: None,
+            owner_scope: Some("durable-test".into()),
+            transport_session_id: None,
+            execution_resources: None,
+            started_at: timestamp(),
+        }
+    }
+
+    fn wait_for_durable_status(path: &Path, expected: &str) {
+        for _ in 0..200 {
+            if read_bounded_json::<DurableCommandState>(path)
+                .ok()
+                .is_some_and(|state| state.status == expected)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("durable state never reached {expected}");
+    }
+
+    #[test]
+    fn durable_job_recovery_keeps_output_and_refuses_replay() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let store = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let job = store
+            .create_durable_job(durable_test_spec(
+                session_id.clone(),
+                "tools::command_session::tests::durable_supervisor_output_child",
+                5_000,
+            ))
+            .expect("create durable job");
+        let spec_path = job.spec_path().to_path_buf();
+        let state_path = job.paths.state.clone();
+        let supervisor = std::thread::spawn({
+            let spec_path = spec_path.clone();
+            move || crate::async_runtime::block_on(run_durable_command_supervisor(spec_path))
+        });
+        for _ in 0..200 {
+            if job.paths.spawned.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            job.paths.spawned.is_file(),
+            "supervisor must claim the spec"
+        );
+        let replay = crate::async_runtime::block_on(run_durable_command_supervisor(spec_path));
+        assert!(replay
+            .expect_err("second supervisor must refuse replay")
+            .contains("replay refused"));
+
+        // Rebuild the store while the original supervisor still owns the job.
+        let recovered = CommandSessionStore::with_durable_root(root);
+        let recovered_session = recovered.get(&session_id).expect("recovered session");
+        assert!(recovered_session.is_durable());
+        assert!(!recovered_session.terminal_observed());
+
+        let result = supervisor
+            .join()
+            .expect("supervisor thread")
+            .expect("child exit");
+        assert_eq!(result, 0);
+        wait_for_durable_status(&state_path, "exited");
+        crate::async_runtime::block_on(recovered_session.refresh_status());
+        let (stdout, total) = recovered_session.retained_stream_bytes("stdout");
+        assert!(total >= stdout.len());
+        assert!(String::from_utf8_lossy(&stdout).contains("durable-child-output"));
+        recovered_session.mark_terminal_observed();
+        assert!(job.paths.observed.is_file());
+    }
+
+    #[test]
+    fn recovered_durable_session_accepts_stdin_control() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let store = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let job = store
+            .create_durable_job(durable_test_spec(
+                session_id.clone(),
+                "tools::command_session::tests::durable_supervisor_stdin_child",
+                5_000,
+            ))
+            .expect("create durable job");
+        let state_path = job.paths.state.clone();
+        let supervisor = std::thread::spawn({
+            let spec_path = job.spec_path().to_path_buf();
+            move || crate::async_runtime::block_on(run_durable_command_supervisor(spec_path))
+        });
+        wait_for_durable_status(&state_path, "running");
+
+        let recovered = CommandSessionStore::with_durable_root(root);
+        let write = write_stdin(
+            &recovered,
+            &json!({
+                "session_id": session_id,
+                "chars": "hello-after-reconnect\n",
+                "yield_time_ms": 50,
+                "max_output_bytes": 4096
+            }),
+        )
+        .expect("queue durable stdin");
+        assert_eq!(write["durable"], true);
+        // The child reads until EOF. Terminate the session after proving the
+        // control file was consumed; its stdout must include the input before
+        // the supervisor exits on timeout/kill.
+        for _ in 0..100 {
+            if durable_control_files(&job.paths.control).is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(durable_control_files(&job.paths.control).is_empty());
+        assert_eq!(supervisor.join().expect("supervisor thread").unwrap(), 0);
+        wait_for_durable_status(&state_path, "exited");
+        let recovered_session = recovered.get(&session_id).expect("recovered session");
+        crate::async_runtime::block_on(recovered_session.refresh_status());
+        let (stdout, _) = recovered_session.retained_stream_bytes("stdout");
+        assert!(String::from_utf8_lossy(&stdout).contains("durable-stdin:hello-after-reconnect"));
+    }
+
+    #[test]
+    fn durable_session_does_not_block_daemon_handoff() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let creator = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let _job = creator
+            .create_durable_job(durable_test_spec(
+                session_id,
+                "tools::command_session::tests::durable_supervisor_output_child",
+                5_000,
+            ))
+            .expect("durable job");
+        let recovered = CommandSessionStore::with_durable_root(root);
+        assert_eq!(recovered.prepare_daemon_handoff(u32::MAX).unwrap(), None);
+    }
+
+    #[test]
+    fn stale_unclaimed_durable_job_is_interrupted_without_replay() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let creator = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let mut spec = durable_test_spec(
+            session_id.clone(),
+            "tools::command_session::tests::durable_supervisor_output_child",
+            5_000,
+        );
+        spec.started_at = (Utc::now() - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let job = creator.create_durable_job(spec).expect("durable job");
+        let recovered = CommandSessionStore::with_durable_root(root);
+        let session = recovered.get(&session_id).expect("recovered session");
+        crate::async_runtime::block_on(session.refresh_status());
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
+        assert_eq!(snapshot["termination_reason"], "launch_interrupted");
+        assert_eq!(snapshot["retryable"], true);
+        assert!(
+            !job.paths.spawned.exists(),
+            "recovery must never replay the job"
+        );
+    }
+
+    #[test]
+    fn recovered_running_durable_job_holds_execution_capacity() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let creator = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let job = creator
+            .create_durable_job(durable_test_spec(
+                session_id,
+                "tools::command_session::tests::durable_supervisor_output_child",
+                5_000,
+            ))
+            .expect("durable job");
+        let mut state = job.read_state().expect("state");
+        state.status = "running".into();
+        state.supervisor_pid = Some(std::process::id());
+        persist_durable_state(&job.paths, &state);
+        let recovered = CommandSessionStore::with_durable_root(root);
+        let error = recovered
+            .ensure_execution_capacity(1)
+            .expect_err("recovered running durable job must consume capacity");
+        assert!(matches!(
+            error,
+            WorkspaceError::ToolDetails {
+                code: "EXECUTION_CAPACITY_HELD",
+                ..
+            }
+        ));
+    }
 
     fn spawn_test_session() -> ExecSession {
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
@@ -737,9 +1543,194 @@ impl CommandSessionStore {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            execution_admission: Mutex::new(()),
             max_sessions: max_sessions.max(1),
             terminal_slot_retention,
             terminal_log_retention: terminal_log_retention.max(terminal_slot_retention),
+            durable_root: None,
+        }
+    }
+
+    pub fn with_durable_root(root: PathBuf) -> Self {
+        let store = Self {
+            sessions: Mutex::new(HashMap::new()),
+            execution_admission: Mutex::new(()),
+            max_sessions: DEFAULT_MAX_EXEC_SESSIONS,
+            terminal_slot_retention: DEFAULT_TERMINAL_SLOT_RETENTION,
+            terminal_log_retention: DEFAULT_TERMINAL_LOG_RETENTION,
+            durable_root: Some(root),
+        };
+        store.recover_durable_sessions();
+        store
+    }
+
+    pub fn durable_enabled(&self) -> bool {
+        self.durable_root.is_some()
+    }
+
+    pub fn execution_start_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.execution_admission
+            .lock()
+            .expect("execution admission lock")
+    }
+
+    pub fn ensure_execution_capacity(&self, max_running: usize) -> Result<(), WorkspaceError> {
+        let sessions = {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        let running = sessions
+            .into_iter()
+            .filter(|session| {
+                crate::async_runtime::block_on(session.refresh_status());
+                !session.has_exited()
+            })
+            .count();
+        if running >= max_running.max(1) {
+            return Err(WorkspaceError::ToolDetails {
+                code: "EXECUTION_CAPACITY_HELD",
+                message: "Execution capacity is currently held by running command sessions.".into(),
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "running_command_sessions": running,
+                    "max_running_commands": max_running.max(1),
+                    "durable_sessions_included": true,
+                    "suggestion": "Wait for or terminate an existing command session before starting another."
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_durable_job(
+        &self,
+        spec: DurableCommandSpec,
+    ) -> Result<DurableJobHandle, WorkspaceError> {
+        let root = self
+            .durable_root
+            .as_ref()
+            .ok_or_else(|| WorkspaceError::Tool {
+                code: "DURABLE_COMMAND_UNAVAILABLE",
+                message: "Durable command storage is not configured.".into(),
+                category: "runtime",
+                retryable: false,
+            })?;
+        if Uuid::parse_str(&spec.session_id).is_err() {
+            return Err(WorkspaceError::invalid_argument(
+                "durable command session_id must be a UUID",
+            ));
+        }
+        let paths = DurableJobPaths::new(root, &spec.session_id);
+        fs::create_dir_all(&paths.control).map_err(|error| WorkspaceError::ToolDetails {
+            code: "DURABLE_COMMAND_CREATE_FAILED",
+            message: format!("Failed to create durable command job directory: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({"session_id": spec.session_id}),
+        })?;
+        if paths.spec.exists() || paths.spawned.exists() {
+            return Err(WorkspaceError::ToolDetails {
+                code: "DURABLE_COMMAND_ID_CONFLICT",
+                message: "Durable command session already exists; refusing to replay it.".into(),
+                category: "conflict",
+                retryable: false,
+                details: json!({"session_id": spec.session_id}),
+            });
+        }
+        write_json_atomic(&paths.spec, &spec).map_err(|error| WorkspaceError::ToolDetails {
+            code: "DURABLE_COMMAND_CREATE_FAILED",
+            message: format!("Failed to persist durable command spec: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({"session_id": spec.session_id}),
+        })?;
+        let state = DurableCommandState {
+            schema_version: DURABLE_COMMAND_SCHEMA_VERSION,
+            session_id: spec.session_id.clone(),
+            status: "starting".into(),
+            termination_reason: "running".into(),
+            supervisor_pid: None,
+            child_pid: None,
+            exit_code: None,
+            stdin_open: true,
+            started_at: spec.started_at.clone(),
+            finished_at: None,
+            last_output_at: spec.started_at.clone(),
+            stdout_total_bytes: 0,
+            stderr_total_bytes: 0,
+        };
+        write_json_atomic(&paths.state, &state).map_err(|error| WorkspaceError::ToolDetails {
+            code: "DURABLE_COMMAND_CREATE_FAILED",
+            message: format!("Failed to persist durable command state: {error}"),
+            category: "runtime",
+            retryable: true,
+            details: json!({"session_id": spec.session_id}),
+        })?;
+        Ok(DurableJobHandle { paths, spec })
+    }
+
+    fn recover_durable_sessions(&self) {
+        let Some(root) = self.durable_root.as_ref() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        let mut recovered = Vec::new();
+        for entry in entries.flatten().take(self.max_sessions.saturating_mul(4)) {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let Some(session_id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if Uuid::parse_str(&session_id).is_err() {
+                continue;
+            }
+            let paths = DurableJobPaths::new(root, &session_id);
+            let Ok(spec) = read_bounded_json::<DurableCommandSpec>(&paths.spec) else {
+                continue;
+            };
+            let Ok(state) = read_bounded_json::<DurableCommandState>(&paths.state) else {
+                continue;
+            };
+            if spec.schema_version != DURABLE_COMMAND_SCHEMA_VERSION
+                || state.schema_version != DURABLE_COMMAND_SCHEMA_VERSION
+                || spec.session_id != session_id
+                || state.session_id != session_id
+            {
+                continue;
+            }
+            if state.status == "exited" && paths.observed.is_file() {
+                if let Some(finished) = state
+                    .finished_at
+                    .as_deref()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                {
+                    let elapsed = Utc::now().signed_duration_since(finished.with_timezone(&Utc));
+                    if elapsed
+                        .to_std()
+                        .ok()
+                        .is_some_and(|elapsed| elapsed > self.terminal_log_retention)
+                    {
+                        let _ = fs::remove_dir_all(&paths.dir);
+                        continue;
+                    }
+                }
+            }
+            recovered.push(ExecSession::from_durable_job(
+                DurableJobHandle { paths, spec },
+                state,
+            ));
+        }
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        for session in recovered {
+            sessions.insert(session.session_id.clone(), Arc::new(session));
         }
     }
 
@@ -867,12 +1858,17 @@ impl CommandSessionStore {
         let mut blockers = Vec::new();
         for session in sessions {
             crate::async_runtime::block_on(session.refresh_status());
+            if session.is_durable() {
+                // The detached supervisor owns this command; MCP daemon handoff
+                // does not affect its process or output state.
+                continue;
+            }
             let child_pid = if session.has_exited() {
                 None
             } else {
                 crate::async_runtime::block_on(async {
                     let child = session.child.lock().await;
-                    child.id()
+                    child.as_ref().and_then(|child| child.id())
                 })
             };
             let is_blocking_initiator = child_pid == Some(initiator_pid)
@@ -1001,7 +1997,7 @@ fn prune_terminal_sessions(
 
 pub struct ExecSession {
     pub session_id: String,
-    pub(crate) child: AsyncMutex<Child>,
+    pub(crate) child: AsyncMutex<Option<Child>>,
     pub stdin: AsyncMutex<Option<ChildStdin>>,
     stdin_open: Mutex<bool>,
     interactive: bool,
@@ -1029,9 +2025,10 @@ pub struct ExecSession {
     resource_lease: Mutex<Option<ExecutionLease>>,
     execution_resources: Option<Value>,
     expected_exit_codes: Vec<i32>,
+    durable_job: Option<DurableJobHandle>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHarnessMetadata {
     pub task_id: String,
     pub command: String,
@@ -1129,7 +2126,7 @@ impl ExecSession {
         let execution_resources = resource_lease.as_ref().map(ExecutionLease::to_value);
         Self {
             session_id,
-            child: AsyncMutex::new(child),
+            child: AsyncMutex::new(Some(child)),
             stdin: AsyncMutex::new(stdin),
             stdin_open: Mutex::new(stdin_open),
             interactive,
@@ -1157,7 +2154,56 @@ impl ExecSession {
             resource_lease: Mutex::new(resource_lease),
             execution_resources,
             expected_exit_codes: vec![0],
+            durable_job: None,
         }
+    }
+
+    fn from_durable_job(job: DurableJobHandle, state: DurableCommandState) -> Self {
+        let exited = !matches!(state.status.as_str(), "starting" | "running");
+        Self {
+            session_id: job.spec.session_id.clone(),
+            child: AsyncMutex::new(None),
+            stdin: AsyncMutex::new(None),
+            stdin_open: Mutex::new(state.stdin_open),
+            interactive: false,
+            command: job.spec.command.clone(),
+            resolved_cwd: job.spec.cwd.clone(),
+            output_encoding: StreamEncoding::Utf8,
+            stdout: Mutex::new(StreamBuffer::default()),
+            stderr: Mutex::new(StreamBuffer::default()),
+            started_at: Instant::now(),
+            started_at_iso: state.started_at.clone(),
+            finished_at: Mutex::new(exited.then(Instant::now)),
+            finished_at_iso: Mutex::new(state.finished_at.clone()),
+            last_output_at: Mutex::new(state.last_output_at.clone()),
+            exit_code: Mutex::new(state.exit_code),
+            exited: AtomicBool::new(exited),
+            last_access: Mutex::new(Instant::now()),
+            termination_reason: Mutex::new(Some(state.termination_reason.clone())),
+            reader_tasks: AsyncMutex::new(Vec::new()),
+            harness_metadata: job.spec.harness_metadata.clone(),
+            owner_scope: job.spec.owner_scope.clone(),
+            transport_session_id: job.spec.transport_session_id.clone(),
+            harness_finalized: AtomicBool::new(job.paths.harness_finalized.is_file()),
+            terminal_observed: AtomicBool::new(job.paths.observed.is_file()),
+            externally_retained: AtomicBool::new(true),
+            resource_lease: Mutex::new(None),
+            execution_resources: job.spec.execution_resources.clone(),
+            expected_exit_codes: job.spec.expected_exit_codes.clone(),
+            durable_job: Some(job),
+        }
+    }
+
+    pub(crate) fn attach_durable_job(mut self, job: DurableJobHandle) -> Self {
+        self.session_id = job.spec.session_id.clone();
+        self.started_at_iso = job.spec.started_at.clone();
+        self.durable_job = Some(job);
+        self.externally_retained.store(true, Ordering::Release);
+        self
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.durable_job.is_some()
     }
 
     pub fn with_expected_exit_codes(mut self, mut expected_exit_codes: Vec<i32>) -> Self {
@@ -1187,29 +2233,47 @@ impl ExecSession {
     }
 
     pub fn terminal_observed(&self) -> bool {
+        if let Some(job) = &self.durable_job {
+            if job.terminal_observed() {
+                self.terminal_observed.store(true, Ordering::Release);
+            }
+        }
         self.terminal_observed.load(Ordering::Acquire)
     }
 
     pub fn mark_terminal_observed(&self) {
         if self.has_exited() && !self.terminal_observed.swap(true, Ordering::AcqRel) {
+            if let Some(job) = &self.durable_job {
+                job.mark_terminal_observed();
+            }
             self.touch();
         }
     }
 
     pub fn mark_harness_finalized(&self) -> bool {
+        if let Some(job) = &self.durable_job {
+            let created = job.mark_harness_finalized();
+            if created {
+                self.harness_finalized.store(true, Ordering::Release);
+            }
+            return created;
+        }
         self.harness_finalized
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
     pub async fn spawn_readers(self: &Arc<Self>) {
+        if self.is_durable() {
+            return;
+        }
         let stdout = {
             let mut guard = self.child.lock().await;
-            guard.stdout.take()
+            guard.as_mut().and_then(|child| child.stdout.take())
         };
         let stderr = {
             let mut guard = self.child.lock().await;
-            guard.stderr.take()
+            guard.as_mut().and_then(|child| child.stderr.take())
         };
         if let Some(stream) = stdout {
             let session = Arc::clone(self);
@@ -1280,8 +2344,26 @@ impl ExecSession {
     }
 
     pub async fn kill_and_wait(&self) {
+        if let Some(job) = &self.durable_job {
+            let _ = job.enqueue_control(&DurableControl {
+                action: "signal".into(),
+                chars: None,
+                signal: Some("KILL".into()),
+            });
+            for _ in 0..100 {
+                self.refresh_status().await;
+                if self.has_exited() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            return;
+        }
         let status = {
             let mut child = self.child.lock().await;
+            let Some(child) = child.as_mut() else {
+                return;
+            };
             let _ = child.start_kill();
             child.wait().await.ok()
         };
@@ -1291,9 +2373,64 @@ impl ExecSession {
     }
 
     pub async fn refresh_status(&self) {
+        if let Some(job) = &self.durable_job {
+            self.refresh_durable_status(job);
+            return;
+        }
         let mut child = self.child.lock().await;
+        let Some(child) = child.as_mut() else {
+            return;
+        };
         if let Ok(Some(status)) = child.try_wait() {
             self.record_exit_status(status);
+        }
+    }
+
+    fn refresh_durable_status(&self, job: &DurableJobHandle) {
+        let Ok(mut state) = job.read_state() else {
+            return;
+        };
+        let supervisor_lost = state
+            .supervisor_pid
+            .is_some_and(|pid| !crate::platform::platform().is_process_alive(pid));
+        let launcher_never_published_pid = state.status == "starting"
+            && state.supervisor_pid.is_none()
+            && chrono::DateTime::parse_from_rfc3339(&state.started_at)
+                .ok()
+                .and_then(|started| {
+                    Utc::now()
+                        .signed_duration_since(started.with_timezone(&Utc))
+                        .to_std()
+                        .ok()
+                })
+                .is_some_and(|elapsed| elapsed > Duration::from_secs(5));
+        if matches!(state.status.as_str(), "starting" | "running")
+            && (supervisor_lost || launcher_never_published_pid)
+        {
+            state.status = "interrupted".into();
+            state.termination_reason = if launcher_never_published_pid {
+                "launch_interrupted".into()
+            } else {
+                "supervisor_lost".into()
+            };
+            state.finished_at = Some(timestamp());
+            state.stdin_open = false;
+            let _ = write_json_atomic(&job.paths.state, &state);
+        }
+        let exited = !matches!(state.status.as_str(), "starting" | "running");
+        *self.exit_code.lock().expect("exit_code lock") = state.exit_code;
+        *self.stdin_open.lock().expect("stdin_open lock") = state.stdin_open;
+        *self.last_output_at.lock().expect("last output lock") = state.last_output_at.clone();
+        *self.termination_reason.lock().expect("termination lock") =
+            Some(state.termination_reason.clone());
+        *self.finished_at_iso.lock().expect("finished_at_iso lock") = state.finished_at.clone();
+        if exited && !self.exited.swap(true, Ordering::AcqRel) {
+            *self.finished_at.lock().expect("finished_at lock") = Some(Instant::now());
+            self.resource_lease
+                .lock()
+                .expect("resource lease lock")
+                .take();
+            self.touch();
         }
     }
 
@@ -1347,6 +2484,9 @@ impl ExecSession {
     }
 
     pub fn retained_stream_bytes(&self, stream: &str) -> (Vec<u8>, usize) {
+        if let Some(job) = &self.durable_job {
+            return job.retained_stream_bytes(stream);
+        }
         match stream {
             "stderr" => {
                 let buffer = self.stderr.lock().expect("stderr lock");
@@ -1360,6 +2500,9 @@ impl ExecSession {
     }
 
     pub fn snapshot(&self, max_output_bytes: usize) -> Value {
+        if let Some(job) = &self.durable_job {
+            self.refresh_durable_status(job);
+        }
         let stdout_bytes = self.stdout.lock().expect("stdout lock").data.clone();
         let stderr_bytes = self.stderr.lock().expect("stderr lock").data.clone();
         let stdout = truncate_tail(&stdout_bytes, max_output_bytes);
@@ -1391,20 +2534,54 @@ impl ExecSession {
             "timeout" => "timed_out",
             "killed" => "killed",
             "spawn_failed" => "spawn_failed",
-            "server_restart" => "interrupted",
+            "server_restart" | "supervisor_lost" | "launch_interrupted" => "interrupted",
             _ => "failed",
         };
         let retryable = matches!(
             reason,
-            "timeout" | "killed" | "spawn_failed" | "server_restart"
+            "timeout"
+                | "killed"
+                | "spawn_failed"
+                | "server_restart"
+                | "supervisor_lost"
+                | "launch_interrupted"
         );
-        let session_age_ms = self.started_at.elapsed().as_millis();
+        let session_age_ms = self
+            .durable_job
+            .as_ref()
+            .and_then(|_| chrono::DateTime::parse_from_rfc3339(&self.started_at_iso).ok())
+            .map(|started| {
+                Utc::now()
+                    .signed_duration_since(started.with_timezone(&Utc))
+                    .num_milliseconds()
+                    .max(0) as u128
+            })
+            .unwrap_or_else(|| self.started_at.elapsed().as_millis());
         let finished_at = *self.finished_at.lock().expect("finished_at lock");
-        let execution_duration_ms = finished_at
-            .map(|finished_at| finished_at.duration_since(self.started_at).as_millis())
-            .unwrap_or(session_age_ms);
-        let retained_ms = finished_at
-            .map(|finished_at| finished_at.elapsed().as_millis())
+        let durable_finished = self
+            .finished_at_iso
+            .lock()
+            .expect("finished_at_iso lock")
+            .clone()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok());
+        let durable_started = chrono::DateTime::parse_from_rfc3339(&self.started_at_iso).ok();
+        let execution_duration_ms = match (durable_started, durable_finished) {
+            (Some(started), Some(finished)) => finished
+                .signed_duration_since(started)
+                .num_milliseconds()
+                .max(0) as u128,
+            _ => finished_at
+                .map(|finished_at| finished_at.duration_since(self.started_at).as_millis())
+                .unwrap_or(session_age_ms),
+        };
+        let retained_ms = durable_finished
+            .map(|finished| {
+                Utc::now()
+                    .signed_duration_since(finished.with_timezone(&Utc))
+                    .num_milliseconds()
+                    .max(0) as u128
+            })
+            .or_else(|| finished_at.map(|finished_at| finished_at.elapsed().as_millis()))
             .unwrap_or(0);
         json!({
             "session_id": self.session_id,
@@ -1422,6 +2599,9 @@ impl ExecSession {
             "suggestion": match reason {
                 "timeout" => "读取保留输出，调整 timeout_ms 后重试",
                 "killed" => "确认终止原因后重新执行命令",
+                "supervisor_lost" | "launch_interrupted" => {
+                    "durable supervisor did not complete; start a new command rather than replaying this session"
+                }
                 "exited" => "检查 exit_code 和 stderr",
                 "crashed" => "检查 stderr 后重试或恢复工作区",
                 _ => "继续读取 session 或等待进程结束",
@@ -1448,6 +2628,8 @@ impl ExecSession {
                 "stderr": format!("session:{}:stderr", self.session_id)
             },
             "execution_resources": self.execution_resources
+            ,"process_bound": !self.is_durable()
+            ,"durable": self.is_durable()
         })
     }
 }
@@ -1574,26 +2756,47 @@ pub fn write_stdin(store: &CommandSessionStore, args: &Value) -> Result<Value, W
     }
 
     if !chars.is_empty() {
-        let mut stdin_guard = crate::async_runtime::block_on(session.stdin.lock());
-        let stdin = stdin_guard.as_mut().ok_or_else(|| WorkspaceError::Tool {
-            code: "SESSION_CLOSED",
-            message: "Session stdin is closed.".into(),
-            category: "runtime",
-            retryable: false,
-        })?;
-        use tokio::io::AsyncWriteExt;
-        crate::async_runtime::block_on(async {
-            stdin
-                .write_all(chars.as_bytes())
-                .await
-                .map_err(|_| WorkspaceError::Tool {
+        if let Some(job) = session.durable_job.as_ref() {
+            if !session
+                .snapshot(0)
+                .get("stdin_open")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(WorkspaceError::Tool {
                     code: "SESSION_CLOSED",
                     message: "Session stdin is closed.".into(),
                     category: "runtime",
                     retryable: false,
-                })
-        })?;
-        let _ = crate::async_runtime::block_on(stdin.flush());
+                });
+            }
+            job.enqueue_control(&DurableControl {
+                action: "stdin".into(),
+                chars: Some(chars.to_string()),
+                signal: None,
+            })?;
+        } else {
+            let mut stdin_guard = crate::async_runtime::block_on(session.stdin.lock());
+            let stdin = stdin_guard.as_mut().ok_or_else(|| WorkspaceError::Tool {
+                code: "SESSION_CLOSED",
+                message: "Session stdin is closed.".into(),
+                category: "runtime",
+                retryable: false,
+            })?;
+            use tokio::io::AsyncWriteExt;
+            crate::async_runtime::block_on(async {
+                stdin
+                    .write_all(chars.as_bytes())
+                    .await
+                    .map_err(|_| WorkspaceError::Tool {
+                        code: "SESSION_CLOSED",
+                        message: "Session stdin is closed.".into(),
+                        category: "runtime",
+                        retryable: false,
+                    })
+            })?;
+            let _ = crate::async_runtime::block_on(stdin.flush());
+        }
     }
 
     let yield_ms = args
@@ -1633,23 +2836,45 @@ pub fn kill_session(store: &CommandSessionStore, args: &Value) -> Result<Value, 
 
     if running {
         session.mark_termination_reason("killed");
-        crate::async_runtime::block_on(async {
-            let pid = {
-                let child = session.child.lock().await;
-                child.id()
-            };
-            if let Some(pid) = pid {
-                send_session_signal(pid, signal);
-            } else {
-                let mut child = session.child.lock().await;
-                let _ = child.start_kill();
-            }
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), async {
-                let mut child = session.child.lock().await;
-                let _ = child.wait().await;
-            })
-            .await;
-        });
+        if let Some(job) = session.durable_job.as_ref() {
+            let _ = job.enqueue_control(&DurableControl {
+                action: "signal".into(),
+                chars: None,
+                signal: Some(signal.to_string()),
+            });
+            crate::async_runtime::block_on(async {
+                let deadline = Instant::now() + Duration::from_millis(wait_ms);
+                while Instant::now() < deadline {
+                    session.refresh_status().await;
+                    if session.has_exited() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        } else {
+            crate::async_runtime::block_on(async {
+                let pid = {
+                    let child = session.child.lock().await;
+                    child.as_ref().and_then(|child| child.id())
+                };
+                if let Some(pid) = pid {
+                    send_session_signal(pid, signal);
+                } else {
+                    let mut child = session.child.lock().await;
+                    if let Some(child) = child.as_mut() {
+                        let _ = child.start_kill();
+                    }
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), async {
+                    let mut child = session.child.lock().await;
+                    if let Some(child) = child.as_mut() {
+                        let _ = child.wait().await;
+                    }
+                })
+                .await;
+            });
+        }
         crate::async_runtime::block_on(session.refresh_status());
         if crate::async_runtime::block_on(session.is_running()) {
             status = "terminating";

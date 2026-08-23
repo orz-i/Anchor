@@ -229,6 +229,12 @@ impl ToolContext {
         let root = workspace.root().to_path_buf();
         let command_cost = CommandCostGuard::new(&harness_root, &root);
         let resources = ExecutionResourceManager::new(&harness_root);
+        let harness = Harness::new(root.clone(), harness_root).expect("无法初始化 Harness");
+        let durable_command_root = harness
+            .store_root()
+            .join("workspaces")
+            .join(harness.workspace_id())
+            .join("command-jobs");
         let context = Self {
             workspace,
             auth,
@@ -237,7 +243,7 @@ impl ToolContext {
                 .expect("tool profile must be validated")
                 .into(),
             permission_mode,
-            harness: Harness::new(root.clone(), harness_root).expect("无法初始化 Harness"),
+            harness,
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
             ui_widget_domain: None,
@@ -250,7 +256,7 @@ impl ToolContext {
             session_cursor_scopes: Arc::new(Mutex::new(HashMap::new())),
             command_output_cursors: Arc::new(Mutex::new(HashMap::new())),
             workspace_mutation_locks: Arc::new(WorkspaceMutationLocks::default()),
-            sessions: Arc::new(CommandSessionStore::new()),
+            sessions: Arc::new(CommandSessionStore::with_durable_root(durable_command_root)),
             resources: Arc::new(resources),
             command_cost: Arc::new(command_cost),
             published_catalog: Arc::new(Mutex::new(None)),

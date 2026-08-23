@@ -229,6 +229,10 @@ impl ExecutionResourceManager {
         self.policy.to_value()
     }
 
+    pub fn max_running_commands(&self) -> usize {
+        self.policy.max_running_commands
+    }
+
     pub fn is_cpu_intensive(&self, program: &str, args: &[String]) -> bool {
         is_cpu_intensive_command(program, args)
     }

@@ -2782,6 +2782,7 @@ pub fn run() -> i32 {
         &parsed.command,
         Command::DaemonRun { .. }
             | Command::GatewayDaemonRun { .. }
+            | Command::ExecSupervisorRun { .. }
             | Command::Admin(AdminCommand::DaemonRun { .. })
             | Command::ServiceRun { .. }
             | Command::ServiceAdminRun { .. }
@@ -2878,6 +2879,11 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         } => run_gateway_daemon(&config_scope, &workspaces)
             .await
             .map(|_| 0),
+        Command::ExecSupervisorRun { spec } => {
+            crate::tools::command_session::run_durable_command_supervisor(spec)
+                .await
+                .map_err(AppError::Message)
+        }
         Command::DaemonRun {
             workspace,
             service,

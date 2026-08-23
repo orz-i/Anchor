@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::tools::workspace::{
     relative_display, tool_ok, Workspace, WorkspaceError, DEFAULT_EXCLUDED_NAMES,
@@ -21,6 +24,11 @@ const DEFAULT_SEARCH_MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SEARCH_MAX_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_SCAN_TIMEOUT_MS: u64 = 30_000;
 const MAX_SCAN_TIMEOUT_MS: u64 = 120_000;
+const MAX_REPLACE_FILES: usize = 64;
+const DEFAULT_REPLACE_MAX_MATCHES: usize = 10_000;
+const MAX_REPLACE_MATCHES: usize = 100_000;
+const DEFAULT_REPLACE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REPLACE_BYTES: usize = 256 * 1024 * 1024;
 
 static REPOSITORY_SCAN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -32,10 +40,499 @@ struct ReadRequest {
     start_byte: usize,
 }
 
+fn decode_preserving_encoding(
+    data: &[u8],
+) -> Result<(String, PreservedTextEncoding), WorkspaceError> {
+    if let Some(payload) = data.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(payload.to_vec())
+            .map(|text| (text, PreservedTextEncoding::Utf8Bom))
+            .map_err(|_| unsupported_encoding());
+    }
+    if let Some(payload) = data.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(payload, true).map(|text| (text, PreservedTextEncoding::Utf16Le));
+    }
+    if let Some(payload) = data.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(payload, false).map(|text| (text, PreservedTextEncoding::Utf16Be));
+    }
+    if data.iter().take(4096).any(|byte| *byte == 0) {
+        return Err(WorkspaceError::Tool {
+            code: "BINARY_FILE",
+            message: "Binary file replacement is not supported.".into(),
+            category: "validation",
+            retryable: false,
+        });
+    }
+    String::from_utf8(data.to_vec())
+        .map(|text| (text, PreservedTextEncoding::Utf8))
+        .map_err(|_| unsupported_encoding())
+}
+
+fn encode_preserving_encoding(text: &str, encoding: PreservedTextEncoding) -> Vec<u8> {
+    match encoding {
+        PreservedTextEncoding::Utf8 => text.as_bytes().to_vec(),
+        PreservedTextEncoding::Utf8Bom => {
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice(text.as_bytes());
+            bytes
+        }
+        PreservedTextEncoding::Utf16Le | PreservedTextEncoding::Utf16Be => {
+            let mut bytes = if matches!(encoding, PreservedTextEncoding::Utf16Le) {
+                vec![0xFF, 0xFE]
+            } else {
+                vec![0xFE, 0xFF]
+            };
+            for unit in text.encode_utf16() {
+                let pair = if matches!(encoding, PreservedTextEncoding::Utf16Le) {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&pair);
+            }
+            bytes
+        }
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+fn replacement_temp_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".{}.replace-stage-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file"),
+        Uuid::new_v4().simple()
+    ))
+}
+
+fn cleanup_replacement_temps(prepared: &[PreparedReplacement]) {
+    for item in prepared {
+        let _ = fs::remove_file(&item.temp_path);
+    }
+}
+
+fn replace_staged_file(temp: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    fs::rename(temp, path)
+}
+
+fn restore_replacement_backups(prepared: &[PreparedReplacement], through_index: usize) {
+    for item in prepared.iter().take(through_index.saturating_add(1)) {
+        let restore = replacement_temp_path(&item.path);
+        if fs::write(&restore, &item.original).is_ok() {
+            let _ = replace_staged_file(&restore, &item.path);
+            let _ = fs::set_permissions(&item.path, item.permissions.clone());
+        }
+        let _ = fs::remove_file(&restore);
+    }
+}
+
+fn parse_replace_files(args: &Value) -> Result<Vec<ReplaceFileRequest>, WorkspaceError> {
+    let files = args
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorkspaceError::invalid_argument("files is required"))?;
+    if files.is_empty() || files.len() > MAX_REPLACE_FILES {
+        return Err(WorkspaceError::invalid_argument(format!(
+            "files must contain between 1 and {MAX_REPLACE_FILES} entries"
+        )));
+    }
+    files
+        .iter()
+        .map(|item| {
+            let path = item
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| WorkspaceError::invalid_argument("files[].path is required"))?;
+            let expected_sha256 = item
+                .get("expected_sha256")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase);
+            if expected_sha256.as_ref().is_some_and(|hash| {
+                hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(WorkspaceError::invalid_argument(
+                    "files[].expected_sha256 must be a 64-character hexadecimal SHA-256 digest",
+                ));
+            }
+            let expected_matches = item
+                .get("expected_matches")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            Ok(ReplaceFileRequest {
+                path: path.to_string(),
+                expected_sha256,
+                expected_matches,
+            })
+        })
+        .collect()
+}
+
+pub fn replace_text(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+) -> Result<Value, WorkspaceError> {
+    replace_text_with_pre_commit_hook(ws, args, cancellation, || {})
+}
+
+fn replace_text_with_pre_commit_hook<F>(
+    ws: &Workspace,
+    args: &Value,
+    cancellation: &CancellationToken,
+    pre_commit_hook: F,
+) -> Result<Value, WorkspaceError>
+where
+    F: FnOnce(),
+{
+    ensure_not_cancelled(cancellation)?;
+    let find = args
+        .get("find")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| WorkspaceError::invalid_argument("find must be a non-empty string"))?;
+    let replace = args
+        .get("replace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkspaceError::invalid_argument("replace is required"))?;
+    if find == replace {
+        return Err(WorkspaceError::invalid_argument(
+            "find and replace must differ",
+        ));
+    }
+    let dry_run = args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_matches = args
+        .get("max_matches")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_REPLACE_MAX_MATCHES as u64)
+        .clamp(1, MAX_REPLACE_MATCHES as u64) as usize;
+    let max_total_bytes = args
+        .get("max_total_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_REPLACE_MAX_BYTES as u64)
+        .clamp(1, MAX_REPLACE_BYTES as u64) as usize;
+    let requests = parse_replace_files(args)?;
+
+    let mut prepared = Vec::with_capacity(requests.len());
+    let mut file_results = Vec::with_capacity(requests.len());
+    let mut seen_paths = HashSet::new();
+    let mut total_matches = 0usize;
+    let mut total_bytes = 0usize;
+    for request in &requests {
+        ensure_not_cancelled(cancellation)?;
+        ws.reject_unsafe_text(&request.path)?;
+        ws.reject_git_metadata_write_path(&request.path)?;
+        ws.reject_write_symlink(&request.path)?;
+        let resolved = ws.resolve_existing(&request.path)?;
+        if !seen_paths.insert(resolved.path.clone()) {
+            return Err(WorkspaceError::invalid_argument(format!(
+                "Duplicate replacement target resolves to the same file: {}",
+                resolved.display
+            )));
+        }
+        if !resolved.path.is_file() {
+            return Err(WorkspaceError::Tool {
+                code: "NOT_A_FILE",
+                message: format!(
+                    "Replacement target is not a regular file: {}",
+                    resolved.display
+                ),
+                category: "validation",
+                retryable: false,
+            });
+        }
+        let original = fs::read(&resolved.path).map_err(|error| WorkspaceError::ToolDetails {
+            code: "REPLACE_READ_FAILED",
+            message: format!("Failed to read {}: {error}", resolved.display),
+            category: "runtime",
+            retryable: true,
+            details: json!({"path": resolved.display, "workspace_modified": false}),
+        })?;
+        total_bytes = total_bytes.saturating_add(original.len());
+        if total_bytes > max_total_bytes {
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_BYTE_BUDGET_EXCEEDED",
+                message: "Replacement input exceeds max_total_bytes.".into(),
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "bytes_read": total_bytes,
+                    "max_total_bytes": max_total_bytes,
+                    "workspace_modified": false,
+                    "suggestion": "Split the replacement into a smaller explicit file batch."
+                }),
+            });
+        }
+        let before_sha256 = sha256_hex(&original);
+        if request
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &before_sha256)
+        {
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_PRECONDITION_FAILED",
+                message: format!("SHA-256 precondition failed for {}.", resolved.display),
+                category: "conflict",
+                retryable: true,
+                details: json!({
+                    "path": resolved.display,
+                    "expected_sha256": request.expected_sha256,
+                    "actual_sha256": before_sha256,
+                    "workspace_modified": false
+                }),
+            });
+        }
+        let (text, encoding) = decode_preserving_encoding(&original)?;
+        let match_count = text.match_indices(find).count();
+        if request
+            .expected_matches
+            .is_some_and(|expected| expected != match_count)
+        {
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_PRECONDITION_FAILED",
+                message: format!("Match-count precondition failed for {}.", resolved.display),
+                category: "conflict",
+                retryable: true,
+                details: json!({
+                    "path": resolved.display,
+                    "expected_matches": request.expected_matches,
+                    "actual_matches": match_count,
+                    "workspace_modified": false
+                }),
+            });
+        }
+        total_matches = total_matches.saturating_add(match_count);
+        if total_matches > max_matches {
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_MATCH_BUDGET_EXCEEDED",
+                message: "Replacement match count exceeds max_matches.".into(),
+                category: "validation",
+                retryable: true,
+                details: json!({
+                    "matches": total_matches,
+                    "max_matches": max_matches,
+                    "workspace_modified": false,
+                    "suggestion": "Narrow the explicit file batch or raise max_matches within the bounded limit."
+                }),
+            });
+        }
+        let updated_text = text.replace(find, replace);
+        let updated = encode_preserving_encoding(&updated_text, encoding);
+        let after_sha256 = sha256_hex(&updated);
+        file_results.push(json!({
+            "path": resolved.display,
+            "matches": match_count,
+            "encoding": encoding.label(),
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_before": original.len(),
+            "bytes_after": updated.len()
+        }));
+        if match_count == 0 {
+            continue;
+        }
+        let permissions = fs::metadata(&resolved.path)
+            .map_err(|error| WorkspaceError::ToolDetails {
+                code: "REPLACE_METADATA_FAILED",
+                message: format!("Failed to read metadata for {}: {error}", resolved.display),
+                category: "runtime",
+                retryable: true,
+                details: json!({"path": resolved.display, "workspace_modified": false}),
+            })?
+            .permissions();
+        prepared.push(PreparedReplacement {
+            display: resolved.display,
+            temp_path: replacement_temp_path(&resolved.path),
+            path: resolved.path,
+            original,
+            updated,
+            permissions,
+            match_count,
+            before_sha256,
+        });
+    }
+
+    if total_matches == 0 {
+        return Err(WorkspaceError::Tool {
+            code: "REPLACE_NO_MATCH",
+            message: "No literal matches were found in the explicit replacement targets.".into(),
+            category: "validation",
+            retryable: false,
+        });
+    }
+
+    if dry_run {
+        return Ok(tool_ok(json!({
+            "dry_run": true,
+            "mode": "literal",
+            "files": file_results,
+            "files_modified": prepared.iter().filter(|item| item.match_count > 0).map(|item| item.display.clone()).collect::<Vec<_>>(),
+            "total_matches": total_matches,
+            "bytes_processed": total_bytes,
+            "transaction": {
+                "committed": false,
+                "atomic": true,
+                "cas_verified": false
+            },
+            "warnings": []
+        })));
+    }
+
+    for item in &prepared {
+        ensure_not_cancelled(cancellation)?;
+        if let Err(error) = fs::write(&item.temp_path, &item.updated) {
+            cleanup_replacement_temps(&prepared);
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_STAGE_FAILED",
+                message: format!("Failed to stage {}: {error}", item.display),
+                category: "runtime",
+                retryable: true,
+                details: json!({"path": item.display, "workspace_modified": false}),
+            });
+        }
+        if let Err(error) = fs::set_permissions(&item.temp_path, item.permissions.clone()) {
+            cleanup_replacement_temps(&prepared);
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_STAGE_FAILED",
+                message: format!(
+                    "Failed to preserve permissions for {}: {error}",
+                    item.display
+                ),
+                category: "runtime",
+                retryable: true,
+                details: json!({"path": item.display, "workspace_modified": false}),
+            });
+        }
+    }
+
+    pre_commit_hook();
+
+    // Freeze the complete candidate set immediately before the first commit.
+    // Any external or parallel modification makes the whole batch fail closed.
+    for item in &prepared {
+        ensure_not_cancelled(cancellation)?;
+        ws.reject_write_symlink(&item.display)?;
+        let current = fs::read(&item.path).map_err(|error| WorkspaceError::ToolDetails {
+            code: "CONCURRENT_FILE_CHANGE",
+            message: format!(
+                "Replacement target changed before commit: {} ({error})",
+                item.display
+            ),
+            category: "conflict",
+            retryable: true,
+            details: json!({"path": item.display, "workspace_modified": false}),
+        })?;
+        if current != item.original {
+            cleanup_replacement_temps(&prepared);
+            return Err(WorkspaceError::ToolDetails {
+                code: "CONCURRENT_FILE_CHANGE",
+                message: format!("Replacement target changed before commit: {}", item.display),
+                category: "conflict",
+                retryable: true,
+                details: json!({
+                    "path": item.display,
+                    "expected_sha256": item.before_sha256,
+                    "actual_sha256": sha256_hex(&current),
+                    "workspace_modified": false,
+                    "suggestion": "Read or search the target again and retry with the new expected_sha256."
+                }),
+            });
+        }
+    }
+
+    for (index, item) in prepared.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        if let Err(error) = replace_staged_file(&item.temp_path, &item.path)
+            .and_then(|_| fs::set_permissions(&item.path, item.permissions.clone()))
+        {
+            restore_replacement_backups(&prepared, index);
+            cleanup_replacement_temps(&prepared);
+            return Err(WorkspaceError::ToolDetails {
+                code: "REPLACE_COMMIT_FAILED",
+                message: format!("Failed to commit {}: {error}", item.display),
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "path": item.display,
+                    "workspace_modified": false,
+                    "rollback_attempted": true
+                }),
+            });
+        }
+    }
+    cleanup_replacement_temps(&prepared);
+
+    Ok(tool_ok(json!({
+        "dry_run": false,
+        "mode": "literal",
+        "change_id": Uuid::new_v4().simple().to_string(),
+        "files": file_results,
+        "files_modified": prepared.iter().filter(|item| item.match_count > 0).map(|item| item.display.clone()).collect::<Vec<_>>(),
+        "total_matches": total_matches,
+        "bytes_processed": total_bytes,
+        "transaction": {
+            "committed": true,
+            "atomic": true,
+            "cas_verified": true
+        },
+        "recovery": "git",
+        "warnings": []
+    })))
+}
+
 #[derive(Default)]
 struct RepositoryScan {
     files: Vec<PathBuf>,
     skipped_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReplaceFileRequest {
+    path: String,
+    expected_sha256: Option<String>,
+    expected_matches: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreservedTextEncoding {
+    Utf8,
+    Utf8Bom,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl PreservedTextEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Utf8Bom => "utf-8-bom",
+            Self::Utf16Le => "utf-16le",
+            Self::Utf16Be => "utf-16be",
+        }
+    }
+}
+
+struct PreparedReplacement {
+    display: String,
+    path: PathBuf,
+    original: Vec<u8>,
+    updated: Vec<u8>,
+    permissions: fs::Permissions,
+    match_count: usize,
+    before_sha256: String,
+    temp_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -1203,6 +1700,166 @@ mod tests {
         .expect("subdirectory scan");
         assert_eq!(listed["total_files"], 1);
         assert_eq!(listed["files"][0]["path"], "sub/kept.txt");
+    }
+
+    #[test]
+    fn replace_text_dry_run_and_commit_preserve_bom_crlf_and_hash_preconditions() {
+        let root = tempdir().expect("workspace");
+        let path = root.path().join("script.txt");
+        let mut original = vec![0xEF, 0xBB, 0xBF];
+        original.extend_from_slice(b"old\r\nold\r\n");
+        std::fs::write(&path, &original).expect("fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("permissions");
+        }
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+
+        let dry = replace_text(
+            &workspace,
+            &json!({
+                "files": [{"path": "script.txt", "expected_matches": 2}],
+                "find": "old",
+                "replace": "new",
+                "dry_run": true
+            }),
+            &cancellation,
+        )
+        .expect("dry run");
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["total_matches"], 2);
+        assert_eq!(dry["files"][0]["encoding"], "utf-8-bom");
+        assert_eq!(std::fs::read(&path).expect("unchanged"), original);
+
+        let expected_sha256 = dry["files"][0]["before_sha256"]
+            .as_str()
+            .expect("sha")
+            .to_string();
+        let committed = replace_text(
+            &workspace,
+            &json!({
+                "files": [{
+                    "path": "script.txt",
+                    "expected_matches": 2,
+                    "expected_sha256": expected_sha256
+                }],
+                "find": "old",
+                "replace": "new"
+            }),
+            &cancellation,
+        )
+        .expect("commit");
+        assert_eq!(committed["transaction"]["committed"], true);
+        assert_eq!(committed["transaction"]["cas_verified"], true);
+        let updated = std::fs::read(&path).expect("updated");
+        assert_eq!(&updated[..3], &[0xEF, 0xBB, 0xBF]);
+        assert_eq!(&updated[3..], b"new\r\nnew\r\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+    }
+
+    #[test]
+    fn replace_text_rejects_duplicate_targets_and_stale_preconditions() {
+        let root = tempdir().expect("workspace");
+        std::fs::write(root.path().join("a.txt"), "old\n").expect("fixture");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+
+        let duplicate = replace_text(
+            &workspace,
+            &json!({
+                "files": [{"path": "a.txt"}, {"path": "./a.txt"}],
+                "find": "old",
+                "replace": "new"
+            }),
+            &cancellation,
+        )
+        .expect_err("duplicate target");
+        assert!(matches!(
+            duplicate,
+            WorkspaceError::Tool {
+                code: "INVALID_ARGUMENT",
+                ..
+            }
+        ));
+
+        let stale = replace_text(
+            &workspace,
+            &json!({
+                "files": [{"path": "a.txt", "expected_sha256": "00".repeat(32)}],
+                "find": "old",
+                "replace": "new"
+            }),
+            &cancellation,
+        )
+        .expect_err("stale sha");
+        assert!(matches!(
+            stale,
+            WorkspaceError::ToolDetails {
+                code: "REPLACE_PRECONDITION_FAILED",
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn replace_text_detects_concurrent_change_before_any_commit() {
+        let root = tempdir().expect("workspace");
+        let a = root.path().join("a.txt");
+        let b = root.path().join("b.txt");
+        std::fs::write(&a, "old a\n").expect("a");
+        std::fs::write(&b, "old b\n").expect("b");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let cancellation = CancellationToken::default();
+        let external_b = b.clone();
+
+        let error = replace_text_with_pre_commit_hook(
+            &workspace,
+            &json!({
+                "files": [{"path": "a.txt"}, {"path": "b.txt"}],
+                "find": "old",
+                "replace": "new"
+            }),
+            &cancellation,
+            move || {
+                std::fs::write(&external_b, "external b\n").expect("external mutation");
+            },
+        )
+        .expect_err("CAS conflict");
+        assert!(matches!(
+            error,
+            WorkspaceError::ToolDetails {
+                code: "CONCURRENT_FILE_CHANGE",
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "old a\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "external b\n");
+        assert!(std::fs::read_dir(root.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .contains("replace-stage")));
     }
 
     #[test]

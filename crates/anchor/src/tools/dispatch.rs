@@ -67,6 +67,7 @@ fn task_recovery_trackable(tool: &str) -> bool {
     matches!(
         tool,
         "apply_patch"
+            | "replace_text"
             | "exec_command"
             | "wait_command"
             | "write_stdin"
@@ -541,8 +542,8 @@ fn policy_alternatives(message: &str) -> Vec<Value> {
 
 fn advances_expected_state(name: &str, output: &Value) -> bool {
     match name {
-        "apply_patch" | "git_stage" | "git_commit" | "git_restore" | "git_reset" | "git_revert"
-        | "git_clean" | "remove_path" => true,
+        "apply_patch" | "replace_text" | "git_stage" | "git_commit" | "git_restore"
+        | "git_reset" | "git_revert" | "git_clean" | "remove_path" => true,
         "exec_command" => command_output_is_terminal(output),
         _ => false,
     }
@@ -1394,6 +1395,7 @@ fn call_tool_impl(
             "list_dir" => file::list_dir(ws, &effective_args, cancellation),
             "list_files" => file::list_files(ws, &effective_args, cancellation),
             "search_text" => file::search_text(ws, &effective_args, cancellation),
+            "replace_text" => file::replace_text(ws, &effective_args, cancellation),
             "patch_check" => {
                 patch::patch_check_with_cancellation(ctx, &effective_args, cancellation)
             }
@@ -1890,7 +1892,7 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
         "exec_command" | "stage_commit" | "wait_stage_commit" | "remove_path" | "git_stage"
         | "git_commit" | "git_restore" | "git_reset" | "git_revert" | "git_clean" | "git_merge"
         | "git_branch_create" | "git_branch_delete" | "git_switch" => true,
-        "apply_patch" => !args
+        "apply_patch" | "replace_text" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false),
@@ -1928,6 +1930,7 @@ fn standalone_operation(name: &str) -> bool {
         name,
         "patch_check"
             | "apply_patch"
+            | "replace_text"
             | "remove_path"
             | "exec_command"
             | "git_stage"
@@ -2087,6 +2090,14 @@ fn server_info_for_session(
         .iter()
         .filter(|session| session.get("execution_status") == Some(&json!("running")))
         .count();
+    let durable_command_sessions = command_sessions
+        .iter()
+        .filter(|session| session.get("durable") == Some(&Value::Bool(true)))
+        .count();
+    let process_bound_command_sessions = command_sessions
+        .iter()
+        .filter(|session| session.get("process_bound") == Some(&Value::Bool(true)))
+        .count();
     let downstream_mcp = ctx.mcp_proxies.status();
     let command_cost_policy = json!({
         "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
@@ -2131,7 +2142,10 @@ fn server_info_for_session(
             "status": "available",
             "retained_session_count": command_sessions.len(),
             "running_session_count": running_command_sessions,
-            "sessions_process_bound": true
+            "durable_session_count": durable_command_sessions,
+            "process_bound_session_count": process_bound_command_sessions,
+            "durable_supervisor_available": ctx.sessions.durable_enabled(),
+            "sessions_process_bound": process_bound_command_sessions > 0
         },
         "downstream_mcp": downstream_mcp.clone()
     });

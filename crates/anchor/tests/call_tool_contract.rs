@@ -75,6 +75,56 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn replace_text_routes_through_public_contract_and_honors_preconditions() {
+    let fx = tiny_js_fixture();
+    let target = fx.root.join("replace.txt");
+    fs::write(&target, "old value\nold value\n").expect("fixture");
+    let ctx = ctx_for(&fx.root);
+
+    let dry = invoke(
+        &ctx,
+        "replace_text",
+        json!({
+            "files": [{"path": "replace.txt", "expected_matches": 2}],
+            "find": "old",
+            "replace": "new",
+            "dry_run": true
+        }),
+    );
+    let dry = assert_ok(&dry);
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["total_matches"], 2);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "old value\nold value\n"
+    );
+
+    let sha = dry["files"][0]["before_sha256"]
+        .as_str()
+        .expect("sha")
+        .to_string();
+    let committed = invoke(
+        &ctx,
+        "replace_text",
+        json!({
+            "files": [{
+                "path": "replace.txt",
+                "expected_matches": 2,
+                "expected_sha256": sha
+            }],
+            "find": "old",
+            "replace": "new"
+        }),
+    );
+    let committed = assert_ok(&committed);
+    assert_eq!(committed["transaction"]["cas_verified"], true);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "new value\nnew value\n"
+    );
+}
+
+#[test]
 fn task_status_surfaces_running_command_heartbeat() {
     let fx = tiny_js_fixture();
     let mut ctx = ctx_for(&fx.root);
@@ -545,11 +595,11 @@ fn git_facade_describes_and_reports_operation_specific_arguments() {
         .expect("git facade");
     assert_eq!(
         git["inputSchema"]["properties"]["include_ignored"]["description"],
-        "Valid only for git operation(s): clean."
+        "Only for: clean"
     );
     assert!(git["inputSchema"]["properties"]["operation"]["description"]
         .as_str()
-        .is_some_and(|description| description.contains("Do not send arguments")));
+        .is_some_and(|description| description.contains("Required:")));
 
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
@@ -1297,7 +1347,7 @@ fn core_profile_keeps_default_capabilities_and_exposes_one_session_facade() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 24);
+    assert_eq!(names.len(), 25);
     assert!(names.contains("git"));
     assert!(names.contains("task"));
     assert!(names.contains("skill"));
@@ -1465,10 +1515,13 @@ fn wait_command_returns_terminal_state_and_incremental_output() {
             ),
             "filesystem_scope": "workspace",
             "timeout_ms": 5_000,
-            "yield_time_ms": 0
+            "yield_time_ms": 0,
+            "durable": true
         }),
     );
     let payload = assert_ok(&result);
+    assert_eq!(payload["durable"], true, "{payload}");
+    assert_eq!(payload["process_bound"], false, "{payload}");
     let session_id = payload["session_id"].as_str().expect("session id");
 
     let waited = invoke(
@@ -1497,6 +1550,179 @@ fn wait_command_returns_terminal_state_and_incremental_output() {
     let stdout = waited["stdout"]["content"].as_str().expect("stdout");
     assert!(stdout.contains("started"));
     assert!(stdout.contains("finished"));
+}
+
+#[test]
+fn durable_wait_recovers_after_tool_context_reconstruction() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-u",
+                "-c",
+                "import time; print('before-reconnect', flush=True); time.sleep(0.35); print('after-reconnect', flush=True)"
+            ],
+            "filesystem_scope": "workspace",
+            "timeout_ms": 5_000,
+            "yield_time_ms": 0,
+            "durable": true
+        }),
+    );
+    let payload = assert_ok(&result);
+    assert_eq!(payload["durable"], true, "{payload}");
+    assert_eq!(payload["process_bound"], false, "{payload}");
+    let session_id = payload["session_id"]
+        .as_str()
+        .expect("durable session id")
+        .to_string();
+
+    drop(ctx);
+    let recovered_ctx = ctx_for(&fx.root);
+    let sessions = invoke(
+        &recovered_ctx,
+        "list_command_sessions",
+        json!({"include_terminal": true, "max_output_bytes": 0}),
+    );
+    let sessions = assert_ok(&sessions);
+    assert!(sessions["sessions"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["session_id"] == session_id)));
+
+    let waited = invoke(
+        &recovered_ctx,
+        "wait_command",
+        json!({
+            "session_id": session_id,
+            "timeout_ms": 3_000,
+            "stdout_offset": 0,
+            "stderr_offset": 0,
+            "return_incremental_output": true
+        }),
+    );
+    let waited = assert_ok(&waited);
+    assert_eq!(waited["state"], "completed", "{waited}");
+    assert_eq!(waited["durable"], true, "{waited}");
+    let stdout = waited["stdout"]["content"].as_str().expect("stdout");
+    assert!(stdout.contains("before-reconnect"), "{waited}");
+    assert!(stdout.contains("after-reconnect"), "{waited}");
+}
+
+#[test]
+fn durable_kill_works_after_tool_context_reconstruction() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-u", "-c", "import time; print('durable-running', flush=True); time.sleep(10)"],
+            "filesystem_scope": "workspace",
+            "timeout_ms": 15_000,
+            "yield_time_ms": 0,
+            "durable": true
+        }),
+    );
+    let started = assert_ok(&started);
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("durable session id")
+        .to_string();
+    drop(ctx);
+
+    let recovered_ctx = ctx_for(&fx.root);
+    let killed = invoke(
+        &recovered_ctx,
+        "kill_session",
+        json!({
+            "session_id": session_id,
+            "signal": "KILL",
+            "wait_ms": 3_000,
+            "max_output_bytes": 4096
+        }),
+    );
+    let killed = assert_err(&killed);
+    assert_eq!(killed["killed"], true, "{killed}");
+    assert_eq!(killed["status"], "killed", "{killed}");
+    assert_eq!(killed["durable"], true, "{killed}");
+    assert_eq!(killed["process_bound"], false, "{killed}");
+    assert_eq!(killed["error"]["code"], "COMMAND_KILLED", "{killed}");
+}
+
+#[test]
+fn durable_verification_finalizes_once_after_context_reconstruction() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let task = ctx
+        .harness
+        .start_task("durable verification finalization")
+        .expect("start task");
+    let started = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-u",
+                "-c",
+                "import time; print('durable-verification', flush=True); time.sleep(0.2)"
+            ],
+            "filesystem_scope": "workspace",
+            "timeout_ms": 5_000,
+            "yield_time_ms": 0,
+            "durable": true,
+            "verification_kind": "test",
+            "verification_key": "durable-reconnect-verification",
+            "verification_level": "required"
+        }),
+    );
+    let started = assert_ok(&started);
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("durable session id")
+        .to_string();
+    drop(ctx);
+
+    let recovered_ctx = ctx_for(&fx.root);
+    let waited = invoke(
+        &recovered_ctx,
+        "wait_command",
+        json!({"session_id": session_id, "timeout_ms": 3_000}),
+    );
+    let waited = assert_ok(&waited);
+    assert_eq!(waited["execution_status"], "succeeded", "{waited}");
+    assert!(waited["verification_id"].as_str().is_some(), "{waited}");
+
+    let records = recovered_ctx
+        .harness
+        .list_verifications(&task.id)
+        .expect("durable verification records");
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0].verification_key.as_deref(),
+        Some("durable-reconnect-verification")
+    );
+    assert!(records[0].passed);
+
+    let waited_again = invoke(
+        &recovered_ctx,
+        "wait_command",
+        json!({"session_id": session_id, "timeout_ms": 0}),
+    );
+    assert_ok(&waited_again);
+    let records_after = recovered_ctx
+        .harness
+        .list_verifications(&task.id)
+        .expect("verification records after second wait");
+    assert_eq!(
+        records_after.len(),
+        1,
+        "repeated wait must not duplicate verification"
+    );
 }
 
 #[test]

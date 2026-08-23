@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use common::*;
 use serde_json::json;
@@ -13,6 +14,24 @@ const TRAVERSAL_PATCH: &str = r#"*** Begin Patch
 +unsafe
 *** End Patch
 "#;
+
+#[test]
+fn internal_exec_supervisor_rejects_specs_outside_harness_store() {
+    let temp = tempfile::tempdir().expect("outside supervisor spec");
+    let spec = temp.path().join("spec.json");
+    fs::write(&spec, b"{}").expect("write fake spec");
+    let output = Command::new(env!("CARGO_BIN_EXE_anchor"))
+        .arg("exec-supervisor-run")
+        .arg(&spec)
+        .output()
+        .expect("invoke hidden supervisor");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("outside the configured Harness store"),
+        "stderr={stderr}"
+    );
+}
 
 #[test]
 fn read_file_rejects_symlink_escape() {

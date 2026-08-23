@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 42,
+    "catalog_version": 43,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -21,6 +21,7 @@
       "read_file",
       "read_output",
       "remove_path",
+      "replace_text",
       "search_text",
       "server_info",
       "session",
@@ -31,10 +32,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 28
+    "tool_count": 29
   },
   "core": {
-    "catalog_version": 42,
+    "catalog_version": 43,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -52,6 +53,7 @@
       "read_file",
       "read_output",
       "remove_path",
+      "replace_text",
       "search_text",
       "server_info",
       "session",
@@ -61,10 +63,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 24
+    "tool_count": 25
   },
   "read-only": {
-    "catalog_version": 42,
+    "catalog_version": 43,
     "names": [
       "browser_build_info",
       "cwd",

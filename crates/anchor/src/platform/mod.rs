@@ -63,8 +63,9 @@ mod open;
 mod paths;
 
 pub(crate) use child_process::{
-    configure_exec_tokio_process, configure_supervised_tokio_process, hide_std_console,
-    hide_tokio_console, lower_exec_child_priority,
+    configure_durable_supervisor_tokio_process, configure_exec_tokio_process,
+    configure_supervised_tokio_process, hide_std_console, hide_tokio_console,
+    lower_exec_child_priority,
 };
 pub use open::open_path_in_file_manager;
 

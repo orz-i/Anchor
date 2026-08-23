@@ -74,6 +74,41 @@ pub struct PolicySettings {
     pub external_paid_max_duration_seconds: u64,
 }
 
+fn safe_regex_pattern_literal(source: &str, start: usize) -> bool {
+    let mut before = source[..start].trim_end().to_ascii_lowercase();
+    // Python string prefixes occur immediately before the quote. Strip only a
+    // bounded prefix sequence, then require a known regex-pattern call site.
+    for _ in 0..3 {
+        if before
+            .chars()
+            .last()
+            .is_some_and(|ch| matches!(ch, 'r' | 'b' | 'u' | 'f'))
+        {
+            before.pop();
+        } else {
+            break;
+        }
+    }
+    [
+        "re.compile(",
+        "re.search(",
+        "re.match(",
+        "re.fullmatch(",
+        "re.findall(",
+        "re.finditer(",
+        "re.split(",
+        "re.sub(",
+        "re.subn(",
+        "regex.compile(",
+        "regex.search(",
+        "regex.match(",
+        "regexp(",
+        "new regexp(",
+    ]
+    .iter()
+    .any(|call| before.ends_with(call))
+}
+
 impl Default for PolicySettings {
     fn default() -> Self {
         Self {
@@ -924,6 +959,7 @@ fn inline_source_contains_external_path(source: &str) -> bool {
         outside[start..end].fill(b' ');
         let literal = &source[content_start..content_end];
         if !safe_separator_literal(source, start, end, literal)
+            && !safe_regex_pattern_literal(source, start)
             && text_contains_external_path(literal)
             && !safe_diagnostic_path_literal(source, start, end)
         {
@@ -1358,6 +1394,52 @@ mod tests {
             Some(&workspace),
         )
         .expect_err("actual external path access must remain blocked");
+        assert!(error.0.contains("WORKSPACE_PATH_PROTECTED"), "{error}");
+    }
+
+    #[test]
+    fn strict_workspace_allows_regex_escape_literals_but_not_external_file_access() {
+        let dir = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(dir.path().join("src/tools")).expect("tree");
+        std::fs::write(dir.path().join("src/tools/registry.rs"), "( alpha )\n").expect("fixture");
+        let workspace = Workspace::new(dir.path().to_path_buf())
+            .expect("workspace")
+            .with_strict_read_boundary(true);
+        let policy = PolicySettings::default();
+        let source = "import re; from pathlib import Path; text=Path('src/tools/registry.rs').read_text(); print(re.findall(r'\\(\\s*([a-z]+)', text))";
+        let command =
+            join_command_tokens(&["python3".to_string(), "-c".to_string(), source.to_string()]);
+        validate_command_for_workspace(
+            &json!({
+                "cmd": command,
+                "executable": "python3",
+                "args": ["-c", source],
+                "shell": "direct",
+                "filesystem_scope": "workspace"
+            }),
+            &policy,
+            Some(&workspace),
+        )
+        .expect("regex escape syntax must remain data, not become an absolute path");
+
+        let external = "import re; print(open('/tmp/secret').read()); print(re.search(r'\\/tmp\\/secret', 'x'))";
+        let command = join_command_tokens(&[
+            "python3".to_string(),
+            "-c".to_string(),
+            external.to_string(),
+        ]);
+        let error = validate_command_for_workspace(
+            &json!({
+                "cmd": command,
+                "executable": "python3",
+                "args": ["-c", external],
+                "shell": "direct",
+                "filesystem_scope": "workspace"
+            }),
+            &policy,
+            Some(&workspace),
+        )
+        .expect_err("regex data must not mask a separate real external file access");
         assert!(error.0.contains("WORKSPACE_PATH_PROTECTED"), "{error}");
     }
 
