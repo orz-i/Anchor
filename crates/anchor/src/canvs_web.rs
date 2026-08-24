@@ -148,14 +148,19 @@ fn task_card(task: &CanvsTask) -> String {
         "other"
     };
 
-    let worktree_flag = if task.workspace_mode == "worktree" { "true" } else { "false" };
+    let worktree_flag = if task.workspace_mode == "worktree" {
+        "true"
+    } else {
+        "false"
+    };
     let search_content = format!(
         "{} {} {} {}",
         task.objective,
         task.id,
         task.branch.as_deref().unwrap_or(""),
         task.expected_head.as_deref().unwrap_or("")
-    ).to_lowercase();
+    )
+    .to_lowercase();
 
     format!(
         "<a class='task-card' href='./canvs/tasks/{}' data-status='{}' data-category='{}' data-worktree='{}' data-search='{}'>
@@ -293,7 +298,11 @@ pub fn task_detail_page(workspace_name: &str, snapshot: &CanvsSnapshot) -> Strin
                     escape_html(&v.level),
                     escape_attr(&v.created_at),
                     escape_html(&v.created_at),
-                    if v.passed { "badge-success" } else { "badge-destructive" },
+                    if v.passed {
+                        "badge-success"
+                    } else {
+                        "badge-destructive"
+                    },
                     escape_html(&disposition_label(&v.disposition)),
                     verification_meta(v.exit_code, v.duration_ms),
                 )
@@ -616,7 +625,11 @@ fn string_list(values: &[String], empty: &str, completed: bool) -> String {
     }
     format!(
         "<ol class='steps-list {}'>{}</ol>",
-        if completed { "is-completed" } else { "is-pending" },
+        if completed {
+            "is-completed"
+        } else {
+            "is-pending"
+        },
         values
             .iter()
             .enumerate()
