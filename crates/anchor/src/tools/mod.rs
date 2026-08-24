@@ -15,6 +15,7 @@ pub mod recovery;
 pub mod registry;
 pub mod resource_budget;
 pub(crate) mod schema;
+pub mod search;
 pub mod session;
 pub mod workspace;
 

@@ -8,7 +8,8 @@ use crate::tools::context::ToolContext;
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
 use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
 use crate::tools::{
-    command_session, exec, file, git, image_tool, patch, recovery, session, CancellationToken,
+    command_session, exec, file, git, image_tool, patch, recovery, search, session,
+    CancellationToken,
 };
 
 fn policy_tool_err(err: PolicyError) -> Value {
@@ -1394,7 +1395,7 @@ fn call_tool_impl(
             "read_file" => file::read_file(ws, &effective_args, cancellation),
             "list_dir" => file::list_dir(ws, &effective_args, cancellation),
             "list_files" => file::list_files(ws, &effective_args, cancellation),
-            "grep" | "search_text" => file::grep(ws, &effective_args, cancellation),
+            "grep" | "search_text" => search::search(ws, &effective_args, cancellation),
             "replace_text" => file::replace_text(ws, &effective_args, cancellation),
             "patch_check" => {
                 patch::patch_check_with_cancellation(ctx, &effective_args, cancellation)
