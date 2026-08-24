@@ -686,6 +686,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "search",
+        "Search repository",
+        "[anchor-core anchor-files] Search repository text and code structure through one deterministic interface; engine selection is managed internally by Anchor.",
+        true,
+        false,
+        false,
+    ),
+    (
         "replace_text",
         "Replace text",
         "[anchor-core anchor-files] Replace one literal string across an explicit bounded file set with dry-run, SHA/match preconditions, encoding/mode preservation, and pre-commit CAS.",
@@ -1781,6 +1789,28 @@ pub fn output_schema(name: &str) -> Value {
                 "warnings": warnings_property()
             }),
             &["mode", "bytes_read", "truncated", "next", "warnings"],
+        ),
+        "search" => success_output_schema(
+            json!({
+                "query": { "type": "string" },
+                "requested_mode": { "type": "string", "enum": ["auto", "text", "symbol", "callers", "callees", "impact", "explore"] },
+                "mode": { "type": "string", "enum": ["text", "symbol", "callers", "callees", "impact", "explore"] },
+                "engine": { "type": "string" },
+                "degraded": { "type": "boolean" },
+                "degraded_reason": { "type": ["string", "null"] },
+                "data": { "type": ["object", "array", "string", "number", "boolean", "null"] },
+                "warnings": warnings_property()
+            }),
+            &[
+                "query",
+                "requested_mode",
+                "mode",
+                "engine",
+                "degraded",
+                "degraded_reason",
+                "data",
+                "warnings",
+            ],
         ),
         "grep" | "search_text" => success_output_schema(
             json!({
@@ -3708,7 +3738,7 @@ pub fn input_schema(name: &str) -> Value {
         "list_dir" => json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "default": "." },
+                "path": { "type": "string", "default": ".", "description": "Text-search scope. In auto mode, a non-default path deterministically selects the text backend." },
                 "recursive": { "type": "boolean", "default": false },
                 "max_depth": { "type": "integer", "minimum": 1, "maximum": 20, "default": 1 },
                 "max_entries": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
@@ -3730,6 +3760,35 @@ pub fn input_schema(name: &str) -> Value {
                 "scan_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000, "description": "Cooperative repository traversal deadline." },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 50000, "default": 5000 }
             },
+            "additionalProperties": false
+        }),
+        "search" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "minLength": 1 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "text", "symbol", "callers", "callees", "impact", "explore"],
+                    "default": "auto",
+                    "description": "Deterministic search intent. auto uses text controls, whitespace, and identifier shape; it does not invoke an LLM classifier."
+                },
+                "path": { "type": "string", "default": "." },
+                "include_globs": { "type": "array", "items": { "type": "string" } },
+                "exclude_globs": { "type": "array", "items": { "type": "string" } },
+                "regex": { "type": "boolean", "default": false },
+                "case_sensitive": { "type": "boolean", "default": false },
+                "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 0 },
+                "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"], "default": "matches", "description": "Text-backend output shape." },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "max_scan_files": { "type": "integer", "minimum": 1, "maximum": 250000, "default": 100000 },
+                "max_scan_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824, "default": 134217728 },
+                "scan_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000 },
+                "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
+                "graph_depth": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
+                "graph_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000 }
+            },
+            "required": ["query"],
             "additionalProperties": false
         }),
         "grep" | "search_text" => json!({
@@ -4291,6 +4350,21 @@ mod tests {
         assert_eq!(output_schema("search_text"), output_schema("grep"));
         assert!(!exposed_tool_names("core").contains(&"search_text"));
         assert!(exposed_tool_names("core").contains(&"grep"));
+    }
+
+    #[test]
+    fn unified_search_schema_is_distinct_from_legacy_text_contract() {
+        let search_input = input_schema("search");
+        let search_output = output_schema("search");
+
+        assert_ne!(search_input, input_schema("grep"));
+        assert!(search_input["properties"]["mode"]
+            .get("enum")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|modes| modes.iter().any(|mode| mode == "impact")));
+        assert!(search_output["properties"]["engine"].is_object());
+        assert!(search_output["properties"]["degraded"].is_object());
+        assert!(!exposed_tool_names("core").contains(&"search"));
     }
 
     #[test]

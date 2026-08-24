@@ -1395,7 +1395,8 @@ fn call_tool_impl(
             "read_file" => file::read_file(ws, &effective_args, cancellation),
             "list_dir" => file::list_dir(ws, &effective_args, cancellation),
             "list_files" => file::list_files(ws, &effective_args, cancellation),
-            "grep" | "search_text" => search::search(ws, &effective_args, cancellation),
+            "search" => search::search(ws, &effective_args, cancellation),
+            "grep" | "search_text" => file::grep(ws, &effective_args, cancellation),
             "replace_text" => file::replace_text(ws, &effective_args, cancellation),
             "patch_check" => {
                 patch::patch_check_with_cancellation(ctx, &effective_args, cancellation)
@@ -1797,7 +1798,8 @@ fn apply_default_cwd(
             let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
             effective["path"] = Value::String(prefix_relative_path(&base, path));
         }
-        "read_file" | "grep" | "search_text" | "git_blame" | "view_image" | "remove_path" => {
+        "read_file" | "search" | "grep" | "search_text" | "git_blame" | "view_image"
+        | "remove_path" => {
             if let Some(path) = effective.get("path").and_then(Value::as_str) {
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
