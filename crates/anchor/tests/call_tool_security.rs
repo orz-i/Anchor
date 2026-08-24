@@ -172,7 +172,7 @@ fn external_read_tools_reject_directory_listing_and_search_by_default() {
 
     let matches_result = invoke(
         &ctx,
-        "grep",
+        "search",
         json!({"path": parent.to_string_lossy(), "query": "TOP_SECRET"}),
     );
     assert_security_or_policy_err(&matches_result);

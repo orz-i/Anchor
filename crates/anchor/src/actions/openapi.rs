@@ -222,20 +222,21 @@ mod tests {
     }
 
     #[test]
-    fn core_openapi_exposes_grep_as_read_only() {
+    fn core_openapi_exposes_search_as_read_only() {
         let tools =
             crate::tools::catalog::build_effective_catalog_from_parts("core", false, Vec::new())
                 .expect("effective core catalog")
                 .tools;
         let schema = build_openapi(&tools, "https://actions.example.com", "none");
-        let operation = &schema["paths"]["/actions/grep"]["post"];
+        let operation = &schema["paths"]["/actions/search"]["post"];
 
-        assert_eq!(operation["operationId"], "anchor_grep");
+        assert_eq!(operation["operationId"], "anchor_search");
         assert_eq!(operation["x-openai-isConsequential"], false);
         assert_eq!(
             operation["requestBody"]["content"]["application/json"]["schema"],
-            crate::tools::registry::input_schema("grep")
+            crate::tools::registry::input_schema("search")
         );
+        assert!(schema["paths"].get("/actions/grep").is_none());
         assert!(schema["paths"].get("/actions/search_text").is_none());
         assert!(schema["paths"].get("/actions/git").is_some());
         assert!(schema["paths"].get("/actions/task").is_some());

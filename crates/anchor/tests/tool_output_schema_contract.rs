@@ -82,7 +82,7 @@ fn high_value_local_tool_successes_match_published_output_schemas() {
         ("server_info", json!({})),
         ("read_file", json!({"path": "src/math.js"})),
         (
-            "grep",
+            "search",
             json!({"query": "add", "path": "src", "max_results": 20}),
         ),
         (

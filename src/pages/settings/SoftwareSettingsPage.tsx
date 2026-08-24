@@ -106,7 +106,7 @@ export function SoftwareSettingsPage() {
   };
 
   return (
-    <PageLayout kicker="全局设置" title="软件管理" description="安装和管理 frpc、cloudflared、ripgrep、CodeGraph 等 Anchor 外部工具。">
+    <PageLayout kicker="全局设置" title="软件管理" description="安装和管理 frpc、cloudflared、ripgrep、CodeGraph 等 Anchor 辅助运行时。">
       <div className="flex flex-col gap-5">
         {!mutationSupported && !loading && (
           <Alert>

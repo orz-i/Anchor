@@ -1163,7 +1163,7 @@ fn policy_rejection_returns_safe_structured_alternatives() {
         .expect("alternatives");
     assert!(alternatives
         .iter()
-        .any(|alternative| alternative["name"] == "grep"));
+        .any(|alternative| alternative["name"] == "search"));
 }
 
 #[test]
@@ -1353,7 +1353,8 @@ fn core_profile_keeps_default_capabilities_and_exposes_one_session_facade() {
     assert!(names.contains("skill"));
     assert!(names.contains("environment"));
     assert!(names.contains("cwd"));
-    assert!(names.contains("grep"));
+    assert!(names.contains("search"));
+    assert!(!names.contains("grep"));
     assert!(!names.contains("search_text"));
     assert!(!names.contains("command_cost_explain"));
     assert!(names.contains("session"));
@@ -1840,28 +1841,31 @@ fn list_files_filters_with_patterns() {
 }
 
 #[test]
-fn grep_filters_by_glob() {
+fn search_filters_by_glob() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let hit = invoke(
         &ctx,
-        "grep",
+        "search",
         json!({"query": "function add", "include_globs": ["**/*.js"], "max_results": 10}),
     );
     let hit_payload = assert_ok(&hit);
-    assert!(hit_payload["total_matches"].as_u64().unwrap_or(0) > 0);
+    assert!(hit_payload["data"]["total_matches"].as_u64().unwrap_or(0) > 0);
 
     let miss = invoke(
         &ctx,
-        "grep",
+        "search",
         json!({"query": "function add", "include_globs": ["**/*.py"]}),
     );
     let miss_payload = assert_ok(&miss);
-    assert_eq!(miss_payload["total_matches"].as_u64().unwrap_or(1), 0);
+    assert_eq!(
+        miss_payload["data"]["total_matches"].as_u64().unwrap_or(1),
+        0
+    );
 }
 
 #[test]
-fn legacy_search_text_name_routes_to_grep_without_catalog_exposure() {
+fn legacy_text_search_names_route_without_catalog_exposure() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let result = invoke(
@@ -1872,17 +1876,26 @@ fn legacy_search_text_name_routes_to_grep_without_catalog_exposure() {
     let payload = assert_ok(&result);
     assert!(payload["total_matches"].as_u64().unwrap_or(0) > 0);
 
+    let grep_result = invoke(
+        &ctx,
+        "grep",
+        json!({"query": "function add", "include_globs": ["**/*.js"]}),
+    );
+    let grep_payload = assert_ok(&grep_result);
+    assert!(grep_payload["total_matches"].as_u64().unwrap_or(0) > 0);
+
     let tools = anchor_lib::tools::list_tools_for_profile("core");
     let names = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<std::collections::HashSet<_>>();
-    assert!(names.contains("grep"));
+    assert!(names.contains("search"));
+    assert!(!names.contains("grep"));
     assert!(!names.contains("search_text"));
 }
 
 #[test]
-fn grep_truncates_multibyte_preview_on_a_utf8_boundary() {
+fn search_truncates_multibyte_preview_on_a_utf8_boundary() {
     let fx = tiny_js_fixture();
     fs::write(
         fx.root.join("src/multibyte.txt"),
@@ -1891,7 +1904,7 @@ fn grep_truncates_multibyte_preview_on_a_utf8_boundary() {
     .expect("write multibyte fixture");
     let result = invoke(
         &ctx_for(&fx.root),
-        "grep",
+        "search",
         json!({
             "query": "marker",
             "path": "src/multibyte.txt",
@@ -1899,7 +1912,7 @@ fn grep_truncates_multibyte_preview_on_a_utf8_boundary() {
         }),
     );
     let payload = assert_ok(&result);
-    let preview = payload["matches"][0]["preview"]
+    let preview = payload["data"]["matches"][0]["preview"]
         .as_str()
         .expect("preview string");
 

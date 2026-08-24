@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 44;
+pub const CATALOG_VERSION: u32 = 45;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -935,7 +935,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
     "list_files",
-    "grep",
+    "search",
     "replace_text",
     "apply_patch",
     "remove_path",
@@ -1020,7 +1020,7 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "list_dir",
     "list_files",
-    "grep",
+    "search",
     "read_output",
     "wait_command",
     "list_command_sessions",
@@ -4319,7 +4319,8 @@ mod tests {
         assert!(names.contains(&"list_command_sessions"));
         assert!(names.contains(&"browser_build_info"));
         assert!(names.contains(&"browser_wait_for_build"));
-        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"search"));
+        assert!(!names.contains(&"grep"));
         assert!(!names.contains(&"search_text"));
         assert!(names.contains(&"replace_text"));
         assert!(!names.contains(&"command_cost_explain"));
@@ -4345,11 +4346,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_search_text_schema_matches_grep_without_public_exposure() {
+    fn legacy_text_search_schemas_remain_available_without_public_exposure() {
         assert_eq!(input_schema("search_text"), input_schema("grep"));
         assert_eq!(output_schema("search_text"), output_schema("grep"));
         assert!(!exposed_tool_names("core").contains(&"search_text"));
-        assert!(exposed_tool_names("core").contains(&"grep"));
+        assert!(!exposed_tool_names("core").contains(&"grep"));
+        assert!(exposed_tool_names("core").contains(&"search"));
     }
 
     #[test]
@@ -4364,7 +4366,7 @@ mod tests {
             .is_some_and(|modes| modes.iter().any(|mode| mode == "impact")));
         assert!(search_output["properties"]["engine"].is_object());
         assert!(search_output["properties"]["degraded"].is_object());
-        assert!(!exposed_tool_names("core").contains(&"search"));
+        assert!(exposed_tool_names("core").contains(&"search"));
     }
 
     #[test]
@@ -4388,7 +4390,7 @@ mod tests {
             "begin_work_session",
             "close_work_session",
             "read_file",
-            "grep",
+            "search",
             "replace_text",
             "apply_patch",
             "exec_command",

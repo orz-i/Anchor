@@ -7,10 +7,10 @@ import { Textarea } from "@/components/ui/textarea";
 
 const EXAMPLE_CONFIG = `{
   "mcpServers": {
-    "codegraph": {
+    "local-tools": {
       "type": "stdio",
-      "command": "codegraph",
-      "args": ["serve", "--mcp", "--path", "\${workspaceFolder}"],
+      "command": "node",
+      "args": ["./scripts/mcp-server.mjs", "\${workspaceFolder}"],
       "maxTools": 16
     },
     "remote": {

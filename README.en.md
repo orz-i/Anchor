@@ -223,7 +223,7 @@ The default `core` profile provides a stable, composable development tool set:
 
 | Category | Main tools |
 | --- | --- |
-| File reading | `read_file`, `list_dir`, `list_files`, `grep`, `view_image` |
+| File reading | `read_file`, `list_dir`, `list_files`, `search`, `view_image` |
 | File modification | `apply_patch` |
 | Command execution | `exec_command`, `write_stdin`, `read_output`, `kill_session` |
 | Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
@@ -247,7 +247,9 @@ Harness tasks continue to use the configured Workspace by default. When independ
 
 ### Code search and structural analysis
 
-`grep` is the unified text/regex search tool. Anchor prefers an available ripgrep (`rg`) binary to prefilter candidate files, then keeps path boundaries, text decoding, ordering, context, pagination, and scan budgets under Anchor's structured implementation. If `rg` is unavailable or prefiltering fails, the tool automatically falls back to the built-in scanner. The former `search_text` name remains only as a hidden compatibility entry point and is no longer published in the tool catalog or OpenAPI schema.
+`search` is the unified repository-search entry point with `auto`, `text`, `symbol`, `callers`, `callees`, `impact`, and `explore` modes. `auto` uses deterministic routing rather than an extra LLM classifier: explicit path/regex/glob/context controls select text search, identifier-shaped queries prefer symbol search, and natural-language queries select structural exploration.
+
+The text backend prefers an available ripgrep (`rg`) binary to prefilter candidate files, while Anchor remains responsible for path boundaries, decoding, ordering, context, pagination, and scan budgets. If `rg` is unavailable or prefiltering fails, it falls back to the built-in scanner. The semantic backend invokes CodeGraph internally, lazily initializes a Workspace-local index, and syncs it before querying; index or query failures are surfaced as `degraded` results and fall back to text search. `grep` and the older `search_text` name remain hidden compatibility entry points and are not published in the tool catalog or OpenAPI schema.
 
 Anchor's `software` manager also supports ripgrep and CodeGraph:
 
@@ -257,7 +259,7 @@ anchor software install codegraph
 anchor software list
 ```
 
-Managed binaries take precedence during resolution. CodeGraph is invoked through the existing `exec_command` surface instead of adding a family of `codegraph_*` tools; `environment check` reports ripgrep and CodeGraph under `code_intelligence`, including `available`, `managed`, and the resolved path.
+CodeGraph is an internal `search` runtime rather than an Agent-facing `exec_command` or `codegraph_*` capability. Anchor disables its telemetry/update checks, serializes index operations, and isolates `.codegraph` as a local runtime artifact. `environment check` reports only `search.text` and `search.semantic` capability state instead of exposing the CodeGraph executable path. Operators can still install, inspect, or uninstall the managed runtime through `anchor software`.
 
 ## Permission and recovery model
 

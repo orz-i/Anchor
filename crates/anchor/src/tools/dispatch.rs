@@ -518,8 +518,8 @@ fn policy_alternatives(message: &str) -> Vec<Value> {
         "rg" | "ripgrep" => vec![
             json!({
                 "type": "tool",
-                "name": "grep",
-                "reason": "使用 Anchor 的受控文本搜索，不需要额外命令白名单"
+                "name": "search",
+                "reason": "使用 Anchor 的统一受控搜索，不需要额外命令白名单"
             }),
             json!({
                 "type": "command",
@@ -534,7 +534,7 @@ fn policy_alternatives(message: &str) -> Vec<Value> {
         })],
         "findstr" => vec![json!({
             "type": "tool",
-            "name": "grep",
+            "name": "search",
             "reason": "使用跨平台工作区文本搜索"
         })],
         _ => Vec::new(),
