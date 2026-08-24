@@ -3786,7 +3786,7 @@ pub fn input_schema(name: &str) -> Value {
                 "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
                 "graph_depth": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
-                "graph_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000 }
+                "graph_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 60000 }
             },
             "required": ["query"],
             "additionalProperties": false

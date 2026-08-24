@@ -1,9 +1,8 @@
 //! Anchor-managed external software.
 //!
-//! Both can be installed into the app cache `bin/` directory (downloaded from
-//! GitHub, honoring the mirror + proxy config). Binaries found in the cache dir
-//! are "managed" (uninstallable); binaries found on PATH or in system install
-//! locations are reported but cannot be removed from here.
+//! Software can be installed into Anchor-managed storage (downloaded from
+//! GitHub, honoring the mirror + proxy config). Managed installations are
+//! uninstallable here; binaries found on PATH remain externally owned.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -20,7 +19,7 @@ use crate::tunnel::frp::{cached_frpc_path, download_frpc_to_cache, resolve_frpc}
 // binary. Keep the managed build on the previous release until upstream ships
 // a fixed binary; system-installed newer rg remains usable and is detected.
 const RIPGREP_VERSION: &str = "15.1.0";
-const CODEGRAPH_VERSION: &str = "v0.9.6";
+const CODEGRAPH_VERSION: &str = "v1.5.0";
 const SUPPORTED_SOFTWARE_KINDS: &[&str] = &["frpc", "cloudflared", "ripgrep", "codegraph"];
 
 /// Status of Anchor-managed external software, serialized to the frontend.
@@ -68,10 +67,13 @@ pub(crate) fn resolve_codegraph() -> Option<PathBuf> {
         .or_else(|| which::which("codegraph").ok())
 }
 
+pub(crate) fn managed_codegraph_available() -> bool {
+    cached_codegraph_path().is_some_and(|path| path.is_file())
+}
+
 pub(crate) fn resolve_managed_software_program(name: &str) -> Option<PathBuf> {
     match name {
         "rg" | "ripgrep" => cached_ripgrep_path().filter(|path| path.is_file()),
-        "codegraph" => cached_codegraph_path().filter(|path| path.is_file()),
         _ => None,
     }
 }
@@ -573,7 +575,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn software_catalog_contains_both_supported_tunnel_binaries() {
+    fn software_catalog_contains_supported_managed_runtimes() {
         let statuses = list_software();
         assert_eq!(statuses.len(), supported_kinds().len());
         assert!(statuses.iter().any(|status| {
@@ -589,6 +591,8 @@ mod tests {
         assert!(statuses.iter().any(|status| {
             status.kind == "codegraph" && status.target_version == CODEGRAPH_VERSION
         }));
+        assert_eq!(CODEGRAPH_VERSION, "v1.5.0");
+        assert!(resolve_managed_software_program("codegraph").is_none());
     }
 
     #[test]

@@ -41,7 +41,6 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "ruff",
     "rg",
     "ripgrep",
-    "codegraph",
     "mypy",
     "eslint",
     "tsc",
@@ -1236,14 +1235,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn default_policy_allows_managed_code_intelligence_commands() {
+    fn default_policy_allows_text_search_accelerators_but_not_internal_codegraph() {
         let policy = PolicySettings::default();
-        for command in ["rg", "ripgrep", "codegraph"] {
+        for command in ["rg", "ripgrep"] {
             assert!(
                 policy.allowed_commands.contains(command),
                 "{command} must be available to the managed software toolchain"
             );
         }
+        assert!(!policy.allowed_commands.contains("codegraph"));
     }
 
     #[test]

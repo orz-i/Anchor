@@ -2402,9 +2402,8 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
         crate::tools::environment::summarize_diagnosis(&full_development_environment)
     };
     let managed_rg = crate::tunnel::resolve_managed_software_program("rg");
-    let managed_codegraph = crate::tunnel::resolve_managed_software_program("codegraph");
     let effective_rg = exec::resolve_effective_system_program("rg");
-    let effective_codegraph = exec::resolve_effective_system_program("codegraph");
+    let semantic_search_available = crate::tunnel::resolve_codegraph().is_some();
     let mut response = tool_ok(json!({
         "detail": detail,
         "full_detail_available": true,
@@ -2441,16 +2440,18 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
             "resolution": "workdir_first",
             "allowlist_required": true
         },
-        "code_intelligence": {
-            "ripgrep": {
-                "available": effective_rg.is_some(),
-                "managed": managed_rg.is_some(),
-                "path": effective_rg.map(|path| path.to_string_lossy().to_string())
+        "search": {
+            "public_tool": "search",
+            "text": {
+                "available": true,
+                "accelerated": effective_rg.is_some(),
+                "managed_accelerator": managed_rg.is_some()
             },
-            "codegraph": {
-                "available": effective_codegraph.is_some(),
-                "managed": managed_codegraph.is_some(),
-                "path": effective_codegraph.map(|path| path.to_string_lossy().to_string())
+            "semantic": {
+                "available": semantic_search_available,
+                "managed": crate::tunnel::managed_codegraph_available(),
+                "runtime": "internal",
+                "fallback": "text"
             }
         },
         "development_environment": development_environment,
