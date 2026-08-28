@@ -2034,4 +2034,205 @@ mod tests {
         assert!(retry["checkpoint_hash"].as_str().is_some());
         assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
     }
+
+    #[test]
+    fn scoped_worktree_checkpoint_uses_primary_session_store_and_wait_is_idempotent() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let opened =
+            dev_session::open(&ctx, &json!({"create_if_missing": true})).expect("open session");
+        let session_id = opened["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session_path = opened["session_path"]
+            .as_str()
+            .expect("session path")
+            .to_string();
+
+        let task_id = Uuid::new_v4().simple().to_string();
+        let worktree = crate::tools::git::create_managed_worktree(
+            &ctx.workspace,
+            &task_id,
+            Some("anchor/test-stage-checkpoint-scope"),
+            "HEAD",
+            false,
+        )
+        .expect("managed worktree");
+        let task = ctx
+            .harness
+            .start_task_in_git_worktree("stage checkpoint scope", task_id.clone(), worktree)
+            .expect("worktree task");
+        let scoped = ctx
+            .scoped_for_task(&task, None)
+            .expect("scope task")
+            .expect("worktree context");
+        fs::write(scoped.workspace.root().join("main.txt"), "after\n").expect("change");
+        let refreshed = scoped
+            .harness
+            .refresh_expected_state_for_operation(&task_id, Some("worktree-change"))
+            .expect("refresh");
+        let expected = refreshed.expected_state;
+
+        let result = run(
+            &scoped,
+            &json!({
+                "task_id": task_id,
+                "expected_head": expected.head.expect("head"),
+                "expected_fingerprint": expected.worktree_fingerprint,
+                "paths": ["main.txt"],
+                "message": "checkpoint through primary session store",
+                "required_checks": [],
+                "idempotency_key": "worktree-primary-session-checkpoint",
+                "session_checkpoint": {
+                    "session_id": session_id,
+                    "expected_path": session_path,
+                    "user_intent": "checkpoint from scoped stage commit"
+                }
+            }),
+            &CancellationToken::default(),
+        )
+        .expect("stage commit");
+        assert_eq!(result["complete"], true, "{result}");
+        assert_eq!(result["workflow_status"], "completed", "{result}");
+        assert!(result["checkpoint_hash"].as_str().is_some(), "{result}");
+        let commit_sha = result["commit_sha"].clone();
+        assert_eq!(
+            git(scoped.workspace.root(), &["rev-list", "--count", "HEAD"]),
+            "2"
+        );
+        assert!(!scoped
+            .workspace
+            .root()
+            .join("docs/session/index.json")
+            .exists());
+
+        let repeated = wait(
+            &scoped,
+            &json!({
+                "task_id": task_id,
+                "idempotency_key": "worktree-primary-session-checkpoint",
+                "wait_timeout_ms": 1
+            }),
+            &CancellationToken::default(),
+        )
+        .expect("idempotent wait");
+        assert_eq!(repeated["complete"], true, "{repeated}");
+        assert_eq!(repeated["commit_sha"], commit_sha);
+        assert_eq!(
+            git(scoped.workspace.root(), &["rev-list", "--count", "HEAD"]),
+            "2"
+        );
+
+        let stored = dev_session::get(&ctx, &json!({"session_id": opened["session_id"]}))
+            .expect("read primary session");
+        assert!(stored["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("checkpoint from scoped stage commit")));
+        assert!(workspace.path().join("docs/session/index.json").exists());
+    }
+
+    #[test]
+    fn scoped_worktree_pending_checkpoint_wait_recovers_without_duplicate_commit() {
+        let Some((workspace, _harness, ctx)) = fixture() else {
+            return;
+        };
+        let opened =
+            dev_session::open(&ctx, &json!({"create_if_missing": true})).expect("open session");
+        let session_id = opened["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session_path = opened["session_path"]
+            .as_str()
+            .expect("session path")
+            .to_string();
+        let session_index = workspace.path().join("docs/session/index.json");
+        let session_index_content = fs::read(&session_index).expect("read session index");
+
+        let task_id = Uuid::new_v4().simple().to_string();
+        let worktree = crate::tools::git::create_managed_worktree(
+            &ctx.workspace,
+            &task_id,
+            Some("anchor/test-stage-checkpoint-recovery"),
+            "HEAD",
+            false,
+        )
+        .expect("managed worktree");
+        let task = ctx
+            .harness
+            .start_task_in_git_worktree("stage checkpoint recovery", task_id.clone(), worktree)
+            .expect("worktree task");
+        let scoped = ctx
+            .scoped_for_task(&task, None)
+            .expect("scope task")
+            .expect("worktree context");
+        fs::write(scoped.workspace.root().join("main.txt"), "after\n").expect("change");
+        let refreshed = scoped
+            .harness
+            .refresh_expected_state_for_operation(&task_id, Some("worktree-change"))
+            .expect("refresh");
+        let expected = refreshed.expected_state;
+
+        // Model the post-commit persistence outage seen in production while keeping
+        // the persisted checkpoint arguments themselves valid. Restoring the index
+        // before wait() models retrying after the Session store becomes available.
+        fs::remove_file(&session_index).expect("temporarily remove session index");
+        let first = run(
+            &scoped,
+            &json!({
+                "task_id": task_id,
+                "expected_head": expected.head.expect("head"),
+                "expected_fingerprint": expected.worktree_fingerprint,
+                "paths": ["main.txt"],
+                "message": "commit before checkpoint recovery",
+                "required_checks": [],
+                "idempotency_key": "worktree-primary-session-checkpoint-recovery",
+                "session_checkpoint": {
+                    "session_id": session_id,
+                    "expected_path": session_path,
+                    "user_intent": "resume persisted stage checkpoint"
+                }
+            }),
+            &CancellationToken::default(),
+        )
+        .expect("commit with pending checkpoint");
+        assert_eq!(first["complete"], false, "{first}");
+        assert_eq!(
+            first["workflow_status"], "committed_checkpoint_pending",
+            "{first}"
+        );
+        assert_eq!(first["error"]["code"], "SESSION_NOT_OPENED", "{first}");
+        let commit_sha = first["commit_sha"].clone();
+        assert_eq!(
+            git(scoped.workspace.root(), &["rev-list", "--count", "HEAD"]),
+            "2"
+        );
+
+        fs::write(&session_index, session_index_content).expect("restore session index");
+        let resumed = wait(
+            &scoped,
+            &json!({
+                "task_id": task_id,
+                "idempotency_key": "worktree-primary-session-checkpoint-recovery",
+                "wait_timeout_ms": 1
+            }),
+            &CancellationToken::default(),
+        )
+        .expect("resume checkpoint from persisted receipt");
+        assert_eq!(resumed["complete"], true, "{resumed}");
+        assert_eq!(resumed["workflow_status"], "completed", "{resumed}");
+        assert_eq!(resumed["commit_sha"], commit_sha);
+        assert!(resumed["checkpoint_hash"].as_str().is_some(), "{resumed}");
+        assert_eq!(
+            git(scoped.workspace.root(), &["rev-list", "--count", "HEAD"]),
+            "2"
+        );
+        let stored = dev_session::get(&ctx, &json!({"session_id": opened["session_id"]}))
+            .expect("read resumed primary session");
+        assert!(stored["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("resume persisted stage checkpoint")));
+    }
 }

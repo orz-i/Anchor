@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::tools::context::ToolContext;
-use crate::tools::workspace::{tool_ok, WorkspaceError, WorkspaceResult};
+use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError, WorkspaceResult};
 
 const MAX_HOST_SESSION_KEY_CHARS: usize = 256;
 const MAX_SESSION_ID_CHARS: usize = 64;
@@ -479,7 +479,20 @@ pub fn checkpoint(
 ) -> WorkspaceResult<Value> {
     let session_id = required_checkpoint_argument(args, "session_id")?;
     let expected_path = required_checkpoint_argument(args, "expected_path")?;
-    let session_dir = resolve_dir(ctx, args)?;
+    // Session history belongs to the primary workspace even when the caller is a
+    // task-scoped ToolContext rooted at an isolated Git worktree. Public Session
+    // tools are normally kept on the primary context by dispatch, but internal
+    // workflows such as stage_commit call checkpoint directly after operating in
+    // the task worktree. Keep that invariant here as well so a committed workflow
+    // cannot strand itself in committed_checkpoint_pending merely because it
+    // bypassed dispatch.
+    let primary_workspace = primary_session_workspace(ctx)?;
+    let session_workspace = primary_workspace.as_ref().unwrap_or(&ctx.workspace);
+    let session_dir = storage::resolve_session_dir(
+        session_workspace,
+        args.get("workspace_root").and_then(Value::as_str),
+        args.get("session_dir").and_then(Value::as_str),
+    )?;
     if !session_dir.exists() {
         return Err(session_not_opened());
     }
@@ -503,7 +516,7 @@ pub fn checkpoint(
             }),
         ));
     }
-    let document_path = ctx.workspace.root().join(&entry.path);
+    let document_path = session_workspace.root().join(&entry.path);
     let document_content = fs::read_to_string(&document_path).map_err(|error| {
         session_error(
             "SESSION_READ_FAILED",
@@ -631,7 +644,7 @@ pub fn checkpoint(
         )
     };
     if updated {
-        let current_store_bytes = indexed_store_bytes(ctx, &index);
+        let current_store_bytes = indexed_store_bytes(session_workspace.root(), &index);
         let previous_document_bytes = fs::metadata(&document_path)
             .map(|value| value.len())
             .unwrap_or(0);
@@ -656,7 +669,7 @@ pub fn checkpoint(
     if content_bytes > storage::MAX_SESSION_FILE_BYTES * 3 / 4 {
         warnings.push("当前 Session 文件已超过容量上限的 75%，建议减少后续 checkpoint 内容或开始新的 Session。");
     }
-    let persistence = persistence_details(ctx, &entry.path);
+    let persistence = persistence_details_at(session_workspace.root(), &entry.path);
     Ok(tool_ok(json!({
         "session_id": session_id,
         "path": entry.path,
@@ -974,7 +987,10 @@ fn bounded_checkpoint_text(value: &str, maximum: usize) -> String {
 }
 
 fn persistence_details(ctx: &ToolContext, relative_path: &str) -> Value {
-    let root = ctx.workspace.root();
+    persistence_details_at(ctx.workspace.root(), relative_path)
+}
+
+fn persistence_details_at(root: &std::path::Path, relative_path: &str) -> Value {
     let git_tracked = git_path_command(root, &["ls-files", "--error-unmatch", "--", relative_path])
         .is_some_and(|output| output.status.success());
     let git_ignored = git_path_command(root, &["check-ignore", "-q", "--", relative_path])
@@ -1105,6 +1121,16 @@ fn resolve_dir(ctx: &ToolContext, args: &Value) -> WorkspaceResult<std::path::Pa
     )
 }
 
+fn primary_session_workspace(ctx: &ToolContext) -> WorkspaceResult<Option<Workspace>> {
+    if ctx.is_primary_workspace() {
+        return Ok(None);
+    }
+    Ok(Some(
+        Workspace::new(ctx.primary_workspace_root().to_path_buf())?
+            .with_strict_read_boundary(ctx.workspace.strict_read_boundary()),
+    ))
+}
+
 fn resolve_host_session_key(args: &Value) -> WorkspaceResult<Option<String>> {
     let value = args
         .get("_host_session_key")
@@ -1169,11 +1195,11 @@ fn session_dir_display(ctx: &ToolContext, path: &std::path::Path) -> String {
     crate::tools::workspace::relative_display(ctx.workspace.root(), path)
 }
 
-fn indexed_store_bytes(ctx: &ToolContext, index: &model::SessionIndex) -> u64 {
+fn indexed_store_bytes(root: &std::path::Path, index: &model::SessionIndex) -> u64 {
     index
         .sessions
         .values()
-        .filter_map(|entry| fs::metadata(ctx.workspace.root().join(&entry.path)).ok())
+        .filter_map(|entry| fs::metadata(root.join(&entry.path)).ok())
         .map(|metadata| metadata.len())
         .sum()
 }
