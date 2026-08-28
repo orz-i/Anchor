@@ -484,6 +484,10 @@ impl TaskStatus {
         )
     }
 
+    pub fn is_active_writer(self) -> bool {
+        matches!(self, Self::Active | Self::Verifying)
+    }
+
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),

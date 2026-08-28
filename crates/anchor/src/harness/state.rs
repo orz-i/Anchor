@@ -1181,7 +1181,7 @@ impl Harness {
             .store
             .list_tasks(&self.workspace_id)?
             .into_iter()
-            .filter(|task| matches!(task.status, TaskStatus::Active | TaskStatus::Verifying))
+            .filter(|task| task.status.is_active_writer())
             .collect())
     }
 
@@ -1189,10 +1189,7 @@ impl Harness {
         let tasks = self.store.list_tasks(&self.workspace_id)?;
         Ok(tasks
             .iter()
-            .find(|task| {
-                exclude != Some(task.id.as_str())
-                    && matches!(task.status, TaskStatus::Active | TaskStatus::Verifying)
-            })
+            .find(|task| exclude != Some(task.id.as_str()) && task.status.is_active_writer())
             .or_else(|| {
                 tasks
                     .iter()

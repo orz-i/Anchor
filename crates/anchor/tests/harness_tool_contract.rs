@@ -2075,17 +2075,61 @@ fn unbound_transport_never_adopts_workspace_default_task() {
         "binding-session-a",
     );
     assert_eq!(paused_first["ok"], true, "{paused_first}");
-    let rejected = call_tool_for_session(
+
+    let standalone_status = call_tool_for_session(
         &ctx,
-        "apply_patch",
+        "harness_status",
+        &json!({}),
+        "ambiguous-fourth-session",
+    );
+    assert_eq!(
+        standalone_status["active_task_count"], 0,
+        "{standalone_status}"
+    );
+    assert!(
+        standalone_status["task_id"].is_null(),
+        "{standalone_status}"
+    );
+    assert_eq!(
+        standalone_status["capabilities"]["exec"]["status"], "available",
+        "{standalone_status}"
+    );
+    assert_eq!(
+        standalone_status["capabilities"]["write"]["status"], "available",
+        "{standalone_status}"
+    );
+
+    let standalone_exec = call_tool_for_session(
+        &ctx,
+        "exec_command",
         &json!({
-            "patch": "*** Begin Patch\n*** Add File: forbidden.txt\n+forbidden\n*** End Patch\n"
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('standalone-after-paused-tasks')"],
+            "yield_time_ms": 30_000
         }),
         "ambiguous-fourth-session",
     );
-    assert_eq!(rejected["ok"], false, "{rejected}");
-    assert_eq!(rejected["error"]["code"], "TASK_BINDING_REQUIRED");
-    assert!(!workspace.join("forbidden.txt").exists());
+    assert_eq!(standalone_exec["command_ok"], true, "{standalone_exec}");
+    assert_eq!(
+        standalone_exec["harness_mode"], "standalone",
+        "{standalone_exec}"
+    );
+    assert_eq!(standalone_exec["task_required"], false, "{standalone_exec}");
+
+    let standalone_patch = call_tool_for_session(
+        &ctx,
+        "apply_patch",
+        &json!({
+            "patch": "*** Begin Patch\n*** Add File: standalone-after-paused.txt\n+standalone\n*** End Patch\n"
+        }),
+        "ambiguous-fourth-session",
+    );
+    assert_eq!(standalone_patch["ok"], true, "{standalone_patch}");
+    assert_eq!(
+        standalone_patch["harness_mode"], "standalone",
+        "{standalone_patch}"
+    );
+    assert!(workspace.join("standalone-after-paused.txt").exists());
 }
 
 #[test]

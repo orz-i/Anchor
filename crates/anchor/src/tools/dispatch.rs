@@ -1194,20 +1194,20 @@ fn call_tool_impl(
         }
     }
     if selected_task.is_none() && requires_write_baseline(name, &effective_args) {
-        let writable_task_ids = ctx
+        let active_writer_task_ids = ctx
             .harness
             .list_tasks()
             .unwrap_or_default()
             .into_iter()
-            .filter(|task| task.status.is_writable())
+            .filter(|task| task.status.is_active_writer())
             .map(|task| task.id)
             .collect::<Vec<_>>();
-        if !writable_task_ids.is_empty() {
+        if !active_writer_task_ids.is_empty() {
             return attach_harness_status(
                 ctx,
                 tool_err_code(
                     "TASK_BINDING_REQUIRED",
-                    "工作区已有可恢复的 Harness Task，但当前 MCP 会话无法唯一确定任务绑定，不能静默退化为 standalone。",
+                    "工作区已有活动 Harness 写任务，但当前 MCP 会话无法唯一确定任务绑定，不能静默退化为 standalone。",
                     "permission",
                 ),
                 false,
