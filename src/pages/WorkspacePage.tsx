@@ -17,7 +17,7 @@ import { PageLayout } from "@/components/admin/PageLayout";
 import { RuntimePolicyForm, type RuntimePolicyDraft } from "@/components/admin/RuntimePolicyForm";
 import { ServicePanel } from "@/components/admin/ServicePanel";
 import { SkillServiceConfigForm } from "@/components/admin/SkillServiceConfigForm";
-import { TunnelConfigForm, type SaveTunnelOptions, type TunnelFormConfig } from "@/components/admin/TunnelConfigForm";
+import { TunnelConfigForm, type TunnelFormConfig } from "@/components/admin/TunnelConfigForm";
 import { WorkspaceMetaForm } from "@/components/admin/WorkspaceMetaForm";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -26,7 +26,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { listFrpProfiles, setLastWorkspace, type FrpProfileDto } from "@/lib/api/settings";
-import { restartTunnel, stopTunnel } from "@/lib/api/tunnel";
 import {
   deleteWorkspace,
   getActionsRuntimeStatus,
@@ -40,7 +39,7 @@ import {
 } from "@/lib/api/workspaces";
 import { notifyStartFailure, runServiceToggle } from "@/lib/runtime/service";
 import type { ActionsAuthDraft, AuthConfig, McpActivity, RuntimeRecovery, RuntimeState, RuntimeStatus, WorkspaceProfile } from "@/lib/types";
-import { actionsConfig, actionsLocalEndpoint, actionsOAuthAuthorizeUrl, actionsOAuthTokenUrl, actionsOpenApiUrl, actionsPrivacyUrl, frpPublicUrl, mcpLocalEndpoint } from "@/lib/types";
+import { actionsConfig, actionsLocalEndpoint, actionsOAuthAuthorizeUrl, actionsOAuthTokenUrl, actionsOpenApiUrl, actionsPrivacyUrl, mcpLocalEndpoint } from "@/lib/types";
 
 type ServiceTab = "mcp" | "actions" | "canvs";
 type SubTab = "config" | "logs" | "health";
@@ -177,35 +176,17 @@ export function WorkspaceDetailPage() {
     if (reload) await load();
   };
 
-  const publicEndpointFromTunnel = (config: TunnelFormConfig, suffix: string) => {
-    const base = frpPublicUrl(config.type, config.frp_subdomain, config.frp_server, config.frp_profile_id, frpProfiles, config.public_url);
-    return base ? `${base.replace(/\/$/, "")}${suffix}` : "";
-  };
-
-  const restartTunnelIfConfigured = async (service: "mcp" | "actions", config: TunnelFormConfig) => {
-    if (config.type === "none") { await stopTunnel(workspaceId, service); return; }
-    const status = await restartTunnel(workspaceId, service);
-    if (service === "mcp" && status.publicUrl) setMcpRuntime((current) => current ? { ...current, publicEndpoint: `${status.publicUrl.replace(/\/$/, "")}/mcp` } : current);
-    if (service === "actions" && status.publicUrl) setActionsRuntime((current) => current ? { ...current, publicEndpoint: `${status.publicUrl.replace(/\/$/, "")}/openapi.json` } : current);
-  };
-
-  const saveMcpTunnel = async (config: TunnelFormConfig, options?: SaveTunnelOptions) => {
+  const saveMcpTunnel = async (config: TunnelFormConfig) => {
     if (!profile) return;
     const next: WorkspaceProfile = { ...profile, tunnel: { ...profile.tunnel, type: config.type, public_url: config.public_url, frp_server: config.frp_server, frp_subdomain: config.frp_subdomain, frp_profile_id: config.frp_profile_id, frp_server_port: config.frp_server_port, frp_proxy_type: config.frp_proxy_type, frp_cert_path: config.frp_cert_path, frp_key_path: config.frp_key_path, cloudflare_mode: config.cloudflare_mode, use_proxy: config.use_proxy } };
     await persist(next);
-    if (!options?.skipTunnelRestart) await restartTunnelIfConfigured("mcp", config);
-    if (!options?.skipTunnelRestart && !options?.skipServicePrompt) await refreshStatuses(workspaceId);
-    if (!mcpRuntime?.publicEndpoint) setMcpRuntime((current) => current ? { ...current, publicEndpoint: publicEndpointFromTunnel(config, "/mcp") } : current);
   };
 
-  const saveActionsTunnel = async (config: TunnelFormConfig, options?: SaveTunnelOptions) => {
+  const saveActionsTunnel = async (config: TunnelFormConfig) => {
     if (!profile) return;
     const current = actionsConfig(profile);
     const next: WorkspaceProfile = { ...profile, actions: { ...current, tunnel_type: config.type, public_url: config.public_url, frp_server: config.frp_server, frp_subdomain: config.frp_subdomain, frp_profile_id: config.frp_profile_id, frp_server_port: config.frp_server_port, frp_proxy_type: config.frp_proxy_type, frp_cert_path: config.frp_cert_path, frp_key_path: config.frp_key_path, cloudflare_mode: config.cloudflare_mode, use_proxy: config.use_proxy } };
     await persist(next);
-    if (!options?.skipTunnelRestart) await restartTunnelIfConfigured("actions", config);
-    if (!options?.skipTunnelRestart && !options?.skipServicePrompt) await refreshStatuses(workspaceId);
-    if (!actionsRuntime?.publicEndpoint) setActionsRuntime((runtime) => runtime ? { ...runtime, publicEndpoint: publicEndpointFromTunnel(config, "/openapi.json") } : runtime);
   };
 
   const removeWorkspace = async () => {

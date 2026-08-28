@@ -28,10 +28,25 @@ export interface TunnelFormConfig {
   cloudflare_mode: string;
   use_proxy: boolean;
 }
-export interface SaveTunnelOptions { skipTunnelRestart?: boolean; skipServicePrompt?: boolean; }
 
-export function TunnelConfigForm({ workspaceId, service, config, onSave }: { workspaceId: string; service: "mcp" | "actions"; config: TunnelFormConfig; onSave: (config: TunnelFormConfig, options?: SaveTunnelOptions) => void | Promise<void> }) {
-  const initial = useMemo<TunnelFormConfig>(() => ({ ...config, frp_profile_id: config.frp_profile_id ?? "", use_proxy: config.use_proxy ?? true }), [config]);
+export function TunnelConfigForm({ workspaceId, service, config, onSave }: { workspaceId: string; service: "mcp" | "actions"; config: TunnelFormConfig; onSave: (config: TunnelFormConfig) => void | Promise<void> }) {
+  const persisted = useMemo(() => ({
+    scope: `${workspaceId}:${service}`,
+    config: {
+      type: config.type,
+      public_url: config.public_url,
+      frp_server: config.frp_server,
+      frp_subdomain: config.frp_subdomain,
+      frp_profile_id: config.frp_profile_id ?? "",
+      frp_server_port: config.frp_server_port,
+      frp_proxy_type: config.frp_proxy_type,
+      frp_cert_path: config.frp_cert_path,
+      frp_key_path: config.frp_key_path,
+      cloudflare_mode: config.cloudflare_mode,
+      use_proxy: config.use_proxy ?? true,
+    } satisfies TunnelFormConfig,
+  }), [workspaceId, service, config.type, config.public_url, config.frp_server, config.frp_subdomain, config.frp_profile_id, config.frp_server_port, config.frp_proxy_type, config.frp_cert_path, config.frp_key_path, config.cloudflare_mode, config.use_proxy]);
+  const initial = persisted.config;
   const [draft, setDraft] = useState<TunnelFormConfig>(initial);
   const [profiles, setProfiles] = useState<FrpProfileDto[]>([]);
   const [token, setToken] = useState("");
@@ -63,17 +78,17 @@ export function TunnelConfigForm({ workspaceId, service, config, onSave }: { wor
   const canTest = showFrp || showCloudflare;
   const update = <K extends keyof TunnelFormConfig>(key: K, value: TunnelFormConfig[K]) => setDraft((current) => ({ ...current, [key]: value }));
 
-  const saveDraft = async (options?: SaveTunnelOptions) => {
+  const saveDraft = async () => {
     if (tokenDirty) {
       if (!tokenMutation) throw new Error("当前 Web 管理 API 尚未开放隧道 Token 写入。");
       await setWorkspaceSecret(workspaceId, secretKey, token);
       setLoadedToken(token);
     }
-    await onSave({ ...draft }, options);
+    await onSave({ ...draft });
   };
   const save = async () => { if (!dirty || saving) return; setSaving(true); try { await saveDraft(); toast.success("隧道配置已保存"); } catch (error) { if (!isPrivilegedActionCancelled(error)) toast.error("保存失败", { description: String(error) }); } finally { setSaving(false); } };
-  const runStart = async () => { if (!canTest || starting) return; setStarting(true); try { if (dirty) await saveDraft({ skipTunnelRestart: true, skipServicePrompt: true }); const result = await startTunnel(workspaceId, service); if (result.publicUrl && draft.cloudflare_mode === "quick") update("public_url", result.publicUrl); toast.success("隧道已启动", { description: result.publicUrl || result.state }); } catch (error) { if (!isPrivilegedActionCancelled(error)) toast.error("启动隧道失败", { description: String(error) }); } finally { setStarting(false); } };
-  const runTest = async () => { if (!canTest || testing) return; setTesting(true); try { if (dirty) await saveDraft({ skipTunnelRestart: true, skipServicePrompt: true }); const result = await testTunnel(workspaceId, service); if (result.publicUrl && draft.cloudflare_mode === "quick") update("public_url", result.publicUrl); (result.success ? toast.success : toast.warning)(result.success ? "测试成功" : "测试未完成", { description: [result.message, result.publicUrl].filter(Boolean).join(" · ") }); } catch (error) { if (!isPrivilegedActionCancelled(error)) toast.error("测试失败", { description: String(error) }); } finally { setTesting(false); } };
+  const runStart = async () => { if (!canTest || starting) return; setStarting(true); try { if (dirty) await saveDraft(); const result = await startTunnel(workspaceId, service); if (result.publicUrl && draft.cloudflare_mode === "quick") update("public_url", result.publicUrl); toast.success("隧道已启动", { description: result.publicUrl || result.state }); } catch (error) { if (!isPrivilegedActionCancelled(error)) toast.error("启动隧道失败", { description: String(error) }); } finally { setStarting(false); } };
+  const runTest = async () => { if (!canTest || testing) return; setTesting(true); try { if (dirty) await saveDraft(); const result = await testTunnel(workspaceId, service); if (result.publicUrl && draft.cloudflare_mode === "quick") update("public_url", result.publicUrl); (result.success ? toast.success : toast.warning)(result.success ? "测试成功" : "测试未完成", { description: [result.message, result.publicUrl].filter(Boolean).join(" · ") }); } catch (error) { if (!isPrivilegedActionCancelled(error)) toast.error("测试失败", { description: String(error) }); } finally { setTesting(false); } };
 
   return <form className="grid gap-5" onSubmit={(event) => { event.preventDefault(); void save(); }}><FieldGroup>
     <Field><FieldLabel>隧道类型</FieldLabel><Select value={draft.type} onValueChange={(value) => setDraft((current) => ({ ...current, type: value ?? "none", public_url: value === current.type ? current.public_url : "" }))}><SelectTrigger className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="none">未配置</SelectItem><SelectItem value="frp">FRP</SelectItem><SelectItem value="cloudflare">Cloudflare</SelectItem></SelectContent></Select></Field>
