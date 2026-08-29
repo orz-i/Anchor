@@ -10,7 +10,7 @@ import { readWorkspaceLogs, type LogChunk, type LogService } from "@/lib/api/log
 
 const AUTO_REFRESH_MS = 3000;
 
-export function LogViewer({ workspaceId, service, autoRefresh = true, title }: { workspaceId: string; service: LogService; autoRefresh?: boolean; title?: string }) {
+export function LogViewer({ workspaceId, service, autoRefresh = false, title }: { workspaceId: string; service: LogService; autoRefresh?: boolean; title?: string }) {
   const [chunks, setChunks] = useState<LogChunk[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");

@@ -25,6 +25,7 @@ interface AdminContextValue {
   workspaces: WorkspaceProfile[];
   mcpRuntimeStates: Record<string, RuntimeState>;
   actionsRuntimeStates: Record<string, RuntimeState>;
+  controlPlaneRevision: number;
   loading: boolean;
   refreshWorkspaces: () => Promise<WorkspaceProfile[]>;
   setWorkspaces: React.Dispatch<React.SetStateAction<WorkspaceProfile[]>>;
@@ -38,12 +39,37 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function runtimeStatesEqual(
+  current: Record<string, RuntimeState>,
+  next: Record<string, RuntimeState>,
+): boolean {
+  const currentIds = Object.keys(current);
+  const nextIds = Object.keys(next);
+  return (
+    currentIds.length === nextIds.length &&
+    nextIds.every((workspaceId) => current[workspaceId] === next[workspaceId])
+  );
+}
+
 export function AdminProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<WorkspaceProfile[]>([]);
   const [mcpRuntimeStates, setMcpRuntimeStates] = useState<Record<string, RuntimeState>>({});
   const [actionsRuntimeStates, setActionsRuntimeStates] = useState<Record<string, RuntimeState>>({});
+  const [controlPlaneRevision, setControlPlaneRevision] = useState(0);
   const [loading, setLoading] = useState(true);
   const mountedRef = useRef(true);
+
+  const setMcpRuntimeState = useCallback((workspaceId: string, state: RuntimeState) => {
+    setMcpRuntimeStates((current) =>
+      current[workspaceId] === state ? current : { ...current, [workspaceId]: state },
+    );
+  }, []);
+
+  const setActionsRuntimeState = useCallback((workspaceId: string, state: RuntimeState) => {
+    setActionsRuntimeStates((current) =>
+      current[workspaceId] === state ? current : { ...current, [workspaceId]: state },
+    );
+  }, []);
 
   const applyControlPlaneStatus = useCallback(
     (status: Awaited<ReturnType<typeof getControlPlaneStatus>>) => {
@@ -53,8 +79,10 @@ export function AdminProvider({ children }: { children: ReactNode }) {
         mcpStates[item.id] = item.mcpState;
         actionsStates[item.id] = item.actionsState;
       }
-      setMcpRuntimeStates(mcpStates);
-      setActionsRuntimeStates(actionsStates);
+      setMcpRuntimeStates((current) => (runtimeStatesEqual(current, mcpStates) ? current : mcpStates));
+      setActionsRuntimeStates((current) =>
+        runtimeStatesEqual(current, actionsStates) ? current : actionsStates,
+      );
     },
     [],
   );
@@ -77,21 +105,14 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       let lastFault = "";
       while (!cancelled) {
         try {
-          const batch = await getControlPlaneEvents(cursor, 15_000);
+          const batch = await getControlPlaneEvents(cursor, 25_000);
           if (cancelled) return;
           cursor = batch.nextCursor;
           lastFault = "";
           if (batch.events.length > 0 || batch.resetSources.length > 0) {
             applyControlPlaneStatus(await getControlPlaneStatus());
-          } else {
-            const items = await listWorkspaces();
             if (cancelled) return;
-            setWorkspaces((current) => {
-              const currentIds = new Set(current.map((item) => item.id));
-              const changed =
-                items.length !== currentIds.size || items.some((item) => !currentIds.has(item.id));
-              return changed ? items : current;
-            });
+            setControlPlaneRevision((revision) => revision + 1);
           }
         } catch (error) {
           if (cancelled) return;
@@ -125,15 +146,23 @@ export function AdminProvider({ children }: { children: ReactNode }) {
       workspaces,
       mcpRuntimeStates,
       actionsRuntimeStates,
+      controlPlaneRevision,
       loading,
       refreshWorkspaces,
       setWorkspaces,
-      setMcpRuntimeState: (workspaceId, state) =>
-        setMcpRuntimeStates((current) => ({ ...current, [workspaceId]: state })),
-      setActionsRuntimeState: (workspaceId, state) =>
-        setActionsRuntimeStates((current) => ({ ...current, [workspaceId]: state })),
+      setMcpRuntimeState,
+      setActionsRuntimeState,
     }),
-    [actionsRuntimeStates, loading, mcpRuntimeStates, refreshWorkspaces, workspaces],
+    [
+      actionsRuntimeStates,
+      controlPlaneRevision,
+      loading,
+      mcpRuntimeStates,
+      refreshWorkspaces,
+      setActionsRuntimeState,
+      setMcpRuntimeState,
+      workspaces,
+    ],
   );
 
   return <AdminContext.Provider value={value}>{children}</AdminContext.Provider>;

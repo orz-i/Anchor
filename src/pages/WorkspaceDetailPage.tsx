@@ -87,7 +87,16 @@ function canvsWebUrl(endpoint: string): string {
 export function WorkspaceDetailPage() {
   const params = useParams();
   const navigate = useNavigate();
-  const admin = useAdmin();
+  const {
+    workspaces,
+    mcpRuntimeStates,
+    actionsRuntimeStates,
+    controlPlaneRevision,
+    refreshWorkspaces,
+    setWorkspaces,
+    setMcpRuntimeState,
+    setActionsRuntimeState,
+  } = useAdmin();
   const [profile, setProfile] = useState<WorkspaceProfile | null>(null);
   const [frpProfiles, setFrpProfiles] = useState<FrpProfileDto[]>([]);
   const [loading, setLoading] = useState(true);
@@ -100,15 +109,15 @@ export function WorkspaceDetailPage() {
   const [mcpRuntime, setMcpRuntime] = useState<RuntimeStatus | null>(null);
   const [actionsRuntime, setActionsRuntime] = useState<RuntimeStatus | null>(null);
 
-  const workspaceId = params.id || admin.workspaces[0]?.id || "";
+  const workspaceId = params.id || workspaces[0]?.id || "";
 
   const refreshStatuses = useCallback(async (id: string) => {
     const [mcp, actions] = await Promise.all([getRuntimeStatus(id), getActionsRuntimeStatus(id)]);
     setMcpRuntime(mcp);
     setActionsRuntime(actions);
-    admin.setMcpRuntimeState(id, mcp.state);
-    admin.setActionsRuntimeState(id, actions.state);
-  }, [admin]);
+    setMcpRuntimeState(id, mcp.state);
+    setActionsRuntimeState(id, actions.state);
+  }, [setActionsRuntimeState, setMcpRuntimeState]);
 
   const load = useCallback(async () => {
     if (!workspaceId) {
@@ -136,13 +145,12 @@ export function WorkspaceDetailPage() {
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
-    if (!workspaceId) return;
-    const timer = window.setInterval(() => { if (!document.hidden) void refreshStatuses(workspaceId).catch((error) => setBackendError(String(error))); }, 5000);
-    return () => window.clearInterval(timer);
-  }, [refreshStatuses, workspaceId]);
+    if (!workspaceId || controlPlaneRevision === 0) return;
+    void refreshStatuses(workspaceId).catch((error) => setBackendError(String(error)));
+  }, [controlPlaneRevision, refreshStatuses, workspaceId]);
 
-  const mcpState: RuntimeState = mcpRuntime?.state ?? admin.mcpRuntimeStates[workspaceId] ?? "stopped";
-  const actionsState: RuntimeState = actionsRuntime?.state ?? admin.actionsRuntimeStates[workspaceId] ?? "stopped";
+  const mcpState: RuntimeState = mcpRuntime?.state ?? mcpRuntimeStates[workspaceId] ?? "stopped";
+  const actionsState: RuntimeState = actionsRuntime?.state ?? actionsRuntimeStates[workspaceId] ?? "stopped";
   const actions = profile ? actionsConfig(profile) : null;
   const mcpLocal = mcpRuntime?.localEndpoint || (profile ? mcpLocalEndpoint(profile.runtime.local_port) : "");
   const actionsLocal = actionsRuntime?.localEndpoint || (actions ? actionsLocalEndpoint(actions.local_port) : "");
@@ -150,8 +158,8 @@ export function WorkspaceDetailPage() {
   const actionsPublic = actionsRuntime?.publicEndpoint || "";
 
   const applyRuntime = (service: "mcp" | "actions", runtime: RuntimeStatus) => {
-    if (service === "mcp") { setMcpRuntime(runtime); admin.setMcpRuntimeState(workspaceId, runtime.state); }
-    else { setActionsRuntime(runtime); admin.setActionsRuntimeState(workspaceId, runtime.state); }
+    if (service === "mcp") { setMcpRuntime(runtime); setMcpRuntimeState(workspaceId, runtime.state); }
+    else { setActionsRuntime(runtime); setActionsRuntimeState(workspaceId, runtime.state); }
   };
 
   const toggleService = async (service: "mcp" | "actions") => {
@@ -172,7 +180,7 @@ export function WorkspaceDetailPage() {
     if (!profile) return;
     await updateWorkspace(next, profile);
     setProfile(next);
-    admin.setWorkspaces((items) => items.map((item) => item.id === next.id ? next : item));
+    setWorkspaces((items) => items.map((item) => item.id === next.id ? next : item));
     if (reload) await load();
   };
 
@@ -192,7 +200,7 @@ export function WorkspaceDetailPage() {
   const removeWorkspace = async () => {
     if (!profile || !window.confirm(`确定删除工作区「${profile.name}」？不会删除磁盘目录。`)) return;
     await deleteWorkspace(profile.id);
-    await admin.refreshWorkspaces();
+    await refreshWorkspaces();
     toast.success("工作区已删除");
     navigate("/workspaces", { replace: true });
   };

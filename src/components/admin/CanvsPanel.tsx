@@ -27,7 +27,7 @@ export function CanvsPanel({ workspaceId, localUrl = "", publicUrl = "", onTaskS
   const [snapshot, setSnapshot] = useState<CanvsSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const generation = useRef(0);
   const busyRef = useRef(false);
 
