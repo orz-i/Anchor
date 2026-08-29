@@ -182,6 +182,27 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    fn path_not_found(
+        &self,
+        requested_path: &str,
+        base: &Path,
+        candidate: &Path,
+    ) -> WorkspaceError {
+        WorkspaceError::ToolDetails {
+            code: "NOT_FOUND",
+            message: format!("Path not found: {requested_path}"),
+            category: "not_found",
+            retryable: false,
+            details: json!({
+                "requested_path": requested_path,
+                "base_path": relative_display(&self.root, base),
+                "resolved_path": relative_display(&self.root, candidate),
+                "resolution": "base_relative",
+                "suggestion": "Use a path relative to the reported base_path, or reset the session cwd before retrying."
+            }),
+        }
+    }
+
     pub fn new(root: PathBuf) -> WorkspaceResult<Self> {
         let root = root
             .canonicalize()
@@ -388,7 +409,7 @@ impl Workspace {
         };
         let resolved = candidate
             .canonicalize()
-            .map_err(|_| WorkspaceError::not_found(format!("Path not found: {raw}")))?;
+            .map_err(|_| self.path_not_found(raw, &self.root, &candidate))?;
         if !self.allow_external_reads && !resolved.starts_with(&self.root) {
             return Err(WorkspaceError::path_outside_workspace());
         }
@@ -413,7 +434,7 @@ impl Workspace {
         let candidate = base.join(raw.replace('/', std::path::MAIN_SEPARATOR_STR));
         let resolved = candidate
             .canonicalize()
-            .map_err(|_| WorkspaceError::not_found(format!("Path not found: {raw}")))?;
+            .map_err(|_| self.path_not_found(raw, &base, &candidate))?;
         self.ensure_inside_workspace(&candidate, &resolved)?;
         Ok(ResolvedPath {
             display: relative_display(&self.root, &resolved),
@@ -457,7 +478,7 @@ impl Workspace {
         if candidate.exists() || candidate.is_symlink() {
             let resolved = candidate
                 .canonicalize()
-                .map_err(|_| WorkspaceError::not_found(format!("Path not found: {raw_path}")))?;
+                .map_err(|_| self.path_not_found(raw_path, &self.root, &candidate))?;
             self.ensure_inside_workspace(&candidate, &resolved)?;
             return Ok(ResolvedPath {
                 display: relative_display(&self.root, &resolved),
@@ -533,7 +554,19 @@ impl Workspace {
     fn validate_base(&self, base: &Path) -> WorkspaceResult<PathBuf> {
         let resolved = base
             .canonicalize()
-            .map_err(|_| WorkspaceError::not_found("Base path not found"))?;
+            .map_err(|_| WorkspaceError::ToolDetails {
+                code: "NOT_FOUND",
+                message: "Base path not found".into(),
+                category: "not_found",
+                retryable: false,
+                details: json!({
+                    "requested_path": ".",
+                    "base_path": relative_display(&self.root, base),
+                    "resolved_path": relative_display(&self.root, base),
+                    "resolution": "base",
+                    "suggestion": "Reset the session cwd to an existing workspace directory before retrying."
+                }),
+            })?;
         if !resolved.is_dir() {
             return Err(WorkspaceError::not_a_directory("Base is not a directory"));
         }
@@ -778,6 +811,27 @@ mod tests {
             .resolve_read_path(&external.path().display().to_string())
             .expect_err("external read must be rejected");
         assert_eq!(error.to_error_value()["code"], "PATH_OUTSIDE_WORKSPACE");
+    }
+
+    #[test]
+    fn missing_path_reports_requested_base_and_resolved_diagnostics() {
+        let root = tempfile::tempdir().expect("workspace");
+        let base = root.path().join("mobile/app/android");
+        std::fs::create_dir_all(&base).expect("base");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let error = workspace
+            .resolve_existing_at(&base, "src/missing.kt")
+            .expect_err("missing path")
+            .to_error_value();
+
+        assert_eq!(error["code"], "NOT_FOUND");
+        assert_eq!(error["details"]["requested_path"], "src/missing.kt");
+        assert_eq!(error["details"]["base_path"], "mobile/app/android");
+        assert_eq!(
+            error["details"]["resolved_path"],
+            "mobile/app/android/src/missing.kt"
+        );
+        assert!(error["details"]["suggestion"].is_string());
     }
 
     #[test]

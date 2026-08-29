@@ -686,6 +686,68 @@ pub enum StreamEncoding {
     WindowsOem,
 }
 
+fn non_blocking_stderr_warnings(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("warning:")
+                && (lower.contains("lf will be replaced by crlf")
+                    || lower.contains("crlf will be replaced by lf"))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn attach_stderr_classification(
+    object: &mut serde_json::Map<String, Value>,
+    command_ok: Option<bool>,
+) {
+    let stderr = object
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let non_blocking = non_blocking_stderr_warnings(stderr);
+    let non_empty_line_count = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let classification = if stderr.trim().is_empty() {
+        "empty"
+    } else if command_ok == Some(false) {
+        "error"
+    } else if !non_blocking.is_empty() && non_blocking.len() == non_empty_line_count {
+        "non_blocking_warning"
+    } else {
+        "diagnostic"
+    };
+    object.insert(
+        "stderr_classification".into(),
+        Value::String(classification.into()),
+    );
+    object.insert(
+        "non_blocking_warnings".into(),
+        serde_json::to_value(&non_blocking).unwrap_or_else(|_| json!([])),
+    );
+    if !non_blocking.is_empty() {
+        let warnings = object
+            .entry("warnings")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(warnings) = warnings.as_array_mut() {
+            for warning in non_blocking {
+                if !warnings
+                    .iter()
+                    .any(|value| value.as_str() == Some(&warning))
+                {
+                    warnings.push(Value::String(warning));
+                }
+            }
+        }
+    }
+}
+
 pub fn finalize_execution_result(mut value: Value) -> Value {
     let transport_ok = value
         .get("transport_ok")
@@ -744,6 +806,7 @@ pub fn finalize_execution_result(mut value: Value) -> Value {
             command_ok.map(Value::Bool).unwrap_or(Value::Null),
         );
         object.insert("retryable".into(), Value::Bool(retryable));
+        attach_stderr_classification(object, command_ok);
         if command_ok == Some(false) || !transport_ok {
             let execution_started = object
                 .get("execution_started")
@@ -1413,6 +1476,41 @@ mod tests {
         assert_eq!(result["retryable"], false);
         assert_eq!(result["session_id"], Value::Null);
         assert_eq!(result["error"]["code"], "COMMAND_EXIT_NONZERO");
+    }
+
+    #[test]
+    fn git_line_ending_stderr_is_classified_as_non_blocking_warning() {
+        let warning = "warning: in the working copy of 'src/main.rs', LF will be replaced by CRLF the next time Git touches it";
+        let result = finalize_execution_result(json!({
+            "status": "exited",
+            "termination_reason": "exited",
+            "exit_code": 0,
+            "transport_ok": true,
+            "command_ok": true,
+            "stderr": warning,
+            "warnings": []
+        }));
+
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["stderr_classification"], "non_blocking_warning");
+        assert_eq!(result["non_blocking_warnings"], json!([warning]));
+        assert_eq!(result["warnings"], json!([warning]));
+    }
+
+    #[test]
+    fn successful_non_warning_stderr_remains_diagnostic() {
+        let result = finalize_execution_result(json!({
+            "status": "exited",
+            "termination_reason": "exited",
+            "exit_code": 0,
+            "transport_ok": true,
+            "command_ok": true,
+            "stderr": "compiler emitted progress",
+            "warnings": []
+        }));
+
+        assert_eq!(result["stderr_classification"], "diagnostic");
+        assert_eq!(result["non_blocking_warnings"], json!([]));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -239,6 +239,27 @@ pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
         ));
     }
 
+    let probes = json!({
+        "git": git,
+        "pwsh": pwsh,
+        "windows_powershell": windows_powershell,
+        "go": go,
+        "node": node,
+        "pnpm": pnpm,
+        "corepack": corepack,
+        "corepack_pnpm": corepack_pnpm,
+        "cargo": cargo,
+        "cargo_clippy": cargo_clippy,
+        "cargo_fmt": cargo_fmt,
+        "rustc": rustc,
+        "rustup": rustup,
+        "rustup_cargo": rustup_cargo,
+        "rustup_rustc_path": rustup_rustc_path,
+        "docker_cli": docker_cli,
+        "docker_daemon": docker_daemon
+    });
+    let probe_health = summarize_probe_health(&probes);
+
     json!({
         "platform": {
             "os": std::env::consts::OS,
@@ -253,25 +274,8 @@ pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
         "missing_required_tools": missing_required_tools,
         "git_line_endings": git_line_endings,
         "package_manager": declared,
-        "probes": {
-            "git": git,
-            "pwsh": pwsh,
-            "windows_powershell": windows_powershell,
-            "go": go,
-            "node": node,
-            "pnpm": pnpm,
-            "corepack": corepack,
-            "corepack_pnpm": corepack_pnpm,
-            "cargo": cargo,
-            "cargo_clippy": cargo_clippy,
-            "cargo_fmt": cargo_fmt,
-            "rustc": rustc,
-            "rustup": rustup,
-            "rustup_cargo": rustup_cargo,
-            "rustup_rustc_path": rustup_rustc_path,
-            "docker_cli": docker_cli,
-            "docker_daemon": docker_daemon
-        },
+        "probes": probes,
+        "probe_health": probe_health,
         "node_modules": node_modules,
         "docker_project_detected": docker_project,
         "checkout_kind": git_checkout_kind(root),
@@ -296,6 +300,33 @@ pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
                 .collect::<Vec<_>>()
         },
         "findings": findings
+    })
+}
+
+fn summarize_probe_health(probes: &Value) -> Value {
+    let mut unhealthy = Vec::new();
+    let mut transient = Vec::new();
+    let mut retryable = Vec::new();
+    if let Some(entries) = probes.as_object() {
+        for (name, probe) in entries {
+            if probe.get("healthy").and_then(Value::as_bool) == Some(false) {
+                unhealthy.push(name.clone());
+            }
+            if probe.get("transient").and_then(Value::as_bool) == Some(true) {
+                transient.push(name.clone());
+            }
+            if probe.get("retryable").and_then(Value::as_bool) == Some(true) {
+                retryable.push(name.clone());
+            }
+        }
+    }
+    json!({
+        "unhealthy_count": unhealthy.len(),
+        "unhealthy": unhealthy,
+        "transient_count": transient.len(),
+        "transient": transient,
+        "retryable": retryable,
+        "retry_recommended": !transient.is_empty()
     })
 }
 
@@ -334,6 +365,7 @@ pub fn summarize_diagnosis(full: &Value) -> Value {
         "docker_execution_allowed": full["docker_execution_allowed"],
         "docker_verification_healthy": full["docker_verification_healthy"],
         "recommended_verification_route": full["recommended_verification_route"],
+        "probe_health": full["probe_health"],
         "toolchain_search_path": {
             "effective_additions": full["toolchain_search_path"]["effective_additions"]
         },
@@ -744,8 +776,30 @@ fn unavailable_probe(message: &str) -> Value {
         "version": null,
         "path": null,
         "error": message,
-        "timed_out": false
+        "exit_code": null,
+        "timed_out": false,
+        "failure_stage": "dependency",
+        "classification": "dependency_unavailable",
+        "transient": false,
+        "retryable": false,
+        "duration_ms": 0,
+        "probe": null
     })
+}
+
+fn transient_probe_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "temporarily unavailable",
+        "resource busy",
+        "try again",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
 }
 
 fn probe(program: &str, args: &[&str], cwd: &Path, limit: Duration) -> Value {
@@ -770,6 +824,22 @@ fn probe_resolved(
     cwd: &Path,
     limit: Duration,
 ) -> Value {
+    let start = Instant::now();
+    let resolved_display = resolved.as_ref().map(|path| path.display().to_string());
+    let argv = std::iter::once(
+        resolved_display
+            .clone()
+            .unwrap_or_else(|| program.to_string()),
+    )
+    .chain(args.iter().map(|value| (*value).to_string()))
+    .collect::<Vec<_>>();
+    let probe = json!({
+        "program": program,
+        "resolved_executable": resolved_display,
+        "argv": argv,
+        "cwd": cwd.display().to_string(),
+        "timeout_ms": limit.as_millis()
+    });
     let output = crate::async_runtime::block_on(async {
         let mut command = probe_command(program, resolved.as_deref(), args);
         crate::platform::hide_tokio_console(&mut command);
@@ -789,25 +859,47 @@ fn probe_resolved(
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let healthy = output.status.success();
+            let transient = !healthy && transient_probe_message(&stderr);
             json!({
                 "found": resolved.is_some(),
-                "healthy": output.status.success(),
+                "healthy": healthy,
                 "version": if stdout.is_empty() { Value::Null } else { Value::String(stdout) },
                 "path": resolved.map(|path| path.display().to_string()),
-                "error": if output.status.success() || stderr.is_empty() { Value::Null } else { Value::String(stderr) },
+                "error": if healthy || stderr.is_empty() { Value::Null } else { Value::String(stderr) },
                 "exit_code": output.status.code(),
-                "timed_out": false
+                "timed_out": false,
+                "failure_stage": if healthy { Value::Null } else { json!("process") },
+                "classification": if healthy { "success" } else { "nonzero_exit" },
+                "transient": transient,
+                "retryable": transient,
+                "duration_ms": start.elapsed().as_millis(),
+                "probe": probe
             })
         }
-        Ok(Err(error)) => json!({
-            "found": resolved.is_some(),
-            "healthy": false,
-            "version": null,
-            "path": resolved.map(|path| path.display().to_string()),
-            "error": error.to_string(),
-            "exit_code": null,
-            "timed_out": false
-        }),
+        Ok(Err(error)) => {
+            let transient = matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+            );
+            json!({
+                "found": resolved.is_some(),
+                "healthy": false,
+                "version": null,
+                "path": resolved.map(|path| path.display().to_string()),
+                "error": error.to_string(),
+                "exit_code": null,
+                "timed_out": false,
+                "failure_stage": "spawn",
+                "classification": "spawn_failure",
+                "transient": transient,
+                "retryable": transient,
+                "duration_ms": start.elapsed().as_millis(),
+                "probe": probe
+            })
+        }
         Err(_) => json!({
             "found": resolved.is_some(),
             "healthy": false,
@@ -815,7 +907,13 @@ fn probe_resolved(
             "path": resolved.map(|path| path.display().to_string()),
             "error": format!("probe timed out after {} ms", limit.as_millis()),
             "exit_code": null,
-            "timed_out": true
+            "timed_out": true,
+            "failure_stage": "timeout",
+            "classification": "timeout",
+            "transient": true,
+            "retryable": true,
+            "duration_ms": start.elapsed().as_millis(),
+            "probe": probe
         }),
     }
 }
@@ -823,6 +921,44 @@ fn probe_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_spawn_failure_exposes_command_and_failure_classification() {
+        let root = tempfile::tempdir().expect("root");
+        let missing = root.path().join("definitely-missing-tool");
+        let result = probe_resolved(
+            "definitely-missing-tool",
+            Some(missing.clone()),
+            &["--version"],
+            root.path(),
+            Duration::from_millis(250),
+        );
+
+        assert_eq!(result["healthy"], false);
+        assert_eq!(result["failure_stage"], "spawn");
+        assert_eq!(result["classification"], "spawn_failure");
+        assert_eq!(
+            result["probe"]["resolved_executable"],
+            missing.display().to_string()
+        );
+        assert_eq!(result["probe"]["argv"][1], "--version");
+        assert!(result["duration_ms"].is_u64());
+    }
+
+    #[test]
+    fn probe_health_summary_surfaces_transient_retry_signal() {
+        let probes = json!({
+            "git": {"healthy": false, "transient": true, "retryable": true},
+            "node": {"healthy": true, "transient": false, "retryable": false},
+            "cargo": {"healthy": false, "transient": false, "retryable": false}
+        });
+        let summary = summarize_probe_health(&probes);
+
+        assert_eq!(summary["unhealthy_count"], 2);
+        assert_eq!(summary["transient_count"], 1);
+        assert_eq!(summary["retry_recommended"], true);
+        assert_eq!(summary["transient"], json!(["git"]));
+    }
 
     #[test]
     fn package_manager_uses_declared_version() {

@@ -1467,9 +1467,10 @@ pub fn output_schema(name: &str) -> Value {
                             "recommended_query": { "type": "string", "const": "anchor-core" },
                             "group_queries": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
                             "strategy": { "type": "string", "minLength": 1 },
-                            "host_followup_notice": { "type": "string", "minLength": 1 }
+                            "host_followup_notice": { "type": "string", "minLength": 1 },
+                            "catalog_publication": { "type": "object", "additionalProperties": true }
                         },
-                        "required": ["recommended_query", "group_queries", "strategy", "host_followup_notice"],
+                        "required": ["recommended_query", "group_queries", "strategy", "host_followup_notice", "catalog_publication"],
                         "additionalProperties": false
                     },
                     "command_cost_policy": { "type": "object" },
@@ -2026,6 +2027,8 @@ pub fn output_schema(name: &str) -> Value {
                 "stderr_truncated": { "type": "boolean" },
                 "stdout_complete": { "type": "boolean" },
                 "stderr_complete": { "type": "boolean" },
+                "stderr_classification": { "type": "string", "enum": ["empty", "non_blocking_warning", "diagnostic", "error"] },
+                "non_blocking_warnings": warnings_property(),
                 "duration_ms": { "type": "integer", "minimum": 0 },
                 "elapsed_ms": { "type": "integer", "minimum": 0 },
                 "execution_mode": { "type": "string", "minLength": 1 },
@@ -3075,7 +3078,6 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                     "title": title,
                     "description": description,
                     "inputSchema": input_schema,
-                    "outputSchema": output_schema(name),
                     "annotations": {
                         "title": title,
                         "readOnlyHint": read_only,
@@ -4469,13 +4471,47 @@ mod tests {
 
     #[test]
     fn every_advanced_tool_has_a_valid_output_schema() {
-        for tool in list_tools_for_profile("advanced") {
-            let name = tool["name"].as_str().expect("tool name");
-            let schema = tool.get("outputSchema").expect("output schema");
+        for name in exposed_tool_names("advanced") {
+            let schema = output_schema(name);
             assert_eq!(schema["type"], "object", "{name} output root");
-            jsonschema::meta::validate(schema)
+            jsonschema::meta::validate(&schema)
                 .unwrap_or_else(|error| panic!("{name} output schema: {error}"));
         }
+    }
+
+    #[test]
+    fn published_local_tools_do_not_repeat_internal_output_schemas() {
+        for tool in list_tools_for_profile("advanced") {
+            let name = tool["name"].as_str().expect("tool name");
+            assert!(
+                tool.get("outputSchema").is_none(),
+                "{name} should rely on internal output validation instead of publishing a duplicate outputSchema"
+            );
+        }
+    }
+
+    #[test]
+    fn omitting_published_output_schemas_materially_reduces_advanced_catalog_bytes() {
+        let published = list_tools_for_profile("advanced");
+        let published_bytes = serde_json::to_vec(&published)
+            .expect("published catalog")
+            .len();
+        let mut expanded = published.clone();
+        for tool in &mut expanded {
+            let name = tool["name"].as_str().expect("tool name").to_string();
+            tool["outputSchema"] = output_schema(&name);
+        }
+        let expanded_bytes = serde_json::to_vec(&expanded)
+            .expect("expanded catalog")
+            .len();
+        let saved_bytes = expanded_bytes.saturating_sub(published_bytes);
+        println!(
+            "advanced local catalog: published={published_bytes} expanded={expanded_bytes} saved={saved_bytes}"
+        );
+        assert!(
+            saved_bytes >= 20_000,
+            "output schema elision should save meaningful context bytes: {saved_bytes}"
+        );
     }
 
     #[test]

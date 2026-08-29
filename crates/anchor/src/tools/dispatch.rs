@@ -64,6 +64,129 @@ fn policy_tool_err(err: PolicyError) -> Value {
     })
 }
 
+fn attach_path_resolution_diagnostics(
+    ctx: &ToolContext,
+    session_id: Option<&str>,
+    name: &str,
+    requested_args: &Value,
+    effective_args: &Value,
+    output: &mut Value,
+) {
+    if output.get("ok").and_then(Value::as_bool) != Some(false) {
+        return;
+    }
+    let session_relative = matches!(
+        name,
+        "exec_command"
+            | "list_dir"
+            | "list_files"
+            | "read_file"
+            | "search"
+            | "grep"
+            | "search_text"
+            | "view_image"
+            | "remove_path"
+    );
+    let git_root_relative = matches!(
+        name,
+        "git_status"
+            | "git_log"
+            | "git_blame"
+            | "git_diff"
+            | "git_stage"
+            | "git_restore"
+            | "git_clean"
+    );
+    if !session_relative && !git_root_relative {
+        return;
+    }
+    let (requested_path, effective_path, field) = if name == "exec_command" {
+        (
+            requested_args
+                .get("workdir")
+                .or_else(|| requested_args.get("cwd"))
+                .cloned()
+                .unwrap_or_else(|| json!(".")),
+            effective_args
+                .get("workdir")
+                .or_else(|| effective_args.get("cwd"))
+                .cloned()
+                .unwrap_or_else(|| json!(".")),
+            "workdir",
+        )
+    } else if requested_args.get("paths").is_some() || effective_args.get("paths").is_some() {
+        (
+            requested_args
+                .get("paths")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            effective_args
+                .get("paths")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "paths",
+        )
+    } else {
+        (
+            requested_args
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| json!(".")),
+            effective_args
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| json!(".")),
+            "path",
+        )
+    };
+    let base_path = if git_root_relative {
+        ctx.workspace.root().display().to_string()
+    } else {
+        ctx.default_cwd_path_for(session_id).display().to_string()
+    };
+    let resolve_one = |path: &str| {
+        ctx.workspace
+            .root()
+            .join(path.replace('/', std::path::MAIN_SEPARATOR_STR))
+            .display()
+            .to_string()
+    };
+    let resolved_path = if let Some(path) = effective_path.as_str() {
+        json!(resolve_one(path))
+    } else if let Some(paths) = effective_path.as_array() {
+        Value::Array(
+            paths
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(|path| Value::String(resolve_one(path)))
+                        .unwrap_or(Value::Null)
+                })
+                .collect(),
+        )
+    } else {
+        Value::Null
+    };
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "path_resolution".into(),
+            json!({
+                "field": field,
+                "base_kind": if git_root_relative { "git_worktree_root" } else { "session_cwd" },
+                "base_path": base_path,
+                "requested_path": requested_path,
+                "effective_path": effective_path,
+                "resolved_path": resolved_path,
+                "suggestion": if git_root_relative {
+                    "Pass Git pathspecs relative to the Git worktree root; session cwd is intentionally ignored."
+                } else {
+                    "Pass path/workdir relative to the current session cwd. Use cwd operation=get to inspect or cwd operation=set to reset it."
+                }
+            }),
+        );
+    }
+}
+
 fn task_recovery_trackable(tool: &str) -> bool {
     matches!(
         tool,
@@ -1165,6 +1288,14 @@ fn call_tool_impl(
         let output = policy_tool_err(e);
         let mut output =
             normalize_exec_preflight_result(ctx, name, &effective_args, output, "rejected");
+        attach_path_resolution_diagnostics(
+            ctx,
+            session_id,
+            name,
+            args,
+            &effective_args,
+            &mut output,
+        );
         track_task_recovery(
             ctx,
             initial_task.as_ref().map(|task| task.id.as_str()),
@@ -1647,6 +1778,7 @@ fn call_tool_impl(
             }
         }
     }
+    attach_path_resolution_diagnostics(ctx, session_id, name, args, &effective_args, &mut output);
     track_task_recovery(
         ctx,
         task_id
@@ -2196,6 +2328,19 @@ fn server_info_for_session(
         })
     };
     let schema_telemetry = catalog_schema_telemetry(&running_catalog.tools);
+    let catalog_publication = json!({
+        "local_output_schema": "internal_only",
+        "proxy_output_schema": "preserved",
+        "internal_output_validation": true,
+        "reason": "MCP outputSchema is optional; Anchor validates local structured results internally and omits duplicate output schemas from tools/list to reduce host context cost."
+    });
+    let schema_discovery = json!({
+        "recommended_query": "anchor-core",
+        "group_queries": ["anchor-core", "anchor-skill", "anchor-files", "anchor-command", "anchor-git"],
+        "strategy": "Load one tagged schema group per workflow instead of repeatedly discovering exact tool names.",
+        "host_followup_notice": "A separate 'found tools; listed in the follow-up message' response is rendered by the lazy-schema host, not by the Anchor MCP server.",
+        "catalog_publication": catalog_publication
+    });
     let mut response = tool_ok(json!({
         "server": crate::brand::SERVER_NAME,
         "title": crate::brand::PRODUCT_NAME,
@@ -2231,12 +2376,7 @@ fn server_info_for_session(
         "current_catalog_estimated_tokens": current_catalog.estimated_tokens,
         "current_local_tool_count": current_catalog.local_count,
         "current_proxy_tool_count": current_catalog.proxy_count,
-        "schema_discovery": {
-            "recommended_query": "anchor-core",
-            "group_queries": ["anchor-core", "anchor-skill", "anchor-files", "anchor-command", "anchor-git"],
-            "strategy": "Load one tagged schema group per workflow instead of repeatedly discovering exact tool names.",
-            "host_followup_notice": "A separate 'found tools; listed in the follow-up message' response is rendered by the lazy-schema host, not by the Anchor MCP server."
-        },
+        "schema_discovery": schema_discovery,
         "command_cost_policy": command_cost_policy,
         "downstream_mcp": downstream_mcp.clone(),
         "connection_layers": connection_layers
@@ -2424,6 +2564,17 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
         .as_str()
         .is_some_and(|route| matches!(route, "host" | "docker"));
     let healthy = workspace_exec_available && actionable_verification_route;
+    let transient_probe_failure = !healthy
+        && full_development_environment["probe_health"]["retry_recommended"] == Value::Bool(true);
+    let health_classification = if healthy {
+        "healthy"
+    } else if !workspace_exec_available {
+        "workspace_boundary"
+    } else if transient_probe_failure {
+        "transient_probe"
+    } else {
+        "environment"
+    };
     let development_environment = if detail == "full" {
         full_development_environment
     } else {
@@ -2436,8 +2587,10 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
         "detail": detail,
         "full_detail_available": true,
         "healthy": healthy,
-        "status": if healthy { "healthy" } else { "degraded" },
-        "retryable": !healthy,
+        "status": if healthy { "healthy" } else if transient_probe_failure { "transient_degraded" } else { "degraded" },
+        "health_classification": health_classification,
+        "transient": transient_probe_failure,
+        "retryable": transient_probe_failure,
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
         "network_allowed": ctx.policy.network_allowed(),
@@ -2605,6 +2758,36 @@ mod tests {
             &json!({"paths": ["mobile/app/android/build.gradle"]}),
         );
         assert_eq!(git["paths"], json!(["mobile/app/android/build.gradle"]));
+    }
+
+    #[test]
+    fn failed_path_call_reports_original_and_effective_cwd_resolution() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let nested = workspace.path().join("mobile/app/android");
+        std::fs::create_dir_all(&nested).expect("nested cwd");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        ctx.set_default_cwd(nested.canonicalize().expect("canonical cwd"));
+
+        let result = call_tool_with_cancellation(
+            &ctx,
+            "list_files",
+            &json!({"path": "missing"}),
+            &CancellationToken::default(),
+        );
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["path_resolution"]["base_kind"], "session_cwd");
+        assert_eq!(result["path_resolution"]["requested_path"], "missing");
+        assert_eq!(
+            result["path_resolution"]["effective_path"],
+            "mobile/app/android/missing"
+        );
+        assert!(result["path_resolution"]["resolved_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("mobile/app/android/missing")));
     }
 
     #[test]

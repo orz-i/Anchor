@@ -324,14 +324,18 @@ fn validate_tool_definition(tool: &Value, index: usize) -> Result<(), WorkspaceE
                 json!({"index": index}),
             )
         })?;
-    for field in ["inputSchema", "outputSchema"] {
-        let schema = object.get(field).ok_or_else(|| {
-            catalog_error(
-                "EFFECTIVE_CATALOG_MISSING_SCHEMA",
-                format!("Tool {name} is missing {field}"),
-                json!({"tool": name, "field": field}),
-            )
-        })?;
+    let input_schema = object.get("inputSchema").ok_or_else(|| {
+        catalog_error(
+            "EFFECTIVE_CATALOG_MISSING_SCHEMA",
+            format!("Tool {name} is missing inputSchema"),
+            json!({"tool": name, "field": "inputSchema"}),
+        )
+    })?;
+    for (field, schema) in std::iter::once(("inputSchema", input_schema)).chain(
+        object
+            .get("outputSchema")
+            .map(|schema| ("outputSchema", schema)),
+    ) {
         if !schema.is_object() || schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(catalog_error(
                 "EFFECTIVE_CATALOG_INVALID_SCHEMA",
