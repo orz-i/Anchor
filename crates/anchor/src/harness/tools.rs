@@ -1164,6 +1164,18 @@ fn begin_work_session(
         .harness
         .status_for_task(Some(&task.id))
         .map_err(map_error)?;
+    let previous_session_status = session_state
+        .get("previous_status")
+        .cloned()
+        .unwrap_or_else(|| json!("active"));
+    let current_session_status = session_state
+        .get("session_status")
+        .cloned()
+        .unwrap_or_else(|| json!("active"));
+    let session_reactivated = session_state
+        .get("reactivated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(json!({
         "work_session": {
             "status": "active",
@@ -1182,6 +1194,26 @@ fn begin_work_session(
             "expected_state": task.expected_state
         },
         "session": compact_session_view(&session_state),
+        "session_state_transition": {
+            "from": previous_session_status,
+            "to": current_session_status,
+            "changed": session_reactivated,
+            "reason": if session_reactivated { "begin_work_session" } else { "already_active" }
+        },
+        "state_scopes": {
+            "session_lease": {
+                "status": session_state.get("session_status").cloned().unwrap_or(Value::Null),
+                "reactivated": session_reactivated
+            },
+            "harness_task": {
+                "status": task.status,
+                "phase": task.phase
+            },
+            "checkpoint": {
+                "count": session_state.get("checkpoint_count").cloned().unwrap_or(Value::Null),
+                "session_lifecycle_status": session_state.get("session_status").cloned().unwrap_or(Value::Null)
+            }
+        },
         "task": task_view(&task),
         "harness": harness,
         "reconnect_required": false
@@ -1194,6 +1226,8 @@ fn compact_session_view(session: &Value) -> Value {
         "session_path": session.get("session_path").cloned().unwrap_or(Value::Null),
         "created": session.get("created").cloned().unwrap_or(Value::Bool(false)),
         "resumed": session.get("resumed").cloned().unwrap_or(Value::Bool(false)),
+        "previous_status": session.get("previous_status").cloned().unwrap_or(Value::Null),
+        "reactivated": session.get("reactivated").cloned().unwrap_or(Value::Bool(false)),
         "session_status": session.get("session_status").cloned().unwrap_or(Value::Null),
         "checkpoint_count": session.get("checkpoint_count").cloned().unwrap_or(Value::Null),
         "history_injected": session.get("history_injected").cloned().unwrap_or(Value::Bool(false)),

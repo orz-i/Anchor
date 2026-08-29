@@ -745,7 +745,59 @@ pub fn finalize_execution_result(mut value: Value) -> Value {
         );
         object.insert("retryable".into(), Value::Bool(retryable));
         if command_ok == Some(false) || !transport_ok {
+            let execution_started = object
+                .get("execution_started")
+                .and_then(Value::as_bool)
+                .unwrap_or(!matches!(
+                    reason.as_str(),
+                    "spawn_failed" | "command_rejected"
+                ));
+            let failure_stage = object
+                .get("failure_stage")
+                .and_then(Value::as_str)
+                .unwrap_or(match reason.as_str() {
+                    "command_rejected" => "pre_spawn",
+                    "spawn_failed" => "spawn",
+                    _ if !execution_started => "pre_spawn",
+                    _ => "process",
+                })
+                .to_string();
+            let duration_ms = object
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .or_else(|| object.get("execution_duration_ms").and_then(Value::as_u64))
+                .or_else(|| object.get("elapsed_ms").and_then(Value::as_u64))
+                .unwrap_or(0);
+            let stdout_empty = object
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            let stderr_empty = object
+                .get("stderr")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            let short_empty_process_failure =
+                failure_stage == "process" && duration_ms <= 250 && stdout_empty && stderr_empty;
+            let failure_classification = object
+                .get("failure_classification")
+                .and_then(Value::as_str)
+                .unwrap_or(
+                    if matches!(failure_stage.as_str(), "pre_spawn" | "spawn")
+                        || short_empty_process_failure
+                        || matches!(reason.as_str(), "timeout" | "killed" | "server_restart")
+                    {
+                        "infrastructure"
+                    } else {
+                        "command"
+                    },
+                )
+                .to_string();
             object.insert("ok".into(), Value::Bool(false));
+            object.insert("failure_stage".into(), Value::String(failure_stage.clone()));
+            object.insert(
+                "failure_classification".into(),
+                Value::String(failure_classification.clone()),
+            );
             let exit_code = object.get("exit_code").cloned().unwrap_or(Value::Null);
             let session_id = object.get("session_id").cloned().unwrap_or(Value::Null);
             let error_code = match reason.as_str() {
@@ -772,11 +824,24 @@ pub fn finalize_execution_result(mut value: Value) -> Value {
                     "details": {
                         "termination_reason": reason,
                         "execution_status": execution_status,
+                        "failure_stage": failure_stage,
+                        "failure_classification": failure_classification,
                         "exit_code": exit_code,
                         "session_id": session_id
                     }
                 })
             });
+            if short_empty_process_failure {
+                let warnings = object
+                    .entry("warnings")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(warnings) = warnings.as_array_mut() {
+                    warnings.push(Value::String(
+                        "Process exited almost immediately without stdout/stderr; classify this as an infrastructure/startup failure before treating it as a test failure."
+                            .into(),
+                    ));
+                }
+            }
         } else {
             object.entry("ok").or_insert(Value::Bool(true));
         }
@@ -788,10 +853,13 @@ pub fn list_command_sessions(
     store: &CommandSessionStore,
     args: &Value,
 ) -> Result<Value, WorkspaceError> {
-    let include_terminal = args
-        .get("include_terminal")
+    let include_history = args
+        .get("include_history")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .or_else(|| args.get("include_terminal").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let running_only_compat = args.get("include_history").is_none()
+        && args.get("include_terminal").and_then(Value::as_bool) == Some(false);
     let max_output_bytes = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -812,12 +880,21 @@ pub fn list_command_sessions(
         .map(str::to_string)
         .collect::<Vec<_>>();
     let running_count = running_session_ids.len();
-    let sessions = if include_terminal {
+    let retained_total_count = all_sessions.len();
+    let sessions = if include_history {
         all_sessions
-    } else {
+    } else if running_only_compat {
         all_sessions
             .into_iter()
             .filter(|session| session.get("execution_status") == Some(&json!("running")))
+            .collect::<Vec<_>>()
+    } else {
+        all_sessions
+            .into_iter()
+            .filter(|session| {
+                session.get("execution_status") == Some(&json!("running"))
+                    || session.get("result_observed") == Some(&Value::Bool(false))
+            })
             .collect::<Vec<_>>()
     };
     let session_count = sessions.len();
@@ -834,6 +911,9 @@ pub fn list_command_sessions(
         .count();
     Ok(tool_ok(json!({
         "sessions": sessions,
+        "scope": if include_history { "history" } else if running_only_compat { "running" } else { "pending" },
+        "history_included": include_history,
+        "retained_total_count": retained_total_count,
         "session_count": session_count,
         "running_count": running_count,
         "terminal_count": terminal_count,

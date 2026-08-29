@@ -1672,10 +1672,13 @@ impl Harness {
                     return Ok(None);
                 };
                 let retry_key_matches = recovery_key.is_some_and(|key| key == recovery.id);
+                let fingerprint_matches = recovery.step_fingerprint.as_deref() == step_fingerprint;
+                let safe_corrected_retry = !recovery.explicit_retry_identity
+                    && !recovery.workspace_mutated
+                    && recovery.failed_step == succeeded_step;
                 if recovery.status != TaskRecoveryStatus::Open
                     || recovery.failed_step != succeeded_step
-                    || (!retry_key_matches
-                        && recovery.step_fingerprint.as_deref() != step_fingerprint)
+                    || (!retry_key_matches && !fingerprint_matches && !safe_corrected_retry)
                 {
                     return Ok(None);
                 }
@@ -1690,7 +1693,16 @@ impl Harness {
                     task_id,
                     "task_recovery_resolved",
                     Some(succeeded_step),
-                    json!({"recovery_id": recovery.id}),
+                    json!({
+                        "recovery_id": recovery.id,
+                        "resolution_match": if retry_key_matches {
+                            "recovery_key"
+                        } else if fingerprint_matches {
+                            "step_fingerprint"
+                        } else {
+                            "corrected_non_mutating_retry"
+                        }
+                    }),
                     json!({"ok": true}),
                 ))?;
                 Ok(Some(recovery))
@@ -2710,6 +2722,89 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn corrected_non_mutating_retry_resolves_same_step_without_recovery_key() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("corrected retry").expect("task");
+        harness
+            .record_recovery(
+                &task.id,
+                "git_stage",
+                Some("bad-path-fingerprint"),
+                "tooling_failure",
+                Some("NOT_FOUND"),
+                None,
+                false,
+                false,
+                "not_required",
+                vec![],
+                "task",
+            )
+            .expect("recovery");
+
+        let resolved = harness
+            .resolve_recovery_for_attempt(
+                &task.id,
+                "git_stage",
+                Some("corrected-path-fingerprint"),
+                None,
+            )
+            .expect("resolve")
+            .expect("resolved recovery");
+
+        assert_eq!(resolved.status, TaskRecoveryStatus::Resolved);
+        assert_eq!(resolved.resolved_by_step.as_deref(), Some("git_stage"));
+    }
+
+    #[test]
+    fn mutated_recovery_still_requires_exact_retry_identity() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("mutated recovery").expect("task");
+        let opened = harness
+            .record_recovery(
+                &task.id,
+                "apply_patch",
+                Some("original-fingerprint"),
+                "tooling_failure",
+                Some("PATCH_FAILED"),
+                None,
+                false,
+                true,
+                "required",
+                vec![],
+                "task",
+            )
+            .expect("recovery");
+
+        assert!(harness
+            .resolve_recovery_for_attempt(
+                &task.id,
+                "apply_patch",
+                Some("different-fingerprint"),
+                None,
+            )
+            .expect("resolve attempt")
+            .is_none());
+        assert_eq!(
+            harness.task(&task.id).expect("task").recovery.unwrap().id,
+            opened.id
+        );
     }
 
     #[test]

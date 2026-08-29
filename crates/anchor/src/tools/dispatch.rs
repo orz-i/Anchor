@@ -155,6 +155,12 @@ fn track_task_recovery(
     if !task_recovery_trackable(tool) {
         return;
     }
+    if output.get("failure_classification").and_then(Value::as_str) == Some("infrastructure")
+        && output.get("failure_stage").and_then(Value::as_str) != Some("test")
+    {
+        return;
+    }
+
     if tool == "apply_patch"
         && args
             .get("dry_run")
@@ -641,6 +647,18 @@ fn record_verification_from_output(
         }
         return;
     }
+    if output.get("failure_classification").and_then(Value::as_str) == Some("infrastructure")
+        && output.get("failure_stage").and_then(Value::as_str) != Some("test")
+    {
+        if let Some(object) = output.as_object_mut() {
+            object.insert("verification_skipped".into(), Value::Bool(true));
+            object.insert(
+                "verification_skip_reason".into(),
+                Value::String("infrastructure_failure_before_test".into()),
+            );
+        }
+        return;
+    }
     let Some(command_passed) = output.get("command_ok").and_then(Value::as_bool) else {
         if let Some(object) = output.as_object_mut() {
             object.insert("verification_skipped".into(), Value::Bool(true));
@@ -653,12 +671,19 @@ fn record_verification_from_output(
     };
     let mut passed = command_passed;
     let mut supersede_previous_failures = supersede_previous_failures;
-    if command_passed && identity.kind.eq_ignore_ascii_case("test") {
+    if identity.kind.eq_ignore_ascii_case("test") {
         if let Some(test_count) = explicit_test_count(output) {
             if let Some(object) = output.as_object_mut() {
                 object.insert("verification_test_count".into(), json!(test_count));
+                if !command_passed && test_count > 0 {
+                    object.insert("failure_stage".into(), Value::String("test".into()));
+                    object.insert(
+                        "failure_classification".into(),
+                        Value::String("test_failure".into()),
+                    );
+                }
             }
-            if test_count == 0 {
+            if command_passed && test_count == 0 {
                 passed = false;
                 supersede_previous_failures = false;
                 if let Some(object) = output.as_object_mut() {
@@ -1791,36 +1816,28 @@ fn apply_default_cwd(
 
     let mut effective = args.clone();
     match name {
-        "exec_command" if effective.get("workdir").is_none() && effective.get("cwd").is_none() => {
-            effective["workdir"] = Value::String(base.clone());
+        "exec_command" => {
+            let workdir = effective
+                .get("workdir")
+                .or_else(|| effective.get("cwd"))
+                .and_then(Value::as_str)
+                .unwrap_or(".");
+            effective["workdir"] = Value::String(prefix_relative_path(&base, workdir));
         }
-        "list_dir" | "list_files" | "git_status" | "git_log" => {
+        "list_dir" | "list_files" => {
             let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
             effective["path"] = Value::String(prefix_relative_path(&base, path));
         }
-        "read_file" | "search" | "grep" | "search_text" | "git_blame" | "view_image"
-        | "remove_path" => {
+        "read_file" | "search" | "grep" | "search_text" | "view_image" | "remove_path" => {
             if let Some(path) = effective.get("path").and_then(Value::as_str) {
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
         }
-        "git_diff" | "git_stage" | "git_restore" | "git_clean" => {
-            if let Some(path) = effective.get("path").and_then(Value::as_str) {
-                effective["path"] = Value::String(prefix_relative_path(&base, path));
-            }
-            if let Some(paths) = effective.get("paths").and_then(Value::as_array).cloned() {
-                effective["paths"] = Value::Array(
-                    paths
-                        .iter()
-                        .map(|path| {
-                            path.as_str()
-                                .map(|value| Value::String(prefix_relative_path(&base, value)))
-                                .unwrap_or_else(|| path.clone())
-                        })
-                        .collect(),
-                );
-            }
-        }
+        // Git pathspecs are intentionally worktree-root-relative. They must not
+        // inherit the session cwd: Git already has a stable repository root and
+        // coupling pathspecs to cwd makes stage/diff/restore unpredictable.
+        "git_status" | "git_log" | "git_blame" | "git_diff" | "git_stage" | "git_restore"
+        | "git_clean" => {}
         "apply_patch" | "patch_check" => {
             if let Some(patch) = effective.get("patch").and_then(Value::as_str) {
                 effective["patch"] = Value::String(prefix_patch_paths(&base, patch));
@@ -1838,7 +1855,18 @@ fn prefix_relative_path(base: &str, path: &str) -> String {
     if Path::new(path).is_absolute() || path.starts_with("..") {
         return path.to_string();
     }
-    format!("{base}/{}", path.trim_start_matches("./"))
+    let normalized_base = base.replace('\\', "/").trim_matches('/').to_string();
+    let normalized_path = path
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string();
+    if normalized_path == normalized_base
+        || normalized_path.starts_with(&format!("{normalized_base}/"))
+    {
+        return normalized_path;
+    }
+    format!("{normalized_base}/{normalized_path}")
 }
 
 fn prefix_patch_paths(base: &str, patch: &str) -> String {
@@ -2506,8 +2534,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        call_tool_with_cancellation, preserve_completed_result, record_verification_from_output,
-        VerificationIdentity,
+        apply_default_cwd, call_tool_with_cancellation, prefix_relative_path,
+        preserve_completed_result, record_verification_from_output, VerificationIdentity,
     };
     use crate::tools::{CancellationToken, ToolContext};
 
@@ -2522,6 +2550,61 @@ mod tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["cancellation_after_completion"], true);
         assert_eq!(result["affected_files"], json!(["probe.txt"]));
+    }
+
+    #[test]
+    fn cwd_relative_paths_deduplicate_an_already_prefixed_repo_path() {
+        assert_eq!(
+            prefix_relative_path("mobile/app/android", "mobile/app/android"),
+            "mobile/app/android"
+        );
+        assert_eq!(
+            prefix_relative_path("mobile/app/android", "mobile/app/android/src"),
+            "mobile/app/android/src"
+        );
+        assert_eq!(
+            prefix_relative_path("mobile/app/android", "src"),
+            "mobile/app/android/src"
+        );
+    }
+
+    #[test]
+    fn exec_workdir_is_session_cwd_relative_while_git_paths_stay_repo_root_relative() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let nested = workspace.path().join("mobile/app/android");
+        std::fs::create_dir_all(&nested).expect("nested cwd");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        ctx.set_default_cwd(nested.canonicalize().expect("canonical cwd"));
+
+        let exec_dot = apply_default_cwd(&ctx, None, "exec_command", &json!({"workdir": "."}));
+        assert_eq!(exec_dot["workdir"], "mobile/app/android");
+
+        let exec_prefixed = apply_default_cwd(
+            &ctx,
+            None,
+            "exec_command",
+            &json!({"workdir": "mobile/app/android"}),
+        );
+        assert_eq!(exec_prefixed["workdir"], "mobile/app/android");
+
+        let files = apply_default_cwd(
+            &ctx,
+            None,
+            "list_files",
+            &json!({"path": "mobile/app/android"}),
+        );
+        assert_eq!(files["path"], "mobile/app/android");
+
+        let git = apply_default_cwd(
+            &ctx,
+            None,
+            "git_stage",
+            &json!({"paths": ["mobile/app/android/build.gradle"]}),
+        );
+        assert_eq!(git["paths"], json!(["mobile/app/android/build.gradle"]));
     }
 
     #[test]
@@ -2607,6 +2690,95 @@ mod tests {
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
+    }
+
+    #[test]
+    fn infrastructure_failure_before_tests_is_not_recorded_as_test_failure() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx
+            .harness
+            .start_task("gradle startup failure")
+            .expect("task");
+        let mut output = json!({
+            "ok": false,
+            "execution_started": true,
+            "command_ok": false,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "",
+            "failure_stage": "process",
+            "failure_classification": "infrastructure"
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "gradlew.bat test --tests ExampleTest",
+                verification_key: Some("example-test"),
+                test_file: Some("ExampleTest"),
+                test_name: Some("ExampleTest"),
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["verification_skipped"], true);
+        assert_eq!(
+            output["verification_skip_reason"],
+            "infrastructure_failure_before_test"
+        );
+        assert!(ctx
+            .harness
+            .list_verifications(&task.id)
+            .expect("verifications")
+            .is_empty());
+    }
+
+    #[test]
+    fn observed_test_execution_promotes_nonzero_command_to_test_failure_stage() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("real test failure").expect("task");
+        let mut output = json!({
+            "ok": false,
+            "execution_started": true,
+            "command_ok": false,
+            "exit_code": 1,
+            "stdout": "running 2 tests\ntest example_a ... FAILED\ntest example_b ... ok\n",
+            "stderr": "assertion failed",
+            "failure_stage": "process",
+            "failure_classification": "command"
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "cargo test example",
+                verification_key: Some("example-test"),
+                test_file: None,
+                test_name: Some("example"),
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["verification_test_count"], 2);
+        assert_eq!(output["failure_stage"], "test");
+        assert_eq!(output["failure_classification"], "test_failure");
+        assert_eq!(output["verification"]["status"], "failed");
     }
 
     #[test]

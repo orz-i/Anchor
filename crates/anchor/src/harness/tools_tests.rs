@@ -18,6 +18,71 @@ fn timestamp() -> String {
 }
 
 #[test]
+fn begin_work_session_reports_session_reactivation_without_conflating_task_state() {
+    let temp = tempdir().expect("temp");
+    let workspace = temp.path().join("workspace");
+    let harness_root = temp.path().join("harness");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let ctx = ToolContext::for_test(workspace.clone(), harness_root).expect("context");
+    let started = call(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "session transition diagnostics",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+        &CancellationToken::default(),
+        None,
+    )
+    .expect("begin");
+    let session_id = started["work_session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let expected_path = started["work_session"]["session_path"]
+        .as_str()
+        .expect("session path")
+        .to_string();
+    crate::tools::session::checkpoint(
+        &ctx,
+        &json!({
+            "session_id": session_id,
+            "expected_path": expected_path,
+            "turn_id": "pause-before-begin",
+            "user_intent": "pause session document",
+            "session_status": "paused"
+        }),
+        None,
+    )
+    .expect("pause checkpoint");
+
+    let resumed = call(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "session transition diagnostics",
+            "workspace_root": workspace.to_string_lossy(),
+            "session_id": started["work_session"]["session_id"]
+        }),
+        &CancellationToken::default(),
+        None,
+    )
+    .expect("resume begin");
+
+    assert_eq!(resumed["session_state_transition"]["from"], "paused");
+    assert_eq!(resumed["session_state_transition"]["to"], "active");
+    assert_eq!(resumed["session_state_transition"]["changed"], true);
+    assert_eq!(
+        resumed["session_state_transition"]["reason"],
+        "begin_work_session"
+    );
+    assert_eq!(resumed["state_scopes"]["session_lease"]["status"], "active");
+    assert_eq!(resumed["state_scopes"]["harness_task"]["status"], "active");
+    assert_eq!(resumed["session"]["previous_status"], "paused");
+    assert_eq!(resumed["session"]["reactivated"], true);
+}
+
+#[test]
 fn close_outbox_recovers_on_next_harness_call_after_restart() {
     let temp = tempdir().expect("temp");
     let workspace = temp.path().join("workspace");

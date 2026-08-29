@@ -1608,6 +1608,9 @@ pub fn output_schema(name: &str) -> Value {
         "list_command_sessions" => success_output_schema(
             json!({
                 "sessions": { "type": "array", "items": { "type": "object" } },
+                "scope": { "type": "string", "enum": ["pending", "running", "history"] },
+                "history_included": { "type": "boolean" },
+                "retained_total_count": { "type": "integer", "minimum": 0 },
                 "session_count": { "type": "integer", "minimum": 0 },
                 "running_count": { "type": "integer", "minimum": 0 },
                 "terminal_count": { "type": "integer", "minimum": 0 },
@@ -1625,6 +1628,9 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &[
                 "sessions",
+                "scope",
+                "history_included",
+                "retained_total_count",
                 "session_count",
                 "running_count",
                 "terminal_count",
@@ -2023,6 +2029,11 @@ pub fn output_schema(name: &str) -> Value {
                 "duration_ms": { "type": "integer", "minimum": 0 },
                 "elapsed_ms": { "type": "integer", "minimum": 0 },
                 "execution_mode": { "type": "string", "minLength": 1 },
+                "resolved_executable": { "type": "string", "minLength": 1 },
+                "argv": { "type": "array", "items": { "type": "string" } },
+                "failure_stage": { "type": "string", "enum": ["pre_spawn", "spawn", "process", "test"] },
+                "failure_classification": { "type": "string", "enum": ["infrastructure", "command", "test_failure"] },
+                "toolchain": { "type": "object", "additionalProperties": true },
                 "filesystem_scope": { "type": "string", "const": "workspace" },
                 "sandbox_enforced": { "type": "boolean" },
                 "execution_boundary": { "type": "string", "minLength": 1 },
@@ -2668,6 +2679,8 @@ pub fn output_schema(name: &str) -> Value {
             json!({
                 "work_session": { "type": "object" },
                 "session": { "type": "object" },
+                "session_state_transition": { "type": "object" },
+                "state_scopes": { "type": "object" },
                 "task": { "type": "object" },
                 "harness": { "type": "object" },
                 "reconnect_required": { "type": "boolean", "const": false }
@@ -2675,6 +2688,8 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "work_session",
                 "session",
+                "session_state_transition",
+                "state_scopes",
                 "task",
                 "harness",
                 "reconnect_required",
@@ -3922,8 +3937,8 @@ pub fn input_schema(name: &str) -> Value {
                     "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
                     "description": "Workspace-relative toolchain directories to prepend to this child process PATH and use when resolving the requested executable. Parent traversal and paths resolving outside the workspace are rejected."
                 },
-                "shell": { "type": "string", "enum": ["direct", "pwsh", "powershell", "cmd"], "description": "Optional explicit Windows shell. Use direct with executable for shell-free execution." },
-                "workdir": { "type": "string", "default": "." },
+                "shell": { "type": "string", "enum": ["direct", "pwsh", "powershell", "cmd"], "description": "Optional explicit Windows shell. Use direct with executable for shell-free execution. Do not launch the same shell family again inside args; redundant PowerShell/cmd nesting is rejected before spawn." },
+                "workdir": { "type": "string", "default": ".", "description": "Working directory relative to the current session cwd. '.' means the session cwd. Paths already prefixed by the current cwd are de-duplicated instead of being joined twice." },
                 "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 30000 },
                 "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 32768 },
                 "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
@@ -4036,7 +4051,8 @@ pub fn input_schema(name: &str) -> Value {
         "list_command_sessions" => json!({
             "type": "object",
             "properties": {
-                "include_terminal": { "type": "boolean", "default": true },
+                "include_history": { "type": "boolean", "default": false, "description": "Include consumed terminal command-session history. By default only running and terminal-unconsumed sessions are returned." },
+                "include_terminal": { "type": "boolean", "description": "Compatibility alias: true includes terminal history; false requests running sessions only. Prefer include_history for new callers." },
                 "max_output_bytes": { "type": "integer", "minimum": 0, "maximum": 65536, "default": 4096 }
             },
             "additionalProperties": false

@@ -1226,18 +1226,32 @@ impl Drop for RipgrepPathOutput {
     }
 }
 
-fn ripgrep_prefilter(
-    root: &Path,
-    query: &str,
+struct RipgrepPrefilter<'a> {
+    root: &'a Path,
+    query: &'a str,
     use_regex: bool,
     case_sensitive: bool,
-    include_globs: &[String],
-    exclude_globs: &[String],
-    eligible_files: &[PathBuf],
+    include_globs: &'a [String],
+    exclude_globs: &'a [String],
+    eligible_files: &'a [PathBuf],
     eligible_bytes: usize,
-    budget: &RepositoryScanBudget,
-    cancellation: &CancellationToken,
-) -> Result<Option<Vec<PathBuf>>, WorkspaceError> {
+    budget: &'a RepositoryScanBudget,
+    cancellation: &'a CancellationToken,
+}
+
+fn ripgrep_prefilter(input: RipgrepPrefilter<'_>) -> Result<Option<Vec<PathBuf>>, WorkspaceError> {
+    let RipgrepPrefilter {
+        root,
+        query,
+        use_regex,
+        case_sensitive,
+        include_globs,
+        exclude_globs,
+        eligible_files,
+        eligible_bytes,
+        budget,
+        cancellation,
+    } = input;
     let Some(rg) = crate::tunnel::resolve_ripgrep() else {
         return Ok(None);
     };
@@ -1417,18 +1431,18 @@ pub fn grep(
 
     let mut accelerator = "anchor";
     let search_files = if resolved.path.is_dir() {
-        match ripgrep_prefilter(
-            &resolved.path,
+        match ripgrep_prefilter(RipgrepPrefilter {
+            root: &resolved.path,
             query,
             use_regex,
             case_sensitive,
-            &include_globs,
-            &exclude_globs,
-            &eligible_files,
+            include_globs: &include_globs,
+            exclude_globs: &exclude_globs,
+            eligible_files: &eligible_files,
             eligible_bytes,
-            &budget,
+            budget: &budget,
             cancellation,
-        )? {
+        })? {
             Some(files) => {
                 accelerator = "ripgrep+anchor";
                 files

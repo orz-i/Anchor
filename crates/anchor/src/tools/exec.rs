@@ -641,6 +641,50 @@ fn execution_mode(execution: &Value) -> &str {
     }
 }
 
+fn shell_family(program: &str) -> Option<&'static str> {
+    let normalized = program.replace('\\', "/");
+    let name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .trim_matches(['\'', '"'])
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" => Some("powershell"),
+        "cmd" | "cmd.exe" => Some("cmd"),
+        _ => None,
+    }
+}
+
+fn redundant_nested_shell(shell: &str, command_args: &[String]) -> Option<String> {
+    let outer_family = shell_family(shell)?;
+    if let Some(first) = command_args.first() {
+        if shell_family(first) == Some(outer_family) {
+            return Some(first.clone());
+        }
+    }
+    for pair in command_args.windows(2) {
+        let switch = pair[0].to_ascii_lowercase();
+        let is_payload_switch = match outer_family {
+            "powershell" => matches!(switch.as_str(), "-command" | "-c"),
+            "cmd" => switch == "/c",
+            _ => false,
+        };
+        if !is_payload_switch {
+            continue;
+        }
+        let first_token = pair[1]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['\'', '"']);
+        if shell_family(first_token) == Some(outer_family) {
+            return Some(pair[1].clone());
+        }
+    }
+    None
+}
+
 pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), WorkspaceError> {
     let object = args.as_object_mut().ok_or_else(|| {
         WorkspaceError::invalid_argument("exec_command arguments must be an object")
@@ -710,6 +754,13 @@ pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), Workspace
         }
     };
     let command_args = structured_args(object.get("args"))?;
+    if shell != "direct" {
+        if let Some(nested) = redundant_nested_shell(shell, &command_args) {
+            return Err(WorkspaceError::invalid_argument(format!(
+                "Redundant nested shell detected: shell={shell} already launches that shell family, but args launch it again ({nested}). Pass only the target command to the selected shell, or use shell=direct with executable for an explicit child shell."
+            )));
+        }
+    }
     validate_exec_env(object.get("env"))?;
     validate_toolchain_paths(object.get("toolchain_paths"))?;
     let mut tokens = Vec::with_capacity(command_args.len() + 1);
@@ -1053,6 +1104,7 @@ pub fn exec_command_with_cancellation(
     match result {
         Ok(mut out) => {
             attach_command_file_changes(ctx, &workspace_before, &mut out);
+            attach_java_toolchain_diagnostics(args, cmd, &mut out);
             if include_diagnostics {
                 if let Some(object) = out.as_object_mut() {
                     object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
@@ -1072,6 +1124,7 @@ pub fn exec_command_with_cancellation(
         Err(error) => match execution_failure_result(&error, cmd, &workdir.path) {
             Some(mut result) => {
                 attach_command_file_changes(ctx, &workspace_before, &mut result);
+                attach_java_toolchain_diagnostics(args, cmd, &mut result);
                 if include_diagnostics {
                     if let Some(object) = result.as_object_mut() {
                         object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
@@ -1147,6 +1200,89 @@ fn attach_command_file_changes(
             "mutation_attributed".into(),
             Value::Bool(mutation_attributed),
         );
+    }
+}
+
+fn command_uses_java_toolchain(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    let java_tools = ["gradle", "gradlew", "mvn", "mvnw", "java", "javac"];
+    lower
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '/' | '\\' | '"' | '\'' | ';' | '&' | '|')
+        })
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            let base = part
+                .strip_suffix(".bat")
+                .or_else(|| part.strip_suffix(".cmd"))
+                .or_else(|| part.strip_suffix(".exe"))
+                .unwrap_or(part);
+            java_tools.contains(&base)
+        })
+}
+
+fn attach_java_toolchain_diagnostics(execution: &Value, cmd: &str, output: &mut Value) {
+    if !command_uses_java_toolchain(cmd) {
+        return;
+    }
+    let command_java_home = execution
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get("JAVA_HOME"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let inherited_java_home = std::env::var("JAVA_HOME").ok();
+    let (java_home, source) = if let Some(value) = command_java_home {
+        (Some(value), "command_env")
+    } else if let Some(value) = inherited_java_home {
+        (Some(value), "process_env")
+    } else {
+        (None, "unset")
+    };
+    let java_from_home = java_home.as_ref().map(|home| {
+        PathBuf::from(home)
+            .join("bin")
+            .join(format!("java{}", std::env::consts::EXE_SUFFIX))
+    });
+    let javac_from_home = java_home.as_ref().map(|home| {
+        PathBuf::from(home)
+            .join("bin")
+            .join(format!("javac{}", std::env::consts::EXE_SUFFIX))
+    });
+    let resolved_java = java_from_home
+        .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+        .or_else(|| resolve_effective_system_program("java"));
+    let resolved_javac = javac_from_home
+        .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+        .or_else(|| resolve_effective_system_program("javac"));
+    let jdk_detected = resolved_javac.is_some();
+
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "toolchain".into(),
+            json!({
+                "java_home": java_home,
+                "java_home_source": source,
+                "java_executable": resolved_java.map(|path| path.display().to_string()),
+                "javac_executable": resolved_javac.map(|path| path.display().to_string()),
+                "jdk_detected": jdk_detected
+            }),
+        );
+        if source != "unset" && !jdk_detected {
+            let warnings = object
+                .entry("warnings")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(warnings) = warnings.as_array_mut() {
+                warnings.push(Value::String(
+                    "JAVA_HOME does not expose javac; Gradle/Maven may be inheriting a JRE instead of a JDK."
+                        .into(),
+                ));
+            }
+        }
     }
 }
 
@@ -1415,6 +1551,9 @@ async fn run_command(
             retryable: true,
             details: json!({
                 "termination_reason": "spawn_failed",
+                "failure_stage": "spawn",
+                "resolved_executable": program,
+                "argv": std::iter::once(program.clone()).chain(args.iter().cloned()).collect::<Vec<_>>(),
                 "recoverable": true,
                 "suggestion": "检查命令路径、权限和运行时环境后重试"
             }),
@@ -1458,7 +1597,8 @@ async fn run_command(
             start,
             cmd,
             cwd,
-            true,
+            &program,
+            &args,
             execution_mode,
         ));
     }
@@ -1504,7 +1644,8 @@ async fn run_command(
                 start,
                 cmd,
                 cwd,
-                false,
+                &program,
+                &args,
                 execution_mode,
             ));
         }
@@ -1513,7 +1654,15 @@ async fn run_command(
             session.kill_and_wait().await;
             session.refresh_status().await;
             session.wait_for_readers().await;
-            let snapshot = session.snapshot(max_output);
+            let snapshot = merge_exec_result(
+                session.snapshot(max_output),
+                start,
+                cmd,
+                cwd,
+                &program,
+                &args,
+                execution_mode,
+            );
             return Err(WorkspaceError::ToolDetails {
                 code: "TIMEOUT",
                 message: "Command timed out.".into(),
@@ -1553,7 +1702,8 @@ async fn run_command(
                         start,
                         cmd,
                         cwd,
-                        false,
+                        &program,
+                        &args,
                         execution_mode,
                     ));
                 }
@@ -1568,7 +1718,8 @@ async fn run_command(
                 start,
                 cmd,
                 cwd,
-                true,
+                &program,
+                &args,
                 execution_mode,
             ));
         }
@@ -1766,6 +1917,11 @@ fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -
         object.entry("warnings").or_insert_with(|| json!([]));
         object.insert("command".into(), json!(command));
         object.insert("resolved_cwd".into(), json!(cwd.display().to_string()));
+        for key in ["failure_stage", "resolved_executable", "argv"] {
+            if let Some(value) = details.get(key) {
+                object.insert(key.into(), value.clone());
+            }
+        }
         object.insert("execution_mode".into(), json!("direct"));
         object.insert("filesystem_scope".into(), json!("workspace"));
         object.insert("sandbox_enforced".into(), Value::Bool(false));
@@ -1784,13 +1940,24 @@ fn merge_exec_result(
     start: Instant,
     command: &str,
     cwd: &Path,
-    _keep_session: bool,
+    program: &str,
+    args: &[String],
     execution_mode: &str,
 ) -> Value {
     if let Some(obj) = snapshot.as_object_mut() {
         let duration_ms = start.elapsed().as_millis();
         obj.insert("command".into(), json!(command));
         obj.insert("resolved_cwd".into(), json!(cwd.display().to_string()));
+        obj.insert("resolved_executable".into(), json!(program));
+        obj.insert(
+            "argv".into(),
+            serde_json::to_value(
+                std::iter::once(program.to_string())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|_| json!([])),
+        );
         obj.insert("duration_ms".into(), json!(duration_ms));
         obj.insert("elapsed_ms".into(), json!(duration_ms));
         obj.insert("transport_ok".into(), Value::Bool(true));
@@ -1977,6 +2144,87 @@ mod tests {
     }
 
     #[test]
+    fn structured_shell_rejects_redundant_nested_shell_family() {
+        let mut nested_pwsh = json!({
+            "shell": "pwsh",
+            "args": ["-NoProfile", "-Command", "powershell.exe -Command \"echo nested\""]
+        });
+        assert!(normalize_exec_arguments(&mut nested_pwsh).is_err());
+
+        let mut nested_cmd = json!({
+            "shell": "cmd",
+            "args": ["/d", "/c", "cmd.exe /c echo nested"]
+        });
+        assert!(normalize_exec_arguments(&mut nested_cmd).is_err());
+
+        let mut direct_payload = json!({
+            "shell": "pwsh",
+            "args": ["-NoProfile", "-Command", "./gradlew.bat test --tests ExampleTest"]
+        });
+        normalize_exec_arguments(&mut direct_payload).expect("single shell wrapper");
+        assert!(direct_payload["cmd"].as_str().unwrap().contains("gradlew"));
+    }
+
+    #[test]
+    fn java_toolchain_detection_covers_gradle_maven_and_java_commands() {
+        assert!(command_uses_java_toolchain("./gradlew.bat test"));
+        assert!(command_uses_java_toolchain("mvnw.cmd test"));
+        assert!(command_uses_java_toolchain("java -version"));
+        assert!(!command_uses_java_toolchain("cargo test"));
+    }
+
+    #[test]
+    fn command_java_home_diagnostics_report_a_detected_jdk() {
+        let java_home = tempdir().expect("java home");
+        let bin = java_home.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("java bin");
+        for tool in ["java", "javac"] {
+            std::fs::write(
+                bin.join(format!("{tool}{}", std::env::consts::EXE_SUFFIX)),
+                "probe",
+            )
+            .expect("tool");
+        }
+        let mut output = json!({"warnings": []});
+        attach_java_toolchain_diagnostics(
+            &json!({"env": {"JAVA_HOME": java_home.path().to_string_lossy()}}),
+            "./gradlew test",
+            &mut output,
+        );
+        assert_eq!(output["toolchain"]["java_home_source"], "command_env");
+        assert_eq!(output["toolchain"]["jdk_detected"], true);
+        assert!(output["toolchain"]["java_executable"].is_string());
+        assert!(output["toolchain"]["javac_executable"].is_string());
+    }
+
+    #[test]
+    fn short_empty_nonzero_exit_is_classified_as_infrastructure_failure() {
+        let result = finalize_execution_result(json!({
+            "command": "gradlew.bat test",
+            "resolved_cwd": "C:/workspace",
+            "status": "exited",
+            "termination_reason": "exited",
+            "execution_started": true,
+            "command_ok": false,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 100,
+            "elapsed_ms": 100,
+            "warnings": []
+        }));
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["failure_stage"], "process", "{result}");
+        assert_eq!(
+            result["failure_classification"], "infrastructure",
+            "{result}"
+        );
+        assert!(result["warnings"]
+            .as_array()
+            .is_some_and(|warnings| !warnings.is_empty()));
+    }
+
+    #[test]
     fn expected_nonzero_exit_code_is_a_successful_command_result() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
@@ -2057,6 +2305,32 @@ mod tests {
             &json!({"include_terminal": true, "max_output_bytes": 0}),
         );
         assert_eq!(sessions["pending_result_count"], 0, "{sessions}");
+        assert_eq!(sessions["scope"], "history", "{sessions}");
+        assert!(sessions["sessions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["session_id"] == session_id)));
+
+        let pending = call_tool(
+            &ctx,
+            "list_command_sessions",
+            &json!({"max_output_bytes": 0}),
+        );
+        assert_eq!(pending["scope"], "pending", "{pending}");
+        assert_eq!(pending["history_included"], false, "{pending}");
+        assert!(pending["sessions"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["session_id"] != session_id)));
+
+        let history = call_tool(
+            &ctx,
+            "list_command_sessions",
+            &json!({"include_history": true, "max_output_bytes": 0}),
+        );
+        assert_eq!(history["scope"], "history", "{history}");
+        assert_eq!(history["history_included"], true, "{history}");
+        assert!(history["sessions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["session_id"] == session_id)));
     }
 
     #[cfg(unix)]
