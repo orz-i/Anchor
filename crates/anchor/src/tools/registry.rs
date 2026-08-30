@@ -1063,13 +1063,22 @@ pub fn is_allowed_tool(name: &str) -> bool {
 }
 
 fn error_output_schema() -> Value {
+    // This schema primitive is also reused by nested/internal intermediate results
+    // (for example staged-commit child command receipts) before they cross the
+    // public tool boundary. Machine-actionable fields are therefore declared here
+    // but are enforced at the public boundary by the shared error normalizer and
+    // public contract tests rather than required on every intermediate object.
     json!({
         "type": "object",
         "properties": {
             "code": { "type": "string", "minLength": 1 },
+            "error_code": { "type": "string", "minLength": 1 },
             "message": { "type": "string", "minLength": 1 },
             "category": { "type": "string", "minLength": 1 },
             "retryable": { "type": "boolean" },
+            "cause_scope": { "type": "string", "minLength": 1 },
+            "workspace_mutated": { "type": ["boolean", "null"] },
+            "recommended_retry": {},
             "details": { "type": "object" }
         },
         "required": ["code", "message", "category", "retryable"],

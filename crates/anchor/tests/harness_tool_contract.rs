@@ -174,6 +174,16 @@ fn durable_task_can_be_explicitly_reclaimed_by_a_new_session_with_head_cas() {
         missing_reclaim["error"]["code"],
         "WORK_SESSION_RECLAIM_REQUIRED"
     );
+    assert_eq!(
+        missing_reclaim["error"]["error_code"],
+        "WORK_SESSION_RECLAIM_REQUIRED"
+    );
+    assert_eq!(missing_reclaim["error"]["cause_scope"], "task_lease");
+    assert_eq!(missing_reclaim["error"]["workspace_mutated"], false);
+    assert_eq!(
+        missing_reclaim["error"]["recommended_retry"]["tool"],
+        "begin_work_session"
+    );
 
     let wrong_head = call_tool_for_session(
         &ctx,
@@ -193,6 +203,12 @@ fn durable_task_can_be_explicitly_reclaimed_by_a_new_session_with_head_cas() {
         wrong_head["error"]["code"],
         "WORK_SESSION_RECLAIM_HEAD_MISMATCH"
     );
+    assert_eq!(wrong_head["error"]["cause_scope"], "task_lease");
+    assert_eq!(wrong_head["error"]["workspace_mutated"], false);
+    assert_eq!(
+        wrong_head["error"]["recommended_retry"]["arguments"]["expected_head"],
+        expected_head
+    );
 
     let reclaimed = call_tool_for_session(
         &ctx,
@@ -211,6 +227,31 @@ fn durable_task_can_be_explicitly_reclaimed_by_a_new_session_with_head_cas() {
     assert_eq!(reclaimed["task"]["id"], task_id);
     assert_eq!(reclaimed["task"]["session_id"], new_session_id);
     assert_eq!(reclaimed["work_session"]["task_created"], false);
+}
+
+#[test]
+fn task_facade_missing_binding_returns_machine_actionable_rebind_contract() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    let mut ctx =
+        ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+    ctx.tool_profile = "advanced".into();
+
+    let result = call_tool(&ctx, "task", &json!({"operation": "gate_status"}));
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["error"]["code"], "TASK_STATE_REQUIRED");
+    assert_eq!(result["error"]["error_code"], "TASK_STATE_REQUIRED");
+    assert_eq!(result["error"]["cause_scope"], "harness_task");
+    assert_eq!(result["error"]["workspace_mutated"], false);
+    assert_eq!(
+        result["error"]["recommended_retry"]["tool"],
+        "begin_work_session"
+    );
+    assert_eq!(
+        result["error"]["recommended_retry"]["arguments"]["create_if_missing"],
+        false
+    );
 }
 
 #[cfg(unix)]

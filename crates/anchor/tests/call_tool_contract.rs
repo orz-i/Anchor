@@ -117,6 +117,13 @@ fn named_toolchain_conflicting_environment_is_rejected_before_spawn() {
         payload["error"]["code"], "TOOLCHAIN_ENV_CONFLICT",
         "{payload}"
     );
+    assert_eq!(payload["error"]["error_code"], "TOOLCHAIN_ENV_CONFLICT");
+    assert_eq!(payload["error"]["cause_scope"], "toolchain_registry");
+    assert_eq!(payload["error"]["workspace_mutated"], false);
+    assert_eq!(
+        payload["error"]["recommended_retry"]["tool"],
+        "exec_command"
+    );
     assert_eq!(
         payload["error"]["details"]["cause_scope"],
         "toolchain_registry"
@@ -1217,6 +1224,13 @@ fn policy_rejection_returns_safe_structured_alternatives() {
     let out = invoke(&ctx, "exec_command", json!({"cmd": "findstr hello"}));
     let error = assert_err(&out);
     assert_eq!(error["error"]["code"], "POLICY_REJECTED");
+    assert_eq!(error["error"]["error_code"], "POLICY_REJECTED");
+    assert_eq!(error["error"]["cause_scope"], "execution_policy");
+    assert_eq!(error["error"]["workspace_mutated"], false);
+    assert_eq!(
+        error["error"]["recommended_retry"]["strategy"],
+        "choose_safe_alternative"
+    );
     assert_eq!(error["error"]["retryable"], true);
     assert_eq!(error["error"]["details"]["recoverable"], true);
     let alternatives = error["error"]["details"]["alternatives"]
@@ -1244,7 +1258,11 @@ fn unknown_tool_is_validation_error() {
     let out = invoke(&ctx, "definitely_not_a_tool", json!({}));
     let err = assert_err(&out);
     assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(err["error"]["error_code"], "INVALID_ARGUMENT");
     assert_eq!(err["error"]["category"], "validation");
+    assert_eq!(err["error"]["cause_scope"], "input");
+    assert_eq!(err["error"]["workspace_mutated"], false);
+    assert_eq!(err["error"]["recommended_retry"], Value::Null);
 }
 
 #[test]
@@ -1811,6 +1829,10 @@ fn nonzero_command_exit_keeps_transport_ok_but_sets_command_ok_false() {
     assert_eq!(payload["status"], "exited");
     assert_eq!(payload["exit_code"], 1);
     assert_eq!(payload["error"]["code"], "COMMAND_EXIT_NONZERO");
+    assert_eq!(payload["error"]["error_code"], "COMMAND_EXIT_NONZERO");
+    assert_eq!(payload["error"]["cause_scope"], "command_runtime");
+    assert_eq!(payload["error"]["workspace_mutated"], false);
+    assert_eq!(payload["error"]["recommended_retry"], Value::Null);
 }
 
 #[test]

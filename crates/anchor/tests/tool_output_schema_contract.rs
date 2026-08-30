@@ -21,6 +21,37 @@ fn assert_matches_output_schema(tool: &str, value: &Value) {
 }
 
 #[test]
+fn representative_exec_errors_match_published_machine_actionable_schema() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    let cases = [
+        json!({"cmd": "findstr hello"}),
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('must-not-run')"],
+            "toolchains": {"java": "default"},
+            "env": {"JAVA_HOME": "manual-conflict"}
+        }),
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "raise SystemExit(7)"],
+            "yield_time_ms": 10_000
+        }),
+    ];
+
+    for args in cases {
+        let output = invoke(&ctx, "exec_command", args);
+        let error = assert_err(&output);
+        assert_matches_output_schema("exec_command", error);
+        assert_eq!(error["error"]["error_code"], error["error"]["code"]);
+        assert!(error["error"]["cause_scope"].is_string());
+        assert!(error["error"].get("workspace_mutated").is_some());
+        assert!(error["error"].get("recommended_retry").is_some());
+    }
+}
+
+#[test]
 fn worktree_management_successes_match_published_output_schemas() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("workspace");
