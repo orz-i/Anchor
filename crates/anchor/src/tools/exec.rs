@@ -35,6 +35,7 @@ fn apply_execution_environment(
             }
         }
     }
+    apply_java_toolchain_environment(execution, command, program);
 
     #[cfg(windows)]
     command
@@ -1221,24 +1222,128 @@ fn command_uses_java_toolchain(cmd: &str) -> bool {
         })
 }
 
-fn attach_java_toolchain_diagnostics(execution: &Value, cmd: &str, output: &mut Value) {
-    if !command_uses_java_toolchain(cmd) {
-        return;
+fn execution_uses_java_toolchain(execution: &Value, program: &str) -> bool {
+    if command_uses_java_toolchain(program) {
+        return true;
     }
+    execution
+        .get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| {
+            let joined = args
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            command_uses_java_toolchain(&joined)
+        })
+}
+
+fn java_home_has_jdk(home: &Path) -> bool {
+    home.join("bin")
+        .join(format!("java{}", std::env::consts::EXE_SUFFIX))
+        .is_file()
+        && home
+            .join("bin")
+            .join(format!("javac{}", std::env::consts::EXE_SUFFIX))
+            .is_file()
+}
+
+fn jdk_home_from_javac(path: &Path) -> Option<PathBuf> {
+    let home = path.parent()?.parent()?.to_path_buf();
+    java_home_has_jdk(&home).then_some(home)
+}
+
+#[derive(Debug, Clone)]
+struct JavaHomeSelection {
+    home: Option<PathBuf>,
+    source: &'static str,
+    original: Option<PathBuf>,
+    repaired: bool,
+}
+
+fn select_java_home(execution: &Value) -> JavaHomeSelection {
     let command_java_home = execution
         .get("env")
         .and_then(Value::as_object)
         .and_then(|env| env.get("JAVA_HOME"))
         .and_then(Value::as_str)
-        .map(str::to_string);
-    let inherited_java_home = std::env::var("JAVA_HOME").ok();
-    let (java_home, source) = if let Some(value) = command_java_home {
-        (Some(value), "command_env")
-    } else if let Some(value) = inherited_java_home {
-        (Some(value), "process_env")
-    } else {
-        (None, "unset")
-    };
+        .map(PathBuf::from);
+    let inherited = std::env::var_os("JAVA_HOME").map(PathBuf::from);
+    let detected = resolve_effective_system_program("javac")
+        .as_deref()
+        .and_then(jdk_home_from_javac);
+    select_java_home_from(command_java_home, inherited, detected)
+}
+
+fn select_java_home_from(
+    command_java_home: Option<PathBuf>,
+    inherited: Option<PathBuf>,
+    detected: Option<PathBuf>,
+) -> JavaHomeSelection {
+    if let Some(home) = command_java_home {
+        return JavaHomeSelection {
+            home: Some(home),
+            source: "command_env",
+            original: None,
+            repaired: false,
+        };
+    }
+    if inherited.as_deref().is_some_and(java_home_has_jdk) {
+        return JavaHomeSelection {
+            home: inherited,
+            source: "process_env",
+            original: None,
+            repaired: false,
+        };
+    }
+    if detected.is_some() {
+        return JavaHomeSelection {
+            home: detected,
+            source: if inherited.is_some() {
+                "auto_repaired_process_env"
+            } else {
+                "auto_detected_jdk"
+            },
+            original: inherited,
+            repaired: true,
+        };
+    }
+
+    JavaHomeSelection {
+        home: inherited.clone(),
+        source: if inherited.is_some() {
+            "process_env_invalid"
+        } else {
+            "unset"
+        },
+        original: inherited,
+        repaired: false,
+    }
+}
+
+fn apply_java_toolchain_environment(execution: &Value, command: &mut Command, program: &str) {
+    if !execution_uses_java_toolchain(execution, program) {
+        return;
+    }
+    let selection = select_java_home(execution);
+    if selection.repaired {
+        if let Some(home) = selection.home {
+            command.env("JAVA_HOME", home);
+        }
+    }
+}
+
+fn attach_java_toolchain_diagnostics(execution: &Value, cmd: &str, output: &mut Value) {
+    if !command_uses_java_toolchain(cmd) {
+        return;
+    }
+    let selection = select_java_home(execution);
+    let java_home = selection
+        .home
+        .as_ref()
+        .map(|home| home.display().to_string());
+    let source = selection.source;
     let java_from_home = java_home.as_ref().map(|home| {
         PathBuf::from(home)
             .join("bin")
@@ -1267,6 +1372,8 @@ fn attach_java_toolchain_diagnostics(execution: &Value, cmd: &str, output: &mut 
             json!({
                 "java_home": java_home,
                 "java_home_source": source,
+                "java_home_repaired": selection.repaired,
+                "original_java_home": selection.original.map(|home| home.display().to_string()),
                 "java_executable": resolved_java.map(|path| path.display().to_string()),
                 "javac_executable": resolved_javac.map(|path| path.display().to_string()),
                 "jdk_detected": jdk_detected
@@ -2039,11 +2146,27 @@ fn resolve_program(
                     retryable: true,
                 })?;
         if !resolved.starts_with(&canonical_workspace) {
-            return Err(WorkspaceError::Tool {
+            let command_name = resolved
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(trimmed)
+                .to_string();
+            return Err(WorkspaceError::ToolDetails {
                 code: "EXECUTABLE_OUTSIDE_WORKSPACE",
                 message: format!("Workspace 外可执行文件被拒绝: {trimmed}"),
                 category: "security",
-                retryable: false,
+                retryable: true,
+                details: json!({
+                    "cause_scope": "executable_path_policy",
+                    "workspace_mutated": false,
+                    "requested_executable": trimmed,
+                    "resolved_executable": resolved.display().to_string(),
+                    "recommended_retry": {
+                        "shell": "direct",
+                        "executable": command_name
+                    },
+                    "reason": "External system toolchains must be selected by command name so Anchor can resolve them through the trusted system/managed toolchain search path. Absolute external executable paths are not accepted."
+                }),
             });
         }
         let extension = resolved
@@ -2195,6 +2318,64 @@ mod tests {
         assert_eq!(output["toolchain"]["jdk_detected"], true);
         assert!(output["toolchain"]["java_executable"].is_string());
         assert!(output["toolchain"]["javac_executable"].is_string());
+    }
+
+    #[test]
+    fn java_home_selection_repairs_an_invalid_inherited_home_with_detected_jdk() {
+        let invalid = tempdir().expect("invalid java home");
+        let detected = tempdir().expect("detected java home");
+        let bin = detected.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("java bin");
+        for tool in ["java", "javac"] {
+            std::fs::write(
+                bin.join(format!("{tool}{}", std::env::consts::EXE_SUFFIX)),
+                b"stub",
+            )
+            .expect("tool");
+        }
+
+        let selection = select_java_home_from(
+            None,
+            Some(invalid.path().to_path_buf()),
+            Some(detected.path().to_path_buf()),
+        );
+        assert_eq!(selection.home.as_deref(), Some(detected.path()));
+        assert_eq!(selection.source, "auto_repaired_process_env");
+        assert_eq!(selection.original.as_deref(), Some(invalid.path()));
+        assert!(selection.repaired);
+    }
+
+    #[test]
+    fn explicit_external_executable_rejection_returns_direct_command_name_retry() {
+        let workspace = tempdir().expect("workspace");
+        let external = tempdir().expect("external");
+        let executable = external
+            .path()
+            .join(format!("adb{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&executable, b"stub").expect("external executable");
+        let error = resolve_program(
+            executable.to_str().expect("utf8 path"),
+            workspace.path(),
+            workspace.path(),
+            &crate::tools::policy::PolicySettings::default(),
+            &[],
+        )
+        .expect_err("absolute external executable must be rejected");
+        match error {
+            WorkspaceError::ToolDetails { code, details, .. } => {
+                assert_eq!(code, "EXECUTABLE_OUTSIDE_WORKSPACE");
+                assert_eq!(details["cause_scope"], "executable_path_policy");
+                assert_eq!(details["workspace_mutated"], false);
+                assert_eq!(
+                    details["recommended_retry"]["shell"],
+                    Value::String("direct".into())
+                );
+                assert!(details["recommended_retry"]["executable"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("adb")));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
