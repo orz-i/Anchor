@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::context::ToolContext;
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
-use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
+use crate::tools::workspace::{
+    normalize_machine_actionable_error_contract, tool_err, tool_err_code, tool_ok, WorkspaceError,
+};
 use crate::tools::{
     command_session, exec, file, git, image_tool, patch, recovery, search, session,
     CancellationToken,
@@ -59,9 +61,16 @@ fn policy_tool_err(err: PolicyError) -> Value {
             "reason": reason,
             "recoverable": recoverable,
             "suggestion": suggestion,
-            "alternatives": alternatives
+            "alternatives": alternatives,
+            "cause_scope": "execution_policy",
+            "workspace_mutated": false
         }),
     })
+}
+
+fn finalize_public_tool_output(mut output: Value) -> Value {
+    normalize_machine_actionable_error_contract(&mut output);
+    output
 }
 
 fn attach_path_resolution_diagnostics(
@@ -1111,7 +1120,14 @@ fn skill_script_permission_error(
 /// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
-    call_tool_impl(ctx, name, args, &CancellationToken::default(), true, None)
+    finalize_public_tool_output(call_tool_impl(
+        ctx,
+        name,
+        args,
+        &CancellationToken::default(),
+        true,
+        None,
+    ))
 }
 
 pub fn call_tool_with_cancellation(
@@ -1120,7 +1136,7 @@ pub fn call_tool_with_cancellation(
     args: &Value,
     cancellation: &CancellationToken,
 ) -> Value {
-    call_tool_impl(ctx, name, args, cancellation, true, None)
+    finalize_public_tool_output(call_tool_impl(ctx, name, args, cancellation, true, None))
 }
 
 #[doc(hidden)]
@@ -1130,14 +1146,14 @@ pub fn call_tool_for_session(
     args: &Value,
     session_id: &str,
 ) -> Value {
-    call_tool_impl(
+    finalize_public_tool_output(call_tool_impl(
         ctx,
         name,
         args,
         &CancellationToken::default(),
         true,
         Some(session_id),
-    )
+    ))
 }
 
 pub(crate) fn call_tool_prevalidated_with_session_cancellation(
@@ -1147,7 +1163,14 @@ pub(crate) fn call_tool_prevalidated_with_session_cancellation(
     cancellation: &CancellationToken,
     session_id: Option<&str>,
 ) -> Value {
-    call_tool_impl(ctx, name, args, cancellation, false, session_id)
+    finalize_public_tool_output(call_tool_impl(
+        ctx,
+        name,
+        args,
+        cancellation,
+        false,
+        session_id,
+    ))
 }
 
 fn call_tool_impl(

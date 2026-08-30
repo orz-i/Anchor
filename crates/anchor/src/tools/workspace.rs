@@ -704,6 +704,126 @@ pub fn tool_err(error: WorkspaceError) -> Value {
     })
 }
 
+pub(crate) fn normalize_machine_actionable_error_contract(structured: &mut Value) {
+    if structured.get("ok").and_then(Value::as_bool) != Some(false) {
+        return;
+    }
+    let root_mutation = structured
+        .get("mutation_attributed")
+        .and_then(Value::as_bool)
+        .map(Value::Bool);
+    let Some(error) = structured.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN_ERROR")
+        .to_string();
+    let category = error
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let mut details = error
+        .get("details")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let cause_scope = details
+        .get("cause_scope")
+        .cloned()
+        .unwrap_or_else(|| Value::String(default_error_cause_scope(&code, &category).into()));
+    let workspace_mutated = details
+        .get("workspace_mutated")
+        .cloned()
+        .or(root_mutation)
+        .unwrap_or_else(|| default_error_workspace_mutated(&category));
+    let recommended_retry = details
+        .get("recommended_retry")
+        .cloned()
+        .unwrap_or_else(|| inferred_recommended_retry(&code, &details));
+
+    details
+        .entry("cause_scope")
+        .or_insert_with(|| cause_scope.clone());
+    details
+        .entry("workspace_mutated")
+        .or_insert_with(|| workspace_mutated.clone());
+    details
+        .entry("recommended_retry")
+        .or_insert_with(|| recommended_retry.clone());
+
+    error.insert("error_code".into(), Value::String(code));
+    error.insert("cause_scope".into(), cause_scope);
+    error.insert("workspace_mutated".into(), workspace_mutated);
+    error.insert("recommended_retry".into(), recommended_retry);
+    error.insert("details".into(), Value::Object(details));
+}
+
+fn default_error_cause_scope(code: &str, category: &str) -> &'static str {
+    if code.starts_with("WORK_SESSION_")
+        || code.starts_with("TASK_")
+        || code.starts_with("BASELINE_")
+    {
+        "harness_task"
+    } else if code.starts_with("SESSION_") {
+        "session"
+    } else if code.starts_with("TOOLCHAIN_") {
+        "toolchain"
+    } else if code.starts_with("COMMAND_") || code.starts_with("EXECUTION_") || code == "TIMEOUT" {
+        "command_runtime"
+    } else if code.contains("PATH") || code.contains("SYMLINK") || code.contains("WORKSPACE_LINK") {
+        "workspace_path"
+    } else if code.starts_with("GIT_") {
+        "git"
+    } else {
+        match category {
+            "policy" | "permission" | "security" => "policy",
+            "validation" => "input",
+            "conflict" => "state_conflict",
+            "not_found" => "resource_lookup",
+            "runtime" => "runtime",
+            "internal" => "internal",
+            _ => "tool",
+        }
+    }
+}
+
+fn default_error_workspace_mutated(category: &str) -> Value {
+    if matches!(
+        category,
+        "validation" | "policy" | "permission" | "security" | "not_found" | "conflict"
+    ) {
+        Value::Bool(false)
+    } else {
+        Value::Null
+    }
+}
+
+fn inferred_recommended_retry(code: &str, details: &serde_json::Map<String, Value>) -> Value {
+    if let Some(alternatives) = details
+        .get("alternatives")
+        .and_then(Value::as_array)
+        .filter(|alternatives| !alternatives.is_empty())
+    {
+        return json!({
+            "strategy": "choose_safe_alternative",
+            "alternatives": alternatives
+        });
+    }
+    if code == "TASK_STATE_REQUIRED" {
+        return json!({
+            "tool": "begin_work_session",
+            "arguments": {"create_if_missing": false},
+            "required_arguments": ["objective"],
+            "reason": "Recover the durable Session/Task binding before retrying the task-scoped operation."
+        });
+    }
+    Value::Null
+}
+
 pub fn tool_err_code(
     code: &'static str,
     message: impl Into<String>,
@@ -729,6 +849,7 @@ pub fn wrap_tool_result(structured: Value) -> Value {
 }
 
 pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, mut structured: Value) -> Value {
+    normalize_machine_actionable_error_contract(&mut structured);
     let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
     let image_payload = if tool_name == "view_image"
         && args
@@ -767,6 +888,7 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, mut structured: Value
             details: json!({"tool": tool_name}),
         });
     }
+    normalize_machine_actionable_error_contract(&mut structured);
 
     let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
     let text_value = if tool_name == "view_image" && !is_error {
@@ -798,7 +920,58 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, mut structured: Value
 mod tests {
     use serde_json::json;
 
-    use super::{wrap_mcp_tool_result, Workspace};
+    use super::{
+        normalize_machine_actionable_error_contract, wrap_mcp_tool_result, Workspace,
+        WorkspaceError,
+    };
+
+    #[test]
+    fn machine_actionable_error_contract_adds_stable_fields_without_erasing_details() {
+        let mut output = super::tool_err(WorkspaceError::ToolDetails {
+            code: "TOOLCHAIN_PATH_NOT_FOUND",
+            message: "missing runtime".into(),
+            category: "runtime",
+            retryable: true,
+            details: json!({"path": "tools/java"}),
+        });
+        normalize_machine_actionable_error_contract(&mut output);
+
+        assert_eq!(output["error"]["error_code"], "TOOLCHAIN_PATH_NOT_FOUND");
+        assert_eq!(output["error"]["cause_scope"], "toolchain");
+        assert_eq!(
+            output["error"]["workspace_mutated"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            output["error"]["recommended_retry"],
+            serde_json::Value::Null
+        );
+        assert_eq!(output["error"]["details"]["path"], "tools/java");
+        assert_eq!(output["error"]["details"]["cause_scope"], "toolchain");
+    }
+
+    #[test]
+    fn machine_actionable_error_contract_preserves_explicit_retry_and_mutation_state() {
+        let mut output = json!({
+            "ok": false,
+            "mutation_attributed": true,
+            "error": {
+                "code": "COMMAND_EXIT_NONZERO",
+                "message": "failed",
+                "category": "runtime",
+                "retryable": true,
+                "details": {
+                    "recommended_retry": {"tool": "wait_command", "arguments": {"session_id": "s1"}}
+                }
+            }
+        });
+        normalize_machine_actionable_error_contract(&mut output);
+
+        assert_eq!(output["error"]["cause_scope"], "command_runtime");
+        assert_eq!(output["error"]["workspace_mutated"], true);
+        assert_eq!(output["error"]["recommended_retry"]["tool"], "wait_command");
+        assert_eq!(output["error"]["details"]["workspace_mutated"], true);
+    }
 
     #[test]
     fn strict_read_boundary_rejects_explicit_external_paths() {

@@ -128,11 +128,26 @@ fn ensure_session_reclaim_safe(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            tool_error(
-                "WORK_SESSION_RECLAIM_HEAD_REQUIRED",
-                "expected_head is required when reclaim_session=true",
-            )
+        .ok_or_else(|| WorkspaceError::ToolDetails {
+            code: "WORK_SESSION_RECLAIM_HEAD_REQUIRED",
+            message: "expected_head is required when reclaim_session=true".into(),
+            category: "validation",
+            retryable: true,
+            details: json!({
+                "cause_scope": "task_lease",
+                "workspace_mutated": false,
+                "task_id": task.id,
+                "recommended_retry": {
+                    "tool": "begin_work_session",
+                    "arguments": {
+                        "task_id": task.id,
+                        "objective": task.objective,
+                        "create_if_missing": false,
+                        "reclaim_session": true,
+                        "expected_head": task.expected_state.head
+                    }
+                }
+            }),
         })?;
     let durable_head = task.expected_state.head.as_deref().unwrap_or_default();
     if durable_head != expected_head {
@@ -144,7 +159,19 @@ fn ensure_session_reclaim_safe(
             details: json!({
                 "task_id": task.id,
                 "expected_head": durable_head,
-                "observed_head": expected_head
+                "observed_head": expected_head,
+                "cause_scope": "task_lease",
+                "workspace_mutated": false,
+                "recommended_retry": {
+                    "tool": "begin_work_session",
+                    "arguments": {
+                        "task_id": task.id,
+                        "objective": task.objective,
+                        "create_if_missing": false,
+                        "reclaim_session": true,
+                        "expected_head": durable_head
+                    }
+                }
             }),
         });
     }
@@ -159,7 +186,13 @@ fn ensure_session_reclaim_safe(
                 "task_id": task.id,
                 "running_sessions": running,
                 "unobserved_terminal_sessions": unobserved_terminal,
-                "required_action": "Wait for/consume or terminate the retained command session before reclaiming the Task."
+                "required_action": "Wait for/consume or terminate the retained command session before reclaiming the Task.",
+                "cause_scope": "task_lease",
+                "workspace_mutated": false,
+                "recommended_retry": {
+                    "strategy": "consume_or_terminate_retained_commands_then_retry",
+                    "tools": ["wait_command", "kill_session", "begin_work_session"]
+                }
             }),
         });
     }
@@ -1142,7 +1175,20 @@ fn begin_work_session(
                     "task_id": task.id,
                     "current_session_id": task.session_id,
                     "requested_session_id": session_id,
-                    "required_action": "Retry begin_work_session with task_id, reclaim_session=true, and expected_head after confirming the prior client no longer owns a running command."
+                    "required_action": "Retry begin_work_session with task_id, reclaim_session=true, and expected_head after confirming the prior client no longer owns a running command.",
+                    "cause_scope": "task_lease",
+                    "workspace_mutated": false,
+                    "recommended_retry": {
+                        "tool": "begin_work_session",
+                        "arguments": {
+                            "task_id": task.id,
+                            "objective": objective,
+                            "session_id": session_id,
+                            "create_if_missing": false,
+                            "reclaim_session": true,
+                            "expected_head": task.expected_state.head
+                        }
+                    }
                 }),
             });
         }
