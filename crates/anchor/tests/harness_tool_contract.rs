@@ -34,6 +34,87 @@ fn initialize_git(root: &std::path::Path) {
 }
 
 #[test]
+fn durable_task_objective_can_be_revised_in_place_with_event_history() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "objective revision\n").expect("写入文件");
+    fs::write(workspace.join(".gitignore"), "/docs/session/\n").expect("gitignore");
+    initialize_git(&workspace);
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+
+    let started = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "research only",
+            "workspace_root": workspace.to_string_lossy()
+        }),
+        "objective-revision-transport",
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let task_id = started["task"]["id"].as_str().expect("task id").to_string();
+    let session_id = started["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let conflict = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "implement and verify",
+            "workspace_root": workspace.to_string_lossy(),
+            "session_id": session_id,
+            "task_id": task_id,
+            "create_if_missing": false
+        }),
+        "objective-revision-transport",
+    );
+    assert_eq!(conflict["ok"], false, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "WORK_SESSION_TASK_CONFLICT");
+    assert_eq!(
+        conflict["error"]["details"]["recommended_retry"]["arguments"]["objective_revision"],
+        true
+    );
+
+    let resumed = call_tool_for_session(
+        &ctx,
+        "begin_work_session",
+        &json!({
+            "objective": "implement and verify",
+            "workspace_root": workspace.to_string_lossy(),
+            "session_id": session_id,
+            "task_id": task_id,
+            "objective_revision": true,
+            "create_if_missing": false
+        }),
+        "objective-revision-transport",
+    );
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(resumed["work_session"]["task_created"], false);
+    assert_eq!(resumed["work_session"]["objective_revised"], true);
+    assert_eq!(
+        resumed["work_session"]["previous_objective"],
+        "research only"
+    );
+    assert_eq!(resumed["task"]["objective"], "implement and verify");
+
+    let events = call_tool(
+        &ctx,
+        "list_task_events",
+        &json!({"task_id": resumed["task"]["id"], "limit": 100}),
+    );
+    assert_eq!(events["ok"], true, "{events}");
+    assert!(events["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .any(|event| event["kind"] == "task_objective_revised"));
+}
+
+#[test]
 fn durable_task_can_be_explicitly_reclaimed_by_a_new_session_with_head_cas() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

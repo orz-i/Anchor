@@ -65,7 +65,7 @@ pub fn compact_checkpoint_records(
     let mut compaction = CheckpointCompaction::default();
 
     for (index, record) in records.iter().enumerate() {
-        let Some(tool_name) = auto_checkpoint_tool(&record.turn_id) else {
+        let Some(_tool_name) = auto_checkpoint_tool(&record.turn_id) else {
             continue;
         };
         let Some(task_id) = runtime_state_value(record, "task_id") else {
@@ -82,7 +82,12 @@ pub fn compact_checkpoint_records(
         } else if let Some(test) = verification_slot(record) {
             format!("{task_id}:verification:{test}")
         } else {
-            format!("{task_id}:progress:{tool_name}")
+            // Generic tool milestones describe one evolving runtime state. Keeping one
+            // slot per tool (exec/wait/patch/...) lets stale state survive merely because
+            // it was emitted by a different tool, which bloats long Sessions and can leave
+            // contradictory facts in the handoff. Commits and verification identities stay
+            // independently addressable above; all other auto progress coalesces per Task.
+            format!("{task_id}:progress")
         };
         if let Some(previous) = latest_auto_slot.insert(slot, index) {
             if keep[previous] {
@@ -490,4 +495,69 @@ fn redact_text(value: &mut String) -> bool {
         .into_owned();
     *value = redacted;
     *value != original
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auto_record(turn_id: &str, runtime_state: &[&str], tests: &[&str]) -> CheckpointRecord {
+        CheckpointRecord {
+            turn_id: turn_id.into(),
+            runtime_state: runtime_state.iter().map(|value| (*value).into()).collect(),
+            tests: tests.iter().map(|value| (*value).into()).collect(),
+            ..CheckpointRecord::default()
+        }
+    }
+
+    #[test]
+    fn generic_auto_progress_coalesces_across_tool_names() {
+        let records = vec![
+            auto_record("auto-apply_patch-a", &["task_id=task-1"], &[]),
+            auto_record("auto-exec_command-b", &["task_id=task-1"], &[]),
+            auto_record("auto-wait_command-c", &["task_id=task-1"], &[]),
+        ];
+        let (compacted, stats) = compact_checkpoint_records(records);
+        assert_eq!(stats.coalesced_active_auto, 2);
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].turn_id, "auto-wait_command-c");
+    }
+
+    #[test]
+    fn commits_and_verification_slots_remain_independently_addressable() {
+        let records = vec![
+            auto_record(
+                "auto-git_commit-a",
+                &["task_id=task-1", "commit_sha=aaa"],
+                &[],
+            ),
+            auto_record(
+                "auto-git_commit-b",
+                &["task_id=task-1", "commit_sha=bbb"],
+                &[],
+            ),
+            auto_record(
+                "auto-exec_command-a",
+                &["task_id=task-1"],
+                &["verification_kind=test-a, success=false"],
+            ),
+            auto_record(
+                "auto-wait_command-b",
+                &["task_id=task-1"],
+                &["verification_kind=test-a, success=true"],
+            ),
+        ];
+        let (compacted, stats) = compact_checkpoint_records(records);
+        assert_eq!(stats.coalesced_active_auto, 1);
+        assert_eq!(compacted.len(), 3);
+        assert!(compacted
+            .iter()
+            .any(|record| record.turn_id == "auto-git_commit-a"));
+        assert!(compacted
+            .iter()
+            .any(|record| record.turn_id == "auto-git_commit-b"));
+        assert!(compacted
+            .iter()
+            .any(|record| record.turn_id == "auto-wait_command-b"));
+    }
 }

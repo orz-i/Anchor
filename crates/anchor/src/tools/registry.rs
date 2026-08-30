@@ -3471,6 +3471,7 @@ pub fn input_schema(name: &str) -> Value {
                 "create_if_missing": { "type": "boolean", "default": true, "description": "When false, recover an already-existing Session + writable Harness Task only. Never create a replacement Task or Git worktree; return a structured not-found/conflict error instead." },
                 "resume_completed": { "type": "boolean", "default": false, "description": "Explicitly reactivate the selected completed Session instead of creating a continuation Session." },
                 "task_id": { "type": "string", "minLength": 1, "description": "Explicit durable Harness Task to attach to instead of selecting by the current Session binding." },
+                "objective_revision": { "type": "boolean", "default": false, "description": "When reusing a writable durable Task with a different objective, explicitly revise that Task objective in place and preserve the prior objective in Harness event history instead of creating/requiring a replacement Task." },
                 "reclaim_session": { "type": "boolean", "default": false, "description": "Explicitly transfer a durable Task from its previous Session lease to the opened Session. Reclaim is rejected while the Task owns running or unconsumed command sessions." },
                 "expected_head": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Caller-observed Git HEAD required when reclaim_session=true; must match the durable Task expected HEAD." },
                 "workspace_mode": { "type": "string", "enum": ["shared", "worktree"], "default": "shared", "description": "Use the configured workspace by default, or use an isolated Anchor-managed Git worktree for a new task." },
@@ -3595,6 +3596,7 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": merge_schema_properties(vec![json!({
                 "task_id": { "type": "string", "minLength": 1 },
+                "objective": { "type": "string", "minLength": 1, "maxLength": 4000, "description": "Explicitly revise the current objective in place. The previous objective is preserved in Harness event history." },
                 "completed_steps": { "type": "array", "items": { "type": "string" } },
                 "pending_steps": { "type": "array", "items": { "type": "string" } }
             }), task_configuration_input_properties()]),

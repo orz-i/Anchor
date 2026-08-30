@@ -938,6 +938,10 @@ fn begin_work_session(
         .get("create_if_missing")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let objective_revision_requested = args
+        .get("objective_revision")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let session_state = crate::tools::session::open(ctx, args)?;
     let session_id = session_state
         .get("session_id")
@@ -975,15 +979,22 @@ fn begin_work_session(
         task.session_id.as_deref() == Some(session_id)
             && task.session_path.as_deref() == Some(session_path)
     });
-    let session_task = tasks
+    let writable_session_tasks = tasks
         .iter()
-        .find(|task| {
+        .filter(|task| {
             task.status.is_writable()
-                && task.objective == objective
                 && task.session_id.as_deref() == Some(session_id)
                 && task.session_path.as_deref() == Some(session_path)
         })
+        .cloned()
+        .collect::<Vec<_>>();
+    let session_task = writable_session_tasks
+        .iter()
+        .find(|task| task.objective == objective)
         .cloned();
+    let unique_session_task = (writable_session_tasks.len() == 1)
+        .then(|| writable_session_tasks.first().cloned())
+        .flatten();
     let existing_session_tasks = tasks
         .iter()
         .filter(|task| {
@@ -1001,31 +1012,55 @@ fn begin_work_session(
             })
         })
         .collect::<Vec<_>>();
-    let selected_task = requested_task.or(session_task).or(explicit_task);
+    let selected_task = requested_task
+        .or(session_task)
+        .or(explicit_task)
+        .or(unique_session_task);
+    let mut objective_revised_from = None::<String>;
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
             validate_requested_workspace_mode(ctx, args, &task)?;
             if task.objective != objective {
-                if requested_task_id.is_some() {
+                if objective_revision_requested {
+                    ensure_writer_handoff_available(ctx, Some(&task.id), None)?;
+                    let previous_objective = task.objective.clone();
+                    ctx.harness.switch_task(&task.id).map_err(map_error)?;
+                    let task = ctx
+                        .harness
+                        .revise_objective(&task.id, objective)
+                        .map_err(map_error)?;
+                    objective_revised_from = Some(previous_objective);
+                    (task, false, None)
+                } else if requested_task_id.is_some() {
                     return Err(WorkspaceError::ToolDetails {
                         code: "WORK_SESSION_TASK_CONFLICT",
                         message: "The requested durable Harness Task has a different objective."
                             .into(),
                         category: "conflict",
-                        retryable: false,
+                        retryable: true,
                         details: json!({
                             "task_id": task.id,
                             "requested_objective": objective,
-                            "existing_objective": task.objective
+                            "existing_objective": task.objective,
+                            "cause_scope": "task_objective",
+                            "workspace_mutated": false,
+                            "recommended_retry": {
+                                "tool": "begin_work_session",
+                                "arguments": {
+                                    "task_id": task.id,
+                                    "objective": objective,
+                                    "objective_revision": true,
+                                    "create_if_missing": false
+                                }
+                            }
                         }),
                     });
-                }
-                if !create_if_missing {
+                } else if !create_if_missing {
                     return Err(WorkspaceError::ToolDetails {
                         code: "WORK_SESSION_TASK_CONFLICT",
                         message: "The existing Session is bound to a different writable Harness Task, and create_if_missing=false forbids creating a replacement Task/worktree.".into(),
                         category: "conflict",
-                        retryable: false,
+                        retryable: true,
                         details: json!({
                             "session_id": session_id,
                             "session_path": session_path,
@@ -1035,13 +1070,25 @@ fn begin_work_session(
                             "existing_status": task.status,
                             "existing_phase": task.phase,
                             "existing_workspace_mode": task_workspace_mode(&task),
-                            "create_if_missing": false
+                            "create_if_missing": false,
+                            "cause_scope": "task_objective",
+                            "workspace_mutated": false,
+                            "recommended_retry": {
+                                "tool": "begin_work_session",
+                                "arguments": {
+                                    "task_id": task.id,
+                                    "objective": objective,
+                                    "objective_revision": true,
+                                    "create_if_missing": false
+                                }
+                            }
                         }),
                     });
+                } else {
+                    let previous_task_id = task.id.clone();
+                    let next = start_task_for_workspace_mode(ctx, objective, args)?;
+                    (next, true, Some(previous_task_id))
                 }
-                let previous_task_id = task.id.clone();
-                let next = start_task_for_workspace_mode(ctx, objective, args)?;
-                (next, true, Some(previous_task_id))
             } else {
                 ensure_writer_handoff_available(ctx, Some(&task.id), None)?;
                 let task = ctx.harness.switch_task(&task.id).map_err(map_error)?;
@@ -1184,6 +1231,8 @@ fn begin_work_session(
             "task_id": task.id,
             "task_created": task_created,
             "previous_task_id": previous_task_id,
+            "objective_revised": objective_revised_from.is_some(),
+            "previous_objective": objective_revised_from,
             "auto_paused_previous_task_ids": auto_paused_previous_task_ids,
             "parallel": task.git_worktree.is_some(),
             "workspace_mode": task_workspace_mode(&task),
@@ -2401,16 +2450,27 @@ fn task_workspace_mode(task: &TaskSession) -> &'static str {
 
 fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
+    let objective = args
+        .get("objective")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let completed_steps = string_list(args.get("completed_steps"))?;
     let pending_steps = string_list(args.get("pending_steps"))?;
     let configuration = parse_task_configuration(args)?;
-    let mut task = if completed_steps.is_some() || pending_steps.is_some() {
+    let mut task = if let Some(objective) = objective {
         ctx.harness
-            .update_steps(task_id, completed_steps, pending_steps)
+            .revise_objective(task_id, objective)
             .map_err(map_error)?
     } else {
         ctx.harness.task(task_id).map_err(map_error)?
     };
+    if completed_steps.is_some() || pending_steps.is_some() {
+        task = ctx
+            .harness
+            .update_steps(task_id, completed_steps, pending_steps)
+            .map_err(map_error)?;
+    }
     if !configuration.is_empty() {
         task = ctx
             .harness

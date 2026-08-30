@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::tools::dispatch::call_tool_prevalidated_with_session_cancellation;
@@ -417,10 +416,7 @@ fn bind_host_session_scope(state: &ToolContext, params: &Value, session_id: Opti
     ) else {
         return;
     };
-    let scope = format!(
-        "host-session:{:x}",
-        Sha256::digest(host_session_key.as_bytes())
-    );
+    let scope = crate::tools::session::host_session_scope(host_session_key);
     state.bind_cursor_scope_for_session(session_id, Some(&scope));
 }
 

@@ -1280,6 +1280,42 @@ impl Harness {
             })
     }
 
+    pub fn revise_objective(&self, task_id: &str, objective: &str) -> HarnessResult<TaskSession> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
+        }
+        self.store
+            .with_workspace_transaction(&self.workspace_id, |transaction| {
+                let mut task = self.task(task_id)?;
+                if !task.status.is_writable() {
+                    return Err(HarnessError::new(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务已经关闭，不能修订任务目标",
+                    ));
+                }
+                if task.objective == objective {
+                    return Ok(task);
+                }
+                let previous_objective = task.objective.clone();
+                task.objective = objective.to_string();
+                task.updated_at = timestamp();
+                transaction.save_task(&task)?;
+                transaction.append_event(&harness_event(
+                    &self.workspace_id,
+                    task_id,
+                    "task_objective_revised",
+                    Some("update_task"),
+                    json!({
+                        "previous_objective": previous_objective,
+                        "objective": task.objective
+                    }),
+                    json!({"ok": true}),
+                ))?;
+                Ok(task)
+            })
+    }
+
     pub fn configure_task(
         &self,
         task_id: &str,

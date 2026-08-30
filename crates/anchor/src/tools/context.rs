@@ -513,6 +513,9 @@ impl ToolContext {
                 .task_binding_scope_key_for_session(session_id)
                 .is_some()
             {
+                let scope = self
+                    .task_binding_scope_key_for_session(session_id)
+                    .and_then(|scope| scope.strip_prefix("scope:").map(str::to_string));
                 let writable = self
                     .harness
                     .list_tasks()
@@ -521,6 +524,25 @@ impl ToolContext {
                     .filter(|task| task.status.is_writable())
                     .filter(|task| task.session_id.is_some() && task.session_path.is_some())
                     .collect::<Vec<_>>();
+                if let Some(scope) = scope.as_deref() {
+                    let matched = writable
+                        .iter()
+                        .filter(|task| {
+                            task.session_path.as_deref().is_some_and(|path| {
+                                crate::tools::session::session_path_matches_host_scope(
+                                    &self.primary_workspace_root,
+                                    path,
+                                    scope,
+                                )
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if matched.len() == 1 {
+                        let task = matched.into_iter().next()?;
+                        return self.bind_task_for_session(Some(session_id), &task.id).ok();
+                    }
+                }
                 if writable.len() == 1 {
                     let task = writable.into_iter().next()?;
                     return self.bind_task_for_session(Some(session_id), &task.id).ok();
@@ -777,6 +799,47 @@ mod tests {
 
         ctx.bind_cursor_scope_for_session("transport-c", Some("oauth-principal:same-user"));
         assert!(ctx.task_for_session(Some("transport-c")).is_none());
+    }
+
+    #[test]
+    fn host_session_scope_recovers_the_matching_task_when_multiple_are_writable() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        let session_dir = workspace.path().join("docs/session");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        let first = ctx.harness.start_task("first task").expect("first task");
+        let second = ctx.harness.start_task("second task").expect("second task");
+        let first_path = "docs/session/ses_first.md";
+        let second_path = "docs/session/ses_second.md";
+        std::fs::write(
+            workspace.path().join(first_path),
+            "# Anchor Session\n\n**Host session key:** conversation-a\n",
+        )
+        .expect("first session");
+        std::fs::write(
+            workspace.path().join(second_path),
+            "# Anchor Session\n\n**Host session key:** conversation-b\n",
+        )
+        .expect("second session");
+        ctx.harness
+            .bind_session(&first.id, "ses_first", first_path)
+            .expect("bind first durable session");
+        ctx.harness
+            .bind_session(&second.id, "ses_second", second_path)
+            .expect("bind second durable session");
+
+        let scope = crate::tools::session::host_session_scope("conversation-b");
+        ctx.bind_cursor_scope_for_session("transport-b", Some(&scope));
+        assert_eq!(
+            ctx.task_for_session(Some("transport-b"))
+                .map(|task| task.id),
+            Some(second.id)
+        );
     }
 
     #[test]

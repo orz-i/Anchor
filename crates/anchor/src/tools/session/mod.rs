@@ -20,6 +20,38 @@ const MAX_LIST_LIMIT: usize = 100;
 const DEFAULT_GET_BYTES: usize = 64 * 1024;
 const MAX_GET_BYTES: usize = 256 * 1024;
 
+pub(crate) fn host_session_scope(host_session_key: &str) -> String {
+    format!(
+        "host-session:{}",
+        storage::sha256(host_session_key.as_bytes())
+    )
+}
+
+pub(crate) fn session_path_matches_host_scope(
+    workspace_root: &std::path::Path,
+    session_path: &str,
+    host_scope: &str,
+) -> bool {
+    if !host_scope.starts_with("host-session:") {
+        return false;
+    }
+    let Ok(canonical_workspace) = workspace_root.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = workspace_root.join(session_path).canonicalize() else {
+        return false;
+    };
+    if !path.starts_with(&canonical_workspace) || !path.is_file() {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    markdown::metadata(&content, "Host session key")
+        .map(|key| host_session_scope(&key) == host_scope)
+        .unwrap_or(false)
+}
+
 pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let session_dir = resolve_dir(ctx, args)?;
     storage::ensure_directory(&session_dir)?;
