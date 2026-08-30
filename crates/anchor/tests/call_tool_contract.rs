@@ -75,6 +75,57 @@ fn server_info_returns_workspace_and_tools() {
 }
 
 #[test]
+fn named_node_toolchain_selects_a_trusted_runtime_and_reports_the_selection() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": "node",
+            "args": ["-e", "console.log(process.execPath)"],
+            "toolchains": {"node": "default"}
+        }),
+    );
+    let payload = assert_ok(&result);
+    assert_eq!(payload["command_ok"], true, "{payload}");
+    assert_eq!(payload["named_toolchains"]["node"]["selector"], "default");
+    assert!(payload["named_toolchains"]["node"]["home"]
+        .as_str()
+        .is_some_and(|home| !home.is_empty()));
+    assert!(payload["resolved_executable"]
+        .as_str()
+        .is_some_and(|path| path.to_ascii_lowercase().contains("node")));
+}
+
+#[test]
+fn named_toolchain_conflicting_environment_is_rejected_before_spawn() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": ["-c", "print('must-not-run')"],
+            "toolchains": {"java": "default"},
+            "env": {"JAVA_HOME": "legacy-manual-selection"}
+        }),
+    );
+    let payload = assert_err(&result);
+    assert_eq!(
+        payload["error"]["code"], "TOOLCHAIN_ENV_CONFLICT",
+        "{payload}"
+    );
+    assert_eq!(
+        payload["error"]["details"]["cause_scope"],
+        "toolchain_registry"
+    );
+    assert_eq!(payload["error"]["details"]["workspace_mutated"], false);
+    assert_eq!(payload["execution_started"], false);
+}
+
+#[test]
 fn replace_text_routes_through_public_contract_and_honors_preconditions() {
     let fx = tiny_js_fixture();
     let target = fx.root.join("replace.txt");
@@ -418,6 +469,8 @@ fn environment_and_cwd_facades_route_to_existing_contracts() {
     let environment = invoke(&ctx, "environment", json!({"operation": "check"}));
     let environment = assert_ok(&environment);
     assert_eq!(environment["facade"], "environment");
+    assert!(environment["development_environment"]["toolchain_registry"]["runtimes"].is_object());
+
     assert_eq!(environment["operation"], "check");
     assert_eq!(environment["detail"], "compact");
     assert!(environment["workspace_exec_available"].is_boolean());
@@ -430,6 +483,14 @@ fn environment_and_cwd_facades_route_to_existing_contracts() {
     let full_environment = assert_ok(&full_environment);
     assert_eq!(full_environment["detail"], "full");
     assert!(full_environment["development_environment"]["probes"].is_object());
+    assert_eq!(
+        full_environment["development_environment"]["toolchain_registry"]["accepts_external_paths"],
+        false
+    );
+    assert!(
+        full_environment["development_environment"]["toolchain_registry"]["runtimes"]["node"]
+            .is_array()
+    );
 
     let initial = invoke(&ctx, "cwd", json!({"operation": "get"}));
     let initial = assert_ok(&initial);
