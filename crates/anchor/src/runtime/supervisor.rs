@@ -211,6 +211,20 @@ impl RuntimeSupervisor {
         entry.phase = RuntimePhase::Stopping;
         entry.desired_running = false;
         entry.next_retry_at = None;
+        if kind == ServiceKind::Mcp {
+            if let Some(readiness) = entry.mcp_handoff_readiness.as_ref() {
+                let cancelled = readiness.cancel_in_flight();
+                if cancelled > 0 {
+                    append_profile_log(
+                        workspace_id,
+                        stderr_log_name(kind),
+                        &format!(
+                            "[shutdown] cancelling {cancelled} in-flight MCP request(s) before listener drain"
+                        ),
+                    );
+                }
+            }
+        }
         if let Some(listener) = entry.handoff_listener.take() {
             listener.close();
         }

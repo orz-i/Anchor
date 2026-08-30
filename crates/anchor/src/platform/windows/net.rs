@@ -1,20 +1,10 @@
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, SetTcpEntry, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
-    MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_LISTEN, TCP_TABLE_OWNER_PID_LISTENER,
+    GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_LISTEN,
+    TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows::Win32::Networking::WinSock::AF_INET;
 
 use crate::error::{AppError, AppResult};
-
-/// Layout-compatible with `MIB_TCPROW` for `SetTcpEntry`.
-#[repr(C)]
-struct TcpRow {
-    dw_state: u32,
-    dw_local_addr: u32,
-    dw_local_port: u32,
-    dw_remote_addr: u32,
-    dw_remote_port: u32,
-}
 
 /// Windows stores TCP ports in network byte order inside `dwLocalPort`.
 fn local_port_from_dw(dw_local_port: u32) -> u16 {
@@ -75,31 +65,6 @@ fn find_listener_row(port: u16) -> AppResult<Option<MIB_TCPROW_OWNER_PID>> {
 
 pub fn find_pid_listening_on_port(port: u16) -> AppResult<Option<u32>> {
     Ok(find_listener_row(port)?.map(|row| row.dwOwningPid))
-}
-
-/// Force-close a TCP listener via `SetTcpEntry(MIB_TCP_STATE_DELETE_TCB)`.
-/// Used to reclaim a port still held by this process after a failed graceful stop.
-pub fn reclaim_listening_port(port: u16) -> AppResult<bool> {
-    let Some(row) = find_listener_row(port)? else {
-        return Ok(false);
-    };
-
-    let mut tcp_row = TcpRow {
-        dw_state: MIB_TCP_STATE_DELETE_TCB.0 as u32,
-        dw_local_addr: row.dwLocalAddr,
-        dw_local_port: row.dwLocalPort,
-        dw_remote_addr: row.dwRemoteAddr,
-        dw_remote_port: row.dwRemotePort,
-    };
-
-    let status = unsafe { SetTcpEntry((&mut tcp_row as *mut TcpRow).cast()) };
-    if status != 0 {
-        let message = format!("SetTcpEntry failed for port {port}: Win32 error {status}");
-        eprintln!("{message}");
-        return Err(AppError::Message(message));
-    }
-
-    Ok(true)
 }
 
 #[cfg(test)]

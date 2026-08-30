@@ -10,13 +10,6 @@ pub trait Platform: Send + Sync {
 
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>>;
 
-    /// Best-effort reclaim of a TCP listener on the given port. Windows uses
-    /// `SetTcpEntry`; other platforms return `Ok(false)`.
-    fn reclaim_listening_port(&self, port: u16) -> AppResult<bool> {
-        let _ = port;
-        Ok(false)
-    }
-
     fn process_image_path(&self, pid: u32) -> AppResult<Option<String>>;
 
     /// Return processes whose executable image exactly matches `image_path`.

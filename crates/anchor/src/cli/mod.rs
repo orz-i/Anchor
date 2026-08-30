@@ -33,7 +33,10 @@ use crate::gateway_daemon;
 use crate::logging::{profile_log_files, ProfileLogService};
 use crate::mcp::gateway;
 use crate::platform::platform;
-use crate::runtime::{await_listener_shutdown, update_public_url, RuntimeSupervisor, ServiceKind};
+use crate::runtime::{
+    await_listener_shutdown, loopback_port_bindable, update_public_url, RuntimeSupervisor,
+    ServiceKind,
+};
 use crate::settings::McpGatewayConfig;
 use crate::tunnel::{
     ensure_for_runtime, is_quick_tunnel_url_change_error, log_dir_for_profile,
@@ -2479,6 +2482,12 @@ async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
             true,
         )
         .await?;
+        wait_for_selected_ports_available(
+            &profile,
+            service,
+            Duration::from_secs(options.wait_seconds),
+        )
+        .await?;
     }
     let state = control::ensure_daemon_running(
         &profile,
@@ -2670,8 +2679,31 @@ fn ensure_selected_ports_available(
                 "{label} 端口 {port} 已被 PID {pid} 占用；CLI 不会接管 GUI 或其他进程"
             )));
         }
+        if !loopback_port_bindable(port) {
+            return Err(AppError::Message(format!(
+                "{label} 端口 {port} 当前没有活动 LISTEN owner，但仍无法重新绑定；Windows 上这通常表示上一次连接尚未完成 TCP 释放"
+            )));
+        }
     }
     Ok(())
+}
+
+async fn wait_for_selected_ports_available(
+    profile: &WorkspaceProfile,
+    service: ServiceSelection,
+    timeout: Duration,
+) -> AppResult<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let error = match ensure_selected_ports_available(profile, service) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn cli_tunnel_retry_delay(attempts: u8) -> Duration {
@@ -3659,17 +3691,21 @@ async fn shutdown(
     services: &[ServiceKind],
     tunnels: &[TunnelServiceKind],
 ) -> AppResult<()> {
-    for kind in services.iter().rev().copied() {
-        let handle = runtime.begin_stop(&profile.id, kind);
-        await_listener_shutdown(handle, port_for(profile, kind)).await;
-        runtime.finish_stop(&profile.id, kind);
-    }
-
     let mut first_error = None;
+    // Stop ingress first. Keeping FRP/Cloudflare alive while the local server is
+    // draining can preserve or recreate a TCP connection to the business port,
+    // which is especially harmful on Windows where a recently closed endpoint
+    // can make the successor bind fail with WSAEADDRINUSE (10048).
     for kind in tunnels.iter().rev().copied() {
         if let Err(error) = stop_for_runtime(profile, kind).await {
             first_error.get_or_insert(error);
         }
+    }
+
+    for kind in services.iter().rev().copied() {
+        let handle = runtime.begin_stop(&profile.id, kind);
+        await_listener_shutdown(handle, port_for(profile, kind)).await;
+        runtime.finish_stop(&profile.id, kind);
     }
     match first_error {
         Some(error) => Err(error),

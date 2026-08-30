@@ -4,12 +4,13 @@ use std::net::{IpAddr, SocketAddr, TcpListener};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-/// A process-local duplicate of a live business listener.
+/// A process-local handoff token for a live business listener.
 ///
-/// The serving task owns a separate descriptor/handle for the same kernel
-/// socket. Keeping this duplicate alive lets a future daemon generation inherit
-/// the listener without releasing and rebinding the stable business port.
+/// Unix keeps a duplicate descriptor for zero-downtime daemon handoff. Other
+/// platforms do not support listener inheritance, so retaining an extra socket
+/// handle would only delay deterministic port release during stop/restart.
 pub(crate) struct HandoffListener {
+    #[cfg(unix)]
     listener: TcpListener,
 }
 
@@ -32,11 +33,24 @@ fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
 
 impl HandoffListener {
     pub(crate) fn close(self) {
+        #[cfg(unix)]
         drop(self.listener);
     }
 
     pub(crate) fn activate(self) -> io::Result<(tokio::net::TcpListener, HandoffListener)> {
-        prepare_listener(self.listener)
+        #[cfg(unix)]
+        {
+            prepare_listener(self.listener)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "listener handoff is only supported on Unix",
+            ))
+        }
     }
 
     #[cfg(unix)]
@@ -82,9 +96,12 @@ fn prepare_listener(
 ) -> io::Result<(tokio::net::TcpListener, HandoffListener)> {
     ensure_loopback_listener(&listener)?;
     listener.set_nonblocking(true)?;
+    #[cfg(unix)]
     let handoff = HandoffListener {
         listener: listener.try_clone()?,
     };
+    #[cfg(not(unix))]
+    let handoff = HandoffListener {};
     let serving = tokio::net::TcpListener::from_std(listener)?;
     Ok((serving, handoff))
 }
@@ -109,6 +126,7 @@ fn ensure_loopback_listener(listener: &TcpListener) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn duplicate_keeps_the_business_port_bound_after_serving_handle_drops() {
         let (serving, handoff) = bind_loopback_listener(0).expect("bind listener");
@@ -124,6 +142,19 @@ mod tests {
         handoff.close();
         let rebound = TcpListener::bind(address).expect("port released after final listener drop");
         drop(rebound);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn non_unix_handoff_token_does_not_retain_business_listener() {
+        let (serving, handoff) = bind_loopback_listener(0).expect("bind listener");
+        let address = serving.local_addr().expect("serving address");
+
+        drop(serving);
+        let rebound = TcpListener::bind(address)
+            .expect("non-Unix handoff token must not retain the business listener");
+        drop(rebound);
+        handoff.close();
     }
 
     #[cfg(unix)]

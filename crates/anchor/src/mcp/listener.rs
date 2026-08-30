@@ -89,6 +89,10 @@ pub(crate) struct McpHandoffSnapshot {
 }
 
 impl McpHandoffReadiness {
+    pub(crate) fn cancel_in_flight(&self) -> usize {
+        self.in_flight.cancel_all()
+    }
+
     pub(crate) fn snapshot_for_handoff(
         &self,
         initiator_pid: u32,

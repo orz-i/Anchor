@@ -119,6 +119,25 @@ impl Drop for InFlightRequestGuard {
 }
 
 impl InFlightRequests {
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.inner.lock().expect("MCP in-flight request lock").len()
+    }
+
+    /// Cooperatively cancel every request that is currently executing.
+    ///
+    /// Keep registry entries until their request guards are dropped so shutdown
+    /// code can still observe whether cancellation has actually drained the
+    /// handlers rather than treating cancellation delivery as completion.
+    pub(crate) fn cancel_all(&self) -> usize {
+        let requests = self.inner.lock().expect("MCP in-flight request lock");
+        let count = requests.len();
+        for token in requests.values() {
+            token.cancel();
+        }
+        count
+    }
+
     pub(crate) fn count_excluding_session(&self, excluded_session_id: Option<&str>) -> usize {
         let requests = self.inner.lock().expect("MCP in-flight request lock");
         let excluded_prefix = excluded_session_id.map(|session_id| format!("{session_id}:"));
@@ -880,6 +899,22 @@ mod tests {
         assert!(first.is_cancelled());
         assert!(second.is_cancelled());
         assert!(!other.is_cancelled());
+    }
+
+    #[test]
+    fn in_flight_registry_cancels_all_without_releasing_active_guards() {
+        let requests = InFlightRequests::default();
+        let first = requests.insert("session", &json!(1)).expect("first");
+        let second = requests.insert("other", &json!(2)).expect("second");
+
+        assert_eq!(requests.count(), 2);
+        assert_eq!(requests.cancel_all(), 2);
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert_eq!(requests.count(), 2);
+
+        drop((first, second));
+        assert_eq!(requests.count(), 0);
     }
 
     #[test]

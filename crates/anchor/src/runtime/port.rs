@@ -1,4 +1,5 @@
 use std::time::{Duration, Instant};
+use std::{net::Ipv4Addr, net::TcpListener};
 
 use crate::async_runtime::JoinHandle;
 
@@ -8,74 +9,52 @@ pub fn is_own_process(pid: u32) -> bool {
     pid == std::process::id()
 }
 
-pub fn try_reclaim_own_port(port: u16) -> bool {
-    let Ok(Some(pid)) = platform().find_pid_listening_on_port(port) else {
-        return false;
-    };
-    if !is_own_process(pid) {
-        return false;
-    }
-
-    match platform().reclaim_listening_port(port) {
-        Ok(true) => platform()
-            .find_pid_listening_on_port(port)
-            .ok()
-            .flatten()
-            .is_none(),
-        Ok(false) => false,
-        Err(error) => {
-            eprintln!("reclaim_listening_port({port}) failed: {error}");
-            false
+/// Return whether a fresh listener can actually bind the workspace loopback
+/// endpoint right now.
+///
+/// On Windows, absence from the LISTEN table is not enough: accepted TCP
+/// connections can keep the local transport address unavailable after the
+/// listening socket has been closed. A short-lived bind probe reflects the
+/// same condition the successor daemon will face without relying on privileged
+/// `SetTcpEntry` state mutation.
+pub fn loopback_port_bindable(port: u16) -> bool {
+    match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => {
+            drop(listener);
+            true
         }
+        Err(_) => false,
     }
 }
 
 pub async fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if loopback_port_bindable(port) {
+            return true;
+        }
         match platform().find_pid_listening_on_port(port) {
-            Ok(None) => return true,
-            Ok(Some(pid)) if is_own_process(pid) => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Ok(Some(_)) => return false,
+            Ok(Some(pid)) if !is_own_process(pid) => return false,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             Err(_) => return false,
         }
     }
-
-    if try_reclaim_own_port(port) {
-        return true;
-    }
-
-    platform()
-        .find_pid_listening_on_port(port)
-        .ok()
-        .flatten()
-        .is_none()
+    loopback_port_bindable(port)
 }
 
 pub fn wait_for_port_free_blocking(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if loopback_port_bindable(port) {
+            return true;
+        }
         match platform().find_pid_listening_on_port(port) {
-            Ok(None) => return true,
-            Ok(Some(pid)) if is_own_process(pid) => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(Some(_)) => return false,
+            Ok(Some(pid)) if !is_own_process(pid) => return false,
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => return false,
         }
     }
-
-    if try_reclaim_own_port(port) {
-        return true;
-    }
-
-    platform()
-        .find_pid_listening_on_port(port)
-        .ok()
-        .flatten()
-        .is_none()
+    loopback_port_bindable(port)
 }
 
 pub async fn await_listener_shutdown(handle: Option<JoinHandle<()>>, port: u16) {
@@ -90,8 +69,10 @@ pub async fn await_listener_shutdown(handle: Option<JoinHandle<()>>, port: u16) 
         }
     }
 
-    if !wait_for_port_free(port, Duration::from_secs(2)).await {
-        let _ = try_reclaim_own_port(port);
+    if !wait_for_port_free(port, Duration::from_secs(5)).await {
+        eprintln!(
+            "listener port {port} is still not bindable after graceful shutdown; successor startup must wait for TCP release"
+        );
     }
 }
 
@@ -108,5 +89,20 @@ pub fn port_busy_message(port: u16, service_label: &str, pid: u32) -> String {
         )
     } else {
         format!("{service_label}端口 {port} 已被占用：{image}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_bind_probe_tracks_real_bindability() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+
+        assert!(!loopback_port_bindable(port));
+        drop(listener);
+        assert!(loopback_port_bindable(port));
     }
 }
