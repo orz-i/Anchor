@@ -26,6 +26,8 @@ const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
 const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::ZERO;
 const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
 const DURABLE_COMMAND_SCHEMA_VERSION: u32 = 1;
+const TERMINAL_RECONCILIATION_GRACE: Duration = Duration::from_millis(250);
+const TERMINAL_RECONCILIATION_POLL: Duration = Duration::from_millis(10);
 const DURABLE_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DURABLE_LOG_RETAIN_BYTES: u64 = 8 * 1024 * 1024;
 const DURABLE_JSON_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -504,11 +506,23 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     }
 
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
-    let exit_status = loop {
+    let exit_status = 'wait: loop {
         if let Ok(Some(status)) = child.try_wait() {
             break status;
         }
         if Instant::now() >= deadline {
+            let grace_deadline = Instant::now() + TERMINAL_RECONCILIATION_GRACE;
+            while Instant::now() < grace_deadline {
+                if let Ok(Some(status)) = child.try_wait() {
+                    if status.success() {
+                        let mut current = state.lock().expect("durable state lock");
+                        current.termination_reason = "late_success".into();
+                        persist_durable_state(&paths, &current);
+                    }
+                    break 'wait status;
+                }
+                tokio::time::sleep(TERMINAL_RECONCILIATION_POLL).await;
+            }
             {
                 let mut current = state.lock().expect("durable state lock");
                 current.termination_reason = "timeout".into();
@@ -770,7 +784,7 @@ pub fn finalize_execution_result(mut value: Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or(match reason.as_str() {
             "running" => "running",
-            "exited" if command_ok == Some(true) => "succeeded",
+            "exited" | "late_success" if command_ok == Some(true) => "succeeded",
             "exited" => "failed",
             "cancelled" => "cancelled",
             "timeout" => "timed_out",
@@ -1070,7 +1084,7 @@ pub fn wait_command(store: &CommandSessionStore, args: &Value) -> Result<Value, 
     let exit_code = snapshot.get("exit_code").and_then(Value::as_i64);
     let state = match termination_reason {
         "running" => "running",
-        "exited" if exit_code == Some(0) => "completed",
+        "exited" | "late_success" if exit_code == Some(0) => "completed",
         "exited" => "failed",
         "cancelled" | "killed" => "cancelled",
         _ => "failed",
@@ -1158,6 +1172,21 @@ impl Default for CommandSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_success_is_a_successful_terminal_result() {
+        let result = finalize_execution_result(json!({
+            "status": "exited",
+            "termination_reason": "late_success",
+            "exit_code": 0,
+            "transport_ok": true,
+            "command_ok": true
+        }));
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["execution_status"], "succeeded", "{result}");
+        assert_eq!(result["termination_reason"], "late_success", "{result}");
+    }
 
     #[test]
     #[ignore = "invoked as a child process by durable supervisor tests"]
@@ -2698,7 +2727,7 @@ impl ExecSession {
         };
         let reason = termination_reason.as_deref().unwrap_or("running");
         let command_ok = match reason {
-            "exited" => {
+            "exited" | "late_success" => {
                 Some(exit_code.is_some_and(|code| self.expected_exit_codes.contains(&code)))
             }
             "running" => None,
@@ -2706,7 +2735,7 @@ impl ExecSession {
         };
         let execution_status = match reason {
             "running" => "running",
-            "exited" if command_ok == Some(true) => "succeeded",
+            "exited" | "late_success" if command_ok == Some(true) => "succeeded",
             "exited" => "failed",
             "cancelled" => "cancelled",
             "timeout" => "timed_out",

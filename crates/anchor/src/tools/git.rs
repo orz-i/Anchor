@@ -2081,14 +2081,16 @@ fn git_ahead_behind(cwd: &std::path::Path, upstream: &str) -> Result<(i64, i64),
 }
 
 fn parse_diff_files(diff: &str) -> Vec<Value> {
-    let mut files = Vec::new();
+    let mut files: Vec<Value> = Vec::new();
     for line in diff.lines() {
         if let Some(path) = line.strip_prefix("+++ b/") {
-            files.push(json!({
-                "path": path,
-                "status": "modified",
-                "binary": false
-            }));
+            if !files.iter().any(|file| file["path"] == path) {
+                files.push(json!({
+                    "path": path,
+                    "status": "modified",
+                    "binary": false
+                }));
+            }
         } else if line.starts_with("--- /dev/null") {
             continue;
         } else if let Some(path) = line.strip_prefix("--- a/") {
@@ -2102,6 +2104,19 @@ fn parse_diff_files(diff: &str) -> Vec<Value> {
         }
     }
     files
+}
+
+#[cfg(test)]
+mod diff_file_tests {
+    use super::*;
+
+    #[test]
+    fn diff_file_summary_deduplicates_repeated_paths() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2 +2 @@\n-a\n+b\n";
+        let files = parse_diff_files(diff);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0]["path"], "src/lib.rs");
+    }
 }
 
 fn git_error(message: &str) -> WorkspaceError {

@@ -278,11 +278,6 @@ fn track_task_recovery(
     if !task_recovery_trackable(tool) {
         return;
     }
-    if output.get("failure_classification").and_then(Value::as_str) == Some("infrastructure")
-        && output.get("failure_stage").and_then(Value::as_str) != Some("test")
-    {
-        return;
-    }
 
     if tool == "apply_patch"
         && args
@@ -749,6 +744,31 @@ fn explicit_test_count(output: &Value) -> Option<u64> {
     None
 }
 
+fn command_looks_like_test_runner(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "gradle ",
+        "gradlew",
+        "cargo test",
+        "pytest",
+        "python -m pytest",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "pnpm run test",
+        "yarn test",
+        "flutter test",
+        "go test",
+        "dotnet test",
+        "xcodebuild test",
+        "connecteddebugandroidtest",
+        "connectedandroidtest",
+        "instrumentation",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+}
+
 fn classify_test_outcome(output: &Value) -> Option<&'static str> {
     let text = format!(
         "{}\n{}",
@@ -780,6 +800,14 @@ fn classify_test_outcome(output: &Value) -> Option<&'static str> {
         || lower.contains("could not connect")
         || lower.contains("connection refused");
     if provider_or_runner && transport_failure {
+        return Some("test_infrastructure_failure");
+    }
+
+    let missing_prerequisite = lower.contains("must run before cli verification")
+        || lower.contains("build must run before verification")
+        || lower.contains("required build artifact is missing")
+        || lower.contains("required test prerequisite is missing");
+    if missing_prerequisite {
         return Some("test_infrastructure_failure");
     }
 
@@ -849,7 +877,9 @@ fn record_verification_from_output(
             }
         }
     }
-    if output.get("failure_classification").and_then(Value::as_str) == Some("infrastructure")
+    if identity.kind.eq_ignore_ascii_case("test")
+        && command_looks_like_test_runner(identity.command)
+        && output.get("failure_classification").and_then(Value::as_str) == Some("infrastructure")
         && output.get("failure_stage").and_then(Value::as_str) != Some("test")
     {
         if let Some(object) = output.as_object_mut() {
@@ -2935,6 +2965,51 @@ mod tests {
 
         assert_eq!(output["verification_skipped"], true);
         assert_eq!(output["verification_skip_reason"], "command_not_executed");
+        assert!(ctx
+            .harness
+            .list_verifications(&task.id)
+            .expect("verifications")
+            .is_empty());
+    }
+
+    #[test]
+    fn missing_prebuilt_test_artifact_is_classified_as_test_infrastructure() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("admin assets").expect("task");
+        let mut output = json!({
+            "ok": false,
+            "execution_started": true,
+            "command_ok": false,
+            "exit_code": 101,
+            "stdout": "pnpm build must run before CLI verification",
+            "stderr": "error: test failed",
+            "failure_stage": "process",
+            "failure_classification": "command"
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "cargo test --all-targets",
+                verification_key: Some("all-targets"),
+                test_file: None,
+                test_name: None,
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["test_outcome"], "test_infrastructure_failure");
+        assert_eq!(output["failure_stage"], "test");
+        assert_eq!(output["failure_classification"], "infrastructure");
+        assert_eq!(output["verification_skipped"], true);
         assert!(ctx
             .harness
             .list_verifications(&task.id)

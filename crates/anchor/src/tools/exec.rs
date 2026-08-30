@@ -20,6 +20,7 @@ use crate::tools::CancellationToken;
 
 const COMPLETION_GRACE: Duration = Duration::from_millis(50);
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const TERMINAL_RECONCILIATION_GRACE: Duration = Duration::from_millis(250);
 
 fn apply_execution_environment(
     ctx: &ToolContext,
@@ -1757,6 +1758,35 @@ async fn run_command(
             ));
         }
         if !tty && Instant::now() >= deadline {
+            let grace_deadline = Instant::now() + TERMINAL_RECONCILIATION_GRACE;
+            while !session.has_exited()
+                && !cancellation.is_cancelled()
+                && Instant::now() < grace_deadline
+            {
+                tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
+                session.refresh_status().await;
+            }
+            if cancellation.is_cancelled() {
+                continue;
+            }
+            if session.has_exited() {
+                session.wait_for_readers().await;
+                let snapshot = session.snapshot(max_output);
+                if snapshot.get("command_ok").and_then(Value::as_bool) == Some(true) {
+                    session.mark_termination_reason("late_success");
+                }
+                session.mark_terminal_observed();
+                let snapshot = session.snapshot(max_output);
+                return Ok(merge_exec_result(
+                    snapshot,
+                    start,
+                    cmd,
+                    cwd,
+                    &program,
+                    &args,
+                    execution_mode,
+                ));
+            }
             session.mark_termination_reason("timeout");
             session.kill_and_wait().await;
             session.refresh_status().await;
