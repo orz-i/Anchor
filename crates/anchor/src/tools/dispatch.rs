@@ -749,6 +749,55 @@ fn explicit_test_count(output: &Value) -> Option<u64> {
     None
 }
 
+fn classify_test_outcome(output: &Value) -> Option<&'static str> {
+    let text = format!(
+        "{}\n{}",
+        verification_output_text(output, "stdout"),
+        verification_output_text(output, "stderr")
+    );
+    let lower = text.to_ascii_lowercase();
+    let device_unavailable = [
+        "no connected devices",
+        "no devices/emulators found",
+        "no devices found",
+        "device offline",
+        "device unavailable",
+        "failed to find target device",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern));
+    if device_unavailable {
+        return Some("device_unavailable");
+    }
+
+    let provider_or_runner = lower.contains("device provider")
+        || lower.contains("unified test platform")
+        || lower.contains("android test orchestrator")
+        || lower.contains("instrumentation");
+    let transport_failure = lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("failed to connect")
+        || lower.contains("could not connect")
+        || lower.contains("connection refused");
+    if provider_or_runner && transport_failure {
+        return Some("test_infrastructure_failure");
+    }
+
+    if lower.contains("starting 0 tests") || explicit_test_count(output) == Some(0) {
+        return Some("zero_tests_started");
+    }
+    if explicit_test_count(output).is_some_and(|count| count > 0) {
+        return Some(
+            if output.get("command_ok").and_then(Value::as_bool) == Some(false) {
+                "test_failure"
+            } else {
+                "passed"
+            },
+        );
+    }
+    None
+}
+
 fn record_verification_from_output(
     ctx: &ToolContext,
     task_id: &str,
@@ -769,6 +818,36 @@ fn record_verification_from_output(
             );
         }
         return;
+    }
+    if identity.kind.eq_ignore_ascii_case("test") {
+        if let Some(outcome) = classify_test_outcome(output) {
+            if let Some(object) = output.as_object_mut() {
+                object.insert("test_outcome".into(), Value::String(outcome.into()));
+            }
+            if matches!(
+                outcome,
+                "device_unavailable" | "test_infrastructure_failure" | "zero_tests_started"
+            ) {
+                if let Some(object) = output.as_object_mut() {
+                    object.insert("verification_skipped".into(), Value::Bool(true));
+                    object.insert(
+                        "verification_skip_reason".into(),
+                        Value::String(outcome.into()),
+                    );
+                    object.insert("verification_inconclusive".into(), Value::Bool(true));
+                    if outcome == "zero_tests_started" {
+                        object.insert("verification_test_count".into(), json!(0));
+                    } else {
+                        object.insert("failure_stage".into(), Value::String("test".into()));
+                        object.insert(
+                            "failure_classification".into(),
+                            Value::String("infrastructure".into()),
+                        );
+                    }
+                }
+                return;
+            }
+        }
     }
     if output.get("failure_classification").and_then(Value::as_str) == Some("infrastructure")
         && output.get("failure_stage").and_then(Value::as_str) != Some("test")
@@ -792,8 +871,7 @@ fn record_verification_from_output(
         }
         return;
     };
-    let mut passed = command_passed;
-    let mut supersede_previous_failures = supersede_previous_failures;
+    let passed = command_passed;
     if identity.kind.eq_ignore_ascii_case("test") {
         if let Some(test_count) = explicit_test_count(output) {
             if let Some(object) = output.as_object_mut() {
@@ -803,17 +881,6 @@ fn record_verification_from_output(
                     object.insert(
                         "failure_classification".into(),
                         Value::String("test_failure".into()),
-                    );
-                }
-            }
-            if command_passed && test_count == 0 {
-                passed = false;
-                supersede_previous_failures = false;
-                if let Some(object) = output.as_object_mut() {
-                    object.insert("verification_inconclusive".into(), Value::Bool(true));
-                    object.insert(
-                        "verification_failure_reason".into(),
-                        Value::String("no_tests_executed".into()),
                     );
                 }
             }
@@ -2683,7 +2750,7 @@ fn set_default_cwd_for_session(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
@@ -2965,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_test_run_is_inconclusive_and_does_not_supersede_a_real_failure() {
+    fn zero_test_run_is_inconclusive_and_is_not_recorded_as_a_real_failure() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
         let ctx =
@@ -3016,11 +3083,18 @@ mod tests {
         );
 
         assert_eq!(output["verification_inconclusive"], true);
-        assert_eq!(output["verification_failure_reason"], "no_tests_executed");
+        assert_eq!(output["verification_skipped"], true);
+        assert_eq!(output["verification_skip_reason"], "zero_tests_started");
+        assert_eq!(output["test_outcome"], "zero_tests_started");
         assert_eq!(output["verification_test_count"], 0);
-        assert_eq!(output["verification"]["passed"], Value::Null);
-        assert_eq!(output["verification"]["status"], "failed");
-        assert_eq!(output["supersedes"], json!([]));
+        assert!(output.get("verification").is_none());
+        assert_eq!(
+            ctx.harness
+                .list_verifications(&task.id)
+                .expect("load verifications")
+                .len(),
+            1
+        );
         let previous = ctx
             .harness
             .list_verifications(&task.id)
@@ -3029,6 +3103,95 @@ mod tests {
             .find(|record| record.id == previous.id)
             .expect("previous record");
         assert!(previous.dispositions.is_empty());
+    }
+
+    #[test]
+    fn android_missing_device_is_classified_as_test_infrastructure() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("android device").expect("task");
+        let mut output = json!({
+            "ok": false,
+            "execution_started": true,
+            "command_ok": false,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "No connected devices!",
+            "failure_stage": "process",
+            "failure_classification": "command"
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "gradlew connectedDebugAndroidTest",
+                verification_key: Some("android-instrumentation"),
+                test_file: None,
+                test_name: None,
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["test_outcome"], "device_unavailable");
+        assert_eq!(output["failure_stage"], "test");
+        assert_eq!(output["failure_classification"], "infrastructure");
+        assert_eq!(output["verification_skipped"], true);
+        assert!(ctx
+            .harness
+            .list_verifications(&task.id)
+            .expect("verifications")
+            .is_empty());
+    }
+
+    #[test]
+    fn android_device_provider_timeout_is_classified_as_test_infrastructure() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        let task = ctx.harness.start_task("android provider").expect("task");
+        let mut output = json!({
+            "ok": false,
+            "execution_started": true,
+            "command_ok": false,
+            "exit_code": 1,
+            "stdout": "UTP device provider failed to connect",
+            "stderr": "Device provider timed out while connecting to emulator",
+            "failure_stage": "process",
+            "failure_classification": "command"
+        });
+
+        record_verification_from_output(
+            &ctx,
+            &task.id,
+            VerificationIdentity {
+                kind: "test",
+                command: "gradlew connectedDebugAndroidTest",
+                verification_key: Some("android-instrumentation"),
+                test_file: None,
+                test_name: None,
+                level: "blocking",
+            },
+            true,
+            &mut output,
+        );
+
+        assert_eq!(output["test_outcome"], "test_infrastructure_failure");
+        assert_eq!(output["failure_classification"], "infrastructure");
+        assert_eq!(output["verification_skipped"], true);
+        assert!(ctx
+            .harness
+            .list_verifications(&task.id)
+            .expect("verifications")
+            .is_empty());
     }
 
     #[test]

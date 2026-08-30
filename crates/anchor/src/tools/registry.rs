@@ -2036,6 +2036,7 @@ pub fn output_schema(name: &str) -> Value {
                 "argv": { "type": "array", "items": { "type": "string" } },
                 "failure_stage": { "type": "string", "enum": ["pre_spawn", "spawn", "process", "test"] },
                 "failure_classification": { "type": "string", "enum": ["infrastructure", "command", "test_failure"] },
+                "test_outcome": { "type": "string", "enum": ["passed", "test_failure", "test_infrastructure_failure", "zero_tests_started", "device_unavailable"] },
                 "toolchain": { "type": "object", "additionalProperties": true },
                 "filesystem_scope": { "type": "string", "const": "workspace" },
                 "sandbox_enforced": { "type": "boolean" },
@@ -2061,6 +2062,8 @@ pub fn output_schema(name: &str) -> Value {
                 "mutation_attributed": { "type": "boolean" },
                 "verification_skipped": { "type": "boolean" },
                 "verification_skip_reason": { "type": "string" },
+                "verification_inconclusive": { "type": "boolean" },
+                "verification_test_count": { "type": "integer", "minimum": 0 },
                 "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
                 "warnings": warnings_property()
                 }),
