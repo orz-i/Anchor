@@ -2038,6 +2038,7 @@ pub fn output_schema(name: &str) -> Value {
                 "failure_classification": { "type": "string", "enum": ["infrastructure", "command", "test_failure"] },
                 "test_outcome": { "type": "string", "enum": ["passed", "test_failure", "test_infrastructure_failure", "zero_tests_started", "device_unavailable"] },
                 "toolchain": { "type": "object", "additionalProperties": true },
+                "named_toolchains": { "type": "object", "additionalProperties": true },
                 "filesystem_scope": { "type": "string", "const": "workspace" },
                 "sandbox_enforced": { "type": "boolean" },
                 "execution_boundary": { "type": "string", "minLength": 1 },
@@ -3943,6 +3944,18 @@ pub fn input_schema(name: &str) -> Value {
                     "maxItems": 16,
                     "items": { "type": "string", "minLength": 1, "maxLength": 1024 },
                     "description": "Workspace-relative toolchain directories to prepend to this child process PATH and use when resolving the requested executable. Parent traversal and paths resolving outside the workspace are rejected."
+                },
+                "toolchains": {
+                    "type": "object",
+                    "maxProperties": 4,
+                    "properties": {
+                        "java": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Trusted JDK selector. Use default or a version prefix such as 17 or 21. External paths are never accepted." },
+                        "node": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Trusted Node.js selector. Use default or a version prefix such as 20 or 24. External paths are never accepted." },
+                        "flutter": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Trusted Flutter SDK selector. Use default or a discovered version prefix. External paths are never accepted." },
+                        "android_sdk": { "type": "string", "enum": ["default"], "description": "Select the trusted active/default Android SDK without passing ANDROID_HOME, ANDROID_SDK_ROOT, or external paths." }
+                    },
+                    "additionalProperties": false,
+                    "description": "Named trusted host runtimes discovered by Anchor. These selectors do not bypass command allowlists or workspace policy and cannot contain filesystem paths."
                 },
                 "shell": { "type": "string", "enum": ["direct", "pwsh", "powershell", "cmd"], "description": "Optional explicit Windows shell. Use direct with executable for shell-free execution. Do not launch the same shell family again inside args; redundant PowerShell/cmd nesting is rejected before spawn." },
                 "workdir": { "type": "string", "default": ".", "description": "Working directory relative to the current session cwd. '.' means the session cwd. Paths already prefixed by the current cwd are de-duplicated instead of being joined twice." },

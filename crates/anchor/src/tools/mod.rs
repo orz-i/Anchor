@@ -17,6 +17,7 @@ pub mod resource_budget;
 pub(crate) mod schema;
 pub mod search;
 pub mod session;
+pub(crate) mod toolchain;
 pub mod workspace;
 
 pub use cancellation::CancellationToken;

@@ -29,12 +29,16 @@ fn apply_execution_environment(
     program: &str,
     child_parallelism: usize,
 ) -> Result<(), WorkspaceError> {
+    let named_toolchains = crate::tools::toolchain::resolve_requested(execution)?;
     if let Some(env) = execution.get("env").and_then(Value::as_object) {
         for (name, value) in env {
             if let Some(value) = value.as_str() {
                 command.env(name, value);
             }
         }
+    }
+    for (name, value) in &named_toolchains.env {
+        command.env(name, value);
     }
     apply_java_toolchain_environment(execution, command, program);
 
@@ -49,9 +53,41 @@ fn apply_execution_environment(
     apply_standard_user_toolchain_path(command)?;
     ctx.resources
         .apply_child_environment(command, child_parallelism, program);
-    let toolchain_paths = resolve_toolchain_paths(execution, ctx.workspace.root())?;
+    let mut toolchain_paths = named_toolchains.path_entries;
+    for path in resolve_toolchain_paths(execution, ctx.workspace.root())? {
+        push_unique_path(&mut toolchain_paths, path, false);
+    }
     apply_toolchain_path_overlay(command, &toolchain_paths)?;
     Ok(())
+}
+
+fn attach_named_toolchain_diagnostics(execution: &Value, output: &mut Value) {
+    if execution.get("toolchains").is_none() {
+        return;
+    }
+    let Ok(selection) = crate::tools::toolchain::resolve_requested(execution) else {
+        return;
+    };
+    if let Some(object) = output.as_object_mut() {
+        object.insert("named_toolchains".into(), selection.selected);
+    }
+}
+
+fn resolve_from_directories(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
+    for directory in directories {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        for extension in ["exe", "cmd", "bat", "ps1"] {
+            let candidate = directory.join(format!("{name}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn durable_supervisor_executable() -> Result<PathBuf, std::io::Error> {
@@ -609,10 +645,18 @@ fn parse_and_resolve_execution(
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
 ) -> Result<(String, Vec<String>), WorkspaceError> {
+    let named_toolchains = crate::tools::toolchain::resolve_requested(execution)?;
     let toolchain_paths = resolve_toolchain_paths(execution, workspace_root)?;
     let structured = execution.get("executable").is_some() || execution.get("shell").is_some();
     if !structured {
-        return parse_and_resolve(cmd, cwd, workspace_root, policy, &toolchain_paths);
+        return parse_and_resolve(
+            cmd,
+            cwd,
+            workspace_root,
+            policy,
+            &toolchain_paths,
+            &named_toolchains.path_entries,
+        );
     }
     let shell = execution
         .get("shell")
@@ -628,7 +672,14 @@ fn parse_and_resolve_execution(
         "cmd" => "cmd.exe",
         _ => return Err(WorkspaceError::invalid_argument("unsupported shell")),
     };
-    let program = resolve_program(raw_program, cwd, workspace_root, policy, &toolchain_paths)?;
+    let program = resolve_program(
+        raw_program,
+        cwd,
+        workspace_root,
+        policy,
+        &toolchain_paths,
+        &named_toolchains.path_entries,
+    )?;
     Ok((program, structured_args(execution.get("args"))?))
 }
 
@@ -716,6 +767,7 @@ pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), Workspace
     if cmd.is_some() {
         validate_exec_env(object.get("env"))?;
         validate_toolchain_paths(object.get("toolchain_paths"))?;
+        crate::tools::toolchain::validate_request(object.get("toolchains"))?;
         return Ok(());
     }
 
@@ -765,6 +817,7 @@ pub(crate) fn normalize_exec_arguments(args: &mut Value) -> Result<(), Workspace
     }
     validate_exec_env(object.get("env"))?;
     validate_toolchain_paths(object.get("toolchain_paths"))?;
+    crate::tools::toolchain::validate_request(object.get("toolchains"))?;
     let mut tokens = Vec::with_capacity(command_args.len() + 1);
     tokens.push(program.to_string());
     tokens.extend(command_args);
@@ -1107,6 +1160,7 @@ pub fn exec_command_with_cancellation(
         Ok(mut out) => {
             attach_command_file_changes(ctx, &workspace_before, &mut out);
             attach_java_toolchain_diagnostics(args, cmd, &mut out);
+            attach_named_toolchain_diagnostics(args, &mut out);
             if include_diagnostics {
                 if let Some(object) = out.as_object_mut() {
                     object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
@@ -1127,6 +1181,7 @@ pub fn exec_command_with_cancellation(
             Some(mut result) => {
                 attach_command_file_changes(ctx, &workspace_before, &mut result);
                 attach_java_toolchain_diagnostics(args, cmd, &mut result);
+                attach_named_toolchain_diagnostics(args, &mut result);
                 if include_diagnostics {
                     if let Some(object) = result.as_object_mut() {
                         object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
@@ -1325,6 +1380,13 @@ fn select_java_home_from(
 
 fn apply_java_toolchain_environment(execution: &Value, command: &mut Command, program: &str) {
     if !execution_uses_java_toolchain(execution, program) {
+        return;
+    }
+    if execution
+        .get("toolchains")
+        .and_then(Value::as_object)
+        .is_some_and(|toolchains| toolchains.contains_key("java"))
+    {
         return;
     }
     let selection = select_java_home(execution);
@@ -2130,6 +2192,7 @@ fn parse_and_resolve(
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
     toolchain_paths: &[PathBuf],
+    trusted_toolchain_paths: &[PathBuf],
 ) -> Result<(String, Vec<String>), WorkspaceError> {
     let parts =
         crate::tools::policy::split_command_line(cmd).map_err(WorkspaceError::invalid_argument)?;
@@ -2137,7 +2200,14 @@ fn parse_and_resolve(
         return Err(WorkspaceError::invalid_argument("Empty command"));
     }
 
-    let program = resolve_program(&parts[0], cwd, workspace_root, policy, toolchain_paths)?;
+    let program = resolve_program(
+        &parts[0],
+        cwd,
+        workspace_root,
+        policy,
+        toolchain_paths,
+        trusted_toolchain_paths,
+    )?;
     Ok((program, parts[1..].to_vec()))
 }
 
@@ -2147,6 +2217,7 @@ fn resolve_program(
     workspace_root: &Path,
     policy: &crate::tools::policy::PolicySettings,
     toolchain_paths: &[PathBuf],
+    trusted_toolchain_paths: &[PathBuf],
 ) -> Result<String, WorkspaceError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2154,6 +2225,11 @@ fn resolve_program(
     }
 
     let explicit_path = trimmed.contains(['/', '\\']);
+    if !explicit_path {
+        if let Some(candidate) = resolve_from_directories(trimmed, trusted_toolchain_paths) {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
     let candidate = if Path::new(trimmed).is_absolute() {
         Path::new(trimmed).to_path_buf()
     } else {
@@ -2388,6 +2464,7 @@ mod tests {
             workspace.path(),
             workspace.path(),
             &crate::tools::policy::PolicySettings::default(),
+            &[],
             &[],
         )
         .expect_err("absolute external executable must be rejected");
@@ -2687,6 +2764,7 @@ mod tests {
             workspace.path(),
             workspace.path(),
             &crate::tools::policy::PolicySettings::default(),
+            &[],
             &[],
         )
         .expect("workspace entry resolves");

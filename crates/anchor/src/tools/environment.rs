@@ -259,6 +259,7 @@ pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
         "docker_daemon": docker_daemon
     });
     let probe_health = summarize_probe_health(&probes);
+    let toolchain_registry = crate::tools::toolchain::registry_value();
 
     json!({
         "platform": {
@@ -299,6 +300,7 @@ pub fn diagnose(root: &Path, docker_execution_allowed: bool) -> Value {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
         },
+        "toolchain_registry": toolchain_registry,
         "findings": findings
     })
 }
@@ -369,6 +371,7 @@ pub fn summarize_diagnosis(full: &Value) -> Value {
         "toolchain_search_path": {
             "effective_additions": full["toolchain_search_path"]["effective_additions"]
         },
+        "toolchain_registry": crate::tools::toolchain::registry_summary(&full["toolchain_registry"]),
         "findings": full["findings"]
     })
 }

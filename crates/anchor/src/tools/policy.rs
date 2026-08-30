@@ -51,6 +51,9 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "ruby",
     "java",
     "javac",
+    "flutter",
+    "dart",
+    "adb",
     "cmake",
     "clang",
     "gcc",
@@ -89,6 +92,7 @@ fn safe_regex_pattern_literal(source: &str, start: usize) -> bool {
             break;
         }
     }
+
     [
         "re.compile(",
         "re.search(",
@@ -1555,6 +1559,15 @@ mod tests {
     fn basic_diagnostic_commands_are_allowed() {
         let policy = PolicySettings::default();
         for command in BASIC_READ_ONLY_COMMANDS {
+            validate_command(&json!({"cmd": command}), &policy)
+                .unwrap_or_else(|err| panic!("{command} should be allowed: {err}"));
+        }
+    }
+
+    #[test]
+    fn mobile_toolchain_entrypoints_are_default_allowlisted() {
+        let policy = PolicySettings::default();
+        for command in ["flutter --version", "dart --version", "adb devices"] {
             validate_command(&json!({"cmd": command}), &policy)
                 .unwrap_or_else(|err| panic!("{command} should be allowed: {err}"));
         }
