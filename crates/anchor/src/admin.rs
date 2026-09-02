@@ -43,11 +43,6 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "rollback_workspace_skill_package",
     "remove_workspace_skill_package",
     "inspect_workspace_skills",
-    "install_workspace_skill_package",
-    "set_workspace_skill_channel",
-    "activate_workspace_skill_package",
-    "rollback_workspace_skill_package",
-    "remove_workspace_skill_package",
     "open_workspace_directory",
     "delete_workspace",
     "run_health_checks",
@@ -1665,6 +1660,15 @@ mod tests {
             dispatch_command(&state, "session", "save_frp_profile", json!({})).await,
             Err(AdminDispatchError::NotMigrated)
         ));
+    }
+
+    #[test]
+    fn web_admin_supported_commands_are_unique() {
+        let unique = WEB_ADMIN_SUPPORTED_COMMANDS
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), WEB_ADMIN_SUPPORTED_COMMANDS.len());
     }
 
     #[cfg(not(windows))]
