@@ -259,7 +259,7 @@ fn effective_catalog_error(error: crate::tools::workspace::WorkspaceError) -> Va
     serde_json::json!({
         "code": if budget_exceeded { -32004 } else { -32603 },
         "message": if budget_exceeded {
-            "Anchor MCP tool catalog exceeds the ChatGPT compatibility budget. Reduce downstream tools with includeTools, excludeTools, or maxTools, then restart Anchor and refresh or recreate the ChatGPT app."
+            "Anchor MCP tool catalog exceeds the ChatGPT compatibility budget. Switch to the core or read-only tool profile, then restart Anchor and refresh or recreate the ChatGPT app."
         } else {
             "Failed to build effective MCP tool catalog"
         },
@@ -317,44 +317,24 @@ pub async fn handle_request_with_protocol_session_and_cancellation(
     let result = match method {
         "initialize" => Ok(initialize_result_for_version(state, protocol_version)),
         "ping" => Ok(serde_json::json!({})),
-        "tools/list" => {
-            if !state
-                .mcp_proxies
-                .wait_until_configured(Duration::from_secs(70))
-                .await
-            {
-                return serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32003,
-                        "message": "MCP proxy tool catalog is still initializing",
-                        "data": {
-                            "reason": "proxy_catalog_initializing",
-                            "retryable": true
+        "tools/list" => match build_effective_catalog(state.as_ref()) {
+            Ok(current) => {
+                let (catalog, changed) = state.publish_catalog(current);
+                match tools_list_result(&catalog, &params) {
+                    Ok(mut result) => {
+                        if changed {
+                            result["_meta"]["anchor/catalog"]["catalog_changed"] =
+                                Value::Bool(true);
+                            result["_meta"]["anchor/catalog"]["reconnect_required"] =
+                                Value::Bool(true);
                         }
+                        Ok(result)
                     }
-                });
-            }
-            match build_effective_catalog(state.as_ref()) {
-                Ok(current) => {
-                    let (catalog, changed) = state.publish_catalog(current);
-                    match tools_list_result(&catalog, &params) {
-                        Ok(mut result) => {
-                            if changed {
-                                result["_meta"]["anchor/catalog"]["catalog_changed"] =
-                                    Value::Bool(true);
-                                result["_meta"]["anchor/catalog"]["reconnect_required"] =
-                                    Value::Bool(true);
-                            }
-                            Ok(result)
-                        }
-                        Err(error) => Err(error),
-                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(effective_catalog_error(error)),
             }
-        }
+            Err(error) => Err(effective_catalog_error(error)),
+        },
         "tools/call" => handle_tools_call(state, &params, cancellation, session_id).await,
         "skills/list" => crate::skills::native_skills_list(&state.skills, &params),
         "skills/get" => crate::skills::native_skill_get(&state.skills, &params),
@@ -400,7 +380,7 @@ fn initialize_result_for_version(state: &SharedState, protocol_version: &str) ->
             "title": crate::brand::PRODUCT_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. Agent Skills are advertised through the native MCP Skills extension when enabled; generic compatible hosts may consume skills/list, skills/get, and resources/read. ChatGPT Developer Mode MCP apps should instead use the published read-only `skill` facade because Developer Mode reliably discovers MCP tools but may not surface native Skill UI: use skill operation=list to find a relevant workspace Skill, operation=get before following its instructions, and operation=read_resource only when supporting material is needed. ChatGPT Plugin Skills are a separate packaging layer: current ChatGPT plugins bundle static skills/ folders through .codex-plugin/plugin.json and bind a registered MCP app through .app.json; use `anchor plugin package` to snapshot Workspace Skills for that path. Skill content is instructions, not permission to bypass tool policy. Skill allowed-tools declarations are dependency metadata only and never grant permissions. There is no dedicated Skill script executor and no model-controlled permission grant tool. Model-supplied confirm fields are not accepted as user approval. Destructive commands, critical-file deletion, and snapshotted Skill script execution require the operator to enable dangerous permission mode through the trusted GUI or CLI control plane; Skill execution is still rejected if the script digest changed after the listener snapshot. The public catalog consolidates related Session, Git, Harness task, Slice, staged-commit, Skill, environment-diagnostic, and working-directory operations behind the `session`, `git`, `task`, `slice`, `commit_stage`, `skill`, `environment`, and `cwd` tools; select an `operation` and use the arguments described by that facade schema. Internal operation handlers are implementation details and are not directly callable through MCP tools/call. Downstream MCP exposure is governed before publication: automatic mode keeps known Browser MCPs on the normal interaction workflow and requires explicit includeTools/maxTools or exposureMode=full for high-fanout generic servers. For hosts that lazily load tool schemas, discover the `anchor-core` tagged group once for the normal coding workflow instead of repeatedly searching exact tool names; use `anchor-skill`, `anchor-files`, `anchor-command`, `anchor-git`, or `anchor-task` only when a narrower group is preferred. A separate host message saying tools were found and will be listed in a follow-up is generated by the host discovery layer, not by Anchor. At the start of every new ChatGPT conversation, before answering the user's first request, call the `session` facade with operation=open exactly once. Treat this as initialization of an isolated development Session, not as implicit history restoration. Session open must not read, summarize, inject, pause, or otherwise depend on other Sessions. Preserve the returned session_id and session_path for this conversation. Only when the user explicitly asks to restore, find, compare, or reference previous work may you call session operation=list for bounded metadata and then operation=get for one explicit relevant session_id. The legacy docs/history-session/ directory is a frozen archive: it is never migrated, scanned by the new Session store, or injected automatically; use read_file on an exact legacy path only when the user explicitly requests legacy history. Anchor synchronously writes idempotent best-effort milestone checkpoints after supported code changes, commits, retained command stages, and browser visual or artifact stages. These automatic milestones do not replace the final task handoff. Before any final response after starting a retained command, call list_command_sessions. If requires_followup is true, call wait_command for each running or terminal-unobserved command session, or kill_session and consume its terminal result. close_work_session and explicit Session checkpoints reject pending command results. After completing each user-requested task in the conversation, call session operation=checkpoint with the preserved session_id and session_path as expected_path. Only state that final progress was saved after the checkpoint returns ok=true with the same session_id and path."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. Agent Skills are advertised through the native MCP Skills extension when enabled; generic compatible hosts may consume skills/list, skills/get, and resources/read. ChatGPT Developer Mode MCP apps should instead use the published read-only `skill` facade because Developer Mode reliably discovers MCP tools but may not surface native Skill UI: use skill operation=list to find a relevant workspace Skill, operation=get before following its instructions, and operation=read_resource only when supporting material is needed. ChatGPT Plugin Skills are a separate packaging layer: current ChatGPT plugins bundle static skills/ folders through .codex-plugin/plugin.json and bind a registered MCP app through .app.json; use `anchor plugin package` to snapshot Workspace Skills for that path. Skill content is instructions, not permission to bypass tool policy. Skill allowed-tools declarations are dependency metadata only and never grant permissions. There is no dedicated Skill script executor and no model-controlled permission grant tool. Model-supplied confirm fields are not accepted as user approval. Destructive commands, critical-file deletion, and snapshotted Skill script execution require the operator to enable dangerous permission mode through the trusted GUI or CLI control plane; Skill execution is still rejected if the script digest changed after the listener snapshot. The public catalog consolidates related Session, Git, Harness task, Slice, staged-commit, Skill, downstream MCP, environment-diagnostic, and working-directory operations behind the `session`, `git`, `task`, `slice`, `commit_stage`, `skill`, `mcp`, `environment`, and `cwd` tools; select an `operation` and use the arguments described by that facade schema. Internal operation handlers are implementation details and are not directly callable through MCP tools/call. Downstream MCP servers and their tool schemas are never injected into the primary tools/list catalog. Use `mcp` operation=list/get for server state, search_tools for compact discovery, get_tool for one exact schema, and call for invocation; the advanced profile additionally exposes register/enable/disable/refresh/remove lifecycle operations. For hosts that lazily load tool schemas, discover the `anchor-core` tagged group once for the normal coding workflow instead of repeatedly searching exact tool names; use `anchor-skill`, `anchor-files`, `anchor-command`, `anchor-git`, or `anchor-task` only when a narrower group is preferred. A separate host message saying tools were found and will be listed in a follow-up is generated by the host discovery layer, not by Anchor. At the start of every new ChatGPT conversation, before answering the user's first request, call the `session` facade with operation=open exactly once. Treat this as initialization of an isolated development Session, not as implicit history restoration. Session open must not read, summarize, inject, pause, or otherwise depend on other Sessions. Preserve the returned session_id and session_path for this conversation. Only when the user explicitly asks to restore, find, compare, or reference previous work may you call session operation=list for bounded metadata and then operation=get for one explicit relevant session_id. The legacy docs/history-session/ directory is a frozen archive: it is never migrated, scanned by the new Session store, or injected automatically; use read_file on an exact legacy path only when the user explicitly requests legacy history. Anchor synchronously writes idempotent best-effort milestone checkpoints after supported code changes, commits, retained command stages, and browser visual or artifact stages. These automatic milestones do not replace the final task handoff. Before any final response after starting a retained command, call list_command_sessions. If requires_followup is true, call wait_command for each running or terminal-unobserved command session, or kill_session and consume its terminal result. close_work_session and explicit Session checkpoints reject pending command results. After completing each user-requested task in the conversation, call session operation=checkpoint with the preserved session_id and session_path as expected_path. Only state that final progress was saved after the checkpoint returns ok=true with the same session_id and path."
     })
 }
 
@@ -445,127 +425,8 @@ async fn handle_tools_call(
         }));
     }
 
-    if state.mcp_proxies.contains_tool(name) {
-        let mut active_task = state.task_for_session(session_id);
-        let scoped_context = match active_task
-            .as_ref()
-            .map(|task| state.scoped_for_task(task, session_id))
-            .transpose()
-        {
-            Ok(context) => context.flatten(),
-            Err(message) => {
-                return Ok(browser_workspace_path_error(
-                    name,
-                    crate::tools::workspace::WorkspaceError::Tool {
-                        code: "TASK_WORKTREE_UNAVAILABLE",
-                        message,
-                        category: "runtime",
-                        retryable: true,
-                    },
-                ))
-            }
-        };
-        let execution_state = scoped_context.as_ref().unwrap_or(state.as_ref());
-        if let Some(task) = active_task.as_ref() {
-            match execution_state
-                .harness
-                .resume_task_for_activity(&task.id, name, session_id)
-            {
-                Ok(task) => active_task = Some(task),
-                Err(error) => {
-                    return Err(serde_json::json!({
-                        "code": -32603,
-                        "message": "Failed to resume paused Harness task for proxy activity",
-                        "data": {
-                            "reason": "task_auto_resume_failed",
-                            "harness_error": error.code(),
-                            "details": error.to_string()
-                        }
-                    }))
-                }
-            }
-        }
-        let (proxy_args, artifact_targets) = match prepare_browser_workspace_arguments(
-            &execution_state.workspace,
-            &state.workspace,
-            name,
-            &raw_args,
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok(browser_workspace_path_error(name, error)),
-        };
-        let operation = execution_state
-            .harness
-            .record_operation(
-                None,
-                active_task.as_ref().map(|task| task.id.as_str()),
-                session_id,
-                name,
-                "started",
-                serde_json::json!({
-                    "arguments": raw_args,
-                    "source": "mcp_proxy",
-                    "session_id": session_id
-                }),
-                serde_json::json!({"ok": true}),
-            )
-            .ok();
-        if let Some(mut result) = state
-            .mcp_proxies
-            .call_tool_with_cancellation(name, &proxy_args, cancellation)
-            .await
-        {
-            let artifact_result = finalize_browser_workspace_artifacts(&artifact_targets);
-            if let Ok(value) = &mut result {
-                if let Err(error) = artifact_result {
-                    *value = browser_workspace_path_error(name, error);
-                } else {
-                    attach_browser_workspace_artifacts(
-                        execution_state.workspace.root(),
-                        &artifact_targets,
-                        value,
-                    );
-                }
-                attach_browser_build_info(execution_state, name, value, cancellation).await;
-                attach_proxy_auto_checkpoint(state.as_ref(), name, &proxy_args, value, session_id);
-            }
-            if let Some(operation) = operation {
-                if let Ok(value) = &mut result {
-                    if let Some(structured) = value
-                        .get_mut("structuredContent")
-                        .and_then(Value::as_object_mut)
-                    {
-                        structured
-                            .insert("operation_id".into(), Value::String(operation.id.clone()));
-                    }
-                }
-                let summary = proxy_operation_summary(name, session_id, &result);
-                let succeeded = summary.get("ok").and_then(Value::as_bool) == Some(true);
-                let _ = execution_state.harness.record_operation(
-                    Some(&operation.id),
-                    active_task.as_ref().map(|task| task.id.as_str()),
-                    session_id,
-                    name,
-                    if succeeded { "completed" } else { "failed" },
-                    serde_json::json!({
-                        "arguments": raw_args,
-                        "source": "mcp_proxy",
-                        "session_id": session_id
-                    }),
-                    summary.clone(),
-                );
-                if let Some(task) = active_task.as_ref() {
-                    let _ = execution_state.harness.record_event(
-                        &task.id,
-                        "proxy_operation_finished",
-                        Some(name),
-                        serde_json::json!({"session_id": session_id}),
-                        summary,
-                    );
-                }
-            }
-            return result;
-        }
+    if name == "mcp" {
+        return handle_mcp_facade_call(state, &raw_args, cancellation, session_id).await;
     }
 
     if matches!(name, "browser_build_info" | "browser_wait_for_build") {
@@ -654,6 +515,354 @@ async fn handle_tools_call(
     });
     let structured = await_local_tool_worker(name, &raw_args, cancellation, worker).await?;
     Ok(wrap_mcp_tool_result(name, &raw_args, structured))
+}
+
+async fn handle_mcp_facade_call(
+    state: &SharedState,
+    raw_args: &Value,
+    cancellation: &CancellationToken,
+    session_id: Option<&str>,
+) -> Result<Value, Value> {
+    if let Err(error) = crate::tools::schema::validate_tool_input("mcp", raw_args) {
+        return Ok(wrap_mcp_tool_result("mcp", raw_args, tool_err(error)));
+    }
+    let operation = raw_args
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let allowed = crate::tools::registry::facade_operations_for_profile("mcp", &state.tool_profile);
+    if !allowed.contains(&operation) {
+        return Ok(wrap_mcp_tool_result(
+            "mcp",
+            raw_args,
+            tool_err(crate::tools::workspace::WorkspaceError::ToolDetails {
+                code: "MCP_OPERATION_NOT_ALLOWED",
+                message: format!(
+                    "mcp operation `{operation}` is not available in the `{}` tool profile",
+                    state.tool_profile
+                ),
+                category: "permission",
+                retryable: false,
+                details: serde_json::json!({"operation": operation, "profile": state.tool_profile}),
+            }),
+        ));
+    }
+    let Some(operation_tool) = crate::tools::registry::facade_tool_for_operation("mcp", operation)
+    else {
+        return Ok(wrap_mcp_tool_result(
+            "mcp",
+            raw_args,
+            tool_err(crate::tools::workspace::WorkspaceError::Tool {
+                code: "MCP_OPERATION_UNKNOWN",
+                message: format!("unknown mcp operation `{operation}`"),
+                category: "validation",
+                retryable: false,
+            }),
+        ));
+    };
+    let mut operation_args = raw_args.clone();
+    if let Some(object) = operation_args.as_object_mut() {
+        object.remove("operation");
+    }
+    if let Err(error) = crate::tools::schema::validate_tool_input(operation_tool, &operation_args) {
+        return Ok(wrap_mcp_tool_result("mcp", raw_args, tool_err(error)));
+    }
+    if !state
+        .mcp_proxies
+        .wait_until_configured(Duration::from_secs(30))
+        .await
+    {
+        return Ok(wrap_mcp_tool_result(
+            "mcp",
+            raw_args,
+            tool_err(crate::tools::workspace::WorkspaceError::Tool {
+                code: "MCP_RUNTIME_INITIALIZING",
+                message:
+                    "downstream MCP runtime initialization did not complete within the bounded wait"
+                        .into(),
+                category: "runtime",
+                retryable: true,
+            }),
+        ));
+    }
+
+    let structured_result = |value: Value| {
+        let mut structured = tool_ok(value);
+        if let Some(object) = structured.as_object_mut() {
+            object.insert("facade".into(), Value::String("mcp".into()));
+            object.insert("operation".into(), Value::String(operation.to_string()));
+        }
+        wrap_mcp_tool_result("mcp", raw_args, structured)
+    };
+    let runtime_error = |code: &'static str, message: String, retryable: bool| {
+        wrap_mcp_tool_result(
+            "mcp",
+            raw_args,
+            tool_err(crate::tools::workspace::WorkspaceError::ToolDetails {
+                code,
+                message,
+                category: "runtime",
+                retryable,
+                details: serde_json::json!({"operation": operation}),
+            }),
+        )
+    };
+
+    match operation {
+        "list" => return Ok(structured_result(state.mcp_proxies.status())),
+        "get" => {
+            let server = operation_args
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Ok(match state.mcp_proxies.server_status(server) {
+                Some(status) => structured_result(status),
+                None => runtime_error(
+                    "MCP_SERVER_NOT_FOUND",
+                    format!("downstream MCP server `{server}` was not found"),
+                    false,
+                ),
+            });
+        }
+        "search_tools" => {
+            let server = operation_args.get("server").and_then(Value::as_str);
+            let query = operation_args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let cursor = operation_args
+                .get("cursor")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
+            let max_results = operation_args
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .unwrap_or(20) as usize;
+            return Ok(structured_result(state.mcp_proxies.search_tools(
+                server,
+                query,
+                cursor,
+                max_results,
+            )));
+        }
+        "get_tool" => {
+            let server = operation_args
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let tool = operation_args
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Ok(match state.mcp_proxies.tool_definition(server, tool) {
+                Some(definition) => structured_result(definition),
+                None => runtime_error(
+                    "MCP_TOOL_NOT_FOUND",
+                    format!("downstream MCP tool `{server}/{tool}` was not found"),
+                    false,
+                ),
+            });
+        }
+        "register" => {
+            let server = operation_args
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let config = operation_args.get("config").unwrap_or(&Value::Null);
+            let spec = match crate::mcp::proxy::parse_mcp_server_registration(
+                server,
+                config,
+                state.workspace.root(),
+            ) {
+                Ok(spec) => spec,
+                Err(message) => {
+                    return Ok(runtime_error("MCP_SERVER_CONFIG_INVALID", message, false))
+                }
+            };
+            return Ok(match state.mcp_proxies.register_server(spec).await {
+                Ok(status) => structured_result(status),
+                Err(message) => runtime_error("MCP_SERVER_REGISTER_FAILED", message, true),
+            });
+        }
+        "enable" | "disable" => {
+            let server = operation_args
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let enabled = operation == "enable";
+            return Ok(
+                match state.mcp_proxies.set_server_enabled(server, enabled).await {
+                    Ok(status) => structured_result(status),
+                    Err(message) => runtime_error("MCP_SERVER_STATE_CHANGE_FAILED", message, true),
+                },
+            );
+        }
+        "refresh" => {
+            let server = operation_args
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Ok(match state.mcp_proxies.refresh_server(server).await {
+                Ok(status) => structured_result(status),
+                Err(message) => runtime_error("MCP_SERVER_REFRESH_FAILED", message, true),
+            });
+        }
+        "remove" => {
+            let server = operation_args
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return Ok(match state.mcp_proxies.remove_server(server).await {
+                Ok(status) => structured_result(status),
+                Err(message) => runtime_error("MCP_SERVER_REMOVE_FAILED", message, false),
+            });
+        }
+        "call" => {}
+        _ => unreachable!("validated mcp operation"),
+    }
+
+    let server = operation_args
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool = operation_args
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let arguments = operation_args
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if state.mcp_proxies.tool_definition(server, tool).is_none() {
+        return Ok(runtime_error(
+            "MCP_TOOL_NOT_FOUND",
+            format!("downstream MCP tool `{server}/{tool}` was not found"),
+            false,
+        ));
+    }
+
+    let activity_name = format!("mcp:{server}/{tool}");
+    let mut active_task = state.task_for_session(session_id);
+    let scoped_context = match active_task
+        .as_ref()
+        .map(|task| state.scoped_for_task(task, session_id))
+        .transpose()
+    {
+        Ok(context) => context.flatten(),
+        Err(message) => return Ok(runtime_error("TASK_WORKTREE_UNAVAILABLE", message, true)),
+    };
+    let execution_state = scoped_context.as_ref().unwrap_or(state.as_ref());
+    if let Some(task) = active_task.as_ref() {
+        match execution_state
+            .harness
+            .resume_task_for_activity(&task.id, &activity_name, session_id)
+        {
+            Ok(task) => active_task = Some(task),
+            Err(error) => {
+                return Err(serde_json::json!({
+                    "code": -32603,
+                    "message": "Failed to resume paused Harness task for downstream MCP activity",
+                    "data": {
+                        "reason": "task_auto_resume_failed",
+                        "harness_error": error.code(),
+                        "details": error.to_string()
+                    }
+                }))
+            }
+        }
+    }
+    let (proxy_args, artifact_targets) = match prepare_browser_workspace_arguments(
+        &execution_state.workspace,
+        &state.workspace,
+        tool,
+        &arguments,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return Ok(browser_workspace_path_error(tool, error)),
+    };
+    let operation_receipt = execution_state
+        .harness
+        .record_operation(
+            None,
+            active_task.as_ref().map(|task| task.id.as_str()),
+            session_id,
+            &activity_name,
+            "started",
+            serde_json::json!({
+                "server": server,
+                "tool": tool,
+                "arguments": arguments,
+                "source": "mcp_facade",
+                "session_id": session_id
+            }),
+            serde_json::json!({"ok": true}),
+        )
+        .ok();
+    let Some(mut result) = state
+        .mcp_proxies
+        .call_server_tool_with_cancellation(server, tool, &proxy_args, cancellation)
+        .await
+    else {
+        return Ok(runtime_error(
+            "MCP_TOOL_NOT_FOUND",
+            format!("downstream MCP tool `{server}/{tool}` disappeared before invocation"),
+            true,
+        ));
+    };
+    let artifact_result = finalize_browser_workspace_artifacts(&artifact_targets);
+    if let Ok(value) = &mut result {
+        if let Err(error) = artifact_result {
+            *value = browser_workspace_path_error(tool, error);
+        } else {
+            attach_browser_workspace_artifacts(
+                execution_state.workspace.root(),
+                &artifact_targets,
+                value,
+            );
+        }
+        attach_browser_build_info(execution_state, tool, value, cancellation).await;
+        attach_proxy_auto_checkpoint(state.as_ref(), tool, &proxy_args, value, session_id);
+    }
+    if let Some(operation_receipt) = operation_receipt {
+        if let Ok(value) = &mut result {
+            if let Some(structured) = value
+                .get_mut("structuredContent")
+                .and_then(Value::as_object_mut)
+            {
+                structured.insert(
+                    "operation_id".into(),
+                    Value::String(operation_receipt.id.clone()),
+                );
+            }
+        }
+        let summary = proxy_operation_summary(&activity_name, session_id, &result);
+        let succeeded = summary.get("ok").and_then(Value::as_bool) == Some(true);
+        let _ = execution_state.harness.record_operation(
+            Some(&operation_receipt.id),
+            active_task.as_ref().map(|task| task.id.as_str()),
+            session_id,
+            &activity_name,
+            if succeeded { "completed" } else { "failed" },
+            serde_json::json!({
+                "server": server,
+                "tool": tool,
+                "arguments": arguments,
+                "source": "mcp_facade",
+                "session_id": session_id
+            }),
+            summary.clone(),
+        );
+        if let Some(task) = active_task.as_ref() {
+            let _ = execution_state.harness.record_event(
+                &task.id,
+                "mcp_operation_finished",
+                Some(&activity_name),
+                serde_json::json!({"server": server, "tool": tool, "session_id": session_id}),
+                summary,
+            );
+        }
+    }
+    result
 }
 
 async fn await_local_tool_worker(
@@ -1567,7 +1776,7 @@ async fn call_browser_proxy_tool_named(
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<(String, Value), WorkspaceError> {
-    let tool_name =
+    let (server_name, tool_name) =
         find_browser_proxy_tool(ctx, suffix).ok_or_else(|| WorkspaceError::ToolDetails {
             code: "BROWSER_TOOL_UNAVAILABLE",
             message: format!(
@@ -1582,11 +1791,11 @@ async fn call_browser_proxy_tool_named(
         })?;
     let result = ctx
         .mcp_proxies
-        .call_tool_with_cancellation(&tool_name, arguments, cancellation)
+        .call_server_tool_with_cancellation(&server_name, &tool_name, arguments, cancellation)
         .await
         .ok_or_else(|| WorkspaceError::Tool {
             code: "BROWSER_TOOL_UNAVAILABLE",
-            message: format!("Browser proxy route disappeared: {tool_name}"),
+            message: format!("Browser proxy route disappeared: {server_name}/{tool_name}"),
             category: "runtime",
             retryable: true,
         })?;
@@ -1595,7 +1804,7 @@ async fn call_browser_proxy_tool_named(
         message: format!("Browser proxy call failed: {error}"),
         category: "runtime",
         retryable: true,
-        details: serde_json::json!({"tool": tool_name, "proxy_error": error}),
+        details: serde_json::json!({"server": server_name, "tool": tool_name, "proxy_error": error}),
     })?;
     let structured = result.get("structuredContent").unwrap_or(&result);
     if structured.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -1618,24 +1827,17 @@ async fn call_browser_proxy_tool_named(
                 .or_else(|| error.get("retryable").and_then(Value::as_bool))
                 .unwrap_or(true),
             details: serde_json::json!({
+                "server": server_name,
                 "tool": tool_name,
                 "structured": structured
             }),
         });
     }
-    Ok((tool_name, result))
+    Ok((format!("{server_name}/{tool_name}"), result))
 }
 
-fn find_browser_proxy_tool(ctx: &ToolContext, suffix: &str) -> Option<String> {
-    let catalog = ctx
-        .published_catalog()
-        .or_else(|| build_effective_catalog(ctx).ok())?;
-    catalog
-        .tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .find(|name| name.ends_with(suffix) && ctx.mcp_proxies.contains_tool(name))
-        .map(str::to_string)
+fn find_browser_proxy_tool(ctx: &ToolContext, suffix: &str) -> Option<(String, String)> {
+    ctx.mcp_proxies.find_tool_by_suffix(suffix)
 }
 
 fn extract_browser_json_payload(value: &Value) -> Option<Value> {
@@ -1844,10 +2046,9 @@ mod tests {
     use super::browser_os_path;
     use super::{
         attach_browser_workspace_artifacts, await_local_tool_worker_with_limits,
-        browser_build_matches, browser_current_build, effective_catalog_error,
-        extract_browser_json_payload, finalize_browser_workspace_artifacts, handle_request,
-        handle_tools_call, initialize_result, new_state, prepare_browser_workspace_arguments,
-        tool_arguments, tools_list_result,
+        browser_build_matches, browser_current_build, extract_browser_json_payload,
+        finalize_browser_workspace_artifacts, handle_request, handle_tools_call, initialize_result,
+        new_state, prepare_browser_workspace_arguments, tool_arguments, tools_list_result,
     };
 
     fn test_state() -> (tempfile::TempDir, tempfile::TempDir, Arc<ToolContext>) {
@@ -1938,7 +2139,7 @@ mod tests {
         let (prepared, targets) = prepare_browser_workspace_arguments(
             &state.workspace,
             &state.workspace,
-            "browser__take_screenshot",
+            "take_screenshot",
             &json!({"filePath": "docs/artifacts/browser/page.png"}),
         )
         .expect("prepare browser path");
@@ -1965,7 +2166,7 @@ mod tests {
         let (_prepared, targets) = prepare_browser_workspace_arguments(
             &state.workspace,
             &state.workspace,
-            "browser__take_screenshot",
+            "take_screenshot",
             &json!({"filePath": "docs/artifacts/browser/page.png"}),
         )
         .expect("prepare browser path");
@@ -2048,7 +2249,7 @@ mod tests {
         let (prepared, targets) = prepare_browser_workspace_arguments(
             &state.workspace,
             &state.workspace,
-            "browser__upload_file",
+            "upload_file",
             &json!({"filePath": "fixtures/upload.txt"}),
         )
         .expect("prepare upload path");
@@ -2069,7 +2270,7 @@ mod tests {
         let (prepared, targets) = prepare_browser_workspace_arguments(
             &worktree,
             &state.workspace,
-            "browser__take_screenshot",
+            "take_screenshot",
             &json!({"filePath": "artifacts/page.png"}),
         )
         .expect("prepare worktree screenshot");
@@ -2105,7 +2306,7 @@ mod tests {
         let (upload_args, upload_targets) = prepare_browser_workspace_arguments(
             &worktree,
             &state.workspace,
-            "browser__upload_file",
+            "upload_file",
             &json!({"filePath": "fixtures/upload.txt"}),
         )
         .expect("prepare worktree upload");
@@ -2125,7 +2326,7 @@ mod tests {
         let (directory_args, directory_targets) = prepare_browser_workspace_arguments(
             &worktree,
             &state.workspace,
-            "browser__lighthouse_audit",
+            "lighthouse_audit",
             &json!({"outputDirPath": "artifacts/audit"}),
         )
         .expect("prepare worktree output directory");
@@ -2155,7 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn unpublished_new_tool_requires_reconnect() {
         let (_workspace, _harness, state) = test_state();
-        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
+        let core = build_effective_catalog_from_parts("core", true).expect("core");
         let _ = state.publish_catalog(core);
 
         let error = handle_tools_call(
@@ -2173,78 +2374,18 @@ mod tests {
         assert_eq!(error["data"]["reconnect_required"], true);
     }
 
-    fn browser_proxy_tools(count: usize) -> Vec<serde_json::Value> {
-        const DISCOVERY_TOOLS: &[&str] = &[
-            "health_check",
-            "reconnect",
-            "reset_session",
-            "list_pages",
-            "new_page",
-            "navigate_page",
-            "take_snapshot",
-            "take_screenshot",
-            "evaluate_script",
-            "click",
-            "fill",
-            "fill_form",
-            "wait_for",
-            "select_page",
-            "close_page",
-            "press_key",
-            "type_text",
-            "hover",
-            "handle_dialog",
-            "upload_file",
-            "resize_page",
-        ];
-        (0..count)
-            .map(|index| {
-                let name = DISCOVERY_TOOLS
-                    .get(index)
-                    .map(|suffix| format!("browser__{suffix}"))
-                    .unwrap_or_else(|| format!("browser__action_{index:02}"));
-                json!({
-                    "name": name,
-                    "title": format!("Browser action {index}"),
-                    "description": "Representative browser MCP action",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    },
-                    "outputSchema": {
-                        "type": "object",
-                        "properties": {"ok": {"type": "boolean"}},
-                        "required": ["ok"],
-                        "additionalProperties": true
-                    },
-                    "annotations": {
-                        "readOnlyHint": false,
-                        "destructiveHint": true,
-                        "idempotentHint": false,
-                        "openWorldHint": true
-                    }
-                })
-            })
-            .collect()
-    }
-
     #[test]
-    fn tools_list_returns_a_budget_compliant_catalog_in_one_response() {
-        let catalog = build_effective_catalog_from_parts("core", true, browser_proxy_tools(48))
-            .expect("budget-compliant catalog");
+    fn tools_list_returns_local_only_catalog_with_mcp_facade() {
+        let catalog = build_effective_catalog_from_parts("core", true)
+            .expect("budget-compliant local catalog");
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_tools = first["tools"].as_array().expect("first tools");
         assert_eq!(first_tools.len(), catalog.tools.len());
-        assert_eq!(first["_meta"]["anchor/catalog"]["local_tool_count"], 25);
         assert_eq!(
-            first["_meta"]["anchor/catalog"]["proxy_tool_count"],
-            catalog.proxy_count
+            first["_meta"]["anchor/catalog"]["local_tool_count"],
+            crate::tools::registry::exposed_tool_names("core").len()
         );
-        assert!(
-            catalog.proxy_count < 48,
-            "core profile should trim Browser-only proxy surface"
-        );
+        assert_eq!(first["_meta"]["anchor/catalog"]["proxy_tool_count"], 0);
         assert!(first["_meta"]["anchor/catalog"]["estimated_tokens"]
             .as_u64()
             .is_some_and(|tokens| tokens > 0));
@@ -2259,21 +2400,16 @@ mod tests {
             "list_command_sessions",
             "search",
             "server_info",
+            "mcp",
             "browser_build_info",
             "browser_wait_for_build",
-            "browser__health_check",
-            "browser__reconnect",
-            "browser__reset_session",
-            "browser__list_pages",
-            "browser__navigate_page",
-            "browser__take_snapshot",
         ] {
             assert!(
                 first_names.contains(required),
                 "{required} missing from first page"
             );
         }
-        assert!(first_tools[..catalog.local_count].iter().all(|tool| {
+        assert!(first_tools.iter().all(|tool| {
             !tool["name"]
                 .as_str()
                 .unwrap_or_default()
@@ -2283,9 +2419,9 @@ mod tests {
     }
 
     #[test]
-    fn advanced_tools_list_keeps_browser_recovery_tools_on_the_first_page() {
-        let catalog = build_effective_catalog_from_parts("advanced", true, browser_proxy_tools(48))
-            .expect("advanced browser catalog");
+    fn advanced_tools_list_exposes_mcp_facade_but_hides_mcp_operation_leaves() {
+        let catalog =
+            build_effective_catalog_from_parts("advanced", true).expect("advanced local catalog");
         let first = tools_list_result(&catalog, &json!({})).expect("first page");
         let first_names = first["tools"]
             .as_array()
@@ -2294,20 +2430,7 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<std::collections::HashSet<_>>();
 
-        for required in [
-            "git",
-            "task",
-            "slice",
-            "commit_stage",
-            "browser__health_check",
-            "browser__reconnect",
-            "browser__reset_session",
-            "browser__list_pages",
-            "browser__new_page",
-            "browser__navigate_page",
-            "browser__take_snapshot",
-            "browser__take_screenshot",
-        ] {
+        for required in ["git", "task", "slice", "commit_stage", "mcp"] {
             assert!(
                 first_names.contains(required),
                 "{required} missing from advanced first page"
@@ -2320,6 +2443,16 @@ mod tests {
             "git_worktree_remove",
             "stage_commit",
             "stage_commit_status",
+            "mcp_list_servers",
+            "mcp_get_server",
+            "mcp_search_tools",
+            "mcp_get_tool",
+            "mcp_call_tool",
+            "mcp_register_server",
+            "mcp_enable_server",
+            "mcp_disable_server",
+            "mcp_refresh_server",
+            "mcp_remove_server",
         ] {
             assert!(
                 !first_names.contains(internal),
@@ -2335,8 +2468,7 @@ mod tests {
 
     #[test]
     fn tools_list_rejects_a_cursor_from_another_catalog() {
-        let catalog = build_effective_catalog_from_parts("core", true, browser_proxy_tools(48))
-            .expect("catalog");
+        let catalog = build_effective_catalog_from_parts("core", true).expect("catalog");
         let error = tools_list_result(
             &catalog,
             &json!({
@@ -2347,22 +2479,6 @@ mod tests {
 
         assert_eq!(error["code"], -32602);
         assert_eq!(error["data"]["reason"], "invalid_tools_list_cursor");
-    }
-
-    #[test]
-    fn tools_list_maps_over_budget_catalog_to_actionable_server_error() {
-        let error = build_effective_catalog_from_parts("advanced", true, browser_proxy_tools(101))
-            .expect_err("over-budget catalog");
-        let response = effective_catalog_error(error);
-
-        assert_eq!(response["code"], -32004);
-        assert!(response["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("includeTools")));
-        assert_eq!(
-            response["data"]["details"]["reason"],
-            "chatgpt_catalog_budget_exceeded"
-        );
     }
 
     #[test]

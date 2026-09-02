@@ -223,10 +223,9 @@ mod tests {
 
     #[test]
     fn core_openapi_exposes_search_as_read_only() {
-        let tools =
-            crate::tools::catalog::build_effective_catalog_from_parts("core", false, Vec::new())
-                .expect("effective core catalog")
-                .tools;
+        let tools = crate::tools::catalog::build_effective_catalog_from_parts("core", false)
+            .expect("effective core catalog")
+            .tools;
         let schema = build_openapi(&tools, "https://actions.example.com", "none");
         let operation = &schema["paths"]["/actions/search"]["post"];
 

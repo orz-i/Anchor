@@ -68,7 +68,7 @@ impl SkillSummary {
         let mut resolutions = Vec::new();
         let mut resolved = Vec::new();
         let mut missing = Vec::new();
-        let mut ambiguous = Vec::new();
+        let ambiguous = Vec::new();
 
         for declared in &self.allowed_tools {
             if available.contains(declared) {
@@ -82,42 +82,13 @@ impl SkillSummary {
                 continue;
             }
 
-            let suffix = format!("__{declared}");
-            let mut candidates = available
-                .iter()
-                .filter(|name| name.ends_with(&suffix))
-                .cloned()
-                .collect::<Vec<_>>();
-            candidates.sort();
-            match candidates.as_slice() {
-                [only] => {
-                    resolved.push(only.clone());
-                    resolutions.push(SkillToolResolution {
-                        declared: declared.clone(),
-                        status: "resolved".into(),
-                        resolved: Some(only.clone()),
-                        candidates,
-                    });
-                }
-                [] => {
-                    missing.push(declared.clone());
-                    resolutions.push(SkillToolResolution {
-                        declared: declared.clone(),
-                        status: "missing".into(),
-                        resolved: None,
-                        candidates,
-                    });
-                }
-                _ => {
-                    ambiguous.push(declared.clone());
-                    resolutions.push(SkillToolResolution {
-                        declared: declared.clone(),
-                        status: "ambiguous".into(),
-                        resolved: None,
-                        candidates,
-                    });
-                }
-            }
+            missing.push(declared.clone());
+            resolutions.push(SkillToolResolution {
+                declared: declared.clone(),
+                status: "missing".into(),
+                resolved: None,
+                candidates: Vec::new(),
+            });
         }
 
         resolved.sort();
@@ -531,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_prefixed_proxy_tools_and_reports_missing_dependencies() {
+    fn tool_dependencies_require_exact_published_names_without_proxy_suffix_resolution() {
         let mut summary = SkillSummary {
             name: "example".into(),
             description: "Example".into(),
@@ -566,8 +537,8 @@ mod tests {
             warnings: Vec::new(),
         };
         summary.resolve_tools(&["read_file".into(), "mcp_probe_kit__start_feature".into()]);
-        assert_eq!(summary.resolved_tools.len(), 2);
-        assert_eq!(summary.missing_tools, vec!["missing"]);
+        assert_eq!(summary.resolved_tools, vec!["read_file"]);
+        assert_eq!(summary.missing_tools, vec!["start_feature", "missing"]);
         assert!(!summary.tool_compatible);
     }
 }

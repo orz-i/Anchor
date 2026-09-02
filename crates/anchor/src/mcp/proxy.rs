@@ -11,7 +11,7 @@ use std::time::Duration;
 use chrono::Utc;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,32 +27,11 @@ use crate::tunnel::append_profile_log;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const MAX_TOOL_LIST_PAGES: usize = 100;
 const MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER: usize = 4_096;
-const MAX_PROXY_TOOLS_PER_SERVER: usize = 256;
-const MAX_PROXY_TOOLS_TOTAL: usize = 512;
+const MAX_PROXY_TOOLS_PER_SERVER: usize = MAX_DISCOVERED_PROXY_TOOLS_PER_SERVER;
+const MAX_PROXY_CATALOG_BYTES_PER_SERVER: usize = 8 * 1024 * 1024;
 const MAX_PROXY_TOOL_DEFINITION_BYTES: usize = 128 * 1024;
 const MAX_PROXY_TOOL_TITLE_BYTES: usize = 256;
 const MAX_PROXY_TOOL_DESCRIPTION_BYTES: usize = 2048;
-const MAX_AUTO_PROXY_TOOLS_PER_SERVER: usize = 24;
-const DEFAULT_BROWSER_PROXY_TOOLS: &[&str] = &[
-    "list_pages",
-    "new_page",
-    "navigate_page",
-    "take_snapshot",
-    "take_screenshot",
-    "evaluate_script",
-    "click",
-    "fill",
-    "fill_form",
-    "wait_for",
-    "select_page",
-    "close_page",
-    "press_key",
-    "type_text",
-    "hover",
-    "handle_dialog",
-    "upload_file",
-    "resize_page",
-];
 const DEFAULT_STDIO_MAX_CONCURRENT_REQUESTS: usize = 4;
 const DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS: usize = 16;
 const MAX_PROXY_CONCURRENT_REQUESTS: usize = 64;
@@ -63,8 +42,6 @@ const BROWSER_DEBUGGING_PORT_BASE: u32 = 42_000;
 const BROWSER_DEBUGGING_PORT_SPAN: u32 = 20_000;
 const BROWSER_DEBUGGING_PORT_STEP: u32 = 7_919;
 const BROWSER_DEBUGGING_PORT_ATTEMPTS: u32 = 2_048;
-const BROWSER_MANAGEMENT_PAGE_TIMEOUT_SECONDS: u64 = 20;
-const PROXY_CONNECTION_REPLACEMENT_TIMEOUT_SECONDS: u64 = 45;
 const PROXY_TERMINATION_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone)]
@@ -75,29 +52,6 @@ struct SanitizedProxyTool {
     input_schema: Value,
     output_schema: Value,
     synthesized_output_schema: bool,
-}
-
-fn proxy_management_failure(connection: &Value, page_state: &Value) -> Option<String> {
-    if let Some(message) = page_state.get("error_message").and_then(Value::as_str) {
-        if !message.trim().is_empty() {
-            return Some(message.to_string());
-        }
-    }
-    let raw = page_state.get("raw").unwrap_or(&Value::Null);
-    if raw.get("isError").and_then(Value::as_bool) == Some(true) {
-        return proxy_text_content(raw)
-            .filter(|message| !message.trim().is_empty())
-            .or_else(|| Some("Downstream browser page-state request failed".into()));
-    }
-    if connection.get("operational").and_then(Value::as_bool) == Some(false) {
-        return connection
-            .get("last_error")
-            .and_then(Value::as_str)
-            .filter(|message| !message.trim().is_empty())
-            .map(ToString::to_string)
-            .or_else(|| Some("Downstream browser connection is not operational".into()));
-    }
-    None
 }
 
 fn prepare_my_agent_browser_isolation(
@@ -306,43 +260,6 @@ fn display_proxy_path(path: &Path) -> String {
     {
         display.into_owned()
     }
-}
-
-fn wrap_proxy_structured_result(structured: Value, output_schema: &Value) -> Value {
-    let validation = jsonschema::validator_for(output_schema)
-        .and_then(|validator| validator.validate(&structured));
-    let structured = match validation {
-        Ok(()) => structured,
-        Err(error) => json!({
-            "ok": false,
-            "status": "error",
-            "server": "proxy",
-            "connection": {},
-            "error": {
-                "code": "DOWNSTREAM_SCHEMA_MISMATCH",
-                "message": format!("Proxy result violates outputSchema: {error}"),
-                "retryable": false
-            },
-            "error_code": "DOWNSTREAM_SCHEMA_MISMATCH",
-            "error_message": format!("Proxy result violates outputSchema: {error}"),
-            "retryable": false,
-            "browser_session_id": "unknown",
-            "connection_status": "unknown",
-            "transport_connected": false,
-            "operational": false,
-            "browser_cdp_reachable": null,
-            "page_count": 0,
-            "pages": [],
-            "selected_page": null,
-            "page_state": {}
-        }),
-    };
-    let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
-    json!({
-        "content": [{"type": "text", "text": structured.to_string()}],
-        "structuredContent": structured,
-        "isError": is_error
-    })
 }
 
 fn proxy_text_content(value: &Value) -> Option<String> {
@@ -749,81 +666,6 @@ fn bounded_proxy_state_value(value: &Value, depth: usize) -> Value {
     }
 }
 
-fn proxy_management_tools(
-    spec: &McpProxyServerSpec,
-) -> Vec<(String, ProxyRouteKind, Value, Value, Value)> {
-    if !spec.management_tools {
-        return Vec::new();
-    }
-    let input_schema = json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-    });
-    let output_schema = json!({
-        "type": "object",
-        "properties": {
-            "ok": {"type": "boolean"},
-            "status": {"type": "string"},
-            "server": {"type": "string"},
-            "connection": {"type": "object", "additionalProperties": true},
-            "error": {"type": ["object", "null"]},
-            "error_code": {"type": ["string", "null"]},
-            "error_message": {"type": ["string", "null"]},
-            "retryable": {"type": "boolean"},
-            "browser_session_id": {"type": "string", "minLength": 1},
-            "connection_status": {"type": "string"},
-            "transport_connected": {"type": "boolean"},
-            "operational": {"type": "boolean"},
-            "browser_cdp_reachable": {"type": ["boolean", "null"]},
-            "observed_at": {"type": "string", "minLength": 1},
-            "recovered_during_probe": {"type": "boolean"},
-            "page_count": {"type": "integer", "minimum": 0},
-            "pages": {"type": "array", "items": {"type": "object"}},
-            "selected_page": {"type": ["object", "null"]},
-            "page_state": {"type": "object", "additionalProperties": true}
-        },
-        "required": [
-            "ok", "status", "server", "connection", "retryable",
-            "browser_session_id", "connection_status", "transport_connected",
-            "operational", "observed_at", "recovered_during_probe", "page_count", "pages"
-        ],
-        "additionalProperties": true
-    });
-    [
-        ("health_check", ProxyRouteKind::HealthCheck, true),
-        ("reconnect", ProxyRouteKind::Reconnect, false),
-        ("reset_session", ProxyRouteKind::ResetSession, false),
-    ]
-    .into_iter()
-    .map(|(suffix, kind, read_only)| {
-        let public_name = format!("{}__{suffix}", spec.tool_prefix);
-        let title = format!("{} {suffix}", spec.name);
-        let definition = json!({
-            "name": public_name,
-            "title": title,
-            "description": format!("Manage or inspect the downstream MCP connection for {}.", spec.name),
-            "inputSchema": input_schema,
-            "outputSchema": output_schema,
-            "annotations": {
-                "title": title,
-                "readOnlyHint": read_only,
-                "destructiveHint": !read_only,
-                "idempotentHint": true,
-                "openWorldHint": true
-            }
-        });
-        (
-            public_name,
-            kind,
-            definition,
-            input_schema.clone(),
-            output_schema.clone(),
-        )
-    })
-    .collect()
-}
-
 fn fallback_proxy_output_schema() -> Value {
     json!({
         "type": "object",
@@ -855,42 +697,20 @@ fn fallback_proxy_output_schema() -> Value {
 struct SanitizedProxyCatalog {
     tools: Vec<SanitizedProxyTool>,
     discovered_count: usize,
-    filtered_count: usize,
-    truncated_count: usize,
-    selection_source: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProxyExposureMode {
-    Auto,
-    Full,
-}
-
-impl ProxyExposureMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Full => "full",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct McpProxyServerSpec {
     pub name: String,
+    enabled: bool,
     transport: McpProxyTransportSpec,
     command: String,
     args: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: PathBuf,
-    tool_prefix: String,
-    include_tools: Option<BTreeSet<String>>,
-    exclude_tools: BTreeSet<String>,
-    max_tools: Option<usize>,
-    exposure_mode: ProxyExposureMode,
     max_concurrent_requests: usize,
     request_timeout: Duration,
-    management_tools: bool,
+    raw_config: RawMcpServerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -977,6 +797,7 @@ fn sanitize_proxy_catalog(
     let discovered_count = catalog.len();
     let mut selected = Vec::with_capacity(catalog.len());
     let mut discovered_names = BTreeSet::new();
+    let mut catalog_bytes = 0usize;
     for (index, tool) in catalog.into_iter().enumerate() {
         let downstream_name = tool
             .get("name")
@@ -984,62 +805,29 @@ fn sanitize_proxy_catalog(
             .filter(|name| !name.is_empty() && name.len() <= 128)
             .ok_or_else(|| format!("downstream tool #{index} has an invalid name"))?
             .to_string();
-        discovered_names.insert(downstream_name.clone());
-        if spec
-            .include_tools
-            .as_ref()
-            .is_some_and(|included| !included.contains(&downstream_name))
-            || spec.exclude_tools.contains(&downstream_name)
-        {
-            continue;
+        if !discovered_names.insert(downstream_name.clone()) {
+            return Err(format!(
+                "downstream MCP `{}` advertises duplicate tool `{downstream_name}`",
+                spec.name
+            ));
+        }
+        catalog_bytes = catalog_bytes.saturating_add(
+            serde_json::to_vec(&tool)
+                .map_err(|error| error.to_string())?
+                .len(),
+        );
+        if catalog_bytes > MAX_PROXY_CATALOG_BYTES_PER_SERVER {
+            return Err(format!(
+                "downstream MCP `{}` tool catalog exceeds the {} byte runtime budget",
+                spec.name, MAX_PROXY_CATALOG_BYTES_PER_SERVER
+            ));
         }
         selected.push((downstream_name, tool));
     }
-    if let Some(included) = spec.include_tools.as_ref() {
-        let missing = included
-            .difference(&discovered_names)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "downstream MCP `{}` did not advertise includeTools entries: {}",
-                spec.name,
-                missing.join(", ")
-            ));
-        }
-    }
-
-    let selection_source = if spec.include_tools.is_some() {
-        "explicit_include"
-    } else if spec.max_tools.is_some() {
-        "explicit_max"
-    } else if spec.exposure_mode == ProxyExposureMode::Full {
-        "explicit_full"
-    } else if is_my_agent_browser_spec(spec) {
-        selected.retain(|(name, _)| DEFAULT_BROWSER_PROXY_TOOLS.contains(&name.as_str()));
-        "browser_workflow"
-    } else if selected.len() > MAX_AUTO_PROXY_TOOLS_PER_SERVER {
-        return Err(format!(
-            "downstream MCP `{}` advertises {} tools without an explicit exposure policy; automatic exposure is limited to {MAX_AUTO_PROXY_TOOLS_PER_SERVER}. Configure includeTools/maxTools, or set exposureMode to `full` after reviewing the catalog",
-            spec.name,
-            selected.len()
-        ));
-    } else {
-        "auto_all"
-    };
-
     selected.sort_by(|left, right| left.0.cmp(&right.0));
-    let filtered_count = discovered_count.saturating_sub(selected.len());
-    let truncated_count = spec
-        .max_tools
-        .map(|maximum| selected.len().saturating_sub(maximum))
-        .unwrap_or_default();
-    if let Some(maximum) = spec.max_tools {
-        selected.truncate(maximum);
-    }
     if selected.len() > MAX_PROXY_TOOLS_PER_SERVER {
         return Err(format!(
-            "downstream MCP `{}` selected {} tools after includeTools/excludeTools; maximum is {MAX_PROXY_TOOLS_PER_SERVER}. Configure maxTools or narrower filters",
+            "downstream MCP `{}` advertised {} tools; maximum is {MAX_PROXY_TOOLS_PER_SERVER}",
             spec.name,
             selected.len()
         ));
@@ -1060,7 +848,7 @@ fn sanitize_proxy_catalog(
         }
         let public_name = format!(
             "{}__{}",
-            sanitize_tool_segment(&spec.tool_prefix),
+            sanitize_tool_segment(&spec.name),
             sanitize_tool_segment(&downstream_name)
         );
         if !valid_public_tool_name(&public_name) {
@@ -1129,9 +917,6 @@ fn sanitize_proxy_catalog(
     Ok(SanitizedProxyCatalog {
         tools: sanitized,
         discovered_count,
-        filtered_count,
-        truncated_count,
-        selection_source,
     })
 }
 
@@ -1193,9 +978,6 @@ struct ProxyServer {
     catalog_digest: String,
     downstream_tools: BTreeSet<String>,
     discovered_tool_count: usize,
-    filtered_tool_count: usize,
-    truncated_tool_count: usize,
-    selection_source: &'static str,
     client: Mutex<Option<Arc<McpProxyClient>>>,
     session_id: StdMutex<String>,
     concurrency: Semaphore,
@@ -1215,7 +997,8 @@ struct ProxyServer {
     last_reconnect_at: StdMutex<Option<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RawMcpServerConfig {
     #[serde(rename = "type", default)]
     transport_type: String,
@@ -1233,30 +1016,10 @@ struct RawMcpServerConfig {
     headers: BTreeMap<String, String>,
     #[serde(default)]
     disabled: bool,
-    #[serde(rename = "toolPrefix", default)]
-    tool_prefix: Option<String>,
-    #[serde(rename = "includeTools", default)]
-    include_tools: Option<Vec<String>>,
-    #[serde(rename = "excludeTools", default)]
-    exclude_tools: Vec<String>,
-    #[serde(rename = "maxTools", default)]
-    max_tools: Option<usize>,
-    #[serde(rename = "exposureMode", default)]
-    exposure_mode: Option<String>,
     #[serde(rename = "maxConcurrentRequests", default)]
     max_concurrent_requests: Option<usize>,
     #[serde(rename = "requestTimeoutSeconds", default)]
     request_timeout_seconds: Option<u64>,
-    #[serde(rename = "managementTools", default)]
-    management_tools: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ProxyRouteKind {
-    Downstream,
-    HealthCheck,
-    Reconnect,
-    ResetSession,
 }
 
 #[derive(Clone)]
@@ -1264,24 +1027,30 @@ struct ProxyRoute {
     server: Arc<ProxyServer>,
     server_name: String,
     downstream_name: String,
+    definition: Value,
     input_schema: Value,
     output_schema: Value,
     synthesized_output_schema: bool,
-    kind: ProxyRouteKind,
 }
 
 #[derive(Default)]
 struct RegistryState {
-    tools: Vec<Value>,
-    routes: HashMap<String, ProxyRoute>,
+    specs: BTreeMap<String, McpProxyServerSpec>,
+    servers: BTreeMap<String, Arc<ProxyServer>>,
+    routes: HashMap<(String, String), ProxyRoute>,
     failures: BTreeMap<String, String>,
 }
+
+type ProxyConfigPersistence =
+    Arc<dyn Fn(&str, &[McpProxyServerSpec]) -> Result<(), String> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct McpProxyRegistry {
     state: Arc<RwLock<RegistryState>>,
     configured: Arc<AtomicBool>,
     configured_notify: Arc<Notify>,
+    workspace_id: Arc<RwLock<Option<String>>>,
+    persist_config: ProxyConfigPersistence,
 }
 
 impl Default for McpProxyRegistry {
@@ -1290,6 +1059,8 @@ impl Default for McpProxyRegistry {
             state: Arc::new(RwLock::new(RegistryState::default())),
             configured: Arc::new(AtomicBool::new(true)),
             configured_notify: Arc::new(Notify::new()),
+            workspace_id: Arc::new(RwLock::new(None)),
+            persist_config: Arc::new(persist_mcp_proxy_specs),
         }
     }
 }
@@ -1374,6 +1145,14 @@ impl std::fmt::Display for ProxyClientError {
 }
 
 impl McpProxyRegistry {
+    #[cfg(test)]
+    fn with_persistence_for_test(persist_config: ProxyConfigPersistence) -> Self {
+        Self {
+            persist_config,
+            ..Self::default()
+        }
+    }
+
     pub fn begin_configuration(&self) {
         self.configured.store(false, Ordering::Release);
         *self.state.write().expect("mcp proxy registry write") = RegistryState::default();
@@ -1390,53 +1169,151 @@ impl McpProxyRegistry {
         timeout(limit, notified).await.is_ok() && self.configured.load(Ordering::Acquire)
     }
 
-    pub fn list_tools(&self) -> Vec<Value> {
-        self.state
-            .read()
-            .expect("mcp proxy registry read")
-            .tools
-            .clone()
-    }
-
-    pub fn contains_tool(&self, public_name: &str) -> bool {
-        self.state
-            .read()
-            .expect("mcp proxy registry read")
-            .routes
-            .contains_key(public_name)
-    }
-
     pub fn status(&self) -> Value {
         let state = self.state.read().expect("mcp proxy registry read");
-        let mut servers = BTreeMap::<String, (Arc<ProxyServer>, usize)>::new();
-        for route in state.routes.values() {
-            let entry = servers
-                .entry(route.server_name.clone())
-                .or_insert_with(|| (route.server.clone(), 0));
-            entry.1 += 1;
-        }
-        let servers = servers
-            .into_values()
-            .map(|(server, tool_count)| server.status(tool_count))
-            .collect::<Vec<_>>();
-        let unavailable_servers = state
-            .failures
+        let servers = state
+            .specs
             .iter()
-            .map(|(name, error)| json!({"name": name, "error": error}))
+            .map(|(name, spec)| server_status_from_state(&state, name, spec))
             .collect::<Vec<_>>();
+        let enabled_server_count = state.specs.values().filter(|spec| spec.enabled).count();
+        let connected_server_count = state.servers.len();
         json!({
             "configured": self.configured.load(Ordering::Acquire),
             "server_count": servers.len(),
+            "enabled_server_count": enabled_server_count,
+            "connected_server_count": connected_server_count,
             "servers": servers,
-            "unavailable_server_count": unavailable_servers.len(),
-            "unavailable_servers": unavailable_servers
+            "unavailable_server_count": state.failures.len()
         })
+    }
+
+    pub fn server_status(&self, name: &str) -> Option<Value> {
+        let state = self.state.read().expect("mcp proxy registry read");
+        let spec = state.specs.get(name)?;
+        Some(server_status_from_state(&state, name, spec))
+    }
+
+    pub fn specs(&self) -> Vec<McpProxyServerSpec> {
+        self.state
+            .read()
+            .expect("mcp proxy registry read")
+            .specs
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn search_tools(
+        &self,
+        server: Option<&str>,
+        query: &str,
+        cursor: usize,
+        max_results: usize,
+    ) -> Value {
+        let query = query.trim().to_ascii_lowercase();
+        let state = self.state.read().expect("mcp proxy registry read");
+        let mut items = state
+            .routes
+            .values()
+            .filter(|route| server.is_none_or(|server| route.server_name == server))
+            .filter_map(|route| {
+                let title = route
+                    .definition
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(route.downstream_name.as_str());
+                let description = route
+                    .definition
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let searchable = format!(
+                    "{}\n{}\n{}\n{}",
+                    route.server_name, route.downstream_name, title, description
+                )
+                .to_ascii_lowercase();
+                if !query.is_empty() && !searchable.contains(&query) {
+                    return None;
+                }
+                Some(json!({
+                    "server": route.server_name,
+                    "tool": route.downstream_name,
+                    "title": title,
+                    "description": description
+                }))
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            left.get("server")
+                .and_then(Value::as_str)
+                .cmp(&right.get("server").and_then(Value::as_str))
+                .then_with(|| {
+                    left.get("tool")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("tool").and_then(Value::as_str))
+                })
+        });
+        let total_matches = items.len();
+        let end = cursor.saturating_add(max_results).min(total_matches);
+        let page = if cursor < total_matches {
+            items[cursor..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        json!({
+            "configured": self.configured.load(Ordering::Acquire),
+            "query": query,
+            "server": server,
+            "items": page,
+            "total_matches": total_matches,
+            "next_cursor": (end < total_matches).then_some(end)
+        })
+    }
+
+    pub fn tool_definition(&self, server: &str, tool: &str) -> Option<Value> {
+        let state = self.state.read().expect("mcp proxy registry read");
+        let route = state.routes.get(&(server.to_string(), tool.to_string()))?;
+        Some(json!({
+            "server": route.server_name,
+            "tool": route.downstream_name,
+            "title": route.definition.get("title").cloned().unwrap_or(Value::Null),
+            "description": route.definition.get("description").cloned().unwrap_or(Value::Null),
+            "inputSchema": route.input_schema,
+            "outputSchema": route.output_schema,
+            "synthesizedOutputSchema": route.synthesized_output_schema,
+            "annotations": route.definition.get("annotations").cloned().unwrap_or(Value::Null)
+        }))
+    }
+
+    pub fn find_tool_by_suffix(&self, suffix: &str) -> Option<(String, String)> {
+        let state = self.state.read().expect("mcp proxy registry read");
+        let mut matches = state
+            .routes
+            .values()
+            .filter(|route| route.downstream_name.ends_with(suffix))
+            .map(|route| (route.server_name.clone(), route.downstream_name.clone()))
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.into_iter().next()
     }
 
     pub async fn configure(&self, specs: Vec<McpProxyServerSpec>, workspace_id: &str) {
         self.begin_configuration();
+        *self
+            .workspace_id
+            .write()
+            .expect("mcp proxy workspace id write") = Some(workspace_id.to_string());
+        {
+            let mut state = self.state.write().expect("mcp proxy registry write");
+            state.specs = specs
+                .iter()
+                .cloned()
+                .map(|spec| (spec.name.clone(), spec))
+                .collect();
+        }
         let mut tasks = JoinSet::new();
-        for spec in specs {
+        for spec in specs.into_iter().filter(|spec| spec.enabled) {
             let server_name = spec.name.clone();
             let workspace_id = workspace_id.to_string();
             tasks.spawn(async move {
@@ -1462,85 +1339,13 @@ impl McpProxyRegistry {
         for (server_name, workspace_id, result) in connected_results {
             match result {
                 Ok((server, catalog)) => {
-                    let mut added = 0usize;
-                    let mut skipped_duplicates = Vec::new();
-                    let mut state = self.state.write().expect("mcp proxy registry write");
-                    for tool in catalog.tools {
-                        if state.tools.len() >= MAX_PROXY_TOOLS_TOTAL {
-                            append_profile_log(
-                                &workspace_id,
-                                "stderr.log",
-                                &format!(
-                                    "[mcp-proxy:{server_name}] global proxied tool limit {MAX_PROXY_TOOLS_TOTAL} reached"
-                                ),
-                            );
-                            break;
-                        }
-                        let public_name = tool.public_name.clone();
-                        if state.routes.contains_key(&public_name) {
-                            skipped_duplicates.push(public_name);
-                            continue;
-                        }
-                        state.routes.insert(
-                            public_name,
-                            ProxyRoute {
-                                server: server.clone(),
-                                server_name: server_name.clone(),
-                                downstream_name: tool.downstream_name,
-                                input_schema: tool.input_schema,
-                                output_schema: tool.output_schema,
-                                synthesized_output_schema: tool.synthesized_output_schema,
-                                kind: ProxyRouteKind::Downstream,
-                            },
-                        );
-                        state.tools.push(tool.definition);
-                        added += 1;
-                    }
-                    for (public_name, kind, definition, input_schema, output_schema) in
-                        proxy_management_tools(&server.spec)
-                    {
-                        if state.tools.len() >= MAX_PROXY_TOOLS_TOTAL {
-                            break;
-                        }
-                        if state.routes.contains_key(&public_name) {
-                            skipped_duplicates.push(public_name);
-                            continue;
-                        }
-                        state.routes.insert(
-                            public_name,
-                            ProxyRoute {
-                                server: server.clone(),
-                                server_name: server_name.clone(),
-                                downstream_name: String::new(),
-                                input_schema,
-                                output_schema,
-                                synthesized_output_schema: false,
-                                kind,
-                            },
-                        );
-                        state.tools.push(definition);
-                        added += 1;
-                    }
-                    drop(state);
-                    for public_name in skipped_duplicates {
-                        append_profile_log(
-                            &workspace_id,
-                            "stderr.log",
-                            &format!(
-                                "[mcp-proxy:{server_name}] skipped duplicate merged tool {public_name}"
-                            ),
-                        );
-                    }
+                    let added = catalog.tools.len();
+                    self.install_connected_server(server, catalog);
                     append_profile_log(
                         &workspace_id,
                         "stdout.log",
                         &format!(
-                            "[mcp-proxy:{server_name}] connected; exposure_mode={} selection_source={} discovered={} filtered={} max_tools_truncated={} merged={added}",
-                            server.spec.exposure_mode.label(),
-                            catalog.selection_source,
-                            catalog.discovered_count,
-                            catalog.filtered_count,
-                            catalog.truncated_count
+                            "[mcp-proxy:{server_name}] connected; discovered={added}; catalog remains lazy and is not published into tools/list"
                         ),
                     );
                 }
@@ -1558,50 +1363,236 @@ impl McpProxyRegistry {
                 }
             }
         }
-        self.state
-            .write()
-            .expect("mcp proxy registry write")
-            .tools
-            .sort_by(|left, right| {
-                left.get("name")
-                    .and_then(Value::as_str)
-                    .cmp(&right.get("name").and_then(Value::as_str))
-            });
         self.configured.store(true, Ordering::Release);
         self.configured_notify.notify_waiters();
     }
 
-    pub async fn call_tool(
+    fn install_connected_server(
         &self,
-        public_name: &str,
-        arguments: &Value,
-    ) -> Option<Result<Value, Value>> {
-        self.call_tool_with_cancellation(public_name, arguments, &CancellationToken::default())
-            .await
+        server: Arc<ProxyServer>,
+        catalog: SanitizedProxyCatalog,
+    ) -> Option<Arc<ProxyServer>> {
+        let server_name = server.spec.name.clone();
+        let mut state = self.state.write().expect("mcp proxy registry write");
+        state
+            .routes
+            .retain(|(name, _), _| name.as_str() != server_name.as_str());
+        for tool in catalog.tools {
+            let key = (server_name.clone(), tool.downstream_name.clone());
+            state.routes.insert(
+                key,
+                ProxyRoute {
+                    server: server.clone(),
+                    server_name: server_name.clone(),
+                    downstream_name: tool.downstream_name,
+                    definition: tool.definition,
+                    input_schema: tool.input_schema,
+                    output_schema: tool.output_schema,
+                    synthesized_output_schema: tool.synthesized_output_schema,
+                },
+            );
+        }
+        state.failures.remove(&server_name);
+        state.servers.insert(server_name, server)
     }
 
-    pub async fn call_tool_with_cancellation(
+    fn remove_connected_server(&self, server_name: &str) -> Option<Arc<ProxyServer>> {
+        let mut state = self.state.write().expect("mcp proxy registry write");
+        state
+            .routes
+            .retain(|(name, _), _| name.as_str() != server_name);
+        state.failures.remove(server_name);
+        state.servers.remove(server_name)
+    }
+
+    fn record_connection_failure(&self, server_name: &str, error: String) {
+        self.state
+            .write()
+            .expect("mcp proxy registry write")
+            .failures
+            .insert(server_name.to_string(), error);
+    }
+
+    pub async fn register_server(&self, spec: McpProxyServerSpec) -> Result<Value, String> {
+        let workspace_id = self.workspace_id()?;
+        let mut specs = self.specs();
+        if specs.iter().any(|current| current.name == spec.name) {
+            return Err(format!(
+                "downstream MCP server `{}` already exists",
+                spec.name
+            ));
+        }
+        specs.push(spec.clone());
+        (self.persist_config)(&workspace_id, &specs)?;
+        self.state
+            .write()
+            .expect("mcp proxy registry write")
+            .specs
+            .insert(spec.name.clone(), spec.clone());
+        if spec.enabled {
+            match connect_initial_with_retry(spec.clone(), workspace_id.clone()).await {
+                Ok((server, catalog)) => {
+                    if let Some(previous) = self.install_connected_server(server, catalog) {
+                        previous.shutdown().await;
+                    }
+                }
+                Err(error) => {
+                    self.record_connection_failure(&spec.name, error.clone());
+                    return Err(format!(
+                        "downstream MCP server `{}` was persisted but activation failed: {error}",
+                        spec.name
+                    ));
+                }
+            }
+        }
+        self.server_status(&spec.name).ok_or_else(|| {
+            format!(
+                "downstream MCP server `{}` disappeared after register",
+                spec.name
+            )
+        })
+    }
+
+    pub async fn set_server_enabled(
         &self,
-        public_name: &str,
+        server_name: &str,
+        enabled: bool,
+    ) -> Result<Value, String> {
+        let workspace_id = self.workspace_id()?;
+        let mut specs = self.specs();
+        let Some(spec) = specs.iter_mut().find(|spec| spec.name == server_name) else {
+            return Err(format!(
+                "downstream MCP server `{server_name}` was not found"
+            ));
+        };
+        spec.enabled = enabled;
+        spec.raw_config.disabled = !enabled;
+        let updated = spec.clone();
+        (self.persist_config)(&workspace_id, &specs)?;
+        self.state
+            .write()
+            .expect("mcp proxy registry write")
+            .specs
+            .insert(server_name.to_string(), updated.clone());
+
+        if !enabled {
+            if let Some(previous) = self.remove_connected_server(server_name) {
+                previous.shutdown().await;
+            }
+            return self.server_status(server_name).ok_or_else(|| {
+                format!("downstream MCP server `{server_name}` disappeared after disable")
+            });
+        }
+
+        match connect_initial_with_retry(updated, workspace_id.clone()).await {
+            Ok((server, catalog)) => {
+                if let Some(previous) = self.install_connected_server(server, catalog) {
+                    previous.shutdown().await;
+                }
+                self.server_status(server_name).ok_or_else(|| {
+                    format!("downstream MCP server `{server_name}` disappeared after enable")
+                })
+            }
+            Err(error) => {
+                self.record_connection_failure(server_name, error.clone());
+                Err(format!(
+                    "downstream MCP server `{server_name}` was enabled in persisted configuration but activation failed: {error}"
+                ))
+            }
+        }
+    }
+
+    pub async fn refresh_server(&self, server_name: &str) -> Result<Value, String> {
+        let workspace_id = self.workspace_id()?;
+        let spec = self
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == server_name)
+            .ok_or_else(|| format!("downstream MCP server `{server_name}` was not found"))?;
+        if !spec.enabled {
+            return Err(format!(
+                "downstream MCP server `{server_name}` is disabled; enable it before refresh"
+            ));
+        }
+        let (server, catalog) = connect_initial_with_retry(spec, workspace_id).await?;
+        let previous = self.install_connected_server(server, catalog);
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        self.server_status(server_name).ok_or_else(|| {
+            format!("downstream MCP server `{server_name}` disappeared after refresh")
+        })
+    }
+
+    pub async fn remove_server(&self, server_name: &str) -> Result<Value, String> {
+        let workspace_id = self.workspace_id()?;
+        let mut specs = self.specs();
+        let original_len = specs.len();
+        specs.retain(|spec| spec.name != server_name);
+        if specs.len() == original_len {
+            return Err(format!(
+                "downstream MCP server `{server_name}` was not found"
+            ));
+        }
+        (self.persist_config)(&workspace_id, &specs)?;
+        {
+            let mut state = self.state.write().expect("mcp proxy registry write");
+            state.specs.remove(server_name);
+        }
+        if let Some(previous) = self.remove_connected_server(server_name) {
+            previous.shutdown().await;
+        }
+        Ok(json!({"server": server_name, "removed": true}))
+    }
+
+    fn workspace_id(&self) -> Result<String, String> {
+        self.workspace_id
+            .read()
+            .expect("mcp proxy workspace id read")
+            .clone()
+            .ok_or_else(|| "downstream MCP runtime is not bound to a workspace profile".to_string())
+    }
+
+    pub async fn call_server_tool(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Option<Result<Value, Value>> {
+        self.call_server_tool_with_cancellation(
+            server_name,
+            tool_name,
+            arguments,
+            &CancellationToken::default(),
+        )
+        .await
+    }
+
+    pub async fn call_server_tool_with_cancellation(
+        &self,
+        server_name: &str,
+        tool_name: &str,
         arguments: &Value,
         cancellation: &CancellationToken,
     ) -> Option<Result<Value, Value>> {
+        let route_key = (server_name.to_string(), tool_name.to_string());
         let route = self
             .state
             .read()
             .expect("mcp proxy registry read")
             .routes
-            .get(public_name)
+            .get(&route_key)
             .cloned()?;
 
         let server = route.server.clone();
         let server_name = route.server_name.clone();
+        let call_name = format!("{server_name}/{}", route.downstream_name);
         let input_validator = match jsonschema::validator_for(&route.input_schema) {
             Ok(validator) => validator,
             Err(error) => {
                 return Some(Ok(proxy_call_error_result(
                     &server_name,
-                    public_name,
+                    &call_name,
                     "proxy_input_schema_invalid",
                     error.to_string(),
                     false,
@@ -1612,20 +1603,11 @@ impl McpProxyRegistry {
         if let Err(error) = input_validator.validate(arguments) {
             return Some(Ok(proxy_call_error_result(
                 &server_name,
-                public_name,
+                &call_name,
                 "proxy_input_invalid",
                 error.to_string(),
                 false,
                 false,
-            )));
-        }
-        if !matches!(route.kind, ProxyRouteKind::Downstream) {
-            let structured = server
-                .handle_management_call(route.kind, cancellation)
-                .await;
-            return Some(Ok(wrap_proxy_structured_result(
-                structured,
-                &route.output_schema,
             )));
         }
         let permit = timeout(server.spec.request_timeout, server.concurrency.acquire());
@@ -1635,7 +1617,7 @@ impl McpProxyRegistry {
                 server.record_queue_cancelled();
                 return Some(Ok(proxy_call_error_result(
                     &server_name,
-                    public_name,
+                    &call_name,
                     "proxy_call_cancelled",
                     "request cancelled while waiting for downstream capacity".into(),
                     false,
@@ -1648,7 +1630,7 @@ impl McpProxyRegistry {
                     server.record_failure_message("downstream concurrency queue is closed");
                     return Some(Ok(proxy_call_error_result(
                         &server_name,
-                        public_name,
+                        &call_name,
                         "proxy_queue_closed",
                         "downstream concurrency queue is closed".into(),
                         true,
@@ -1659,7 +1641,7 @@ impl McpProxyRegistry {
                     server.record_queue_timeout();
                     return Some(Ok(proxy_call_error_result(
                         &server_name,
-                        public_name,
+                        &call_name,
                         "proxy_queue_timeout",
                         format!(
                             "waited {} seconds for downstream capacity",
@@ -1679,7 +1661,7 @@ impl McpProxyRegistry {
                 server.clone().schedule_reconnect();
                 return Some(Ok(proxy_call_error_result(
                     &server_name,
-                    public_name,
+                    &call_name,
                     "proxy_reconnect_failed",
                     message,
                     true,
@@ -1698,7 +1680,7 @@ impl McpProxyRegistry {
             )
             .await;
         if let Err(error) = &result {
-            server.record_client_error(public_name, error);
+            server.record_client_error(&call_name, error);
             let cancelled = error.is_cancelled();
             let connection_lost = error.invalidates_connection();
             if connection_lost {
@@ -1719,19 +1701,19 @@ impl McpProxyRegistry {
             Ok(result) => {
                 match normalize_proxy_tool_result(
                     &server_name,
-                    public_name,
+                    &call_name,
                     result,
                     &route.output_schema,
                     route.synthesized_output_schema,
                 ) {
                     Ok(mut normalized) => {
                         if route.synthesized_output_schema {
-                            server.decorate_proxy_result(public_name, &mut normalized);
+                            server.decorate_proxy_result(&call_name, &mut normalized);
                         }
                         if let Some((code, message)) = normalized_proxy_failure(&normalized) {
                             server.record_failure(&code, &message);
                         } else {
-                            server.record_success(public_name, Some(&normalized));
+                            server.record_success(&call_name, Some(&normalized));
                         }
                         normalized
                     }
@@ -1739,13 +1721,13 @@ impl McpProxyRegistry {
                         server.record_failure("proxy_result_invalid", &message);
                         let mut error_result = proxy_call_error_result(
                             &server_name,
-                            public_name,
+                            &call_name,
                             "proxy_result_invalid",
                             message,
                             false,
                             false,
                         );
-                        server.decorate_proxy_result(public_name, &mut error_result);
+                        server.decorate_proxy_result(&call_name, &mut error_result);
                         error_result
                     }
                 }
@@ -1754,17 +1736,42 @@ impl McpProxyRegistry {
                 let connection_lost = error.invalidates_connection();
                 let mut error_result = proxy_call_error_result(
                     &server_name,
-                    public_name,
-                    &proxy_failure_reason(public_name, &error),
+                    &call_name,
+                    &proxy_failure_reason(&call_name, &error),
                     error.to_string(),
                     error.retryable(),
                     connection_lost,
                 );
-                server.decorate_proxy_result(public_name, &mut error_result);
+                server.decorate_proxy_result(&call_name, &mut error_result);
                 error_result
             }
         }))
     }
+}
+
+fn server_status_from_state(state: &RegistryState, name: &str, spec: &McpProxyServerSpec) -> Value {
+    if let Some(server) = state.servers.get(name) {
+        let tool_count = state
+            .routes
+            .keys()
+            .filter(|(server_name, _)| server_name == name)
+            .count();
+        return server.status(tool_count);
+    }
+    json!({
+        "name": name,
+        "enabled": spec.enabled,
+        "transport": spec.transport.label(),
+        "connected": false,
+        "transport_connected": false,
+        "operational": false,
+        "tool_count": 0,
+        "discovered_tool_count": 0,
+        "lazy_discovery": true,
+        "published_tool_count": 0,
+        "error": state.failures.get(name),
+        "disabled": !spec.enabled
+    })
 }
 
 impl ProxyServer {
@@ -1781,9 +1788,6 @@ impl ProxyServer {
             .map(|tool| tool.downstream_name.clone())
             .collect();
         let discovered_tool_count = catalog.discovered_count;
-        let filtered_tool_count = catalog.filtered_count;
-        let truncated_tool_count = catalog.truncated_count;
-        let selection_source = catalog.selection_source;
         let max_concurrent_requests = spec.max_concurrent_requests;
         Ok((
             Arc::new(Self {
@@ -1792,9 +1796,6 @@ impl ProxyServer {
                 catalog_digest,
                 downstream_tools,
                 discovered_tool_count,
-                filtered_tool_count,
-                truncated_tool_count,
-                selection_source,
                 client: Mutex::new(Some(client)),
                 session_id: StdMutex::new(Uuid::new_v4().to_string()),
                 concurrency: Semaphore::new(max_concurrent_requests),
@@ -1831,7 +1832,7 @@ impl ProxyServer {
         let reconnected_digest = proxy_catalog_digest(&catalog.tools)?;
         if reconnected_digest != self.catalog_digest {
             return Err(
-                "downstream tool catalog contract changed; restart the MCP listener to renegotiate tools/list"
+                "downstream tool catalog changed during transparent reconnect; use mcp operation=refresh to accept the new lazy catalog"
                     .to_string(),
             );
         }
@@ -1847,255 +1848,6 @@ impl ProxyServer {
             .lock()
             .expect("mcp proxy reconnect time lock") = Some(proxy_timestamp());
         Ok(connected)
-    }
-
-    async fn handle_management_call(
-        &self,
-        kind: ProxyRouteKind,
-        cancellation: &CancellationToken,
-    ) -> Value {
-        let browser_server = self.is_browser_server();
-        let initial_connection = self.status(self.downstream_tools.len());
-        let initial_operational = initial_connection
-            .get("operational")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let (mut result, page_state) = match kind {
-            ProxyRouteKind::HealthCheck if browser_server => (
-                Ok("healthy"),
-                self.bounded_management_page_state(cancellation).await,
-            ),
-            ProxyRouteKind::Reconnect if browser_server => {
-                let current = self.status(self.downstream_tools.len());
-                let operational = current
-                    .get("operational")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if operational {
-                    let page_state = self.bounded_management_page_state(cancellation).await;
-                    if proxy_management_failure(&current, &page_state).is_none() {
-                        (Ok("already_healthy"), page_state)
-                    } else {
-                        let result = self.replace_connection().await.map(|_| "reconnected");
-                        let page_state = if result.is_ok() {
-                            self.bounded_management_page_state(cancellation).await
-                        } else {
-                            self.last_known_page_state()
-                        };
-                        (result, page_state)
-                    }
-                } else {
-                    let result = self.replace_connection().await.map(|_| "reconnected");
-                    let page_state = if result.is_ok() {
-                        self.bounded_management_page_state(cancellation).await
-                    } else {
-                        self.last_known_page_state()
-                    };
-                    (result, page_state)
-                }
-            }
-            ProxyRouteKind::ResetSession if browser_server => {
-                let result = self.replace_connection().await.map(|_| "session_reset");
-                let page_state = if result.is_ok() {
-                    self.bounded_management_page_state(cancellation).await
-                } else {
-                    self.last_known_page_state()
-                };
-                (result, page_state)
-            }
-            ProxyRouteKind::HealthCheck => {
-                let result = self.probe_connection(cancellation).await.map(|_| "healthy");
-                let page_state = if result.is_ok() {
-                    self.management_page_state(cancellation).await
-                } else {
-                    self.last_known_page_state()
-                };
-                (result, page_state)
-            }
-            ProxyRouteKind::Reconnect => {
-                let result = if self.probe_connection(cancellation).await.is_ok() {
-                    Ok("already_healthy")
-                } else {
-                    self.replace_connection().await.map(|_| "reconnected")
-                };
-                let page_state = if result.is_ok() {
-                    self.management_page_state(cancellation).await
-                } else {
-                    self.last_known_page_state()
-                };
-                (result, page_state)
-            }
-            ProxyRouteKind::ResetSession => {
-                let result = self.replace_connection().await.map(|_| "session_reset");
-                let page_state = if result.is_ok() {
-                    self.management_page_state(cancellation).await
-                } else {
-                    self.last_known_page_state()
-                };
-                (result, page_state)
-            }
-            ProxyRouteKind::Downstream => (Ok("healthy"), self.last_known_page_state()),
-        };
-        let connection = self.status(self.downstream_tools.len());
-        if result.is_ok() {
-            if let Some(message) = proxy_management_failure(&connection, &page_state) {
-                result = Err(message);
-            }
-        }
-        let connection_status = proxy_connection_status(&connection);
-        let transport_connected = connection
-            .get("transport_connected")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let operational = connection
-            .get("operational")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let recovered_during_probe = !initial_operational && operational;
-        let observed_at = connection
-            .get("observed_at")
-            .cloned()
-            .unwrap_or_else(|| Value::String(proxy_timestamp()));
-        let browser_cdp_reachable = connection
-            .get("browser_cdp_reachable")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let session_id = self
-            .session_id
-            .lock()
-            .expect("mcp proxy session id lock")
-            .clone();
-        let pages = page_state
-            .get("pages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let selected_page = page_state
-            .get("selected_page")
-            .cloned()
-            .unwrap_or(Value::Null);
-        match result {
-            Ok(status) => json!({
-                "ok": true,
-                "status": status,
-                "server": self.spec.name,
-                "connection": connection,
-                "error": null,
-                "error_code": null,
-                "error_message": null,
-                "retryable": false,
-                "browser_session_id": session_id,
-                "connection_status": connection_status,
-                "transport_connected": transport_connected,
-                "operational": operational,
-                "browser_cdp_reachable": browser_cdp_reachable,
-                "observed_at": observed_at,
-                "recovered_during_probe": recovered_during_probe,
-                "page_count": pages.len(),
-                "pages": pages,
-                "selected_page": selected_page,
-                "page_state": page_state
-            }),
-            Err(message) => {
-                let error_code = browser_proxy_error_code("management", &message);
-                json!({
-                    "ok": false,
-                    "status": "unhealthy",
-                    "server": self.spec.name,
-                    "connection": connection,
-                    "error": {
-                        "code": error_code,
-                        "message": message,
-                        "retryable": true
-                    },
-                    "error_code": error_code,
-                    "error_message": message,
-                    "retryable": true,
-                    "browser_session_id": session_id,
-                    "connection_status": connection_status,
-                    "transport_connected": transport_connected,
-                    "operational": operational,
-                    "browser_cdp_reachable": browser_cdp_reachable,
-                    "observed_at": observed_at,
-                    "recovered_during_probe": recovered_during_probe,
-                    "page_count": pages.len(),
-                    "pages": pages,
-                    "selected_page": selected_page,
-                    "page_state": page_state
-                })
-            }
-        }
-    }
-
-    async fn management_page_state(&self, cancellation: &CancellationToken) -> Value {
-        if !self.is_browser_server() {
-            return self.last_known_page_state();
-        }
-        let Some(tool_name) = self
-            .downstream_tools
-            .iter()
-            .find(|name| matches!(name.as_str(), "list_pages" | "listPages"))
-            .cloned()
-        else {
-            return self.last_known_page_state();
-        };
-        let client = match self.ensure_client().await {
-            Ok(client) => client,
-            Err(message) => {
-                return json!({
-                    "pages": [],
-                    "selected_page": null,
-                    "page_count": 0,
-                    "error_code": "BROWSER_NOT_CONNECTED",
-                    "error_message": message
-                })
-            }
-        };
-        match client
-            .request_with_cancellation(
-                "tools/call",
-                json!({"name": tool_name, "arguments": {}}),
-                cancellation,
-            )
-            .await
-        {
-            Ok(result) => proxy_page_state(&result),
-            Err(error) => json!({
-                "pages": [],
-                "selected_page": null,
-                "page_count": 0,
-                "error_code": browser_proxy_error_code("list_pages", &error.to_string()),
-                "error_message": error.to_string()
-            }),
-        }
-    }
-
-    async fn bounded_management_page_state(&self, cancellation: &CancellationToken) -> Value {
-        let limit = self
-            .spec
-            .request_timeout
-            .min(Duration::from_secs(BROWSER_MANAGEMENT_PAGE_TIMEOUT_SECONDS));
-        match timeout(limit, self.management_page_state(cancellation)).await {
-            Ok(page_state) => page_state,
-            Err(_) => json!({
-                "pages": [],
-                "selected_page": null,
-                "page_count": 0,
-                "error_code": "BROWSER_MANAGEMENT_TIMEOUT",
-                "error_message": format!(
-                    "browser page-state request timed out after {} seconds",
-                    limit.as_secs()
-                )
-            }),
-        }
-    }
-
-    fn is_browser_server(&self) -> bool {
-        self.spec
-            .tool_prefix
-            .to_ascii_lowercase()
-            .contains("browser")
-            || self.spec.name.to_ascii_lowercase().contains("browser")
     }
 
     fn last_known_page_state(&self) -> Value {
@@ -2250,19 +2002,19 @@ impl ProxyServer {
                 ));
             let recovery_hint = match code {
                 "STALE_ELEMENT_REFERENCE" => {
-                    "Call browser__take_snapshot and use a fresh element UID."
+                    "Call the browser `take_snapshot` tool through mcp and use a fresh element UID."
                 }
                 "NO_ACTIVE_PAGE" | "PAGE_CLOSED" => {
-                    "Call browser__list_pages, browser__select_page, then browser__take_snapshot."
+                    "Call the browser `list_pages`, `select_page`, then `take_snapshot` tools through mcp."
                 }
                 "BROWSER_CRASHED" => {
-                    "Chrome is being relaunched; call browser__health_check, then open or navigate to the target page again."
+                    "Inspect the downstream server with mcp operation=get; refresh it if disconnected, then open or navigate to the target page again."
                 }
                 "BROWSER_NOT_CONNECTED" | "CDP_CONNECTION_LOST" => {
-                    "Call browser__health_check, reconnect only if disconnected, then list pages again."
+                    "Inspect the downstream server with mcp operation=get; use operation=refresh only if disconnected, then call `list_pages` through mcp."
                 }
                 "ELEMENT_WAIT_TIMEOUT" | "PAGE_LOAD_TIMEOUT" | "SCRIPT_TIMEOUT" => {
-                    "The browser connection was preserved; inspect the current page with browser__take_snapshot before retrying."
+                    "The browser connection was preserved; call `take_snapshot` through mcp before retrying."
                 }
                 _ => "Inspect error_message and the current browser page state before retrying.",
             };
@@ -2293,64 +2045,6 @@ impl ProxyServer {
             structured.insert("error_message".into(), Value::Null);
             structured.insert("retryable".into(), Value::Bool(false));
         }
-    }
-
-    async fn probe_connection(&self, cancellation: &CancellationToken) -> Result<(), String> {
-        let client = self.ensure_client().await?;
-        match client
-            .request_with_cancellation("ping", json!({}), cancellation)
-            .await
-        {
-            Ok(_) => {
-                self.record_success("ping", None);
-                Ok(())
-            }
-            Err(error) => {
-                let code = proxy_failure_reason("ping", &error);
-                self.record_failure(&code, &error.to_string());
-                if error.invalidates_connection() {
-                    self.invalidate_client(&client).await;
-                }
-                Err(error.to_string())
-            }
-        }
-    }
-
-    async fn replace_connection(&self) -> Result<(), String> {
-        self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
-        let previous = {
-            let mut client = self.client.lock().await;
-            client.take()
-        };
-        if let Some(previous) = previous {
-            if timeout(
-                Duration::from_secs(PROXY_TERMINATION_TIMEOUT_SECONDS),
-                previous.terminate(),
-            )
-            .await
-            .is_err()
-            {
-                append_profile_log(
-                    &self.workspace_id,
-                    "stderr.log",
-                    &format!(
-                        "[mcp-proxy:{}] timed out terminating the previous downstream process",
-                        self.spec.name
-                    ),
-                );
-            }
-        }
-        timeout(
-            Duration::from_secs(PROXY_CONNECTION_REPLACEMENT_TIMEOUT_SECONDS),
-            self.ensure_client(),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "timed out replacing downstream MCP connection after {PROXY_CONNECTION_REPLACEMENT_TIMEOUT_SECONDS} seconds"
-            )
-        })?
-        .map(|_| ())
     }
 
     async fn invalidate_client(&self, failed: &Arc<McpProxyClient>) {
@@ -2502,6 +2196,7 @@ impl ProxyServer {
         let operational = transport_connected && browser_cdp_reachable != Some(false);
         json!({
             "name": self.spec.name,
+            "enabled": self.spec.enabled,
             "transport": self.spec.transport.label(),
             "connected": operational,
             "transport_connected": transport_connected,
@@ -2516,12 +2211,9 @@ impl ProxyServer {
             "client": client_status,
             "reconnect_scheduled": self.reconnect_scheduled.load(Ordering::Acquire),
             "tool_count": tool_count,
-            "selected_downstream_tool_count": self.downstream_tools.len(),
             "discovered_tool_count": self.discovered_tool_count,
-            "filtered_tool_count": self.filtered_tool_count,
-            "truncated_tool_count": self.truncated_tool_count,
-            "exposure_mode": self.spec.exposure_mode.label(),
-            "selection_source": self.selection_source,
+            "lazy_discovery": true,
+            "published_tool_count": 0,
             "max_concurrent_requests": self.spec.max_concurrent_requests,
             "in_flight_requests": self.spec.max_concurrent_requests.saturating_sub(available_slots),
             "available_slots": available_slots,
@@ -2530,7 +2222,6 @@ impl ProxyServer {
             "cancellations": self.cancellations.load(Ordering::Relaxed),
             "timeouts": self.timeouts.load(Ordering::Relaxed),
             "queue_timeouts": self.queue_timeouts.load(Ordering::Relaxed),
-            "management_tools": self.spec.management_tools,
             "reconnect_attempts": self.reconnect_attempts.load(Ordering::Relaxed),
             "last_reconnect_at": self.last_reconnect_at.lock().expect("mcp proxy reconnect time lock").clone(),
             "last_success_at": self.last_success_at.lock().expect("mcp proxy success time lock").clone(),
@@ -2541,6 +2232,17 @@ impl ProxyServer {
             "last_error_at": self.last_error_at.lock().expect("mcp proxy error time lock").clone(),
             "last_error": last_error
         })
+    }
+
+    async fn shutdown(&self) {
+        let client = self.client.lock().await.take();
+        if let Some(client) = client {
+            let _ = timeout(
+                Duration::from_secs(PROXY_TERMINATION_TIMEOUT_SECONDS),
+                client.terminate(),
+            )
+            .await;
+        }
     }
 
     fn schedule_reconnect(self: Arc<Self>) {
@@ -3825,9 +3527,8 @@ pub fn parse_mcp_proxy_config(
 
     let mut specs = Vec::new();
     for (name, config) in servers {
-        if config.disabled {
-            continue;
-        }
+        let raw_config = config.clone();
+        let enabled = !config.disabled;
         let workspace_display = workspace_path.display().to_string();
         let transport_name = config.transport_type.trim().to_ascii_lowercase();
         let has_url = config
@@ -3935,31 +3636,6 @@ pub fn parse_mcp_proxy_config(
                 }
             })
             .unwrap_or_else(|| workspace_path.to_path_buf());
-        let tool_prefix =
-            sanitize_tool_segment(config.tool_prefix.as_deref().unwrap_or(name.as_str()));
-        let include_tools = config
-            .include_tools
-            .map(|tools| parse_configured_tool_names(&name, "includeTools", tools))
-            .transpose()?;
-        let exclude_tools =
-            parse_configured_tool_names(&name, "excludeTools", config.exclude_tools)?;
-        let exposure_mode = match config.exposure_mode.as_deref().unwrap_or("auto") {
-            "auto" => ProxyExposureMode::Auto,
-            "full" => ProxyExposureMode::Full,
-            other => {
-                return Err(format!(
-                    "MCP server `{name}` exposureMode must be `auto` or `full`, got `{other}`"
-                ));
-            }
-        };
-        if config
-            .max_tools
-            .is_some_and(|maximum| maximum > MAX_PROXY_TOOLS_PER_SERVER)
-        {
-            return Err(format!(
-                "MCP server `{name}` maxTools must be at most {MAX_PROXY_TOOLS_PER_SERVER}"
-            ));
-        }
         let default_concurrency = match &transport {
             McpProxyTransportSpec::Stdio => DEFAULT_STDIO_MAX_CONCURRENT_REQUESTS,
             McpProxyTransportSpec::StreamableHttp { .. } => DEFAULT_HTTP_MAX_CONCURRENT_REQUESTS,
@@ -3975,16 +3651,12 @@ pub fn parse_mcp_proxy_config(
 
         specs.push(McpProxyServerSpec {
             name,
+            enabled,
             transport,
             command,
             args,
             env,
             cwd,
-            tool_prefix,
-            include_tools,
-            exclude_tools,
-            max_tools: config.max_tools,
-            exposure_mode,
             max_concurrent_requests,
             request_timeout: Duration::from_secs(
                 config
@@ -3992,10 +3664,78 @@ pub fn parse_mcp_proxy_config(
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECONDS)
                     .clamp(1, 600),
             ),
-            management_tools: config.management_tools.unwrap_or(true),
+            raw_config,
         });
     }
     Ok(specs)
+}
+
+pub fn parse_mcp_server_registration(
+    server_name: &str,
+    config: &Value,
+    workspace_path: &Path,
+) -> Result<McpProxyServerSpec, String> {
+    validate_mcp_server_name(server_name)?;
+    let mut config = config
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "downstream MCP server config must be an object".to_string())?;
+    if config.contains_key("disabled") {
+        return Err(
+            "register does not accept `disabled`; use the enable/disable lifecycle operations"
+                .into(),
+        );
+    }
+    config.insert("disabled".into(), Value::Bool(false));
+    let raw = json!({
+        "mcpServers": {
+            server_name: Value::Object(config)
+        }
+    })
+    .to_string();
+    let mut specs = parse_mcp_proxy_config(&raw, workspace_path)?;
+    if specs.len() != 1 {
+        return Err("register must produce exactly one downstream MCP server".into());
+    }
+    Ok(specs.remove(0))
+}
+
+pub fn serialize_mcp_proxy_config(specs: &[McpProxyServerSpec]) -> Result<String, String> {
+    let mut servers = BTreeMap::<String, RawMcpServerConfig>::new();
+    for spec in specs {
+        let mut raw = spec.raw_config.clone();
+        raw.disabled = !spec.enabled;
+        servers.insert(spec.name.clone(), raw);
+    }
+    serde_json::to_string_pretty(&json!({"mcpServers": servers}))
+        .map_err(|error| format!("failed to serialize downstream MCP configuration: {error}"))
+}
+
+fn persist_mcp_proxy_specs(workspace_id: &str, specs: &[McpProxyServerSpec]) -> Result<(), String> {
+    let serialized = serialize_mcp_proxy_config(specs)?;
+    let mut store = crate::data::DataStore::load()
+        .map_err(|error| format!("failed to load workspace configuration: {error}"))?;
+    let mut profile = store.get(workspace_id).cloned().ok_or_else(|| {
+        format!("workspace not found while persisting downstream MCP: {workspace_id}")
+    })?;
+    profile.runtime.mcp_config = serialized;
+    store
+        .update(profile)
+        .map_err(|error| format!("failed to persist downstream MCP configuration: {error}"))
+}
+
+fn validate_mcp_server_name(server_name: &str) -> Result<(), String> {
+    let trimmed = server_name.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed != server_name {
+        return Err(
+            "downstream MCP server name must be 1..128 characters without surrounding whitespace"
+                .into(),
+        );
+    }
+    if trimmed.chars().any(|character| character.is_control()) {
+        return Err("downstream MCP server name cannot contain control characters".into());
+    }
+    Ok(())
 }
 
 fn validate_proxy_http_url(server_name: &str, raw: &str) -> Result<String, String> {
@@ -4055,28 +3795,6 @@ fn validate_proxy_http_headers(
         })?;
     }
     Ok(headers)
-}
-
-fn parse_configured_tool_names(
-    server_name: &str,
-    field: &str,
-    values: Vec<String>,
-) -> Result<BTreeSet<String>, String> {
-    let mut names = BTreeSet::new();
-    for value in values {
-        let name = value.trim();
-        if name.is_empty() || name.len() > 128 {
-            return Err(format!(
-                "MCP server `{server_name}` {field} contains an empty or overlong tool name"
-            ));
-        }
-        if !names.insert(name.to_string()) {
-            return Err(format!(
-                "MCP server `{server_name}` {field} contains duplicate tool `{name}`"
-            ));
-        }
-    }
-    Ok(names)
 }
 
 fn expand_workspace_placeholders(value: &str, workspace_path: &str) -> String {
@@ -4143,7 +3861,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
     use axum::body::Body;
@@ -4161,12 +3879,12 @@ mod tests {
     use super::{
         apply_stdio_proxy_process_path, browser_debugging_port, browser_proxy_error_code,
         expand_proxy_placeholders, merge_proxy_success_summary, normalize_proxy_tool_result,
-        normalized_proxy_failure, parse_mcp_proxy_config, prepare_my_agent_browser_isolation,
-        proxy_browser_cdp_reachable, proxy_catalog_digest, proxy_connection_status,
-        proxy_failure_reason, proxy_management_tools, proxy_page_state, proxy_result_state_summary,
-        resolve_stdio_proxy_program, sanitize_proxy_catalog, wrap_proxy_structured_result,
-        McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec, ProxyClientError,
-        ProxyExposureMode,
+        normalized_proxy_failure, parse_mcp_proxy_config, parse_mcp_server_registration,
+        prepare_my_agent_browser_isolation, proxy_browser_cdp_reachable, proxy_catalog_digest,
+        proxy_connection_status, proxy_failure_reason, proxy_page_state,
+        proxy_result_state_summary, resolve_stdio_proxy_program, sanitize_proxy_catalog,
+        serialize_mcp_proxy_config, McpProxyRegistry, McpProxyServerSpec, McpProxyTransportSpec,
+        ProxyClientError, RawMcpServerConfig,
     };
 
     #[cfg(unix)]
@@ -4209,22 +3927,52 @@ mod tests {
     }
 
     fn test_spec() -> McpProxyServerSpec {
+        let raw_config = RawMcpServerConfig {
+            transport_type: "stdio".into(),
+            command: "noop".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: BTreeMap::new(),
+            disabled: false,
+            max_concurrent_requests: Some(4),
+            request_timeout_seconds: Some(5),
+        };
         McpProxyServerSpec {
             name: "test".into(),
+            enabled: true,
             transport: McpProxyTransportSpec::Stdio,
             command: "noop".into(),
             args: Vec::new(),
             env: BTreeMap::new(),
             cwd: Path::new(".").to_path_buf(),
-            tool_prefix: "test".into(),
-            include_tools: None,
-            exclude_tools: BTreeSet::new(),
-            max_tools: None,
-            exposure_mode: ProxyExposureMode::Full,
             max_concurrent_requests: 4,
             request_timeout: Duration::from_secs(5),
-            management_tools: false,
+            raw_config,
         }
+    }
+
+    fn runtime_test_spec(
+        name: &str,
+        command: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+        max_concurrent_requests: usize,
+        request_timeout: Duration,
+    ) -> McpProxyServerSpec {
+        let mut spec = test_spec();
+        spec.name = name.to_string();
+        spec.command = command.clone();
+        spec.args = args.clone();
+        spec.cwd = cwd;
+        spec.max_concurrent_requests = max_concurrent_requests;
+        spec.request_timeout = request_timeout;
+        spec.raw_config.command = command;
+        spec.raw_config.args = args;
+        spec.raw_config.max_concurrent_requests = Some(max_concurrent_requests);
+        spec.raw_config.request_timeout_seconds = Some(request_timeout.as_secs());
+        spec
     }
 
     fn raw_proxy_tool(name: &str) -> serde_json::Value {
@@ -4402,7 +4150,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_catalog_is_validated_and_published_conservatively() {
+    fn proxy_catalog_is_validated_but_never_published_into_anchor_catalog() {
         let catalog = sanitize_proxy_catalog(
             &test_spec(),
             vec![json!({
@@ -4433,13 +4181,13 @@ mod tests {
         assert!(definition.get("_meta").is_none());
         assert_eq!(definition["outputSchema"]["required"], json!(["ok"]));
         assert!(catalog.tools[0].synthesized_output_schema);
-        let effective = crate::tools::build_effective_catalog_from_parts(
-            "core",
-            true,
-            vec![definition.clone()],
-        )
-        .expect("sanitized proxy tool passes the final effective catalog contract");
-        assert_eq!(effective.proxy_count, 1);
+        let effective = crate::tools::build_effective_catalog_from_parts("core", true)
+            .expect("effective Anchor catalog");
+        assert_eq!(effective.proxy_count, 0);
+        assert!(!effective
+            .tools
+            .iter()
+            .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("test__read_secret") }));
         let validator = jsonschema::validator_for(&catalog.tools[0].input_schema).unwrap();
         assert!(validator.validate(&json!({"path": "README.md"})).is_ok());
         assert!(validator.validate(&json!({"unknown": true})).is_err());
@@ -4520,7 +4268,7 @@ mod tests {
     fn browser_proxy_failures_are_classified_for_recovery() {
         assert_eq!(
             proxy_failure_reason(
-                "browser__navigate",
+                "navigate_page",
                 &ProxyClientError::Timeout {
                     method: "tools/call".into(),
                     seconds: 90,
@@ -4530,7 +4278,7 @@ mod tests {
         );
         assert_eq!(
             proxy_failure_reason(
-                "browser__wait_for",
+                "wait_for",
                 &ProxyClientError::Timeout {
                     method: "tools/call".into(),
                     seconds: 30,
@@ -4540,7 +4288,7 @@ mod tests {
         );
         assert_eq!(
             proxy_failure_reason(
-                "browser__click",
+                "click",
                 &ProxyClientError::Transport("CDP target closed".into()),
             ),
             "devtools_channel_disconnected"
@@ -4551,18 +4299,15 @@ mod tests {
         }
         .invalidates_connection());
         assert_eq!(
-            browser_proxy_error_code("browser__fill", "Element uid=12 is stale and not found"),
+            browser_proxy_error_code("fill", "Element uid=12 is stale and not found"),
             "STALE_ELEMENT_REFERENCE"
         );
         assert_eq!(
-            browser_proxy_error_code("browser__wait_for", "request timed out after 30 seconds"),
+            browser_proxy_error_code("wait_for", "request timed out after 30 seconds"),
             "ELEMENT_WAIT_TIMEOUT"
         );
         assert_eq!(
-            browser_proxy_error_code(
-                "browser__evaluate_script",
-                "request timed out after 30 seconds"
-            ),
+            browser_proxy_error_code("evaluate_script", "request timed out after 30 seconds"),
             "SCRIPT_TIMEOUT"
         );
     }
@@ -4782,103 +4527,37 @@ mod tests {
     }
 
     #[test]
-    fn proxy_catalog_applies_include_exclude_and_max_tools_deterministically() {
-        let mut spec = test_spec();
-        spec.include_tools = Some(
-            ["click", "navigate", "screenshot"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        );
-        spec.exclude_tools = ["navigate"].into_iter().map(str::to_string).collect();
-        spec.max_tools = Some(1);
+    fn high_fanout_catalog_is_retained_for_lazy_discovery_without_selection_policy() {
+        let tools = (0..300)
+            .map(|index| raw_proxy_tool(&format!("tool_{index:03}")))
+            .collect::<Vec<_>>();
+        let catalog = sanitize_proxy_catalog(&test_spec(), tools).expect("lazy catalog");
 
-        let catalog = sanitize_proxy_catalog(
-            &spec,
-            vec![
-                raw_proxy_tool("screenshot"),
-                raw_proxy_tool("evaluate"),
-                raw_proxy_tool("navigate"),
-                raw_proxy_tool("click"),
-                raw_proxy_tool("tabs"),
-            ],
+        assert_eq!(catalog.discovered_count, 300);
+        assert_eq!(catalog.tools.len(), 300);
+        assert_eq!(catalog.tools[0].downstream_name, "tool_000");
+        assert_eq!(catalog.tools[299].downstream_name, "tool_299");
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_duplicate_downstream_tool_names() {
+        let error = sanitize_proxy_catalog(
+            &test_spec(),
+            vec![raw_proxy_tool("click"), raw_proxy_tool("click")],
         )
-        .expect("filtered catalog");
-
-        assert_eq!(catalog.discovered_count, 5);
-        assert_eq!(catalog.filtered_count, 3);
-        assert_eq!(catalog.truncated_count, 1);
-        assert_eq!(catalog.tools.len(), 1);
-        assert_eq!(catalog.tools[0].downstream_name, "click");
-        assert_eq!(catalog.tools[0].public_name, "test__click");
+        .expect_err("duplicate downstream tool");
+        assert!(error.contains("duplicate tool `click`"));
     }
 
     #[test]
-    fn automatic_generic_exposure_requires_policy_for_high_fanout_catalogs() {
+    fn browser_metadata_is_preserved_inside_lazy_tool_definition() {
         let mut spec = test_spec();
-        spec.exposure_mode = ProxyExposureMode::Auto;
-        let tools = (0..25)
-            .map(|index| raw_proxy_tool(&format!("tool_{index:02}")))
-            .collect::<Vec<_>>();
-
-        let error = sanitize_proxy_catalog(&spec, tools).expect_err("unbounded catalog");
-        assert!(error.contains("without an explicit exposure policy"));
-        assert!(error.contains("limited to 24"));
-
-        spec.exposure_mode = ProxyExposureMode::Full;
-        let tools = (0..25)
-            .map(|index| raw_proxy_tool(&format!("tool_{index:02}")))
-            .collect::<Vec<_>>();
-        let catalog = sanitize_proxy_catalog(&spec, tools).expect("explicit full catalog");
-        assert_eq!(catalog.tools.len(), 25);
-        assert_eq!(catalog.selection_source, "explicit_full");
-    }
-
-    #[test]
-    fn automatic_browser_exposure_keeps_the_default_workflow_and_filters_low_frequency_tools() {
-        let mut spec = test_spec();
+        spec.name = "browser".into();
         spec.command = "my-agent-browser".into();
-        spec.exposure_mode = ProxyExposureMode::Auto;
-        let catalog = sanitize_proxy_catalog(
-            &spec,
-            vec![
-                raw_proxy_tool("list_pages"),
-                raw_proxy_tool("navigate_page"),
-                raw_proxy_tool("take_snapshot"),
-                raw_proxy_tool("take_screenshot"),
-                raw_proxy_tool("click"),
-                raw_proxy_tool("lighthouse_audit"),
-                raw_proxy_tool("take_heapsnapshot"),
-            ],
-        )
-        .expect("browser workflow catalog");
-
-        let names = catalog
-            .tools
-            .iter()
-            .map(|tool| tool.downstream_name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            names,
-            [
-                "click",
-                "list_pages",
-                "navigate_page",
-                "take_screenshot",
-                "take_snapshot",
-            ]
-            .into_iter()
-            .collect()
-        );
-        assert_eq!(catalog.selection_source, "browser_workflow");
-        assert_eq!(catalog.discovered_count, 7);
-        assert_eq!(catalog.filtered_count, 2);
-
-        let screenshot = catalog
-            .tools
-            .iter()
-            .find(|tool| tool.downstream_name == "take_screenshot")
-            .expect("screenshot tool");
+        let catalog = sanitize_proxy_catalog(&spec, vec![raw_proxy_tool("take_screenshot")])
+            .expect("browser lazy catalog");
+        let screenshot = &catalog.tools[0];
+        assert_eq!(screenshot.downstream_name, "take_screenshot");
         assert_eq!(
             screenshot.definition["_meta"]["ui"]["resourceUri"],
             crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
@@ -4887,16 +4566,6 @@ mod tests {
             screenshot.definition["_meta"]["openai/outputTemplate"],
             crate::mcp::ui::IMAGE_VIEWER_RESOURCE_URI
         );
-    }
-
-    #[test]
-    fn proxy_catalog_rejects_missing_include_tools_entries() {
-        let mut spec = test_spec();
-        spec.include_tools = Some(["missing"].into_iter().map(str::to_string).collect());
-
-        let error = sanitize_proxy_catalog(&spec, vec![raw_proxy_tool("click")])
-            .expect_err("missing configured tool");
-        assert!(error.contains("did not advertise includeTools entries: missing"));
     }
 
     #[test]
@@ -4942,7 +4611,7 @@ mod tests {
 
         let normalized = normalize_proxy_tool_result(
             "browser",
-            "browser__click",
+            "click",
             json!({
                 "content": [{"type": "text", "text": "clicked"}]
             }),
@@ -5058,23 +4727,6 @@ mod tests {
     }
 
     #[test]
-    fn browser_management_contract_exposes_probe_freshness() {
-        let mut spec = test_spec();
-        spec.management_tools = true;
-        let entries = proxy_management_tools(&spec);
-        let health = entries
-            .iter()
-            .find(|(name, ..)| name.ends_with("__health_check"))
-            .expect("health management tool");
-        let output_schema = &health.4;
-        assert!(output_schema["properties"]["observed_at"].is_object());
-        assert!(output_schema["properties"]["recovered_during_probe"].is_object());
-        let required = output_schema["required"].as_array().expect("required");
-        assert!(required.iter().any(|item| item == "observed_at"));
-        assert!(required.iter().any(|item| item == "recovered_during_probe"));
-    }
-
-    #[test]
     fn parses_standard_mcp_servers_and_expands_workspace_folder() {
         let specs = parse_mcp_proxy_config(
             r#"{
@@ -5092,116 +4744,84 @@ mod tests {
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "code graph");
-        assert_eq!(specs[0].tool_prefix, "code_graph");
+        assert!(specs[0].enabled);
         assert_eq!(specs[0].args[2], "/tmp/example");
-        assert!(specs[0].management_tools);
     }
 
     #[test]
-    fn parses_proxy_tool_selection_controls() {
-        let specs = parse_mcp_proxy_config(
-            r#"{
+    fn removed_eager_exposure_fields_are_hard_rejected() {
+        for field in [
+            "includeTools",
+            "excludeTools",
+            "maxTools",
+            "exposureMode",
+            "toolPrefix",
+            "managementTools",
+        ] {
+            let raw = json!({
                 "mcpServers": {
                     "browser": {
+                        "type": "stdio",
                         "command": "browser-mcp",
-                        "includeTools": ["navigate", "click", "screenshot"],
-                        "excludeTools": ["screenshot"],
-                        "maxTools": 2,
-                        "maxConcurrentRequests": 3
+                        field: if field == "maxTools" { json!(2) } else { json!(false) }
                     }
                 }
-            }"#,
-            Path::new("/tmp/example"),
-        )
-        .expect("parse selection controls");
-
-        let spec = &specs[0];
-        assert_eq!(spec.max_tools, Some(2));
-        assert_eq!(spec.exposure_mode, ProxyExposureMode::Auto);
-        assert_eq!(spec.max_concurrent_requests, 3);
-        assert!(spec
-            .include_tools
-            .as_ref()
-            .is_some_and(|tools| tools.contains("navigate") && tools.contains("click")));
-        assert!(spec.exclude_tools.contains("screenshot"));
+            })
+            .to_string();
+            let error = parse_mcp_proxy_config(&raw, Path::new("/tmp/example"))
+                .expect_err("removed eager exposure field must be rejected");
+            assert!(
+                error.contains(field),
+                "missing removed field in error: {error}"
+            );
+        }
     }
 
     #[test]
-    fn management_tools_can_be_disabled_and_use_stable_prefixed_names() {
+    fn disabled_servers_remain_in_canonical_state_and_round_trip() {
         let specs = parse_mcp_proxy_config(
-            r#"{"mcpServers":{"browser":{"command":"browser-mcp","managementTools":false}}}"#,
+            r#"{"mcpServers":{"remote":{"type":"stdio","command":"noop","disabled":true}}}"#,
             Path::new("/tmp/example"),
         )
-        .expect("parse management flag");
-        assert!(!specs[0].management_tools);
-        assert!(proxy_management_tools(&specs[0]).is_empty());
+        .expect("disabled server config");
+        assert_eq!(specs.len(), 1);
+        assert!(!specs[0].enabled);
 
-        let mut enabled = specs[0].clone();
-        enabled.management_tools = true;
-        let names = proxy_management_tools(&enabled)
-            .into_iter()
-            .map(|(name, ..)| name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "browser__health_check",
-                "browser__reconnect",
-                "browser__reset_session"
-            ]
-        );
+        let serialized = serialize_mcp_proxy_config(&specs).expect("serialize canonical config");
+        let reparsed = parse_mcp_proxy_config(&serialized, Path::new("/tmp/example"))
+            .expect("reparse canonical config");
+        assert_eq!(reparsed.len(), 1);
+        assert!(!reparsed[0].enabled);
+        assert_eq!(reparsed[0].name, "remote");
     }
 
     #[test]
-    fn management_results_accept_null_error_and_never_publish_null_structured_content() {
-        let mut spec = test_spec();
-        spec.management_tools = true;
-        let tools = proxy_management_tools(&spec);
-        let output_schema = tools[0].4.clone();
-        let wrapped = wrap_proxy_structured_result(
-            json!({
-                "ok": true,
-                "status": "healthy",
-                "server": "browser",
-                "connection": {"connected": true},
-                "error": null,
-                "error_code": null,
-                "error_message": null,
-                "retryable": false,
-                "browser_session_id": "session-1",
-                "connection_status": "connected",
-                "transport_connected": true,
-                "operational": true,
-                "browser_cdp_reachable": true,
-                "observed_at": "2026-08-11T03:00:00Z",
-                "recovered_during_probe": false,
-                "page_count": 0,
-                "pages": [],
-                "selected_page": null,
-                "page_state": {}
-            }),
-            &output_schema,
-        );
-        assert!(wrapped["structuredContent"].is_object());
-        assert_eq!(wrapped["structuredContent"]["error"], Value::Null);
-        assert_eq!(wrapped["isError"], false);
+    fn dynamic_registration_reuses_strict_config_schema_and_rejects_disabled() {
+        let spec = parse_mcp_server_registration(
+            "remote",
+            &json!({"type": "stdio", "command": "noop"}),
+            Path::new("/tmp/example"),
+        )
+        .expect("registration config");
+        assert!(spec.enabled);
+        assert_eq!(spec.name, "remote");
 
-        let invalid = wrap_proxy_structured_result(Value::Null, &output_schema);
-        assert!(invalid["structuredContent"].is_object());
-        assert_eq!(
-            invalid["structuredContent"]["error_code"],
-            "DOWNSTREAM_SCHEMA_MISMATCH"
-        );
-        assert_eq!(invalid["isError"], true);
+        let error = parse_mcp_server_registration(
+            "remote",
+            &json!({"type": "stdio", "command": "noop", "disabled": true}),
+            Path::new("/tmp/example"),
+        )
+        .expect_err("register must not accept disabled");
+        assert!(error.contains("enable/disable"));
     }
 
     #[tokio::test]
-    async fn browser_health_check_rejects_downstream_page_errors() {
+    async fn dynamic_lifecycle_persists_and_applies_live_without_published_tool_routes() {
         let Ok(python) = which::which("python") else {
             return;
         };
         let temp = tempfile::tempdir().expect("tempdir");
-        let script = temp.path().join("browser_health_error.py");
+        let script = temp.path().join("dynamic_mcp.py");
         fs::write(
             &script,
             r#"import json
@@ -5214,59 +4834,94 @@ for raw in sys.stdin:
     request_id = message["id"]
     method = message.get("method")
     if method == "initialize":
-        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "browser", "version": "1"}}
+        result = {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "dynamic", "version": "1"}}
     elif method == "tools/list":
-        result = {"tools": [{"name": "list_pages", "description": "List pages", "inputSchema": {"type": "object", "properties": {}}}]}
+        result = {"tools": [{"name": "ping", "description": "Ping", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}]}
     elif method == "tools/call":
-        result = {"content": [{"type": "text", "text": "Chrome failed to start (port unavailable)"}], "isError": True}
+        result = {"content": [{"type": "text", "text": "pong"}]}
     else:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
 "#,
         )
-        .expect("write browser fixture");
+        .expect("write dynamic mcp fixture");
 
-        let registry = McpProxyRegistry::default();
+        let persisted = Arc::new(StdMutex::new(Vec::<Vec<(String, bool)>>::new()));
+        let persisted_for_hook = persisted.clone();
+        let registry =
+            McpProxyRegistry::with_persistence_for_test(Arc::new(move |_workspace, specs| {
+                persisted_for_hook
+                    .lock()
+                    .expect("persistence snapshots")
+                    .push(
+                        specs
+                            .iter()
+                            .map(|spec| (spec.name.clone(), spec.enabled))
+                            .collect(),
+                    );
+                Ok(())
+            }));
         registry
-            .configure(
-                vec![McpProxyServerSpec {
-                    name: "browser".into(),
-                    transport: McpProxyTransportSpec::Stdio,
-                    command: python.display().to_string(),
-                    args: vec![script.display().to_string()],
-                    env: BTreeMap::new(),
-                    cwd: temp.path().to_path_buf(),
-                    tool_prefix: "browser".into(),
-                    include_tools: None,
-                    exclude_tools: BTreeSet::new(),
-                    max_tools: None,
-                    exposure_mode: ProxyExposureMode::Full,
-                    max_concurrent_requests: 2,
-                    request_timeout: Duration::from_secs(3),
-                    management_tools: true,
-                }],
-                "browser-health-error-test",
-            )
+            .configure(Vec::new(), "dynamic-lifecycle-test")
             .await;
 
-        let status = registry.status();
-        let server = &status["servers"][0];
-        assert_eq!(server["exposure_mode"], "full");
-        assert_eq!(server["selection_source"], "explicit_full");
-        assert_eq!(server["discovered_tool_count"], 1);
-        assert_eq!(server["selected_downstream_tool_count"], 1);
-
-        let health = registry
-            .call_tool("browser__health_check", &json!({}))
+        let spec = runtime_test_spec(
+            "dynamic",
+            python.display().to_string(),
+            vec![script.display().to_string()],
+            temp.path().to_path_buf(),
+            2,
+            Duration::from_secs(5),
+        );
+        let registered = registry
+            .register_server(spec)
             .await
-            .expect("health route")
-            .expect("health result");
-        assert_eq!(health["structuredContent"]["ok"], false);
-        assert_eq!(health["structuredContent"]["status"], "unhealthy");
-        assert_eq!(health["isError"], true);
-        assert!(health["structuredContent"]["error_message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Chrome failed to start")));
+            .expect("register live server");
+        assert_eq!(registered["enabled"], true);
+        assert_eq!(registered["connected"], true);
+        assert_eq!(registered["published_tool_count"], 0);
+        assert_eq!(
+            registry.search_tools(Some("dynamic"), "ping", 0, 10)["total_matches"],
+            1
+        );
+
+        let disabled = registry
+            .set_server_enabled("dynamic", false)
+            .await
+            .expect("disable live server");
+        assert_eq!(disabled["enabled"], false);
+        assert_eq!(disabled["connected"], false);
+        assert!(registry.tool_definition("dynamic", "ping").is_none());
+
+        let enabled = registry
+            .set_server_enabled("dynamic", true)
+            .await
+            .expect("enable live server");
+        assert_eq!(enabled["connected"], true);
+        assert!(registry.tool_definition("dynamic", "ping").is_some());
+
+        let refreshed = registry
+            .refresh_server("dynamic")
+            .await
+            .expect("refresh live server");
+        assert_eq!(refreshed["connected"], true);
+
+        let removed = registry
+            .remove_server("dynamic")
+            .await
+            .expect("remove live server");
+        assert_eq!(removed["removed"], true);
+        assert!(registry.server_status("dynamic").is_none());
+
+        assert_eq!(
+            *persisted.lock().expect("persistence snapshots"),
+            vec![
+                vec![("dynamic".into(), true)],
+                vec![("dynamic".into(), false)],
+                vec![("dynamic".into(), true)],
+                Vec::new(),
+            ]
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -5407,28 +5062,7 @@ for raw in sys.stdin:
     }
 
     #[test]
-    fn rejects_invalid_proxy_tool_selection_controls() {
-        let duplicate = parse_mcp_proxy_config(
-            r#"{"mcpServers":{"browser":{"command":"browser-mcp","includeTools":["click","click"]}}}"#,
-            Path::new("/tmp/example"),
-        )
-        .expect_err("duplicate includeTools");
-        assert!(duplicate.contains("includeTools contains duplicate tool `click`"));
-
-        let excessive = parse_mcp_proxy_config(
-            r#"{"mcpServers":{"browser":{"command":"browser-mcp","maxTools":257}}}"#,
-            Path::new("/tmp/example"),
-        )
-        .expect_err("excessive maxTools");
-        assert!(excessive.contains("maxTools must be at most 256"));
-
-        let invalid_exposure = parse_mcp_proxy_config(
-            r#"{"mcpServers":{"browser":{"command":"browser-mcp","exposureMode":"everything"}}}"#,
-            Path::new("/tmp/example"),
-        )
-        .expect_err("invalid exposure mode");
-        assert!(invalid_exposure.contains("exposureMode must be `auto` or `full`"));
-
+    fn rejects_invalid_proxy_runtime_limits() {
         let invalid_concurrency = parse_mcp_proxy_config(
             r#"{"mcpServers":{"browser":{"command":"browser-mcp","maxConcurrentRequests":0}}}"#,
             Path::new("/tmp/example"),
@@ -5479,29 +5113,27 @@ for raw in sys.stdin:
     }
 
     #[test]
-    fn proxy_status_surfaces_unavailable_servers_and_governance_failures() {
+    fn proxy_status_surfaces_configured_server_activation_failures() {
         let registry = McpProxyRegistry::default();
-        registry
-            .state
-            .write()
-            .expect("proxy registry state")
+        let mut spec = test_spec();
+        spec.name = "failed-server".into();
+        let mut state = registry.state.write().expect("proxy registry state");
+        state.specs.insert(spec.name.clone(), spec);
+        state
             .failures
-            .insert(
-                "large-catalog".into(),
-                "automatic exposure is limited to 24".into(),
-            );
+            .insert("failed-server".into(), "activation failed".into());
+        drop(state);
 
         let status = registry.status();
-        assert_eq!(status["server_count"], 0);
+        assert_eq!(status["server_count"], 1);
         assert_eq!(status["unavailable_server_count"], 1);
-        assert_eq!(status["unavailable_servers"][0]["name"], "large-catalog");
-        assert!(status["unavailable_servers"][0]["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("limited to 24")));
+        assert_eq!(status["servers"][0]["name"], "failed-server");
+        assert_eq!(status["servers"][0]["error"], "activation failed");
+        assert_eq!(status["servers"][0]["published_tool_count"], 0);
     }
 
     #[tokio::test]
-    async fn concurrent_proxy_merge_resolves_duplicate_public_names_by_server_name() {
+    async fn concurrent_proxy_discovery_keeps_same_tool_name_isolated_per_server() {
         let Ok(python) = which::which("python") else {
             return;
         };
@@ -5534,21 +5166,15 @@ for raw in sys.stdin:
         )
         .expect("write deterministic merge fixture");
 
-        let make_spec = |name: &str, delay: &str| McpProxyServerSpec {
-            name: name.into(),
-            transport: McpProxyTransportSpec::Stdio,
-            command: python.display().to_string(),
-            args: vec![script.display().to_string(), name.into(), delay.into()],
-            env: BTreeMap::new(),
-            cwd: temp.path().to_path_buf(),
-            tool_prefix: "shared".into(),
-            include_tools: None,
-            exclude_tools: BTreeSet::new(),
-            max_tools: None,
-            exposure_mode: ProxyExposureMode::Full,
-            max_concurrent_requests: 2,
-            request_timeout: Duration::from_secs(5),
-            management_tools: false,
+        let make_spec = |name: &str, delay: &str| {
+            runtime_test_spec(
+                name,
+                python.display().to_string(),
+                vec![script.display().to_string(), name.into(), delay.into()],
+                temp.path().to_path_buf(),
+                2,
+                Duration::from_secs(5),
+            )
         };
 
         let registry = McpProxyRegistry::default();
@@ -5560,8 +5186,12 @@ for raw in sys.stdin:
             .await;
 
         let state = registry.state.read().expect("proxy registry state");
-        let route = state.routes.get("shared__ping").expect("shared ping route");
-        assert_eq!(route.server_name, "alpha");
+        assert!(state
+            .routes
+            .contains_key(&("alpha".to_string(), "ping".to_string())));
+        assert!(state
+            .routes
+            .contains_key(&("zeta".to_string(), "ping".to_string())));
     }
 
     #[tokio::test]
@@ -5585,35 +5215,28 @@ for raw in sys.stdin:
         let registry = McpProxyRegistry::default();
         registry.configure(specs, "proxy-http-test").await;
 
-        let names = registry
-            .list_tools()
-            .into_iter()
-            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        let discovery = registry.search_tools(Some("remote"), "", 0, 20);
+        let names = discovery["items"]
+            .as_array()
+            .expect("lazy discovery items")
+            .iter()
+            .filter_map(|item| item["tool"].as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(
-            names,
-            [
-                "remote__health_check",
-                "remote__json",
-                "remote__reconnect",
-                "remote__reset_session",
-                "remote__slow",
-                "remote__sse",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        );
+        assert_eq!(names, ["json", "slow", "sse"].into_iter().collect());
+        assert!(discovery["items"].as_array().unwrap().iter().all(|item| {
+            item.get("inputSchema").is_none() && item.get("outputSchema").is_none()
+        }));
+        assert!(registry.tool_definition("remote", "json").is_some());
 
         let json_result = registry
-            .call_tool("remote__json", &json!({}))
+            .call_server_tool("remote", "json", &json!({}))
             .await
             .expect("known JSON route")
             .expect("JSON result");
         assert_eq!(json_result["structuredContent"]["ok"], true);
 
         let sse_result = registry
-            .call_tool("remote__sse", &json!({}))
+            .call_server_tool("remote", "sse", &json!({}))
             .await
             .expect("known SSE route")
             .expect("SSE result");
@@ -5627,7 +5250,12 @@ for raw in sys.stdin:
         let worker_cancellation = cancellation.clone();
         let slow = tokio::spawn(async move {
             worker_registry
-                .call_tool_with_cancellation("remote__slow", &json!({}), &worker_cancellation)
+                .call_server_tool_with_cancellation(
+                    "remote",
+                    "slow",
+                    &json!({}),
+                    &worker_cancellation,
+                )
                 .await
                 .expect("known slow route")
                 .expect("cancelled HTTP result")
@@ -5655,7 +5283,7 @@ for raw in sys.stdin:
         assert_eq!(status["server_count"], 1);
         assert_eq!(status["servers"][0]["name"], "remote");
         assert_eq!(status["servers"][0]["transport"], "streamable-http");
-        assert_eq!(status["servers"][0]["tool_count"], 6);
+        assert_eq!(status["servers"][0]["tool_count"], 3);
         assert_eq!(status["servers"][0]["calls"], 3);
         assert_eq!(status["servers"][0]["cancellations"], 1);
         let encoded_status = status.to_string();
@@ -5709,22 +5337,14 @@ for raw in sys.stdin:
         let registry = McpProxyRegistry::default();
         registry
             .configure(
-                vec![McpProxyServerSpec {
-                    name: "slow".into(),
-                    transport: McpProxyTransportSpec::Stdio,
-                    command: python.display().to_string(),
-                    args: vec![script.display().to_string()],
-                    env: BTreeMap::new(),
-                    cwd: temp.path().to_path_buf(),
-                    tool_prefix: "slow".into(),
-                    include_tools: None,
-                    exclude_tools: BTreeSet::new(),
-                    max_tools: None,
-                    exposure_mode: ProxyExposureMode::Full,
-                    max_concurrent_requests: 4,
-                    request_timeout: Duration::from_secs(5),
-                    management_tools: false,
-                }],
+                vec![runtime_test_spec(
+                    "slow",
+                    python.display().to_string(),
+                    vec![script.display().to_string()],
+                    temp.path().to_path_buf(),
+                    4,
+                    Duration::from_secs(5),
+                )],
                 "proxy-cancellation-test",
             )
             .await;
@@ -5734,7 +5354,7 @@ for raw in sys.stdin:
         let worker_token = token.clone();
         let worker = tokio::spawn(async move {
             worker_registry
-                .call_tool_with_cancellation("slow__slow", &json!({}), &worker_token)
+                .call_server_tool_with_cancellation("slow", "slow", &json!({}), &worker_token)
                 .await
                 .expect("known route")
                 .expect("cancelled call is a tool result")
@@ -5806,22 +5426,14 @@ for raw in sys.stdin:
         let registry = McpProxyRegistry::default();
         registry
             .configure(
-                vec![McpProxyServerSpec {
-                    name: "concurrent".into(),
-                    transport: McpProxyTransportSpec::Stdio,
-                    command: python.display().to_string(),
-                    args: vec![script.display().to_string()],
-                    env: BTreeMap::new(),
-                    cwd: temp.path().to_path_buf(),
-                    tool_prefix: "concurrent".into(),
-                    include_tools: None,
-                    exclude_tools: BTreeSet::new(),
-                    max_tools: None,
-                    exposure_mode: ProxyExposureMode::Full,
-                    max_concurrent_requests: 2,
-                    request_timeout: Duration::from_secs(5),
-                    management_tools: false,
-                }],
+                vec![runtime_test_spec(
+                    "concurrent",
+                    python.display().to_string(),
+                    vec![script.display().to_string()],
+                    temp.path().to_path_buf(),
+                    2,
+                    Duration::from_secs(5),
+                )],
                 "proxy-concurrency-test",
             )
             .await;
@@ -5830,8 +5442,8 @@ for raw in sys.stdin:
         let first_args = json!({});
         let second_args = json!({});
         let (first, second) = tokio::join!(
-            registry.call_tool("concurrent__wait", &first_args),
-            registry.call_tool("concurrent__wait", &second_args)
+            registry.call_server_tool("concurrent", "wait", &first_args),
+            registry.call_server_tool("concurrent", "wait", &second_args)
         );
         assert_eq!(
             first.expect("known first route").expect("first result")["structuredContent"]["ok"],
@@ -5905,22 +5517,14 @@ for raw in sys.stdin:
         let registry = McpProxyRegistry::default();
         registry
             .configure(
-                vec![McpProxyServerSpec {
-                    name: "cancellable".into(),
-                    transport: McpProxyTransportSpec::Stdio,
-                    command: python.display().to_string(),
-                    args: vec![script.display().to_string(), starts.display().to_string()],
-                    env: BTreeMap::new(),
-                    cwd: temp.path().to_path_buf(),
-                    tool_prefix: "cancellable".into(),
-                    include_tools: None,
-                    exclude_tools: BTreeSet::new(),
-                    max_tools: None,
-                    exposure_mode: ProxyExposureMode::Full,
-                    max_concurrent_requests: 2,
-                    request_timeout: Duration::from_secs(10),
-                    management_tools: false,
-                }],
+                vec![runtime_test_spec(
+                    "cancellable",
+                    python.display().to_string(),
+                    vec![script.display().to_string(), starts.display().to_string()],
+                    temp.path().to_path_buf(),
+                    2,
+                    Duration::from_secs(10),
+                )],
                 "proxy-cancel-followup-test",
             )
             .await;
@@ -5930,7 +5534,12 @@ for raw in sys.stdin:
         let worker_cancellation = cancellation.clone();
         let slow = tokio::spawn(async move {
             worker_registry
-                .call_tool_with_cancellation("cancellable__slow", &json!({}), &worker_cancellation)
+                .call_server_tool_with_cancellation(
+                    "cancellable",
+                    "slow",
+                    &json!({}),
+                    &worker_cancellation,
+                )
                 .await
                 .expect("known route")
                 .expect("cancelled result")
@@ -5945,7 +5554,7 @@ for raw in sys.stdin:
 
         let started = Instant::now();
         let fast = registry
-            .call_tool("cancellable__fast", &json!({}))
+            .call_server_tool("cancellable", "fast", &json!({}))
             .await
             .expect("known followup route")
             .expect("followup result");
@@ -6001,35 +5610,25 @@ for raw in sys.stdin:
         let registry = McpProxyRegistry::default();
         registry
             .configure(
-                vec![McpProxyServerSpec {
-                    name: "unstable".into(),
-                    transport: McpProxyTransportSpec::Stdio,
-                    command: python.display().to_string(),
-                    args: vec![script.display().to_string(), marker.display().to_string()],
-                    env: BTreeMap::new(),
-                    cwd: temp.path().to_path_buf(),
-                    tool_prefix: "unstable".into(),
-                    include_tools: None,
-                    exclude_tools: BTreeSet::new(),
-                    max_tools: None,
-                    exposure_mode: ProxyExposureMode::Full,
-                    max_concurrent_requests: 4,
-                    request_timeout: Duration::from_secs(5),
-                    management_tools: false,
-                }],
+                vec![runtime_test_spec(
+                    "unstable",
+                    python.display().to_string(),
+                    vec![script.display().to_string(), marker.display().to_string()],
+                    temp.path().to_path_buf(),
+                    4,
+                    Duration::from_secs(5),
+                )],
                 "proxy-reconnect-test",
             )
             .await;
 
-        let exposed_tools = registry.list_tools();
-        let exposed = exposed_tools
-            .iter()
-            .find(|tool| tool["name"] == "unstable__ping")
-            .expect("proxied tool is exposed");
-        assert_eq!(exposed["outputSchema"]["required"], json!(["ok"]));
+        let definition = registry
+            .tool_definition("unstable", "ping")
+            .expect("proxied tool is discoverable lazily");
+        assert_eq!(definition["outputSchema"]["required"], json!(["ok"]));
 
         let first = registry
-            .call_tool("unstable__ping", &json!({}))
+            .call_server_tool("unstable", "ping", &json!({}))
             .await
             .expect("known route")
             .expect("first failure is a tool result");
@@ -6044,7 +5643,7 @@ for raw in sys.stdin:
         );
 
         let second = registry
-            .call_tool("unstable__ping", &json!({}))
+            .call_server_tool("unstable", "ping", &json!({}))
             .await
             .expect("known route")
             .expect("second call reconnects");
@@ -6092,28 +5691,20 @@ for raw in sys.stdin:
         let registry = McpProxyRegistry::default();
         registry
             .configure(
-                vec![McpProxyServerSpec {
-                    name: "drift".into(),
-                    transport: McpProxyTransportSpec::Stdio,
-                    command: python.display().to_string(),
-                    args: vec![script.display().to_string(), marker.display().to_string()],
-                    env: BTreeMap::new(),
-                    cwd: temp.path().to_path_buf(),
-                    tool_prefix: "drift".into(),
-                    include_tools: None,
-                    exclude_tools: BTreeSet::new(),
-                    max_tools: None,
-                    exposure_mode: ProxyExposureMode::Full,
-                    max_concurrent_requests: 4,
-                    request_timeout: Duration::from_secs(5),
-                    management_tools: false,
-                }],
+                vec![runtime_test_spec(
+                    "drift",
+                    python.display().to_string(),
+                    vec![script.display().to_string(), marker.display().to_string()],
+                    temp.path().to_path_buf(),
+                    4,
+                    Duration::from_secs(5),
+                )],
                 "proxy-catalog-drift-test",
             )
             .await;
 
         let first = registry
-            .call_tool("drift__ping", &json!({}))
+            .call_server_tool("drift", "ping", &json!({}))
             .await
             .expect("known route")
             .expect("first failure is a tool result");
@@ -6124,7 +5715,7 @@ for raw in sys.stdin:
         );
 
         let second = registry
-            .call_tool("drift__ping", &json!({}))
+            .call_server_tool("drift", "ping", &json!({}))
             .await
             .expect("known route")
             .expect("catalog drift is a tool result");
@@ -6135,6 +5726,6 @@ for raw in sys.stdin:
         );
         assert!(second["structuredContent"]["error"]["details"]["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("catalog contract changed")));
+            .is_some_and(|detail| detail.contains("mcp operation=refresh")));
     }
 }

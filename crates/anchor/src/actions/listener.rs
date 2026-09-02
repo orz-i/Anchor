@@ -191,7 +191,7 @@ async fn serve(
         "core".into(),
         policy.permission_mode.clone(),
     ));
-    let effective_catalog = tools::build_effective_catalog_from_parts("core", false, Vec::new())
+    let effective_catalog = tools::build_effective_catalog_from_parts("core", false)
         .map_err(|error| std::io::Error::other(error.message()))?;
     let tools: Vec<Value> = effective_catalog
         .tools

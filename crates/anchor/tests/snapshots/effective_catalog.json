@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 45,
+    "catalog_version": 46,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -17,6 +17,7 @@
       "list_command_sessions",
       "list_dir",
       "list_files",
+      "mcp",
       "patch_check",
       "read_file",
       "read_output",
@@ -32,10 +33,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 29
+    "tool_count": 30
   },
   "core": {
-    "catalog_version": 45,
+    "catalog_version": 46,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -50,6 +51,7 @@
       "list_command_sessions",
       "list_dir",
       "list_files",
+      "mcp",
       "read_file",
       "read_output",
       "remove_path",
@@ -63,10 +65,10 @@
       "wait_command",
       "write_stdin"
     ],
-    "tool_count": 25
+    "tool_count": 26
   },
   "read-only": {
-    "catalog_version": 45,
+    "catalog_version": 46,
     "names": [
       "browser_build_info",
       "cwd",
@@ -75,6 +77,7 @@
       "list_command_sessions",
       "list_dir",
       "list_files",
+      "mcp",
       "read_file",
       "read_output",
       "search",
@@ -84,6 +87,6 @@
       "view_image",
       "wait_command"
     ],
-    "tool_count": 15
+    "tool_count": 16
   }
 }

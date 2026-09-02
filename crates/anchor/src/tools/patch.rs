@@ -1661,9 +1661,8 @@ mod tests {
             "read_file"
         );
 
-        let catalog =
-            crate::tools::catalog::build_effective_catalog_from_parts("advanced", true, Vec::new())
-                .expect("advanced catalog");
+        let catalog = crate::tools::catalog::build_effective_catalog_from_parts("advanced", true)
+            .expect("advanced catalog");
         let _ = context.publish_catalog(catalog);
         assert_eq!(
             post_validation_recovery_suggestion(&context)["tool"],

@@ -2,17 +2,31 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 45;
+pub const CATALOG_VERSION: u32 = 46;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
     "skill",
+    "mcp",
     "git",
     "task",
     "slice",
     "commit_stage",
     "environment",
     "cwd",
+];
+
+pub const MCP_OPERATIONS: &[(&str, &str)] = &[
+    ("list", "mcp_list_servers"),
+    ("get", "mcp_get_server"),
+    ("search_tools", "mcp_search_tools"),
+    ("get_tool", "mcp_get_tool"),
+    ("call", "mcp_call_tool"),
+    ("register", "mcp_register_server"),
+    ("enable", "mcp_enable_server"),
+    ("disable", "mcp_disable_server"),
+    ("refresh", "mcp_refresh_server"),
+    ("remove", "mcp_remove_server"),
 ];
 
 pub const SESSION_OPERATIONS: &[(&str, &str)] = &[
@@ -103,6 +117,7 @@ fn facade_operations(facade: &str) -> Option<&'static [(&'static str, &'static s
     match facade {
         "session" => Some(SESSION_OPERATIONS),
         "skill" => Some(SKILL_OPERATIONS),
+        "mcp" => Some(MCP_OPERATIONS),
         "git" => Some(GIT_OPERATIONS),
         "task" => Some(TASK_OPERATIONS),
         "slice" => Some(SLICE_OPERATIONS),
@@ -244,6 +259,94 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         true,
         false,
         false,
+    ),
+    (
+        "mcp",
+        "Downstream MCP",
+        "[anchor-core] Manage configured downstream MCP servers and lazily discover or invoke their tools through one domain facade. Use search_tools before get_tool to avoid loading full downstream schemas; downstream tools are never injected into Anchor's primary tools/list catalog.",
+        false,
+        true,
+        true,
+    ),
+    (
+        "mcp_list_servers",
+        "List downstream MCP servers",
+        "List configured downstream MCP servers and their live connection state without publishing downstream tool schemas.",
+        true,
+        false,
+        true,
+    ),
+    (
+        "mcp_get_server",
+        "Get downstream MCP server",
+        "Return one configured downstream MCP server's live state.",
+        true,
+        false,
+        true,
+    ),
+    (
+        "mcp_search_tools",
+        "Search downstream MCP tools",
+        "Search compact downstream MCP tool metadata without returning input/output schemas.",
+        true,
+        false,
+        true,
+    ),
+    (
+        "mcp_get_tool",
+        "Inspect downstream MCP tool",
+        "Return the full schema for one exact downstream MCP server/tool pair after discovery.",
+        true,
+        false,
+        true,
+    ),
+    (
+        "mcp_call_tool",
+        "Call downstream MCP tool",
+        "Invoke one exact downstream MCP server/tool pair through Anchor's bounded proxy runtime.",
+        false,
+        true,
+        true,
+    ),
+    (
+        "mcp_register_server",
+        "Register downstream MCP server",
+        "Persist and activate one new downstream MCP server using the hard-cut runtime configuration schema.",
+        false,
+        true,
+        true,
+    ),
+    (
+        "mcp_enable_server",
+        "Enable downstream MCP server",
+        "Persist enabled state and activate one configured downstream MCP server immediately.",
+        false,
+        true,
+        true,
+    ),
+    (
+        "mcp_disable_server",
+        "Disable downstream MCP server",
+        "Persist disabled state and terminate one configured downstream MCP server immediately.",
+        false,
+        true,
+        true,
+    ),
+    (
+        "mcp_refresh_server",
+        "Refresh downstream MCP server",
+        "Reconnect one enabled downstream MCP server and atomically replace its lazy tool catalog.",
+        false,
+        true,
+        true,
+    ),
+    (
+        "mcp_remove_server",
+        "Remove downstream MCP server",
+        "Persist removal and terminate one configured downstream MCP server immediately.",
+        false,
+        true,
+        true,
     ),
     (
         "environment",
@@ -918,6 +1021,12 @@ pub const CORE_TOOLS: &[&str] = &[
     "session_get",
     "session_validate",
     "skill",
+    "mcp",
+    "mcp_list_servers",
+    "mcp_get_server",
+    "mcp_search_tools",
+    "mcp_get_tool",
+    "mcp_call_tool",
     "task",
     "update_verification_disposition",
     "resolve_recovery",
@@ -970,6 +1079,11 @@ pub const CORE_TOOLS: &[&str] = &[
 /// local tool. This prevents newly introduced diagnostics/admin helpers from
 /// silently expanding the published ChatGPT catalog.
 pub const ADVANCED_EXTRA_TOOLS: &[&str] = &[
+    "mcp_register_server",
+    "mcp_enable_server",
+    "mcp_disable_server",
+    "mcp_refresh_server",
+    "mcp_remove_server",
     "slice",
     "commit_stage",
     "complete_work_session",
@@ -1009,6 +1123,11 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "session_list",
     "session_get",
     "skill",
+    "mcp",
+    "mcp_list_servers",
+    "mcp_get_server",
+    "mcp_search_tools",
+    "mcp_get_tool",
     "list_skills",
     "load_skill",
     "read_skill_resource",
@@ -1041,6 +1160,13 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "session_checkpoint",
     "session_validate",
     "task",
+    "mcp",
+    "mcp_call_tool",
+    "mcp_register_server",
+    "mcp_enable_server",
+    "mcp_disable_server",
+    "mcp_refresh_server",
+    "mcp_remove_server",
     "slice",
     "commit_stage",
     "begin_work_session",
@@ -3231,6 +3357,73 @@ pub fn input_schema(name: &str) -> Value {
                 .collect::<Vec<_>>();
             facade_input_schema(facade, &operations)
         }
+        "mcp_list_servers" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "mcp_get_server" | "mcp_enable_server" | "mcp_disable_server" | "mcp_refresh_server"
+        | "mcp_remove_server" => json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required": ["server"],
+            "additionalProperties": false
+        }),
+        "mcp_search_tools" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "maxLength": 512, "default": "" },
+                "server": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "cursor": { "type": "integer", "minimum": 0, "default": 0 },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+            },
+            "additionalProperties": false
+        }),
+        "mcp_get_tool" => json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "tool": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required": ["server", "tool"],
+            "additionalProperties": false
+        }),
+        "mcp_call_tool" => json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "tool": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "arguments": { "type": "object", "default": {} }
+            },
+            "required": ["server", "tool"],
+            "additionalProperties": false
+        }),
+        "mcp_register_server" => json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "enum": ["stdio", "streamable-http"] },
+                        "command": { "type": "string" },
+                        "args": { "type": "array", "items": { "type": "string" } },
+                        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "cwd": { "type": "string" },
+                        "url": { "type": "string" },
+                        "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                        "maxConcurrentRequests": { "type": "integer", "minimum": 1, "maximum": 64 },
+                        "requestTimeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 600 }
+                    },
+                    "required": ["type"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["server", "config"],
+            "additionalProperties": false
+        }),
         "browser_build_info" => json!({
             "type": "object",
             "properties": {},
@@ -4334,8 +4527,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        exposed_tool_names, input_schema, is_facade_operation_tool, list_tools_for_profile,
-        output_schema, require_tool_profile,
+        exposed_tool_names, facade_operations_for_profile, input_schema, is_facade_operation_tool,
+        list_tools_for_profile, output_schema, require_tool_profile,
     };
 
     #[test]
@@ -4347,11 +4540,12 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), exposed_tool_names("core").len());
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"git"));
         assert!(names.contains(&"task"));
         assert!(names.contains(&"skill"));
+        assert!(names.contains(&"mcp"));
         assert!(names.contains(&"environment"));
         assert!(names.contains(&"cwd"));
         assert!(names.contains(&"session"));
@@ -4416,10 +4610,9 @@ mod tests {
 
     #[test]
     fn lazy_schema_tags_expose_a_bounded_core_workflow_bundle() {
-        let tools =
-            crate::tools::catalog::build_effective_catalog_from_parts("advanced", true, Vec::new())
-                .expect("effective advanced catalog")
-                .tools;
+        let tools = crate::tools::catalog::build_effective_catalog_from_parts("advanced", true)
+            .expect("effective advanced catalog")
+            .tools;
         let core = tools
             .iter()
             .filter(|tool| {
@@ -4446,6 +4639,7 @@ mod tests {
             "git",
             "task",
             "skill",
+            "mcp",
         ] {
             assert!(
                 core.contains(required),
@@ -4453,7 +4647,7 @@ mod tests {
             );
         }
         assert!(
-            core.len() <= 20,
+            core.len() <= 21,
             "core schema group must stay bounded: {core:?}"
         );
 
@@ -4480,6 +4674,54 @@ mod tests {
         assert_eq!(require_tool_profile("advanced").unwrap(), "advanced");
         assert_eq!(require_tool_profile("read-only").unwrap(), "read-only");
         assert!(require_tool_profile("unknown").is_err());
+    }
+
+    #[test]
+    fn mcp_facade_operations_are_profile_scoped_without_aliases() {
+        assert_eq!(
+            facade_operations_for_profile("mcp", "read-only"),
+            vec!["list", "get", "search_tools", "get_tool"]
+        );
+        assert_eq!(
+            facade_operations_for_profile("mcp", "core"),
+            vec!["list", "get", "search_tools", "get_tool", "call"]
+        );
+        assert_eq!(
+            facade_operations_for_profile("mcp", "advanced"),
+            vec![
+                "list",
+                "get",
+                "search_tools",
+                "get_tool",
+                "call",
+                "register",
+                "enable",
+                "disable",
+                "refresh",
+                "remove",
+            ]
+        );
+
+        let register = input_schema("mcp_register_server");
+        let config = &register["properties"]["config"]["properties"];
+        for removed in [
+            "includeTools",
+            "excludeTools",
+            "maxTools",
+            "exposureMode",
+            "toolPrefix",
+            "managementTools",
+            "disabled",
+        ] {
+            assert!(
+                config.get(removed).is_none(),
+                "legacy field leaked: {removed}"
+            );
+        }
+        assert_eq!(
+            register["properties"]["config"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]

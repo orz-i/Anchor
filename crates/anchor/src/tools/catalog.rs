@@ -22,92 +22,6 @@ pub struct EffectiveCatalog {
     pub estimated_tokens: usize,
 }
 
-const CORE_BROWSER_PROXY_SUFFIXES: &[&str] = &[
-    "health_check",
-    "reconnect",
-    "reset_session",
-    "list_pages",
-    "new_page",
-    "navigate_page",
-    "take_snapshot",
-    "take_screenshot",
-    "evaluate_script",
-    "click",
-    "fill",
-    "fill_form",
-    "wait_for",
-    "select_page",
-    "close_page",
-    "press_key",
-    "type_text",
-    "hover",
-    "handle_dialog",
-    "upload_file",
-    "resize_page",
-];
-
-const READ_ONLY_BROWSER_PROXY_SUFFIXES: &[&str] = &[
-    "health_check",
-    "list_pages",
-    "take_snapshot",
-    "take_screenshot",
-    "list_console_messages",
-    "get_console_message",
-    "list_network_requests",
-    "get_network_request",
-];
-
-fn filter_proxy_tools_for_profile(tool_profile: &str, proxy_tools: Vec<Value>) -> Vec<Value> {
-    let allowed_browser_suffixes = match tool_profile {
-        "advanced" => return proxy_tools,
-        "read-only" => READ_ONLY_BROWSER_PROXY_SUFFIXES,
-        _ => CORE_BROWSER_PROXY_SUFFIXES,
-    };
-    proxy_tools
-        .into_iter()
-        .filter(|tool| {
-            let Some(name) = tool.get("name").and_then(Value::as_str) else {
-                return true;
-            };
-            let Some(suffix) = name.strip_prefix("browser__") else {
-                return true;
-            };
-            allowed_browser_suffixes.contains(&suffix)
-        })
-        .collect()
-}
-
-fn proxy_discovery_priority(tool: &Value) -> Option<usize> {
-    const FIRST_PAGE_SUFFIXES: &[&str] = &[
-        "health_check",
-        "reconnect",
-        "reset_session",
-        "list_pages",
-        "new_page",
-        "navigate_page",
-        "take_snapshot",
-        "take_screenshot",
-        "evaluate_script",
-        "click",
-        "fill",
-        "fill_form",
-        "wait_for",
-        "select_page",
-        "close_page",
-        "press_key",
-        "type_text",
-        "hover",
-        "handle_dialog",
-        "upload_file",
-        "resize_page",
-    ];
-    let name = tool.get("name").and_then(Value::as_str)?;
-    let suffix = name.rsplit_once("__").map_or(name, |(_, suffix)| suffix);
-    FIRST_PAGE_SUFFIXES
-        .iter()
-        .position(|candidate| *candidate == suffix)
-}
-
 impl EffectiveCatalog {
     pub fn metrics_value(&self) -> Value {
         json!({
@@ -122,53 +36,17 @@ impl EffectiveCatalog {
 }
 
 pub fn build_effective_catalog(ctx: &ToolContext) -> Result<EffectiveCatalog, WorkspaceError> {
-    build_effective_catalog_from_parts(
-        &ctx.tool_profile,
-        ctx.skills.is_enabled(),
-        ctx.mcp_proxies.list_tools(),
-    )
+    build_effective_catalog_from_parts(&ctx.tool_profile, ctx.skills.is_enabled())
 }
 
 pub fn build_effective_catalog_from_parts(
     tool_profile: &str,
     _skill_service_enabled: bool,
-    proxy_tools: Vec<Value>,
 ) -> Result<EffectiveCatalog, WorkspaceError> {
     let mut tools = crate::tools::registry::list_tools_for_profile(tool_profile);
-    let mut proxy_tools = filter_proxy_tools_for_profile(tool_profile, proxy_tools);
     tools.sort_by(tool_name_order);
-    proxy_tools.sort_by(tool_name_order);
     let local_count = tools.len();
-    let proxy_count = proxy_tools.len();
-    if proxy_tools.is_empty() {
-        tools.extend(proxy_tools);
-    } else {
-        let core_names = crate::tools::registry::exposed_tool_names("core")
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let (mut core_tools, mut extended_tools): (Vec<_>, Vec<_>) =
-            tools.into_iter().partition(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| core_names.contains(name))
-            });
-        let (mut priority_proxy_tools, mut remaining_proxy_tools): (Vec<_>, Vec<_>) = proxy_tools
-            .into_iter()
-            .partition(|tool| proxy_discovery_priority(tool).is_some());
-        core_tools.sort_by(tool_name_order);
-        extended_tools.sort_by(tool_name_order);
-        priority_proxy_tools.sort_by(|left, right| {
-            proxy_discovery_priority(left)
-                .cmp(&proxy_discovery_priority(right))
-                .then_with(|| tool_name_order(left, right))
-        });
-        remaining_proxy_tools.sort_by(tool_name_order);
-
-        tools = core_tools;
-        tools.extend(priority_proxy_tools);
-        tools.extend(extended_tools);
-        tools.extend(remaining_proxy_tools);
-    }
+    let proxy_count = 0;
 
     let mut names = HashSet::with_capacity(tools.len());
     let mut total_bytes = 0usize;
@@ -260,9 +138,9 @@ fn enforce_chatgpt_catalog_budget(
             "estimated_tokens": estimated_tokens,
             "budget": catalog_budget_value(),
             "suggestions": [
-                "Use downstream exposureMode=auto with includeTools/maxTools, or reduce an explicit full catalog",
                 "Use the core or read-only Anchor tool profile",
-                "Restart Anchor and refresh or recreate the ChatGPT app after reducing the catalog"
+                "Reduce Anchor's published first-class domain tools rather than downstream MCP tools",
+                "Restart Anchor and refresh or recreate the ChatGPT app after changing the local catalog"
             ]
         }),
     ))
@@ -292,7 +170,7 @@ pub fn digest_tools(tools: &[Value]) -> Result<String, WorkspaceError> {
 pub fn snapshot_document() -> Result<Value, WorkspaceError> {
     let mut snapshots = Map::new();
     for profile in ["core", "read-only", "advanced"] {
-        let catalog = build_effective_catalog_from_parts(profile, true, Vec::new())?;
+        let catalog = build_effective_catalog_from_parts(profile, true)?;
         snapshots.insert(
             profile.to_string(),
             json!({
@@ -411,188 +289,56 @@ fn catalog_error(code: &'static str, message: impl Into<String>, details: Value)
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
-
-    use proptest::prelude::*;
-    use serde_json::json;
+    use std::collections::HashSet;
 
     use super::{
-        build_effective_catalog_from_parts, snapshot_document, CORE_BROWSER_PROXY_SUFFIXES,
-        MAX_CHATGPT_CATALOG_BYTES, MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS, MAX_CHATGPT_CATALOG_TOOLS,
+        build_effective_catalog_from_parts, snapshot_document, MAX_CHATGPT_CATALOG_BYTES,
+        MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS, MAX_CHATGPT_CATALOG_TOOLS,
     };
 
-    fn proxy_tool(name: &str) -> serde_json::Value {
-        json!({
-            "name": name,
-            "title": name,
-            "description": "fuzz proxy tool",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            },
-            "outputSchema": {
-                "type": "object",
-                "properties": {"ok": {"type": "boolean"}},
-                "required": ["ok"],
-                "additionalProperties": true
-            },
-            "annotations": {
-                "readOnlyHint": false,
-                "destructiveHint": true,
-                "idempotentHint": false,
-                "openWorldHint": true
-            }
-        })
-    }
-
-    fn browser_tools(count: usize) -> Vec<serde_json::Value> {
-        const DISCOVERY_TOOLS: &[&str] = &[
-            "health_check",
-            "reconnect",
-            "reset_session",
-            "list_pages",
-            "new_page",
-            "navigate_page",
-            "take_snapshot",
-            "take_screenshot",
-            "evaluate_script",
-            "click",
-            "fill",
-            "fill_form",
-            "wait_for",
-            "select_page",
-            "close_page",
-            "press_key",
-            "type_text",
-            "hover",
-            "handle_dialog",
-            "upload_file",
-            "resize_page",
-        ];
-        (0..count)
-            .map(|index| {
-                let name = DISCOVERY_TOOLS
-                    .get(index)
-                    .map(|suffix| format!("browser__{suffix}"))
-                    .unwrap_or_else(|| format!("browser__action_{index:02}"));
-                proxy_tool(&name)
-            })
-            .collect()
-    }
-
     #[test]
-    fn advanced_plus_browser_catalog_stays_within_chatgpt_budget() {
-        let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(48))
-            .expect("advanced plus browser catalog");
-
-        assert_eq!(
-            catalog.local_count,
-            crate::tools::registry::exposed_tool_names("advanced").len()
-        );
-        assert_eq!(catalog.proxy_count, 48);
-        let first_page_names = catalog.tools[..64]
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<BTreeSet<_>>();
-        for required in [
-            "browser__health_check",
-            "browser__reconnect",
-            "browser__reset_session",
-            "browser__list_pages",
-            "browser__navigate_page",
-            "browser__take_snapshot",
-        ] {
-            assert!(
-                first_page_names.contains(required),
-                "{required} missing from advanced first page"
+    fn every_profile_catalog_is_local_only_and_within_chatgpt_budget() {
+        for profile in ["core", "read-only", "advanced"] {
+            let catalog = build_effective_catalog_from_parts(profile, true)
+                .expect("effective local-only catalog");
+            assert_eq!(
+                catalog.local_count,
+                crate::tools::registry::exposed_tool_names(profile).len()
             );
+            assert_eq!(catalog.proxy_count, 0);
+            assert_eq!(catalog.tools.len(), catalog.local_count);
+            assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
+            assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
+            assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
+            assert!(catalog.tools.iter().all(|tool| {
+                !tool["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("browser__")
+            }));
         }
-        assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
-        assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
-        assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
     }
 
     #[test]
-    fn read_only_profile_keeps_only_read_only_browser_workflow_tools() {
-        let mut proxies = browser_tools(48);
-        proxies.push(proxy_tool("external__search"));
-        let catalog = build_effective_catalog_from_parts("read-only", true, proxies)
-            .expect("read-only browser catalog");
-        let names = catalog
-            .tools
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<HashSet<_>>();
-
-        assert!(names.contains("browser__health_check"));
-        assert!(names.contains("browser__take_snapshot"));
-        assert!(!names.contains("browser__click"));
-        assert!(!names.contains("browser__navigate_page"));
-        assert!(names.contains("external__search"));
-        assert_eq!(catalog.proxy_count, 5);
-    }
-
-    #[test]
-    fn core_plus_browser_catalog_stays_within_chatgpt_budget() {
-        let catalog = build_effective_catalog_from_parts("core", true, browser_tools(48))
-            .expect("core plus browser catalog");
-
-        assert_eq!(catalog.local_count, 25);
-        assert_eq!(catalog.proxy_count, CORE_BROWSER_PROXY_SUFFIXES.len());
-        assert!(catalog.tools[..catalog.local_count].iter().all(|tool| {
-            !tool["name"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("browser__")
-        }));
-        assert!(catalog.tools[catalog.local_count..].iter().all(|tool| {
-            tool["name"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("browser__")
-        }));
-        assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
-        assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
-        assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
-    }
-
-    #[test]
-    fn restricted_browser_catalog_stays_within_chatgpt_budget() {
-        let catalog = build_effective_catalog_from_parts("core", true, browser_tools(8))
-            .expect("restricted browser catalog");
-
-        assert_eq!(catalog.local_count, 25);
-        assert_eq!(catalog.proxy_count, 8);
-        assert_eq!(catalog.tools.len(), 33);
-        assert!(catalog.total_bytes <= MAX_CHATGPT_CATALOG_BYTES);
-        assert!(catalog.estimated_tokens <= MAX_CHATGPT_CATALOG_ESTIMATED_TOKENS);
-    }
-
-    #[test]
-    fn over_budget_catalog_returns_actionable_diagnostics() {
-        let error = build_effective_catalog_from_parts("advanced", true, browser_tools(102))
-            .expect_err("catalog should exceed the tool-count budget");
-        let diagnostic = error.to_error_value();
-
-        assert_eq!(
-            diagnostic["code"],
-            "EFFECTIVE_CATALOG_CHATGPT_BUDGET_EXCEEDED"
-        );
-        assert_eq!(
-            diagnostic["details"]["reason"],
-            "chatgpt_catalog_budget_exceeded"
-        );
-        assert_eq!(
-            diagnostic["details"]["local_tool_count"],
-            crate::tools::registry::exposed_tool_names("advanced").len()
-        );
-        assert_eq!(diagnostic["details"]["proxy_tool_count"], 102);
-        assert!(diagnostic["details"]["suggestions"]
-            .as_array()
-            .is_some_and(|suggestions| suggestions.iter().any(|suggestion| suggestion
-                .as_str()
-                .is_some_and(|text| text.contains("includeTools")))));
+    fn mcp_is_the_only_downstream_entry_point_in_primary_catalogs() {
+        for profile in ["core", "read-only", "advanced"] {
+            let catalog = build_effective_catalog_from_parts(profile, true).expect("catalog");
+            let names = catalog
+                .tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<HashSet<_>>();
+            assert!(names.contains("mcp"), "mcp facade missing from {profile}");
+            for internal in crate::tools::registry::MCP_OPERATIONS
+                .iter()
+                .map(|(_, internal)| *internal)
+            {
+                assert!(
+                    !names.contains(internal),
+                    "internal mcp operation {internal} leaked into {profile} tools/list"
+                );
+            }
+        }
     }
 
     #[test]
@@ -619,7 +365,7 @@ mod tests {
     fn internal_skill_operation_handlers_are_hidden_while_single_facade_is_published() {
         for enabled in [true, false] {
             for profile in ["core", "read-only", "advanced"] {
-                let catalog = build_effective_catalog_from_parts(profile, enabled, Vec::new())
+                let catalog = build_effective_catalog_from_parts(profile, enabled)
                     .expect("effective catalog");
                 let names = catalog
                     .tools
@@ -643,8 +389,8 @@ mod tests {
     #[test]
     fn domain_facades_hide_internal_operation_handlers_in_effective_catalogs() {
         for profile in ["core", "read-only", "advanced"] {
-            let catalog = build_effective_catalog_from_parts(profile, true, Vec::new())
-                .expect("effective catalog");
+            let catalog =
+                build_effective_catalog_from_parts(profile, true).expect("effective catalog");
             let names = catalog
                 .tools
                 .iter()
@@ -672,58 +418,6 @@ mod tests {
                 assert!(names.contains("slice"));
                 assert!(names.contains("commit_stage"));
             }
-        }
-    }
-
-    #[test]
-    fn advanced_with_default_browser_keeps_skill_facade_in_first_64_entries() {
-        let catalog = build_effective_catalog_from_parts("advanced", true, browser_tools(21))
-            .expect("advanced plus default browser catalog");
-        assert_eq!(catalog.local_count, 29);
-        assert_eq!(catalog.proxy_count, 21);
-        assert_eq!(catalog.tools.len(), 50);
-        assert!(catalog.tools[..catalog.tools.len().min(64)]
-            .iter()
-            .any(|tool| tool["name"] == "skill"));
-        assert!(catalog.tools.len() <= MAX_CHATGPT_CATALOG_TOOLS);
-    }
-
-    #[test]
-    fn duplicate_local_or_proxy_name_is_rejected() {
-        let error = build_effective_catalog_from_parts("core", true, vec![proxy_tool("read_file")])
-            .expect_err("duplicate tool");
-        assert_eq!(
-            error.to_error_value()["code"],
-            "EFFECTIVE_CATALOG_DUPLICATE_TOOL"
-        );
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(32))]
-
-        #[test]
-        fn fuzz_catalog_digest_is_stable_across_proxy_order(
-            generated in prop::collection::btree_set("[a-z][a-z0-9_]{0,15}", 0..64)
-        ) {
-            let names = generated.into_iter().collect::<BTreeSet<_>>();
-            let first = names.iter().map(|name| proxy_tool(&format!("fuzz__{name}"))).collect::<Vec<_>>();
-            let mut second = first.clone();
-            second.reverse();
-            let first = build_effective_catalog_from_parts("core", true, first).unwrap();
-            let second = build_effective_catalog_from_parts("core", true, second).unwrap();
-            prop_assert_eq!(first.digest, second.digest);
-            prop_assert_eq!(first.tools, second.tools);
-        }
-
-        #[test]
-        fn fuzz_duplicate_proxy_names_are_always_rejected(name in "[a-z][a-z0-9_]{0,20}") {
-            let name = format!("fuzz__{name}");
-            let result = build_effective_catalog_from_parts(
-                "read-only",
-                true,
-                vec![proxy_tool(&name), proxy_tool(&name)],
-            );
-            prop_assert!(result.is_err());
         }
     }
 }

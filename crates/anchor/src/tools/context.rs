@@ -993,9 +993,8 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let core = build_effective_catalog_from_parts("core", true, Vec::new()).expect("core");
-        let advanced =
-            build_effective_catalog_from_parts("advanced", true, Vec::new()).expect("advanced");
+        let core = build_effective_catalog_from_parts("core", true).expect("core");
+        let advanced = build_effective_catalog_from_parts("advanced", true).expect("advanced");
 
         let (published, changed) = ctx.publish_catalog(core.clone());
         assert!(!changed);
