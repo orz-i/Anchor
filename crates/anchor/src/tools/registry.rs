@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 46;
+pub const CATALOG_VERSION: u32 = 47;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -50,6 +50,13 @@ pub const SKILL_OPERATIONS: &[(&str, &str)] = &[
     ("list", "list_skills"),
     ("get", "load_skill"),
     ("read_resource", "read_skill_resource"),
+    ("packages", "skill_list_packages"),
+    ("validate", "skill_validate_package"),
+    ("install", "skill_install_package"),
+    ("set_channel", "skill_set_channel"),
+    ("activate", "skill_activate_package"),
+    ("rollback", "skill_rollback_package"),
+    ("remove", "skill_remove_package"),
 ];
 
 pub const GIT_OPERATIONS: &[(&str, &str)] = &[
@@ -519,9 +526,65 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "read_skill_resource",
         "Read Skill resource",
-        "Read a supporting resource or script source inside a discovered Skill directory without executing it.",
+        "Read a supporting resource or script source from an active immutable Skill package without executing it.",
         true,
         false,
+        false,
+    ),
+    (
+        "skill_list_packages",
+        "List Skill packages",
+        "Inspect installed immutable Skill package versions, channel pointers, active versions, and rollback depth.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "skill_validate_package",
+        "Validate Skill package",
+        "Validate one workspace-local Skill source directory before installation, including manifest completeness and content digest.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "skill_install_package",
+        "Install Skill package",
+        "Install a validated Skill source as an immutable content-addressed package and assign a lifecycle channel. Installation does not grant tool permissions.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "skill_set_channel",
+        "Set Skill channel",
+        "Move a stable, development, canary, or pinned channel pointer to an already installed immutable Skill version.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "skill_activate_package",
+        "Activate Skill package",
+        "Atomically activate the immutable package referenced by one Skill lifecycle channel.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "skill_rollback_package",
+        "Rollback Skill package",
+        "Atomically restore the previous active immutable Skill package from bounded activation history.",
+        false,
+        true,
+        false,
+    ),
+    (
+        "skill_remove_package",
+        "Remove Skill package",
+        "Remove one inactive, unreferenced immutable Skill package version. Active or channel-referenced versions are rejected.",
+        false,
+        true,
         false,
     ),
     (
@@ -1034,6 +1097,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_skills",
     "load_skill",
     "read_skill_resource",
+    "skill_list_packages",
+    "skill_validate_package",
     "switch_task",
     "environment",
     "cwd",
@@ -1079,6 +1144,11 @@ pub const CORE_TOOLS: &[&str] = &[
 /// local tool. This prevents newly introduced diagnostics/admin helpers from
 /// silently expanding the published ChatGPT catalog.
 pub const ADVANCED_EXTRA_TOOLS: &[&str] = &[
+    "skill_install_package",
+    "skill_set_channel",
+    "skill_activate_package",
+    "skill_rollback_package",
+    "skill_remove_package",
     "mcp_register_server",
     "mcp_enable_server",
     "mcp_disable_server",
@@ -1131,6 +1201,8 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
     "list_skills",
     "load_skill",
     "read_skill_resource",
+    "skill_list_packages",
+    "skill_validate_package",
     "environment",
     "cwd",
     "check_exec_environment",
@@ -1167,6 +1239,11 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "mcp_disable_server",
     "mcp_refresh_server",
     "mcp_remove_server",
+    "skill_install_package",
+    "skill_set_channel",
+    "skill_activate_package",
+    "skill_rollback_package",
+    "skill_remove_package",
     "slice",
     "commit_stage",
     "begin_work_session",
@@ -1614,6 +1691,8 @@ pub fn output_schema(name: &str) -> Value {
                         "properties": {
                             "configured": { "type": "boolean" },
                             "server_count": { "type": "integer", "minimum": 0 },
+                            "enabled_server_count": { "type": "integer", "minimum": 0 },
+                            "connected_server_count": { "type": "integer", "minimum": 0 },
                             "unavailable_server_count": { "type": "integer", "minimum": 0 },
                             "unavailable_servers": {
                                 "type": "array",
@@ -1635,7 +1714,7 @@ pub fn output_schema(name: &str) -> Value {
                                 }
                             }
                         },
-                        "required": ["configured", "server_count", "servers", "unavailable_server_count", "unavailable_servers"],
+                        "required": ["configured", "server_count", "enabled_server_count", "connected_server_count", "servers", "unavailable_server_count", "unavailable_servers"],
                         "additionalProperties": false
                     },
                     "connection_layers": { "type": "object" }
@@ -3362,6 +3441,65 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {},
             "additionalProperties": false
         }),
+        "skill_list_packages" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "skill_validate_package" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "minLength": 1, "description": "Workspace-local Skill source directory containing SKILL.md" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "skill_install_package" => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "minLength": 1, "description": "Workspace-local Skill source directory containing SKILL.md" },
+                "channel": { "type": "string", "enum": ["stable", "development", "canary", "pinned"] },
+                "activate": { "type": "boolean", "default": false }
+            },
+            "required": ["path", "channel"],
+            "additionalProperties": false
+        }),
+        "skill_set_channel" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "channel": { "type": "string", "enum": ["stable", "development", "canary", "pinned"] },
+                "version": { "type": "string", "minLength": 1, "description": "Installed declared version or full sha256 digest" }
+            },
+            "required": ["name", "channel", "version"],
+            "additionalProperties": false
+        }),
+        "skill_activate_package" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "channel": { "type": "string", "enum": ["stable", "development", "canary", "pinned"] }
+            },
+            "required": ["name", "channel"],
+            "additionalProperties": false
+        }),
+        "skill_rollback_package" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "skill_remove_package" => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1, "description": "Installed declared version or full sha256 digest" }
+            },
+            "required": ["name", "version"],
+            "additionalProperties": false
+        }),
         "mcp_get_server" | "mcp_enable_server" | "mcp_disable_server" | "mcp_refresh_server"
         | "mcp_remove_server" => json!({
             "type": "object",
@@ -4725,6 +4863,51 @@ mod tests {
     }
 
     #[test]
+    fn skill_package_lifecycle_is_profile_scoped_behind_one_facade() {
+        let read_only = vec!["list", "get", "read_resource", "packages", "validate"];
+        assert_eq!(
+            facade_operations_for_profile("skill", "read-only"),
+            read_only
+        );
+        assert_eq!(facade_operations_for_profile("skill", "core"), read_only);
+        assert_eq!(
+            facade_operations_for_profile("skill", "advanced"),
+            vec![
+                "list",
+                "get",
+                "read_resource",
+                "packages",
+                "validate",
+                "install",
+                "set_channel",
+                "activate",
+                "rollback",
+                "remove",
+            ]
+        );
+        let exposed = list_tools_for_profile("advanced");
+        let names = exposed
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("skill"));
+        for internal in [
+            "skill_list_packages",
+            "skill_validate_package",
+            "skill_install_package",
+            "skill_set_channel",
+            "skill_activate_package",
+            "skill_rollback_package",
+            "skill_remove_package",
+        ] {
+            assert!(
+                !names.contains(internal),
+                "internal Skill lifecycle leaf leaked: {internal}"
+            );
+        }
+    }
+
+    #[test]
     fn read_file_schema_requires_exactly_one_path_source() {
         let schema = input_schema("read_file");
         let validator = jsonschema::validator_for(&schema).expect("read_file input schema");
@@ -4977,10 +5160,34 @@ mod tests {
             let operations = skill["inputSchema"]["properties"]["operation"]["enum"]
                 .as_array()
                 .expect("skill operations");
-            let expected_operations = vec![json!("list"), json!("get"), json!("read_resource")];
+            let expected_operations = if profile == "advanced" {
+                vec![
+                    json!("list"),
+                    json!("get"),
+                    json!("read_resource"),
+                    json!("packages"),
+                    json!("validate"),
+                    json!("install"),
+                    json!("set_channel"),
+                    json!("activate"),
+                    json!("rollback"),
+                    json!("remove"),
+                ]
+            } else {
+                vec![
+                    json!("list"),
+                    json!("get"),
+                    json!("read_resource"),
+                    json!("packages"),
+                    json!("validate"),
+                ]
+            };
             assert_eq!(operations, &expected_operations);
-            assert_eq!(skill["annotations"]["readOnlyHint"], true);
-            assert_eq!(skill["annotations"]["destructiveHint"], false);
+            assert_eq!(skill["annotations"]["readOnlyHint"], profile != "advanced");
+            assert_eq!(
+                skill["annotations"]["destructiveHint"],
+                profile == "advanced"
+            );
         }
     }
 }

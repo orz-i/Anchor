@@ -1426,7 +1426,7 @@ fn core_profile_keeps_default_capabilities_and_exposes_one_session_facade() {
         .copied()
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 25);
+    assert_eq!(names.len(), 26);
     assert!(names.contains("git"));
     assert!(names.contains("task"));
     assert!(names.contains("skill"));

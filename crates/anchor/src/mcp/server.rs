@@ -2834,6 +2834,14 @@ mod tests {
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("tool context"),
         );
+        state
+            .skills
+            .install_package(
+                skill_dir.to_str().expect("skill path"),
+                crate::skills::SkillChannel::Stable,
+                true,
+            )
+            .expect("install active Skill package");
 
         let tools = handle_request(
             &state,
@@ -3037,7 +3045,7 @@ mod tests {
         let (_workspace, _harness, state) = test_state();
         state
             .skills
-            .configure(crate::skills::SkillSettings::from_text(false, "skills"));
+            .configure(crate::skills::SkillSettings::new(false));
 
         let initialized = initialize_result(&state);
         assert_eq!(

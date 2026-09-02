@@ -9,5 +9,6 @@ pub(crate) use migration::{
     WorkspacePathMapping,
 };
 pub use model::AppData;
+pub(crate) use storage::atomic_write;
 pub(crate) use store::validate_workspace_profile;
 pub use store::DataStore;

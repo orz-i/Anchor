@@ -1,32 +1,47 @@
-# MCP Agent Skills 服务
+# Agent Skill package lifecycle
 
-Anchor 可以从当前 workspace/profile 配置的目录中发现 Agent Skills。Skill 有三条明确分离的消费路径，共用同一个 `SkillCatalog`：
+Anchor 的 Skill 运行时使用**不可变 package + channel + active snapshot** 模型。workspace 中的普通目录只是显式 `validate/install` 的输入；目录出现、修改或删除都不会自动改变运行中的 Skill。
 
-- **ChatGPT Developer Mode / MCP tools**：公开单一只读 `skill` facade tool，提供 `list`、`get`、`read_resource`；这是只通过 ChatGPT 网页 Developer Mode 注册 MCP 时的主路径，只占一个 `tools/list` 槽位；
-- **MCP runtime compatibility**：Anchor 继续声明 MCP Skills extension，并提供 `skills/list`、`skills/get`、`resources/read` 给支持该扩展的宿主；
-- **ChatGPT/Codex Plugin package**：需要原生 Plugin Skill UI 时，把 Skill 作为插件目录中的静态 `skills/` 文件夹，由 `.codex-plugin/plugin.json` 声明，并通过 `.app.json` 绑定已注册的 Anchor MCP app。
-
-旧的 Skill helper 工具仍保留为兼容调用入口，但不再发布到 `tools/list`，因此不会重新占用 ChatGPT 的工具目录配额。
-
-数据模型保持不变：**一个 workspace 对应一个 WorkspaceProfile**。Skill 服务开关和目录列表保存在该 profile 的 `runtime` 配置中，GUI 与 Linux CLI 启动的 MCP 使用同一份配置。
-
-## Skill 目录格式
-
-每个 Skill 是一个包含 `SKILL.md` 的目录：
+核心状态位于：
 
 ```text
-skills/
-└── code-review/
-    ├── SKILL.md
-    ├── references/
-    │   └── review-checklist.md
-    ├── scripts/
-    │   └── inspect-diff.py
-    └── assets/
-        └── example.png
+<workspace>/.anchor/skills/
+├── state.json
+├── state.lock
+└── packages/
+    └── <skill-name>/
+        └── <sha256>/
+            └── <skill-name>/
+                ├── SKILL.md
+                ├── references/
+                ├── scripts/
+                └── assets/
 ```
 
-`SKILL.md` 必须以 YAML frontmatter 开始，`name` 必须与目录名一致：
+`state.json` 是 canonical lifecycle state。package 目录以完整内容摘要寻址；`stable`、`development`、`canary`、`pinned` 是指向已安装摘要的 channel。每个 Skill 只有一个 active package；切换 active package 会记录有界 rollback history。
+
+## 硬切行为
+
+P1 不保留旧目录扫描兼容路径：
+
+- 不再配置或读取 `runtime.skill_roots`；旧 profile 中仍含该字段时，严格配置反序列化会直接拒绝，不会静默忽略或自动迁移。
+- 不再默认扫描 `.agents/skills`、`.codex/skills`、`skills` 或 home/external roots。
+- 不再因为源目录变化自动刷新 Skill runtime。
+- 不提供旧 operation alias、双写 package/root 状态或 fallback scan。
+- Plugin package、MCP Skill extension、`skill` facade 全部只消费 active packages。
+
+迁移方式是显式安装，而不是复制旧配置：
+
+```bash
+anchor skill validate PROFILE_ID skills/code-review
+anchor skill install PROFILE_ID skills/code-review --channel stable --activate
+```
+
+`.agents/skills/...` 或 `.codex/skills/...` 仍可以作为**workspace 内的显式安装源目录**，但它们不再具有运行时特殊语义。
+
+## Skill package 格式
+
+源目录必须包含 `SKILL.md`，并满足现有 Skill parser 与资源安全约束。`name` 必须与源目录名一致：
 
 ```markdown
 ---
@@ -34,10 +49,7 @@ name: code-review
 description: Review a code change for correctness, security, and regressions.
 allowed-tools: read_file git_diff search
 metadata:
-  version: "1"
-  policy:
-    strict: true
-  priority: 5
+  version: "1.2.0"
 ---
 
 # Code review
@@ -45,264 +57,218 @@ metadata:
 Read the changed files and report concrete findings with file references.
 ```
 
-除 `name`、`description`、`license`、`compatibility`、`metadata` 和
-`allowed-tools` 外，Anchor 也兼容 `risk`、`category`、`user-invocable`
-等生态扩展字段。扩展字段会作为只读元数据返回；若与 `metadata` 中的同名键冲突，
-显式 `metadata` 值优先。扩展字段不会授予工具权限、启用脚本执行或绕过现有策略。
+`metadata.version` 可选。若存在，它是不可变的声明版本：同一个 Skill 的同一 declared version 不能重新绑定到不同 package digest；需要变更内容时必须使用新版本号，或直接使用完整 `sha256:...` 标识版本。
 
-名称规则：
-
-- 1–64 个字符；
-- 只允许小写字母、数字和单个连字符；
-- 不能以连字符开头或结尾；
-- 不能包含连续连字符。
-
-## 默认扫描目录
-
-每个 workspace/profile 默认扫描：
+支持目录：
 
 ```text
-.agents/skills
-.codex/skills
-skills
+<skill-name>/
+├── SKILL.md
+├── references/
+├── scripts/
+└── assets/
 ```
 
-相对路径以 workspace 根目录为基准。也可以在 GUI 中添加绝对路径或 `~/` 路径，例如：
+安装前会复用 Anchor 现有的 frontmatter、manifest、路径、文件大小、摘要和敏感文件排除校验。符号链接、未进入受控 manifest 的额外文件、不可读取资源或超限资源都会阻止安全 package 安装。
 
-```text
-~/.codex/skills
-/opt/company-skills
+## Lifecycle
+
+### Validate
+
+只检查 workspace 内源目录，不写 package store：
+
+```bash
+anchor skill validate PROFILE_ID skills/code-review
 ```
 
-根目录可以直接是单个 Skill，也可以在两层以内包含多个 Skill 子目录。配置顺序代表优先级；同名 Skill 出现多次时保留最先发现的版本，并在扫描预览和兼容 Skill 目录中返回警告。
+返回 Skill name、完整 package digest、declared version、文件数量、总字节数和 quality warnings。
 
-## GUI 配置
+### Install
 
-打开 workspace 的 **MCP → 配置 → Agent Skills**：
+```bash
+anchor skill install PROFILE_ID skills/code-review --channel development
+anchor skill install PROFILE_ID skills/code-review --channel stable --activate
+```
 
-1. 开启或关闭 Skill 服务；
-2. 每行填写一个 Skill 根目录；
-3. 点击“扫描目录”进行只读预览；
-4. 点击“保存 Skill 服务”；
-5. MCP 已运行时，停止并重新启动 MCP 服务；若 Skill 还需要出现在 ChatGPT Plugin 中，重新执行后文的 `anchor plugin package` 生成插件静态快照。
+安装流程：
 
-“扫描目录”只读取文件，不启动 MCP、Actions、脚本或隧道。
+1. 校验源目录和完整 manifest；
+2. 复制到 store 内 staging；
+3. 原子发布到 content-addressed package 目录；
+4. 在跨进程 `state.lock` 下重新读取 canonical state；
+5. 原子更新 channel / optional active pointer；
+6. 原子写回 `state.json`。
 
-## ChatGPT Developer Mode（MCP-only 主路径）
+安装失败不会把不完整 package 作为 active runtime 暴露。
 
-当 ChatGPT 只能通过 Developer Mode 注册一个 MCP endpoint 时，不依赖宿主是否实现 MCP Skills extension，也不要求 Plugin package。Anchor 稳定发布一个 `skill` tool：
+### Channel
+
+四个 channel：
+
+- `stable`
+- `development`
+- `canary`
+- `pinned`
+
+将 channel 指向一个已安装 declared version 或完整 digest：
+
+```bash
+anchor skill set-channel PROFILE_ID code-review canary 1.3.0
+anchor skill set-channel PROFILE_ID code-review pinned sha256:<64-hex>
+```
+
+移动 channel **不会自动切换 active package**。
+
+### Activate
+
+```bash
+anchor skill activate PROFILE_ID code-review canary
+```
+
+激活只接受已有 channel；当前 active `(channel,digest)` 被写入 bounded history，随后原子切换 active pointer。
+
+运行中的 MCP 不扫描源目录。它只检测 canonical `state.json` 是否变化；检测到 package lifecycle 状态更新后重建 active package snapshot。
+
+### Rollback
+
+```bash
+anchor skill rollback PROFILE_ID code-review
+```
+
+回到最近仍存在的 active package。没有 rollback target 时失败，不做 silent fallback。
+
+### Remove
+
+```bash
+anchor skill remove PROFILE_ID code-review 1.2.0
+```
+
+以下情况拒绝删除：
+
+- 版本当前 active；
+- 任一 channel 仍指向该版本。
+
+删除时先把 package tree 移入 store 内 `.trash`，成功持久化 lifecycle state 后再清理；持久化失败会恢复 package tree。
+
+## MCP `skill` facade
+
+对外仍只有一个一级 `skill` tool，不会为 package/version 增加 `tools/list` 条目。
+
+`read-only` 与 `core` 可用：
+
+- `list`
+- `get`
+- `read_resource`
+- `packages`
+- `validate`
+
+`advanced` 额外开放：
+
+- `install`
+- `set_channel`
+- `activate`
+- `rollback`
+- `remove`
+
+示例：
 
 ```json
 {
-  "operation": "list",
-  "query": "review"
+  "operation": "install",
+  "path": "skills/code-review",
+  "channel": "canary",
+  "activate": false
 }
 ```
 
-如果命中相关 Skill，再读取正文：
-
 ```json
 {
-  "operation": "get",
-  "name": "code-review"
-}
-```
-
-`get` 返回 Skill 指令以及可读 resources/scripts 清单。只有指令明确需要某个支持文件时再读取：
-
-```json
-{
-  "operation": "read_resource",
+  "operation": "activate",
   "name": "code-review",
-  "path": "references/review-checklist.md"
+  "channel": "canary"
 }
 ```
 
-三个 operation 均为只读，并继续受 Workspace 路径、资源 manifest、文件大小和摘要校验约束。`skill` 在 Skill 服务关闭时仍保持在 `tools/list`，此时 `list` 返回 `enabled=false` 和空 Skill 列表，因此切换 Skill 服务不需要改变 MCP tool schema。
+内部 lifecycle leaves 只是 facade implementation，不进入公开 `tools/list`，也不能作为兼容直调入口使用。
 
-从 Catalog 34 起，旧的 Skill helper 直调兼容层已删除：`list_skill_resources` 不再存在；`list_skills`、`load_skill`、`read_skill_resource` 仅作为 `skill` facade 的内部 operation handler 使用，既不进入 `tools/list`，也不能通过 `tools/call` 绕过公开目录直接调用。新客户端和旧客户端都应迁移到 `skill` facade，或使用标准 `skills/list`、`skills/get`、`resources/read` 协议路径。
+## Native MCP Skills extension
 
-## MCP Skills extension（兼容路径）
+Skill 服务启用时 Anchor 继续声明 `io.modelcontextprotocol/skills`，并实现：
 
-Skill 服务启用时，MCP `initialize` 会声明：
+- `skills/list`
+- `skills/get`
+- `resources/list`
+- `resources/read`
 
-```json
-{
-  "capabilities": {
-    "extensions": {
-      "io.modelcontextprotocol/skills": {}
-    }
-  }
-}
+这些协议端点只导出 active packages。canonical URI 仍为：
+
+```text
+skill://anchor/<name>/SKILL.md
+skill://anchor/<name>/references/<file>
+skill://anchor/<name>/scripts/<file>
+skill://anchor/<name>/assets/<file>
 ```
 
-Anchor 实现 `skills/list`、`skills/get` 与 `resources/read`：
+manifest 中的每个可读文件都有文件级 SHA-256。资源读取会再次 canonicalize 路径并复核当前文件 digest；package 文件被替换或篡改时读取失败，不会把变化后的内容当作已批准 snapshot。
 
-- `skills/list` 返回 canonical `skill://anchor/<name>/SKILL.md` URI、完整 YAML frontmatter 的 JSON 投影，以及 `SKILL.md` 和全部可导入支持文件的资源清单；`anchor` 是 MCP server namespace，`<name>` 是 Skill 目录名，并且必须与 frontmatter `name` 完全一致；
-- 每个资源条目包含文件级 `sha256:<64 lowercase hex>` digest；`SKILL.md` 文件摘要与 Anchor 的整包 `SkillSummary.digest` 分开计算；
-- `skills/get` 通过 canonical `SKILL.md` URI 返回与目录相同的完整 Skill manifest；
-- `resources/read` 对 manifest 中的 canonical URI 返回完整文件内容，以便宿主核对 digest。
+## ChatGPT/Codex Plugin package
 
-这条 MCP extension 是兼容能力，不是当前 ChatGPT Plugin 的 Skill 打包入口。Anchor 仍对该目录执行保守完整性约束：`SKILL.md` 不超过 256 KiB、单个支持文件不超过 1 MiB、单个 Skill 最多 100 个文件且总资源不超过 5 MiB；符号链接、资源扫描截断、未进入受控清单的额外文件或不可读取资源不会进入可导出的安全快照。
-
-## ChatGPT/Codex Plugin package（可选原生 Skill UI 路径）
-
-仅在 Developer mode 中把 Anchor MCP URL 注册成一个 app，会得到工具连接，但**不会自动把 Workspace Skill 变成该 app 详情页中的 Plugin Skills**。要让详情页出现 Skill，需要把 app 与静态 Skill 目录组装成真正的 Plugin package。
-
-先在 ChatGPT Developer mode 注册 Anchor MCP，并从浏览器 URL 复制 `plugin_asdk_app...` technical ID。然后执行：
+`anchor plugin package` 只快照**当前 active packages**：
 
 ```bash
 anchor plugin package PROFILE_ID --app-id plugin_asdk_app_xxx
 ```
 
-默认生成：
+未安装、只安装未激活、或仅存在于 source directory 的 Skill 都不会进入 Plugin package。
+
+默认输出：
 
 ```text
 <workspace>/.anchor/chatgpt-plugin-marketplace/
 ├── marketplace.json
 └── plugins/
     └── anchor-<workspace>/
-        ├── .codex-plugin/
-        │   └── plugin.json
+        ├── .codex-plugin/plugin.json
         ├── .app.json
-        └── skills/
-            └── <skill-name>/
-                ├── SKILL.md
-                └── ...supporting files
+        └── skills/<active-skill>/...
 ```
 
-`plugin.json` 声明 `"skills": "./skills/"` 与 `"apps": "./.app.json"`；`.app.json` 将逻辑 app 名 `anchor` 映射到传入的 `plugin_asdk_app...`。打包只复制**位于当前 workspace 内**且通过 Anchor 现有 Skill 完整性/路径/资源校验的目录；`~/.codex/skills` 等 home/external 来源默认不会被复制到 Plugin package，避免无意把用户级私有资源打包出去。所有被跳过 Skill 都会作为 warning 返回。
+active package 切换后需要重新执行 `anchor plugin package` 才会更新静态 Plugin bundle。
 
-可用 `--output PATH` 指定独立 marketplace 根目录，或用 `--name stable-kebab-name` 固定 plugin name。相对 `--output` 以 Workspace 根目录解析。
+## Web Admin
 
-本地验证流程：
+Workspace 的 **Agent Skills** 面板提供同一 canonical package lifecycle：
 
-1. 确认 Workspace Skill 服务已启用并能扫描到 `<skill-name>/SKILL.md`；
-2. 在 ChatGPT Developer mode 注册 Anchor MCP app，取得 `plugin_asdk_app...`；
-3. 执行 `anchor plugin package ... --app-id ...`；
-4. 按命令输出运行 `codex plugin marketplace add "<marketplace-root>"`；
-5. 重启 ChatGPT desktop app，在 Plugins Directory 选择该 local marketplace 并安装生成的 Plugin；
-6. 新建聊天，打开 Plugin 详情确认 Skills 列表，再测试 Skill activation/use。
+- 开关 Skill runtime；
+- 从 workspace-local path 安装 package；
+- 选择 install channel 和 optional immediate activation；
+- 设置 channel；
+- 激活 channel；
+- rollback；
+- 删除 inactive/unreferenced version；
+- 查看 installed versions、channel pointers、active digest 和 rollback depth。
 
-`plugin_asdk_app...` 属于 ChatGPT 对当前注册 app 分配的宿主技术 ID，Anchor 不静态猜测或硬编码。修改 Workspace Skill 后，需重新运行 `anchor plugin package` 更新插件静态快照；仅重启 MCP daemon 不会修改已经安装的 Plugin Skill 文件。
-
-## 兼容 Skill helper 工具
-
-以下旧接口继续保留在服务器中，供已经缓存过 schema 的旧客户端显式调用；**它们不再出现在 `tools/list`**。
-
-### `list_skills`
-
-返回有界的 Skill 元数据，用于先判断哪个 Skill 与任务相关：
-
-```json
-{
-  "query": "review",
-  "max_results": 100
-}
-```
-
-主要返回字段：名称、描述、来源目录、`skill://` URI、SHA-256 摘要、关联 resources/scripts 和扫描警告。
-
-### `load_skill`
-
-按名称加载正文指令。较长 Skill 支持按行和返回字节预算渐进加载：
-
-```json
-{
-  "name": "code-review",
-  "start_line": 1,
-  "end_line": 400,
-  "max_bytes": 65536
-}
-```
-
-返回值包含 `startLine`、`endLine`、`totalLines`、`totalBytes`、`returnedBytes`、`truncated` 和 `nextStartLine`。如果 `truncated=true`，使用 `nextStartLine` 继续读取。`max_bytes` 最大为 262144。
-
-对不支持原生 MCP Skills extension 的旧客户端，推荐工作流仍是先调用 `list_skills`，仅在任务确实需要时调用 `load_skill`。
-
-### `read_skill_resource`
-
-读取 Skill 的关联资源或脚本源码：
-
-```json
-{
-  "name": "code-review",
-  "path": "references/review-checklist.md",
-  "start_line": 1,
-  "end_line": 120,
-  "max_bytes": 262144
-}
-```
-
-文本资源返回 UTF-8；图片、PDF 等二进制资源返回 base64。资源路径必须位于对应 Skill 目录内。
-
-## MCP Resources
-
-MCP `resources/list` 始终提供 Anchor 自身的 UI resources；Skill 服务启用时再附加 Skill resources：
-
-```text
-ui://anchor/image-viewer/v1.html
-skill://index.json
-skill://<skill-name>/SKILL.md
-skill://<skill-name>/references/<file>
-skill://<skill-name>/scripts/<file>
-skill://<skill-name>/assets/<file>
-```
-
-canonical `resources/read` 请求（不带查询参数）会一次返回完整 `SKILL.md`，用于原生 Skill 导入的 digest 校验。旧客户端仍可显式使用查询参数分页，例如：
-
-```text
-skill://code-review/SKILL.md?start_line=401&max_bytes=65536
-```
-
-仅允许 `start_line`、`end_line` 和 `max_bytes` 三个查询参数，且 `max_bytes` 不得超过 131072。
-
-`skill://index.json` 是渐进式发现索引，条目包含：
-
-```json
-{
-  "name": "code-review",
-  "type": "skill-md",
-  "description": "Review a code change...",
-  "url": "skill://code-review/SKILL.md",
-  "digest": "sha256:..."
-}
-```
-
-`ui://anchor/image-viewer/v1.html` 是 `view_image` 与 Browser `take_screenshot` 共享的 MCP Apps Results UI。它通过标准 MCP image content 直接显示图片；Browser screenshot 指定 `filePath` 只落盘时，UI 使用返回的 workspace artifact 路径调用现有 `view_image` 读取预览。该能力不增加新的公开 MCP tool。
-
-Skill 服务关闭时，MCP 仍声明 resources capability 以提供 Anchor UI resources，但不声明 Skills extension；Skill URI 不可用。Skill 服务开启时，旧 Skill helper 工具同样不会进入 `tools/list`；原生 Skill 发现不再消耗工具槽位。
-
-## Linux CLI
-
-Linux 无界面模式读取同一个 workspace/profile：
-
-```bash
-anchor list
-anchor serve PROFILE_ID --service mcp
-```
-
-Skill 服务不需要额外 CLI 参数。MCP 启动时会读取 profile 中的 `skill_service_enabled` 和 `skill_roots`。使用 systemd 时，确保服务用户对 Skill 目录具有读取权限。
+Web Admin 与 CLI/MCP 不维护第二套状态；三者都操作 `.anchor/skills/state.json`。
 
 ## 安全边界
 
-- Skill 服务当前是 **MCP-only**，不会加入 Actions OpenAPI 网关。
-- `scripts/` 中的文件只作为源码列出和读取，服务器不会执行 Skill 脚本。
-- Skill 内容是任务指令，不构成权限授予，也不能绕过现有命令白名单、路径策略、确认门禁或 workspace 边界。
-- 扫描不跟随目录遍历中的符号链接；Skill 目录必须保留在配置根目录内。
-- 资源读取会再次 canonicalize 路径，拒绝 `..`、绝对路径和符号链接越界。
-- `SKILL.md` 和单个资源默认受大小限制，工具参数可以在上限内进一步收紧返回大小。
-- `SKILL.md` 的 128 KiB 文件上限是安全硬边界。正文超过建议的 500 行或估算 5000 tokens 时不会被拒绝，而是在 `list_skills` 和 `load_skill` 中返回 `oversized`、大小统计及 `qualityWarnings`。
-- token 数量是用于上下文预算提示的近似估算，不作为格式有效性、权限或执行判断依据。
-- 不要把密钥、Token、客户数据或其他敏感信息放入 Skill 文件。
-- 外部来源的 Skill 应先审查其 `SKILL.md`、resources 和 scripts，再加入共享目录。
+- Skill 内容仍只是指令和依赖元数据，不授予权限。
+- `allowed-tools` 不会扩大 Anchor 的 tool profile、command allowlist、危险操作门禁或 workspace 权限。
+- package source 必须位于当前 workspace；不接受 home/external source path。
+- managed `.anchor/skills` 不能再次作为 install source，避免递归/自引用 package。
+- package install 拒绝符号链接。
+- store lifecycle mutation 使用跨进程文件锁；`state.json` 使用原子替换。
+- store 状态损坏时 fail closed：active catalog 为空并报告错误，mutation 不会覆盖损坏状态。
+- active scripts 延续已有 snapshot digest 校验；文件发生变化后不能借由原有授权继续执行。
+- resources 读取持续执行 manifest + digest 校验。
+- Skill service 不加入 Actions OpenAPI 网关。
 
-## 客户端建议
+## 运维
 
-支持 MCP Skills extension 的 Plugin 应优先使用原生 Skill 导入。旧客户端若只能使用兼容接口，则采用渐进式加载：
+启动 MCP 不需要 Skill root 参数：
 
-1. 使用 `list_skills` 或 `skill://index.json` 获取名称和描述；
-2. 选择与当前任务匹配的 Skill；
-3. 调用 `load_skill` 读取指令；较长正文按 `nextStartLine` 分页；
-4. 仅在指令引用关联文件时调用 `read_skill_resource`；
-5. 所有实际文件、Git 和命令操作仍通过原有 Anchor 工具执行。
+```bash
+anchor serve PROFILE_ID --service mcp
+```
+
+唯一 profile 开关是 `runtime.skill_service_enabled`。Skill package 生命周期独立存放在 workspace `.anchor/skills` 中，因此 portable profile 配置不再携带 directory scan roots。

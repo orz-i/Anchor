@@ -643,20 +643,21 @@ fn validate_tunnel_requirements(
         return Err(AppError::Message("当前仅支持 FRP 和 Cloudflare。".into()));
     }
 
-    let (mode, token, named_url) = match kind {
+    let (mode, secret_key, named_url) = match kind {
         TunnelServiceKind::Mcp => (
             profile.tunnel.cloudflare_mode.as_str(),
-            SecretStore::get(&profile.id, "cloudflare_token")?.unwrap_or_default(),
+            "cloudflare_token",
             profile.tunnel.public_url.clone(),
         ),
         TunnelServiceKind::Actions => (
             profile.actions.cloudflare_mode.as_str(),
-            SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default(),
+            "actions_cloudflare_token",
             profile.actions.public_url.clone(),
         ),
     };
 
     if mode == "named" {
+        let token = SecretStore::get(&profile.id, secret_key)?.unwrap_or_default();
         if token.trim().is_empty() {
             return Err(AppError::Message(
                 "Cloudflare 命名隧道模式需要填写 Tunnel Token。".into(),

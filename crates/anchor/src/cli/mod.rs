@@ -5,6 +5,7 @@ mod frp;
 mod handoff;
 mod ilink;
 mod plugin;
+mod skill;
 mod software;
 mod tunnel;
 mod upgrade;
@@ -2887,6 +2888,7 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Tunnel(command) => tunnel::execute(command, cli.json).await,
         Command::Software(command) => software::execute(command, cli.json).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
+        Command::Skill(command) => skill::execute(command, cli.json).await,
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::Service(command) => execute_service(command, cli.json),

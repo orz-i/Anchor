@@ -97,10 +97,7 @@ fn package_profile(
         .map_err(io_error("创建 .codex-plugin 目录"))?;
 
     let catalog = SkillCatalog::new(workspace_root.clone());
-    catalog.configure(SkillSettings::from_text(
-        profile.runtime.skill_service_enabled,
-        &profile.runtime.skill_roots,
-    ));
+    catalog.configure(SkillSettings::new(profile.runtime.skill_service_enabled));
     let skill_export = catalog
         .export_plugin_skills(&staging_root.join("skills"))
         .map_err(AppError::Message)?;
@@ -284,7 +281,6 @@ mod tests {
             Some("Anchor Demo".into()),
         );
         profile.runtime.skill_service_enabled = true;
-        profile.runtime.skill_roots = ".agents/skills".into();
         profile
     }
 
@@ -304,6 +300,17 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         write_fixture_skill(temp.path());
         let profile = fixture_profile(temp.path());
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        catalog
+            .install_package(
+                temp.path()
+                    .join(".agents/skills/review-anchor")
+                    .to_str()
+                    .expect("skill path"),
+                crate::skills::SkillChannel::Stable,
+                true,
+            )
+            .expect("install package before Plugin export");
         let output = temp.path().join("marketplace");
         let options = PluginPackageOptions {
             workspace: profile.id.clone(),

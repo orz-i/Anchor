@@ -37,7 +37,17 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "list_admin_audit_events",
     "list_workspaces",
     "create_workspace",
+    "install_workspace_skill_package",
+    "set_workspace_skill_channel",
+    "activate_workspace_skill_package",
+    "rollback_workspace_skill_package",
+    "remove_workspace_skill_package",
     "inspect_workspace_skills",
+    "install_workspace_skill_package",
+    "set_workspace_skill_channel",
+    "activate_workspace_skill_package",
+    "rollback_workspace_skill_package",
+    "remove_workspace_skill_package",
     "open_workspace_directory",
     "delete_workspace",
     "run_health_checks",
@@ -186,7 +196,46 @@ struct CreateWorkspaceArgs {
 struct SkillsArgs {
     id: String,
     enabled: bool,
-    roots: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillInstallArgs {
+    id: String,
+    path: String,
+    channel: String,
+    #[serde(default)]
+    activate: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillChannelArgs {
+    id: String,
+    name: String,
+    channel: String,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillActivateArgs {
+    id: String,
+    name: String,
+    channel: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillNameArgs {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillRemoveArgs {
+    id: String,
+    name: String,
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,7 +937,40 @@ async fn dispatch_command(
         }
         "inspect_workspace_skills" => {
             let input: SkillsArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            management::inspect_workspace_skills(&input.id, input.enabled, &input.roots)
+            management::inspect_workspace_skills(&input.id, input.enabled).map_err(Into::into)
+        }
+        "install_workspace_skill_package" => {
+            let input: SkillInstallArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::install_workspace_skill_package(
+                &input.id,
+                &input.path,
+                &input.channel,
+                input.activate,
+            )
+            .map_err(Into::into)
+        }
+        "set_workspace_skill_channel" => {
+            let input: SkillChannelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::set_workspace_skill_channel(
+                &input.id,
+                &input.name,
+                &input.channel,
+                &input.version,
+            )
+            .map_err(Into::into)
+        }
+        "activate_workspace_skill_package" => {
+            let input: SkillActivateArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::activate_workspace_skill_package(&input.id, &input.name, &input.channel)
+                .map_err(Into::into)
+        }
+        "rollback_workspace_skill_package" => {
+            let input: SkillNameArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::rollback_workspace_skill_package(&input.id, &input.name).map_err(Into::into)
+        }
+        "remove_workspace_skill_package" => {
+            let input: SkillRemoveArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::remove_workspace_skill_package(&input.id, &input.name, &input.version)
                 .map_err(Into::into)
         }
         "open_workspace_directory" => {

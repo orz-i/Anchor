@@ -54,7 +54,7 @@ export interface SkillSummary {
   toolCompatible: boolean;
   toolEnforcementMode: string;
   toolGrantsPermissions: boolean;
-  source: "workspace" | "home" | "external";
+  source: "package";
   sourceId: string;
   relativePath: string;
   uri: string;
@@ -67,9 +67,9 @@ export interface SkillSummary {
   warnings: string[];
 }
 
-export interface SkillInspection {
+export interface SkillCatalogInspection {
   enabled: boolean;
-  roots: string[];
+  packageStore: string;
   skills: SkillSummary[];
   warnings: string[];
   truncated: boolean;
@@ -77,6 +77,34 @@ export interface SkillInspection {
   scriptExecutionPolicy: string;
   snapshotMode: string;
   catalogDigest: string;
+}
+
+export type SkillChannel = "stable" | "development" | "canary" | "pinned";
+
+export interface SkillPackageVersion {
+  digest: string;
+  declaredVersion?: string | null;
+  installedAt: string;
+}
+
+export interface SkillPackage {
+  name: string;
+  versions: SkillPackageVersion[];
+  channels: Record<string, string>;
+  activeChannel?: string | null;
+  activeDigest?: string | null;
+  rollbackDepth: number;
+}
+
+export interface SkillPackageList {
+  storeSchemaVersion: number;
+  storeRoot: string;
+  packages: SkillPackage[];
+}
+
+export interface SkillInspection {
+  catalog: SkillCatalogInspection;
+  packages: SkillPackageList;
 }
 
 export interface AuthConfig {
@@ -98,7 +126,6 @@ export interface RuntimeConfig {
   workspace_local_entries?: boolean;
   workspace_script_extensions?: string;
   skill_service_enabled?: boolean;
-  skill_roots?: string;
   strict_workspace_reads?: boolean;
   external_paid_commands_enabled?: boolean;
   external_paid_max_runs_per_day?: number;

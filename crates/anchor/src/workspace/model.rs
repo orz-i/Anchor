@@ -63,10 +63,8 @@ pub struct RuntimeConfig {
     pub allowed_commands: String,
     pub workspace_local_entries: bool,
     pub workspace_script_extensions: String,
-    /// Expose Agent Skills from configured directories through MCP tools/resources.
+    /// Expose installed and active Agent Skill packages through MCP tools/resources.
     pub skill_service_enabled: bool,
-    /// Newline-separated Skill roots. Relative paths resolve from the workspace root.
-    pub skill_roots: String,
     /// Runtime-enforced read boundary. It is strict by default; only an
     /// operator-enabled dangerous profile may explicitly opt out.
     pub strict_workspace_reads: bool,
@@ -245,10 +243,6 @@ fn default_external_paid_max_duration_seconds() -> u64 {
     1800
 }
 
-fn default_skill_roots() -> String {
-    ".agents/skills\n.codex/skills\nskills".to_string()
-}
-
 fn default_max_patch_bytes() -> u32 {
     200_000
 }
@@ -296,7 +290,6 @@ impl Default for RuntimeConfig {
             workspace_local_entries: default_workspace_local_entries(),
             workspace_script_extensions: default_workspace_script_extensions(),
             skill_service_enabled: default_skill_service_enabled(),
-            skill_roots: default_skill_roots(),
             strict_workspace_reads: default_strict_workspace_reads(),
             external_paid_commands_enabled: false,
             external_paid_max_runs_per_day: default_external_paid_max_runs_per_day(),

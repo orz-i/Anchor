@@ -87,7 +87,6 @@ fn mcp_runtime_changed(current: &WorkspaceProfile, next: &WorkspaceProfile) -> b
         || current.runtime.workspace_local_entries != next.runtime.workspace_local_entries
         || current.runtime.workspace_script_extensions != next.runtime.workspace_script_extensions
         || current.runtime.skill_service_enabled != next.runtime.skill_service_enabled
-        || current.runtime.skill_roots != next.runtime.skill_roots
         || current.runtime.strict_workspace_reads != next.runtime.strict_workspace_reads
         || current.runtime.external_paid_commands_enabled
             != next.runtime.external_paid_commands_enabled

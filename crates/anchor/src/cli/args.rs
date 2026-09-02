@@ -10,6 +10,18 @@ pub struct CliArgs {
     pub command: Command,
 }
 
+pub fn skill_usage() -> &'static str {
+    "Agent Skill package 命令：\n\
+  anchor skill list <workspace>\n\
+  anchor skill validate <workspace> <workspace-relative-path>\n\
+  anchor skill install <workspace> <workspace-relative-path> --channel stable|development|canary|pinned [--activate]\n\
+  anchor skill set-channel <workspace> <name> <channel> <version-or-sha256>\n\
+  anchor skill activate <workspace> <name> <channel>\n\
+  anchor skill rollback <workspace> <name>\n\
+  anchor skill remove <workspace> <name> <version-or-sha256>\n\n\
+源目录只用于显式 validate/install；运行时仅解析 .anchor/skills 中已安装且 active 的不可变 package。"
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ILinkCommand {
     Login { workspace: String },
@@ -1585,6 +1597,121 @@ pub enum PluginCommand {
     Package(PluginPackageOptions),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillCommand {
+    List {
+        workspace: String,
+    },
+    Validate {
+        workspace: String,
+        path: String,
+    },
+    Install {
+        workspace: String,
+        path: String,
+        channel: String,
+        activate: bool,
+    },
+    SetChannel {
+        workspace: String,
+        name: String,
+        channel: String,
+        version: String,
+    },
+    Activate {
+        workspace: String,
+        name: String,
+        channel: String,
+    },
+    Rollback {
+        workspace: String,
+        name: String,
+    },
+    Remove {
+        workspace: String,
+        name: String,
+        version: String,
+    },
+}
+
+fn parse_skill_command(args: &mut VecDeque<String>) -> Result<SkillCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("list") => {
+            let workspace = pop_value(args, "skill list")?;
+            ensure_empty(args, "skill list")?;
+            Ok(SkillCommand::List { workspace })
+        }
+        Some("validate") => {
+            let workspace = pop_value(args, "skill validate")?;
+            let path = pop_value(args, "skill validate")?;
+            ensure_empty(args, "skill validate")?;
+            Ok(SkillCommand::Validate { workspace, path })
+        }
+        Some("install") => {
+            let workspace = pop_value(args, "skill install")?;
+            let path = pop_value(args, "skill install")?;
+            let mut channel = None;
+            let mut activate = false;
+            while let Some(option) = args.pop_front() {
+                match option.as_str() {
+                    "--channel" => channel = Some(pop_value(args, "--channel")?),
+                    "--activate" => activate = true,
+                    other => return Err(format!("skill install 不支持参数：{other}")),
+                }
+            }
+            Ok(SkillCommand::Install {
+                workspace,
+                path,
+                channel: channel.ok_or_else(|| "skill install 缺少 --channel".to_string())?,
+                activate,
+            })
+        }
+        Some("set-channel") => {
+            let workspace = pop_value(args, "skill set-channel")?;
+            let name = pop_value(args, "skill set-channel")?;
+            let channel = pop_value(args, "skill set-channel")?;
+            let version = pop_value(args, "skill set-channel")?;
+            ensure_empty(args, "skill set-channel")?;
+            Ok(SkillCommand::SetChannel {
+                workspace,
+                name,
+                channel,
+                version,
+            })
+        }
+        Some("activate") => {
+            let workspace = pop_value(args, "skill activate")?;
+            let name = pop_value(args, "skill activate")?;
+            let channel = pop_value(args, "skill activate")?;
+            ensure_empty(args, "skill activate")?;
+            Ok(SkillCommand::Activate {
+                workspace,
+                name,
+                channel,
+            })
+        }
+        Some("rollback") => {
+            let workspace = pop_value(args, "skill rollback")?;
+            let name = pop_value(args, "skill rollback")?;
+            ensure_empty(args, "skill rollback")?;
+            Ok(SkillCommand::Rollback { workspace, name })
+        }
+        Some("remove") => {
+            let workspace = pop_value(args, "skill remove")?;
+            let name = pop_value(args, "skill remove")?;
+            let version = pop_value(args, "skill remove")?;
+            ensure_empty(args, "skill remove")?;
+            Ok(SkillCommand::Remove {
+                workspace,
+                name,
+                version,
+            })
+        }
+        Some(other) => Err(format!("未知 skill 命令：{other}\n\n{}", skill_usage())),
+        None => Err(skill_usage().to_string()),
+    }
+}
+
 fn parse_plugin_command(args: &mut VecDeque<String>) -> Result<PluginCommand, String> {
     match args.pop_front().as_deref() {
         Some("package") => {
@@ -1643,6 +1770,7 @@ pub enum Command {
     Tunnel(TunnelCommand),
     Software(SoftwareCommand),
     Workspace(WorkspaceCommand),
+    Skill(SkillCommand),
     Plugin(PluginCommand),
     Gateway(GatewayCommand),
     Service(ServiceCommand),
@@ -1739,6 +1867,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("tunnel") => Command::Tunnel(parse_tunnel_command(&mut args)?),
         Some("software" | "sw") => Command::Software(parse_software_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
+        Some("skill" | "skills") => Command::Skill(parse_skill_command(&mut args)?),
         Some("plugin") => Command::Plugin(parse_plugin_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
         Some("service" | "svc") => Command::Service(parse_service_command(&mut args)?),
@@ -1820,6 +1949,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] tunnel <show|configure> ...\n\n\
   anchor [--config-dir PATH] [--json] software <list|install|uninstall> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
+  anchor [--config-dir PATH] [--json] skill <command> ...\n\n\
   anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
   anchor [--config-dir PATH] [--json] service <command>\n\n\
@@ -2905,5 +3035,51 @@ mod tests {
         let missing = parse(strings(&["plugin", "package", "Anchor"]))
             .expect_err("plugin app id is required");
         assert!(missing.contains("--app-id"));
+    }
+
+    #[test]
+    fn parses_skill_package_lifecycle_commands() {
+        let install = parse(strings(&[
+            "skill",
+            "install",
+            "Anchor",
+            "skills/review",
+            "--channel",
+            "canary",
+            "--activate",
+        ]))
+        .expect("skill install");
+        assert_eq!(
+            install.command,
+            Command::Skill(SkillCommand::Install {
+                workspace: "Anchor".into(),
+                path: "skills/review".into(),
+                channel: "canary".into(),
+                activate: true,
+            })
+        );
+
+        let channel = parse(strings(&[
+            "skills",
+            "set-channel",
+            "Anchor",
+            "review",
+            "stable",
+            "1.2.3",
+        ]))
+        .expect("skill set-channel");
+        assert_eq!(
+            channel.command,
+            Command::Skill(SkillCommand::SetChannel {
+                workspace: "Anchor".into(),
+                name: "review".into(),
+                channel: "stable".into(),
+                version: "1.2.3".into(),
+            })
+        );
+
+        let missing = parse(strings(&["skill", "install", "Anchor", "skills/review"]))
+            .expect_err("skill install requires channel");
+        assert!(missing.contains("--channel"));
     }
 }

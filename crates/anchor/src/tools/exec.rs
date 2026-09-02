@@ -2778,7 +2778,7 @@ mod tests {
     fn skill_script_requires_operator_dangerous_mode() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
-        let skill = workspace.path().join(".agents/skills/example");
+        let skill = workspace.path().join("sources/example");
         std::fs::create_dir_all(skill.join("scripts")).expect("skill scripts");
         std::fs::write(
             skill.join("SKILL.md"),
@@ -2789,11 +2789,29 @@ mod tests {
         let mut ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
+        let installed = ctx
+            .skills
+            .install_package(
+                skill.to_str().expect("skill path"),
+                crate::skills::SkillChannel::Stable,
+                true,
+            )
+            .expect("install active Skill package");
+        let digest = installed.active_digest.expect("active digest");
+        let relative_script = format!(
+            ".anchor/skills/packages/example/{}/example/scripts/run.py",
+            digest.trim_start_matches("sha256:")
+        );
+        let relative_workdir = format!(
+            ".anchor/skills/packages/example/{}/example/scripts",
+            digest.trim_start_matches("sha256:")
+        );
+        let installed_script = workspace.path().join(&relative_script);
 
         let output = call_tool(
             &ctx,
             "exec_command",
-            &json!({"cmd": "python .agents/skills/example/scripts/run.py"}),
+            &json!({"cmd": format!("python {relative_script}")}),
         );
         assert_eq!(output["ok"], false, "{output}");
         assert_eq!(
@@ -2808,7 +2826,7 @@ mod tests {
             "exec_command",
             &json!({
                 "cmd": "python -c \"import runpy; runpy.run_path('run.py')\"",
-                "workdir": ".agents/skills/example/scripts"
+                "workdir": relative_workdir
             }),
         );
         assert_eq!(
@@ -2821,19 +2839,19 @@ mod tests {
         let approved_by_control_plane = call_tool(
             &ctx,
             "exec_command",
-            &json!({"cmd": "python .agents/skills/example/scripts/run.py"}),
+            &json!({"cmd": format!("python {relative_script}")}),
         );
         assert_eq!(
             approved_by_control_plane["ok"], true,
             "{approved_by_control_plane}"
         );
 
-        std::fs::write(skill.join("scripts/run.py"), "print('changed')\n").expect("change");
+        std::fs::write(&installed_script, "print('changed')\n").expect("change package script");
         let stale = call_tool(
             &ctx,
             "exec_command",
             &json!({
-                "cmd": "python .agents/skills/example/scripts/run.py"
+                "cmd": format!("python {relative_script}")
             }),
         );
         assert_eq!(stale["ok"], false, "{stale}");

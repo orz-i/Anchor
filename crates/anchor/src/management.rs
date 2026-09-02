@@ -315,15 +315,90 @@ fn workspace_path(id: &str) -> AppResult<PathBuf> {
     workspace_profile(id).map(|profile| PathBuf::from(profile.path))
 }
 
-pub(crate) fn inspect_workspace_skills(
-    id: &str,
-    enabled: bool,
-    roots: &str,
-) -> AppResult<serde_json::Value> {
+fn workspace_skill_catalog(id: &str, enabled: bool) -> AppResult<crate::skills::SkillCatalog> {
     let profile = workspace_profile(id)?;
     let catalog = crate::skills::SkillCatalog::new(PathBuf::from(profile.path));
-    catalog.configure(crate::skills::SkillSettings::from_text(enabled, roots));
-    Ok(serde_json::to_value(catalog.list(None, 200))?)
+    catalog.configure(crate::skills::SkillSettings::new(enabled));
+    Ok(catalog)
+}
+
+pub(crate) fn inspect_workspace_skills(id: &str, enabled: bool) -> AppResult<serde_json::Value> {
+    let catalog = workspace_skill_catalog(id, enabled)?;
+    Ok(serde_json::json!({
+        "catalog": catalog.list(None, 200),
+        "packages": catalog.packages()
+    }))
+}
+
+pub(crate) fn install_workspace_skill_package(
+    id: &str,
+    path: &str,
+    channel: &str,
+    activate: bool,
+) -> AppResult<serde_json::Value> {
+    let profile = workspace_profile(id)?;
+    let catalog = workspace_skill_catalog(id, profile.runtime.skill_service_enabled)?;
+    let channel = crate::skills::SkillChannel::parse(channel).map_err(AppError::Message)?;
+    let package = catalog
+        .install_package(path, channel, activate)
+        .map_err(AppError::Message)?;
+    Ok(serde_json::to_value(package)?)
+}
+
+pub(crate) fn set_workspace_skill_channel(
+    id: &str,
+    name: &str,
+    channel: &str,
+    version: &str,
+) -> AppResult<serde_json::Value> {
+    let profile = workspace_profile(id)?;
+    let catalog = workspace_skill_catalog(id, profile.runtime.skill_service_enabled)?;
+    let channel = crate::skills::SkillChannel::parse(channel).map_err(AppError::Message)?;
+    Ok(serde_json::to_value(
+        catalog
+            .set_channel(name, channel, version)
+            .map_err(AppError::Message)?,
+    )?)
+}
+
+pub(crate) fn activate_workspace_skill_package(
+    id: &str,
+    name: &str,
+    channel: &str,
+) -> AppResult<serde_json::Value> {
+    let profile = workspace_profile(id)?;
+    let catalog = workspace_skill_catalog(id, profile.runtime.skill_service_enabled)?;
+    let channel = crate::skills::SkillChannel::parse(channel).map_err(AppError::Message)?;
+    Ok(serde_json::to_value(
+        catalog
+            .activate_package(name, channel)
+            .map_err(AppError::Message)?,
+    )?)
+}
+
+pub(crate) fn rollback_workspace_skill_package(
+    id: &str,
+    name: &str,
+) -> AppResult<serde_json::Value> {
+    let profile = workspace_profile(id)?;
+    let catalog = workspace_skill_catalog(id, profile.runtime.skill_service_enabled)?;
+    Ok(serde_json::to_value(
+        catalog.rollback_package(name).map_err(AppError::Message)?,
+    )?)
+}
+
+pub(crate) fn remove_workspace_skill_package(
+    id: &str,
+    name: &str,
+    version: &str,
+) -> AppResult<serde_json::Value> {
+    let profile = workspace_profile(id)?;
+    let catalog = workspace_skill_catalog(id, profile.runtime.skill_service_enabled)?;
+    Ok(serde_json::to_value(
+        catalog
+            .remove_package(name, version)
+            .map_err(AppError::Message)?,
+    )?)
 }
 
 pub(crate) fn create_workspace(path: String, name: Option<String>) -> AppResult<WorkspaceProfile> {

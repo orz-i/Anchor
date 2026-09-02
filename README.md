@@ -325,9 +325,9 @@ Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`�
 
 ### 通过 MCP 提请 Agent Skill
 
-每个 workspace/profile 可以配置一个或多个 Agent Skills 根目录。MCP 客户端可先调用 `list_skills` 获取有界元数据，再调用 `load_skill` 加载完整 `SKILL.md`，或通过 `read_skill_resource` / `skill://` 读取关联资源。Skill 脚本不会被服务器执行。
+每个 workspace/profile 使用 `.anchor/skills` 中的不可变 Agent Skill packages。源目录只用于显式 `validate/install`；运行时不会自动扫描 `.agents/skills`、`.codex/skills` 或 `skills`。通过 stable/development/canary/pinned channel 选择已安装版本，再显式 activate；支持 rollback 和受保护的 version removal。
 
-默认扫描 `.agents/skills`、`.codex/skills` 和 `skills`。在 workspace 的 **MCP → 配置 → Agent Skills** 中可以扫描预览并保存目录。完整格式、协议和安全边界见 [MCP Agent Skills 服务](docs/skill-service.md)。
+MCP 仍只公开一个 `skill` facade：read-only/core 可 list/get/read_resource/packages/validate，advanced 才能 install/set_channel/activate/rollback/remove。CLI 可使用 `anchor skill ...`，Web Admin 的 Agent Skills 面板使用同一 canonical package store。完整生命周期、协议和安全边界见 [Agent Skill package lifecycle](docs/skill-service.md)。
 
 ### 断联恢复与 OAuth 续约
 

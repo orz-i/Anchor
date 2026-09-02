@@ -1306,11 +1306,35 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request: ControlRequest = read_json_frame(&mut stream)
+    handle_connection_with_settings(&mut stream, profile, command_sender, None).await
+}
+
+#[cfg(any(unix, windows, test))]
+async fn handle_connection_with_settings<S>(
+    stream: &mut S,
+    profile: &WorkspaceProfile,
+    command_sender: &DaemonControlSender,
+    settings_override: Option<&crate::settings::AppSettings>,
+) -> AppResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request: ControlRequest = read_json_frame(stream)
         .await
         .map_err(|error| AppError::Message(format!("invalid control request: {error:?}")))?;
-    let handled = handle_request(request, profile, !command_sender.is_closed()).await;
-    write_json_frame(&mut stream, &handled.response).await?;
+    let handled = match settings_override {
+        Some(settings) => {
+            handle_request_with_settings(
+                request,
+                profile,
+                !command_sender.is_closed(),
+                Some(settings),
+            )
+            .await
+        }
+        None => handle_request(request, profile, !command_sender.is_closed()).await,
+    };
+    write_json_frame(stream, &handled.response).await?;
     // The response is already fully flushed. On Windows Named Pipes the client
     // may close immediately after reading it, causing shutdown() to report
     // ERROR_NO_DATA (232 / "pipe is being closed"). That is a normal completed
@@ -1369,6 +1393,16 @@ async fn handle_request(
     profile: &WorkspaceProfile,
     command_available: bool,
 ) -> HandledRequest {
+    handle_request_with_settings(request, profile, command_available, None).await
+}
+
+#[cfg(any(unix, windows, test))]
+async fn handle_request_with_settings(
+    request: ControlRequest,
+    profile: &WorkspaceProfile,
+    command_available: bool,
+    settings_override: Option<&crate::settings::AppSettings>,
+) -> HandledRequest {
     if let Err(response) = validate_protocol_version(&request) {
         return handled(*response);
     }
@@ -1404,15 +1438,18 @@ async fn handle_request(
                     {
                         status.mcp_activity = Some(crate::mcp::activity_snapshot(&profile.id));
                     }
-                    let settings = match crate::settings::AppSettings::load() {
-                        Ok(settings) => settings,
-                        Err(error) => {
-                            return handled(ControlResponse::error(
-                                request_id,
-                                ERROR_INTERNAL,
-                                error.to_string(),
-                            ));
-                        }
+                    let settings = match settings_override {
+                        Some(settings) => settings.clone(),
+                        None => match crate::settings::AppSettings::load() {
+                            Ok(settings) => settings,
+                            Err(error) => {
+                                return handled(ControlResponse::error(
+                                    request_id,
+                                    ERROR_INTERNAL,
+                                    error.to_string(),
+                                ));
+                            }
+                        },
                     };
                     let tunnels = crate::tunnel::supervisor().lock().await;
                     status.mcp_tunnel = Some(tunnels.status(
@@ -1824,7 +1861,15 @@ mod tests {
         let server_profile = profile.clone();
         let (command_sender, _command_receiver) = control_channel();
         let server_task = tokio::spawn(async move {
-            handle_connection(server, &server_profile, &command_sender).await
+            let settings = crate::settings::AppSettings::default();
+            let mut server = server;
+            handle_connection_with_settings(
+                &mut server,
+                &server_profile,
+                &command_sender,
+                Some(&settings),
+            )
+            .await
         });
         let request = ControlRequest {
             protocol_version: super::super::protocol::CONTROL_PROTOCOL_VERSION,
@@ -1843,7 +1888,7 @@ mod tests {
             .expect("server task")
             .expect("serve request");
 
-        assert!(response.ok);
+        assert!(response.ok, "unexpected control response: {response:?}");
         assert_eq!(response.request_id, request.request_id);
         match response.result.expect("status result") {
             ControlResult::WorkspaceStatus { status } => assert_eq!(status.id, expected_id),

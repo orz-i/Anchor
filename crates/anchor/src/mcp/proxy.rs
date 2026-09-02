@@ -1178,13 +1178,21 @@ impl McpProxyRegistry {
             .collect::<Vec<_>>();
         let enabled_server_count = state.specs.values().filter(|spec| spec.enabled).count();
         let connected_server_count = state.servers.len();
+        let mut unavailable_servers = state
+            .failures
+            .iter()
+            .map(|(name, error)| json!({ "name": name, "error": error }))
+            .collect::<Vec<_>>();
+        unavailable_servers
+            .sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
         json!({
             "configured": self.configured.load(Ordering::Acquire),
             "server_count": servers.len(),
             "enabled_server_count": enabled_server_count,
             "connected_server_count": connected_server_count,
             "servers": servers,
-            "unavailable_server_count": state.failures.len()
+            "unavailable_server_count": state.failures.len(),
+            "unavailable_servers": unavailable_servers
         })
     }
 
@@ -5127,6 +5135,11 @@ for raw in sys.stdin:
         let status = registry.status();
         assert_eq!(status["server_count"], 1);
         assert_eq!(status["unavailable_server_count"], 1);
+        assert_eq!(status["unavailable_servers"][0]["name"], "failed-server");
+        assert_eq!(
+            status["unavailable_servers"][0]["error"],
+            "activation failed"
+        );
         assert_eq!(status["servers"][0]["name"], "failed-server");
         assert_eq!(status["servers"][0]["error"], "activation failed");
         assert_eq!(status["servers"][0]["published_tool_count"], 0);

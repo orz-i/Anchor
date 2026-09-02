@@ -72,7 +72,7 @@ pub(super) fn read_resource(request: ResourceReadRequest<'_>) -> Result<SkillRea
     let current_digest = format!("sha256:{:x}", Sha256::digest(&data));
     if request.readable_digests.get(&path) != Some(&current_digest) {
         return Err(format!(
-            "Skill 资源在目录快照建立后已变化：{path}；请重启 MCP listener 重新加载 Skill"
+            "Skill package 资源在 active snapshot 建立后已变化：{path}；请重新安装并激活经过校验的不可变 package"
         ));
     }
     let mime_type = mime_type_for(&canonical).to_string();

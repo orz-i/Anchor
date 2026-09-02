@@ -506,19 +506,6 @@ fn remap_known_profile_paths(
             }
         }
     }
-
-    let remapped_roots = profile
-        .runtime
-        .skill_roots
-        .lines()
-        .map(|line| {
-            remap_path_under_workspace(line, source_root, target_root, source_platform)
-                .map(|path| path_string(&path))
-                .unwrap_or_else(|| line.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    profile.runtime.skill_roots = remapped_roots;
 }
 
 fn remap_path_under_workspace(
@@ -781,9 +768,6 @@ mod tests {
         let mut data = sample_data(r"D:\projects\demo".into());
         data.profiles[0].tunnel.frp_cert_path = r"D:\projects\demo\.anchor\cert\server.pem".into();
         data.profiles[0].tunnel.frp_key_path = r"D:\projects\demo\.anchor\cert\server.key".into();
-        data.profiles[0].runtime.skill_roots = r"D:\projects\demo\.agents\skills
-.codex/skills"
-            .into();
         let mapping = WorkspacePathMapping {
             selector: "stable-workspace-id".into(),
             target: target.path().to_path_buf(),
@@ -813,13 +797,6 @@ mod tests {
                 .join("cert")
                 .join("server.key")
         );
-        assert!(profile
-            .runtime
-            .skill_roots
-            .lines()
-            .next()
-            .unwrap()
-            .contains(".agents"));
         assert_eq!(workspaces[0].source_path, r"D:\projects\demo");
         assert!(warnings.is_empty());
     }

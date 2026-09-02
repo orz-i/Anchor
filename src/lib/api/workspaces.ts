@@ -9,7 +9,9 @@ import type {
   GatewayEventCursor,
   GatewayLogChunk,
   RuntimeStatus,
+  SkillChannel,
   SkillInspection,
+  SkillPackage,
   WorkspaceControlStatus,
   WorkspaceProfile,
 } from "@/lib/types";
@@ -111,9 +113,49 @@ export async function updateWorkspace(
 export async function inspectWorkspaceSkills(
   id: string,
   enabled: boolean,
-  roots: string,
 ): Promise<SkillInspection> {
-  return invokeRead<SkillInspection>("inspect_workspace_skills", { id, enabled, roots });
+  return invokeRead<SkillInspection>("inspect_workspace_skills", { id, enabled });
+}
+
+export async function installWorkspaceSkillPackage(
+  id: string,
+  path: string,
+  channel: SkillChannel,
+  activate = false,
+): Promise<SkillPackage> {
+  return invokeAdmin<SkillPackage>("install_workspace_skill_package", { id, path, channel, activate });
+}
+
+export async function setWorkspaceSkillChannel(
+  id: string,
+  name: string,
+  channel: SkillChannel,
+  version: string,
+): Promise<SkillPackage> {
+  return invokeAdmin<SkillPackage>("set_workspace_skill_channel", { id, name, channel, version });
+}
+
+export async function activateWorkspaceSkillPackage(
+  id: string,
+  name: string,
+  channel: SkillChannel,
+): Promise<SkillPackage> {
+  return invokeAdmin<SkillPackage>("activate_workspace_skill_package", { id, name, channel });
+}
+
+export async function rollbackWorkspaceSkillPackage(
+  id: string,
+  name: string,
+): Promise<SkillPackage> {
+  return invokeAdmin<SkillPackage>("rollback_workspace_skill_package", { id, name });
+}
+
+export async function removeWorkspaceSkillPackage(
+  id: string,
+  name: string,
+  version: string,
+): Promise<SkillPackage> {
+  return invokeAdmin<SkillPackage>("remove_workspace_skill_package", { id, name, version });
 }
 
 export async function openWorkspaceDirectory(path: string): Promise<void> {

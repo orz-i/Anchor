@@ -289,7 +289,7 @@ mod tests {
     fn image_viewer_resource_is_available_when_skills_are_disabled() {
         let root = tempfile::tempdir().expect("workspace");
         let catalog = SkillCatalog::new(root.path().to_path_buf());
-        catalog.configure(SkillSettings::from_text(false, "skills"));
+        catalog.configure(SkillSettings::new(false));
 
         let listed = resources_list(&catalog, &json!({})).expect("resources/list");
         assert_eq!(listed["resources"][0]["uri"], IMAGE_VIEWER_RESOURCE_URI);

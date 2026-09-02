@@ -158,6 +158,61 @@ mod tests {
     }
 
     #[test]
+    fn migrates_removed_skill_roots_to_canonical_profiles() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("profiles.json");
+        let mut data = AppData::default();
+        data.profiles.push(crate::workspace::WorkspaceProfile::new(
+            ".".into(),
+            Some("legacy-skill-roots".into()),
+        ));
+        let mut value =
+            serde_json::to_value(ProfilesData::from_app_data(&data)).expect("profiles json");
+        value["profiles"][0]["runtime"]["skill_roots"] =
+            serde_json::Value::String(".agents/skills\n.codex/skills".into());
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value).expect("json")),
+        )
+        .expect("legacy profiles");
+
+        let migrated = load_profiles_with_backup(&path).expect("migrate profiles");
+
+        assert_eq!(migrated.profiles.len(), 1);
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read migrated profiles"))
+                .expect("parse migrated profiles");
+        assert!(persisted["profiles"][0]["runtime"]
+            .get("skill_roots")
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_skill_root_migration_still_rejects_other_unknown_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("profiles.json");
+        let mut data = AppData::default();
+        data.profiles.push(crate::workspace::WorkspaceProfile::new(
+            ".".into(),
+            Some("strict-migration".into()),
+        ));
+        let mut value =
+            serde_json::to_value(ProfilesData::from_app_data(&data)).expect("profiles json");
+        value["profiles"][0]["runtime"]["skill_roots"] = serde_json::Value::String("skills".into());
+        value["profiles"][0]["runtime"]["unexpected_future_field"] = serde_json::Value::Bool(true);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value).expect("json")),
+        )
+        .expect("legacy profiles");
+
+        let error = load_profiles_with_backup(&path)
+            .expect_err("unrelated unknown fields must remain rejected");
+
+        assert!(error.to_string().contains("unexpected_future_field"));
+    }
+
+    #[test]
     fn rejects_unprotected_plaintext_secrets() {
         let temp = tempfile::tempdir().expect("tempdir");
         let secrets_path = temp.path().join("secrets.json");
@@ -307,7 +362,7 @@ pub fn load() -> AppResult<AppData> {
 pub(crate) fn load_profiles_only() -> AppResult<AppData> {
     let path = data_file_path()?;
     if has_primary_or_backup(&path) {
-        return Ok(load_with_backup::<ProfilesData>(&path)?.into_app_data());
+        return Ok(load_profiles_with_backup(&path)?.into_app_data());
     }
     Ok(AppData::default())
 }
@@ -520,6 +575,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn load_with_backup<T>(path: &Path) -> AppResult<T>
 where
     T: Serialize + DeserializeOwned,
@@ -548,11 +604,90 @@ where
     }
 }
 
-#[cfg(test)]
-fn read_data(path: &Path) -> AppResult<AppData> {
-    read_json::<ProfilesData>(path).map(ProfilesData::into_app_data)
+fn load_profiles_with_backup(path: &Path) -> AppResult<ProfilesData> {
+    match read_profiles_json(path) {
+        Ok((data, migrated)) => {
+            if migrated {
+                write_json(path, &data)?;
+            }
+            Ok(data)
+        }
+        Err(primary_error) => {
+            let backup = backup_path(path);
+            if !backup.exists() {
+                return Err(primary_error);
+            }
+            let (recovered, _) = read_profiles_json(&backup).map_err(|backup_error| {
+                crate::error::AppError::Message(format!(
+                    "配置文件损坏且备份无法读取：主文件错误：{primary_error}；备份错误：{backup_error}"
+                ))
+            })?;
+            let text = serde_json::to_string_pretty(&recovered)?;
+            atomic_write(path, format!("{text}\n").as_bytes())?;
+            eprintln!(
+                "配置文件 {} 损坏，已从 {} 恢复",
+                path.display(),
+                backup.display()
+            );
+            Ok(recovered)
+        }
+    }
 }
 
+fn read_profiles_json(path: &Path) -> AppResult<(ProfilesData, bool)> {
+    let raw = fs::read_to_string(path)?;
+    match serde_json::from_str::<ProfilesData>(&raw) {
+        Ok(data) => Ok((data, false)),
+        Err(primary_error) => {
+            let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+                crate::error::AppError::Message(format!(
+                    "无法解析配置文件 {}：{primary_error}",
+                    path.display()
+                ))
+            })?;
+            if !remove_legacy_skill_roots(&mut value) {
+                return Err(crate::error::AppError::Message(format!(
+                    "无法解析配置文件 {}：{primary_error}",
+                    path.display()
+                )));
+            }
+            let data = serde_json::from_value::<ProfilesData>(value).map_err(|error| {
+                crate::error::AppError::Message(format!(
+                    "无法迁移配置文件 {}：{error}",
+                    path.display()
+                ))
+            })?;
+            Ok((data, true))
+        }
+    }
+}
+
+fn remove_legacy_skill_roots(value: &mut serde_json::Value) -> bool {
+    let Some(profiles) = value
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut migrated = false;
+    for profile in profiles {
+        let Some(runtime) = profile
+            .get_mut("runtime")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        migrated |= runtime.remove("skill_roots").is_some();
+    }
+    migrated
+}
+
+#[cfg(test)]
+fn read_data(path: &Path) -> AppResult<AppData> {
+    read_profiles_json(path).map(|(data, _)| data.into_app_data())
+}
+
+#[cfg(test)]
 fn read_json<T>(path: &Path) -> AppResult<T>
 where
     T: DeserializeOwned,
@@ -571,7 +706,7 @@ fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.bak"))
 }
 
-pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     let parent = path.parent().ok_or_else(|| {
         crate::error::AppError::Message(format!("配置路径缺少父目录：{}", path.display()))
     })?;

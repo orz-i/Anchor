@@ -1,6 +1,6 @@
 {
   "advanced": {
-    "catalog_version": 46,
+    "catalog_version": 47,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -36,7 +36,7 @@
     "tool_count": 30
   },
   "core": {
-    "catalog_version": 46,
+    "catalog_version": 47,
     "names": [
       "apply_patch",
       "begin_work_session",
@@ -68,7 +68,7 @@
     "tool_count": 26
   },
   "read-only": {
-    "catalog_version": 46,
+    "catalog_version": 47,
     "names": [
       "browser_build_info",
       "cwd",

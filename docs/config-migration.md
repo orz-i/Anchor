@@ -188,7 +188,7 @@ anchor import /secure/anchor-migration.json \
 - 项目代码和 Workspace 文件；
 - `.anchor/cert` 或其他 FRP TLS 证书/私钥文件；
 - 自定义 runtime 可执行文件；
-- Workspace 外的 skill roots；
+- 已安装 Skill package 的本地 package store（需要在目标机器重新安装/导入并激活所需版本）；
 - systemd / Windows Service / FRP 服务端 / DNS / Cloudflare 等系统或公网基础设施。
 
 如果 FRP 证书/私钥路径位于源 Workspace 根目录内，import 会随 Workspace 根目录一起重映射该路径；目标文件不存在时会返回 warning，但不会把证书内容放入迁移包。

@@ -160,7 +160,7 @@ impl ToolContext {
             permission_mode: self.permission_mode.clone(),
             harness,
             mcp_proxies: self.mcp_proxies.clone(),
-            skills: crate::skills::SkillCatalog::new(root.clone()),
+            skills: self.skills.clone(),
             ui_widget_domain: self.ui_widget_domain.clone(),
             primary_workspace_root: self.primary_workspace_root.clone(),
             scoped_task_id: Some(task.id.clone()),

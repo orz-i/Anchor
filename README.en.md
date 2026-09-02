@@ -317,9 +317,9 @@ Multiple workspaces can share one local Gateway and one public tunnel while rema
 
 ### Request Agent Skills through MCP
 
-Each workspace/profile can expose one or more Agent Skills roots. MCP clients can call `list_skills` for bounded metadata, `load_skill` for the complete `SKILL.md`, and `read_skill_resource` or `skill://` resources for supporting files. The server does not execute Skill scripts.
+Each workspace/profile uses immutable Agent Skill packages stored under `.anchor/skills`. Source directories are only inputs to explicit `validate/install`; the runtime no longer auto-scans `.agents/skills`, `.codex/skills`, or `skills`. Installed versions are assigned to stable/development/canary/pinned channels and become usable only after explicit activation; rollback and protected version removal are supported.
 
-The default roots are `.agents/skills`, `.codex/skills`, and `skills`. Configure and preview them under **MCP → Configuration → Agent Skills**. See the [MCP Agent Skills service guide](docs/skill-service.md) for the format, protocol, and security boundaries.
+MCP still publishes one `skill` facade: read-only/core can list/get/read_resource/packages/validate, while advanced alone can install/set_channel/activate/rollback/remove. `anchor skill ...` and the Web Admin Agent Skills panel use the same canonical package store. See the [Agent Skill package lifecycle guide](docs/skill-service.md) for lifecycle, protocol, and security boundaries.
 
 ### Reconnection and OAuth renewal
 

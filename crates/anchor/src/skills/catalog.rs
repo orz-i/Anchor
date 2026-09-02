@@ -12,8 +12,11 @@ use super::model::{
     paginate_text, parse_skill_markdown, SkillLoadResult, SkillReadResult, SkillSummary,
 };
 use super::resource::{discover_files, read_resource, ResourceReadRequest, MAX_RESOURCE_BYTES};
+use super::store::{
+    ActiveSkillPackage, SkillChannel, SkillPackageList, SkillPackageStore, SkillPackageValidation,
+    SkillPackageView,
+};
 
-const DEFAULT_SKILL_ROOTS: &str = ".agents/skills\n.codex/skills\nskills";
 const MAX_SKILLS: usize = 200;
 pub(super) const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 pub(super) const MAX_NATIVE_IMPORT_SKILLS: usize = 5;
@@ -27,7 +30,53 @@ const MAX_NATIVE_SCAN_RAW_BYTES: u64 = 7 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillSettings {
     pub enabled: bool,
-    pub roots: Vec<String>,
+}
+
+fn read_active_package_record(
+    _workspace_root: &Path,
+    store: &SkillPackageStore,
+    active: &ActiveSkillPackage,
+) -> Result<SkillRecord, String> {
+    let store_root = store
+        .root()
+        .canonicalize()
+        .map_err(|error| format!("managed Skill store is unavailable: {error}"))?;
+    let canonical = active
+        .directory
+        .canonicalize()
+        .map_err(|error| format!("installed package directory is unavailable: {error}"))?;
+    if !canonical.starts_with(&store_root) {
+        return Err("installed package directory escaped the managed Skill store".into());
+    }
+    let mut record = read_skill_record_with_source(
+        &canonical,
+        "package",
+        &format!("{}:{}", active.channel, active.digest),
+        active.declared_version.as_deref().unwrap_or(&active.digest),
+    )?;
+    if record.summary.name != active.name {
+        return Err(format!(
+            "package identity changed from `{}` to `{}`",
+            active.name, record.summary.name
+        ));
+    }
+    if record.summary.digest != active.digest {
+        return Err(format!(
+            "package digest mismatch: expected {}, observed {}",
+            active.digest, record.summary.digest
+        ));
+    }
+    record.summary.metadata.as_object_mut().map(|metadata| {
+        metadata.insert(
+            "anchor-channel".into(),
+            Value::String(active.channel.clone()),
+        );
+        metadata.insert(
+            "anchor-package-digest".into(),
+            Value::String(active.digest.clone()),
+        );
+    });
+    Ok(record)
 }
 
 fn copy_skill_tree(record: &SkillRecord, destination: &Path) -> Result<(), String> {
@@ -144,52 +193,31 @@ fn normalize_command_path(value: &str) -> String {
     }
 }
 
-fn public_roots(roots: &[String]) -> Vec<String> {
-    roots.iter().map(|root| display_root(root)).collect()
-}
-
 impl Default for SkillSettings {
     fn default() -> Self {
-        Self::from_text(true, DEFAULT_SKILL_ROOTS)
+        Self { enabled: true }
     }
 }
 
 impl SkillSettings {
-    pub fn from_text(enabled: bool, roots: &str) -> Self {
-        let roots = roots
-            .lines()
-            .flat_map(|line| line.split(';'))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        Self {
-            enabled,
-            roots: if roots.is_empty() {
-                DEFAULT_SKILL_ROOTS.lines().map(str::to_string).collect()
-            } else {
-                roots
-            },
-        }
-    }
-
-    pub fn roots_text(&self) -> String {
-        self.roots.join("\n")
+    pub fn new(enabled: bool) -> Self {
+        Self { enabled }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SkillCatalog {
     workspace_root: PathBuf,
-    settings: RwLock<SkillSettings>,
-    snapshot: RwLock<Arc<SkillSnapshot>>,
+    settings: Arc<RwLock<SkillSettings>>,
+    store: Arc<SkillPackageStore>,
+    snapshot: Arc<RwLock<Arc<SkillSnapshot>>>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillListResult {
     pub enabled: bool,
-    pub roots: Vec<String>,
+    pub package_store: String,
     pub skills: Vec<SkillSummary>,
     pub warnings: Vec<String>,
     pub truncated: bool,
@@ -234,16 +262,22 @@ struct SkillSnapshot {
 impl SkillCatalog {
     pub fn new(workspace_root: PathBuf) -> Self {
         let settings = SkillSettings::default();
-        let snapshot = Arc::new(scan_workspace(&workspace_root, &settings));
+        let store = Arc::new(SkillPackageStore::new(&workspace_root));
+        let snapshot = Arc::new(scan_active_packages(&workspace_root, &store, &settings));
         Self {
             workspace_root,
-            settings: RwLock::new(settings),
-            snapshot: RwLock::new(snapshot),
+            settings: Arc::new(RwLock::new(settings)),
+            store,
+            snapshot: Arc::new(RwLock::new(snapshot)),
         }
     }
 
     pub fn configure(&self, settings: SkillSettings) {
-        let snapshot = Arc::new(scan_workspace(&self.workspace_root, &settings));
+        let snapshot = Arc::new(scan_active_packages(
+            &self.workspace_root,
+            &self.store,
+            &settings,
+        ));
         *self.settings.write().expect("skill settings write") = settings;
         *self.snapshot.write().expect("skill snapshot write") = snapshot;
     }
@@ -258,17 +292,17 @@ impl SkillCatalog {
 
     pub fn list(&self, query: Option<&str>, max_results: usize) -> SkillListResult {
         let settings = self.settings();
-        let snapshot = self.refresh_snapshot();
+        let snapshot = self.current_snapshot();
         if !settings.enabled {
             return SkillListResult {
                 enabled: false,
-                roots: public_roots(&settings.roots),
+                package_store: ".anchor/skills".into(),
                 skills: Vec::new(),
                 warnings: Vec::new(),
                 truncated: false,
                 script_execution_enabled: false,
                 script_execution_policy: "disabled".into(),
-                snapshot_mode: "live-refresh".into(),
+                snapshot_mode: "active-package-snapshot".into(),
                 catalog_digest: snapshot.digest.clone(),
             };
         }
@@ -292,15 +326,75 @@ impl SkillCatalog {
 
         SkillListResult {
             enabled: true,
-            roots: public_roots(&settings.roots),
+            package_store: ".anchor/skills".into(),
             skills,
             warnings: snapshot.warnings.clone(),
             truncated,
             script_execution_enabled: false,
             script_execution_policy: "operator-dangerous-mode".into(),
-            snapshot_mode: "live-refresh".into(),
+            snapshot_mode: "active-package-snapshot".into(),
             catalog_digest: snapshot.digest.clone(),
         }
+    }
+
+    pub fn packages(&self) -> SkillPackageList {
+        self.store.list()
+    }
+
+    pub fn validate_package(&self, path: &str) -> Result<SkillPackageValidation, String> {
+        self.validate_package_inner(path)
+            .map(|(_, validation)| validation)
+    }
+
+    pub fn install_package(
+        &self,
+        path: &str,
+        channel: SkillChannel,
+        activate: bool,
+    ) -> Result<SkillPackageView, String> {
+        let (source, validation) = self.validate_package_inner(path)?;
+        let result = self
+            .store
+            .install(&source, &validation, channel, activate)?;
+        self.rebuild_snapshot();
+        Ok(result)
+    }
+
+    pub fn set_channel(
+        &self,
+        name: &str,
+        channel: SkillChannel,
+        version_ref: &str,
+    ) -> Result<SkillPackageView, String> {
+        let result = self.store.set_channel(name, channel, version_ref)?;
+        self.rebuild_snapshot();
+        Ok(result)
+    }
+
+    pub fn activate_package(
+        &self,
+        name: &str,
+        channel: SkillChannel,
+    ) -> Result<SkillPackageView, String> {
+        let result = self.store.activate(name, channel)?;
+        self.rebuild_snapshot();
+        Ok(result)
+    }
+
+    pub fn rollback_package(&self, name: &str) -> Result<SkillPackageView, String> {
+        let result = self.store.rollback(name)?;
+        self.rebuild_snapshot();
+        Ok(result)
+    }
+
+    pub fn remove_package(
+        &self,
+        name: &str,
+        version_ref: &str,
+    ) -> Result<SkillPackageView, String> {
+        let result = self.store.remove(name, version_ref)?;
+        self.rebuild_snapshot();
+        Ok(result)
     }
 
     pub fn load(
@@ -349,7 +443,7 @@ impl SkillCatalog {
 
     pub fn index_json(&self) -> Result<String, String> {
         let settings = self.settings();
-        let snapshot = self.refresh_snapshot();
+        let snapshot = self.current_snapshot();
         let skills = if settings.enabled {
             snapshot
                 .records
@@ -370,7 +464,7 @@ impl SkillCatalog {
         serde_json::to_string_pretty(&serde_json::json!({
             "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
             "catalogDigest": snapshot.digest,
-            "snapshotMode": "live-refresh",
+            "snapshotMode": "active-package-snapshot",
             "skills": skills
         }))
         .map_err(|error| format!("Skill index 序列化失败：{error}"))
@@ -378,7 +472,7 @@ impl SkillCatalog {
 
     pub fn native_catalog(&self) -> NativeSkillCatalog {
         let settings = self.settings();
-        let snapshot = self.refresh_snapshot();
+        let snapshot = self.current_snapshot();
         if !settings.enabled {
             return NativeSkillCatalog {
                 skills: Vec::new(),
@@ -445,7 +539,7 @@ impl SkillCatalog {
         if !settings.enabled {
             return Err("当前 workspace/profile 未启用 Skill 服务".into());
         }
-        let snapshot = self.refresh_snapshot();
+        let snapshot = self.current_snapshot();
         fs::create_dir_all(destination)
             .map_err(|error| format!("无法创建 Plugin skills 目录：{error}"))?;
 
@@ -453,13 +547,6 @@ impl SkillCatalog {
         let mut total_bytes = 0_u64;
         let mut warnings = snapshot.warnings.clone();
         for record in snapshot.records.values() {
-            if record.summary.source != "workspace" {
-                warnings.push(format!(
-                    "Skill {} 来源为 {}，Plugin package 默认只快照 workspace 内 Skill，已跳过",
-                    record.summary.name, record.summary.source
-                ));
-                continue;
-            }
             let entry = match native_entry_with_size(record) {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -594,25 +681,119 @@ impl SkillCatalog {
         if !self.is_enabled() {
             return Err("当前 workspace/profile 未启用 Skill 服务".into());
         }
-        self.refresh_snapshot()
+        self.current_snapshot()
             .records
             .get(name.trim())
             .cloned()
             .ok_or_else(|| format!("找不到 Skill：{}", name.trim()))
     }
 
-    fn refresh_snapshot(&self) -> Arc<SkillSnapshot> {
-        let settings = self.settings.read().expect("skill settings read");
-        let refreshed = Arc::new(scan_workspace(&self.workspace_root, &settings));
-        let mut snapshot = self.snapshot.write().expect("skill snapshot write");
-        if snapshot.digest != refreshed.digest {
-            *snapshot = refreshed;
+    fn current_snapshot(&self) -> Arc<SkillSnapshot> {
+        if self.store.refresh_from_disk().unwrap_or(false) {
+            self.rebuild_snapshot();
         }
-        snapshot.clone()
+        self.snapshot.read().expect("skill snapshot read").clone()
+    }
+
+    fn rebuild_snapshot(&self) {
+        let settings = self.settings();
+        let refreshed = Arc::new(scan_active_packages(
+            &self.workspace_root,
+            &self.store,
+            &settings,
+        ));
+        *self.snapshot.write().expect("skill snapshot write") = refreshed;
+    }
+
+    fn validate_package_inner(
+        &self,
+        path: &str,
+    ) -> Result<(PathBuf, SkillPackageValidation), String> {
+        let workspace = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| format!("failed to canonicalize workspace: {error}"))?;
+        let requested = PathBuf::from(path.trim());
+        let requested = if requested.is_absolute() {
+            requested
+        } else {
+            workspace.join(requested)
+        };
+        let source = requested
+            .canonicalize()
+            .map_err(|error| format!("Skill package source does not exist: {error}"))?;
+        if !source.starts_with(&workspace) {
+            return Err("Skill package source must stay inside the workspace".into());
+        }
+        let store_root = self
+            .store
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| self.store.root().to_path_buf());
+        if source.starts_with(&store_root) {
+            return Err("Skill package source cannot be the managed .anchor/skills store".into());
+        }
+        let relative = source
+            .strip_prefix(&workspace)
+            .unwrap_or(&source)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let record =
+            read_skill_record_with_source(&source, "candidate", "workspace-import", &relative)?;
+        if record.summary.resource_truncated {
+            return Err("Skill package resource manifest is truncated".into());
+        }
+        if !record.summary.warnings.is_empty() {
+            return Err(format!(
+                "Skill package contains files excluded by the security manifest: {}",
+                record.summary.warnings.join("; ")
+            ));
+        }
+        validate_native_manifest_completeness(&record)?;
+        let declared_version = record
+            .summary
+            .metadata
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if declared_version
+            .as_ref()
+            .is_some_and(|version| version.len() > 128 || version.chars().any(char::is_whitespace))
+        {
+            return Err(
+                "Skill metadata.version must be a non-empty token up to 128 characters".into(),
+            );
+        }
+        let total_bytes = record.raw.len() as u64
+            + record
+                .summary
+                .resources
+                .iter()
+                .chain(record.summary.scripts.iter())
+                .map(|file| file.size_bytes)
+                .sum::<u64>();
+        Ok((
+            source,
+            SkillPackageValidation {
+                name: record.summary.name,
+                digest: record.summary.digest,
+                declared_version,
+                source_path: relative,
+                file_count: record.summary.resources.len() + record.summary.scripts.len() + 1,
+                total_bytes,
+                warnings: record.summary.quality_warnings,
+            },
+        ))
     }
 }
 
-fn scan_workspace(workspace_root: &Path, settings: &SkillSettings) -> SkillSnapshot {
+fn scan_active_packages(
+    workspace_root: &Path,
+    store: &SkillPackageStore,
+    settings: &SkillSettings,
+) -> SkillSnapshot {
     if !settings.enabled {
         return SkillSnapshot {
             digest: "sha256:disabled".into(),
@@ -620,49 +801,26 @@ fn scan_workspace(workspace_root: &Path, settings: &SkillSettings) -> SkillSnaps
         };
     }
     let mut result = SkillSnapshot::default();
-    let mut seen_dirs = HashSet::new();
-    for configured_root in &settings.roots {
-        let resolved = resolve_root(workspace_root, configured_root);
-        let canonical_root = match resolved.canonicalize() {
-            Ok(path) if path.is_dir() => path,
-            Ok(_) => {
-                result.warnings.push(format!(
-                    "Skill 根目录不是目录：{}",
-                    display_root(configured_root)
-                ));
-                continue;
-            }
-            Err(_) => continue,
-        };
-        if !seen_dirs.insert(canonical_root.clone()) {
-            continue;
+    if let Some(error) = store.load_error() {
+        result.warnings.push(format!(
+            "Skill package store is unavailable and no package was activated: {error}"
+        ));
+        result.digest = "sha256:store-unavailable".into();
+        return result;
+    }
+    for active in store.active_packages() {
+        if result.records.len() >= MAX_SKILLS {
+            result.truncated = true;
+            break;
         }
-
-        let candidates = discover_skill_dirs(&canonical_root);
-        for skill_dir in candidates {
-            if result.records.len() >= MAX_SKILLS {
-                result.truncated = true;
-                break;
+        match read_active_package_record(workspace_root, store, &active) {
+            Ok(record) => {
+                result.records.insert(active.name.clone(), record);
             }
-            match read_skill_record(workspace_root, configured_root, &canonical_root, &skill_dir) {
-                Ok(record) => {
-                    if result.records.contains_key(&record.summary.name) {
-                        result.warnings.push(format!(
-                            "发现重复 Skill {}，保留先出现的来源，忽略后续目录",
-                            record.summary.name
-                        ));
-                    } else {
-                        result.records.insert(record.summary.name.clone(), record);
-                    }
-                }
-                Err(error) => result.warnings.push(format!(
-                    "忽略 Skill 目录 {}：{error}",
-                    skill_dir
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("<invalid>")
-                )),
-            }
+            Err(error) => result.warnings.push(format!(
+                "Skill package {}@{} is not active: {error}",
+                active.name, active.digest
+            )),
         }
     }
     let mut digest = Sha256::new();
@@ -671,40 +829,22 @@ fn scan_workspace(workspace_root: &Path, settings: &SkillSettings) -> SkillSnaps
         digest.update([0]);
         digest.update(record.summary.digest.as_bytes());
         digest.update([0]);
+        digest.update(record.summary.source_id.as_bytes());
+        digest.update([0]);
     }
     result.digest = format!("sha256:{:x}", digest.finalize());
     result
 }
 
-fn discover_skill_dirs(root: &Path) -> Vec<PathBuf> {
-    if root.join("SKILL.md").is_file() {
-        return vec![root.to_path_buf()];
-    }
-    let mut dirs = WalkDir::new(root)
-        .min_depth(1)
-        .max_depth(2)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_dir() && entry.path().join("SKILL.md").is_file())
-        .map(|entry| entry.into_path())
-        .collect::<Vec<_>>();
-    dirs.sort();
-    dirs
-}
-
-fn read_skill_record(
-    workspace_root: &Path,
-    configured_root: &str,
-    source_root: &Path,
+fn read_skill_record_with_source(
     skill_dir: &Path,
+    source: &str,
+    source_id: &str,
+    relative_path: &str,
 ) -> Result<SkillRecord, String> {
     let canonical_dir = skill_dir
         .canonicalize()
         .map_err(|error| format!("无法解析目录：{error}"))?;
-    if !canonical_dir.starts_with(source_root) {
-        return Err("Skill 目录通过符号链接越过配置根目录".into());
-    }
     let directory_name = canonical_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -720,8 +860,6 @@ fn read_skill_record(
     let discovered = discover_files(&canonical_dir);
     let digest = package_digest(&raw, &discovered.resources, &discovered.scripts);
     let skill_md_digest = format!("sha256:{:x}", Sha256::digest(raw.as_bytes()));
-    let (source, source_id, relative_path) =
-        source_descriptor(workspace_root, configured_root, source_root, &canonical_dir);
     let uri = super::resource::skill_resource_uri(&parsed.name, "SKILL.md");
     let summary = SkillSummary {
         name: parsed.name,
@@ -738,9 +876,9 @@ fn read_skill_record(
         tool_compatible: true,
         tool_enforcement_mode: "declarative-only".into(),
         tool_grants_permissions: false,
-        source,
-        source_id,
-        relative_path,
+        source: source.into(),
+        source_id: source_id.into(),
+        relative_path: relative_path.into(),
         uri,
         digest,
         instruction_lines: parsed.instruction_lines,
@@ -889,84 +1027,6 @@ fn package_digest(
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn source_descriptor(
-    workspace_root: &Path,
-    configured_root: &str,
-    source_root: &Path,
-    skill_dir: &Path,
-) -> (String, String, String) {
-    let workspace = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let home = dirs::home_dir().and_then(|path| path.canonicalize().ok());
-    let source = if source_root.starts_with(&workspace) {
-        "workspace"
-    } else if home
-        .as_ref()
-        .is_some_and(|home| source_root.starts_with(home))
-    {
-        "home"
-    } else {
-        "external"
-    };
-    let mut digest = Sha256::new();
-    digest.update(source_root.to_string_lossy().as_bytes());
-    let hex = format!("{:x}", digest.finalize());
-    let source_id = if source == "workspace" && !Path::new(configured_root).is_absolute() {
-        let label = configured_root
-            .trim_matches(['.', '/', '\\'])
-            .replace(['/', '\\'], "-");
-        format!(
-            "workspace-{}",
-            if label.is_empty() { "root" } else { &label }
-        )
-    } else {
-        format!("{source}-{}", &hex[..12])
-    };
-    let relative_path = skill_dir
-        .strip_prefix(source_root)
-        .unwrap_or_else(|_| Path::new(skill_dir.file_name().unwrap_or_default()))
-        .to_string_lossy()
-        .replace('\\', "/");
-    (
-        source.into(),
-        source_id,
-        if relative_path.is_empty() {
-            ".".into()
-        } else {
-            relative_path
-        },
-    )
-}
-
-fn display_root(configured: &str) -> String {
-    if Path::new(configured).is_absolute() {
-        "<absolute-skill-root>".into()
-    } else {
-        configured.to_string()
-    }
-}
-
-fn resolve_root(workspace_root: &Path, configured: &str) -> PathBuf {
-    if configured == "~" {
-        return dirs::home_dir().unwrap_or_else(|| workspace_root.to_path_buf());
-    }
-    if let Some(rest) = configured
-        .strip_prefix("~/")
-        .or_else(|| configured.strip_prefix("~\\"))
-    {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    let path = PathBuf::from(configured);
-    if path.is_absolute() {
-        path
-    } else {
-        workspace_root.join(path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,18 +1046,59 @@ mod tests {
         .expect("write resource");
     }
 
+    fn write_versioned_skill(root: &Path, name: &str, description: &str, version: &str) {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).expect("create versioned skill");
+        fs::write(
+            directory.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: {description}\nmetadata:\n  version: '{version}'\n---\nUse {version}.\n"
+            ),
+        )
+        .expect("write versioned skill");
+    }
+
+    fn install_package(
+        catalog: &SkillCatalog,
+        path: &Path,
+        channel: SkillChannel,
+        activate: bool,
+    ) -> SkillPackageView {
+        catalog
+            .install_package(path.to_str().expect("utf8 skill path"), channel, activate)
+            .expect("install Skill package")
+    }
+
     #[test]
-    fn discovers_loads_and_reads_workspace_skills() {
+    fn workspace_sources_require_explicit_install_and_activation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         write_skill(&skills, "code-review", "Review code safely.");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
 
+        assert!(catalog.list(None, 100).skills.is_empty());
+        let validation = catalog
+            .validate_package(skills.join("code-review").to_str().unwrap())
+            .expect("validate source");
+        assert_eq!(validation.name, "code-review");
+        let installed = install_package(
+            &catalog,
+            &skills.join("code-review"),
+            SkillChannel::Development,
+            false,
+        );
+        assert!(installed.active_digest.is_none());
+        assert!(catalog.list(None, 100).skills.is_empty());
+        catalog
+            .activate_package("code-review", SkillChannel::Development)
+            .expect("activate package");
+
         let listed = catalog.list(None, 100);
         assert_eq!(listed.skills.len(), 1);
         assert_eq!(listed.skills[0].name, "code-review");
         assert_eq!(listed.skills[0].resources.len(), 1);
-        assert_eq!(listed.skills[0].source, "workspace");
+        assert_eq!(listed.skills[0].source, "package");
+        assert_eq!(listed.snapshot_mode, "active-package-snapshot");
         assert!(!listed.skills[0]
             .source_id
             .contains(temp.path().to_string_lossy().as_ref()));
@@ -1023,25 +1124,37 @@ mod tests {
     }
 
     #[test]
-    fn plugin_export_only_packages_workspace_skill_sources() {
+    fn plugin_export_only_packages_active_installed_skills() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let external = tempfile::tempdir().expect("external");
-        write_skill(external.path(), "private-skill", "Private external skill.");
+        let sources = workspace.path().join("sources");
+        write_skill(&sources, "private-skill", "Private inactive skill.");
+        write_skill(&sources, "active-skill", "Active skill.");
         let catalog = SkillCatalog::new(workspace.path().to_path_buf());
-        catalog.configure(SkillSettings {
-            enabled: true,
-            roots: vec![external.path().to_string_lossy().to_string()],
-        });
+        install_package(
+            &catalog,
+            &sources.join("private-skill"),
+            SkillChannel::Development,
+            false,
+        );
+        install_package(
+            &catalog,
+            &sources.join("active-skill"),
+            SkillChannel::Stable,
+            true,
+        );
 
-        let error = catalog
+        let export = catalog
             .export_plugin_skills(&workspace.path().join("plugin-skills"))
-            .expect_err("external skill must not be packaged");
-        assert!(error.contains("没有可打包的 Skill"));
-        assert!(error.contains("Plugin package 默认只快照 workspace 内 Skill"));
+            .expect("active package export");
+        assert_eq!(export.skills, vec!["active-skill"]);
         assert!(!workspace
             .path()
             .join("plugin-skills/private-skill/SKILL.md")
             .exists());
+        assert!(workspace
+            .path()
+            .join("plugin-skills/active-skill/SKILL.md")
+            .is_file());
     }
 
     #[test]
@@ -1056,6 +1169,7 @@ mod tests {
         .expect("skill");
 
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        install_package(&catalog, &skill_dir, SkillChannel::Stable, true);
         let listed = catalog.list(None, 100);
 
         assert_eq!(listed.skills.len(), 1, "{:?}", listed.warnings);
@@ -1075,14 +1189,12 @@ mod tests {
     fn native_catalog_is_bounded_to_chatgpt_import_limits() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
-        for index in 0..6 {
-            write_skill(
-                &skills,
-                &format!("skill-{index}"),
-                &format!("Skill {index}."),
-            );
-        }
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        for index in 0..6 {
+            let name = format!("skill-{index}");
+            write_skill(&skills, &name, &format!("Skill {index}."));
+            install_package(&catalog, &skills.join(name), SkillChannel::Stable, true);
+        }
 
         let native = catalog.native_catalog();
 
@@ -1096,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn native_catalog_omits_skills_with_unreadable_supporting_files() {
+    fn install_rejects_skills_with_unreadable_supporting_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         write_skill(&skills, "oversize", "Oversize resource.");
@@ -1107,19 +1219,18 @@ mod tests {
         .expect("large resource");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
 
-        let native = catalog.native_catalog();
-
-        assert!(native.skills.is_empty());
-        assert!(native
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("未进入原生 MCP Skill 导入目录")));
+        let error = catalog
+            .validate_package(skills.join("oversize").to_str().unwrap())
+            .expect_err("oversized resource must block package install");
+        assert!(error.contains("security manifest") || error.contains("resource"));
+        assert!(catalog.packages().packages.is_empty());
     }
 
     #[test]
     fn native_catalog_reserves_scan_archive_overhead_across_skills() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
         for name in ["archive-a", "archive-b"] {
             write_skill(&skills, name, "Large native import payload.");
             let references = skills.join(name).join("references");
@@ -1130,8 +1241,8 @@ mod tests {
                 )
                 .expect("payload");
             }
+            install_package(&catalog, &skills.join(name), SkillChannel::Stable, true);
         }
-        let catalog = SkillCatalog::new(temp.path().to_path_buf());
 
         let native = catalog.native_catalog();
 
@@ -1145,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn native_catalog_requires_every_supporting_file_to_be_manifested() {
+    fn package_validation_requires_every_supporting_file_to_be_manifested() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         write_skill(&skills, "complete", "Complete manifest.");
@@ -1154,39 +1265,70 @@ mod tests {
         fs::write(extra.join("NOTES.md"), "not in Anchor resource manifest\n").expect("extra file");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
 
-        let native = catalog.native_catalog();
-
-        assert!(native.skills.is_empty());
-        assert!(native.warnings.iter().any(|warning| {
-            warning.contains("支持文件未进入可校验资源清单") && warning.contains("docs/NOTES.md")
-        }));
+        let error = catalog
+            .validate_package(skills.join("complete").to_str().unwrap())
+            .expect_err("unmanifested file must reject install");
+        assert!(error.contains("支持文件未进入可校验资源清单"));
+        assert!(error.contains("docs/NOTES.md"));
     }
 
     #[test]
-    fn first_configured_root_wins_duplicate_names() {
+    fn multiple_versions_of_one_skill_are_isolated_until_channel_activation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        write_skill(&temp.path().join("one"), "shared", "First skill.");
-        write_skill(&temp.path().join("two"), "shared", "Second skill.");
+        let first_root = temp.path().join("sources/one");
+        let second_root = temp.path().join("sources/two");
+        write_skill(&first_root, "shared", "First skill.");
+        write_skill(&second_root, "shared", "Second skill.");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
-        catalog.configure(SkillSettings::from_text(true, "one\ntwo"));
+        let first = install_package(
+            &catalog,
+            &first_root.join("shared"),
+            SkillChannel::Stable,
+            true,
+        );
+        let second = install_package(
+            &catalog,
+            &second_root.join("shared"),
+            SkillChannel::Canary,
+            false,
+        );
+        assert_ne!(first.active_digest, Some(second.channels["canary"].clone()));
 
         let listed = catalog.list(None, 100);
-
         assert_eq!(listed.skills.len(), 1);
         assert_eq!(listed.skills[0].description, "First skill.");
-        assert!(listed.warnings.iter().any(|value| value.contains("重复")));
+        catalog
+            .activate_package("shared", SkillChannel::Canary)
+            .expect("activate canary");
+        assert_eq!(
+            catalog.list(None, 100).skills[0].description,
+            "Second skill."
+        );
+        catalog.rollback_package("shared").expect("rollback");
+        assert_eq!(
+            catalog.list(None, 100).skills[0].description,
+            "First skill."
+        );
     }
 
     #[test]
     fn resource_path_must_be_in_snapshot_manifest() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(&temp.path().join("skills"), "safe", "Safe skill.");
-        fs::write(
-            temp.path().join("skills/safe/unlisted.bin"),
-            b"secret-but-not-sensitive",
-        )
-        .expect("unlisted");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        let package = install_package(
+            &catalog,
+            &temp.path().join("skills/safe"),
+            SkillChannel::Stable,
+            true,
+        );
+        let digest = package.active_digest.expect("active digest");
+        let package_dir = temp
+            .path()
+            .join(".anchor/skills/packages/safe")
+            .join(digest.trim_start_matches("sha256:"))
+            .join("safe");
+        fs::write(package_dir.join("unlisted.bin"), b"tampered").expect("unlisted package file");
 
         let error = catalog
             .read_resource("safe", "unlisted.bin", None, None, 1024)
@@ -1195,43 +1337,157 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_refreshes_when_skill_files_change() {
+    fn active_snapshot_never_follows_source_directory_changes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         write_skill(&skills, "one", "One.");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        install_package(&catalog, &skills.join("one"), SkillChannel::Stable, true);
         assert_eq!(catalog.list(None, 100).skills.len(), 1);
         write_skill(&skills, "two", "Two.");
         let listed = catalog.list(None, 100);
-        assert_eq!(listed.snapshot_mode, "live-refresh");
-        assert_eq!(listed.skills.len(), 2);
+        assert_eq!(listed.snapshot_mode, "active-package-snapshot");
+        assert_eq!(listed.skills.len(), 1);
+        assert_eq!(listed.skills[0].name, "one");
+        install_package(&catalog, &skills.join("two"), SkillChannel::Stable, true);
+        assert_eq!(catalog.list(None, 100).skills.len(), 2);
     }
 
     #[test]
-    fn package_digest_changes_when_supporting_file_changes() {
+    fn source_digest_changes_do_not_mutate_installed_active_package() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = temp.path().join("skills");
         write_skill(&skills, "digest", "Digest.");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
-        let before = catalog.list(None, 100).skills[0].digest.clone();
+        let before_validation = catalog
+            .validate_package(skills.join("digest").to_str().unwrap())
+            .expect("validate before");
+        install_package(&catalog, &skills.join("digest"), SkillChannel::Stable, true);
+        let active_before = catalog.list(None, 100).skills[0].digest.clone();
         fs::write(skills.join("digest/references/DETAILS.md"), "changed").expect("change");
-        let after = catalog.list(None, 100).skills[0].digest.clone();
-        assert_ne!(before, after);
+        let after_validation = catalog
+            .validate_package(skills.join("digest").to_str().unwrap())
+            .expect("validate after");
+        assert_ne!(before_validation.digest, after_validation.digest);
+        assert_eq!(catalog.list(None, 100).skills[0].digest, active_before);
     }
 
     #[test]
-    fn repository_installed_skill_uses_supported_frontmatter() {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Some(workspace) = manifest.parent().and_then(Path::parent) else {
-            return;
-        };
-        if !workspace
-            .join(".agents/skills/mcp-probe-kit/SKILL.md")
-            .is_file()
-        {
-            return;
-        }
-        let catalog = SkillCatalog::new(workspace.to_path_buf());
+    fn declared_version_is_immutable_across_package_digests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_root = temp.path().join("sources/first");
+        let second_root = temp.path().join("sources/second");
+        write_versioned_skill(&first_root, "immutable", "First payload.", "1.0.0");
+        write_versioned_skill(&second_root, "immutable", "Different payload.", "1.0.0");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+
+        let first = install_package(
+            &catalog,
+            &first_root.join("immutable"),
+            SkillChannel::Stable,
+            true,
+        );
+        assert_eq!(first.versions[0].declared_version.as_deref(), Some("1.0.0"));
+
+        let error = catalog
+            .install_package(
+                second_root.join("immutable").to_str().unwrap(),
+                SkillChannel::Canary,
+                false,
+            )
+            .expect_err("same declared version cannot map to another digest");
+        assert!(error.contains("declared version `1.0.0` is immutable"));
+        assert_eq!(catalog.packages().packages[0].versions.len(), 1);
+    }
+
+    #[test]
+    fn active_and_channel_referenced_versions_are_protected_from_removal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sources = temp.path().join("sources");
+        write_versioned_skill(&sources.join("v1"), "protected", "Stable.", "1.0.0");
+        write_versioned_skill(&sources.join("v2"), "protected", "Canary.", "2.0.0");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        install_package(
+            &catalog,
+            &sources.join("v1/protected"),
+            SkillChannel::Stable,
+            true,
+        );
+        install_package(
+            &catalog,
+            &sources.join("v2/protected"),
+            SkillChannel::Canary,
+            false,
+        );
+
+        let active_error = catalog
+            .remove_package("protected", "1.0.0")
+            .expect_err("active version cannot be removed");
+        assert!(active_error.contains("is active"));
+
+        let referenced_error = catalog
+            .remove_package("protected", "2.0.0")
+            .expect_err("channel-referenced version cannot be removed");
+        assert!(referenced_error.contains("referenced by channels: canary"));
+
+        catalog
+            .set_channel("protected", SkillChannel::Canary, "1.0.0")
+            .expect("repoint canary to stable digest");
+        let removed = catalog
+            .remove_package("protected", "2.0.0")
+            .expect("unreferenced inactive version can be removed");
+        assert_eq!(removed.versions.len(), 1);
+        assert!(removed
+            .versions
+            .iter()
+            .all(|version| version.declared_version.as_deref() == Some("1.0.0")));
+    }
+
+    #[test]
+    fn corrupt_package_store_fails_closed_without_source_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sources = temp.path().join("sources");
+        write_skill(&sources, "closed", "Must not auto-discover.");
+        let store_dir = temp.path().join(".anchor/skills");
+        fs::create_dir_all(&store_dir).expect("store dir");
+        fs::write(store_dir.join("state.json"), b"{not-json").expect("corrupt state");
+
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        let listed = catalog.list(None, 100);
+        assert!(listed.skills.is_empty());
+        assert!(listed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Skill package store is unavailable")));
+
+        let error = catalog
+            .install_package(
+                sources.join("closed").to_str().unwrap(),
+                SkillChannel::Stable,
+                true,
+            )
+            .expect_err("mutation must not overwrite corrupt state");
+        assert!(error.contains("failed to parse Skill store state"));
+        assert_eq!(
+            fs::read(store_dir.join("state.json")).expect("state preserved"),
+            b"{not-json"
+        );
+    }
+
+    #[test]
+    fn installed_package_preserves_supported_frontmatter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = temp.path().join("sources/mcp-probe-kit");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: mcp-probe-kit\ndescription: Probe kit.\ncompatibility: Anchor 3.6.11\nmcp-probe-kit-version: 3.6.11\nallowed-tools: start_feature workflow\n---\nUse it.\n",
+        )
+        .expect("skill");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        assert!(catalog.list(Some("mcp-probe-kit"), 10).skills.is_empty());
+        install_package(&catalog, &skill_dir, SkillChannel::Stable, true);
+
         let listed = catalog.list(Some("mcp-probe-kit"), 10);
         assert_eq!(listed.skills.len(), 1, "{:?}", listed.warnings);
         let skill = &listed.skills[0];
@@ -1242,23 +1498,6 @@ mod tests {
             .is_some_and(|value| value.contains("3.6.11")));
         assert!(skill.allowed_tools.contains(&"start_feature".to_string()));
         assert!(skill.allowed_tools.contains(&"workflow".to_string()));
-
-        let native = catalog.native_catalog();
-        assert_eq!(native.omitted_count, 0, "{:?}", native.warnings);
-        let imported = native
-            .skills
-            .iter()
-            .find(|entry| entry["frontmatter"]["name"] == "mcp-probe-kit")
-            .expect("repository Skill must enter the native import catalog");
-        assert_eq!(imported["uri"], "skill://anchor/mcp-probe-kit/SKILL.md");
-        assert!(imported["resources"]
-            .as_array()
-            .expect("native resources")
-            .iter()
-            .any(|resource| {
-                resource["uri"] == "skill://anchor/mcp-probe-kit/SKILL.md"
-                    && is_full_sha256(resource["digest"].as_str().unwrap_or_default())
-            }));
     }
 
     #[test]
@@ -1275,6 +1514,7 @@ mod tests {
         )
         .expect("skill");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        install_package(&catalog, &skill_dir, SkillChannel::Stable, true);
 
         let listed = catalog.list(None, 10);
         assert_eq!(listed.skills.len(), 1, "{:?}", listed.warnings);
@@ -1318,6 +1558,14 @@ mod tests {
         fs::write(rejected_dir.join("SKILL.md"), rejected).expect("rejected skill");
 
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        catalog
+            .validate_package(accepted_dir.to_str().unwrap())
+            .expect("boundary-sized package validates");
+        install_package(&catalog, &accepted_dir, SkillChannel::Stable, true);
+        let error = catalog
+            .validate_package(rejected_dir.to_str().unwrap())
+            .expect_err("oversized SKILL.md must be rejected before install");
+        assert!(error.contains(&MAX_SKILL_MD_BYTES.to_string()));
         let listed = catalog.list(None, 10);
         assert_eq!(
             listed
@@ -1327,9 +1575,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["accepted"]
         );
-        assert!(listed
-            .warnings
+        assert!(!catalog
+            .packages()
+            .packages
             .iter()
-            .any(|warning| warning.contains(&MAX_SKILL_MD_BYTES.to_string())));
+            .any(|package| package.name == "rejected"));
     }
 }

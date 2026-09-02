@@ -1,6 +1,7 @@
 mod catalog;
 mod model;
 mod resource;
+mod store;
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -9,6 +10,7 @@ use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::ToolContext;
 
 pub use catalog::{PluginSkillExport, SkillCatalog, SkillSettings};
+pub use store::SkillChannel;
 
 const RESOURCE_PAGE_SIZE: usize = 200;
 const MAX_RESOURCE_ENTRIES: usize = 5000;
@@ -22,6 +24,20 @@ struct SkillUriRequest {
     start_line: Option<usize>,
     end_line: Option<usize>,
     max_bytes: u64,
+}
+
+fn skill_package_error(code: &'static str, message: String) -> WorkspaceError {
+    WorkspaceError::Tool {
+        code,
+        message,
+        category: "validation",
+        retryable: false,
+    }
+}
+
+fn required_channel(args: &Value) -> Result<SkillChannel, WorkspaceError> {
+    let channel = required_string(args, "channel")?;
+    SkillChannel::parse(channel).map_err(|message| WorkspaceError::invalid_argument(message))
 }
 
 pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -93,6 +109,82 @@ pub fn read_resource_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value,
     Ok(tool_ok(
         serde_json::to_value(resource).map_err(skill_error)?,
     ))
+}
+
+pub fn packages_tool(catalog: &SkillCatalog) -> Result<Value, WorkspaceError> {
+    Ok(tool_ok(
+        serde_json::to_value(catalog.packages()).map_err(skill_error)?,
+    ))
+}
+
+pub fn validate_package_tool(
+    catalog: &SkillCatalog,
+    args: &Value,
+) -> Result<Value, WorkspaceError> {
+    let path = required_string(args, "path")?;
+    let validated = catalog
+        .validate_package(path)
+        .map_err(|message| skill_package_error("SKILL_PACKAGE_INVALID", message))?;
+    Ok(tool_ok(
+        serde_json::to_value(validated).map_err(skill_error)?,
+    ))
+}
+
+pub fn install_package_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
+    let path = required_string(args, "path")?;
+    let channel = required_channel(args)?;
+    let activate = args
+        .get("activate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let installed = catalog
+        .install_package(path, channel, activate)
+        .map_err(|message| skill_package_error("SKILL_PACKAGE_INSTALL_FAILED", message))?;
+    Ok(tool_ok(
+        serde_json::to_value(installed).map_err(skill_error)?,
+    ))
+}
+
+pub fn set_channel_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
+    let name = required_string(args, "name")?;
+    let channel = required_channel(args)?;
+    let version = required_string(args, "version")?;
+    let package = catalog
+        .set_channel(name, channel, version)
+        .map_err(|message| skill_package_error("SKILL_CHANNEL_UPDATE_FAILED", message))?;
+    Ok(tool_ok(serde_json::to_value(package).map_err(skill_error)?))
+}
+
+pub fn activate_package_tool(
+    catalog: &SkillCatalog,
+    args: &Value,
+) -> Result<Value, WorkspaceError> {
+    let name = required_string(args, "name")?;
+    let channel = required_channel(args)?;
+    let package = catalog
+        .activate_package(name, channel)
+        .map_err(|message| skill_package_error("SKILL_ACTIVATION_FAILED", message))?;
+    Ok(tool_ok(serde_json::to_value(package).map_err(skill_error)?))
+}
+
+pub fn rollback_package_tool(
+    catalog: &SkillCatalog,
+    args: &Value,
+) -> Result<Value, WorkspaceError> {
+    let name = required_string(args, "name")?;
+    let package = catalog
+        .rollback_package(name)
+        .map_err(|message| skill_package_error("SKILL_ROLLBACK_FAILED", message))?;
+    Ok(tool_ok(serde_json::to_value(package).map_err(skill_error)?))
+}
+
+pub fn remove_package_tool(catalog: &SkillCatalog, args: &Value) -> Result<Value, WorkspaceError> {
+    let name = required_string(args, "name")?;
+    let version = required_string(args, "version")?;
+    let package = catalog
+        .remove_package(name, version)
+        .map_err(|message| skill_package_error("SKILL_PACKAGE_REMOVE_FAILED", message))?;
+    Ok(tool_ok(serde_json::to_value(package).map_err(skill_error)?))
 }
 
 pub fn resources_list(catalog: &SkillCatalog, params: &Value) -> Result<Value, Value> {
@@ -478,6 +570,13 @@ mod tests {
         .expect("write skill");
         fs::write(skill_dir.join("references/INFO.md"), "info").expect("write info");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        catalog
+            .install_package(
+                skill_dir.to_str().expect("skill path"),
+                SkillChannel::Stable,
+                true,
+            )
+            .expect("install active skill");
         (temp, catalog)
     }
 
@@ -501,6 +600,7 @@ mod tests {
     #[test]
     fn native_list_uses_only_standard_fields_and_get_is_limited_to_exposed_skills() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
         for index in 0..6 {
             let skill_dir = temp.path().join(format!("skills/skill-{index}"));
             fs::create_dir_all(&skill_dir).expect("skill dir");
@@ -511,8 +611,14 @@ mod tests {
                 ),
             )
             .expect("skill");
+            catalog
+                .install_package(
+                    skill_dir.to_str().expect("skill path"),
+                    SkillChannel::Stable,
+                    true,
+                )
+                .expect("install skill");
         }
-        let catalog = SkillCatalog::new(temp.path().to_path_buf());
 
         let listed = native_skills_list(&catalog, &json!({})).expect("native list");
         let object = listed.as_object().expect("list object");
@@ -617,6 +723,13 @@ mod tests {
         )
         .expect("skill");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        catalog
+            .install_package(
+                skill_dir.to_str().expect("skill path"),
+                SkillChannel::Stable,
+                true,
+            )
+            .expect("install large skill");
 
         let first = resource_read(
             &catalog,
@@ -643,6 +756,13 @@ mod tests {
         assert!(raw.len() < catalog::MAX_SKILL_MD_BYTES as usize);
         fs::write(skill_dir.join("SKILL.md"), &raw).expect("skill");
         let catalog = SkillCatalog::new(temp.path().to_path_buf());
+        catalog
+            .install_package(
+                skill_dir.to_str().expect("skill path"),
+                SkillChannel::Stable,
+                true,
+            )
+            .expect("install native-large skill");
 
         let result = resource_read(
             &catalog,
@@ -676,7 +796,7 @@ mod tests {
     #[test]
     fn disabled_service_exposes_no_resources() {
         let (_temp, catalog) = catalog_with_skill();
-        catalog.configure(SkillSettings::from_text(false, "skills"));
+        catalog.configure(SkillSettings::new(false));
 
         assert_eq!(
             resources_list(&catalog, &json!({})).unwrap()["resources"],
@@ -690,6 +810,7 @@ mod tests {
     #[test]
     fn resources_list_supports_opaque_cursor_pagination() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let catalog = SkillCatalog::new(temp.path().to_path_buf());
         for index in 0..205 {
             let skill_dir = temp.path().join(format!("skills/s{index}"));
             fs::create_dir_all(&skill_dir).expect("skill dir");
@@ -698,8 +819,14 @@ mod tests {
                 format!("---\nname: s{index}\ndescription: Skill {index}.\n---\nUse it.\n"),
             )
             .expect("skill");
+            catalog
+                .install_package(
+                    skill_dir.to_str().expect("skill path"),
+                    SkillChannel::Stable,
+                    true,
+                )
+                .expect("install paginated skill");
         }
-        let catalog = SkillCatalog::new(temp.path().to_path_buf());
         let first = resources_list(&catalog, &json!({})).expect("first page");
         assert_eq!(first["resources"].as_array().unwrap().len(), 200);
         let cursor = first["nextCursor"].as_str().expect("cursor");

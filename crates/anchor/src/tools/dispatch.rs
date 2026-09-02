@@ -1663,6 +1663,23 @@ fn call_tool_impl(
             "read_skill_resource" => {
                 crate::skills::read_resource_tool(&ctx.skills, &effective_args)
             }
+            "skill_list_packages" => crate::skills::packages_tool(&ctx.skills),
+            "skill_validate_package" => {
+                crate::skills::validate_package_tool(&ctx.skills, &effective_args)
+            }
+            "skill_install_package" => {
+                crate::skills::install_package_tool(&ctx.skills, &effective_args)
+            }
+            "skill_set_channel" => crate::skills::set_channel_tool(&ctx.skills, &effective_args),
+            "skill_activate_package" => {
+                crate::skills::activate_package_tool(&ctx.skills, &effective_args)
+            }
+            "skill_rollback_package" => {
+                crate::skills::rollback_package_tool(&ctx.skills, &effective_args)
+            }
+            "skill_remove_package" => {
+                crate::skills::remove_package_tool(&ctx.skills, &effective_args)
+            }
             "check_exec_environment" => check_exec_environment(ctx, &effective_args),
             "exec_health_check" => exec::exec_health_check(ctx),
             "command_cost_explain" => exec::command_cost_explain(ctx, &effective_args),
@@ -2629,7 +2646,17 @@ fn tool_group_manifest(tools: &[&str]) -> Value {
             &mut task
         } else if matches!(
             *tool,
-            "skill" | "list_skills" | "load_skill" | "read_skill_resource"
+            "skill"
+                | "list_skills"
+                | "load_skill"
+                | "read_skill_resource"
+                | "skill_list_packages"
+                | "skill_validate_package"
+                | "skill_install_package"
+                | "skill_set_channel"
+                | "skill_activate_package"
+                | "skill_rollback_package"
+                | "skill_remove_package"
         ) {
             &mut skills
         } else if tool.contains("browser")

@@ -254,11 +254,9 @@ pub(crate) fn spawn_listener_with_handoff(
         runtime.permission_mode.clone(),
         public_base_url.clone(),
     );
-    mcp.skills
-        .configure(crate::skills::SkillSettings::from_text(
-            runtime.skill_service_enabled,
-            &runtime.skill_roots,
-        ));
+    mcp.skills.configure(crate::skills::SkillSettings::new(
+        runtime.skill_service_enabled,
+    ));
     let bearer_token = if auth.bearer_enabled() {
         let key = "bearer_token";
         if auth.use_shared_secrets {
@@ -1679,6 +1677,15 @@ mod tests {
             "HTTP import reference.\n",
         )
         .expect("skill resource");
+        state
+            .mcp
+            .skills
+            .install_package(
+                skill_dir.to_str().expect("skill path"),
+                crate::skills::SkillChannel::Stable,
+                true,
+            )
+            .expect("install active Skill package");
 
         let response = mcp_post(
             State(state.clone()),
