@@ -27,11 +27,26 @@ const NONCE_BYTES: usize = 12;
 const KEY_BYTES: usize = 32;
 const MIN_PASSPHRASE_BYTES: usize = 12;
 const MAX_PORTABLE_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
+const NON_PORTABLE_APP_SECRET_PREFIXES: &[&str] = &["federation_"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspacePathMapping {
     pub selector: String,
     pub target: PathBuf,
+}
+
+fn portable_secrets(data: &AppData) -> SecretsData {
+    let mut secrets = SecretsData::from_app_data(data);
+    strip_non_portable_app_secrets(&mut secrets);
+    secrets
+}
+
+fn strip_non_portable_app_secrets(secrets: &mut SecretsData) {
+    secrets.app_secrets.retain(|scope, _| {
+        !NON_PORTABLE_APP_SECRET_PREFIXES
+            .iter()
+            .any(|prefix| scope.starts_with(prefix))
+    });
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,7 +216,7 @@ fn encode_bundle(data: &AppData, passphrase: &[u8]) -> AppResult<PortableConfigE
     );
     let payload = PortableConfigPayload {
         profiles: ProfilesData::from_app_data(data),
-        secrets: SecretsData::from_app_data(data),
+        secrets: portable_secrets(data),
     };
     let plaintext = serde_json::to_vec(&payload)?;
 
@@ -285,7 +300,9 @@ fn decode_bundle(envelope: &PortableConfigEnvelope, passphrase: &[u8]) -> AppRes
     let payload: PortableConfigPayload = serde_json::from_slice(&plaintext)
         .map_err(|error| AppError::Message(format!("迁移包解密后的配置无效：{error}")))?;
     let mut data = payload.profiles.into_app_data();
-    payload.secrets.apply_to(&mut data);
+    let mut secrets = payload.secrets;
+    strip_non_portable_app_secrets(&mut secrets);
+    secrets.apply_to(&mut data);
     Ok(data)
 }
 
@@ -736,6 +753,45 @@ mod tests {
         let serialized = serde_json::to_string(&envelope).expect("serialize envelope");
         assert!(!serialized.contains("portable-secret"));
         assert!(!serialized.contains("chatgpt-client-stable"));
+    }
+
+    #[test]
+    fn federation_credentials_and_replay_state_are_never_portable() {
+        let mut data = sample_data("C:/work/demo".into());
+        data.app_secrets
+            .entry("federation_outbound_token".into())
+            .or_default()
+            .insert("endpoint-binding".into(), "peer-secret".into());
+        data.app_secrets
+            .entry("federation_inbound_token".into())
+            .or_default()
+            .insert(
+                "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                "peer-secret".into(),
+            );
+        data.app_secrets
+            .entry("federation_request_replay".into())
+            .or_default()
+            .insert("peer".into(), "runtime-replay-state".into());
+        data.app_secrets
+            .entry("other_app_secret".into())
+            .or_default()
+            .insert("keep".into(), "portable-app-value".into());
+
+        let envelope = encode_bundle(&data, b"migration-passphrase").expect("encode");
+        let decoded = decode_bundle(&envelope, b"migration-passphrase").expect("decode");
+
+        assert!(!decoded
+            .app_secrets
+            .contains_key("federation_outbound_token"));
+        assert!(!decoded.app_secrets.contains_key("federation_inbound_token"));
+        assert!(!decoded
+            .app_secrets
+            .contains_key("federation_request_replay"));
+        assert_eq!(
+            decoded.app_secrets["other_app_secret"]["keep"],
+            "portable-app-value"
+        );
     }
 
     #[test]

@@ -17,6 +17,32 @@ impl SecretStore {
         })
     }
 
+    pub fn remove_app_many(values: &[(&str, &str)]) -> AppResult<()> {
+        DataStore::update_file(|data| {
+            for (scope, item_id) in values {
+                if let Some(items) = data.app_secrets.get_mut(*scope) {
+                    items.remove(*item_id);
+                    if items.is_empty() {
+                        data.app_secrets.remove(*scope);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_app_many(values: &[(&str, &str, &str)]) -> AppResult<()> {
+        DataStore::update_file(|data| {
+            for (scope, item_id, value) in values {
+                data.app_secrets
+                    .entry((*scope).to_string())
+                    .or_default()
+                    .insert((*item_id).to_string(), (*value).to_string());
+            }
+            Ok(())
+        })
+    }
+
     pub fn clear_refresh_replay_state(workspace_id: &str) -> AppResult<()> {
         DataStore::update_file(|data| {
             clear_refresh_replay_state_in(data, workspace_id);
@@ -62,6 +88,31 @@ impl SecretStore {
                 .and_then(|items| items.get(item_id))
                 .filter(|value| !value.is_empty())
                 .cloned())
+        })
+    }
+
+    pub fn consume_app_nonce(
+        scope: &str,
+        item_id: &str,
+        nonce: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> AppResult<bool> {
+        DataStore::update_file(|data| {
+            let items = data.app_secrets.entry(scope.to_string()).or_default();
+            let mut used = items
+                .get(item_id)
+                .and_then(|raw| {
+                    serde_json::from_str::<std::collections::HashMap<String, u64>>(raw).ok()
+                })
+                .unwrap_or_default();
+            used.retain(|_, expiry| *expiry >= now);
+            if nonce.is_empty() || used.contains_key(nonce) {
+                return Ok(false);
+            }
+            used.insert(nonce.to_string(), expires_at);
+            items.insert(item_id.to_string(), serde_json::to_string(&used)?);
+            Ok(true)
         })
     }
 }
@@ -154,5 +205,30 @@ mod tests {
         assert!(consume_refresh_token_in(&mut data, &replay_key, "jti-2", 300, 201).unwrap());
         clear_refresh_replay_state_in(&mut data, &workspace_id);
         assert!(!data.app_secrets.contains_key(OAUTH_REFRESH_REPLAY_SCOPE));
+    }
+
+    #[test]
+    fn generic_app_nonce_replay_state_is_bounded_by_expiry() {
+        let mut data = AppData::default();
+        let scope = "federation_request_replay";
+        let item_id = "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let items = data.app_secrets.entry(scope.into()).or_default();
+        items.insert(
+            item_id.into(),
+            serde_json::to_string(&std::collections::HashMap::from([(
+                "expired".to_string(),
+                99_u64,
+            )]))
+            .unwrap(),
+        );
+
+        let mut used = items
+            .get(item_id)
+            .and_then(|raw| {
+                serde_json::from_str::<std::collections::HashMap<String, u64>>(raw).ok()
+            })
+            .unwrap_or_default();
+        used.retain(|_, expiry| *expiry >= 100);
+        assert!(used.is_empty());
     }
 }

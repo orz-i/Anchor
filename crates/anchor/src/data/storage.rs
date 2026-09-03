@@ -16,7 +16,8 @@ use super::secret_protection;
 
 const SECRETS_ENVELOPE_VERSION: u32 = 1;
 #[cfg(windows)]
-const SERVICE_RUNTIME_APP_SECRET_SCOPES: &[&str] = &["oauth_refresh_replay"];
+const SERVICE_RUNTIME_APP_SECRET_SCOPES: &[&str] =
+    &["oauth_refresh_replay", "federation_request_replay"];
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SecretsEnvelope {

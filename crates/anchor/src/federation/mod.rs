@@ -6,10 +6,19 @@ use crate::error::{AppError, AppResult};
 use crate::runtime::RuntimeCapabilitySnapshot;
 use crate::workspace::WorkspaceProfile;
 
+mod transport;
+
+pub(crate) use transport::{
+    clear_peer_credential, handle_inbound_transport, peer_credential_status, probe_remote_peer,
+    remote_read, set_peer_credential, FederationPeerCredentialStatus, FederationRemoteTarget,
+    FederationTransportError, FederationTransportErrorKind, FEDERATION_MAX_REQUEST_BYTES,
+    FEDERATION_MAX_RESPONSE_BYTES, FEDERATION_NODE_HEADER,
+};
+
 pub const FEDERATION_SCHEMA_VERSION: u16 = 1;
 pub const FEDERATION_CONTRACT: &str = "anchor-federation-v1";
 
-const FEDERATION_TRANSPORT_MODE: &str = "local_catalog_read_only";
+const FEDERATION_TRANSPORT_MODE: &str = "gateway_authenticated_read_only";
 const MAX_FEDERATION_WORKSPACE_ROUTES: usize = 256;
 const MAX_FEDERATION_DISPLAY_NAME_BYTES: usize = 200;
 const READ_ONLY_OPERATIONS: &[FederationReadOperation] = &[
@@ -23,6 +32,108 @@ const READ_ONLY_OPERATIONS: &[FederationReadOperation] = &[
 #[serde(rename_all = "snake_case")]
 pub enum FederationAccessMode {
     ReadOnly,
+}
+
+pub async fn execute_local_read(
+    request: &FederationReadRequest,
+) -> AppResult<FederationReadResult> {
+    let store = crate::data::DataStore::load()?;
+    let profiles = store.list().to_vec();
+    drop(store);
+    let local = local_peer_descriptor(&profiles)?;
+    let plan = resolve_local_read(&local, request)?;
+
+    match plan.operation {
+        FederationReadOperation::NodeCapabilities => Ok(FederationReadResult::NodeCapabilities(
+            crate::runtime::capability_snapshot(None)?,
+        )),
+        FederationReadOperation::WorkspaceCatalog => {
+            Ok(FederationReadResult::WorkspaceCatalog(local))
+        }
+        FederationReadOperation::NodeControlStatus => {
+            let status = crate::control::control_plane_status(&profiles).await?;
+            let mcp_active_count = status
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.mcp_state == "running")
+                .count();
+            let actions_active_count = status
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.actions_state == "running")
+                .count();
+            Ok(FederationReadResult::NodeControlStatus(
+                FederationNodeControlStatus {
+                    node_id: local.runtime.node.id,
+                    gateway_state: status.gateway.state,
+                    workspace_count: status.workspaces.len(),
+                    mcp_active_count,
+                    actions_active_count,
+                },
+            ))
+        }
+        FederationReadOperation::WorkspaceStatus => {
+            let workspace_id = plan.workspace_id.as_deref().ok_or_else(|| {
+                AppError::Message(
+                    "FEDERATION_WORKSPACE_REQUIRED: workspace_status requires workspaceId".into(),
+                )
+            })?;
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id == workspace_id)
+                .ok_or_else(|| {
+                    AppError::Message(format!(
+                        "FEDERATION_WORKSPACE_NOT_FOUND: workspace {workspace_id} is not registered on the local node"
+                    ))
+                })?;
+            let status =
+                crate::control::control_plane_status(std::slice::from_ref(profile)).await?;
+            let workspace = status.workspaces.into_iter().next().ok_or_else(|| {
+                AppError::Message(
+                    "FEDERATION_WORKSPACE_STATUS_UNAVAILABLE: local control plane returned no workspace status"
+                        .into(),
+                )
+            })?;
+            Ok(FederationReadResult::WorkspaceStatus(
+                FederationWorkspaceStatus {
+                    node_id: local.runtime.node.id,
+                    workspace_id: profile.id.clone(),
+                    display_name: bounded_display_name(&profile.name, &profile.id),
+                    mcp_state: workspace.mcp_state,
+                    actions_state: workspace.actions_state,
+                },
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FederationNodeControlStatus {
+    pub node_id: String,
+    pub gateway_state: String,
+    pub workspace_count: usize,
+    pub mcp_active_count: usize,
+    pub actions_active_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FederationWorkspaceStatus {
+    pub node_id: String,
+    pub workspace_id: String,
+    pub display_name: String,
+    pub mcp_state: String,
+    pub actions_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum FederationReadResult {
+    NodeCapabilities(RuntimeCapabilitySnapshot),
+    NodeControlStatus(FederationNodeControlStatus),
+    WorkspaceCatalog(FederationPeerDescriptor),
+    WorkspaceStatus(FederationWorkspaceStatus),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
