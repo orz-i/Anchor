@@ -37,7 +37,7 @@ fn skill_package_error(code: &'static str, message: String) -> WorkspaceError {
 
 fn required_channel(args: &Value) -> Result<SkillChannel, WorkspaceError> {
     let channel = required_string(args, "channel")?;
-    SkillChannel::parse(channel).map_err(|message| WorkspaceError::invalid_argument(message))
+    SkillChannel::parse(channel).map_err(WorkspaceError::invalid_argument)
 }
 
 pub fn list_tool(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {

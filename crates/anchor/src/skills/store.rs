@@ -481,6 +481,7 @@ impl SkillPackageStore {
             .map_err(|error| format!("failed to create Skill package store: {error}"))?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.root.join("state.lock"))

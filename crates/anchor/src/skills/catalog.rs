@@ -66,7 +66,7 @@ fn read_active_package_record(
             active.digest, record.summary.digest
         ));
     }
-    record.summary.metadata.as_object_mut().map(|metadata| {
+    if let Some(metadata) = record.summary.metadata.as_object_mut() {
         metadata.insert(
             "anchor-channel".into(),
             Value::String(active.channel.clone()),
@@ -75,7 +75,7 @@ fn read_active_package_record(
             "anchor-package-digest".into(),
             Value::String(active.digest.clone()),
         );
-    });
+    }
     Ok(record)
 }
 
