@@ -39,10 +39,240 @@ pub struct FederationNodeSigningPublic {
     pub fingerprint: String,
 }
 
-pub fn rotate_local_signing_identity() -> AppResult<FederationLocalSigningStatus> {
+fn rotate_signing_identity_with_notice_at(
+    root: &Path,
+    descriptor: &FederationPeerDescriptor,
+    now: u64,
+) -> AppResult<FederationNodeSigningPublic> {
+    let node_id = descriptor.runtime.node.id.as_str();
+    if !valid_node_id(node_id) {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_NODE_INVALID: rotation descriptor requires a valid node id".into(),
+        ));
+    }
+    let data_dir = root.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let lock_file = open_private_lock(&data_dir.join(".federation-signing.lock"))?;
+    lock_file.lock_exclusive()?;
+    let result = {
+        let path = data_dir.join("federation-signing.json");
+        let previous = if path.exists() {
+            read_signing_identity(&path)?
+        } else {
+            create_signing_identity(&path, 1)?
+        };
+        let next_epoch = previous.public.key_epoch.saturating_add(1);
+        if next_epoch == 0 {
+            return Err(AppError::Message(
+                "FEDERATION_SIGNING_EPOCH_INVALID: signing key epoch overflow".into(),
+            ));
+        }
+        let next_record = generate_signing_record(next_epoch)?;
+        let next = identity_from_record(next_record.clone())?;
+        let bootstrap_descriptor_digest = super::registry::descriptor_trust_digest(descriptor)?;
+        let material = RotationNoticeSigningMaterial {
+            schema_version: ROTATION_NOTICE_SCHEMA_VERSION,
+            contract: ROTATION_NOTICE_CONTRACT,
+            issued_at_unix_ms: now,
+            expires_at_unix_ms: now.saturating_add(ROTATION_NOTICE_TTL_MS),
+            node_id,
+            federation_contract: FEDERATION_CONTRACT,
+            federation_schema_version: FEDERATION_SCHEMA_VERSION,
+            previous_signing: &previous.public,
+            next_signing: &next.public,
+            bootstrap_descriptor_digest: &bootstrap_descriptor_digest,
+        };
+        let rotation_payload = serde_json::to_vec(&material)?;
+        let notice = FederationSigningRotationNotice {
+            schema_version: ROTATION_NOTICE_SCHEMA_VERSION,
+            contract: ROTATION_NOTICE_CONTRACT.into(),
+            issued_at_unix_ms: now,
+            expires_at_unix_ms: now.saturating_add(ROTATION_NOTICE_TTL_MS),
+            node_id: node_id.into(),
+            federation_contract: FEDERATION_CONTRACT.into(),
+            federation_schema_version: FEDERATION_SCHEMA_VERSION,
+            previous_signing: previous.public.clone(),
+            next_signing: next.public.clone(),
+            bootstrap_descriptor_digest,
+            signing: FederationDetachedSignature {
+                signer: previous.public.clone(),
+                signature_base64: BASE64.encode(sign_payload(
+                    &previous.key_pair,
+                    ROTATION_NOTICE_DOMAIN,
+                    &rotation_payload,
+                )),
+            },
+        };
+        validate_rotation_notice_shape(&notice)?;
+        let mut notice_bytes = serde_json::to_vec_pretty(&notice)?;
+        notice_bytes.push(b'\n');
+        crate::data::atomic_write(&rotation_notice_path(root), &notice_bytes)?;
+        write_signing_record(&path, &next_record)?;
+        Ok(next.public)
+    };
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
+pub fn verify_rotation_notice(
+    notice: &FederationSigningRotationNotice,
+    bootstrap: &FederationBootstrapBundle,
+) -> AppResult<FederationNodeSigningPublic> {
+    validate_rotation_notice_shape(notice)?;
+    let now = unix_time_ms()?;
+    if notice.issued_at_unix_ms > now.saturating_add(BOOTSTRAP_CLOCK_SKEW_MS)
+        || notice.expires_at_unix_ms < now
+    {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_NOTICE_EXPIRED: rotation notice is outside the accepted time window"
+                .into(),
+        ));
+    }
+    let bootstrap_signer = verify_bootstrap_bundle(bootstrap)?;
+    if bootstrap.node_id != notice.node_id || bootstrap_signer != notice.next_signing {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_BOOTSTRAP_MISMATCH: bootstrap signer does not match the announced next key"
+                .into(),
+        ));
+    }
+    let digest = super::registry::descriptor_trust_digest(&bootstrap.descriptor)?;
+    if digest != notice.bootstrap_descriptor_digest {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_BOOTSTRAP_MISMATCH: bootstrap security descriptor does not match the rotation notice"
+                .into(),
+        ));
+    }
+    Ok(notice.previous_signing.clone())
+}
+
+fn validate_rotation_notice_shape(notice: &FederationSigningRotationNotice) -> AppResult<()> {
+    let encoded = serde_json::to_vec(notice)?;
+    if encoded.len() > MAX_ROTATION_NOTICE_BYTES {
+        return Err(AppError::Message(format!(
+            "FEDERATION_ROTATION_NOTICE_TOO_LARGE: rotation notice exceeds {MAX_ROTATION_NOTICE_BYTES} bytes"
+        )));
+    }
+    if notice.schema_version != ROTATION_NOTICE_SCHEMA_VERSION
+        || notice.contract != ROTATION_NOTICE_CONTRACT
+        || notice.federation_contract != FEDERATION_CONTRACT
+        || notice.federation_schema_version != FEDERATION_SCHEMA_VERSION
+        || !valid_node_id(&notice.node_id)
+        || notice.expires_at_unix_ms < notice.issued_at_unix_ms
+        || notice
+            .expires_at_unix_ms
+            .saturating_sub(notice.issued_at_unix_ms)
+            > ROTATION_NOTICE_TTL_MS
+    {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_NOTICE_INVALID: rotation notice contract or time window is invalid"
+                .into(),
+        ));
+    }
+    validate_public_signing_identity(&notice.previous_signing)?;
+    validate_public_signing_identity(&notice.next_signing)?;
+    if notice.previous_signing.contract != notice.next_signing.contract
+        || notice.previous_signing.algorithm != notice.next_signing.algorithm
+        || notice.next_signing.key_epoch != notice.previous_signing.key_epoch.saturating_add(1)
+        || notice.previous_signing.fingerprint == notice.next_signing.fingerprint
+        || notice.bootstrap_descriptor_digest.len() != 64
+        || !notice
+            .bootstrap_descriptor_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || notice.signing.signer != notice.previous_signing
+    {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_NOTICE_INVALID: signing continuity or bootstrap digest is invalid"
+                .into(),
+        ));
+    }
+    let material = RotationNoticeSigningMaterial {
+        schema_version: notice.schema_version,
+        contract: &notice.contract,
+        issued_at_unix_ms: notice.issued_at_unix_ms,
+        expires_at_unix_ms: notice.expires_at_unix_ms,
+        node_id: &notice.node_id,
+        federation_contract: &notice.federation_contract,
+        federation_schema_version: notice.federation_schema_version,
+        previous_signing: &notice.previous_signing,
+        next_signing: &notice.next_signing,
+        bootstrap_descriptor_digest: &notice.bootstrap_descriptor_digest,
+    };
+    verify_detached_signature(
+        &notice.previous_signing,
+        ROTATION_NOTICE_DOMAIN,
+        &serde_json::to_vec(&material)?,
+        &notice.signing.signature_base64,
+    )
+}
+
+pub fn latest_local_rotation_notice() -> AppResult<Option<FederationSigningRotationNotice>> {
+    let root = crate::platform::platform().app_config_dir()?;
+    let path = rotation_notice_path(&root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read(&path)?;
+    let notice: FederationSigningRotationNotice =
+        serde_json::from_slice(&raw).map_err(|error| {
+            AppError::Message(format!(
+                "FEDERATION_ROTATION_NOTICE_INVALID: cannot parse {}: {error}",
+                path.display()
+            ))
+        })?;
+    validate_rotation_notice_shape(&notice)?;
+    let now = unix_time_ms()?;
+    if notice.expires_at_unix_ms < now {
+        return Ok(None);
+    }
+    Ok(Some(notice))
+}
+
+const ROTATION_NOTICE_SCHEMA_VERSION: u16 = 1;
+const ROTATION_NOTICE_CONTRACT: &str = "anchor-federation-key-rotation-v1";
+const ROTATION_NOTICE_DOMAIN: &str = "anchor:federation:key-rotation:v1";
+const ROTATION_NOTICE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const MAX_ROTATION_NOTICE_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FederationSigningRotationNotice {
+    pub schema_version: u16,
+    pub contract: String,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub node_id: String,
+    pub federation_contract: String,
+    pub federation_schema_version: u16,
+    pub previous_signing: FederationNodeSigningPublic,
+    pub next_signing: FederationNodeSigningPublic,
+    pub bootstrap_descriptor_digest: String,
+    pub signing: FederationDetachedSignature,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotationNoticeSigningMaterial<'a> {
+    schema_version: u16,
+    contract: &'a str,
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    node_id: &'a str,
+    federation_contract: &'a str,
+    federation_schema_version: u16,
+    previous_signing: &'a FederationNodeSigningPublic,
+    next_signing: &'a FederationNodeSigningPublic,
+    bootstrap_descriptor_digest: &'a str,
+}
+
+pub fn rotate_local_signing_identity(
+    descriptor: &FederationPeerDescriptor,
+) -> AppResult<FederationLocalSigningStatus> {
+    let root = crate::platform::platform().app_config_dir()?;
+    let signing = rotate_signing_identity_with_notice_at(&root, descriptor, unix_time_ms()?)?;
     Ok(FederationLocalSigningStatus {
         node_id: crate::runtime::capability_snapshot(None)?.node.id,
-        signing: rotate_local_signing_key()?,
+        signing,
     })
 }
 
@@ -118,11 +348,6 @@ struct BootstrapSigningMaterial<'a> {
 pub fn local_signing_public() -> AppResult<FederationNodeSigningPublic> {
     let root = crate::platform::platform().app_config_dir()?;
     Ok(load_or_create_signing_identity_at(&root)?.public)
-}
-
-pub fn rotate_local_signing_key() -> AppResult<FederationNodeSigningPublic> {
-    let root = crate::platform::platform().app_config_dir()?;
-    rotate_signing_identity_at(&root)
 }
 
 pub fn local_bootstrap_bundle(
@@ -339,6 +564,7 @@ fn load_or_create_signing_identity_at(root: &Path) -> AppResult<LocalSigningIden
     result
 }
 
+#[cfg(test)]
 fn rotate_signing_identity_at(root: &Path) -> AppResult<FederationNodeSigningPublic> {
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir)?;
@@ -366,22 +592,35 @@ fn rotate_signing_identity_at(root: &Path) -> AppResult<FederationNodeSigningPub
 }
 
 fn create_signing_identity(path: &Path, key_epoch: u64) -> AppResult<LocalSigningIdentity> {
+    let record = generate_signing_record(key_epoch)?;
+    write_signing_record(path, &record)?;
+    identity_from_record(record)
+}
+
+fn generate_signing_record(key_epoch: u64) -> AppResult<StoredSigningIdentity> {
     let rng = SystemRandom::new();
     let document = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| {
         AppError::Message(
             "FEDERATION_SIGNING_KEY_GENERATION_FAILED: Ed25519 key generation failed".into(),
         )
     })?;
-    let record = StoredSigningIdentity {
+    Ok(StoredSigningIdentity {
         schema_version: SIGNING_IDENTITY_SCHEMA_VERSION,
         algorithm: SIGNING_ALGORITHM.into(),
         key_epoch,
         private_key_pkcs8_base64: BASE64.encode(document.as_ref()),
-    };
+    })
+}
+
+fn write_signing_record(path: &Path, record: &StoredSigningIdentity) -> AppResult<()> {
     let mut bytes = serde_json::to_vec_pretty(&record)?;
     bytes.push(b'\n');
     crate::data::atomic_write(path, &bytes)?;
-    identity_from_record(record)
+    Ok(())
+}
+
+fn rotation_notice_path(root: &Path) -> std::path::PathBuf {
+    root.join("data").join("federation-rotation-notice.json")
 }
 
 fn read_signing_identity(path: &Path) -> AppResult<LocalSigningIdentity> {
@@ -543,6 +782,30 @@ mod tests {
         assert_eq!(rotated.key_epoch, first.public.key_epoch + 1);
         assert_ne!(rotated.fingerprint, first.public.fingerprint);
         assert_ne!(rotated.public_key_base64, first.public.public_key_base64);
+    }
+
+    #[test]
+    fn rotation_notice_is_signed_by_previous_key_and_binds_next_bootstrap() {
+        let root = tempfile::tempdir().expect("signing root");
+        let descriptor = local_descriptor();
+        let now = unix_time_ms().expect("now");
+        let previous = load_or_create_signing_identity_at(root.path()).expect("previous identity");
+        let next = rotate_signing_identity_with_notice_at(root.path(), &descriptor, now)
+            .expect("signed rotation");
+        assert_eq!(next.key_epoch, previous.public.key_epoch + 1);
+
+        let notice_raw = std::fs::read(rotation_notice_path(root.path())).expect("rotation notice");
+        let notice: FederationSigningRotationNotice =
+            serde_json::from_slice(&notice_raw).expect("parse rotation notice");
+        let current = load_or_create_signing_identity_at(root.path()).expect("current identity");
+        let bootstrap = build_bootstrap_bundle(&current, &descriptor, now + 1).expect("bootstrap");
+        let signer = verify_rotation_notice(&notice, &bootstrap).expect("rotation continuity");
+        assert_eq!(signer, previous.public);
+        assert_eq!(notice.next_signing, next);
+
+        let mut tampered = notice;
+        tampered.next_signing.fingerprint = "sha256:deadbeef".into();
+        assert!(verify_rotation_notice(&tampered, &bootstrap).is_err());
     }
 
     #[test]

@@ -44,7 +44,28 @@ pub(crate) fn federation_bootstrap_bundle(
 
 pub(crate) fn rotate_federation_signing_key(
 ) -> AppResult<crate::federation::FederationLocalSigningStatus> {
-    crate::federation::rotate_local_signing_identity()
+    let profiles = list_workspaces()?;
+    let descriptor = crate::federation::local_peer_descriptor(&profiles)?;
+    crate::federation::rotate_local_signing_identity(&descriptor)
+}
+
+pub(crate) fn federation_discovery_document(
+) -> AppResult<crate::federation::FederationDiscoveryDocument> {
+    let profiles = list_workspaces()?;
+    crate::federation::local_discovery_document(&profiles)
+}
+
+pub(crate) async fn inspect_federation_peer_discovery(
+    node_id: &str,
+) -> AppResult<crate::federation::FederationDiscoveryInspection> {
+    crate::federation::inspect_registered_peer_discovery(node_id).await
+}
+
+pub(crate) fn accept_federation_peer_rebootstrap(
+    node_id: &str,
+    discovery: &crate::federation::FederationDiscoveryDocument,
+) -> AppResult<crate::federation::FederationPeerView> {
+    crate::federation::accept_discovered_rebootstrap(node_id, discovery)
 }
 
 fn desired_gateway_routes(current: &[String], workspace_id: &str, enabled: bool) -> Vec<String> {

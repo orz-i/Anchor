@@ -6,27 +6,36 @@ use crate::error::{AppError, AppResult};
 use crate::runtime::RuntimeCapabilitySnapshot;
 use crate::workspace::WorkspaceProfile;
 
+mod discovery;
 mod registry;
 mod signing;
 mod transport;
 
+pub(crate) use discovery::{
+    fetch_discovery_document, local_discovery_document, validate_discovery_document,
+    FederationDiscoveryDocument, FederationDiscoveryInspection, FederationDiscoveryState,
+    FEDERATION_MAX_DISCOVERY_BYTES,
+};
+
 pub(crate) use registry::{
-    get_peer, inspect_candidate, list_peers, probe_registered_peer, read_trusted_peer,
-    register_peer, remove_peer, require_registered_target, revoke_peer, rotate_peer_credential,
-    trust_peer, update_peer, FederationPeerCandidate, FederationPeerRegistration,
-    FederationPeerUpdate, FederationPeerView,
+    accept_discovered_rebootstrap, get_peer, inspect_candidate, inspect_registered_peer_discovery,
+    list_peers, probe_registered_peer, read_trusted_peer, register_peer, remove_peer,
+    require_registered_target, revoke_peer, rotate_peer_credential, trust_peer, update_peer,
+    FederationPeerCandidate, FederationPeerRegistration, FederationPeerUpdate, FederationPeerView,
 };
 pub(crate) use signing::{
-    local_bootstrap_bundle, local_signing_status, rotate_local_signing_identity,
-    verify_bootstrap_bundle, FederationBootstrapBundle, FederationDetachedSignature,
-    FederationLocalSigningStatus, FederationNodeSigningPublic,
+    latest_local_rotation_notice, local_bootstrap_bundle, local_signing_status,
+    rotate_local_signing_identity, verify_bootstrap_bundle, verify_rotation_notice,
+    FederationBootstrapBundle, FederationDetachedSignature, FederationLocalSigningStatus,
+    FederationNodeSigningPublic, FederationSigningRotationNotice,
 };
 pub(crate) use transport::{
-    canonical_remote_target, clear_peer_credential, handle_inbound_transport,
-    peer_credential_status, probe_remote_peer, remote_read_verified, set_peer_credential,
-    FederationPeerCredentialStatus, FederationRemoteTarget, FederationTransportError,
-    FederationTransportErrorKind, FEDERATION_MAX_REQUEST_BYTES, FEDERATION_MAX_RESPONSE_BYTES,
-    FEDERATION_NODE_HEADER,
+    canonical_federation_endpoint, canonical_remote_target, clear_peer_credential,
+    handle_inbound_transport, peer_credential_status, probe_remote_peer, remote_read_verified,
+    set_peer_credential, FederationPeerCredentialStatus, FederationRemoteTarget,
+    FederationTransportError, FederationTransportErrorKind, FEDERATION_MAX_REQUEST_BYTES,
+    FEDERATION_MAX_RESPONSE_BYTES, FEDERATION_NODE_HEADER, TRANSPORT_CONNECT_TIMEOUT,
+    TRANSPORT_REQUEST_TIMEOUT,
 };
 
 pub const FEDERATION_SCHEMA_VERSION: u16 = 2;

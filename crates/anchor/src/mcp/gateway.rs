@@ -6,7 +6,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -504,6 +504,10 @@ async fn spawn_with_limits(
         )),
     };
     let app = Router::new()
+        .route(
+            "/federation/v2/bootstrap",
+            get(federation_bootstrap_discovery),
+        )
         .route("/federation/v2/read", post(federation_read_request))
         .route("/w/{workspace_id}/{*upstream_path}", any(proxy_request))
         .with_state(state);
@@ -528,6 +532,65 @@ async fn spawn_with_limits(
         handle,
         server_error,
     })
+}
+
+async fn federation_bootstrap_discovery(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.rate_limiter.allow() {
+        return gateway_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Gateway request rate limit exceeded",
+        );
+    }
+    let _permit = match state.concurrency.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return gateway_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway concurrency limit exceeded",
+            )
+        }
+    };
+    if header_bytes(&headers) > GATEWAY_MAX_HEADER_BYTES {
+        return gateway_error(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Gateway request headers are too large",
+        );
+    }
+    let document = (|| {
+        let store = crate::data::DataStore::load()?;
+        let profiles = store.list().to_vec();
+        drop(store);
+        crate::federation::local_discovery_document(&profiles)
+    })();
+    match document.and_then(|document| {
+        let body = serde_json::to_vec(&document)?;
+        if body.len() > crate::federation::FEDERATION_MAX_DISCOVERY_BYTES {
+            return Err(AppError::Message(
+                "FEDERATION_DISCOVERY_TOO_LARGE: local discovery document exceeds the transport limit"
+                    .into(),
+            ));
+        }
+        Ok(body)
+    }) {
+        Ok(body) => {
+            let mut response = Response::new(Body::from(body));
+            response
+                .headers_mut()
+                .insert("content-type", HeaderValue::from_static("application/json"));
+            response.headers_mut().insert(
+                "cache-control",
+                HeaderValue::from_static("no-store, max-age=0"),
+            );
+            response
+        }
+        Err(_) => gateway_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Federation bootstrap discovery failed",
+        ),
+    }
 }
 
 async fn federation_read_request(

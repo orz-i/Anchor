@@ -20,8 +20,8 @@ const REQUEST_REPLAY_SCOPE: &str = "federation_request_replay";
 const TRANSPORT_TTL_MS: u64 = 30_000;
 const TRANSPORT_MAX_TTL_MS: u64 = 60_000;
 const TRANSPORT_CLOCK_SKEW_MS: u64 = 5_000;
-const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const TRANSPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const TRANSPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const FEDERATION_MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub(crate) const FEDERATION_MAX_RESPONSE_BYTES: usize = 512 * 1024;
 pub(crate) const FEDERATION_NODE_HEADER: &str = "x-anchor-federation-node";
@@ -132,7 +132,7 @@ pub(crate) fn canonical_remote_target(
     target: &FederationRemoteTarget,
 ) -> AppResult<FederationRemoteTarget> {
     validate_target(target)?;
-    let endpoint = normalize_endpoint(&target.endpoint)?;
+    let endpoint = canonical_federation_endpoint(&target.endpoint)?;
     Ok(FederationRemoteTarget {
         node_id: target.node_id.clone(),
         endpoint: endpoint.as_str().trim_end_matches('/').to_string(),
@@ -208,7 +208,7 @@ pub async fn remote_read_verified(
             "FEDERATION_REMOTE_TARGET_MISMATCH: request nodeId does not match remote target".into(),
         ));
     }
-    let endpoint = normalize_endpoint(&target.endpoint)?;
+    let endpoint = canonical_federation_endpoint(&target.endpoint)?;
     let binding = credential_binding_key(target)?;
     let token = SecretStore::get_app(OUTBOUND_TOKEN_SCOPE, &binding)?.ok_or_else(|| {
         AppError::Message(
@@ -617,11 +617,11 @@ fn validate_target(target: &FederationRemoteTarget) -> AppResult<()> {
             "FEDERATION_NODE_ID_INVALID: remote target node id is invalid".into(),
         ));
     }
-    normalize_endpoint(&target.endpoint)?;
+    canonical_federation_endpoint(&target.endpoint)?;
     Ok(())
 }
 
-fn normalize_endpoint(raw: &str) -> AppResult<reqwest::Url> {
+pub(crate) fn canonical_federation_endpoint(raw: &str) -> AppResult<reqwest::Url> {
     if raw.trim().len() > 256 {
         return Err(AppError::Message(
             "FEDERATION_ENDPOINT_INVALID: endpoint origin exceeds 256 bytes".into(),

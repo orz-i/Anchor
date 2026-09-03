@@ -10,9 +10,11 @@ use sha2::{Digest, Sha256};
 use crate::error::{AppError, AppResult};
 
 use super::{
-    canonical_remote_target, clear_peer_credential, peer_credential_status, probe_remote_peer,
-    remote_read_verified, set_peer_credential, valid_node_id, validate_peer_descriptor,
-    FederationBootstrapBundle, FederationNodeSigningPublic, FederationPeerCredentialStatus,
+    canonical_remote_target, clear_peer_credential, fetch_discovery_document,
+    peer_credential_status, probe_remote_peer, remote_read_verified, set_peer_credential,
+    valid_node_id, validate_discovery_document, validate_peer_descriptor, verify_rotation_notice,
+    FederationBootstrapBundle, FederationDiscoveryDocument, FederationDiscoveryInspection,
+    FederationDiscoveryState, FederationNodeSigningPublic, FederationPeerCredentialStatus,
     FederationPeerDescriptor, FederationReadRequest, FederationReadResult, FederationRemoteTarget,
 };
 
@@ -28,6 +30,76 @@ pub enum FederationPeerTrustStatus {
     Trusted,
     Drifted,
     Revoked,
+}
+
+pub async fn inspect_registered_peer_discovery(
+    node_id: &str,
+) -> AppResult<FederationDiscoveryInspection> {
+    let root = crate::platform::platform().app_config_dir()?;
+    let peer = record_at(&root, node_id)?;
+    if peer.trust_status == FederationPeerTrustStatus::Revoked {
+        return Err(AppError::Message(
+            "FEDERATION_PEER_REVOKED: revoked peers cannot be discovered until explicitly re-established"
+                .into(),
+        ));
+    }
+    let discovery = fetch_discovery_document(&peer.endpoint, Some(&peer.node_id)).await?;
+    let discovered_signing = validate_discovery_document(&discovery, Some(&peer.node_id))?;
+    let descriptor_digest = descriptor_trust_digest(&discovery.bootstrap.descriptor)?;
+    let (state, continuity_verified) = if discovered_signing == peer.bootstrap_signing {
+        if descriptor_digest == peer.bootstrap_descriptor_digest {
+            (FederationDiscoveryState::Current, true)
+        } else {
+            (FederationDiscoveryState::DescriptorDrift, true)
+        }
+    } else if let Some(rotation) = discovery.rotation.as_ref() {
+        let previous = verify_rotation_notice(rotation, &discovery.bootstrap)?;
+        if previous == peer.bootstrap_signing {
+            (FederationDiscoveryState::RotationAvailable, true)
+        } else {
+            (FederationDiscoveryState::IdentityDrift, false)
+        }
+    } else {
+        (FederationDiscoveryState::IdentityDrift, false)
+    };
+    Ok(FederationDiscoveryInspection {
+        node_id: peer.node_id,
+        endpoint: peer.endpoint,
+        state,
+        discovered_signing,
+        descriptor_digest,
+        continuity_verified,
+        discovery,
+    })
+}
+
+pub fn accept_discovered_rebootstrap(
+    node_id: &str,
+    discovery: &FederationDiscoveryDocument,
+) -> AppResult<FederationPeerView> {
+    let root = crate::platform::platform().app_config_dir()?;
+    let peer = record_at(&root, node_id)?;
+    let discovered_signing = validate_discovery_document(discovery, Some(&peer.node_id))?;
+    let descriptor_digest = descriptor_trust_digest(&discovery.bootstrap.descriptor)?;
+    let allowed = if discovered_signing == peer.bootstrap_signing {
+        descriptor_digest != peer.bootstrap_descriptor_digest
+    } else if let Some(rotation) = discovery.rotation.as_ref() {
+        verify_rotation_notice(rotation, &discovery.bootstrap)? == peer.bootstrap_signing
+    } else {
+        false
+    };
+    if !allowed {
+        return Err(AppError::Message(
+            "FEDERATION_REBOOTSTRAP_NOT_AUTHORIZED: discovery does not prove a descriptor change or signed key rotation from the active bootstrap pin"
+                .into(),
+        ));
+    }
+    update_peer(&FederationPeerUpdate {
+        node_id: peer.node_id,
+        endpoint: None,
+        display_name: None,
+        bootstrap: Some(discovery.bootstrap.clone()),
+    })
 }
 
 fn apply_successful_probe(
@@ -192,6 +264,29 @@ pub struct FederationPeerView {
     #[serde(flatten)]
     pub peer: FederationPeerRecord,
     pub credential: FederationPeerCredentialStatus,
+    pub health: FederationPeerTrustHealth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FederationPeerHealthState {
+    Healthy,
+    ProbeStale,
+    CredentialMissing,
+    Untrusted,
+    Drifted,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationPeerTrustHealth {
+    pub state: FederationPeerHealthState,
+    pub credential_ready: bool,
+    pub probe_fresh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_expires_at_unix_ms: Option<u64>,
+    pub bootstrap_pin_matches_trusted_pin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,7 +815,49 @@ fn trust_peer_at(root: &Path, node_id: &str) -> AppResult<FederationPeerView> {
 
 fn view_for_record(peer: FederationPeerRecord) -> AppResult<FederationPeerView> {
     let credential = peer_credential_status(&target_from(&peer))?;
-    Ok(FederationPeerView { peer, credential })
+    let now = unix_time_ms()?;
+    let health = derive_peer_trust_health(&peer, &credential, now);
+    Ok(FederationPeerView {
+        peer,
+        credential,
+        health,
+    })
+}
+
+fn derive_peer_trust_health(
+    peer: &FederationPeerRecord,
+    credential: &FederationPeerCredentialStatus,
+    now: u64,
+) -> FederationPeerTrustHealth {
+    let credential_ready = credential.outbound_configured && credential.inbound_configured;
+    let probe_expires_at_unix_ms = peer
+        .last_probe_at_unix_ms
+        .map(|value| value.saturating_add(TRUST_PROBE_MAX_AGE_MS));
+    let probe_fresh = probe_expires_at_unix_ms.is_some_and(|expires| expires >= now)
+        && matches!(
+            peer.last_probe_code.as_deref(),
+            Some("FEDERATION_PEER_PROBE_OK" | "FEDERATION_PEER_TRUST_DRIFT")
+        );
+    let bootstrap_pin_matches_trusted_pin = peer.trusted_descriptor_digest.as_deref()
+        == Some(peer.bootstrap_descriptor_digest.as_str())
+        && peer.trusted_signing.as_ref() == Some(&peer.bootstrap_signing);
+    let state = match peer.trust_status {
+        FederationPeerTrustStatus::Revoked => FederationPeerHealthState::Revoked,
+        FederationPeerTrustStatus::Drifted => FederationPeerHealthState::Drifted,
+        FederationPeerTrustStatus::Untrusted => FederationPeerHealthState::Untrusted,
+        FederationPeerTrustStatus::Trusted if !credential_ready => {
+            FederationPeerHealthState::CredentialMissing
+        }
+        FederationPeerTrustStatus::Trusted if !probe_fresh => FederationPeerHealthState::ProbeStale,
+        FederationPeerTrustStatus::Trusted => FederationPeerHealthState::Healthy,
+    };
+    FederationPeerTrustHealth {
+        state,
+        credential_ready,
+        probe_fresh,
+        probe_expires_at_unix_ms,
+        bootstrap_pin_matches_trusted_pin,
+    }
 }
 
 fn target_from(peer: &FederationPeerRecord) -> FederationRemoteTarget {
@@ -1325,5 +1462,70 @@ mod tests {
         let mut revoked = base;
         revoked.trust_status = FederationPeerTrustStatus::Revoked;
         assert!(ensure_read_trust(&revoked).is_err());
+    }
+
+    #[test]
+    fn trust_health_is_derived_from_registry_probe_and_credentials_only() {
+        let observed_signing = signing("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let now = TRUST_PROBE_MAX_AGE_MS + 20_000;
+        let mut peer = FederationPeerRecord {
+            node_id: "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            endpoint: "https://node-b.example".into(),
+            display_name: "Node B".into(),
+            bootstrap_descriptor_digest: "a".repeat(64),
+            bootstrap_signing: observed_signing.clone(),
+            trust_status: FederationPeerTrustStatus::Trusted,
+            registered_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            credential_revision: 1,
+            last_probe_at_unix_ms: Some(now - 1_000),
+            last_probe_code: Some("FEDERATION_PEER_PROBE_OK".into()),
+            last_descriptor_digest: Some("a".repeat(64)),
+            trusted_descriptor_digest: Some("a".repeat(64)),
+            last_signing: Some(observed_signing.clone()),
+            trusted_signing: Some(observed_signing),
+        };
+        let mut credential = FederationPeerCredentialStatus {
+            node_id: peer.node_id.clone(),
+            endpoint: peer.endpoint.clone(),
+            outbound_configured: true,
+            inbound_configured: true,
+        };
+
+        let healthy = derive_peer_trust_health(&peer, &credential, now);
+        assert_eq!(healthy.state, FederationPeerHealthState::Healthy);
+        assert!(healthy.credential_ready);
+        assert!(healthy.probe_fresh);
+        assert!(healthy.bootstrap_pin_matches_trusted_pin);
+
+        peer.last_probe_at_unix_ms = Some(now.saturating_sub(TRUST_PROBE_MAX_AGE_MS + 1));
+        assert_eq!(
+            derive_peer_trust_health(&peer, &credential, now).state,
+            FederationPeerHealthState::ProbeStale
+        );
+
+        peer.last_probe_at_unix_ms = Some(now - 1_000);
+        credential.outbound_configured = false;
+        assert_eq!(
+            derive_peer_trust_health(&peer, &credential, now).state,
+            FederationPeerHealthState::CredentialMissing
+        );
+
+        credential.outbound_configured = true;
+        peer.trust_status = FederationPeerTrustStatus::Untrusted;
+        assert_eq!(
+            derive_peer_trust_health(&peer, &credential, now).state,
+            FederationPeerHealthState::Untrusted
+        );
+        peer.trust_status = FederationPeerTrustStatus::Drifted;
+        assert_eq!(
+            derive_peer_trust_health(&peer, &credential, now).state,
+            FederationPeerHealthState::Drifted
+        );
+        peer.trust_status = FederationPeerTrustStatus::Revoked;
+        assert_eq!(
+            derive_peer_trust_health(&peer, &credential, now).state,
+            FederationPeerHealthState::Revoked
+        );
     }
 }
