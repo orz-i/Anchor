@@ -6,7 +6,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{any, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -504,6 +504,7 @@ async fn spawn_with_limits(
         )),
     };
     let app = Router::new()
+        .route("/federation/v1/read", post(federation_read_request))
         .route("/w/{workspace_id}/{*upstream_path}", any(proxy_request))
         .with_state(state);
     let (shutdown, shutdown_rx) = oneshot::channel();
@@ -527,6 +528,123 @@ async fn spawn_with_limits(
         handle,
         server_error,
     })
+}
+
+async fn federation_read_request(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    if !state.rate_limiter.allow() {
+        return gateway_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Gateway request rate limit exceeded",
+        );
+    }
+    let _permit = match state.concurrency.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return gateway_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway concurrency limit exceeded",
+            )
+        }
+    };
+    if header_bytes(&headers) > GATEWAY_MAX_HEADER_BYTES {
+        return gateway_error(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Gateway request headers are too large",
+        );
+    }
+    let body = match tokio::time::timeout(
+        GATEWAY_REQUEST_BODY_TIMEOUT,
+        axum::body::to_bytes(
+            request.into_body(),
+            crate::federation::FEDERATION_MAX_REQUEST_BYTES,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return federation_transport_error(crate::federation::FederationTransportError {
+                kind: crate::federation::FederationTransportErrorKind::InvalidRequest,
+                code: "FEDERATION_REQUEST_TOO_LARGE",
+                message: "federation request body exceeds the transport limit".into(),
+                retryable: false,
+            })
+        }
+        Err(_) => {
+            return federation_transport_error(crate::federation::FederationTransportError {
+                kind: crate::federation::FederationTransportErrorKind::Unavailable,
+                code: "FEDERATION_REQUEST_TIMEOUT",
+                message: "federation request body timed out".into(),
+                retryable: true,
+            })
+        }
+    };
+    let caller = headers
+        .get(crate::federation::FEDERATION_NODE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    match crate::federation::handle_inbound_transport(caller, authorization, &body).await {
+        Ok(response) => match serde_json::to_vec(&response) {
+            Ok(body) if body.len() <= crate::federation::FEDERATION_MAX_RESPONSE_BYTES => {
+                let mut response = Response::new(Body::from(body));
+                response
+                    .headers_mut()
+                    .insert("content-type", HeaderValue::from_static("application/json"));
+                response
+            }
+            Ok(_) => federation_transport_error(crate::federation::FederationTransportError {
+                kind: crate::federation::FederationTransportErrorKind::Internal,
+                code: "FEDERATION_RESPONSE_TOO_LARGE",
+                message: "federation response exceeded the transport limit".into(),
+                retryable: false,
+            }),
+            Err(_) => federation_transport_error(crate::federation::FederationTransportError {
+                kind: crate::federation::FederationTransportErrorKind::Internal,
+                code: "FEDERATION_RESPONSE_SERIALIZATION_FAILED",
+                message: "federation response could not be serialized".into(),
+                retryable: true,
+            }),
+        },
+        Err(error) => federation_transport_error(error),
+    }
+}
+
+fn federation_transport_error(error: crate::federation::FederationTransportError) -> Response {
+    let status = match error.kind {
+        crate::federation::FederationTransportErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+        crate::federation::FederationTransportErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        crate::federation::FederationTransportErrorKind::Replay => StatusCode::CONFLICT,
+        crate::federation::FederationTransportErrorKind::Unavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        crate::federation::FederationTransportErrorKind::Internal => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    let message = if error.kind == crate::federation::FederationTransportErrorKind::Internal {
+        "federation transport failed internally".to_string()
+    } else {
+        error.message
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": false,
+            "status": "error",
+            "component": "federation_gateway",
+            "stage": "authenticated_read",
+            "code": error.code,
+            "message": message,
+            "retryable": error.retryable
+        })),
+    )
+        .into_response()
 }
 
 async fn proxy_request(
@@ -936,6 +1054,29 @@ mod tests {
     fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
         listener.local_addr().expect("local addr").port()
+    }
+
+    #[tokio::test]
+    async fn gateway_serves_federation_transport_on_the_existing_listener() {
+        let port = free_port();
+        let runtime = spawn_with_limits(port, HashMap::new(), 4, 100, 10)
+            .await
+            .expect("gateway");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/federation/v1/read"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("federation route response");
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let _ = runtime.shutdown.send(());
+        let _ = runtime.handle.await;
     }
 
     #[test]
