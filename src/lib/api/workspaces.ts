@@ -6,9 +6,12 @@ import type {
   ControlEventBatch,
   ControlEventCursor,
   FederationHandshakeValidation,
+  FederationPeerCredentialStatus,
   FederationPeerDescriptor,
   FederationReadPlan,
   FederationReadRequest,
+  FederationReadResult,
+  FederationRemoteTarget,
   GatewayEventBatch,
   GatewayEventCursor,
   GatewayLogChunk,
@@ -22,6 +25,49 @@ import type {
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
+}
+
+export async function getFederationPeerCredentialStatus(
+  target: FederationRemoteTarget,
+): Promise<FederationPeerCredentialStatus> {
+  return invokeRead<FederationPeerCredentialStatus>("get_federation_peer_credential_status", {
+    target,
+  });
+}
+
+export async function setFederationPeerCredential(
+  target: FederationRemoteTarget,
+  token: string,
+  grantId: string,
+): Promise<FederationPeerCredentialStatus> {
+  return invokeAdmin<FederationPeerCredentialStatus>("set_federation_peer_credential", {
+    target,
+    token,
+    grantId,
+  });
+}
+
+export async function clearFederationPeerCredential(
+  target: FederationRemoteTarget,
+  grantId: string,
+): Promise<FederationPeerCredentialStatus> {
+  return invokeAdmin<FederationPeerCredentialStatus>("clear_federation_peer_credential", {
+    target,
+    grantId,
+  });
+}
+
+export async function probeFederationPeer(
+  target: FederationRemoteTarget,
+): Promise<FederationPeerDescriptor> {
+  return invokeRead<FederationPeerDescriptor>("probe_federation_peer", { target });
+}
+
+export async function readFederationRemote(
+  target: FederationRemoteTarget,
+  request: FederationReadRequest,
+): Promise<FederationReadResult> {
+  return invokeRead<FederationReadResult>("read_federation_remote", { target, request });
 }
 
 export async function getControlPlaneStatus(): Promise<ControlPlaneStatus> {

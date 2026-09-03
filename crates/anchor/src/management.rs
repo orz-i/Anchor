@@ -1326,6 +1326,40 @@ pub(crate) fn get_shared_secret(key: &str) -> AppResult<Option<String>> {
     DataStore::read_file(|data| Ok(data.shared_secrets.get(key).cloned()))
 }
 
+pub(crate) fn federation_peer_credential_status(
+    target: &crate::federation::FederationRemoteTarget,
+) -> AppResult<crate::federation::FederationPeerCredentialStatus> {
+    crate::federation::peer_credential_status(target)
+}
+
+pub(crate) fn set_federation_peer_credential(
+    target: &crate::federation::FederationRemoteTarget,
+    token: &str,
+) -> AppResult<crate::federation::FederationPeerCredentialStatus> {
+    crate::federation::set_peer_credential(target, token)?;
+    crate::federation::peer_credential_status(target)
+}
+
+pub(crate) fn clear_federation_peer_credential(
+    target: &crate::federation::FederationRemoteTarget,
+) -> AppResult<crate::federation::FederationPeerCredentialStatus> {
+    crate::federation::clear_peer_credential(target)?;
+    crate::federation::peer_credential_status(target)
+}
+
+pub(crate) async fn probe_federation_peer(
+    target: &crate::federation::FederationRemoteTarget,
+) -> AppResult<crate::federation::FederationPeerDescriptor> {
+    crate::federation::probe_remote_peer(target).await
+}
+
+pub(crate) async fn read_federation_remote(
+    target: &crate::federation::FederationRemoteTarget,
+    request: &crate::federation::FederationReadRequest,
+) -> AppResult<crate::federation::FederationReadResult> {
+    crate::federation::remote_read(target, request).await
+}
+
 fn generated_secret() -> String {
     format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "")
 }

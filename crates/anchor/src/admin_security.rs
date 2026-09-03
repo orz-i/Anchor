@@ -27,6 +27,8 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
     "save_frp_profile",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "set_federation_peer_credential",
+    "clear_federation_peer_credential",
     "install_software",
     "uninstall_software",
     "install_windows_service",
@@ -44,6 +46,8 @@ const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
     "regenerate_shared_secret",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "set_federation_peer_credential",
+    "clear_federation_peer_credential",
     "install_software",
     "uninstall_software",
     #[cfg(windows)]
@@ -156,6 +160,15 @@ impl PrivilegedActionBinding {
         }
     }
 
+    pub fn federation_peer(node_id: &str, endpoint: &str) -> Self {
+        Self {
+            id: Some(endpoint.trim().to_string()),
+            key: Some(node_id.to_string()),
+            kind: None,
+            version: None,
+        }
+    }
+
     pub fn shared_secret(key: &str) -> Self {
         Self {
             id: None,
@@ -263,6 +276,12 @@ fn normalize_binding(
                 && normalized.kind.is_none()
                 && normalized.version.is_none()
         }
+        "set_federation_peer_credential" | "clear_federation_peer_credential" => {
+            normalized.id.is_some()
+                && normalized.key.is_some()
+                && normalized.kind.is_none()
+                && normalized.version.is_none()
+        }
         "install_software" => {
             normalized.id.is_none()
                 && normalized.key.is_none()
@@ -316,6 +335,11 @@ fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> Ap
         "save_frp_profile" | "set_frp_profile_token" | "delete_frp_profile" => {
             format!("FRP profile {}", binding.id.as_deref().unwrap_or_default())
         }
+        "set_federation_peer_credential" | "clear_federation_peer_credential" => format!(
+            "Federation peer {} · {}",
+            binding.key.as_deref().unwrap_or_default(),
+            binding.id.as_deref().unwrap_or_default()
+        ),
         "install_software" => format!(
             "软件 {} · 版本 {}",
             binding.kind.as_deref().unwrap_or_default(),
@@ -710,6 +734,51 @@ pub fn read_admin_audit_events(limit: usize) -> AppResult<Vec<AdminAuditEvent>> 
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn federation_credential_grant_is_bound_to_node_and_endpoint_without_secret_material() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = PrivilegedConfirmationStore::for_test(temp.path().to_path_buf());
+        let target = PrivilegedActionBinding::federation_peer(
+            "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "https://node-b.example",
+        );
+        let prepared = store
+            .prepare("session-a", "set_federation_peer_credential", &target)
+            .expect("prepare federation peer credential");
+        assert!(prepared
+            .target_summary
+            .contains("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(prepared.target_summary.contains("https://node-b.example"));
+        assert!(!prepared.confirmation_text.contains("token"));
+
+        let grant = store
+            .confirm(
+                "session-a",
+                &prepared.confirmation_id,
+                &prepared.confirmation_text,
+            )
+            .expect("confirm");
+        assert!(store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_federation_peer_credential",
+                &PrivilegedActionBinding::federation_peer(
+                    "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "https://other.example",
+                ),
+            )
+            .is_err());
+        store
+            .consume_grant(
+                "session-a",
+                &grant.grant_id,
+                "set_federation_peer_credential",
+                &target,
+            )
+            .expect("matching peer binding remains consumable");
+    }
 
     #[test]
     fn privileged_manifests_are_complete_and_disjoint() {

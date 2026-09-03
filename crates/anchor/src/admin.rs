@@ -54,6 +54,11 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_federation_catalog",
     "validate_federation_peer",
     "resolve_federation_read",
+    "get_federation_peer_credential_status",
+    "set_federation_peer_credential",
+    "clear_federation_peer_credential",
+    "probe_federation_peer",
+    "read_federation_remote",
     "get_last_workspace_id",
     "set_last_workspace",
     "list_frp_profiles",
@@ -123,6 +128,8 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "save_frp_profile_metadata",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "set_federation_peer_credential",
+    "clear_federation_peer_credential",
     "set_workspace_secret",
     "regenerate_workspace_secret",
     "set_shared_secret",
@@ -169,6 +176,34 @@ struct AdminStaticAsset {
 #[serde(rename_all = "camelCase")]
 struct FederationPeerValidationArgs {
     peer: crate::federation::FederationPeerDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FederationTargetArgs {
+    target: crate::federation::FederationRemoteTarget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetFederationPeerCredentialArgs {
+    target: crate::federation::FederationRemoteTarget,
+    token: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClearFederationPeerCredentialArgs {
+    target: crate::federation::FederationRemoteTarget,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FederationRemoteReadArgs {
+    target: crate::federation::FederationRemoteTarget,
+    request: crate::federation::FederationReadRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1063,6 +1098,79 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "get_federation_peer_credential_status" => {
+            let input: FederationTargetArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::federation_peer_credential_status(
+                &input.target,
+            )?)
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "set_federation_peer_credential" => {
+            let input: SetFederationPeerCredentialArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::federation_peer(
+                &input.target.node_id,
+                &input.target.endpoint,
+            );
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "set_federation_peer_credential",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "set_federation_peer_credential",
+                management::set_federation_peer_credential(&input.target, &input.token),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "clear_federation_peer_credential" => {
+            let input: ClearFederationPeerCredentialArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = PrivilegedActionBinding::federation_peer(
+                &input.target.node_id,
+                &input.target.endpoint,
+            );
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "clear_federation_peer_credential",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "clear_federation_peer_credential",
+                management::clear_federation_peer_credential(&input.target),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "probe_federation_peer" => {
+            let input: FederationTargetArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::probe_federation_peer(&input.target).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "read_federation_remote" => {
+            let input: FederationRemoteReadArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::read_federation_remote(&input.target, &input.request).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
         "get_last_workspace_id" => Ok(Value::String(management::get_last_workspace_id()?)),
         "set_last_workspace" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
@@ -1637,7 +1745,7 @@ mod tests {
         );
         assert_eq!(
             capabilities["transports"]["federation"],
-            "local_catalog_read_only"
+            "gateway_authenticated_read_only"
         );
         assert_eq!(capabilities["features"]["federationReadOnly"], true);
     }
@@ -1648,9 +1756,20 @@ mod tests {
             "get_federation_catalog",
             "validate_federation_peer",
             "resolve_federation_read",
+            "get_federation_peer_credential_status",
+            "probe_federation_peer",
+            "read_federation_remote",
         ] {
             assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
             assert!(!WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
+        }
+        for command in [
+            "set_federation_peer_credential",
+            "clear_federation_peer_credential",
+        ] {
+            assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
+            assert!(WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
+            assert!(privileged_actions().contains(&command));
         }
     }
 

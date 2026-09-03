@@ -426,8 +426,42 @@ export interface FederationReadPlan {
   operation: FederationReadOperation;
   access: FederationAccessMode;
   source: "runtime_capability_provider" | "existing_control_plane" | "workspace_registry";
-  transport: "local_catalog_read_only";
+  transport: "gateway_authenticated_read_only";
 }
+
+export interface FederationRemoteTarget {
+  nodeId: string;
+  endpoint: string;
+}
+
+export interface FederationPeerCredentialStatus {
+  nodeId: string;
+  endpoint: string;
+  outboundConfigured: boolean;
+  inboundConfigured: boolean;
+}
+
+export interface FederationNodeControlStatus {
+  nodeId: string;
+  gatewayState: string;
+  workspaceCount: number;
+  mcpActiveCount: number;
+  actionsActiveCount: number;
+}
+
+export interface FederationWorkspaceStatus {
+  nodeId: string;
+  workspaceId: string;
+  displayName: string;
+  mcpState: string;
+  actionsState: string;
+}
+
+export type FederationReadResult =
+  | { kind: "node_capabilities"; data: RuntimeCapabilitySnapshot }
+  | { kind: "node_control_status"; data: FederationNodeControlStatus }
+  | { kind: "workspace_catalog"; data: FederationPeerDescriptor }
+  | { kind: "workspace_status"; data: FederationWorkspaceStatus };
 
 export interface ControlPlaneStatus {
   runtimeCapabilities: RuntimeCapabilitySnapshot;
