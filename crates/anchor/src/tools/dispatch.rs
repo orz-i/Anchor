@@ -2399,6 +2399,16 @@ fn server_info_for_session(
         .filter(|session| session.get("process_bound") == Some(&Value::Bool(true)))
         .count();
     let downstream_mcp = ctx.mcp_proxies.status();
+    let runtime_capabilities =
+        crate::runtime::capability_snapshot(ctx.runtime_workspace_identity()).map_err(|error| {
+            WorkspaceError::ToolDetails {
+                code: "RUNTIME_CAPABILITY_UNAVAILABLE",
+                message: error.to_string(),
+                category: "runtime",
+                retryable: true,
+                details: json!({"cause_scope": "runtime_identity"}),
+            }
+        })?;
     let command_cost_policy = json!({
         "external_paid_commands_enabled": ctx.policy.external_paid_commands_enabled,
         "external_paid_max_runs_per_day": ctx.policy.external_paid_max_runs_per_day,
@@ -2515,6 +2525,7 @@ fn server_info_for_session(
         "current_proxy_tool_count": current_catalog.proxy_count,
         "schema_discovery": schema_discovery,
         "command_cost_policy": command_cost_policy,
+        "runtime_capabilities": runtime_capabilities,
         "downstream_mcp": downstream_mcp.clone(),
         "connection_layers": connection_layers
         ,"schema_telemetry": schema_telemetry

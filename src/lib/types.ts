@@ -331,7 +331,41 @@ export interface ControlPlaneWorkspaceStatus extends WorkspaceControlStatus {
   actionsState: RuntimeState;
 }
 
+export interface NodeIdentity {
+  id: string;
+  platform: string;
+  architecture: string;
+}
+
+export interface RuntimeWorkspaceIdentity {
+  id: string;
+  name: string;
+  path: string;
+}
+
+export interface RuntimeCapabilitySnapshot {
+  schemaVersion: number;
+  contract: string;
+  node: NodeIdentity;
+  workspace?: RuntimeWorkspaceIdentity;
+  transports: {
+    mcp: string;
+    webAdmin: string;
+    localControl: string;
+    federation: string;
+  };
+  features: {
+    workspaceFirst: boolean;
+    dynamicMcp: boolean;
+    skillPackages: boolean;
+    durableCommands: boolean;
+    gateway: boolean;
+    stateAuthority: string;
+  };
+}
+
 export interface ControlPlaneStatus {
+  runtimeCapabilities: RuntimeCapabilitySnapshot;
   gateway: GatewayControlStatus;
   workspaces: ControlPlaneWorkspaceStatus[];
 }

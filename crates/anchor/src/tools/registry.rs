@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-pub const CATALOG_VERSION: u32 = 47;
+pub const CATALOG_VERSION: u32 = 48;
 
 const FACADE_NAMES: &[&str] = &[
     "session",
@@ -1686,6 +1686,7 @@ pub fn output_schema(name: &str) -> Value {
                         "additionalProperties": false
                     },
                     "command_cost_policy": { "type": "object" },
+                    "runtime_capabilities": { "type": "object" },
                     "downstream_mcp": {
                         "type": "object",
                         "properties": {
@@ -1759,6 +1760,7 @@ pub fn output_schema(name: &str) -> Value {
                 "catalog_profile_guidance",
                 "schema_discovery",
                 "command_cost_policy",
+                "runtime_capabilities",
                 "downstream_mcp",
                 "connection_layers",
             ],

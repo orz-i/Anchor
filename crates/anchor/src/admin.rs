@@ -409,6 +409,7 @@ struct AdminState {
     authority: Arc<str>,
     sessions: Arc<Mutex<HashMap<String, AdminSession>>>,
     privileged_confirmations: Arc<Mutex<PrivilegedConfirmationStore>>,
+    runtime_capabilities: crate::runtime::RuntimeCapabilitySnapshot,
 }
 
 struct AdminSession {
@@ -473,28 +474,29 @@ pub async fn serve(port: u16, as_json: bool) -> AppResult<()> {
         );
     }
 
-    axum::serve(listener, router(actual))
+    axum::serve(listener, router(actual)?)
         .await
         .map_err(|error| AppError::Message(format!("Web Admin 服务异常：{error}")))
 }
 
-fn router(address: SocketAddr) -> Router {
+fn router(address: SocketAddr) -> AppResult<Router> {
     let authority = address.to_string();
     let state = AdminState {
         origin: Arc::from(format!("http://{authority}")),
         authority: Arc::from(authority),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         privileged_confirmations: Arc::new(Mutex::new(PrivilegedConfirmationStore::default())),
+        runtime_capabilities: crate::runtime::capability_snapshot(None)?,
     };
-    Router::new()
+    Ok(Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/session", post(create_session))
         .route("/api/v1/commands/{command}", post(command))
         .fallback(get(static_ui))
-        .with_state(state)
+        .with_state(state))
 }
 
-async fn health() -> Json<Value> {
+async fn health(State(state): State<AdminState>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "data": {
@@ -508,7 +510,8 @@ async fn health() -> Json<Value> {
             "privilegedCommands": privileged_actions(),
             "privilegedExecutors": available_privileged_executors(),
             "unavailableCommands": unavailable_privileged_actions(),
-            "mutationCommands": WEB_ADMIN_MUTATION_COMMANDS
+            "mutationCommands": WEB_ADMIN_MUTATION_COMMANDS,
+            "runtimeCapabilities": state.runtime_capabilities
         }
     }))
 }
@@ -1572,7 +1575,33 @@ mod tests {
             authority: Arc::from("127.0.0.1:28769"),
             sessions: Arc::new(Mutex::new(sessions)),
             privileged_confirmations: Arc::new(Mutex::new(PrivilegedConfirmationStore::default())),
+            runtime_capabilities: crate::runtime::capability_snapshot_from_node(
+                crate::runtime::NodeIdentity {
+                    id: "node_00000000000000000000000000000000".into(),
+                    platform: "test".into(),
+                    architecture: "test".into(),
+                },
+                None,
+            ),
         }
+    }
+
+    #[tokio::test]
+    async fn health_exposes_the_shared_runtime_capability_contract() {
+        let Json(payload) = health(State(test_state(HashMap::new()))).await;
+        let capabilities = &payload["data"]["runtimeCapabilities"];
+
+        assert_eq!(capabilities["contract"], "anchor-runtime-capabilities-v1");
+        assert_eq!(
+            capabilities["node"]["id"],
+            "node_00000000000000000000000000000000"
+        );
+        assert_eq!(capabilities["features"]["workspaceFirst"], true);
+        assert_eq!(
+            capabilities["features"]["stateAuthority"],
+            "existing_daemon_control_plane"
+        );
+        assert_eq!(capabilities["transports"]["federation"], "not_implemented");
     }
 
     #[test]

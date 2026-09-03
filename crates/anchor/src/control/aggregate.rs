@@ -20,6 +20,7 @@ const AGGREGATE_WAIT_SLICE_MS: u32 = 1_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlPlaneStatus {
+    pub runtime_capabilities: serde_json::Value,
     pub gateway: GatewayControlStatus,
     pub workspaces: Vec<ControlPlaneWorkspaceStatus>,
 }
@@ -34,6 +35,7 @@ pub struct ControlPlaneWorkspaceStatus {
 }
 
 pub async fn control_plane_status(profiles: &[WorkspaceProfile]) -> AppResult<ControlPlaneStatus> {
+    let runtime_capabilities = serde_json::to_value(crate::runtime::capability_snapshot(None)?)?;
     let gateway_future = gateway_control::status_via_daemon_or_local();
     let workspace_futures = profiles.iter().cloned().map(|profile| async move {
         super::workspace_status_via_daemon_or_local(&profile)
@@ -60,6 +62,7 @@ pub async fn control_plane_status(profiles: &[WorkspaceProfile]) -> AppResult<Co
         });
     }
     Ok(ControlPlaneStatus {
+        runtime_capabilities,
         gateway,
         workspaces,
     })
