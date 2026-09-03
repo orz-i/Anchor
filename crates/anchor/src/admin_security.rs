@@ -29,6 +29,7 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
     "delete_frp_profile",
     "register_federation_peer",
     "update_federation_peer",
+    "accept_federation_peer_rebootstrap",
     "trust_federation_peer",
     "remove_federation_peer",
     "set_federation_peer_credential",
@@ -55,6 +56,7 @@ const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
     "delete_frp_profile",
     "register_federation_peer",
     "update_federation_peer",
+    "accept_federation_peer_rebootstrap",
     "trust_federation_peer",
     "remove_federation_peer",
     "set_federation_peer_credential",
@@ -307,6 +309,7 @@ fn normalize_binding(
         }
         "register_federation_peer"
         | "update_federation_peer"
+        | "accept_federation_peer_rebootstrap"
         | "trust_federation_peer"
         | "remove_federation_peer"
         | "set_federation_peer_credential"
@@ -373,6 +376,7 @@ fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> Ap
         }
         "register_federation_peer"
         | "update_federation_peer"
+        | "accept_federation_peer_rebootstrap"
         | "trust_federation_peer"
         | "remove_federation_peer"
         | "set_federation_peer_credential"

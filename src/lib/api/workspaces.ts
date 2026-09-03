@@ -7,6 +7,8 @@ import type {
   ControlEventCursor,
   FederationHandshakeValidation,
   FederationBootstrapBundle,
+  FederationDiscoveryDocument,
+  FederationDiscoveryInspection,
   FederationLocalSigningStatus,
   FederationPeerCandidate,
   FederationPeerCredentialStatus,
@@ -33,12 +35,28 @@ export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
 }
 
+export async function acceptFederationPeerRebootstrap(
+  nodeId: string,
+  discovery: FederationDiscoveryDocument,
+  grantId: string,
+): Promise<FederationPeerView> {
+  return invokeAdmin<FederationPeerView>("accept_federation_peer_rebootstrap", {
+    nodeId,
+    discovery,
+    grantId,
+  });
+}
+
 export async function getFederationSigningStatus(): Promise<FederationLocalSigningStatus> {
   return invokeRead<FederationLocalSigningStatus>("get_federation_signing_status");
 }
 
 export async function getFederationBootstrapBundle(): Promise<FederationBootstrapBundle> {
   return invokeRead<FederationBootstrapBundle>("get_federation_bootstrap_bundle");
+}
+
+export async function getFederationDiscoveryDocument(): Promise<FederationDiscoveryDocument> {
+  return invokeRead<FederationDiscoveryDocument>("get_federation_discovery_document");
 }
 
 export async function rotateFederationSigningKey(
@@ -72,6 +90,14 @@ export async function listFederationPeers(): Promise<FederationPeerView[]> {
 
 export async function getFederationPeer(nodeId: string): Promise<FederationPeerView> {
   return invokeRead<FederationPeerView>("get_federation_peer", { nodeId });
+}
+
+export async function inspectFederationPeerDiscovery(
+  nodeId: string,
+): Promise<FederationDiscoveryInspection> {
+  return invokeRead<FederationDiscoveryInspection>("inspect_federation_peer_discovery", {
+    nodeId,
+  });
 }
 
 export async function inspectFederationCandidate(

@@ -54,14 +54,17 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_federation_catalog",
     "get_federation_signing_status",
     "get_federation_bootstrap_bundle",
+    "get_federation_discovery_document",
     "rotate_federation_signing_key",
     "validate_federation_peer",
     "resolve_federation_read",
     "list_federation_peers",
     "get_federation_peer",
+    "inspect_federation_peer_discovery",
     "inspect_federation_candidate",
     "register_federation_peer",
     "update_federation_peer",
+    "accept_federation_peer_rebootstrap",
     "trust_federation_peer",
     "remove_federation_peer",
     "get_federation_peer_credential_status",
@@ -143,6 +146,7 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "rotate_federation_signing_key",
     "register_federation_peer",
     "update_federation_peer",
+    "accept_federation_peer_rebootstrap",
     "trust_federation_peer",
     "remove_federation_peer",
     "set_federation_peer_credential",
@@ -223,6 +227,14 @@ struct RegisterFederationPeerArgs {
     endpoint: String,
     display_name: String,
     bundle: crate::federation::FederationBootstrapBundle,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcceptFederationPeerRebootstrapArgs {
+    node_id: String,
+    discovery: crate::federation::FederationDiscoveryDocument,
     grant_id: String,
 }
 
@@ -1018,6 +1030,38 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "accept_federation_peer_rebootstrap" => {
+            let input: AcceptFederationPeerRebootstrapArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let peer = management::get_federation_peer(&input.node_id)?;
+            let binding =
+                PrivilegedActionBinding::federation_peer(&peer.peer.node_id, &peer.peer.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "accept_federation_peer_rebootstrap",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "accept_federation_peer_rebootstrap",
+                management::accept_federation_peer_rebootstrap(&input.node_id, &input.discovery),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "inspect_federation_peer_discovery" => {
+            let input: FederationPeerNodeArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                management::inspect_federation_peer_discovery(&input.node_id).await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
         "rotate_federation_peer_credential" => {
             let input: SetFederationPeerCredentialArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
@@ -1201,6 +1245,11 @@ async fn dispatch_command(
         }
         "get_federation_bootstrap_bundle" => {
             serde_json::to_value(management::federation_bootstrap_bundle()?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_federation_discovery_document" => {
+            serde_json::to_value(management::federation_discovery_document()?)
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
@@ -2058,6 +2107,8 @@ mod tests {
             "resolve_federation_read",
             "list_federation_peers",
             "get_federation_peer",
+            "get_federation_discovery_document",
+            "inspect_federation_peer_discovery",
             "inspect_federation_candidate",
             "get_federation_peer_credential_status",
             "read_federation_remote",
@@ -2068,6 +2119,7 @@ mod tests {
         for command in [
             "register_federation_peer",
             "update_federation_peer",
+            "accept_federation_peer_rebootstrap",
             "trust_federation_peer",
             "remove_federation_peer",
             "set_federation_peer_credential",

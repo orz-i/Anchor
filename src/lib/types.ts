@@ -56,6 +56,44 @@ export interface FederationBootstrapBundle {
   signing: FederationDetachedSignature;
 }
 
+export interface FederationSigningRotationNotice {
+  schemaVersion: number;
+  contract: "anchor-federation-key-rotation-v1";
+  issuedAtUnixMs: number;
+  expiresAtUnixMs: number;
+  nodeId: string;
+  federationContract: string;
+  federationSchemaVersion: number;
+  previousSigning: FederationNodeSigningPublic;
+  nextSigning: FederationNodeSigningPublic;
+  bootstrapDescriptorDigest: string;
+  signing: FederationDetachedSignature;
+}
+
+export interface FederationDiscoveryDocument {
+  schemaVersion: number;
+  contract: "anchor-federation-discovery-v1";
+  nodeId: string;
+  bootstrap: FederationBootstrapBundle;
+  rotation?: FederationSigningRotationNotice;
+}
+
+export type FederationDiscoveryState =
+  | "current"
+  | "descriptor_drift"
+  | "rotation_available"
+  | "identity_drift";
+
+export interface FederationDiscoveryInspection {
+  nodeId: string;
+  endpoint: string;
+  state: FederationDiscoveryState;
+  discoveredSigning: FederationNodeSigningPublic;
+  descriptorDigest: string;
+  continuityVerified: boolean;
+  discovery: FederationDiscoveryDocument;
+}
+
 export type FederationContextScope = "global_shared" | "node_local" | "workspace_local";
 
 export interface FederationContextRef {
@@ -476,6 +514,22 @@ export interface FederationPeerCredentialStatus {
 
 export type FederationPeerTrustStatus = "untrusted" | "trusted" | "drifted" | "revoked";
 
+export type FederationPeerHealthState =
+  | "healthy"
+  | "probe_stale"
+  | "credential_missing"
+  | "untrusted"
+  | "drifted"
+  | "revoked";
+
+export interface FederationPeerTrustHealth {
+  state: FederationPeerHealthState;
+  credentialReady: boolean;
+  probeFresh: boolean;
+  probeExpiresAtUnixMs?: number;
+  bootstrapPinMatchesTrustedPin: boolean;
+}
+
 export interface FederationPeerView {
   nodeId: string;
   endpoint: string;
@@ -493,6 +547,7 @@ export interface FederationPeerView {
   lastSigning?: FederationNodeSigningPublic;
   trustedSigning?: FederationNodeSigningPublic;
   credential: FederationPeerCredentialStatus;
+  health: FederationPeerTrustHealth;
 }
 
 export interface FederationPeerCandidate {
