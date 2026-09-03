@@ -51,6 +51,9 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_canvs_task_snapshot",
     "get_control_plane_status",
     "get_control_plane_events",
+    "get_federation_catalog",
+    "validate_federation_peer",
+    "resolve_federation_read",
     "get_last_workspace_id",
     "set_last_workspace",
     "list_frp_profiles",
@@ -160,6 +163,12 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
 struct AdminStaticAsset {
     content_type: &'static str,
     body: &'static [u8],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationPeerValidationArgs {
+    peer: crate::federation::FederationPeerDescriptor,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1029,6 +1038,31 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "get_federation_catalog" => {
+            let profiles = management::list_workspaces()?;
+            serde_json::to_value(crate::federation::local_peer_descriptor(&profiles)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "validate_federation_peer" => {
+            let input: FederationPeerValidationArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(crate::federation::validate_peer_descriptor(
+                &state.runtime_capabilities,
+                &input.peer,
+            ))
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "resolve_federation_read" => {
+            let request: crate::federation::FederationReadRequest =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let profiles = management::list_workspaces()?;
+            let local = crate::federation::local_peer_descriptor(&profiles)?;
+            serde_json::to_value(crate::federation::resolve_local_read(&local, &request)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "get_last_workspace_id" => Ok(Value::String(management::get_last_workspace_id()?)),
         "set_last_workspace" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
@@ -1601,7 +1635,63 @@ mod tests {
             capabilities["features"]["stateAuthority"],
             "existing_daemon_control_plane"
         );
-        assert_eq!(capabilities["transports"]["federation"], "not_implemented");
+        assert_eq!(
+            capabilities["transports"]["federation"],
+            "local_catalog_read_only"
+        );
+        assert_eq!(capabilities["features"]["federationReadOnly"], true);
+    }
+
+    #[test]
+    fn federation_admin_commands_are_read_only() {
+        for command in [
+            "get_federation_catalog",
+            "validate_federation_peer",
+            "resolve_federation_read",
+        ] {
+            assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
+            assert!(!WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
+        }
+    }
+
+    #[tokio::test]
+    async fn federation_peer_validation_dispatch_uses_shared_runtime_contract() {
+        let state = test_state(HashMap::new());
+        let peer = crate::federation::FederationPeerDescriptor {
+            schema_version: crate::federation::FEDERATION_SCHEMA_VERSION,
+            contract: crate::federation::FEDERATION_CONTRACT.into(),
+            runtime: crate::runtime::capability_snapshot_from_node(
+                crate::runtime::NodeIdentity {
+                    id: "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    platform: "test".into(),
+                    architecture: "test".into(),
+                },
+                None,
+            ),
+            access: crate::federation::FederationAccessMode::ReadOnly,
+            operations: vec![
+                crate::federation::FederationReadOperation::NodeCapabilities,
+                crate::federation::FederationReadOperation::NodeControlStatus,
+                crate::federation::FederationReadOperation::WorkspaceCatalog,
+                crate::federation::FederationReadOperation::WorkspaceStatus,
+            ],
+            workspaces: Vec::new(),
+            context_policy: crate::federation::FederationContextPolicy::default(),
+        };
+
+        let result = match dispatch_command(
+            &state,
+            "session",
+            "validate_federation_peer",
+            json!({"peer": peer}),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => panic!("validation command failed"),
+        };
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["code"], "FEDERATION_PEER_ACCEPTED");
     }
 
     #[test]

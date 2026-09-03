@@ -5,6 +5,10 @@ import type {
   ControlPlaneStatus,
   ControlEventBatch,
   ControlEventCursor,
+  FederationHandshakeValidation,
+  FederationPeerDescriptor,
+  FederationReadPlan,
+  FederationReadRequest,
   GatewayEventBatch,
   GatewayEventCursor,
   GatewayLogChunk,
@@ -22,6 +26,27 @@ export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
 
 export async function getControlPlaneStatus(): Promise<ControlPlaneStatus> {
   return invokeRead<ControlPlaneStatus>("get_control_plane_status");
+}
+
+export async function getFederationCatalog(): Promise<FederationPeerDescriptor> {
+  return invokeRead<FederationPeerDescriptor>("get_federation_catalog");
+}
+
+export async function validateFederationPeer(
+  peer: FederationPeerDescriptor,
+): Promise<FederationHandshakeValidation> {
+  return invokeRead<FederationHandshakeValidation>("validate_federation_peer", { peer });
+}
+
+export async function resolveFederationRead(
+  request: FederationReadRequest,
+): Promise<FederationReadPlan> {
+  return invokeRead<FederationReadPlan>("resolve_federation_read", {
+    nodeId: request.nodeId,
+    workspaceId: request.workspaceId,
+    operation: request.operation,
+    context: request.context,
+  });
 }
 
 export async function getControlPlaneEvents(

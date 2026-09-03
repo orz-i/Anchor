@@ -23,6 +23,14 @@ export interface TunnelConfig {
   use_proxy?: boolean;
 }
 
+export type FederationContextScope = "global_shared" | "node_local" | "workspace_local";
+
+export interface FederationContextRef {
+  scope: FederationContextScope;
+  nodeId?: string;
+  workspaceId?: string;
+}
+
 export interface SkillFileSummary {
   path: string;
   kind: "resource" | "script";
@@ -360,8 +368,65 @@ export interface RuntimeCapabilitySnapshot {
     skillPackages: boolean;
     durableCommands: boolean;
     gateway: boolean;
+    federationReadOnly: boolean;
     stateAuthority: string;
   };
+}
+
+export type FederationAccessMode = "read_only";
+
+export type FederationReadOperation =
+  | "node_capabilities"
+  | "node_control_status"
+  | "workspace_catalog"
+  | "workspace_status";
+
+export interface FederationContextPolicy {
+  scopes: FederationContextScope[];
+  exportWorkspacePaths: false;
+  exportSecrets: false;
+  exportHarnessState: false;
+  remoteMutation: false;
+}
+
+export interface FederationWorkspaceRoute {
+  nodeId: string;
+  workspaceId: string;
+  displayName: string;
+  access: FederationAccessMode;
+}
+
+export interface FederationPeerDescriptor {
+  schemaVersion: number;
+  contract: string;
+  runtime: RuntimeCapabilitySnapshot;
+  access: FederationAccessMode;
+  operations: FederationReadOperation[];
+  workspaces: FederationWorkspaceRoute[];
+  contextPolicy: FederationContextPolicy;
+}
+
+export interface FederationHandshakeValidation {
+  accepted: boolean;
+  code: string;
+  reason: string;
+  peerNodeId?: string;
+}
+
+export interface FederationReadRequest {
+  nodeId: string;
+  workspaceId?: string;
+  operation: FederationReadOperation;
+  context: FederationContextRef;
+}
+
+export interface FederationReadPlan {
+  nodeId: string;
+  workspaceId?: string;
+  operation: FederationReadOperation;
+  access: FederationAccessMode;
+  source: "runtime_capability_provider" | "existing_control_plane" | "workspace_registry";
+  transport: "local_catalog_read_only";
 }
 
 export interface ControlPlaneStatus {
