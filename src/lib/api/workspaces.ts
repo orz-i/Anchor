@@ -6,6 +6,8 @@ import type {
   ControlEventBatch,
   ControlEventCursor,
   FederationHandshakeValidation,
+  FederationBootstrapBundle,
+  FederationLocalSigningStatus,
   FederationPeerCandidate,
   FederationPeerCredentialStatus,
   FederationPeerDescriptor,
@@ -29,6 +31,20 @@ import type {
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
+}
+
+export async function getFederationSigningStatus(): Promise<FederationLocalSigningStatus> {
+  return invokeRead<FederationLocalSigningStatus>("get_federation_signing_status");
+}
+
+export async function getFederationBootstrapBundle(): Promise<FederationBootstrapBundle> {
+  return invokeRead<FederationBootstrapBundle>("get_federation_bootstrap_bundle");
+}
+
+export async function rotateFederationSigningKey(
+  grantId: string,
+): Promise<FederationLocalSigningStatus> {
+  return invokeAdmin<FederationLocalSigningStatus>("rotate_federation_signing_key", { grantId });
 }
 
 export async function revokeFederationPeer(
@@ -61,12 +77,12 @@ export async function getFederationPeer(nodeId: string): Promise<FederationPeerV
 export async function inspectFederationCandidate(
   endpoint: string,
   displayName: string,
-  peer: FederationPeerDescriptor,
+  bundle: FederationBootstrapBundle,
 ): Promise<FederationPeerCandidate> {
   return invokeRead<FederationPeerCandidate>("inspect_federation_candidate", {
     endpoint,
     displayName,
-    peer,
+    bundle,
   });
 }
 

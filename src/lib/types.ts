@@ -23,6 +23,39 @@ export interface TunnelConfig {
   use_proxy?: boolean;
 }
 
+export interface FederationNodeSigningPublic {
+  contract: "anchor-node-signature-v1";
+  algorithm: "ed25519";
+  keyEpoch: number;
+  publicKeyBase64: string;
+  fingerprint: string;
+}
+
+export interface FederationDetachedSignature {
+  signer: FederationNodeSigningPublic;
+  signatureBase64: string;
+}
+
+export interface FederationLocalSigningStatus {
+  nodeId: string;
+  signing: FederationNodeSigningPublic;
+}
+
+export interface FederationBootstrapBundle {
+  schemaVersion: number;
+  contract: "anchor-federation-bootstrap-v1";
+  issuedAtUnixMs: number;
+  expiresAtUnixMs: number;
+  nodeId: string;
+  federationContract: string;
+  federationSchemaVersion: number;
+  runtimeContract: string;
+  runtimeSchemaVersion: number;
+  descriptorDigest: string;
+  descriptor: FederationPeerDescriptor;
+  signing: FederationDetachedSignature;
+}
+
 export type FederationContextScope = "global_shared" | "node_local" | "workspace_local";
 
 export interface FederationContextRef {
@@ -426,7 +459,7 @@ export interface FederationReadPlan {
   operation: FederationReadOperation;
   access: FederationAccessMode;
   source: "runtime_capability_provider" | "existing_control_plane" | "workspace_registry";
-  transport: "gateway_authenticated_read_only";
+  transport: "gateway_authenticated_signed_read_only";
 }
 
 export interface FederationRemoteTarget {
@@ -447,6 +480,8 @@ export interface FederationPeerView {
   nodeId: string;
   endpoint: string;
   displayName: string;
+  bootstrapDescriptorDigest: string;
+  bootstrapSigning: FederationNodeSigningPublic;
   trustStatus: FederationPeerTrustStatus;
   registeredAtUnixMs: number;
   updatedAtUnixMs: number;
@@ -455,6 +490,8 @@ export interface FederationPeerView {
   lastProbeCode?: string;
   lastDescriptorDigest?: string;
   trustedDescriptorDigest?: string;
+  lastSigning?: FederationNodeSigningPublic;
+  trustedSigning?: FederationNodeSigningPublic;
   credential: FederationPeerCredentialStatus;
 }
 
@@ -463,21 +500,23 @@ export interface FederationPeerCandidate {
   endpoint: string;
   displayName: string;
   descriptorDigest: string;
+  signing: FederationNodeSigningPublic;
   trustStatus: "untrusted";
   persisted: false;
   credentialSent: false;
 }
 
 export interface FederationPeerRegistration {
-  nodeId: string;
   endpoint: string;
   displayName: string;
+  bundle: FederationBootstrapBundle;
 }
 
 export interface FederationPeerUpdate {
   nodeId: string;
   endpoint?: string;
   displayName?: string;
+  bootstrap?: FederationBootstrapBundle;
 }
 
 export interface FederationNodeControlStatus {
