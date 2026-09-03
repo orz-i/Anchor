@@ -27,8 +27,14 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
     "save_frp_profile",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "register_federation_peer",
+    "update_federation_peer",
+    "trust_federation_peer",
+    "remove_federation_peer",
     "set_federation_peer_credential",
     "clear_federation_peer_credential",
+    "rotate_federation_peer_credential",
+    "revoke_federation_peer",
     "install_software",
     "uninstall_software",
     "install_windows_service",
@@ -46,8 +52,14 @@ const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
     "regenerate_shared_secret",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "register_federation_peer",
+    "update_federation_peer",
+    "trust_federation_peer",
+    "remove_federation_peer",
     "set_federation_peer_credential",
     "clear_federation_peer_credential",
+    "rotate_federation_peer_credential",
+    "revoke_federation_peer",
     "install_software",
     "uninstall_software",
     #[cfg(windows)]
@@ -276,7 +288,14 @@ fn normalize_binding(
                 && normalized.kind.is_none()
                 && normalized.version.is_none()
         }
-        "set_federation_peer_credential" | "clear_federation_peer_credential" => {
+        "register_federation_peer"
+        | "update_federation_peer"
+        | "trust_federation_peer"
+        | "remove_federation_peer"
+        | "set_federation_peer_credential"
+        | "clear_federation_peer_credential"
+        | "rotate_federation_peer_credential"
+        | "revoke_federation_peer" => {
             normalized.id.is_some()
                 && normalized.key.is_some()
                 && normalized.kind.is_none()
@@ -335,7 +354,14 @@ fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> Ap
         "save_frp_profile" | "set_frp_profile_token" | "delete_frp_profile" => {
             format!("FRP profile {}", binding.id.as_deref().unwrap_or_default())
         }
-        "set_federation_peer_credential" | "clear_federation_peer_credential" => format!(
+        "register_federation_peer"
+        | "update_federation_peer"
+        | "trust_federation_peer"
+        | "remove_federation_peer"
+        | "set_federation_peer_credential"
+        | "clear_federation_peer_credential"
+        | "rotate_federation_peer_credential"
+        | "revoke_federation_peer" => format!(
             "Federation peer {} · {}",
             binding.key.as_deref().unwrap_or_default(),
             binding.id.as_deref().unwrap_or_default()

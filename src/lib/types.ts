@@ -441,6 +441,45 @@ export interface FederationPeerCredentialStatus {
   inboundConfigured: boolean;
 }
 
+export type FederationPeerTrustStatus = "untrusted" | "trusted" | "drifted" | "revoked";
+
+export interface FederationPeerView {
+  nodeId: string;
+  endpoint: string;
+  displayName: string;
+  trustStatus: FederationPeerTrustStatus;
+  registeredAtUnixMs: number;
+  updatedAtUnixMs: number;
+  credentialRevision: number;
+  lastProbeAtUnixMs?: number;
+  lastProbeCode?: string;
+  lastDescriptorDigest?: string;
+  trustedDescriptorDigest?: string;
+  credential: FederationPeerCredentialStatus;
+}
+
+export interface FederationPeerCandidate {
+  nodeId: string;
+  endpoint: string;
+  displayName: string;
+  descriptorDigest: string;
+  trustStatus: "untrusted";
+  persisted: false;
+  credentialSent: false;
+}
+
+export interface FederationPeerRegistration {
+  nodeId: string;
+  endpoint: string;
+  displayName: string;
+}
+
+export interface FederationPeerUpdate {
+  nodeId: string;
+  endpoint?: string;
+  displayName?: string;
+}
+
 export interface FederationNodeControlStatus {
   nodeId: string;
   gatewayState: string;

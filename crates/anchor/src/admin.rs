@@ -54,9 +54,18 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_federation_catalog",
     "validate_federation_peer",
     "resolve_federation_read",
+    "list_federation_peers",
+    "get_federation_peer",
+    "inspect_federation_candidate",
+    "register_federation_peer",
+    "update_federation_peer",
+    "trust_federation_peer",
+    "remove_federation_peer",
     "get_federation_peer_credential_status",
     "set_federation_peer_credential",
     "clear_federation_peer_credential",
+    "rotate_federation_peer_credential",
+    "revoke_federation_peer",
     "probe_federation_peer",
     "read_federation_remote",
     "get_last_workspace_id",
@@ -128,8 +137,15 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "save_frp_profile_metadata",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "register_federation_peer",
+    "update_federation_peer",
+    "trust_federation_peer",
+    "remove_federation_peer",
     "set_federation_peer_credential",
     "clear_federation_peer_credential",
+    "rotate_federation_peer_credential",
+    "revoke_federation_peer",
+    "probe_federation_peer",
     "set_workspace_secret",
     "regenerate_workspace_secret",
     "set_shared_secret",
@@ -176,6 +192,47 @@ struct AdminStaticAsset {
 #[serde(rename_all = "camelCase")]
 struct FederationPeerValidationArgs {
     peer: crate::federation::FederationPeerDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FederationPeerNodeArgs {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FederationCandidateArgs {
+    endpoint: String,
+    display_name: String,
+    peer: crate::federation::FederationPeerDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RegisterFederationPeerArgs {
+    node_id: String,
+    endpoint: String,
+    display_name: String,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateFederationPeerArgs {
+    node_id: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    grant_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FederationPeerGrantArgs {
+    node_id: String,
+    grant_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -948,6 +1005,51 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "rotate_federation_peer_credential" => {
+            let input: SetFederationPeerCredentialArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let peer = crate::federation::require_registered_target(&input.target)?;
+            let binding = PrivilegedActionBinding::federation_peer(&peer.node_id, &peer.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "rotate_federation_peer_credential",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "rotate_federation_peer_credential",
+                management::set_federation_peer_credential(&input.target, &input.token),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "revoke_federation_peer" => {
+            let input: FederationPeerGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let peer = management::get_federation_peer(&input.node_id)?;
+            let binding =
+                PrivilegedActionBinding::federation_peer(&peer.peer.node_id, &peer.peer.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "revoke_federation_peer",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "revoke_federation_peer",
+                management::revoke_federation_peer(&input.node_id),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "confirm_privileged_action" => {
             let input: PrivilegedConfirmArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
@@ -1098,6 +1200,142 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "list_federation_peers" => serde_json::to_value(management::list_federation_peers()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "get_federation_peer" => {
+            let input: FederationPeerNodeArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_federation_peer(&input.node_id)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "inspect_federation_candidate" => {
+            let input: FederationCandidateArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::inspect_federation_candidate(
+                &input.endpoint,
+                &input.display_name,
+                &input.peer,
+            )?)
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "register_federation_peer" => {
+            let input: RegisterFederationPeerArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let target = crate::federation::canonical_remote_target(
+                &crate::federation::FederationRemoteTarget {
+                    node_id: input.node_id.clone(),
+                    endpoint: input.endpoint.clone(),
+                },
+            )?;
+            let binding =
+                PrivilegedActionBinding::federation_peer(&target.node_id, &target.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "register_federation_peer",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "register_federation_peer",
+                management::register_federation_peer(
+                    &crate::federation::FederationPeerRegistration {
+                        node_id: target.node_id,
+                        endpoint: target.endpoint,
+                        display_name: input.display_name,
+                    },
+                ),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "update_federation_peer" => {
+            let input: UpdateFederationPeerArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let current = management::get_federation_peer(&input.node_id)?;
+            let endpoint = input
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| current.peer.endpoint.clone());
+            let target = crate::federation::canonical_remote_target(
+                &crate::federation::FederationRemoteTarget {
+                    node_id: input.node_id.clone(),
+                    endpoint,
+                },
+            )?;
+            let binding =
+                PrivilegedActionBinding::federation_peer(&target.node_id, &target.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "update_federation_peer",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "update_federation_peer",
+                management::update_federation_peer(&crate::federation::FederationPeerUpdate {
+                    node_id: input.node_id,
+                    endpoint: input.endpoint,
+                    display_name: input.display_name,
+                }),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "trust_federation_peer" => {
+            let input: FederationPeerGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let peer = management::get_federation_peer(&input.node_id)?;
+            let binding =
+                PrivilegedActionBinding::federation_peer(&peer.peer.node_id, &peer.peer.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "trust_federation_peer",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "trust_federation_peer",
+                management::trust_federation_peer(&input.node_id),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "remove_federation_peer" => {
+            let input: FederationPeerGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let peer = management::get_federation_peer(&input.node_id)?;
+            let binding =
+                PrivilegedActionBinding::federation_peer(&peer.peer.node_id, &peer.peer.endpoint);
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "remove_federation_peer",
+                &binding,
+            )?;
+            finish_privileged_execution(
+                state,
+                session_id,
+                "remove_federation_peer",
+                management::remove_federation_peer(&input.node_id),
+            )?;
+            Ok(Value::Null)
+        }
         "get_federation_peer_credential_status" => {
             let input: FederationTargetArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
@@ -1110,10 +1348,8 @@ async fn dispatch_command(
         "set_federation_peer_credential" => {
             let input: SetFederationPeerCredentialArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
-            let binding = PrivilegedActionBinding::federation_peer(
-                &input.target.node_id,
-                &input.target.endpoint,
-            );
+            let peer = crate::federation::require_registered_target(&input.target)?;
+            let binding = PrivilegedActionBinding::federation_peer(&peer.node_id, &peer.endpoint);
             consume_privileged_grant(
                 state,
                 session_id,
@@ -1134,10 +1370,8 @@ async fn dispatch_command(
         "clear_federation_peer_credential" => {
             let input: ClearFederationPeerCredentialArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
-            let binding = PrivilegedActionBinding::federation_peer(
-                &input.target.node_id,
-                &input.target.endpoint,
-            );
+            let peer = crate::federation::require_registered_target(&input.target)?;
+            let binding = PrivilegedActionBinding::federation_peer(&peer.node_id, &peer.endpoint);
             consume_privileged_grant(
                 state,
                 session_id,
@@ -1751,26 +1985,37 @@ mod tests {
     }
 
     #[test]
-    fn federation_admin_commands_are_read_only() {
+    fn federation_admin_command_classification_is_explicit() {
         for command in [
             "get_federation_catalog",
             "validate_federation_peer",
             "resolve_federation_read",
+            "list_federation_peers",
+            "get_federation_peer",
+            "inspect_federation_candidate",
             "get_federation_peer_credential_status",
-            "probe_federation_peer",
             "read_federation_remote",
         ] {
             assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
             assert!(!WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
         }
         for command in [
+            "register_federation_peer",
+            "update_federation_peer",
+            "trust_federation_peer",
+            "remove_federation_peer",
             "set_federation_peer_credential",
             "clear_federation_peer_credential",
+            "rotate_federation_peer_credential",
+            "revoke_federation_peer",
         ] {
             assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
             assert!(WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
             assert!(privileged_actions().contains(&command));
         }
+        assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&"probe_federation_peer"));
+        assert!(WEB_ADMIN_MUTATION_COMMANDS.contains(&"probe_federation_peer"));
+        assert!(!privileged_actions().contains(&"probe_federation_peer"));
     }
 
     #[tokio::test]

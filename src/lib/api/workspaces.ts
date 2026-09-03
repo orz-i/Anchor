@@ -6,8 +6,12 @@ import type {
   ControlEventBatch,
   ControlEventCursor,
   FederationHandshakeValidation,
+  FederationPeerCandidate,
   FederationPeerCredentialStatus,
   FederationPeerDescriptor,
+  FederationPeerRegistration,
+  FederationPeerUpdate,
+  FederationPeerView,
   FederationReadPlan,
   FederationReadRequest,
   FederationReadResult,
@@ -25,6 +29,76 @@ import type {
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
+}
+
+export async function revokeFederationPeer(
+  nodeId: string,
+  grantId: string,
+): Promise<FederationPeerView> {
+  return invokeAdmin<FederationPeerView>("revoke_federation_peer", { nodeId, grantId });
+}
+
+export async function rotateFederationPeerCredential(
+  target: FederationRemoteTarget,
+  token: string,
+  grantId: string,
+): Promise<FederationPeerCredentialStatus> {
+  return invokeAdmin<FederationPeerCredentialStatus>("rotate_federation_peer_credential", {
+    target,
+    token,
+    grantId,
+  });
+}
+
+export async function listFederationPeers(): Promise<FederationPeerView[]> {
+  return invokeRead<FederationPeerView[]>("list_federation_peers");
+}
+
+export async function getFederationPeer(nodeId: string): Promise<FederationPeerView> {
+  return invokeRead<FederationPeerView>("get_federation_peer", { nodeId });
+}
+
+export async function inspectFederationCandidate(
+  endpoint: string,
+  displayName: string,
+  peer: FederationPeerDescriptor,
+): Promise<FederationPeerCandidate> {
+  return invokeRead<FederationPeerCandidate>("inspect_federation_candidate", {
+    endpoint,
+    displayName,
+    peer,
+  });
+}
+
+export async function registerFederationPeer(
+  registration: FederationPeerRegistration,
+  grantId: string,
+): Promise<FederationPeerView> {
+  return invokeAdmin<FederationPeerView>("register_federation_peer", {
+    ...registration,
+    grantId,
+  });
+}
+
+export async function updateFederationPeer(
+  update: FederationPeerUpdate,
+  grantId: string,
+): Promise<FederationPeerView> {
+  return invokeAdmin<FederationPeerView>("update_federation_peer", {
+    ...update,
+    grantId,
+  });
+}
+
+export async function trustFederationPeer(
+  nodeId: string,
+  grantId: string,
+): Promise<FederationPeerView> {
+  return invokeAdmin<FederationPeerView>("trust_federation_peer", { nodeId, grantId });
+}
+
+export async function removeFederationPeer(nodeId: string, grantId: string): Promise<void> {
+  await invokeAdmin<null>("remove_federation_peer", { nodeId, grantId });
 }
 
 export async function getFederationPeerCredentialStatus(
@@ -59,8 +133,8 @@ export async function clearFederationPeerCredential(
 
 export async function probeFederationPeer(
   target: FederationRemoteTarget,
-): Promise<FederationPeerDescriptor> {
-  return invokeRead<FederationPeerDescriptor>("probe_federation_peer", { target });
+): Promise<FederationPeerView> {
+  return invokeAdmin<FederationPeerView>("probe_federation_peer", { target });
 }
 
 export async function readFederationRemote(

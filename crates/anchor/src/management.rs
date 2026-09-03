@@ -1329,6 +1329,7 @@ pub(crate) fn get_shared_secret(key: &str) -> AppResult<Option<String>> {
 pub(crate) fn federation_peer_credential_status(
     target: &crate::federation::FederationRemoteTarget,
 ) -> AppResult<crate::federation::FederationPeerCredentialStatus> {
+    crate::federation::require_registered_target(target)?;
     crate::federation::peer_credential_status(target)
 }
 
@@ -1336,28 +1337,75 @@ pub(crate) fn set_federation_peer_credential(
     target: &crate::federation::FederationRemoteTarget,
     token: &str,
 ) -> AppResult<crate::federation::FederationPeerCredentialStatus> {
-    crate::federation::set_peer_credential(target, token)?;
-    crate::federation::peer_credential_status(target)
+    let record = crate::federation::require_registered_target(target)?;
+    Ok(crate::federation::rotate_peer_credential(&record.node_id, token)?.credential)
 }
 
 pub(crate) fn clear_federation_peer_credential(
     target: &crate::federation::FederationRemoteTarget,
 ) -> AppResult<crate::federation::FederationPeerCredentialStatus> {
-    crate::federation::clear_peer_credential(target)?;
-    crate::federation::peer_credential_status(target)
+    let record = crate::federation::require_registered_target(target)?;
+    Ok(crate::federation::revoke_peer(&record.node_id)?.credential)
 }
 
 pub(crate) async fn probe_federation_peer(
     target: &crate::federation::FederationRemoteTarget,
-) -> AppResult<crate::federation::FederationPeerDescriptor> {
-    crate::federation::probe_remote_peer(target).await
+) -> AppResult<crate::federation::FederationPeerView> {
+    let record = crate::federation::require_registered_target(target)?;
+    crate::federation::probe_registered_peer(&record.node_id).await
 }
 
 pub(crate) async fn read_federation_remote(
     target: &crate::federation::FederationRemoteTarget,
     request: &crate::federation::FederationReadRequest,
 ) -> AppResult<crate::federation::FederationReadResult> {
-    crate::federation::remote_read(target, request).await
+    crate::federation::read_trusted_peer(target, request).await
+}
+
+pub(crate) fn list_federation_peers() -> AppResult<Vec<crate::federation::FederationPeerView>> {
+    crate::federation::list_peers()
+}
+
+pub(crate) fn get_federation_peer(
+    node_id: &str,
+) -> AppResult<crate::federation::FederationPeerView> {
+    crate::federation::get_peer(node_id)
+}
+
+pub(crate) fn register_federation_peer(
+    input: &crate::federation::FederationPeerRegistration,
+) -> AppResult<crate::federation::FederationPeerView> {
+    crate::federation::register_peer(input)
+}
+
+pub(crate) fn update_federation_peer(
+    input: &crate::federation::FederationPeerUpdate,
+) -> AppResult<crate::federation::FederationPeerView> {
+    crate::federation::update_peer(input)
+}
+
+pub(crate) fn trust_federation_peer(
+    node_id: &str,
+) -> AppResult<crate::federation::FederationPeerView> {
+    crate::federation::trust_peer(node_id)
+}
+
+pub(crate) fn remove_federation_peer(node_id: &str) -> AppResult<()> {
+    crate::federation::remove_peer(node_id)
+}
+
+pub(crate) fn revoke_federation_peer(
+    node_id: &str,
+) -> AppResult<crate::federation::FederationPeerView> {
+    crate::federation::revoke_peer(node_id)
+}
+
+pub(crate) fn inspect_federation_candidate(
+    endpoint: &str,
+    display_name: &str,
+    descriptor: &crate::federation::FederationPeerDescriptor,
+) -> AppResult<crate::federation::FederationPeerCandidate> {
+    crate::federation::inspect_candidate(endpoint, display_name, descriptor)
 }
 
 fn generated_secret() -> String {
