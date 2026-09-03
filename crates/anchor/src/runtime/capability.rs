@@ -95,7 +95,7 @@ pub(crate) fn capability_snapshot_from_node(
             mcp: "workspace_listener".into(),
             web_admin: "loopback_http".into(),
             local_control: "local_ipc".into(),
-            federation: "gateway_authenticated_read_only".into(),
+            federation: "gateway_authenticated_signed_read_only".into(),
         },
         features: RuntimeFeatureCapabilities {
             workspace_first: true,
@@ -216,7 +216,7 @@ mod tests {
         assert!(snapshot.features.federation_read_only);
         assert_eq!(
             snapshot.transports.federation,
-            "gateway_authenticated_read_only"
+            "gateway_authenticated_signed_read_only"
         );
         assert_eq!(
             snapshot.features.state_authority,

@@ -9,8 +9,9 @@ use crate::secret::SecretStore;
 
 use super::{
     valid_node_id, validate_peer_descriptor, validate_request_context, FederationContextRef,
-    FederationContextScope, FederationPeerDescriptor, FederationReadOperation,
-    FederationReadRequest, FederationReadResult, FEDERATION_CONTRACT, FEDERATION_SCHEMA_VERSION,
+    FederationContextScope, FederationDetachedSignature, FederationNodeSigningPublic,
+    FederationPeerDescriptor, FederationReadOperation, FederationReadRequest, FederationReadResult,
+    FEDERATION_CONTRACT, FEDERATION_SCHEMA_VERSION,
 };
 
 const OUTBOUND_TOKEN_SCOPE: &str = "federation_outbound_token";
@@ -66,6 +67,32 @@ pub struct FederationTransportResponse {
     pub runtime_contract: String,
     pub runtime_schema_version: u16,
     pub result: FederationReadResult,
+    pub signing: FederationDetachedSignature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationVerifiedRead {
+    pub result: FederationReadResult,
+    pub signer: FederationNodeSigningPublic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationPeerProbe {
+    pub descriptor: FederationPeerDescriptor,
+    pub signer: FederationNodeSigningPublic,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FederationTransportResponseSigningMaterial<'a> {
+    schema_version: u16,
+    contract: &'a str,
+    request_id: &'a str,
+    responder_node_id: &'a str,
+    runtime_contract: &'a str,
+    runtime_schema_version: u16,
+    result: &'a FederationReadResult,
+    signer: &'a FederationNodeSigningPublic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +170,8 @@ pub fn peer_credential_status(
     })
 }
 
-pub async fn probe_remote_peer(
-    target: &FederationRemoteTarget,
-) -> AppResult<FederationPeerDescriptor> {
-    let result = remote_read(
+pub async fn probe_remote_peer(target: &FederationRemoteTarget) -> AppResult<FederationPeerProbe> {
+    let verified = remote_read_verified(
         target,
         &FederationReadRequest {
             node_id: target.node_id.clone(),
@@ -160,8 +185,11 @@ pub async fn probe_remote_peer(
         },
     )
     .await?;
-    match result {
-        FederationReadResult::WorkspaceCatalog(peer) => Ok(peer),
+    match verified.result {
+        FederationReadResult::WorkspaceCatalog(peer) => Ok(FederationPeerProbe {
+            descriptor: peer,
+            signer: verified.signer,
+        }),
         _ => Err(AppError::Message(
             "FEDERATION_REMOTE_RESULT_MISMATCH: workspace_catalog returned an unexpected result kind"
                 .into(),
@@ -169,10 +197,10 @@ pub async fn probe_remote_peer(
     }
 }
 
-pub async fn remote_read(
+pub async fn remote_read_verified(
     target: &FederationRemoteTarget,
     request: &FederationReadRequest,
-) -> AppResult<FederationReadResult> {
+) -> AppResult<FederationVerifiedRead> {
     validate_target(target)?;
     validate_request_context(request)?;
     if request.node_id != target.node_id {
@@ -217,7 +245,7 @@ pub async fn remote_read(
         )));
     }
     let url = endpoint
-        .join("federation/v1/read")
+        .join("federation/v2/read")
         .map_err(|error| AppError::Message(format!("invalid federation endpoint: {error}")))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -268,8 +296,12 @@ pub async fn remote_read(
                 "FEDERATION_REMOTE_RESPONSE_INVALID: response contract is invalid: {error}"
             ))
         })?;
-    validate_transport_response(&local_runtime, target, request, &request_id, &response)?;
-    Ok(response.result)
+    let signer =
+        validate_transport_response(&local_runtime, target, request, &request_id, &response)?;
+    Ok(FederationVerifiedRead {
+        result: response.result,
+        signer,
+    })
 }
 
 pub async fn handle_inbound_transport(
@@ -327,14 +359,32 @@ pub async fn handle_inbound_transport(
             )
         })?;
     let runtime = crate::runtime::capability_snapshot(None).map_err(internal_error)?;
+    let response_request_id = envelope.request_id;
+    let response_node_id = runtime.node.id;
+    let response_runtime_contract = runtime.contract;
+    let signing = super::signing::sign_transport_payload_with_signer(|signer| {
+        serde_json::to_vec(&FederationTransportResponseSigningMaterial {
+            schema_version: FEDERATION_SCHEMA_VERSION,
+            contract: FEDERATION_CONTRACT,
+            request_id: &response_request_id,
+            responder_node_id: &response_node_id,
+            runtime_contract: &response_runtime_contract,
+            runtime_schema_version: runtime.schema_version,
+            result: &result,
+            signer,
+        })
+        .map_err(AppError::from)
+    })
+    .map_err(internal_error)?;
     Ok(FederationTransportResponse {
         schema_version: FEDERATION_SCHEMA_VERSION,
         contract: FEDERATION_CONTRACT.into(),
-        request_id: envelope.request_id,
-        responder_node_id: runtime.node.id,
-        runtime_contract: runtime.contract,
+        request_id: response_request_id,
+        responder_node_id: response_node_id,
+        runtime_contract: response_runtime_contract,
         runtime_schema_version: runtime.schema_version,
         result,
+        signing,
     })
 }
 
@@ -434,7 +484,24 @@ fn validate_transport_response(
     request: &FederationReadRequest,
     request_id: &str,
     response: &FederationTransportResponse,
-) -> AppResult<()> {
+) -> AppResult<FederationNodeSigningPublic> {
+    let signed_payload = serde_json::to_vec(&FederationTransportResponseSigningMaterial {
+        schema_version: response.schema_version,
+        contract: &response.contract,
+        request_id: &response.request_id,
+        responder_node_id: &response.responder_node_id,
+        runtime_contract: &response.runtime_contract,
+        runtime_schema_version: response.runtime_schema_version,
+        result: &response.result,
+        signer: &response.signing.signer,
+    })?;
+    let signer = super::signing::verify_transport_signature(&response.signing, &signed_payload)
+        .map_err(|_| {
+            AppError::Message(
+                "FEDERATION_REMOTE_SIGNATURE_INVALID: remote response signature verification failed"
+                    .into(),
+            )
+        })?;
     if response.schema_version != FEDERATION_SCHEMA_VERSION
         || response.contract != FEDERATION_CONTRACT
         || response.request_id != request_id
@@ -512,7 +579,7 @@ fn validate_transport_response(
             ));
         }
     }
-    Ok(())
+    Ok(signer)
 }
 
 async fn read_bounded_response(response: reqwest::Response) -> AppResult<Vec<u8>> {
@@ -671,6 +738,24 @@ fn transport_error(
 mod tests {
     use super::*;
 
+    fn resign_response(root: &std::path::Path, response: &mut FederationTransportResponse) {
+        let seed = super::super::signing::sign_transport_payload_for_test(root, b"seed signer")
+            .expect("seed signer");
+        let payload = serde_json::to_vec(&FederationTransportResponseSigningMaterial {
+            schema_version: response.schema_version,
+            contract: &response.contract,
+            request_id: &response.request_id,
+            responder_node_id: &response.responder_node_id,
+            runtime_contract: &response.runtime_contract,
+            runtime_schema_version: response.runtime_schema_version,
+            result: &response.result,
+            signer: &seed.signer,
+        })
+        .expect("response signing material");
+        response.signing = super::super::signing::sign_transport_payload_for_test(root, &payload)
+            .expect("sign response");
+    }
+
     fn transport_request() -> FederationTransportRequest {
         let runtime = crate::runtime::capability_snapshot(None).expect("runtime");
         let caller = if runtime.node.id == "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
@@ -777,6 +862,7 @@ mod tests {
 
     #[test]
     fn transport_response_must_match_request_node_contract_and_result_kind() {
+        let signing_root = tempfile::tempdir().expect("response signing root");
         let local = crate::runtime::capability_snapshot(None).expect("local runtime");
         let target = FederationRemoteTarget {
             node_id: "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
@@ -800,7 +886,12 @@ mod tests {
             },
             None,
         );
-        let response = FederationTransportResponse {
+        let seed = super::super::signing::sign_transport_payload_for_test(
+            signing_root.path(),
+            b"seed signer",
+        )
+        .expect("seed signer");
+        let mut response = FederationTransportResponse {
             schema_version: FEDERATION_SCHEMA_VERSION,
             contract: FEDERATION_CONTRACT.into(),
             request_id: "0123456789abcdef0123456789abcdef".into(),
@@ -808,7 +899,9 @@ mod tests {
             runtime_contract: local.contract.clone(),
             runtime_schema_version: local.schema_version,
             result: FederationReadResult::NodeCapabilities(remote_runtime),
+            signing: seed,
         };
+        resign_response(signing_root.path(), &mut response);
         validate_transport_response(
             &local,
             &target,
@@ -820,6 +913,7 @@ mod tests {
 
         let mut mismatched = response;
         mismatched.responder_node_id = "node_cccccccccccccccccccccccccccccccc".into();
+        resign_response(signing_root.path(), &mut mismatched);
         assert!(validate_transport_response(
             &local,
             &target,

@@ -504,7 +504,7 @@ async fn spawn_with_limits(
         )),
     };
     let app = Router::new()
-        .route("/federation/v1/read", post(federation_read_request))
+        .route("/federation/v2/read", post(federation_read_request))
         .route("/w/{workspace_id}/{*upstream_path}", any(proxy_request))
         .with_state(state);
     let (shutdown, shutdown_rx) = oneshot::channel();
@@ -1067,7 +1067,7 @@ mod tests {
             .build()
             .expect("client");
         let response = client
-            .post(format!("http://127.0.0.1:{port}/federation/v1/read"))
+            .post(format!("http://127.0.0.1:{port}/federation/v2/read"))
             .header("content-type", "application/json")
             .body("{}")
             .send()

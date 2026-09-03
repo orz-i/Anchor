@@ -52,6 +52,9 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_control_plane_status",
     "get_control_plane_events",
     "get_federation_catalog",
+    "get_federation_signing_status",
+    "get_federation_bootstrap_bundle",
+    "rotate_federation_signing_key",
     "validate_federation_peer",
     "resolve_federation_read",
     "list_federation_peers",
@@ -137,6 +140,7 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "save_frp_profile_metadata",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "rotate_federation_signing_key",
     "register_federation_peer",
     "update_federation_peer",
     "trust_federation_peer",
@@ -188,6 +192,11 @@ struct AdminStaticAsset {
     body: &'static [u8],
 }
 
+fn federation_signing_privileged_binding() -> AppResult<PrivilegedActionBinding> {
+    let node_id = crate::runtime::capability_snapshot(None)?.node.id;
+    Ok(PrivilegedActionBinding::federation_signing(&node_id))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FederationPeerValidationArgs {
@@ -205,15 +214,15 @@ struct FederationPeerNodeArgs {
 struct FederationCandidateArgs {
     endpoint: String,
     display_name: String,
-    peer: crate::federation::FederationPeerDescriptor,
+    bundle: crate::federation::FederationBootstrapBundle,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RegisterFederationPeerArgs {
-    node_id: String,
     endpoint: String,
     display_name: String,
+    bundle: crate::federation::FederationBootstrapBundle,
     grant_id: String,
 }
 
@@ -225,6 +234,8 @@ struct UpdateFederationPeerArgs {
     endpoint: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    bootstrap: Option<crate::federation::FederationBootstrapBundle>,
     grant_id: String,
 }
 
@@ -954,6 +965,8 @@ fn canonical_privileged_binding(
 ) -> AppResult<PrivilegedActionBinding> {
     if is_windows_service_action(action) {
         windows_service_privileged_binding(action)
+    } else if action == "rotate_federation_signing_key" {
+        federation_signing_privileged_binding()
     } else {
         Ok(requested)
     }
@@ -1181,6 +1194,37 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "get_federation_signing_status" => {
+            serde_json::to_value(management::federation_signing_status()?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_federation_bootstrap_bundle" => {
+            serde_json::to_value(management::federation_bootstrap_bundle()?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "rotate_federation_signing_key" => {
+            let input: PrivilegedGrantArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            let binding = federation_signing_privileged_binding()?;
+            consume_privileged_grant(
+                state,
+                session_id,
+                &input.grant_id,
+                "rotate_federation_signing_key",
+                &binding,
+            )?;
+            let result = finish_privileged_execution(
+                state,
+                session_id,
+                "rotate_federation_signing_key",
+                management::rotate_federation_signing_key(),
+            )?;
+            serde_json::to_value(result)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "validate_federation_peer" => {
             let input: FederationPeerValidationArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
@@ -1216,7 +1260,7 @@ async fn dispatch_command(
             serde_json::to_value(management::inspect_federation_candidate(
                 &input.endpoint,
                 &input.display_name,
-                &input.peer,
+                &input.bundle,
             )?)
             .map_err(AppError::from)
             .map_err(Into::into)
@@ -1224,14 +1268,13 @@ async fn dispatch_command(
         "register_federation_peer" => {
             let input: RegisterFederationPeerArgs =
                 serde_json::from_value(args).map_err(AppError::from)?;
-            let target = crate::federation::canonical_remote_target(
-                &crate::federation::FederationRemoteTarget {
-                    node_id: input.node_id.clone(),
-                    endpoint: input.endpoint.clone(),
-                },
+            let candidate = management::inspect_federation_candidate(
+                &input.endpoint,
+                &input.display_name,
+                &input.bundle,
             )?;
             let binding =
-                PrivilegedActionBinding::federation_peer(&target.node_id, &target.endpoint);
+                PrivilegedActionBinding::federation_peer(&candidate.node_id, &candidate.endpoint);
             consume_privileged_grant(
                 state,
                 session_id,
@@ -1245,9 +1288,9 @@ async fn dispatch_command(
                 "register_federation_peer",
                 management::register_federation_peer(
                     &crate::federation::FederationPeerRegistration {
-                        node_id: target.node_id,
-                        endpoint: target.endpoint,
+                        endpoint: candidate.endpoint,
                         display_name: input.display_name,
+                        bundle: input.bundle,
                     },
                 ),
             )?;
@@ -1269,6 +1312,28 @@ async fn dispatch_command(
                     endpoint,
                 },
             )?;
+            if target.endpoint != current.peer.endpoint && input.bootstrap.is_none() {
+                return Err(AdminDispatchError::Rejected(AppError::Message(
+                    "FEDERATION_PEER_REBOOTSTRAP_REQUIRED: endpoint changes require a signed bootstrap bundle"
+                        .into(),
+                )));
+            }
+            if let Some(bundle) = input.bootstrap.as_ref() {
+                let candidate = management::inspect_federation_candidate(
+                    &target.endpoint,
+                    input
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&current.peer.display_name),
+                    bundle,
+                )?;
+                if candidate.node_id != input.node_id {
+                    return Err(AdminDispatchError::Rejected(AppError::Message(
+                        "FEDERATION_BOOTSTRAP_NODE_MISMATCH: re-bootstrap bundle belongs to a different node"
+                            .into(),
+                    )));
+                }
+            }
             let binding =
                 PrivilegedActionBinding::federation_peer(&target.node_id, &target.endpoint);
             consume_privileged_grant(
@@ -1286,6 +1351,7 @@ async fn dispatch_command(
                     node_id: input.node_id,
                     endpoint: input.endpoint,
                     display_name: input.display_name,
+                    bootstrap: input.bootstrap,
                 }),
             )?;
             serde_json::to_value(result)
@@ -1979,7 +2045,7 @@ mod tests {
         );
         assert_eq!(
             capabilities["transports"]["federation"],
-            "gateway_authenticated_read_only"
+            "gateway_authenticated_signed_read_only"
         );
         assert_eq!(capabilities["features"]["federationReadOnly"], true);
     }

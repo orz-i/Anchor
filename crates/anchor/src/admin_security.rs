@@ -35,6 +35,7 @@ const PRIVILEGED_ACTIONS: &[&str] = &[
     "clear_federation_peer_credential",
     "rotate_federation_peer_credential",
     "revoke_federation_peer",
+    "rotate_federation_signing_key",
     "install_software",
     "uninstall_software",
     "install_windows_service",
@@ -60,6 +61,7 @@ const AVAILABLE_PRIVILEGED_EXECUTORS: &[&str] = &[
     "clear_federation_peer_credential",
     "rotate_federation_peer_credential",
     "revoke_federation_peer",
+    "rotate_federation_signing_key",
     "install_software",
     "uninstall_software",
     #[cfg(windows)]
@@ -181,6 +183,15 @@ impl PrivilegedActionBinding {
         }
     }
 
+    pub fn federation_signing(node_id: &str) -> Self {
+        Self {
+            id: Some("ed25519".into()),
+            key: Some(node_id.to_string()),
+            kind: None,
+            version: None,
+        }
+    }
+
     pub fn shared_secret(key: &str) -> Self {
         Self {
             id: None,
@@ -276,6 +287,12 @@ fn normalize_binding(
                 && normalized.kind.is_none()
                 && normalized.version.is_none()
         }
+        "rotate_federation_signing_key" => {
+            normalized.id.as_deref() == Some("ed25519")
+                && normalized.key.is_some()
+                && normalized.kind.is_none()
+                && normalized.version.is_none()
+        }
         "set_shared_secret" | "regenerate_shared_secret" => {
             normalized.id.is_none()
                 && normalized.key.is_some()
@@ -363,6 +380,11 @@ fn binding_target_summary(action: &str, binding: &PrivilegedActionBinding) -> Ap
         | "rotate_federation_peer_credential"
         | "revoke_federation_peer" => format!(
             "Federation peer {} · {}",
+            binding.key.as_deref().unwrap_or_default(),
+            binding.id.as_deref().unwrap_or_default()
+        ),
+        "rotate_federation_signing_key" => format!(
+            "Federation signing key {} · {}",
             binding.key.as_deref().unwrap_or_default(),
             binding.id.as_deref().unwrap_or_default()
         ),

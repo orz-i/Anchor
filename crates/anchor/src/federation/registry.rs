@@ -11,12 +11,12 @@ use crate::error::{AppError, AppResult};
 
 use super::{
     canonical_remote_target, clear_peer_credential, peer_credential_status, probe_remote_peer,
-    remote_read, set_peer_credential, valid_node_id, validate_peer_descriptor,
-    FederationPeerCredentialStatus, FederationPeerDescriptor, FederationReadRequest,
-    FederationReadResult, FederationRemoteTarget,
+    remote_read_verified, set_peer_credential, valid_node_id, validate_peer_descriptor,
+    FederationBootstrapBundle, FederationNodeSigningPublic, FederationPeerCredentialStatus,
+    FederationPeerDescriptor, FederationReadRequest, FederationReadResult, FederationRemoteTarget,
 };
 
-const PEER_REGISTRY_SCHEMA_VERSION: u16 = 1;
+const PEER_REGISTRY_SCHEMA_VERSION: u16 = 2;
 const MAX_PEERS: usize = 128;
 const MAX_DISPLAY_NAME_BYTES: usize = 200;
 const TRUST_PROBE_MAX_AGE_MS: u64 = 10 * 60 * 1000;
@@ -30,12 +30,19 @@ pub enum FederationPeerTrustStatus {
     Revoked,
 }
 
-fn apply_successful_probe(record: &mut FederationPeerRecord, digest: &str, now: u64) {
+fn apply_successful_probe(
+    record: &mut FederationPeerRecord,
+    digest: &str,
+    signer: &FederationNodeSigningPublic,
+    now: u64,
+) {
     record.last_probe_at_unix_ms = Some(now);
     record.last_probe_code = Some("FEDERATION_PEER_PROBE_OK".into());
     record.last_descriptor_digest = Some(digest.to_string());
+    record.last_signing = Some(signer.clone());
     if record.trust_status == FederationPeerTrustStatus::Trusted
-        && record.trusted_descriptor_digest.as_deref() != Some(digest)
+        && (record.trusted_descriptor_digest.as_deref() != Some(digest)
+            || record.trusted_signing.as_ref() != Some(signer))
     {
         record.trust_status = FederationPeerTrustStatus::Drifted;
         record.last_probe_code = Some("FEDERATION_PEER_TRUST_DRIFT".into());
@@ -43,7 +50,10 @@ fn apply_successful_probe(record: &mut FederationPeerRecord, digest: &str, now: 
     record.updated_at_unix_ms = now;
 }
 
-fn recent_successful_probe_digest(record: &FederationPeerRecord, now: u64) -> AppResult<String> {
+fn recent_successful_probe_material(
+    record: &FederationPeerRecord,
+    now: u64,
+) -> AppResult<(String, FederationNodeSigningPublic)> {
     let probed_at = record.last_probe_at_unix_ms.ok_or_else(|| {
         AppError::Message(
             "FEDERATION_TRUST_REQUIRES_PROBE: trust requires a successful recent peer probe".into(),
@@ -55,15 +65,29 @@ fn recent_successful_probe_digest(record: &FederationPeerRecord, now: u64) -> Ap
                 .into(),
         )
     })?;
-    if record.last_probe_code.as_deref() != Some("FEDERATION_PEER_PROBE_OK")
-        || now.saturating_sub(probed_at) > TRUST_PROBE_MAX_AGE_MS
+    let signing = record.last_signing.clone().ok_or_else(|| {
+        AppError::Message(
+            "FEDERATION_TRUST_REQUIRES_SIGNED_PROBE: trust requires a verified peer signing identity"
+                .into(),
+        )
+    })?;
+    if !matches!(
+        record.last_probe_code.as_deref(),
+        Some("FEDERATION_PEER_PROBE_OK" | "FEDERATION_PEER_TRUST_DRIFT")
+    ) || now.saturating_sub(probed_at) > TRUST_PROBE_MAX_AGE_MS
     {
         return Err(AppError::Message(
             "FEDERATION_TRUST_PROBE_STALE: trust requires a successful probe from the last 10 minutes"
                 .into(),
         ));
     }
-    Ok(digest)
+    if digest != record.bootstrap_descriptor_digest || signing != record.bootstrap_signing {
+        return Err(AppError::Message(
+            "FEDERATION_TRUST_BOOTSTRAP_MISMATCH: recent probe does not match the active out-of-band bootstrap pin"
+                .into(),
+        ));
+    }
+    Ok((digest, signing))
 }
 
 pub fn require_registered_target(
@@ -109,6 +133,7 @@ pub async fn read_trusted_peer(
     target: &FederationRemoteTarget,
     request: &FederationReadRequest,
 ) -> AppResult<FederationReadResult> {
+    let root = crate::platform::platform().app_config_dir()?;
     let record = require_trusted_target(target)?;
     if request.node_id != record.node_id {
         return Err(AppError::Message(
@@ -116,7 +141,23 @@ pub async fn read_trusted_peer(
                 .into(),
         ));
     }
-    remote_read(&target_from(&record), request).await
+    let verified = remote_read_verified(&target_from(&record), request).await?;
+    if record.trusted_signing.as_ref() != Some(&verified.signer) {
+        let now = unix_time_ms()?;
+        update_registry_at(&root, |registry| {
+            let current = find_peer_mut(registry, &record.node_id)?;
+            current.trust_status = FederationPeerTrustStatus::Drifted;
+            current.last_signing = Some(verified.signer.clone());
+            current.last_probe_code = Some("FEDERATION_PEER_SIGNING_KEY_DRIFT".into());
+            current.updated_at_unix_ms = now;
+            Ok(())
+        })?;
+        return Err(AppError::Message(
+            "FEDERATION_PEER_SIGNING_KEY_DRIFT: remote response signer does not match the trusted key pin"
+                .into(),
+        ));
+    }
+    Ok(verified.result)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +166,8 @@ pub struct FederationPeerRecord {
     pub node_id: String,
     pub endpoint: String,
     pub display_name: String,
+    pub bootstrap_descriptor_digest: String,
+    pub bootstrap_signing: FederationNodeSigningPublic,
     pub trust_status: FederationPeerTrustStatus,
     pub registered_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -137,6 +180,10 @@ pub struct FederationPeerRecord {
     pub last_descriptor_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_descriptor_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_signing: Option<FederationNodeSigningPublic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_signing: Option<FederationNodeSigningPublic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -150,9 +197,9 @@ pub struct FederationPeerView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FederationPeerRegistration {
-    pub node_id: String,
     pub endpoint: String,
     pub display_name: String,
+    pub bundle: FederationBootstrapBundle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +210,8 @@ pub struct FederationPeerUpdate {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<FederationBootstrapBundle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -172,6 +221,7 @@ pub struct FederationPeerCandidate {
     pub endpoint: String,
     pub display_name: String,
     pub descriptor_digest: String,
+    pub signing: FederationNodeSigningPublic,
     pub trust_status: FederationPeerTrustStatus,
     pub persisted: bool,
     pub credential_sent: bool,
@@ -205,12 +255,12 @@ pub fn get_peer(node_id: &str) -> AppResult<FederationPeerView> {
 
 pub fn register_peer(input: &FederationPeerRegistration) -> AppResult<FederationPeerView> {
     let root = crate::platform::platform().app_config_dir()?;
+    let candidate = inspect_candidate(&input.endpoint, &input.display_name, &input.bundle)?;
     let target = canonical_remote_target(&FederationRemoteTarget {
-        node_id: input.node_id.clone(),
-        endpoint: input.endpoint.clone(),
+        node_id: candidate.node_id.clone(),
+        endpoint: candidate.endpoint.clone(),
     })?;
     reject_self_peer(&target.node_id)?;
-    normalize_display_name(&input.display_name, &target.node_id)?;
     let registry = load_registry_at(&root)?;
     if registry.peers.len() >= MAX_PEERS {
         return Err(AppError::Message(format!(
@@ -235,21 +285,43 @@ pub fn register_peer(input: &FederationPeerRegistration) -> AppResult<Federation
 pub fn update_peer(input: &FederationPeerUpdate) -> AppResult<FederationPeerView> {
     let root = crate::platform::platform().app_config_dir()?;
     let existing = record_at(&root, &input.node_id)?;
-    if let Some(endpoint) = input.endpoint.as_deref() {
-        let canonical = canonical_remote_target(&FederationRemoteTarget {
+    let next_endpoint = if let Some(endpoint) = input.endpoint.as_deref() {
+        canonical_remote_target(&FederationRemoteTarget {
             node_id: input.node_id.clone(),
             endpoint: endpoint.into(),
-        })?;
-        let registry = load_registry_at(&root)?;
-        ensure_endpoint_unique(&registry, &canonical.endpoint, Some(&input.node_id))?;
-        if let Some(name) = input.display_name.as_deref() {
-            normalize_display_name(name, &input.node_id)?;
+        })?
+        .endpoint
+    } else {
+        existing.endpoint.clone()
+    };
+    let next_display_name = if let Some(name) = input.display_name.as_deref() {
+        normalize_display_name(name, &input.node_id)?
+    } else {
+        existing.display_name.clone()
+    };
+    let endpoint_changed = next_endpoint != existing.endpoint;
+    let bootstrap_candidate = input
+        .bootstrap
+        .as_ref()
+        .map(|bundle| inspect_candidate(&next_endpoint, &next_display_name, bundle))
+        .transpose()?;
+    if let Some(candidate) = bootstrap_candidate.as_ref() {
+        if candidate.node_id != input.node_id {
+            return Err(AppError::Message(
+                "FEDERATION_BOOTSTRAP_NODE_MISMATCH: re-bootstrap bundle belongs to a different node"
+                    .into(),
+            ));
         }
-        if canonical.endpoint != existing.endpoint {
-            clear_peer_credential(&target_from(&existing))?;
-        }
-    } else if let Some(name) = input.display_name.as_deref() {
-        normalize_display_name(name, &input.node_id)?;
+    } else if endpoint_changed {
+        return Err(AppError::Message(
+            "FEDERATION_PEER_REBOOTSTRAP_REQUIRED: endpoint changes require a signed bootstrap bundle"
+                .into(),
+        ));
+    }
+    let registry = load_registry_at(&root)?;
+    ensure_endpoint_unique(&registry, &next_endpoint, Some(&input.node_id))?;
+    if endpoint_changed {
+        clear_peer_credential(&target_from(&existing))?;
     }
     update_peer_at(&root, input)
 }
@@ -285,11 +357,33 @@ pub async fn probe_registered_peer(node_id: &str) -> AppResult<FederationPeerVie
     let target = target_from(&peer);
     let now = unix_time_ms()?;
     match probe_remote_peer(&target).await {
-        Ok(descriptor) => {
-            let digest = descriptor_trust_digest(&descriptor)?;
+        Ok(probe) => {
+            let digest = descriptor_trust_digest(&probe.descriptor)?;
+            if digest != peer.bootstrap_descriptor_digest || probe.signer != peer.bootstrap_signing
+            {
+                update_registry_at(&root, |registry| {
+                    let record = find_peer_mut(registry, node_id)?;
+                    record.last_probe_at_unix_ms = Some(now);
+                    record.last_probe_code = Some("FEDERATION_PEER_BOOTSTRAP_DRIFT".into());
+                    record.last_descriptor_digest = Some(digest.clone());
+                    record.last_signing = Some(probe.signer.clone());
+                    if matches!(
+                        record.trust_status,
+                        FederationPeerTrustStatus::Trusted | FederationPeerTrustStatus::Drifted
+                    ) {
+                        record.trust_status = FederationPeerTrustStatus::Drifted;
+                    }
+                    record.updated_at_unix_ms = now;
+                    Ok(())
+                })?;
+                return Err(AppError::Message(
+                    "FEDERATION_PEER_BOOTSTRAP_DRIFT: live peer signing identity or security descriptor does not match the out-of-band bootstrap pin"
+                        .into(),
+                ));
+            }
             update_registry_at(&root, |registry| {
                 let record = find_peer_mut(registry, node_id)?;
-                apply_successful_probe(record, &digest, now);
+                apply_successful_probe(record, &digest, &probe.signer, now);
                 Ok(())
             })?;
             get_peer_at(&root, node_id)
@@ -321,8 +415,10 @@ pub fn trust_peer(node_id: &str) -> AppResult<FederationPeerView> {
 pub fn inspect_candidate(
     endpoint: &str,
     display_name: &str,
-    descriptor: &FederationPeerDescriptor,
+    bundle: &FederationBootstrapBundle,
 ) -> AppResult<FederationPeerCandidate> {
+    let signing = super::verify_bootstrap_bundle(bundle)?;
+    let descriptor = &bundle.descriptor;
     let local_runtime = crate::runtime::capability_snapshot(None)?;
     let validation = validate_peer_descriptor(&local_runtime, descriptor);
     if !validation.accepted {
@@ -341,6 +437,7 @@ pub fn inspect_candidate(
         endpoint: target.endpoint,
         display_name,
         descriptor_digest: descriptor_trust_digest(descriptor)?,
+        signing,
         trust_status: FederationPeerTrustStatus::Untrusted,
         persisted: false,
         credential_sent: false,
@@ -396,12 +493,13 @@ fn register_peer_at(
     root: &Path,
     input: &FederationPeerRegistration,
 ) -> AppResult<FederationPeerView> {
+    let candidate = inspect_candidate(&input.endpoint, &input.display_name, &input.bundle)?;
     let target = canonical_remote_target(&FederationRemoteTarget {
-        node_id: input.node_id.clone(),
-        endpoint: input.endpoint.clone(),
+        node_id: candidate.node_id.clone(),
+        endpoint: candidate.endpoint.clone(),
     })?;
     reject_self_peer(&target.node_id)?;
-    let display_name = normalize_display_name(&input.display_name, &target.node_id)?;
+    let display_name = candidate.display_name.clone();
     let now = unix_time_ms()?;
     update_registry_at(root, |registry| {
         if registry.peers.len() >= MAX_PEERS {
@@ -420,10 +518,13 @@ fn register_peer_at(
             )));
         }
         ensure_endpoint_unique(registry, &target.endpoint, None)?;
+        ensure_bootstrap_signer_unique(registry, &candidate.signing, None)?;
         registry.peers.push(FederationPeerRecord {
             node_id: target.node_id.clone(),
             endpoint: target.endpoint.clone(),
             display_name: display_name.clone(),
+            bootstrap_descriptor_digest: candidate.descriptor_digest.clone(),
+            bootstrap_signing: candidate.signing.clone(),
             trust_status: FederationPeerTrustStatus::Untrusted,
             registered_at_unix_ms: now,
             updated_at_unix_ms: now,
@@ -432,6 +533,8 @@ fn register_peer_at(
             last_probe_code: None,
             last_descriptor_digest: None,
             trusted_descriptor_digest: None,
+            last_signing: None,
+            trusted_signing: None,
         });
         registry
             .peers
@@ -459,6 +562,24 @@ fn update_peer_at(root: &Path, input: &FederationPeerUpdate) -> AppResult<Federa
         existing.display_name.clone()
     };
     let endpoint_changed = next_endpoint != existing.endpoint;
+    let bootstrap_candidate = input
+        .bootstrap
+        .as_ref()
+        .map(|bundle| inspect_candidate(&next_endpoint, &next_display_name, bundle))
+        .transpose()?;
+    if let Some(candidate) = bootstrap_candidate.as_ref() {
+        if candidate.node_id != input.node_id {
+            return Err(AppError::Message(
+                "FEDERATION_BOOTSTRAP_NODE_MISMATCH: re-bootstrap bundle belongs to a different node"
+                    .into(),
+            ));
+        }
+    } else if endpoint_changed {
+        return Err(AppError::Message(
+            "FEDERATION_PEER_REBOOTSTRAP_REQUIRED: endpoint changes require a signed bootstrap bundle"
+                .into(),
+        ));
+    }
     let now = unix_time_ms()?;
     update_registry_at(root, |registry| {
         apply_peer_update_metadata(
@@ -467,6 +588,7 @@ fn update_peer_at(root: &Path, input: &FederationPeerUpdate) -> AppResult<Federa
             &next_endpoint,
             &next_display_name,
             endpoint_changed,
+            bootstrap_candidate.as_ref(),
             now,
         )
     })?;
@@ -479,20 +601,51 @@ fn apply_peer_update_metadata(
     next_endpoint: &str,
     next_display_name: &str,
     endpoint_changed: bool,
+    bootstrap: Option<&FederationPeerCandidate>,
     now: u64,
 ) -> AppResult<()> {
     ensure_endpoint_unique(registry, next_endpoint, Some(node_id))?;
+    if let Some(candidate) = bootstrap {
+        ensure_bootstrap_signer_unique(registry, &candidate.signing, Some(node_id))?;
+    }
     let record = find_peer_mut(registry, node_id)?;
     record.endpoint = next_endpoint.to_string();
     record.display_name = next_display_name.to_string();
     record.updated_at_unix_ms = now;
-    if endpoint_changed {
+    if let Some(candidate) = bootstrap {
+        record.bootstrap_descriptor_digest = candidate.descriptor_digest.clone();
+        record.bootstrap_signing = candidate.signing.clone();
         record.trust_status = FederationPeerTrustStatus::Untrusted;
-        record.credential_revision = record.credential_revision.saturating_add(1);
+        if endpoint_changed {
+            record.credential_revision = record.credential_revision.saturating_add(1);
+        }
         record.last_probe_at_unix_ms = None;
-        record.last_probe_code = Some("FEDERATION_PEER_ENDPOINT_CHANGED".into());
+        record.last_probe_code = Some(if endpoint_changed {
+            "FEDERATION_PEER_ENDPOINT_REBOOTSTRAPPED".into()
+        } else {
+            "FEDERATION_PEER_SIGNING_REBOOTSTRAPPED".into()
+        });
         record.last_descriptor_digest = None;
         record.trusted_descriptor_digest = None;
+        record.last_signing = None;
+        record.trusted_signing = None;
+    }
+    Ok(())
+}
+
+fn ensure_bootstrap_signer_unique(
+    registry: &FederationPeerRegistryFile,
+    signer: &FederationNodeSigningPublic,
+    except_node_id: Option<&str>,
+) -> AppResult<()> {
+    if registry.peers.iter().any(|peer| {
+        peer.bootstrap_signing.fingerprint == signer.fingerprint
+            && except_node_id != Some(peer.node_id.as_str())
+    }) {
+        return Err(AppError::Message(
+            "FEDERATION_SIGNING_KEY_ALREADY_REGISTERED: one bootstrap signing key cannot identify multiple peer nodes"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -520,6 +673,7 @@ fn rotate_peer_credential_at(
         if record.trust_status == FederationPeerTrustStatus::Revoked {
             record.trust_status = FederationPeerTrustStatus::Untrusted;
             record.trusted_descriptor_digest = None;
+            record.trusted_signing = None;
         }
         Ok(())
     })?;
@@ -535,6 +689,7 @@ fn revoke_peer_at(root: &Path, node_id: &str) -> AppResult<FederationPeerView> {
         record.credential_revision = record.credential_revision.saturating_add(1);
         record.updated_at_unix_ms = now;
         record.trusted_descriptor_digest = None;
+        record.trusted_signing = None;
         record.last_probe_code = Some("FEDERATION_PEER_REVOKED".into());
         Ok(())
     })?;
@@ -551,11 +706,12 @@ fn trust_peer_at(root: &Path, node_id: &str) -> AppResult<FederationPeerView> {
         ));
     }
     let now = unix_time_ms()?;
-    let digest = recent_successful_probe_digest(&record, now)?;
+    let (digest, signing) = recent_successful_probe_material(&record, now)?;
     update_registry_at(root, |registry| {
         let record = find_peer_mut(registry, node_id)?;
         record.trust_status = FederationPeerTrustStatus::Trusted;
         record.trusted_descriptor_digest = Some(digest.clone());
+        record.trusted_signing = Some(signing.clone());
         record.updated_at_unix_ms = now;
         Ok(())
     })?;
@@ -709,6 +865,7 @@ fn validate_registry(registry: &FederationPeerRegistryFile) -> AppResult<()> {
     }
     let mut node_ids = BTreeSet::new();
     let mut endpoints = BTreeSet::new();
+    let mut bootstrap_fingerprints = BTreeSet::new();
     for peer in &registry.peers {
         validate_node_selector(&peer.node_id)?;
         let canonical = canonical_remote_target(&target_from(peer))?;
@@ -737,7 +894,14 @@ fn validate_registry(registry: &FederationPeerRegistryFile) -> AppResult<()> {
                 "FEDERATION_PEER_REGISTRY_INVALID: duplicate peer node or endpoint".into(),
             ));
         }
+        if !bootstrap_fingerprints.insert(peer.bootstrap_signing.fingerprint.clone()) {
+            return Err(AppError::Message(
+                "FEDERATION_PEER_REGISTRY_INVALID: one bootstrap signing key cannot identify multiple peer nodes"
+                    .into(),
+            ));
+        }
         for digest in [
+            Some(peer.bootstrap_descriptor_digest.as_str()),
             peer.last_descriptor_digest.as_deref(),
             peer.trusted_descriptor_digest.as_deref(),
         ]
@@ -750,19 +914,49 @@ fn validate_registry(registry: &FederationPeerRegistryFile) -> AppResult<()> {
                 ));
             }
         }
+        if peer.last_descriptor_digest.is_some() != peer.last_signing.is_some() {
+            return Err(AppError::Message(
+                "FEDERATION_PEER_REGISTRY_INVALID: observed descriptor and signing identity must be persisted together"
+                    .into(),
+            ));
+        }
+        for signing in [
+            Some(&peer.bootstrap_signing),
+            peer.last_signing.as_ref(),
+            peer.trusted_signing.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            super::signing::validate_public_signing_identity(signing).map_err(|_| {
+                AppError::Message(
+                    "FEDERATION_PEER_REGISTRY_INVALID: persisted signing identity is invalid"
+                        .into(),
+                )
+            })?;
+        }
         match peer.trust_status {
             FederationPeerTrustStatus::Trusted | FederationPeerTrustStatus::Drifted => {
-                if peer.trusted_descriptor_digest.is_none() {
+                if peer.trusted_descriptor_digest.is_none() || peer.trusted_signing.is_none() {
                     return Err(AppError::Message(
-                        "FEDERATION_PEER_REGISTRY_INVALID: trusted or drifted peer is missing its pinned descriptor digest"
+                        "FEDERATION_PEER_REGISTRY_INVALID: trusted or drifted peer is missing its pinned descriptor or signing identity"
+                            .into(),
+                    ));
+                }
+                if peer.trusted_descriptor_digest.as_deref()
+                    != Some(peer.bootstrap_descriptor_digest.as_str())
+                    || peer.trusted_signing.as_ref() != Some(&peer.bootstrap_signing)
+                {
+                    return Err(AppError::Message(
+                        "FEDERATION_PEER_REGISTRY_INVALID: trusted pins must originate from the active bootstrap pin"
                             .into(),
                     ));
                 }
             }
             FederationPeerTrustStatus::Untrusted | FederationPeerTrustStatus::Revoked => {
-                if peer.trusted_descriptor_digest.is_some() {
+                if peer.trusted_descriptor_digest.is_some() || peer.trusted_signing.is_some() {
                     return Err(AppError::Message(
-                        "FEDERATION_PEER_REGISTRY_INVALID: untrusted or revoked peer must not retain a trusted descriptor digest"
+                        "FEDERATION_PEER_REGISTRY_INVALID: untrusted or revoked peer must not retain trusted descriptor or signing pins"
                             .into(),
                     ));
                 }
@@ -814,11 +1008,33 @@ fn unix_time_ms() -> AppResult<u64> {
 mod tests {
     use super::*;
 
-    fn target(node: char, endpoint: &str) -> FederationPeerRegistration {
+    fn signing(node_id: &str) -> FederationNodeSigningPublic {
+        let root = tempfile::tempdir().expect("signing root");
+        let descriptor = descriptor(node_id);
+        super::super::signing::bootstrap_bundle_for_test(
+            root.path(),
+            &descriptor,
+            unix_time_ms().expect("now"),
+        )
+        .expect("signed bootstrap")
+        .signing
+        .signer
+    }
+
+    fn target(root: &Path, node: char, endpoint: &str) -> FederationPeerRegistration {
+        let node_id = format!("node_{}", node.to_string().repeat(32));
+        let descriptor = descriptor(&node_id);
+        let signing_root = root.join(format!("signer-{node}"));
+        let bundle = super::super::signing::bootstrap_bundle_for_test(
+            &signing_root,
+            &descriptor,
+            unix_time_ms().expect("now"),
+        )
+        .expect("bootstrap");
         FederationPeerRegistration {
-            node_id: format!("node_{}", node.to_string().repeat(32)),
             endpoint: endpoint.into(),
             display_name: format!("Node {node}"),
+            bundle,
         }
     }
 
@@ -854,8 +1070,11 @@ mod tests {
     #[test]
     fn registry_is_local_file_with_canonical_unique_endpoints() {
         let root = tempfile::tempdir().expect("registry root");
-        let first = register_peer_at(root.path(), &target('b', "https://node-b.example/"))
-            .expect("register first");
+        let first = register_peer_at(
+            root.path(),
+            &target(root.path(), 'b', "https://node-b.example/"),
+        )
+        .expect("register first");
         assert_eq!(first.peer.endpoint, "https://node-b.example");
         assert_eq!(
             first.peer.trust_status,
@@ -863,36 +1082,86 @@ mod tests {
         );
         assert!(registry_path(root.path()).ends_with("data/federation-peers.json"));
 
-        let duplicate = register_peer_at(root.path(), &target('c', "https://node-b.example"))
-            .expect_err("same endpoint must not map to another node");
+        let duplicate = register_peer_at(
+            root.path(),
+            &target(root.path(), 'c', "https://node-b.example"),
+        )
+        .expect_err("same endpoint must not map to another node");
         assert!(duplicate
             .to_string()
             .contains("FEDERATION_ENDPOINT_ALREADY_REGISTERED"));
     }
 
     #[test]
+    fn registry_rejects_one_bootstrap_signer_claiming_multiple_node_ids() {
+        let registry_root = tempfile::tempdir().expect("registry root");
+        let signing_root = tempfile::tempdir().expect("signing root");
+        let now = unix_time_ms().expect("now");
+
+        let node_b = "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let bundle_b = super::super::signing::bootstrap_bundle_for_test(
+            signing_root.path(),
+            &descriptor(node_b),
+            now,
+        )
+        .expect("node b bootstrap");
+        register_peer_at(
+            registry_root.path(),
+            &FederationPeerRegistration {
+                endpoint: "https://node-b.example".into(),
+                display_name: "Node B".into(),
+                bundle: bundle_b,
+            },
+        )
+        .expect("register node b");
+
+        let node_c = "node_cccccccccccccccccccccccccccccccc";
+        let bundle_c = super::super::signing::bootstrap_bundle_for_test(
+            signing_root.path(),
+            &descriptor(node_c),
+            now,
+        )
+        .expect("node c bootstrap");
+        assert!(register_peer_at(
+            registry_root.path(),
+            &FederationPeerRegistration {
+                endpoint: "https://node-c.example".into(),
+                display_name: "Node C".into(),
+                bundle: bundle_c,
+            },
+        )
+        .expect_err("one signing key must not identify two registered nodes")
+        .to_string()
+        .contains("FEDERATION_SIGNING_KEY_ALREADY_REGISTERED"));
+    }
+
+    #[test]
     fn endpoint_change_revokes_old_credentials_and_resets_trust_material() {
         let root = tempfile::tempdir().expect("registry root");
-        let mut peer = register_peer_at(root.path(), &target('b', "https://node-b.example"))
-            .expect("register");
+        let mut peer = register_peer_at(
+            root.path(),
+            &target(root.path(), 'b', "https://node-b.example"),
+        )
+        .expect("register");
         peer.peer.trust_status = FederationPeerTrustStatus::Trusted;
-        peer.peer.trusted_descriptor_digest = Some("a".repeat(64));
+        peer.peer.trusted_descriptor_digest = Some(peer.peer.bootstrap_descriptor_digest.clone());
+        peer.peer.trusted_signing = Some(peer.peer.bootstrap_signing.clone());
         update_registry_at(root.path(), |registry| {
             *find_peer_mut(registry, &peer.peer.node_id)? = peer.peer.clone();
             Ok(())
         })
         .expect("seed trusted state");
 
-        update_registry_at(root.path(), |registry| {
-            apply_peer_update_metadata(
-                registry,
-                &peer.peer.node_id,
-                "https://node-b-new.example",
-                &peer.peer.display_name,
-                true,
-                peer.peer.registered_at_unix_ms.saturating_add(1),
-            )
-        })
+        let bootstrap = target(root.path(), 'b', "https://node-b-new.example").bundle;
+        update_peer_at(
+            root.path(),
+            &FederationPeerUpdate {
+                node_id: peer.peer.node_id.clone(),
+                endpoint: Some("https://node-b-new.example".into()),
+                display_name: None,
+                bootstrap: Some(bootstrap),
+            },
+        )
         .expect("update endpoint metadata");
         let updated = load_registry_at(root.path())
             .expect("load updated registry")
@@ -918,12 +1187,19 @@ mod tests {
         let descriptor = descriptor("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let validation = validate_peer_descriptor(&local, &descriptor);
         assert!(validation.accepted);
-        let candidate =
-            inspect_candidate("https://node-b.example", "Imported candidate", &descriptor)
-                .expect("candidate");
+        let root = tempfile::tempdir().expect("bootstrap root");
+        let bundle = super::super::signing::bootstrap_bundle_for_test(
+            root.path(),
+            &descriptor,
+            unix_time_ms().expect("now"),
+        )
+        .expect("bootstrap");
+        let candidate = inspect_candidate("https://node-b.example", "Imported candidate", &bundle)
+            .expect("candidate");
         assert_eq!(candidate.trust_status, FederationPeerTrustStatus::Untrusted);
         assert!(!candidate.persisted);
         assert!(!candidate.credential_sent);
+        assert_eq!(candidate.signing, bundle.signing.signer);
     }
 
     #[test]
@@ -940,10 +1216,13 @@ mod tests {
 
     #[test]
     fn trusted_peer_becomes_drifted_when_security_digest_changes() {
+        let trusted_signing = signing("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let mut record = FederationPeerRecord {
             node_id: "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             endpoint: "https://node-b.example".into(),
             display_name: "Node B".into(),
+            bootstrap_descriptor_digest: "a".repeat(64),
+            bootstrap_signing: trusted_signing.clone(),
             trust_status: FederationPeerTrustStatus::Trusted,
             registered_at_unix_ms: 10,
             updated_at_unix_ms: 20,
@@ -952,8 +1231,10 @@ mod tests {
             last_probe_code: Some("FEDERATION_PEER_PROBE_OK".into()),
             last_descriptor_digest: Some("a".repeat(64)),
             trusted_descriptor_digest: Some("a".repeat(64)),
+            last_signing: Some(trusted_signing.clone()),
+            trusted_signing: Some(trusted_signing.clone()),
         };
-        apply_successful_probe(&mut record, &"b".repeat(64), 30);
+        apply_successful_probe(&mut record, &"b".repeat(64), &trusted_signing, 30);
         assert_eq!(record.trust_status, FederationPeerTrustStatus::Drifted);
         assert_eq!(
             record.last_probe_code.as_deref(),
@@ -967,6 +1248,7 @@ mod tests {
 
     #[test]
     fn registry_rejects_unknown_fields_and_inconsistent_trust_state() {
+        let bootstrap_signing = signing("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let value = serde_json::json!({
             "schemaVersion": PEER_REGISTRY_SCHEMA_VERSION,
             "peers": [{
@@ -988,6 +1270,8 @@ mod tests {
                 node_id: "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 endpoint: "https://node-b.example".into(),
                 display_name: "Node B".into(),
+                bootstrap_descriptor_digest: "a".repeat(64),
+                bootstrap_signing,
                 trust_status: FederationPeerTrustStatus::Trusted,
                 registered_at_unix_ms: 1,
                 updated_at_unix_ms: 1,
@@ -996,6 +1280,8 @@ mod tests {
                 last_probe_code: None,
                 last_descriptor_digest: None,
                 trusted_descriptor_digest: None,
+                last_signing: None,
+                trusted_signing: None,
             }],
         };
         assert!(validate_registry(&invalid).is_err());
@@ -1003,10 +1289,13 @@ mod tests {
 
     #[test]
     fn remote_read_gate_allows_only_trusted_registry_state() {
+        let observed_signing = signing("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let base = FederationPeerRecord {
             node_id: "node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             endpoint: "https://node-b.example".into(),
             display_name: "Node B".into(),
+            bootstrap_descriptor_digest: "a".repeat(64),
+            bootstrap_signing: observed_signing.clone(),
             trust_status: FederationPeerTrustStatus::Untrusted,
             registered_at_unix_ms: 1,
             updated_at_unix_ms: 1,
@@ -1015,12 +1304,15 @@ mod tests {
             last_probe_code: Some("FEDERATION_PEER_PROBE_OK".into()),
             last_descriptor_digest: Some("a".repeat(64)),
             trusted_descriptor_digest: None,
+            last_signing: Some(observed_signing.clone()),
+            trusted_signing: None,
         };
         assert!(ensure_read_trust(&base).is_err());
 
         let mut trusted = base.clone();
         trusted.trust_status = FederationPeerTrustStatus::Trusted;
         trusted.trusted_descriptor_digest = Some("a".repeat(64));
+        trusted.trusted_signing = Some(observed_signing);
         ensure_read_trust(&trusted).expect("trusted read");
 
         let mut drifted = trusted.clone();

@@ -30,6 +30,23 @@ enum GatewayConfigWriteAction {
     ShutdownThenPersist { pid: u32 },
 }
 
+pub(crate) fn federation_signing_status(
+) -> AppResult<crate::federation::FederationLocalSigningStatus> {
+    crate::federation::local_signing_status()
+}
+
+pub(crate) fn federation_bootstrap_bundle(
+) -> AppResult<crate::federation::FederationBootstrapBundle> {
+    let profiles = list_workspaces()?;
+    let descriptor = crate::federation::local_peer_descriptor(&profiles)?;
+    crate::federation::local_bootstrap_bundle(&descriptor)
+}
+
+pub(crate) fn rotate_federation_signing_key(
+) -> AppResult<crate::federation::FederationLocalSigningStatus> {
+    crate::federation::rotate_local_signing_identity()
+}
+
 fn desired_gateway_routes(current: &[String], workspace_id: &str, enabled: bool) -> Vec<String> {
     let mut routes = current
         .iter()
@@ -1403,9 +1420,9 @@ pub(crate) fn revoke_federation_peer(
 pub(crate) fn inspect_federation_candidate(
     endpoint: &str,
     display_name: &str,
-    descriptor: &crate::federation::FederationPeerDescriptor,
+    bundle: &crate::federation::FederationBootstrapBundle,
 ) -> AppResult<crate::federation::FederationPeerCandidate> {
-    crate::federation::inspect_candidate(endpoint, display_name, descriptor)
+    crate::federation::inspect_candidate(endpoint, display_name, bundle)
 }
 
 fn generated_secret() -> String {

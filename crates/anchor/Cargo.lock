@@ -96,6 +96,7 @@ dependencies = [
  "qrcode",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",

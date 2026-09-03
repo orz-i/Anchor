@@ -7,6 +7,7 @@ use crate::runtime::RuntimeCapabilitySnapshot;
 use crate::workspace::WorkspaceProfile;
 
 mod registry;
+mod signing;
 mod transport;
 
 pub(crate) use registry::{
@@ -15,18 +16,23 @@ pub(crate) use registry::{
     trust_peer, update_peer, FederationPeerCandidate, FederationPeerRegistration,
     FederationPeerUpdate, FederationPeerView,
 };
+pub(crate) use signing::{
+    local_bootstrap_bundle, local_signing_status, rotate_local_signing_identity,
+    verify_bootstrap_bundle, FederationBootstrapBundle, FederationDetachedSignature,
+    FederationLocalSigningStatus, FederationNodeSigningPublic,
+};
 pub(crate) use transport::{
     canonical_remote_target, clear_peer_credential, handle_inbound_transport,
-    peer_credential_status, probe_remote_peer, remote_read, set_peer_credential,
+    peer_credential_status, probe_remote_peer, remote_read_verified, set_peer_credential,
     FederationPeerCredentialStatus, FederationRemoteTarget, FederationTransportError,
     FederationTransportErrorKind, FEDERATION_MAX_REQUEST_BYTES, FEDERATION_MAX_RESPONSE_BYTES,
     FEDERATION_NODE_HEADER,
 };
 
-pub const FEDERATION_SCHEMA_VERSION: u16 = 1;
-pub const FEDERATION_CONTRACT: &str = "anchor-federation-v1";
+pub const FEDERATION_SCHEMA_VERSION: u16 = 2;
+pub const FEDERATION_CONTRACT: &str = "anchor-federation-v2";
 
-const FEDERATION_TRANSPORT_MODE: &str = "gateway_authenticated_read_only";
+const FEDERATION_TRANSPORT_MODE: &str = "gateway_authenticated_signed_read_only";
 const MAX_FEDERATION_WORKSPACE_ROUTES: usize = 256;
 const MAX_FEDERATION_DISPLAY_NAME_BYTES: usize = 200;
 const READ_ONLY_OPERATIONS: &[FederationReadOperation] = &[
