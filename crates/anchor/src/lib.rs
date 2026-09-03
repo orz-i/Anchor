@@ -21,6 +21,7 @@ pub mod control;
 pub mod daemon;
 mod data;
 mod error;
+mod federation;
 pub mod gateway_control;
 pub mod gateway_daemon;
 pub mod harness;

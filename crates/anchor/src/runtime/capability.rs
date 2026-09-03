@@ -53,6 +53,7 @@ pub struct RuntimeFeatureCapabilities {
     pub skill_packages: bool,
     pub durable_commands: bool,
     pub gateway: bool,
+    pub federation_read_only: bool,
     pub state_authority: String,
 }
 
@@ -94,7 +95,7 @@ pub(crate) fn capability_snapshot_from_node(
             mcp: "workspace_listener".into(),
             web_admin: "loopback_http".into(),
             local_control: "local_ipc".into(),
-            federation: "not_implemented".into(),
+            federation: "local_catalog_read_only".into(),
         },
         features: RuntimeFeatureCapabilities {
             workspace_first: true,
@@ -102,6 +103,7 @@ pub(crate) fn capability_snapshot_from_node(
             skill_packages: true,
             durable_commands: true,
             gateway: true,
+            federation_read_only: true,
             state_authority: "existing_daemon_control_plane".into(),
         },
     }
@@ -198,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_snapshot_keeps_workspace_first_and_federation_unimplemented() {
+    fn runtime_snapshot_keeps_workspace_first_and_federation_read_only() {
         let workspace = RuntimeWorkspaceIdentity::new("workspace-id", "workspace", "/workspace");
         let temp = tempfile::tempdir().expect("node identity root");
         let snapshot = capability_snapshot_from_node(
@@ -211,7 +213,8 @@ mod tests {
         );
         assert_eq!(snapshot.workspace, Some(workspace));
         assert!(snapshot.features.workspace_first);
-        assert_eq!(snapshot.transports.federation, "not_implemented");
+        assert!(snapshot.features.federation_read_only);
+        assert_eq!(snapshot.transports.federation, "local_catalog_read_only");
         assert_eq!(
             snapshot.features.state_authority,
             "existing_daemon_control_plane"
