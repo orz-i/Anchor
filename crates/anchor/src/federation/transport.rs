@@ -94,12 +94,22 @@ impl std::fmt::Display for FederationTransportError {
 impl std::error::Error for FederationTransportError {}
 
 fn credential_binding_key(target: &FederationRemoteTarget) -> AppResult<String> {
-    validate_target(target)?;
-    let endpoint = normalize_endpoint(&target.endpoint)?;
+    let target = canonical_remote_target(target)?;
     Ok(format!(
         "{:x}",
-        Sha256::digest(format!("{}\0{}", target.node_id, endpoint.as_str()).as_bytes())
+        Sha256::digest(format!("{}\0{}", target.node_id, target.endpoint).as_bytes())
     ))
+}
+
+pub(crate) fn canonical_remote_target(
+    target: &FederationRemoteTarget,
+) -> AppResult<FederationRemoteTarget> {
+    validate_target(target)?;
+    let endpoint = normalize_endpoint(&target.endpoint)?;
+    Ok(FederationRemoteTarget {
+        node_id: target.node_id.clone(),
+        endpoint: endpoint.as_str().trim_end_matches('/').to_string(),
+    })
 }
 
 pub fn set_peer_credential(target: &FederationRemoteTarget, token: &str) -> AppResult<()> {
@@ -116,17 +126,18 @@ pub fn clear_peer_credential(target: &FederationRemoteTarget) -> AppResult<()> {
     SecretStore::remove_app_many(&[
         (OUTBOUND_TOKEN_SCOPE, &binding),
         (INBOUND_TOKEN_SCOPE, &target.node_id),
+        (REQUEST_REPLAY_SCOPE, &target.node_id),
     ])
 }
 
 pub fn peer_credential_status(
     target: &FederationRemoteTarget,
 ) -> AppResult<FederationPeerCredentialStatus> {
-    let endpoint = normalize_endpoint(&target.endpoint)?;
-    let binding = credential_binding_key(target)?;
+    let target = canonical_remote_target(target)?;
+    let binding = credential_binding_key(&target)?;
     Ok(FederationPeerCredentialStatus {
         node_id: target.node_id.clone(),
-        endpoint: endpoint.as_str().trim_end_matches('/').to_string(),
+        endpoint: target.endpoint.clone(),
         outbound_configured: SecretStore::get_app(OUTBOUND_TOKEN_SCOPE, &binding)?.is_some(),
         inbound_configured: SecretStore::get_app(INBOUND_TOKEN_SCOPE, &target.node_id)?.is_some(),
     })

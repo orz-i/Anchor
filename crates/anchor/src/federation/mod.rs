@@ -6,13 +6,21 @@ use crate::error::{AppError, AppResult};
 use crate::runtime::RuntimeCapabilitySnapshot;
 use crate::workspace::WorkspaceProfile;
 
+mod registry;
 mod transport;
 
+pub(crate) use registry::{
+    get_peer, inspect_candidate, list_peers, probe_registered_peer, read_trusted_peer,
+    register_peer, remove_peer, require_registered_target, revoke_peer, rotate_peer_credential,
+    trust_peer, update_peer, FederationPeerCandidate, FederationPeerRegistration,
+    FederationPeerUpdate, FederationPeerView,
+};
 pub(crate) use transport::{
-    clear_peer_credential, handle_inbound_transport, peer_credential_status, probe_remote_peer,
-    remote_read, set_peer_credential, FederationPeerCredentialStatus, FederationRemoteTarget,
-    FederationTransportError, FederationTransportErrorKind, FEDERATION_MAX_REQUEST_BYTES,
-    FEDERATION_MAX_RESPONSE_BYTES, FEDERATION_NODE_HEADER,
+    canonical_remote_target, clear_peer_credential, handle_inbound_transport,
+    peer_credential_status, probe_remote_peer, remote_read, set_peer_credential,
+    FederationPeerCredentialStatus, FederationRemoteTarget, FederationTransportError,
+    FederationTransportErrorKind, FEDERATION_MAX_REQUEST_BYTES, FEDERATION_MAX_RESPONSE_BYTES,
+    FEDERATION_NODE_HEADER,
 };
 
 pub const FEDERATION_SCHEMA_VERSION: u16 = 1;
@@ -614,7 +622,7 @@ fn require_no_workspace(request: &FederationReadRequest) -> AppResult<()> {
     Ok(())
 }
 
-fn valid_node_id(value: &str) -> bool {
+pub(crate) fn valid_node_id(value: &str) -> bool {
     value.strip_prefix("node_").is_some_and(|suffix| {
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
