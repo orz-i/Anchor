@@ -1,8 +1,14 @@
+mod capability;
 mod listener_handoff;
 mod port;
 mod public_url;
 mod supervisor;
 
+pub(crate) use capability::{
+    capability_snapshot, RuntimeCapabilitySnapshot, RuntimeWorkspaceIdentity,
+};
+#[cfg(test)]
+pub(crate) use capability::{capability_snapshot_from_node, NodeIdentity};
 #[cfg(unix)]
 pub(crate) use listener_handoff::InheritableListener;
 pub(crate) use listener_handoff::{bind_loopback_listener, HandoffListener};

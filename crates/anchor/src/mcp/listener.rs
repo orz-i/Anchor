@@ -245,9 +245,15 @@ pub(crate) fn spawn_listener_with_handoff(
     let workspace = Workspace::new(workspace_path)
         .map_err(|e| e.message())?
         .with_strict_read_boundary(!allow_external_reads);
+    let runtime_workspace_identity = crate::runtime::RuntimeWorkspaceIdentity::new(
+        workspace_id.clone(),
+        workspace_name.clone(),
+        workspace.root().display().to_string(),
+    );
     let policy = PolicySettings::from_runtime(&runtime);
     let mcp = new_state(
         workspace,
+        runtime_workspace_identity,
         auth.clone(),
         policy,
         runtime.tool_profile.clone(),
@@ -1539,6 +1545,11 @@ mod tests {
         };
         let mcp = new_state(
             Workspace::new(workspace.path().to_path_buf()).expect("workspace state"),
+            crate::runtime::RuntimeWorkspaceIdentity::new(
+                "listener-test-workspace",
+                "listener-test",
+                workspace.path().display().to_string(),
+            ),
             auth.clone(),
             PolicySettings::default(),
             "core".into(),

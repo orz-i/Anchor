@@ -92,6 +92,7 @@ pub struct ToolContext {
     pub mcp_proxies: crate::mcp::proxy::McpProxyRegistry,
     pub skills: crate::skills::SkillCatalog,
     pub(crate) ui_widget_domain: Option<String>,
+    runtime_workspace_identity: Option<crate::runtime::RuntimeWorkspaceIdentity>,
     primary_workspace_root: PathBuf,
     scoped_task_id: Option<String>,
     default_cwd: Arc<Mutex<PathBuf>>,
@@ -162,6 +163,7 @@ impl ToolContext {
             mcp_proxies: self.mcp_proxies.clone(),
             skills: self.skills.clone(),
             ui_widget_domain: self.ui_widget_domain.clone(),
+            runtime_workspace_identity: self.runtime_workspace_identity.clone(),
             primary_workspace_root: self.primary_workspace_root.clone(),
             scoped_task_id: Some(task.id.clone()),
             default_cwd: Arc::new(Mutex::new(root.clone())),
@@ -218,6 +220,20 @@ impl ToolContext {
         self
     }
 
+    pub(crate) fn with_runtime_workspace_identity(
+        mut self,
+        identity: crate::runtime::RuntimeWorkspaceIdentity,
+    ) -> Self {
+        self.runtime_workspace_identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn runtime_workspace_identity(
+        &self,
+    ) -> Option<crate::runtime::RuntimeWorkspaceIdentity> {
+        self.runtime_workspace_identity.clone()
+    }
+
     pub fn from_workspace_with_harness_root(
         workspace: Workspace,
         auth: AuthConfig,
@@ -247,6 +263,7 @@ impl ToolContext {
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
             ui_widget_domain: None,
+            runtime_workspace_identity: None,
             primary_workspace_root: root.clone(),
             scoped_task_id: None,
             default_cwd: Arc::new(Mutex::new(root)),
@@ -755,6 +772,27 @@ mod tests {
     };
     use crate::tools::catalog::build_effective_catalog_from_parts;
     use serde_json::json;
+
+    #[test]
+    fn registered_workspace_identity_is_explicit_runtime_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let harness_root = tempfile::tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context")
+        .with_runtime_workspace_identity(crate::runtime::RuntimeWorkspaceIdentity::new(
+            "workspace-id",
+            "Workspace Name",
+            workspace.path().display().to_string(),
+        ));
+
+        let identity = ctx.runtime_workspace_identity().expect("runtime identity");
+        assert_eq!(identity.id, "workspace-id");
+        assert_eq!(identity.name, "Workspace Name");
+        assert_eq!(identity.path, workspace.path().display().to_string());
+    }
 
     #[test]
     fn unbound_transport_does_not_adopt_workspace_default_task() {

@@ -181,16 +181,24 @@ async fn serve(
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let workspace = tools::Workspace::new(workspace_path.clone()).map_err(|e| e.message())?;
-    let ctx = Arc::new(ToolContext::from_workspace(
-        workspace,
-        crate::workspace::AuthConfig {
-            auth_type: auth_type.clone(),
-            ..crate::workspace::AuthConfig::default()
-        },
-        policy.clone(),
-        "core".into(),
-        policy.permission_mode.clone(),
-    ));
+    let runtime_workspace_identity = crate::runtime::RuntimeWorkspaceIdentity::new(
+        profile_id,
+        workspace_name.clone(),
+        workspace.root().display().to_string(),
+    );
+    let ctx = Arc::new(
+        ToolContext::from_workspace(
+            workspace,
+            crate::workspace::AuthConfig {
+                auth_type: auth_type.clone(),
+                ..crate::workspace::AuthConfig::default()
+            },
+            policy.clone(),
+            "core".into(),
+            policy.permission_mode.clone(),
+        )
+        .with_runtime_workspace_identity(runtime_workspace_identity),
+    );
     let effective_catalog = tools::build_effective_catalog_from_parts("core", false)
         .map_err(|error| std::io::Error::other(error.message()))?;
     let tools: Vec<Value> = effective_catalog

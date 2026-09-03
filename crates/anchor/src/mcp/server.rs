@@ -2015,6 +2015,7 @@ fn attach_local_browser_checkpoint(
 
 pub fn new_state(
     workspace: Workspace,
+    runtime_workspace_identity: crate::runtime::RuntimeWorkspaceIdentity,
     auth: AuthConfig,
     policy: crate::tools::policy::PolicySettings,
     tool_profile: String,
@@ -2023,6 +2024,7 @@ pub fn new_state(
 ) -> SharedState {
     Arc::new(
         ToolContext::from_workspace(workspace, auth, policy, tool_profile, permission_mode)
+            .with_runtime_workspace_identity(runtime_workspace_identity)
             .with_ui_widget_domain(crate::mcp::ui::widget_domain_from_public_base_url(
                 &public_base_url,
             )),
@@ -2066,6 +2068,11 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let state = new_state(
             Workspace::new(workspace.path().to_path_buf()).expect("workspace state"),
+            crate::runtime::RuntimeWorkspaceIdentity::new(
+                "widget-test-workspace",
+                "widget-test",
+                workspace.path().display().to_string(),
+            ),
             crate::workspace::AuthConfig {
                 auth_type: "noauth".into(),
                 ..crate::workspace::AuthConfig::default()
