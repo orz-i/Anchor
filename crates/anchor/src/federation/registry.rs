@@ -98,10 +98,8 @@ pub fn accept_discovered_rebootstrap(
     let descriptor_digest = descriptor_trust_digest(&discovery.bootstrap.descriptor)?;
     let allowed = if discovered_signing == peer.bootstrap_signing {
         descriptor_digest != peer.bootstrap_descriptor_digest
-    } else if discovery_proves_rotation_from(discovery, &peer.bootstrap_signing)? {
-        true
     } else {
-        false
+        discovery_proves_rotation_from(discovery, &peer.bootstrap_signing)?
     };
     if !allowed {
         return Err(AppError::Message(
