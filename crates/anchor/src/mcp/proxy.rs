@@ -580,6 +580,7 @@ fn proxy_result_state_summary(result: &Value) -> Value {
             json!({"url": current_url, "title": current_title}),
         );
     }
+
     Value::Object(summary)
 }
 
@@ -1430,27 +1431,35 @@ impl McpProxyRegistry {
                 spec.name
             ));
         }
+        let pending_connection = if spec.enabled {
+            Some(
+                connect_initial_with_retry(spec.clone(), workspace_id.clone())
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "downstream MCP server `{}` activation failed before persistence; configuration unchanged: {error}",
+                            spec.name
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         specs.push(spec.clone());
-        (self.persist_config)(&workspace_id, &specs)?;
+        if let Err(error) = (self.persist_config)(&workspace_id, &specs) {
+            if let Some((server, _)) = pending_connection {
+                server.shutdown().await;
+            }
+            return Err(error);
+        }
         self.state
             .write()
             .expect("mcp proxy registry write")
             .specs
             .insert(spec.name.clone(), spec.clone());
-        if spec.enabled {
-            match connect_initial_with_retry(spec.clone(), workspace_id.clone()).await {
-                Ok((server, catalog)) => {
-                    if let Some(previous) = self.install_connected_server(server, catalog) {
-                        previous.shutdown().await;
-                    }
-                }
-                Err(error) => {
-                    self.record_connection_failure(&spec.name, error.clone());
-                    return Err(format!(
-                        "downstream MCP server `{}` was persisted but activation failed: {error}",
-                        spec.name
-                    ));
-                }
+        if let Some((server, catalog)) = pending_connection {
+            if let Some(previous) = self.install_connected_server(server, catalog) {
+                previous.shutdown().await;
             }
         }
         self.server_status(&spec.name).ok_or_else(|| {
@@ -1476,14 +1485,13 @@ impl McpProxyRegistry {
         spec.enabled = enabled;
         spec.raw_config.disabled = !enabled;
         let updated = spec.clone();
-        (self.persist_config)(&workspace_id, &specs)?;
-        self.state
-            .write()
-            .expect("mcp proxy registry write")
-            .specs
-            .insert(server_name.to_string(), updated.clone());
-
         if !enabled {
+            (self.persist_config)(&workspace_id, &specs)?;
+            self.state
+                .write()
+                .expect("mcp proxy registry write")
+                .specs
+                .insert(server_name.to_string(), updated);
             if let Some(previous) = self.remove_connected_server(server_name) {
                 previous.shutdown().await;
             }
@@ -1492,22 +1500,35 @@ impl McpProxyRegistry {
             });
         }
 
-        match connect_initial_with_retry(updated, workspace_id.clone()).await {
-            Ok((server, catalog)) => {
-                if let Some(previous) = self.install_connected_server(server, catalog) {
-                    previous.shutdown().await;
-                }
-                self.server_status(server_name).ok_or_else(|| {
-                    format!("downstream MCP server `{server_name}` disappeared after enable")
-                })
-            }
+        let (server, catalog) = match connect_initial_with_retry(
+            updated.clone(),
+            workspace_id.clone(),
+        )
+        .await
+        {
+            Ok(connection) => connection,
             Err(error) => {
                 self.record_connection_failure(server_name, error.clone());
-                Err(format!(
-                    "downstream MCP server `{server_name}` was enabled in persisted configuration but activation failed: {error}"
-                ))
+                return Err(format!(
+                    "downstream MCP server `{server_name}` activation failed before persistence; configuration unchanged: {error}"
+                ));
             }
+        };
+        if let Err(error) = (self.persist_config)(&workspace_id, &specs) {
+            server.shutdown().await;
+            return Err(error);
         }
+        self.state
+            .write()
+            .expect("mcp proxy registry write")
+            .specs
+            .insert(server_name.to_string(), updated);
+        if let Some(previous) = self.install_connected_server(server, catalog) {
+            previous.shutdown().await;
+        }
+        self.server_status(server_name).ok_or_else(|| {
+            format!("downstream MCP server `{server_name}` disappeared after enable")
+        })
     }
 
     pub async fn refresh_server(&self, server_name: &str) -> Result<Value, String> {
@@ -4930,6 +4951,65 @@ for raw in sys.stdin:
                 Vec::new(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_activation_failure_does_not_persist_enabled_state() {
+        let persisted = Arc::new(StdMutex::new(Vec::<Vec<(String, bool)>>::new()));
+        let persisted_for_hook = persisted.clone();
+        let registry =
+            McpProxyRegistry::with_persistence_for_test(Arc::new(move |_workspace, specs| {
+                persisted_for_hook
+                    .lock()
+                    .expect("persistence snapshots")
+                    .push(
+                        specs
+                            .iter()
+                            .map(|spec| (spec.name.clone(), spec.enabled))
+                            .collect(),
+                    );
+                Ok(())
+            }));
+        registry.configure(Vec::new(), "dynamic-failure-test").await;
+
+        let broken = runtime_test_spec(
+            "broken",
+            "anchor-definitely-missing-mcp-runtime".into(),
+            Vec::new(),
+            std::env::temp_dir(),
+            1,
+            Duration::from_millis(100),
+        );
+        let error = registry
+            .register_server(broken)
+            .await
+            .expect_err("broken registration must fail before persistence");
+        assert!(error.contains("configuration unchanged"), "{error}");
+        assert!(registry.server_status("broken").is_none());
+        assert!(persisted.lock().expect("persistence snapshots").is_empty());
+
+        let mut disabled = runtime_test_spec(
+            "disabled",
+            "anchor-definitely-missing-mcp-runtime".into(),
+            Vec::new(),
+            std::env::temp_dir(),
+            1,
+            Duration::from_millis(100),
+        );
+        disabled.enabled = false;
+        disabled.raw_config.disabled = true;
+        registry
+            .configure(vec![disabled], "dynamic-failure-test")
+            .await;
+        let error = registry
+            .set_server_enabled("disabled", true)
+            .await
+            .expect_err("broken enable must fail before persistence");
+        assert!(error.contains("configuration unchanged"), "{error}");
+        let status = registry.server_status("disabled").expect("disabled status");
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["connected"], false);
+        assert!(persisted.lock().expect("persistence snapshots").is_empty());
     }
 
     #[cfg(target_os = "windows")]
