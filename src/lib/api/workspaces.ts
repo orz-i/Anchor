@@ -23,6 +23,9 @@ import type {
   GatewayEventBatch,
   GatewayEventCursor,
   GatewayLogChunk,
+  OrchestrationInspection,
+  OrchestrationPlan,
+  OrchestrationWorkflowSpec,
   RuntimeStatus,
   SkillChannel,
   SkillInspection,
@@ -33,6 +36,18 @@ import type {
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
   return invokeRead<WorkspaceProfile[]>("list_workspaces");
+}
+
+export async function planOrchestrationWorkflow(
+  workflow: OrchestrationWorkflowSpec,
+): Promise<OrchestrationPlan> {
+  return invokeRead<OrchestrationPlan>("plan_orchestration_workflow", { workflow });
+}
+
+export async function inspectOrchestrationWorkflow(
+  workflow: OrchestrationWorkflowSpec,
+): Promise<OrchestrationInspection> {
+  return invokeRead<OrchestrationInspection>("inspect_orchestration_workflow", { workflow });
 }
 
 export async function acceptFederationPeerRebootstrap(

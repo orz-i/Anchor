@@ -23,6 +23,104 @@ export interface TunnelConfig {
   use_proxy?: boolean;
 }
 
+export type OrchestrationTargetKind = "node" | "workspace" | "harness_task";
+
+export interface OrchestrationTarget {
+  id: string;
+  kind: OrchestrationTargetKind;
+  nodeId: string;
+  workspaceId?: string;
+  taskId?: string;
+}
+
+export interface OrchestrationFleetSpec {
+  id: string;
+  targets: OrchestrationTarget[];
+}
+
+export type OrchestrationReadOperation =
+  | "node_capabilities"
+  | "node_control_status"
+  | "workspace_status"
+  | "harness_task_status";
+
+export interface OrchestrationStepSpec {
+  id: string;
+  targetId: string;
+  operation: OrchestrationReadOperation;
+  dependsOn: string[];
+}
+
+export interface OrchestrationWorkflowSpec {
+  schemaVersion: 1;
+  contract: "anchor-orchestration-v1";
+  id: string;
+  fleet: OrchestrationFleetSpec;
+  steps: OrchestrationStepSpec[];
+}
+
+export type OrchestrationReadSource =
+  | "runtime_capability_provider"
+  | "existing_control_plane"
+  | "harness_store"
+  | "federation_read";
+
+export interface OrchestrationPlanStep {
+  id: string;
+  target: OrchestrationTarget;
+  operation: OrchestrationReadOperation;
+  dependsOn: string[];
+  source: OrchestrationReadSource;
+  remote: boolean;
+  federationRequest?: FederationReadRequest;
+}
+
+export interface OrchestrationPlan {
+  schemaVersion: 1;
+  contract: "anchor-orchestration-v1";
+  workflowId: string;
+  fleetId: string;
+  readOnly: true;
+  stateAuthority: "existing_harness_federation_control_plane";
+  waves: string[][];
+  steps: OrchestrationPlanStep[];
+}
+
+export interface OrchestrationHarnessTaskStatus {
+  workspaceId: string;
+  taskId: string;
+  status: string;
+  progressPercent: number;
+  current: boolean;
+  active: boolean;
+  updatedAt: string;
+}
+
+export type OrchestrationObservation =
+  | { kind: "node_capabilities"; data: RuntimeCapabilitySnapshot }
+  | { kind: "node_control_status"; data: FederationNodeControlStatus }
+  | { kind: "workspace_status"; data: FederationWorkspaceStatus }
+  | { kind: "harness_task_status"; data: OrchestrationHarnessTaskStatus };
+
+export interface OrchestrationStepObservation {
+  stepId: string;
+  targetId: string;
+  state: "observed" | "unavailable";
+  observation?: OrchestrationObservation;
+  error?: string;
+}
+
+export interface OrchestrationInspectionSummary {
+  observed: number;
+  unavailable: number;
+}
+
+export interface OrchestrationInspection {
+  plan: OrchestrationPlan;
+  observations: OrchestrationStepObservation[];
+  summary: OrchestrationInspectionSummary;
+}
+
 export interface FederationNodeSigningPublic {
   contract: "anchor-node-signature-v1";
   algorithm: "ed25519";
