@@ -86,6 +86,24 @@ pub(crate) fn capability_snapshot_from_node(
     node: NodeIdentity,
     workspace: Option<RuntimeWorkspaceIdentity>,
 ) -> RuntimeCapabilitySnapshot {
+    capability_snapshot_with_support(
+        node,
+        workspace,
+        crate::daemon::supported(),
+        crate::gateway_daemon::supported(),
+        crate::admin_service::supported(),
+        cfg!(any(unix, windows)),
+    )
+}
+
+fn capability_snapshot_with_support(
+    node: NodeIdentity,
+    workspace: Option<RuntimeWorkspaceIdentity>,
+    daemon_supported: bool,
+    gateway_supported: bool,
+    web_admin_supported: bool,
+    durable_commands_supported: bool,
+) -> RuntimeCapabilitySnapshot {
     RuntimeCapabilitySnapshot {
         schema_version: RUNTIME_CAPABILITY_SCHEMA_VERSION,
         contract: RUNTIME_CONTRACT.into(),
@@ -93,17 +111,29 @@ pub(crate) fn capability_snapshot_from_node(
         workspace,
         transports: RuntimeTransportCapabilities {
             mcp: "workspace_listener".into(),
-            web_admin: "loopback_http".into(),
-            local_control: "local_ipc".into(),
-            federation: "gateway_authenticated_signed_read_only".into(),
+            web_admin: if web_admin_supported {
+                "loopback_http".into()
+            } else {
+                "unavailable".into()
+            },
+            local_control: if daemon_supported {
+                "local_ipc".into()
+            } else {
+                "unavailable".into()
+            },
+            federation: if gateway_supported {
+                "gateway_authenticated_signed_read_only".into()
+            } else {
+                "unavailable".into()
+            },
         },
         features: RuntimeFeatureCapabilities {
             workspace_first: true,
             dynamic_mcp: true,
             skill_packages: true,
-            durable_commands: true,
-            gateway: true,
-            federation_read_only: true,
+            durable_commands: durable_commands_supported,
+            gateway: gateway_supported,
+            federation_read_only: gateway_supported,
             state_authority: "existing_daemon_control_plane".into(),
         },
     }
@@ -222,5 +252,29 @@ mod tests {
             snapshot.features.state_authority,
             "existing_daemon_control_plane"
         );
+    }
+
+    #[test]
+    fn runtime_snapshot_does_not_advertise_platform_runtime_features_when_unsupported() {
+        let snapshot = capability_snapshot_with_support(
+            NodeIdentity {
+                id: "node_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                platform: "unsupported".into(),
+                architecture: "test".into(),
+            },
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(snapshot.transports.web_admin, "unavailable");
+        assert_eq!(snapshot.transports.local_control, "unavailable");
+        assert_eq!(snapshot.transports.federation, "unavailable");
+        assert!(!snapshot.features.gateway);
+        assert!(!snapshot.features.federation_read_only);
+        assert!(!snapshot.features.durable_commands);
+        assert!(snapshot.features.dynamic_mcp);
+        assert!(snapshot.features.skill_packages);
     }
 }

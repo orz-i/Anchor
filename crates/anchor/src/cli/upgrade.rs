@@ -18,9 +18,150 @@ struct UpgradeReport {
     event: &'static str,
     dry_run: bool,
     current_build: BuildIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supervisor: Option<SupervisorUpgradeReport>,
     results: Vec<RuntimeRolloutResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+fn supervisor_plan_report(route: &SupervisorRoute) -> SupervisorUpgradeReport {
+    let mut workspace_ids = route.workspace_ids.iter().cloned().collect::<Vec<_>>();
+    workspace_ids.sort();
+    SupervisorUpgradeReport {
+        manager: route.manager.clone(),
+        status: "planned",
+        workspace_ids,
+        gateway_managed: route.gateway_managed,
+        previous_build: route.previous_build.clone(),
+        current_build: BuildIdentity::current(),
+        message: "Supervisor owns the selected runtime; upgrade will refresh the supervisor executable/build plan and let it reconcile desired runtime state instead of racing a direct daemon rollout."
+            .into(),
+    }
+}
+
+fn supervisor_scope_route(
+    manager: String,
+    managed: HashSet<String>,
+    gateway_managed: bool,
+    previous_build: Option<BuildIdentity>,
+    targets: &[WorkspaceProfile],
+    include_gateway: bool,
+    all: bool,
+) -> AppResult<Option<SupervisorRoute>> {
+    let selected = targets
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<HashSet<_>>();
+    let overlap =
+        selected.iter().any(|id| managed.contains(id)) || (include_gateway && gateway_managed);
+    if !overlap {
+        return Ok(None);
+    }
+    if !all {
+        let mut missing = managed.difference(&selected).cloned().collect::<Vec<_>>();
+        missing.sort();
+        if !missing.is_empty() || (gateway_managed && !include_gateway) {
+            return Err(AppError::Message(format!(
+                "SUPERVISOR_UPGRADE_SCOPE_MISMATCH: {manager} owns a broader desired runtime set than this upgrade request (missing_workspaces={missing:?}, gateway_managed={gateway_managed}); use `anchor upgrade --all` or explicitly select every service-managed workspace{}",
+                if gateway_managed { " plus --gateway" } else { "" }
+            )));
+        }
+    }
+    Ok(Some(SupervisorRoute {
+        manager,
+        workspace_ids: managed,
+        gateway_managed,
+        previous_build,
+    }))
+}
+
+fn linux_supervisor_route(
+    targets: &[WorkspaceProfile],
+    include_gateway: bool,
+    all: bool,
+) -> AppResult<Option<SupervisorRoute>> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = crate::linux_service::service_status()?;
+        if !status.installed || !status.enabled || !status.running {
+            return Ok(None);
+        }
+        let managed = status
+            .plan
+            .workspaces
+            .iter()
+            .map(|entry| entry.workspace_id.clone())
+            .collect::<HashSet<_>>();
+        let gateway_managed = !status.plan.gateway_workspace_ids.is_empty();
+        supervisor_scope_route(
+            status.manager,
+            managed,
+            gateway_managed,
+            status.plan.installed_build,
+            targets,
+            include_gateway,
+            all,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (targets, include_gateway, all);
+        Ok(None)
+    }
+}
+
+fn apply_linux_supervisor_route(route: &SupervisorRoute) -> AppResult<SupervisorUpgradeReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = crate::linux_service::install_service()?;
+        if status.build_state != "current" {
+            return Err(AppError::Message(format!(
+                "SUPERVISOR_UPGRADE_VERIFY_FAILED: systemd-user service restarted but buildState={} instead of current",
+                status.build_state
+            )));
+        }
+        let mut workspace_ids = route.workspace_ids.iter().cloned().collect::<Vec<_>>();
+        workspace_ids.sort();
+        Ok(SupervisorUpgradeReport {
+            manager: route.manager.clone(),
+            status: "upgraded",
+            workspace_ids,
+            gateway_managed: route.gateway_managed,
+            previous_build: route.previous_build.clone(),
+            current_build: status.current_build,
+            message: "Supervisor executable/build plan is current and desired runtime state is reconciled by systemd-user."
+                .into(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = route;
+        Err(AppError::Message(
+            "Linux supervisor upgrade is unavailable on this platform".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorRoute {
+    manager: String,
+    workspace_ids: HashSet<String>,
+    gateway_managed: bool,
+    previous_build: Option<BuildIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SupervisorUpgradeReport {
+    manager: String,
+    status: &'static str,
+    workspace_ids: Vec<String>,
+    gateway_managed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_build: Option<BuildIdentity>,
+    current_build: BuildIdentity,
+    message: String,
 }
 
 pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
@@ -35,6 +176,20 @@ pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
     let targets = select_workspace_targets(&profiles, &options)?;
     let include_gateway = select_gateway_target(&options)?;
     ensure_windows_scm_does_not_own_targets(&targets, include_gateway)?;
+    let supervisor_route = linux_supervisor_route(&targets, include_gateway, options.all)?;
+    let direct_targets = targets
+        .iter()
+        .filter(|profile| {
+            !supervisor_route
+                .as_ref()
+                .is_some_and(|route| route.workspace_ids.contains(&profile.id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let direct_gateway = include_gateway
+        && !supervisor_route
+            .as_ref()
+            .is_some_and(|route| route.gateway_managed);
 
     let rollout_options = RolloutOptions {
         timeout: Duration::from_secs(options.timeout_seconds),
@@ -43,10 +198,10 @@ pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
         allow_no_rollback: options.allow_no_rollback,
     };
     let mut preflight = Vec::new();
-    for profile in &targets {
+    for profile in &direct_targets {
         preflight.push(rollout::rollout_workspace(profile, rollout_options).await?);
     }
-    if include_gateway {
+    if direct_gateway {
         preflight.push(rollout::rollout_gateway(rollout_options).await?);
     }
     if options.dry_run {
@@ -54,6 +209,7 @@ pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
             event: "runtime_upgrade_plan",
             dry_run: true,
             current_build: BuildIdentity::current(),
+            supervisor: supervisor_route.as_ref().map(supervisor_plan_report),
             results: preflight,
             error: None,
         };
@@ -67,7 +223,20 @@ pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
     };
     let mut results = Vec::new();
     let mut error = None;
-    for profile in &targets {
+    let supervisor = match supervisor_route.as_ref() {
+        Some(route) => match apply_linux_supervisor_route(route) {
+            Ok(report) => Some(report),
+            Err(failure) => {
+                error = Some(format!("{} supervisor: {failure}", route.manager));
+                None
+            }
+        },
+        None => None,
+    };
+    for profile in &direct_targets {
+        if error.is_some() {
+            break;
+        }
         match rollout::rollout_workspace(profile, rollout_options).await {
             Ok(result) => {
                 let continue_rollout = result.is_success();
@@ -82,7 +251,7 @@ pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
             }
         }
     }
-    if error.is_none() && results.iter().all(RuntimeRolloutResult::is_success) && include_gateway {
+    if error.is_none() && results.iter().all(RuntimeRolloutResult::is_success) && direct_gateway {
         match rollout::rollout_gateway(rollout_options).await {
             Ok(result) => results.push(result),
             Err(failure) => error = Some(format!("Gateway: {failure}")),
@@ -94,6 +263,7 @@ pub async fn execute(options: UpgradeOptions, as_json: bool) -> AppResult<i32> {
         event: "runtime_upgrade_complete",
         dry_run: false,
         current_build: BuildIdentity::current(),
+        supervisor,
         results,
         error,
     };
@@ -180,6 +350,64 @@ fn ensure_windows_scm_does_not_own_targets(
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn profile(id: &str) -> WorkspaceProfile {
+        let mut profile = WorkspaceProfile::new(format!("/tmp/{id}"), Some(id.into()));
+        profile.id = id.into();
+        profile
+    }
+
+    #[test]
+    fn supervisor_scope_requires_full_desired_set_for_explicit_upgrade() {
+        let managed = ["a".to_string(), "b".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let error = supervisor_scope_route(
+            "systemd-user".into(),
+            managed.clone(),
+            true,
+            None,
+            &[profile("a")],
+            false,
+            false,
+        )
+        .expect_err("partial supervisor scope must fail");
+        assert!(error
+            .to_string()
+            .contains("SUPERVISOR_UPGRADE_SCOPE_MISMATCH"));
+
+        let route = supervisor_scope_route(
+            "systemd-user".into(),
+            managed.clone(),
+            true,
+            None,
+            &[profile("a"), profile("b")],
+            true,
+            false,
+        )
+        .expect("full explicit scope")
+        .expect("supervisor route");
+        assert_eq!(route.workspace_ids, managed);
+        assert!(route.gateway_managed);
+
+        let all_route = supervisor_scope_route(
+            "systemd-user".into(),
+            ["a".to_string(), "b".to_string()].into_iter().collect(),
+            true,
+            None,
+            &[profile("a")],
+            false,
+            true,
+        )
+        .expect("all permits full supervisor-owned desired state")
+        .expect("supervisor route");
+        assert!(all_route.gateway_managed);
+    }
+}
+
 fn print_report(report: &UpgradeReport, as_json: bool) -> AppResult<()> {
     if as_json {
         return super::print_json(report);
@@ -195,7 +423,17 @@ fn print_report(report: &UpgradeReport, as_json: bool) -> AppResult<()> {
         },
         if report.dry_run { " (dry-run)" } else { "" }
     );
-    if report.results.is_empty() {
+    if let Some(supervisor) = report.supervisor.as_ref() {
+        println!(
+            "Supervisor {}\t{}\tworkspaces={} gateway={}",
+            supervisor.manager,
+            supervisor.status,
+            supervisor.workspace_ids.join(","),
+            supervisor.gateway_managed
+        );
+        println!("  {}", supervisor.message);
+    }
+    if report.results.is_empty() && report.supervisor.is_none() {
         println!("没有匹配的运行中 runtime。");
     }
     for result in &report.results {
