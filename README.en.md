@@ -40,6 +40,7 @@ For a first connection, remember only this: **the Anchor CLI/daemons own runtime
 
 - [See the complete Web Admin setup](#get-started-in-five-minutes)
 - [Go directly to the ChatGPT plugin setup](#mcp-connector)
+- [Open the Anchor documentation center](docs/README.md)
 
 ## Get started in five minutes
 
@@ -103,14 +104,14 @@ When a connection fails, inspect recent MCP requests without leaving the Web Adm
 
 Use the public MCP URL shown by the Web Admin. With OAuth enabled, the client follows the server metadata into the authorization flow; authorization codes, Client IDs, and secrets can be generated and managed from the Web Admin. This release uses preconfigured OAuth clients, so select static/manual OAuth credentials when creating a ChatGPT plugin; CIMD is not required.
 
-For a first connection, ask the agent to initialize history before inspecting the workspace:
+For a first connection, open the current Session before inspecting the workspace:
 
 ```text
-history_session_bootstrap
+session { operation: "open" }
 server_info
-get_default_cwd
-git_status
-check_exec_environment
+cwd { operation: "get" }
+git { operation: "status" }
+environment { operation: "check" }
 ```
 
 This gives the agent explicit project and capability state instead of guessing from the current chat window.
@@ -162,11 +163,11 @@ For OAuth, open the advanced OAuth settings, select static/manual OAuth credenti
 Start a new conversation with the plugin enabled and ask:
 
 ```text
-Use Anchor to call server_info, get_default_cwd, and git_status.
+Use Anchor to call server_info, cwd(operation=get), and git(operation=status).
 Tell me which workspace is connected, its default directory, and its Git status.
 ```
 
-If ChatGPT returns information from the current project, the Anchor runtime, public tunnel, authentication, ChatGPT, and MCP tool chain are connected end to end. Before real development, call `history_session_bootstrap` to initialize or restore project history.
+If ChatGPT returns information from the current project, the Anchor runtime, public tunnel, authentication, ChatGPT, and MCP tool chain are connected end to end. Before real development, use the `session` facade with `operation=open` to initialize or restore the current project Session.
 
 If ChatGPT still shows an old tool list, disconnect and reconnect the plugin or verify again in a new conversation.
 
@@ -197,23 +198,25 @@ MCP and Actions can run together for the same workspace, with separate ports and
 - **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, FRP, and Cloudflare are built in.
 - **A focused default tool surface**: stable core tools are available by default; advanced Harness capabilities are opt-in.
 
-## Let the project remember every conversation
+## Let the project remember every development Session
 
-Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Anchor stores progress in `docs/history-session/` under the current project, so context follows the repository instead of staying trapped in one chat window.
+Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Anchor now stores persistent Sessions under `docs/session/`, so context follows the project instead of staying trapped in one chat window. The old `docs/history-session/` directory is a frozen archive; the current Session store does not scan, migrate, or write to it.
 
 ![ChatGPT new-conversation startup prompt](docs/images/history-session-prompt.png)
 
 *Paste the full prompt into a new conversation to initialize or restore history, then save a checkpoint after each completed task.*
 
-Three tools work together:
+The current API is one `session` facade:
 
-| Tool | Purpose |
+| Operation | Purpose |
 | --- | --- |
-| `history_session_bootstrap` | Initialize or restore a project session; a new file embeds a compressed summary of prior sessions and returns a stable `session_key` and `current_path` |
-| `history_session_checkpoint` | Save structured progress to the stable target returned by bootstrap; reject mismatched targets instead of writing to another history file |
-| `history_session_validate` | Validate numbering, history files, and session mappings; rebuild derived indexes when needed without deleting existing history |
+| `open` | Create, resume, or continue the current Session and return a stable `session_id` / `session_path` |
+| `checkpoint` | Persist decisions, changes, tests, and next actions to the exact Session target returned by `open`; mismatched targets are rejected |
+| `list` | Page through Session metadata from the current `docs/session` store |
+| `get` | Read one explicit `session_id` |
+| `validate` | Validate the current Session store/index and optionally repair it; the legacy archive is not scanned |
 
-History uses readable Markdown that can be backed up or committed with the project. Every new file starts with a bounded inherited summary that is not recursively copied into later summaries. Checkpoints are idempotent, and progress should only be reported as saved after the tool returns `ok=true` with the same session target.
+Session documents use readable Markdown and a derived `docs/session/index.json`. Harness treats `docs/session/` as local Session metadata and excludes it from the business Git baseline by default; teams that want to version these records should make that a deliberate repository policy. A checkpoint is only considered saved when its `session_id` and `expected_path` match the active Session target.
 
 > History persistence is performed when the AI calls the MCP tools; the Web Admin does not record chat content in the background. If the client does not invoke a tool, the server cannot infer that a new conversation or task has happened.
 
@@ -226,9 +229,11 @@ The default `core` profile provides a stable, composable development tool set:
 | File reading | `read_file`, `list_dir`, `list_files`, `search`, `view_image` |
 | File modification | `apply_patch` |
 | Command execution | `exec_command`, `write_stdin`, `read_output`, `kill_session` |
-| Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
-| Environment | `server_info`, `check_exec_environment`, `get_default_cwd`, `set_default_cwd` |
-| History sessions | `history_session_bootstrap`, `history_session_checkpoint`, `history_session_validate` |
+| Git | the `git` facade: `status`, `diff`, `log`, `show`, `blame`, plus profile-gated mutation/worktree operations |
+| Environment | `server_info`, the `environment` facade, and the `cwd` facade |
+| Persistent Sessions | the `session` facade: `open`, `checkpoint`, `list`, `get`, `validate` |
+| Downstream MCP | the `mcp` facade for lazy discovery; core may call tools and advanced may manage server lifecycle |
+| Agent Skills | the `skill` facade for package reads/validation; advanced may install, activate, roll back, and remove packages |
 
 A typical development loop is:
 
@@ -307,7 +312,7 @@ pnpm cli:build
 ./crates/anchor/target/release/anchor serve <workspace> --service mcp
 ```
 
-The Linux CLI also provides a built-in daemon with `start`, `stop`, `restart`, `status`, `logs`, and `doctor`. It will not take over a port already used by the GUI. For production boot-time supervision, systemd should still run `serve` directly. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).
+The Linux CLI also provides built-in daemon operations including `start`, `stop`, `restart`, `status`, `logs`, `doctor`, and `upgrade`. It will not take over a port already owned by another Anchor runtime or external process. For boot-time recovery, prefer Anchor's native `anchor service install` systemd-user control plane instead of putting repeated `restart` commands into shell profiles. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).
 
 Workspace-level commands include `register`, `unregister`, `show`, `start`, `stop`, `gpt-config`, and `test`, covering profile registration, redacted GPT connection settings, and MCP/Actions protocol checks. See the [Workspace CLI guide](docs/workspace-cli.md).
 
@@ -320,6 +325,14 @@ Multiple workspaces can share one local Gateway and one public tunnel while rema
 Each workspace/profile uses immutable Agent Skill packages stored under `.anchor/skills`. Source directories are only inputs to explicit `validate/install`; the runtime no longer auto-scans `.agents/skills`, `.codex/skills`, or `skills`. Installed versions are assigned to stable/development/canary/pinned channels and become usable only after explicit activation; rollback and protected version removal are supported.
 
 MCP still publishes one `skill` facade: read-only/core can list/get/read_resource/packages/validate, while advanced alone can install/set_channel/activate/rollback/remove. `anchor skill ...` and the Web Admin Agent Skills panel use the same canonical package store. See the [Agent Skill package lifecycle guide](docs/skill-service.md) for lifecycle, protocol, and security boundaries.
+
+### Dynamic MCP, Federation, and Orchestration
+
+- [Dynamic MCP](docs/dynamic-mcp.md) documents the single `mcp` facade, lazy downstream tool discovery, and transactional server lifecycle.
+- [Federation](docs/federation.md) documents authenticated + signed read-only connectivity between Anchor Nodes through the existing Gateway; discovery never implies trust and remote write/exec/Harness access remains unavailable.
+- [Orchestration](docs/orchestration.md) documents the `anchor-orchestration-v1` read-only DAG planner/inspector for Node, Workspace, and local Harness Task observations, including dependency-wave barriers.
+
+See the [Anchor documentation center](docs/README.md) for the complete documentation map. Topic guides are currently canonical in Chinese when an English translation has not yet been added.
 
 ### Reconnection and OAuth renewal
 

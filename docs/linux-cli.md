@@ -1,6 +1,6 @@
 # Linux CLI
 
-`anchor` 是面向 Linux 服务器和无桌面环境的运行入口，支持前台 `serve` 和内置后台 daemon。它与桌面端读取同一套配置模型：**一个 workspace 对应一个 WorkspaceProfile**。
+`anchor` 是面向 Linux 服务器和无图形环境的运行入口，支持前台 `serve`、内置后台 daemon 和原生 systemd-user control-plane。CLI 与浏览器 Web Admin 读取同一套配置模型：**一个 workspace 对应一个 WorkspaceProfile**。
 
 ## 构建
 
@@ -34,8 +34,8 @@ sudo install -m 0755 \
 Linux 默认使用：
 
 ```text
-~/.config/anchor-desktop/data/profiles.json
-~/.config/anchor-desktop/data/secrets.json
+~/.config/anchor/data/profiles.json
+~/.config/anchor/data/secrets.json
 ```
 
 普通工作区配置和敏感值分别保存；两个文件均使用当前用户权限。可以通过全局参数覆盖配置根目录：
@@ -44,7 +44,7 @@ Linux 默认使用：
 anchor --config-dir /etc/anchor list
 ```
 
-不要为 CLI 创建第二套 profile。桌面端创建的 workspace/profile 可以直接由 CLI 按 ID、唯一名称或项目路径选择。
+不要为 CLI 创建第二套 profile。浏览器 Web Admin 创建的 workspace/profile 可以直接由 CLI 按 ID、唯一名称或项目路径选择。
 
 从 Windows 等其他平台迁移时，不要直接复制受平台保护的 `secrets.json`。请使用 `anchor export` / `anchor import` 让源平台解密 secrets、目标 Linux 重新按本机权限机制落盘，并通过 `--workspace-path` 映射项目目录。详见 [跨平台配置迁移](config-migration.md)。
 
@@ -80,6 +80,10 @@ anchor doctor <workspace>
 anchor restart <workspace>
 anchor stop <workspace>
 
+# 把运行中的 runtime 升级到当前 CLI build；先 dry-run
+anchor upgrade --all --dry-run
+anchor upgrade --all
+
 # 前台启动 MCP，Ctrl+C 优雅停止
 anchor serve <workspace>
 
@@ -93,7 +97,9 @@ anchor serve <workspace> --service all --tunnel
 anchor --json status <workspace>
 ```
 
-`serve` 是前台常驻命令；`start` 创建 Linux 后台 daemon。若对应端口已被桌面 GUI 或其他进程占用，两种模式都会报错退出，不会停止、接管或替换现有服务。完整运维说明见 [CLI Daemon 与运维命令](cli-daemon.md)。
+`serve` 是前台常驻命令；`start` 创建 Linux 后台 daemon。若对应端口已被其他 Anchor runtime 或外部进程占用，两种模式都会报错退出，不会停止、接管或替换现有服务。完整运维说明见 [CLI Daemon 与运维命令](cli-daemon.md)。
+
+当前 Linux runtime 支持 `anchor upgrade`。如果所选 Workspace/Gateway 由 Anchor 的 systemd-user control-plane 持有，upgrade 会识别 supervisor ownership 并刷新 service executable/build plan，再由 systemd reconcile desired state；不会先停 daemon 再和旧 service plan 竞争拉起。显式选择只覆盖 supervisor desired set 的一部分时会 fail-closed，优先使用 `anchor upgrade --all` 完整升级受管集合。
 
 ### 单 Gateway 多工作区
 
@@ -105,7 +111,9 @@ anchor gateway show
 anchor gateway serve PROJECT_A PROJECT_B PROJECT_C
 ```
 
-`gateway serve` 在一个前台进程中管理所选工作区、Gateway 和唯一 MCP 隧道。Gateway 模式下不能再为各工作区分别使用 `start ... --service mcp`，生产环境应由 systemd 直接监督 `gateway serve`。详见 [单一 MCP Gateway 与多工作区](mcp-gateway.md)。
+`gateway serve` 在一个前台进程中管理所选工作区、Gateway 和唯一 MCP 隧道。Gateway 模式下不能再为各工作区分别使用 `start ... --service mcp`。常规服务器推荐把 Gateway/Workspace desired state 交给 `anchor service install` 的 systemd-user control-plane；`gateway serve` 主要用于调试、容器或外部 supervisor。详见 [单一 MCP Gateway 与多工作区](mcp-gateway.md)。
+
+如果使用 Anchor 原生 systemd-user control-plane，则先用正常 Gateway/Workspace 管理命令形成 desired state，再执行 `anchor service install`；不需要额外再写一个监督 `gateway serve` 的 unit。只有容器、外部 supervisor 或刻意采用 foreground 模式时，才需要让外部 systemd 直接监督 `gateway serve`。
 
 ## systemd 用户服务
 
@@ -127,7 +135,18 @@ anchor service status
 
 以后通过 `anchor start` / `anchor stop` / `anchor restart`、Gateway route/config 管理或 Workspace 注销产生的 desired state 会同步到同一 plan。若需要把“当前实际正在运行的集合”覆盖为下一次启动计划，可显式执行 `anchor service sync`。
 
-`anchor service status` 会同时报告 unit 是否 installed/enabled/running、plan、注册时的 build identity 和当前 CLI build。**更新源码并不等于更新已安装的 `/usr/local/bin/anchor`。** 如果 service/status 显示 build 不一致，应先完成二进制替换/升级，再用新二进制执行一次 `anchor service install`，刷新 unit 与 build registration；否则重启后仍可能由旧安装映像拉起旧 Catalog/行为。
+`anchor service status` 会同时报告 unit 是否 installed/enabled/running、plan、注册时的 build identity 和当前 CLI build。**更新源码并不等于更新已安装的 `/usr/local/bin/anchor`。** 应先确保自己正在运行目标新 build（常规做法是先替换 `/usr/local/bin/anchor`），然后可以：
+
+```bash
+# 推荐：预检后一次升级 systemd-owned desired set
+anchor upgrade --all --dry-run
+anchor upgrade --all
+
+# 也可显式刷新/重装 service registration
+anchor service install
+```
+
+当正在运行的 systemd-user service 持有所选 runtime 时，`anchor upgrade` 会自动走 supervisor-aware lifecycle，而不是执行普通 bounded-outage daemon replacement。`--dry-run` 会在结果中报告 supervisor plan；若只选中了 service desired set 的一部分，则返回 `SUPERVISOR_UPGRADE_SCOPE_MISMATCH`，要求完整选择受管集合。
 
 在 SSH、自动化 shell 或 root 登录中，PAM 可能没有注入 `XDG_RUNTIME_DIR`，即使 `user@<uid>.service` 已运行，裸 `systemctl --user` 也会报 `Failed to connect to bus: No medium found`。Anchor 会按当前有效 UID 显式使用 `/run/user/<uid>` 连接 systemd user manager，并忽略可能陈旧的 `DBUS_SESSION_BUS_ADDRESS`，因此正常情况下无需手工 `export XDG_RUNTIME_DIR=/run/user/0`。如果 user manager 本身不可用，错误会报告 UID、期望 runtime dir，并提示检查 `systemd-logind` / `user@<uid>.service`。
 
@@ -143,24 +162,24 @@ control-plane service 与它拉起的 daemon 运行在 systemd 非交互环境�
 sudo loginctl enable-linger "$USER"
 ```
 
-## GUI 与 CLI 并用
+## Web Admin 与 CLI 并用
 
 - Anchor 只读取当前配置目录和受保护的 `secrets.json` 封装；早期产品目录、明文凭据和旧配置布局不会自动导入。需要保留的工作区应在当前版本中重新注册。
 - 可以共用同一个配置目录和 workspace/profile。
 - 配置文件写入有跨进程锁和最近有效备份。
-- 不要同时用 GUI 和 CLI 启动同一个 workspace 的同一种服务；端口检查会阻止重复启动。
+- 不要通过不同入口并发启动同一个 workspace 的同一种服务；control-plane/端口 ownership 检查会阻止重复接管。
 - CLI 默认不启动隧道，只有显式传入 `--tunnel` 才使用 profile 中已保存的隧道配置。
-- 修改配置后，应重启负责运行该 workspace 的 GUI 服务或 systemd 服务。
+- 修改配置后应通过当前 Workspace daemon/control-plane 的受控 apply/reload/restart 路径生效；不要另起第二个 listener 试图覆盖活动运行态。
 
 ## Agent Skills
 
-Linux CLI 启动 MCP 时会读取同一个 WorkspaceProfile 中的 Skill 服务配置，不需要额外参数：
+Linux CLI 启动 MCP 时会读取同一个 WorkspaceProfile 和 workspace-local `.anchor/skills` package store，不需要 Skill root 参数：
 
 ```bash
 anchor serve PROFILE_ID --service mcp
 ```
 
-确保 systemd 服务用户能够读取 profile 配置的 Skill 根目录。MCP 会稳定发布一个只读 `skill` facade tool（`list` / `get` / `read_resource`），供 ChatGPT Developer Mode 等以 `tools/list` 为可靠发现入口的宿主使用；四个旧 Skill helper 仅保留缓存客户端兼容，不再单独占工具槽。与此同时，MCP 仍声明 `io.modelcontextprotocol/skills` extension，并提供 `skills/list`、`skills/get` 和 `skill://anchor/<skill-name>/...` resources，作为兼容该扩展宿主的标准方向。若需要 ChatGPT Plugin 原生 Skill UI，可另用 `anchor plugin package PROFILE_ID --app-id plugin_asdk_app...` 生成静态 Plugin 快照。Skill 脚本只可读取、不会执行。详细说明见 [MCP Agent Skills 服务](skill-service.md)。
+`skill` 始终只占一个一级 MCP tool。`read-only` / `core` 可用 `list`、`get`、`read_resource`、`packages`、`validate`；`advanced` 另可 `install`、`set_channel`、`activate`、`rollback`、`remove`。内部 operation handler 不作为独立工具发布。与此同时，MCP 仍声明 `io.modelcontextprotocol/skills` extension，并提供 `skills/list`、`skills/get` 和 `skill://anchor/<skill-name>/...` resources；若需要 ChatGPT Plugin 静态快照，可使用 `anchor plugin package PROFILE_ID --app-id plugin_asdk_app...`。完整 package/channel/activation、安全与脚本 snapshot 边界见 [Agent Skill package lifecycle](skill-service.md)。
 
 ## 自动恢复
 

@@ -40,6 +40,7 @@ Anchor 只读取当前配置目录和当前配置格式，不再自动导入早�
 
 - [查看完整安装和 Web Admin 启动步骤](#五分钟开始使用)
 - [直接查看 ChatGPT 插件配置](#mcp-connector)
+- [打开 Anchor 文档中心](docs/README.md)
 
 ## 五分钟开始使用
 
@@ -103,14 +104,14 @@ Windows 对应可执行文件为 `crates/anchor/target/release/anchor.exe`。`an
 
 支持 MCP 的客户端使用 Web Admin 中的公网 MCP URL。使用 OAuth 时，客户端会通过服务端元数据进入授权流程；授权口令、Client ID 和 Secret 均可在 Web Admin 集中生成和管理。当前版本使用预配置 OAuth 客户端，创建 ChatGPT 插件时应选择静态/手动 OAuth 凭据，不需要选择 CIMD。
 
-首次连接建议先调用历史初始化，再检查工作区：
+首次连接建议先打开当前 Session，再检查工作区：
 
 ```text
-history_session_bootstrap
+session { operation: "open" }
 server_info
-get_default_cwd
-git_status
-check_exec_environment
+cwd { operation: "get" }
+git { operation: "status" }
+environment { operation: "check" }
 ```
 
 这样 Agent 不需要依赖聊天上下文猜测当前项目、工作目录和执行能力。
@@ -162,11 +163,11 @@ check_exec_environment
 创建一个启用了该插件的新对话，并发送：
 
 ```text
-请使用 Anchor 调用 server_info、get_default_cwd 和 git_status，
+请使用 Anchor 调用 server_info、cwd(operation=get) 和 git(operation=status)，
 告诉我当前连接的工作区、默认目录和 Git 状态。
 ```
 
-如果能够返回当前项目的信息，说明“Anchor runtime → 公网隧道 → OAuth → ChatGPT → MCP 工具”链路已经打通。首次正式开发时，再调用 `history_session_bootstrap` 初始化或恢复项目历史。
+如果能够返回当前项目的信息，说明“Anchor runtime → 公网隧道 → OAuth → ChatGPT → MCP 工具”链路已经打通。首次正式开发时，再调用 `session` 的 `open` operation 初始化或恢复当前项目 Session。
 
 如果 ChatGPT 仍显示旧的工具列表，请断开并重新连接插件，或创建一个新对话后再次验证。
 
@@ -197,21 +198,23 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 - **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
 - **默认工具面保持简单**：稳定的核心工具默认可用，高级 Harness 能力按需开启。
 
-## 让项目记住每次对话
+## 让项目记住每次开发 Session
 
-普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Anchor 将会话进度写入当前项目的 `docs/history-session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。
+普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Anchor 当前把持久 Session 写入项目的 `docs/session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。旧 `docs/history-session/` 仅作为冻结归档保留，当前 Session store 不扫描、不迁移也不向其写入。
 
 ![ChatGPT 新会话启动提示词](docs/images/history-session-prompt.png)
 
 *复制完整提示词到新会话，即可初始化或恢复历史；每轮任务完成后再保存检查点。*
 
-它提供三个互相配合的历史工具：
+当前使用单一 `session` facade：
 
-| 工具 | 作用 |
+| operation | 作用 |
 | --- | --- |
-| `history_session_bootstrap` | 新对话开始时初始化或恢复项目会话；新文件会固化前序会话的压缩摘要，并返回稳定的 `session_key` 和 `current_path` |
-| `history_session_checkpoint` | 每轮任务完成后按 bootstrap 返回的稳定目标保存结构化进度；目标不一致时拒绝写入，避免串到其他历史文件 |
-| `history_session_validate` | 检查历史编号、文件和会话映射；必要时重建派生索引，不删除已有历史 |
+| `open` | 新对话开始时创建、恢复或续接当前 Session，并返回稳定的 `session_id` / `session_path` |
+| `checkpoint` | 将决策、变更、测试和下一步写入 `open` 返回的明确 Session 目标；目标不一致时拒绝写入 |
+| `list` | 分页列出当前 `docs/session` 的 Session metadata |
+| `get` | 读取一个明确 `session_id` 的内容 |
+| `validate` | 验证当前 Session store/index，并可显式 repair；不会扫描旧 `docs/history-session` |
 
 典型效果：
 
@@ -221,7 +224,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 对话 2：读取历史摘要和最新交接 → 从上次进度继续 → 保存新检查点
 ```
 
-历史文件使用可读的 Markdown 格式，可以随项目备份或纳入 Git，也方便开发者直接审阅和修订。每个新文件顶部都带有有长度上限的“继承的历史摘要”，旧摘要不会递归复制；检查点采用幂等写入，并要求返回 `ok=true` 且会话目标一致后才确认保存成功。
+Session 文件使用可读的 Markdown 格式，并维护 `docs/session/index.json` 派生索引。Harness 默认把 `docs/session/` 当作本地 Session metadata，从业务 Git baseline 中排除；需要共享这些记录时应根据项目自己的版本控制策略显式决定，而不是依赖旧 history 目录语义。检查点要求 `session_id` 与 `expected_path` 对齐后才确认写入成功。
 
 > 历史持久化由 AI 调用 MCP 工具完成，并非 Web Admin 在后台录制聊天内容。若客户端未触发工具调用，服务端无法凭空感知新的对话或任务进度。
 
@@ -234,9 +237,11 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 | 文件读取 | `read_file`、`list_dir`、`list_files`、`search`、`view_image` |
 | 文件修改 | `apply_patch` |
 | 命令执行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
-| Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
-| 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
-| 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate` |
+| Git | `git` facade：`status`、`diff`、`log`、`show`、`blame`，以及按 profile 开放的 mutation/worktree operation |
+| 环境 | `server_info`、`environment` facade、`cwd` facade |
+| 持久 Session | `session` facade：`open`、`checkpoint`、`list`、`get`、`validate` |
+| 下游 MCP | `mcp` facade：懒搜索/加载工具；core 可调用，advanced 可管理 server lifecycle |
+| Agent Skill | `skill` facade：读取/校验 package；advanced 可安装、激活、回滚与删除 |
 
 典型开发过程：
 
@@ -315,19 +320,27 @@ pnpm cli:build
 ./crates/anchor/target/release/anchor serve <workspace> --service mcp
 ```
 
-CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor` 运维命令。它不会接管已被 GUI 占用的端口；生产自启动仍建议由 systemd 直接监督 `serve`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。
+CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor/upgrade` 运维命令。它不会接管已被其他 Anchor runtime 或外部进程占用的端口；需要节点重启后自动恢复时，推荐使用 Anchor 原生的 `anchor service install` systemd-user control-plane，而不是在 shell profile 中重复 `restart`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。
 
 Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`，可直接注册项目、查看脱敏的 GPT 连接配置并验证 MCP/Actions 协议。见 [Workspace CLI 注册与 GPT 连接运维](docs/workspace-cli.md)。
 
 跨 Windows/Linux 迁移不要直接复制 `secrets.json`。使用 `anchor export` / `anchor import`（或 `anchor config export/import`）可在源平台解密后生成 passphrase 加密迁移包，并在目标平台按本机 secret protection 重新保存，同时保留 Workspace ID、OAuth client ID 和认证 secrets。`import` 支持 `--workspace-path WORKSPACE=ABSOLUTE_PATH` 与 `--dry-run` 进行目录映射和预检。完整说明见 [跨平台配置迁移](docs/config-migration.md)。
 
-多个工作区可以通过一个本地 Gateway 和一条公网隧道暴露为 `/w/<workspace-id>/mcp`。GUI 在 **设置 → 通用 → 单一 MCP Gateway** 配置；Linux 可使用 `gateway configure/show/serve`。完整隔离与运维说明见 [单一 MCP Gateway 与多工作区](docs/mcp-gateway.md)。
+多个工作区可以通过一个本地 Gateway 和一条公网隧道暴露为 `/w/<workspace-id>/mcp`。Web Admin 在 **设置 → 通用 → 单一 MCP Gateway** 配置；Linux 可使用 `gateway configure/show/serve`。完整隔离与运维说明见 [单一 MCP Gateway 与多工作区](docs/mcp-gateway.md)。
 
 ### 通过 MCP 提请 Agent Skill
 
 每个 workspace/profile 使用 `.anchor/skills` 中的不可变 Agent Skill packages。源目录只用于显式 `validate/install`；运行时不会自动扫描 `.agents/skills`、`.codex/skills` 或 `skills`。通过 stable/development/canary/pinned channel 选择已安装版本，再显式 activate；支持 rollback 和受保护的 version removal。
 
 MCP 仍只公开一个 `skill` facade：read-only/core 可 list/get/read_resource/packages/validate，advanced 才能 install/set_channel/activate/rollback/remove。CLI 可使用 `anchor skill ...`，Web Admin 的 Agent Skills 面板使用同一 canonical package store。完整生命周期、协议和安全边界见 [Agent Skill package lifecycle](docs/skill-service.md)。
+
+### Dynamic MCP、Federation 与 Orchestration
+
+- [Dynamic MCP](docs/dynamic-mcp.md)：通过单一 `mcp` facade 管理/懒发现下游 MCP，避免把所有下游 schema 注入 Anchor 主 Catalog。
+- [Federation](docs/federation.md)：多个 Anchor Node 通过现有 Gateway 进行 authenticated + signed 的只读互联；discovery 不等于 trust，不开放远程写/exec/Harness。
+- [Orchestration](docs/orchestration.md)：`anchor-orchestration-v1` 提供多 Node/Workspace/Harness Task 的 read-only DAG plan/inspection，并按 dependency waves 观测；当前不是 scheduler 或 remote executor。
+
+完整文档导航见 [Anchor 文档中心](docs/README.md)。
 
 ### 断联恢复与 OAuth 续约
 

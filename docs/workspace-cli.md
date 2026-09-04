@@ -79,7 +79,7 @@ anchor workspace unregister Example --force
 - 清理 CLI daemon 状态和该 profile 的受管隧道状态；
 - CLI daemon 正在运行时先优雅停止，超时后允许终止已验证的 daemon 进程树；
 - 不删除项目目录、Git 仓库或源码；
-- 不停止 GUI 或其他外部 PID；
+- 不停止不属于当前 Anchor daemon/control-plane 的外部 PID；
 - 若配置端口恰好被外部进程监听，只在结果中返回 warning。
 
 `projectFilesDeleted` 始终为 `false`。
@@ -100,7 +100,7 @@ anchor workspace start Example --service all --tunnel
 anchor workspace stop Example
 ```
 
-这两个命令是顶层 `start/stop` 的 workspace 级别名，管理 Linux CLI daemon。Windows/macOS 使用 GUI 或 `serve` 前台模式。
+这两个命令是顶层 `start/stop` 的 workspace 级别名。Workspace 后台 daemon 当前支持 Windows 与 Linux；macOS 使用 `serve` 前台模式。浏览器 Web Admin 与 CLI 共用同一 daemon/control-plane 语义，不维护第二套运行权威。
 
 完整 daemon 行为见 [CLI Daemon 与运维命令](cli-daemon.md)。
 

@@ -30,7 +30,7 @@ one public hostname / one tunnel
    +-- /w/workspace-b/mcp -> 127.0.0.1:<workspace-b-port>/mcp
 ```
 
-只转发以下协议路径：
+Workspace 路由只转发以下 MCP/OAuth 协议路径：
 
 - `mcp`；
 - `.well-known/oauth-authorization-server`；
@@ -38,9 +38,19 @@ one public hostname / one tunnel
 - `oauth/authorize`；
 - `oauth/token`。
 
-其他路径、未知工作区和非法工作区 ID 均返回 `404`，不会回退到默认工作区。
+其他 Workspace 子路径、未知工作区和非法工作区 ID 均返回 `404`，不会回退到默认工作区。
 
-## GUI 配置
+同一个 Gateway listener 现在还承载 Node Federation 的固定根路径；它们不是 Workspace reverse-proxy 路由：
+
+```text
+GET  /federation/v2/bootstrap   # legacy discovery v1
+GET  /federation/v2/discovery   # current bounded rotation-chain discovery
+POST /federation/v2/read        # authenticated + signed read-only transport
+```
+
+`bootstrap` / `discovery` 只返回签名的 public Node/security metadata，明确清空 Workspace catalog；`read` 需要 pairwise bearer credential 并验证 signed response。完整边界见 [Federation](federation.md)。Gateway 停止时这些 Federation HTTP endpoints 同样不可用，不存在第二个 federation-only listener。
+
+## Web Admin 配置
 
 打开 **设置 → 通用 → 单一 MCP Gateway**：
 
@@ -141,7 +151,7 @@ RestartSec=3
 - 不存在“未知工作区转默认工作区”的 fallback；
 - Gateway 不记录或改写 Access Token、授权码和 PKCE verifier；
 - 远程公网基础地址必须使用 HTTPS，HTTP 只允许 loopback；基础地址不能包含凭据、子路径、查询参数或 fragment；
-- Gateway 只允许 GET、POST、DELETE 和固定 MCP/OAuth 路径；
+- Gateway 只允许受控 method 和固定 MCP/OAuth/Federation 路径；Workspace reverse proxy 不能访问 Federation handler，Federation handler 也不能切换 Workspace；
 - Gateway 内部转发显式禁用系统代理，移除 hop-by-hop 与 `Connection` 动态声明的 Header，并由 HTTP 客户端重算请求长度；
 - Gateway 模式下文件工具拒绝显式绝对路径、父目录路径和解析后越出 Workspace 的路径；子进程命令也拒绝绝对路径与父目录路径参数；
 - Actions 服务与隧道不合并，仍按工作区独立运行；
@@ -162,14 +172,14 @@ RestartSec=3
 
 并发许可会保持到响应流结束，不能通过建立长流后提前释放额度。Gateway graceful shutdown 最多等待 3 秒；存在未结束长流时会强制 abort 并等待任务退出。
 
-桌面端 listener 和共享隧道恢复使用有上限的指数退避。Quick Tunnel 地址漂移进入阻断状态，只有修改 Gateway 或 owner 隧道配置后才重新尝试。GUI 每 2 秒刷新 Gateway 与工作区路由状态，但不会覆盖用户正在编辑的草稿。
+Gateway/Workspace runtime 和共享隧道恢复使用有上限的指数退避。Quick Tunnel 地址漂移进入阻断状态，只有修改 Gateway 或 owner 隧道配置后才重新尝试。Web Admin 通过 Gateway control events/status 刷新路由与日志状态，不创建第二套 Gateway runtime，也不会用后台刷新覆盖用户正在编辑的草稿。
 
 ## 当前第一阶段边界
 
 - 内部仍是一工作区一 listener；第一阶段优化的是公网入口和隧道数量，而不是内部端口数量；
 - 响应使用流式转发以兼容 SSE，并带并发与空闲截止时间；
 - 路由成员由“当前正在运行的 MCP 工作区”决定，尚未提供独立的常驻成员列表；
-- GUI 可以逐个启停工作区；headless 多工作区使用 `gateway serve`，不使用每工作区 daemon；
+- Web Admin 可以逐个启停工作区；headless 多工作区可使用 `gateway serve`，或把 desired state 交给 `anchor service install` 的 systemd-user control-plane；
 - Gateway 模式会强化应用层文件和命令路径边界，但项目仍没有 OS 级文件系统沙箱；允许的子进程自身若存在未被参数策略识别的绕过能力，仍需依赖最小权限账户、容器或系统级沙箱防护；
 - 完全相同 URL 加 DCR `client_id` 的租户路由不属于本阶段。
 
@@ -185,4 +195,4 @@ RestartSec=3
 - observed owner/signature 失配；
 - CLI 与桌面构建组合。
 
-仍需在发布候选版本上进行真实新版 GUI、两个 ChatGPT App 的 OAuth 授权、真实固定隧道/Quick Tunnel、Linux systemd 和外部压力测试。代码测试通过不等同于这些外部环境已经验证。
+发布候选仍应进行真实 Web Admin、两个 ChatGPT App 的 OAuth 授权、真实固定隧道/Quick Tunnel、Linux systemd-user service 和外部压力测试。代码测试通过不等同于这些外部环境已经验证。

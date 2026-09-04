@@ -116,16 +116,17 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **实现**: `crates/anchor/src/workspace/` 与 `crates/anchor/src/data/`
 
 ### runtime/
-- **职责**: MCP 运行时生命周期状态机（Stopped → Starting → Running → Stopping → Error）
+- **职责**: MCP/Actions 运行时生命周期与恢复状态机（Stopped → Starting → Running / Recovering → Stopping → Error）以及 machine-local runtime capability / Node identity
 - **实现**: `crates/anchor/src/runtime/`
+- **能力契约**: `anchor-runtime-capabilities-v1`；`gateway` / `federationReadOnly` / `localControl` / `durableCommands` 按当前平台支持派生，不无条件宣称可用
 
 ### control/ 与 daemon.rs
-- **职责**: CLI/GUI 共用的 Workspace 控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal、单服务配置 reload，以及跨 Workspace/Gateway 的纯只读聚合
+- **职责**: CLI/Web Admin 共用的 Workspace 控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal、单服务配置 reload，以及跨 Workspace/Gateway 的纯只读聚合
 - **传输**: Linux Unix Domain Socket；Windows owner/System protected-DACL Named Pipe
 - **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
 - **协议**: Workspace 当前 v6；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel/apply_config 写请求使用 accepted → operation status 异步状态机
 - **升级协商**: daemon state 与 `version` additive 发布 build identity。普通写请求要求当前协议；新客户端只可用旧协议执行 read-only `version` 和稳定的 lifecycle drain（Workspace v2+、Gateway v1+），用于优雅退出旧运行权威后再由当前构建启动
-- **GUI 接入**: Windows/Linux 上 Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Windows GUI 不再提供 process-local Server 回退，检测到旧 listener 时按冲突处理而不是接管
+- **Web Admin 接入**: Windows/Linux 上 Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Web Admin 不提供 process-local Server 回退，检测到旧/外部 listener 时按冲突处理而不是接管
 - **配置应用**: 已运行服务使用 daemon 内单 listener reload；daemon PID、另一 listener 与 Tunnel ownership 不因普通配置应用而重启，新 listener 失败时尝试恢复旧 listener
 - **聚合读取**: `control::aggregate` 并发读取独立 Workspace/Gateway 控制域，返回 canonical MCP/Actions 状态和按 source 保留游标的事件批；聚合层不持有 Runtime/Tunnel/Gateway 运行权威
 
@@ -136,10 +137,16 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **协议**: Gateway protocol v1；请求包含配置域 `configScope`，使用全局 `gateway.sock`/PID/state/lock，reload 与 apply_config 使用 accepted → operation status；v1 通过 additive tags 提供有界 logs/events，不破坏已有 v1 方法
 - **可观察性**: daemon log tail/cursor 单响应正文最多 8 KiB；事件 journal 保留 256 条、单批 32 条、最长 25 秒 long-poll，使用独立 `streamId + sequence` 游标
 - **配置事务**: 运行中配置由 daemon 先切换运行态、更新 state，再持久化；失败停止新运行态并恢复旧运行态；禁用则先 shutdown 后持久化
-- **GUI 边界**: GUI 状态和 route 列表直接来自 Gateway control status，配置写入调用 daemon；Gateway 设置页使用 events 唤醒状态/日志刷新；不创建共享 listener/tunnel，不在协议错误时本地回退
+- **Web Admin 边界**: 状态和 route 列表直接来自 Gateway control status，配置写入调用 daemon；Gateway 设置页使用 events 唤醒状态/日志刷新；不创建共享 listener/tunnel，不在协议错误时本地回退
 - **Workspace 交互**: route/owner profile 更新触发 Gateway reload；活动 route 禁止删除/注销，避免 live Gateway 指向不存在的 Workspace
-- **跨进程一致性**: AppState 每次数据访问前从磁盘刷新；Gateway observed URL 采用窄字段原子更新，避免后台 daemon 与桌面缓存互相覆盖
-- **平台边界**: Windows/Linux Gateway daemon 服务端均已实现；Windows Named Pipe 使用配置 owner 与 LocalSystem 的受保护 DACL，Gateway state v2 校验 executable/PID ownership。Windows GUI 不保留 process-local Gateway 回退
+- **跨进程一致性**: 共享 management/data 层在配置操作前读取 canonical state；Gateway observed URL 采用窄字段原子更新，避免后台 daemon 与管理客户端缓存互相覆盖
+- **平台边界**: Windows/Linux Gateway daemon 服务端均已实现；Windows Named Pipe 使用配置 owner 与 LocalSystem 的受保护 DACL，Gateway state v2 校验 executable/PID ownership。Web Admin 不保留 process-local Gateway 回退
+
+### Linux systemd-user supervisor
+- **职责**: 配置域级开机恢复和 desired-state supervisor；通过 `anchor service install/status/sync/start/stop/restart` 管理
+- **运行权边界**: systemd-user control-plane 持有其 plan 中的 Workspace/Gateway daemon；不要再用 shell profile 或第二个自定义 unit 对同一 runtime 重复 `restart`
+- **升级语义**: `anchor upgrade` 会识别 systemd ownership。受管目标自动走 supervisor-aware service executable/build update；显式选择只覆盖 desired set 一部分时 fail closed，避免旧 service plan 与 direct daemon rollout 竞争
+- **构建验证**: `service status` 区分 installed/current/different 等 build state；实际升级后必须确认 registration 与当前 CLI build 一致
 
 ### Windows SCM supervisor
 - **职责**: 配置域级开机恢复与操作系统 supervisor；desired state 保存于 `windows-service.json`
@@ -147,9 +154,25 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **运行身份**: `windows-service-runtime.json` 保存 supervisor PID、启动时间、实际 executable path 与 build identity；状态读取再以 SCM `queryex` PID、存活性和进程镜像路径交叉校验
 - **升级语义**: `service install` 对已运行 Service 是显式 update：先等待旧 supervisor `STOPPED`（其间优雅排空受管 Workspace/Gateway daemon），再从已更新 binPath 启动当前构建并等待 `RUNNING`；普通 CLI/Web 管理操作不隐式升级 Service
 
+### federation/
+- **职责**: Anchor Node / Workspace 间 authenticated + signed 的只读互联；wire contract 为 `anchor-federation-v2`
+- **读取边界**: 仅 `node_capabilities`、`node_control_status`、`workspace_catalog`、`workspace_status`；不导出 path/secret/Harness state，不提供 remote mutation/exec/Git
+- **信任模型**: machine-local peer registry + pairwise credential + signed bootstrap/probe + operator explicit trust；状态为 Untrusted/Trusted/Drifted/Revoked，discovery 本身不授予 trust
+- **签名与轮换**: Ed25519 machine-local signing identity 使用受平台保护的 v2 store；bounded rotation history 最多 8 跳，合法 continuity 仍要求显式 re-bootstrap → probe → trust
+- **传输**: 复用现有 MCP Gateway 根路径 `/federation/v2/bootstrap`、`/federation/v2/discovery`、`/federation/v2/read`；没有独立 federation listener
+- **状态权威**: registry/SecretStore/Gateway/control 仍是既有 authority，Federation 不复制 Workspace/Harness 数据
+
+### orchestration/
+- **职责**: `anchor-orchestration-v1` 的 transient Workflow/Fleet DAG plan 与 read-only inspection
+- **目标**: Node、Workspace、本地 Harness Task；远端 Node/Workspace 通过 trusted Federation read，本阶段远端 Harness Task fail closed
+- **依赖语义**: planner 生成 deterministic waves；inspection 真实按 wave barrier 执行，同一 wave 内有界并发
+- **状态权威**: `existing_harness_federation_control_plane`；不存在第二套 workflow database、persistent scheduler 或 remote executor
+- **管理入口**: 当前仅有 Web Admin backend/typed API 的 `plan_orchestration_workflow` / `inspect_orchestration_workflow`，尚无专用可视化页、CLI group 或一级 MCP tool
+
 ### mcp/
-- **职责**: MCP 协议、OAuth、Session、工具目录、代理聚合与 Streamable HTTP transport
+- **职责**: MCP 协议、OAuth、Session、工具目录、下游 Dynamic MCP proxy 聚合与 Streamable HTTP transport
 - **实现**: `crates/anchor/src/mcp/` 与 `crates/anchor/src/tools/`
+- **下游 MCP 边界**: 一级 `mcp` facade 做 `search_tools → get_tool → call` 懒加载；advanced lifecycle 的 register/enable 使用 activation-first 事务语义，下游 tool schema 不进入 Anchor 主 Catalog
 
 ### tunnel/
 - **职责**: FRP 配置生成、Cloudflare 隧道进程监督；Workspace live supervisor 由对应 daemon 持有

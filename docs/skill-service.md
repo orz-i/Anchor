@@ -47,7 +47,7 @@ anchor skill install PROFILE_ID skills/code-review --channel stable --activate
 ---
 name: code-review
 description: Review a code change for correctness, security, and regressions.
-allowed-tools: read_file git_diff search
+allowed-tools: read_file git search
 metadata:
   version: "1.2.0"
 ---

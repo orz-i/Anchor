@@ -1,13 +1,13 @@
 # 连接恢复、自动重试与 OAuth 续约
 
-Anchor 对本地服务、隧道、下游 MCP 和桌面后台连接采用分层恢复。恢复遵循两个原则：
+Anchor 对 Workspace/Gateway runtime、隧道、下游 MCP、Web Admin 状态同步和 Harness 工具失败采用分层恢复。恢复遵循两个原则：
 
 1. 能安全重复的连接与读取操作自动重试；
 2. 结果可能已经生效的写入和工具调用不盲目重放。
 
 ## MCP 与 Actions 本地服务
 
-桌面端每两秒维护一次当前 WorkspaceProfile 对应的 MCP 和 Actions 服务。
+MCP/Actions listener 的恢复逻辑属于实际持有运行态的 `RuntimeSupervisor`；在 daemon 模式中由 Workspace daemon 持有，在前台 `serve` 模式中由前台 CLI 持有。Web Admin 只读取 control-plane 状态，不创建第二套本地 listener 来“补救” daemon。
 
 以下情况会进入 `recovering`：
 
@@ -24,7 +24,7 @@ Anchor 对本地服务、隧道、下游 MCP 和桌面后台连接采用分层�
 恢复成功后：
 
 - 服务状态恢复为 `running`；
-- GUI 显示恢复成功提示；
+- control-plane 状态重新报告 `running`，Web Admin/CLI 可观察到恢复结果；
 - `recoveredCount` 增加；
 - 日志写入 `[recovery]` 记录。
 
@@ -32,7 +32,7 @@ Anchor 对本地服务、隧道、下游 MCP 和桌面后台连接采用分层�
 
 ## 隧道恢复
 
-本地服务保持运行时，桌面端会确保对应 FRP 或 Cloudflare 隧道仍然存在。
+本地服务保持运行时，拥有该 Workspace runtime 的 daemon/foreground supervisor 会维护对应 FRP 或 Cloudflare 隧道。
 
 - 隧道进程退出后自动重新创建；
 - 重连失败使用指数退避，避免断网时持续刷进程和日志；
@@ -57,7 +57,7 @@ anchor serve PROFILE_ID --service all --tunnel
 
 使用 `--json` 时输出结构化 `service_state`、`tunnel_retry_scheduled` 和 `tunnel_reconnected` 事件。
 
-本地服务恢复耗尽后，CLI 会优雅停止已启动服务和隧道，并以非零状态退出。配合 systemd 的 `Restart=on-failure`，可以再由系统服务管理器进行进程级重启。
+本地服务恢复耗尽后，foreground CLI 会优雅停止已启动服务和隧道，并以非零状态退出。使用 Anchor 原生 Linux control-plane 时，由 `anchor service install` 注册的 systemd-user service 负责节点级 desired-state 恢复；只有外部 supervisor 模式才需要自行给 `serve` 配置 `Restart=on-failure`。
 
 ## 下游 MCP 聚合
 
@@ -111,16 +111,15 @@ status
 
 `step_fingerprint` 默认来自稳定化后的实际命令或工具参数。调用方在需要修正命令、Patch 内容或环境后仍把它视为同一逻辑步骤时，可提供 `recovery_key`；verification 和 staged commit 也可复用各自的稳定 key。无关的同名工具成功不会解除 recovery，后续不同失败也不会覆盖首个开放恢复点。
 
-## 桌面后台连接
+## Web Admin 状态同步
 
-Workspace 页面会周期读取 MCP 和 Actions 状态：
+Web Admin 不维护业务 runtime。Workspace/Gateway 页面优先消费版本化 control-plane snapshot/event 接口：
 
-- 正常时每五秒同步；
-- 失败后使用 1、2、4、8、15 秒退避；
-- 页面恢复可见或系统重新联网时立即同步；
-- 页面隐藏时暂停轮询；
-- 初始加载失败时保留恢复页面，而不是永久空白；
-- 连续失败只在关键阶段显示通知，避免 Toast 风暴。
+- Workspace 状态优先使用 daemon `events` 长轮询唤醒；
+- 全局 layout 使用 `get_control_plane_status` 聚合快照与 `get_control_plane_events` 唤醒，而不是按 Workspace × service 固定轮询；
+- endpoint 明确 unavailable 时可回退为有界只读状态探测，并继续周期尝试恢复 event-first；
+- protocol/version/remote 错误进入显式 fault，不静默切换到第二套本地运行权威；
+- 页面/网络恢复后重新同步 canonical control-plane 状态。
 
 幂等读取类 Web Admin 请求可以有界重试。保存配置、启动、停止、密钥轮换等变更操作不会由前端自动重放。
 
@@ -149,11 +148,7 @@ Cache-Control: no-store
 Pragma: no-cache
 ```
 
-同一进程内，已经使用过的 Refresh Token 再次提交会返回 `invalid_grant`，提示重新授权。
-
-### 当前限制
-
-Refresh Token 的已使用列表目前保存在服务进程内存中。服务重启后不会保留历史重放记录，但令牌签名、过期时间、Client ID、issuer 和 resource 校验仍然有效。后续可将 token family 状态持久化，以实现跨进程重启的完整轮换重放保护。
+已经使用过的 Refresh Token 再次提交会返回 `invalid_grant`，提示重新授权。Workspace MCP/Actions runtime 会给 OAuth runtime 提供稳定 replay key，已消费 refresh-token JTI 通过 SecretStore 持久化，因此防重放状态可跨 daemon 调用/重启保存；没有 replay key 的孤立测试/临时 runtime 才使用进程内 fallback map。
 
 重新生成 OAuth Token Secret 会立即使现有 Access Token 和 Refresh Token 全部失效，客户端需要重新授权。
 
@@ -168,9 +163,9 @@ Refresh Token 的已使用列表目前保存在服务进程内存中。服务重
 
 自动重试只处理连接建立、listener 重启、隧道恢复和只读状态同步。业务写入与可能产生副作用的 MCP 工具调用保持显式失败。
 
-## Windows 桌面子进程
+## Windows 子进程
 
-Windows GUI 启动的内部控制台程序默认使用无窗口模式：远程命令、Git、Harness 检测、下游 MCP、FRP 和 Cloudflare 不应弹出或闪现命令行窗口。stdout/stderr 仍通过工具结果、session 和日志读取。
+Windows Anchor runtime 启动的内部控制台程序默认使用无窗口模式：远程命令、Git、Harness 检测、下游 MCP、FRP 和 Cloudflare 不应弹出或闪现命令行窗口。stdout/stderr 仍通过工具结果、command session 和日志读取。
 
 详细审计见：
 

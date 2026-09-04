@@ -1,17 +1,17 @@
 # CLI Daemon 与运维命令
 
-长期控制面演进方案见 [CLI、Daemon 与 GUI 控制面演进路线](cli-daemon-roadmap.md)。Workspace 后台 daemon 当前支持 Windows 与 Linux；Gateway 后台 daemon 仍只支持 Linux。两类控制域共享状态/协议基础，但互不接管运行资源。
+历史控制面演进记录见 [CLI、Daemon 与 GUI 控制面演进路线](cli-daemon-roadmap.md)。当前 Workspace 与 Gateway 后台 daemon 均支持 Windows 与 Linux。两类控制域共享状态/协议基础，但互不接管运行资源；浏览器 Web Admin 只是管理客户端，不持有第二套业务 runtime。
 
 `anchor` 提供两种运行方式：
 
 | 模式 | 命令 | 适用场景 |
 | --- | --- | --- |
-| 前台 | `serve` | 调试、容器、systemd 直接监督 |
+| 前台 | `serve` | 调试、容器、外部 supervisor |
 | 后台 daemon | `start` | SSH 会话、人工运维、无需保持终端 |
 
 两种模式都读取同一个 WorkspaceProfile；一个 workspace 仍只对应一个 profile。
 
-Workspace 后台 daemon 提供版本化本地控制端点：Unix 使用 UDS，Windows 使用 Named Pipe。CLI 与桌面端读取控制状态时会优先通过该端点查询；只有端点明确不可用时才执行本地只读探测。协议错误或版本不兼容会直接报告，避免把损坏或过期 daemon 隐藏为“正常离线状态”。
+Workspace 后台 daemon 提供版本化本地控制端点：Unix 使用 UDS，Windows 使用 Named Pipe。CLI 与 Web Admin 读取控制状态时会优先通过该端点查询；只有端点明确不可用时才执行本地只读探测。协议错误或版本不兼容会直接报告，避免把损坏或过期 daemon 隐藏为“正常离线状态”。
 
 Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT 连接运维](workspace-cli.md)。
 
@@ -94,7 +94,7 @@ anchor start <workspace> \
 - 隧道未立即就绪不会阻止本地服务进入 running，daemon 会继续按恢复策略重试；
 - 同参数重复 `start` 是幂等操作；
 - daemon 已运行但参数不同，会提示使用 `restart`；
-- 端口属于 GUI 或其他进程时拒绝启动，不会接管或停止它。
+- 端口属于其他 Anchor runtime 或外部进程时拒绝启动，不会接管或停止它。
 
 ### `stop`
 
@@ -137,9 +137,12 @@ anchor upgrade --all [--dry-run]
 - 非 Linux 平台默认要求旧 state 的 `executablePath` 能被证明与当前 CLI 不是同一二进制，否则拒绝升级；只有显式 `--allow-no-rollback` 才允许放弃自动回滚；
 - 任一目标启动失败但旧构建恢复成功时状态为 `rolled_back`，命令仍返回非零退出码，自动化不会把“已回滚”误判成升级成功；
 - `--all` 选择所有正在运行的 Workspace daemon，并包含正在运行的 Gateway；显式 Workspace selector 可与 `--gateway` 组合；
+- Linux 上若运行中的 systemd-user control-plane 持有所选 Workspace/Gateway，`upgrade` 会自动改走 supervisor-aware lifecycle：刷新 service executable/build plan，再由 systemd reconcile 整个 desired set，避免普通 daemon rollout 与旧 service plan 竞争；
+- Linux supervisor-owned runtime 不允许只升级 desired set 的一部分；显式选择不完整时返回 `SUPERVISOR_UPGRADE_SCOPE_MISMATCH`，使用 `--all` 或完整列出受管 Workspace（以及需要时 `--gateway`）；
+- `--dry-run` 对 Linux supervisor-owned 目标只报告 planned supervisor route，不会重启 service；实际升级后必须验证 `service status` 的 `buildState=current`；
 - Windows SCM 正在管理所选 runtime 时，普通 CLI 不与 supervisor 竞争启动权。先使用管理员权限执行 `anchor service install` 将 SCM supervisor 更新到当前构建，再由 Service 排空/恢复 desired state。
 
-当前实现是 **bounded-outage rolling replacement**：停机窗口从旧 PID 完全退出到新 generation readiness 完成。固定端口架构尚未引入 listener FD/handle handoff 或稳定前置代理，因此不宣称 zero-downtime。
+对**直接由普通 daemon state 持有**的目标，当前实现是 **bounded-outage rolling replacement**：停机窗口从旧 PID 完全退出到新 generation readiness 完成。Linux systemd-user 持有的目标使用上述 supervisor-aware service update，不走这条普通 replacement 路径。固定端口架构尚未把 direct rollout 宣称为通用 zero-downtime。
 
 ### `status`
 
@@ -154,7 +157,7 @@ anchor status [<workspace>|--all] [--watch] [--interval SECONDS]
 - MCP 与 Actions 端口；
 - 每个端口的 owner：
   - `daemon`：由当前 CLI daemon 监听；
-  - `external`：由 GUI 或其他进程监听；
+  - `external`：由当前 control-plane 之外的进程监听；
   - `none`：未监听。
 
 不指定 workspace 或显式使用 `--all` 时，CLI 会输出全部 WorkspaceProfile 的控制面状态。非 watch JSON 模式返回数组；watch JSON 模式输出带 `status_snapshot` 事件名的 NDJSON。
@@ -200,7 +203,7 @@ anchor reload <workspace> [--service mcp|actions|all]
 - 请求先返回异步 operation accepted，daemon 主循环随后重新读取最新 WorkspaceProfile 并只重建目标 listener；
 - Workspace daemon PID 不变，另一服务和现有 Tunnel ownership 不因单服务 reload 被重启；
 - 新 listener 启动失败时会尝试恢复 reload 前的旧 listener；如果恢复也失败，则明确返回两层错误；
-- reload 属于写操作：IPC 不可用、协议不兼容、Workspace/PID 不匹配时直接失败，不会回退到 CLI/GUI 本地 RuntimeSupervisor；
+- reload 属于写操作：IPC 不可用、协议不兼容、Workspace/PID 不匹配时直接失败，不会回退到 CLI/Web Admin 本地 RuntimeSupervisor；
 - `restart` 仍表示完整 daemon 生命周期重启；`reload` 用于配置应用和单服务重建。
 
 ### `doctor`
@@ -257,7 +260,7 @@ Unix 运行目录权限为 `0700`，状态、PID 和锁文件使用当前用户�
 日志继续存放在 profile 日志目录：
 
 ```text
-~/.config/anchor-desktop/logs/<profile-id>/daemon.log
+~/.config/anchor/logs/<profile-id>/daemon.log
 ```
 
 正常退出会移除 PID 和状态文件；锁文件保留并复用。崩溃留下的状态会在下一次 `start/stop` 时识别为 stale 并安全重建或清理。
@@ -290,20 +293,20 @@ CLI 生命周期语义：
 
 运行中 daemon 的 `logs` 和 `logs --follow` 通过 IPC 获取有界日志快照和增量游标。单次响应日志内容最多 8 KiB，避免日志内容突破控制帧上限。daemon 已停止时，CLI 仍允许直接读取已有历史日志文件。
 
-GUI Workspace 控制使用同一生命周期客户端：
+Web Admin Workspace 控制使用同一生命周期客户端：
 
 - MCP/Actions 状态来自 `workspace_status`，包括 daemon PID、端口所有权和 MCP 活跃度；
 - 启动、停止、重启和 Workspace 删除不再创建或接管进程内 listener；
 - MCP/Actions 独立开关会重新计算目标 daemon 服务选择，必要时协调重启整个 Workspace daemon；
-- 运行中日志必须走 daemon IPC；控制端点失败时不会回退为 GUI 直接读取正在写入的日志文件；
+- 运行中日志必须走 daemon IPC；控制端点失败时不会回退为 Web Admin 直接读取正在写入的日志文件；
 - 密钥再生成会通过 IPC 重启真正使用该密钥的 daemon；
-- MCP/Actions Tunnel 的状态、启动、停止、重载和测试均通过 Workspace daemon；daemon 运行时失败不会回退到 GUI 进程自己的 Tunnel Supervisor；
-- 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，GUI 优先使用该值；
+- MCP/Actions Tunnel 的状态、启动、停止、重载和测试均通过 Workspace daemon；daemon 运行时失败不会回退到 Web Admin 进程内的第二套 Tunnel Supervisor；
+- 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，Web Admin 优先使用该值；
 - Workspace 页面状态刷新优先使用 daemon `events` 长轮询，只有控制端点明确不存在时才回退到旧状态轮询；protocol/remote 错误会进入显式 fault 状态，不静默降级；fallback polling 会周期性重新探测事件端点，因此外部 CLI 启动 daemon 后可自动恢复 event-first 模式；
-- Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；GUI 不再根据 `running` 状态自行调用 restart。名称等纯元数据变化不触发 listener，MCP/Actions 运行参数和认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
-- Workspace control protocol v6 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 GUI/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
+- Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；Web Admin 不根据 `running` 状态自行猜测 restart。名称等纯元数据变化不触发 listener，MCP/Actions 运行参数与认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
+- Workspace control protocol v6 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 Web Admin/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
 - Tunnel 仍保持独立事务语义：保存 tunnel 配置后由 tunnel control 执行 start/stop/restart；Workspace profile 更新本身不会把 tunnel 字段误判为 listener 配置。Gateway 仅在其实际使用的 MCP tunnel/owner 字段变化时 reload，不再因 Workspace 名称等无关配置变化重建；
-- Gateway 不归属于任何 Workspace daemon。Windows/Linux GUI/CLI 都使用独立 Gateway daemon；Windows 使用配置域级 Named Pipe，Linux 使用私有 UDS。GUI 不再创建 process-local Gateway listener 或 Tunnel，route 始终由 Gateway daemon 持有并指向对应 Workspace 目标端口。
+- Gateway 不归属于任何 Workspace daemon。Windows/Linux Web Admin/CLI 都使用独立 Gateway daemon；Windows 使用配置域级 Named Pipe，Linux 使用私有 UDS。Web Admin 不创建 process-local Gateway listener 或 Tunnel，route 始终由 Gateway daemon 持有并指向对应 Workspace 目标端口。
 
 ## 独立 Gateway daemon
 
@@ -341,19 +344,19 @@ Gateway protocol v1 的可观察性方法采用 additive tag 扩展，没有修�
 - 当前 Gateway 事件覆盖 daemon ready/stopping、Gateway/route 状态、tunnel recovery/error、reload 和 config apply 结果；单条 state/message 分别限制为 64/512 字节，保证最坏 JSON 转义后仍小于 64 KiB 控制帧；
 - 新客户端连接只实现旧 v1 方法的 daemon 时，新方法失败会作为明确的 protocol/I/O 能力错误上抛，不会被伪装成“daemon 离线”。
 
-运行中的 `gateway logs` / GUI Gateway 日志必须经过 IPC；只有 Gateway daemon 明确停止且 endpoint 不可用时，才允许使用同一有界读取器查看历史日志。`gateway events` 仅存在于活动 daemon 的内存 journal，不提供文件或 polling 语义回退。
+运行中的 `gateway logs` / Web Admin Gateway 日志必须经过 IPC；只有 Gateway daemon 明确停止且 endpoint 不可用时，才允许使用同一有界读取器查看历史日志。`gateway events` 仅存在于活动 daemon 的内存 journal，不提供文件或 polling 语义回退。
 
 Gateway 写控制遵循 fail-closed：
 
 - `shutdown` / `prepare_restart` 先由 daemon IPC 接受；只有已接受退出请求后，CLI 的 `--force` 才能在超时后终止再次确认归属的 PID；
 - `reload` 保留当前 route IDs，重新读取持久化 Gateway/Workspace 配置并在 daemon 内重建运行态；失败时尝试恢复旧 listener/routes/tunnel；
-- 运行中 `gateway configure` / GUI `set_mcp_gateway` 使用 `apply_config`：daemon 先应用新运行态并更新 state，成功后才持久化配置；中间失败会停止新运行态并恢复旧运行态；
+- 运行中 `gateway configure` / Web Admin `set_mcp_gateway` 使用 `apply_config`：daemon 先应用新运行态并更新 state，成功后才持久化配置；中间失败会停止新运行态并恢复旧运行态；
 - 禁用运行中的 Gateway 不使用 `apply_config`，而是先优雅 shutdown，确认退出后再持久化 disabled；
-- endpoint 不可用、协议不兼容、scope/PID 不匹配时所有写请求直接失败，不会回退为 CLI/GUI 进程内 Gateway 或 Tunnel Supervisor。
+- endpoint 不可用、协议不兼容、scope/PID 不匹配时所有写请求直接失败，不会回退为 CLI/Web Admin 进程内 Gateway 或 Tunnel Supervisor。
 
-Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。只有影响 Gateway 所持 MCP tunnel/owner identity 的 Workspace 配置保存才触发 Gateway reload；失败时桌面端恢复旧 Workspace/settings 并再次对齐旧运行态。名称、Actions 或普通 MCP listener 策略变化不会无谓重建 Gateway。活动 route 在 Gateway daemon 停止前不能删除或注销。
+Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。只有影响 Gateway 所持 MCP tunnel/owner identity 的 Workspace 配置保存才触发 Gateway reload；失败时共享 management 层恢复旧 Workspace/settings 并再次对齐旧运行态。名称、Actions 或普通 MCP listener 策略变化不会无谓重建 Gateway。活动 route 在 Gateway daemon 停止前不能删除或注销。
 
-GUI Gateway 页面直接使用 `routeWorkspaceIds` 展示活动路由，不再逐个轮询 Workspace runtime。桌面 AppState 在每次数据操作前重新加载磁盘配置，避免覆盖 Gateway daemon 在后台写入的 observed public URL。
+Web Admin Gateway 页面直接使用 `routeWorkspaceIds` 展示活动路由，并通过 Gateway control status/events 观测变化，不再逐个轮询 Workspace runtime。共享 management/data 层在执行配置操作时重新读取 canonical state，避免覆盖 Gateway daemon 在后台写入的 observed public URL。
 
 ## CLI 配置闭环
 
@@ -367,11 +370,11 @@ anchor --json config apply <workspace> [--wait SECONDS]
 ```
 
 - `config get` 和 `config diff` 是只读操作；`--key` 与 `--set` 使用 `WorkspaceProfile` 的序列化字段路径，例如 `runtime.local_port`、`auth.oauth_redirect_hosts`、`tunnel.type`。
-- `config set` 不修改活动 `profiles.json`，只写入配置目录下受保护的 `pending-config/<workspace>.json`；pending 同时保存 staging 时的 base profile，活动配置被其他 GUI/CLI 进程修改后会检测 stale base 并拒绝覆盖。
+- `config set` 不修改活动 `profiles.json`，只写入配置目录下受保护的 `pending-config/<workspace>.json`；pending 同时保存 staging 时的 base profile，活动配置被其他 Web Admin/CLI 进程修改后会检测 stale base 并拒绝覆盖。
 - `config diff` 默认比较活动 profile 与当前 pending candidate，也可追加临时 `--set` 预览；输出 field-level changes 和共享 `applyPlan`，不会写磁盘或运行态。
 - `config apply` 才把 pending candidate 提升为活动配置。Workspace daemon 运行时必须通过 protocol v6 `apply_config`；endpoint、协议或 PID 归属错误直接失败，不回退为 CLI 本地 `RuntimeSupervisor`。Gateway route/owner 需要更新时只通过独立 Gateway control reload。
 - 任一运行态应用失败时会恢复旧 Workspace/settings，并对已经成功触及的 Workspace/Gateway 运行态执行受控回滚；pending 文件保留，便于修正后重试。全部成功后才删除 pending。
-- 对已停止的 Workspace，`apply` 只持久化配置，不会隐式启动 listener 或 tunnel。如果 Workspace daemon 未运行但相关 GUI Server/外部 listener 仍在监听，CLI 会 fail-closed，避免活动运行态继续使用旧配置；应先停止 listener，或先由 Workspace daemon 接管运行态。
+- 对已停止的 Workspace，`apply` 只持久化配置，不会隐式启动 listener 或 tunnel。如果 Workspace daemon 未运行但相关 legacy/外部 listener 仍在监听，CLI 会 fail-closed，避免活动运行态继续使用旧配置；应先停止 listener，或先由 Workspace daemon 接管运行态。
 - pending 文件不包含独立 secret store 内容，单文件限制为 2 MiB；Unix staging 目录/文件分别使用 `0700` / `0600` 权限。
 
 Gateway 设置页已改为 event-first：活动 daemon 通过 Gateway `events` 唤醒状态与有界日志刷新；只有 endpoint 明确 unavailable 时才以 2 秒间隔读取 configured/stopped 状态并重新探测 event endpoint。协议或远端错误会显示显式 fault，不会静默降级到轮询。
@@ -389,7 +392,7 @@ anchor events --control-plane
 anchor events --control-plane --follow --wait 15
 ```
 
-聚合状态为每个 Workspace 返回原始 `WorkspaceControlStatus` 加 canonical `mcpState/actionsState`。当某 Workspace 是活动 Gateway route 时，MCP 只有在监听 PID 与 Gateway daemon PID 匹配时才标记为 running；错误 PID 会标记 error，route 已选但端口暂未监听则为 recovering。这样 GUI 不再把 Gateway daemon 持有的 MCP listener 误判为“外部进程”。
+聚合状态为每个 Workspace 返回原始 `WorkspaceControlStatus` 加 canonical `mcpState/actionsState`。当某 Workspace 是活动 Gateway route 时，MCP 只有在监听 PID 与 Gateway daemon PID 匹配时才标记为 running；错误 PID 会标记 error，route 已选但端口暂未监听则为 recovering。这样 Web Admin 不再把 Gateway daemon 持有的 MCP listener 误判为“外部进程”。
 
 聚合事件保留 Gateway cursor 与每个 Workspace cursor，最多返回 64 个按时间合并的事件；aggregate truncation 只推进实际返回事件对应的 source cursor，避免跨源丢事件。每次底层 long-poll slice 最长 1 秒；所有 endpoint 都 unavailable 时仍遵守该 cadence，避免 idle busy-loop。endpoint unavailable 只表示该 source 本轮没有事件；protocol/remote 错误直接终止聚合请求。
 
@@ -411,21 +414,42 @@ anchor service stop
 anchor service uninstall
 ```
 
-`service sync` 把当前后台 Workspace daemon 与 Gateway route 集合写入 `windows-service.json`；后续 GUI/CLI 的 Workspace/Gateway 启停也会持续更新这个计划。`install` 注册配置目录专属的 `AnchorControlPlane-<scope>` 服务并设置 `start= auto`。安装、卸载通常需要管理员权限；服务本身运行在 Session 0，因此计划同时保存配置所有者 SID/用户名，用于复用用户态 Named Pipe 身份并给 owner/System 设置受保护 DACL。
+`service sync` 把当前后台 Workspace daemon 与 Gateway route 集合写入 `windows-service.json`；后续 Web Admin/CLI 的 Workspace/Gateway 启停也会持续更新这个计划。`install` 注册配置目录专属的 `AnchorControlPlane-<scope>` 服务并设置 `start= auto`。安装、卸载通常需要管理员权限；服务本身运行在 Session 0，因此计划同时保存配置所有者 SID/用户名，用于复用用户态 Named Pipe 身份并给 owner/System 设置受保护 DACL。
 
-Windows 凭据同时保留 CurrentUser DPAPI 主密文和 LocalMachine DPAPI 的 Service mirror。普通 GUI/CLI 始终使用 CurrentUser 主密文；`service install/start/restart` 会在进入 UAC 前由配置所有者刷新 Service mirror，SCM supervisor 与其子 daemon 通过显式 service context 读取 mirror。SCM 自身仅为恢复 desired-state 时读取不含秘密的 `profiles.json`，因此 Session 0 无法解密用户凭据时也不会阻塞 stale PID 清理和 Workspace 重拉。旧凭据 envelope 没有 Service mirror 时，新版用户进程首次成功读取会原地补充 mirror，同时保持原 `protection/payload` 不变，便于滚动升级期间旧用户态 daemon 继续读取主密文。用户侧后续保存配置刷新 mirror 时，会保留 Service 已写入的 OAuth refresh-token replay runtime scope，避免普通配置保存回滚服务侧防重放状态。
+Windows 凭据同时保留 CurrentUser DPAPI 主密文和 LocalMachine DPAPI 的 Service mirror。普通 Web Admin/CLI 始终使用 CurrentUser 主密文；`service install/start/restart` 会在进入 UAC 前由配置所有者刷新 Service mirror，SCM supervisor 与其子 daemon 通过显式 service context 读取 mirror。SCM 自身仅为恢复 desired-state 时读取不含秘密的 `profiles.json`，因此 Session 0 无法解密用户凭据时也不会阻塞 stale PID 清理和 Workspace 重拉。旧凭据 envelope 没有 Service mirror 时，新版用户进程首次成功读取会原地补充 mirror，同时保持原 `protection/payload` 不变，便于滚动升级期间旧用户态 daemon 继续读取主密文。用户侧后续保存配置刷新 mirror 时，会保留 Service 已写入的 OAuth refresh-token replay runtime scope，避免普通配置保存回滚服务侧防重放状态。
 
 SCM supervisor 运行时额外写入 `windows-service-runtime.json`，记录当前 Service PID、启动时间、实际 executable path 和 `buildIdentity`。Windows 上 plan/runtime state 都使用可覆盖旧目标的 write-through 原子替换，避免系统重启后旧 runtime 文件导致新 Service 无法发布 build identity。`service status` 使用 `sc queryex` 获取真实 SCM PID，并同时校验 runtime state 的 PID 存活与进程镜像路径，输出 `buildState=not_installed|stopped|current|different|unknown`。旧 Service 没有 runtime state 时明确返回 `unknown`，不会因为 package version 相同而误报为 current。
 
-`service install` 同时承担显式“安装/更新到当前二进制”的语义：若 Service 已安装且仍运行，先请求 SCM 停止并等待真正进入 `STOPPED`，由 supervisor 优雅排空其管理的 Workspace/Gateway daemon，再启动刚写入 `binPath` 的当前构建并等待 `RUNNING`。GUI 的“更新服务版本”按钮复用同一路径并通过 UAC 执行。普通状态查询、Workspace 配置保存或桌面启动都不会隐式重启 SCM。
+`service install` 同时承担显式“安装/更新到当前二进制”的语义：若 Service 已安装且仍运行，先请求 SCM 停止并等待真正进入 `STOPPED`，由 supervisor 优雅排空其管理的 Workspace/Gateway daemon，再启动刚写入 `binPath` 的当前构建并等待 `RUNNING`。Web Admin 的“更新服务版本”操作复用同一路径并通过 UAC 执行。普通状态查询或 Workspace 配置保存不会隐式升级 SCM。
 
-GUI 的安装/卸载/启停按钮会通过内部 `service-admin-run` helper 触发标准 Windows UAC，只提升该次 SCM 操作，不要求整个 Anchor 桌面进程长期以管理员身份运行；普通 CLI 命令仍要求从已提升的管理员终端执行。`service-admin-run` 与 `service-run` 都是内部入口，不应人工调用。
+Web Admin 的安装/卸载/启停操作会通过内部 `service-admin-run` helper 触发标准 Windows UAC，只提升该次 SCM 操作，不要求整个 Anchor 管理进程长期以管理员身份运行；普通 CLI 命令仍要求从已提升的管理员终端执行。`service-admin-run` 与 `service-run` 都是内部入口，不应人工调用。
 
-## 与 systemd 的关系
+## Linux systemd-user control-plane
 
-Windows 上可使用上述 SCM Service 提供开机自启和操作系统级 supervisor；Linux 生产服务器仍推荐 systemd 直接监督前台 `serve`。
+Linux 当前也由 Anchor 原生维护配置域专属的 systemd-user control-plane。推荐先通过正常 Workspace/Gateway 命令形成 desired state，再安装 service：
 
-Linux systemd 示例：
+```bash
+anchor start PROFILE_ID --service mcp --tunnel
+anchor service install
+anchor service status
+```
+
+`service install` 会写入并 enable 当前配置域专属的 user unit，保存 Workspace/Gateway desired plan，并由长期 control-plane service 恢复/监督后台 daemon。后续 `start/stop/restart`、Gateway route/config 和 Workspace 注销会持续同步该 plan；需要用当前实际运行集合覆盖 plan 时使用：
+
+```bash
+anchor service sync
+```
+
+升级到一个新的 Anchor build 时，先确保当前执行的 CLI 就是目标 build，然后推荐：
+
+```bash
+anchor upgrade --all --dry-run
+anchor upgrade --all
+```
+
+当 systemd-user 正在持有相关 runtime 时，`upgrade` 会自动刷新 supervisor registration 并让 systemd reconcile desired state。也可以显式执行 `anchor service install` 更新 service build registration。
+
+只有容器、外部 supervisor 或明确采用 foreground 运行模型时，才需要自己写 systemd unit 直接监督 `serve`：
 
 ```ini
 [Service]
@@ -435,7 +459,7 @@ Restart=on-failure
 RestartSec=3
 ```
 
-不要在 systemd 的 `ExecStart` 中使用 `start`，否则 systemd 只会监督短暂存在的启动命令，而不是实际 daemon。
+这种外部 unit 模式下不要在 `ExecStart` 中使用 `start`，否则 systemd 只会监督短暂存在的启动命令，而不是实际 daemon。不要同时让外部 unit 和 `anchor service install` 的 control-plane 拥有同一 Workspace/Gateway runtime。
 
 ## 自动化
 
@@ -471,7 +495,7 @@ anchor --json service sync
 - PID 所有权校验失败时拒绝生命周期写操作；Windows additionally 校验 state v2 `executablePath` 与实际 PID 镜像；
 - Windows daemon state 还校验实际进程创建时间必须早于且接近 state 的 `startedAtUnix`，避免跨系统重启后旧 PID 被新的 `anchor.exe` 实例复用时误判为原 daemon；
 - `stop --force` 只在确认 daemon PID 后终止其进程树；
-- 端口被 GUI 或外部进程占用时拒绝启动；
+- 端口被其他 Anchor runtime 或外部进程占用时拒绝启动；
 - `daemon-run` 是内部命令，不应直接调用；
 - `gateway-daemon-run` 是内部命令，不应直接调用；
 - `service-run` 是 Windows SCM 内部入口，不应直接调用；

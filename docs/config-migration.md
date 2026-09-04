@@ -78,7 +78,7 @@ anchor export /secure/anchor-migration.json --passphrase-stdin
 
 ## 目标平台导入
 
-正式导入前，先停止目标机器上的 Anchor daemon、桌面端或其他会写入同一配置目录的 Anchor 进程，避免迁移过程中旧运行态再次落盘覆盖新配置。
+正式导入前，先停止目标机器上的 Anchor daemon、persistent Admin/service 或其他会写入同一配置目录的 Anchor 进程，避免迁移过程中旧运行态再次落盘覆盖新配置。
 
 ### 1. 先准备 Workspace 目录
 
