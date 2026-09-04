@@ -51,6 +51,8 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_canvs_task_snapshot",
     "get_control_plane_status",
     "get_control_plane_events",
+    "plan_orchestration_workflow",
+    "inspect_orchestration_workflow",
     "get_federation_catalog",
     "get_federation_signing_status",
     "get_federation_bootstrap_bundle",
@@ -205,6 +207,12 @@ fn federation_signing_privileged_binding() -> AppResult<PrivilegedActionBinding>
 #[serde(rename_all = "camelCase")]
 struct FederationPeerValidationArgs {
     peer: crate::federation::FederationPeerDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OrchestrationWorkflowArgs {
+    workflow: crate::orchestration::OrchestrationWorkflowSpec,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1232,6 +1240,20 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
+        "plan_orchestration_workflow" => {
+            let input: OrchestrationWorkflowArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::plan_orchestration_workflow(&input.workflow)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "inspect_orchestration_workflow" => {
+            let input: OrchestrationWorkflowArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::inspect_orchestration_workflow(&input.workflow).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "get_federation_catalog" => {
             let profiles = management::list_workspaces()?;
             serde_json::to_value(crate::federation::local_peer_descriptor(&profiles)?)
@@ -2134,6 +2156,18 @@ mod tests {
         assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&"probe_federation_peer"));
         assert!(WEB_ADMIN_MUTATION_COMMANDS.contains(&"probe_federation_peer"));
         assert!(!privileged_actions().contains(&"probe_federation_peer"));
+    }
+
+    #[test]
+    fn orchestration_admin_commands_are_read_only() {
+        for command in [
+            "plan_orchestration_workflow",
+            "inspect_orchestration_workflow",
+        ] {
+            assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
+            assert!(!WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
+            assert!(!privileged_actions().contains(&command));
+        }
     }
 
     #[tokio::test]

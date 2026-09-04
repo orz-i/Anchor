@@ -32,6 +32,7 @@ mod logging;
 mod management;
 mod mcp;
 mod notifications;
+mod orchestration;
 mod platform;
 pub mod rollout;
 mod runtime;

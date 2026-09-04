@@ -1400,6 +1400,18 @@ pub(crate) async fn read_federation_remote(
     crate::federation::read_trusted_peer(target, request).await
 }
 
+pub(crate) fn plan_orchestration_workflow(
+    workflow: &crate::orchestration::OrchestrationWorkflowSpec,
+) -> AppResult<crate::orchestration::OrchestrationPlan> {
+    crate::orchestration::plan_workflow(workflow)
+}
+
+pub(crate) async fn inspect_orchestration_workflow(
+    workflow: &crate::orchestration::OrchestrationWorkflowSpec,
+) -> AppResult<crate::orchestration::OrchestrationInspection> {
+    crate::orchestration::inspect_workflow(workflow).await
+}
+
 pub(crate) fn list_federation_peers() -> AppResult<Vec<crate::federation::FederationPeerView>> {
     crate::federation::list_peers()
 }
