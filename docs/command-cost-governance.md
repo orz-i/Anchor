@@ -2,7 +2,7 @@
 
 Anchor classifies workspace commands as `free`, `local_expensive`, or
 `external_paid`. Commands classified as `external_paid` are blocked unless an
-operator enables them in the trusted GUI or CLI control plane. A model-supplied
+operator enables them in the trusted Web Admin or CLI control plane. A model-supplied
 argument cannot grant this approval.
 
 The workspace-level daily run input has no additional UI maximum. Runtime and

@@ -5,23 +5,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/mybolide/coding-tools-mcp?label=Release" alt="Latest release"></a>
+  <a href="https://github.com/orz-i/Anchor/releases/latest"><img src="https://img.shields.io/github/v/release/orz-i/Anchor?label=Release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows" alt="Windows x64">
   <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple" alt="macOS Apple Silicon">
   <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest">Download latest</a>
+  <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/orz-i/Anchor/releases/latest">Download latest</a>
 </p>
 
 Anchor is a **Rust CLI/daemon + browser Web Admin** workspace gateway. The management frontend uses pnpm, Vite, React, React Router, shadcn/ui, and Tailwind CSS; runtime ownership stays in the `anchor` CLI/daemons. After registering a project and starting its service, an AI agent can read files, edit code, run commands and tests, inspect Git, and preserve development progress through MCP Sessions.
 
 Anchor reads only the current configuration directory and current configuration format. It no longer imports earlier product directories or compatibility formats automatically. Back up existing configuration and re-register any workspaces that must be retained.
-
-![Anchor workspace overview](docs/images/workspace-overview.png)
-
-*One browser Web Admin manages workspaces, MCP services, connection details, and the session-recovery prompt.*
 
 ## Understand the workflow in 30 seconds
 
@@ -71,10 +67,6 @@ When the AI client is not running on the same machine, expose MCP through HTTPS:
 - Save the server, port, and token under **FRP settings**, or select Cloudflare in the workspace.
 - Give each workspace a distinct subdomain. The app manages the FRP process and aggregates multiple proxy routes.
 
-![FRP configuration](docs/images/frp-configuration.png)
-
-*FRP server profiles are stored centrally; each workspace only selects a profile and supplies its own subdomain.*
-
 If you do not have an FRPS server yet, follow this [FRPS server installation guide (Chinese, WeChat)](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q). After deployment, enter the server address, port, and token under **FRP settings** in the Web Admin.
 
 ### 4. Start MCP
@@ -86,19 +78,11 @@ Open the workspace and click **Start** in the MCP panel. The Web Admin shows:
 - authentication details for ChatGPT;
 - live logs and health-check results.
 
-![Local, public, and ChatGPT MCP connection details](docs/images/workspace-connection.png)
+The Web Admin can verify the local and public endpoints, OAuth metadata, and the MCP protected-resource document.
 
-The Web Admin can verify the local and public endpoints, OAuth metadata, and the MCP protected-resource document:
+When a connection fails, inspect recent MCP requests without leaving the Web Admin.
 
-![MCP health-check results](docs/images/health-check.png)
-
-*Each connectivity and authentication check reports its result separately.*
-
-When a connection fails, inspect recent MCP requests without leaving the Web Admin:
-
-![MCP runtime logs](docs/images/runtime-logs.png)
-
-*The log quickly confirms whether tool discovery, history bootstrap, and checkpoint calls reached the server.*
+Health checks report connectivity and authentication metadata separately; logs can confirm whether tool discovery and `session open/checkpoint` calls actually reached the server.
 
 ### 5. Connect an AI client
 
@@ -192,7 +176,7 @@ MCP and Actions can run together for the same workspace, with separate ports and
 ## Why use it
 
 - **Built for real development**: files, commands, Git, tests, and retained processes live in one Workspace.
-- **Cross-conversation continuity**: a new conversation can recover the complete history summary and the latest detailed handoff.
+- **Cross-conversation continuity**: a new conversation can resume the current Session through the `session` facade and read the latest structured checkpoint without relying on chat history as project state.
 - **Auditable progress**: structured checkpoints preserve decisions, changed files, test results, remaining issues, and next steps inside the project.
 - **Multiple workspaces**: one browser Web Admin stores multiple projects and manages their MCP, Actions, and public endpoints.
 - **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, FRP, and Cloudflare are built in.
@@ -202,9 +186,7 @@ MCP and Actions can run together for the same workspace, with separate ports and
 
 Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Anchor now stores persistent Sessions under `docs/session/`, so context follows the project instead of staying trapped in one chat window. The old `docs/history-session/` directory is a frozen archive; the current Session store does not scan, migrate, or write to it.
 
-![ChatGPT new-conversation startup prompt](docs/images/history-session-prompt.png)
-
-*Paste the full prompt into a new conversation to initialize or restore history, then save a checkpoint after each completed task.*
+In a new conversation, ask the agent to start with `session { operation: "open" }`, read the current Session when needed, and save structured progress with `checkpoint` after a completed unit of work.
 
 The current API is one `session` facade:
 

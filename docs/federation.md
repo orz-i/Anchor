@@ -393,6 +393,12 @@ revoked
 - `get_federation_peer_credential_status`
 - `read_federation_remote`
 
+### Stateful probe（不需要 privileged grant）
+
+- `probe_federation_peer`
+
+Probe 会发起 authenticated/signed read，并把 `last_probe_*`、最近 descriptor/signing observation 写回 peer registry；发现可信 peer 的 contract/bootstrap drift 时还可能把状态更新为 `drifted`。因此它不是只读 command，但当前实现**不属于 privileged action**，不消费 Web Admin privileged grant。
+
 ### Privileged / mutation
 
 - `rotate_federation_signing_key`

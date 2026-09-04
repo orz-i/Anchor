@@ -1,161 +1,127 @@
 # 技术配置
 
-Svelte + TailwindCSS 4 实现设计 Token。
+当前 Web Admin 使用 **Vite + React + React Router + shadcn/ui + Tailwind CSS 4**。本文只记录仓库中已经存在的配置入口；不再使用 Svelte component、`@lucide/svelte` 或旧 `tailwind.config.js` 示例。
 
-## tailwind.config.js
+## Package 入口
 
-```js
-/** @type {import('tailwindcss').Config} */
-export default {
-  darkMode: 'class',
-  content: ['./src/**/*.{html,js,svelte,ts}'],
-  theme: {
-    extend: {
-      fontFamily: {
-        sans: ['"Plus Jakarta Sans"', 'PingFang SC', 'Microsoft YaHei', 'sans-serif'],
-        mono: ['"JetBrains Mono"', 'Cascadia Code', 'Consolas', 'monospace'],
-      },
-      colors: {
-        bg: 'var(--page-bg)',
-        surface: 'var(--card-bg)',
-        border: 'var(--border)',
-        accent: 'var(--primary)',
-        muted: 'var(--text-muted)',
-      },
-      borderRadius: {
-        sm: '6px',
-        md: '10px',
-        lg: '14px',
-      },
-      transitionTimingFunction: {
-        out: 'cubic-bezier(0.16, 1, 0.3, 1)',
-      },
-    },
-  },
-  plugins: [],
-};
+根 `package.json` 当前关键依赖包括：
+
+```text
+react / react-dom
+react-router-dom
+shadcn
+tailwindcss / @tailwindcss/vite
+lucide-react
+next-themes
+sonner
+@fontsource-variable/geist
 ```
 
-## app.css — CSS Variables
+前端开发与校验使用仓库现有 pnpm scripts，不额外创建第二套 frontend package。
+
+## shadcn 配置
+
+`components.json` 是当前组件生成/约定入口，关键配置为：
+
+```json
+{
+  "style": "base-nova",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "config": "",
+    "css": "src/app.css",
+    "baseColor": "neutral",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "iconLibrary": "lucide"
+}
+```
+
+`components.json` 中 `tailwind.config` 字段为空并不是遗漏：当前使用 Tailwind CSS 4 的 CSS-first 配置，theme/token 直接位于 `src/app.css`，仓库不需要额外维护一份 `tailwind.config.js` 主题定义。
+
+## app.css
+
+当前入口：
 
 ```css
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
 
-:root {
-  --page-bg: oklch(0.98 0.004 260);
-  --card-bg: oklch(1 0 0);
-  --surface-hover: oklch(0.97 0.006 260);
-  --border: oklch(0.90 0.008 260);
-  --text-main: oklch(0.18 0.015 260);
-  --text-secondary: oklch(0.42 0.015 260);
-  --text-muted: oklch(0.58 0.012 260);
-  --primary: oklch(0.52 0.20 275);
-  --primary-hover: oklch(0.46 0.22 275);
-  --success: oklch(0.55 0.17 155);
-  --warning: oklch(0.62 0.14 75);
-  --danger: oklch(0.55 0.20 25);
-}
+@custom-variant dark (&:is(.dark *));
 
-.dark {
-  --page-bg: oklch(0.13 0.005 260);
-  --card-bg: oklch(0.19 0.008 260);
-  --surface-hover: oklch(0.22 0.010 260);
-  --border: oklch(0.28 0.010 260);
-  --text-main: oklch(0.97 0.005 260);
-  --text-secondary: oklch(0.72 0.012 260);
-  --text-muted: oklch(0.55 0.012 260);
-  --primary: oklch(0.62 0.18 275);
-  --primary-hover: oklch(0.68 0.20 275);
-  --success: oklch(0.72 0.17 155);
-  --warning: oklch(0.78 0.14 75);
-  --danger: oklch(0.65 0.20 25);
-}
-
-body {
-  font-family: 'Plus Jakarta Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: var(--page-bg);
-  color: var(--text-main);
+@theme inline {
+  --font-sans: "Geist Variable", sans-serif;
+  /* semantic color/radius mappings */
 }
 ```
 
-## 组件示例：StatusOrb.svelte
+`:root` 提供 light token，`.dark` 提供 dark token。业务组件使用 `bg-background`、`text-foreground`、`bg-card`、`text-muted-foreground`、`border-border` 等语义 class，不直接复制 OKLCH 数值。
 
-```svelte
-<script lang="ts">
-  export let state: 'running' | 'starting' | 'stopped' | 'error' = 'stopped';
+## Theme provider
 
-  const colors = {
-    running: 'bg-[var(--success)]',
-    starting: 'bg-[var(--warning)] animate-spin-slow',
-    stopped: 'bg-[var(--text-muted)]',
-    error: 'bg-[var(--danger)]',
-  };
-</script>
+`src/main.tsx` 统一挂载主题：
 
-<span
-  class="inline-block h-2.5 w-2.5 rounded-full {colors[state]}"
-  class:animate-pulse={state === 'running'}
-  aria-label={state}
-/>
+```tsx
+<ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+  <TooltipProvider>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+    <Toaster richColors position="top-right" />
+  </TooltipProvider>
+</ThemeProvider>
 ```
 
-## 组件示例：WorkspaceCard.svelte 结构
+页面/组件不要自行读取 `prefers-color-scheme` 并维护另一份 dark state；需要切换主题时使用 `next-themes` 的 `useTheme()`。
 
-```svelte
-<button
-  class="group w-full rounded-lg border border-[var(--border)]
-         bg-[var(--card-bg)] p-5 text-left
-         transition-all duration-200 ease-out
-         hover:border-[var(--primary)] hover:-translate-y-px
-         focus-visible:outline-2 focus-visible:outline-offset-2
-         focus-visible:outline-[var(--primary)]"
-  on:click
->
-  <div class="flex items-center gap-2">
-    <StatusOrb {state} />
-    <span class="font-semibold">{name}</span>
-  </div>
-  <p class="mt-2 truncate font-mono text-sm text-[var(--text-muted)]">{path}</p>
-  <div class="mt-3 flex items-center justify-between">
-    <Badge>{tunnelType}</Badge>
-    <span class="truncate font-mono text-xs text-[var(--text-secondary)]">{endpoint}</span>
-  </div>
-</button>
+## Components
+
+基础组件位于：
+
+```text
+src/components/ui/
 ```
 
-## 图标
+产品组合组件位于：
 
-使用 [Lucide Svelte](https://lucide.dev/)：
-
-```bash
-pnpm add @lucide/svelte
+```text
+src/components/admin/
 ```
 
-常用图标：FolderOpen, Play, Square, Copy, Check, Settings, Activity, Terminal, Globe, Shield
+新增 UI 优先复用已有 Button、Card、Dialog、Select、Tabs、Tooltip、Field、Empty 等 primitive。只有共享 primitive 确实缺失时再按当前 shadcn style 增加，不在业务页面复制一份近似组件。
 
-## 主题切换
+Runtime 状态复用：
 
-```svelte
-<script lang="ts">
-  import { onMount } from 'svelte';
-
-  let dark = true;
-
-  onMount(() => {
-    dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    apply();
-  });
-
-  function apply() {
-    document.documentElement.classList.toggle('dark', dark);
-  }
-
-  function toggle() {
-    dark = !dark;
-    apply();
-  }
-</script>
+```tsx
+import { RuntimeBadge, RuntimeDot } from "@/components/admin/RuntimeBadge";
 ```
+
+图标直接使用：
+
+```tsx
+import { Copy, Settings2 } from "lucide-react";
+```
+
+## Routing
+
+当前路由由 `src/App.tsx` 的 React Router `Routes` 管理，一级页面包括 Workspace 列表/详情和 General/Keys/FRP/Software settings。新增页面时应接入现有 `AppShell`，不要新建第二个独立管理壳。
+
+## Source-of-truth rule
+
+设计/技术文档出现以下变化时必须同步：
+
+- `components.json` style/base color/icon library 改变；
+- `src/app.css` token/font/radius 改变；
+- `src/main.tsx` theme provider 改变；
+- `AppShell` 布局 breakpoint 改变；
+- `RuntimeState` 或 `RuntimeBadge` 状态语义改变；
+- React/shadcn/Tailwind 版本或前端框架发生架构性迁移。
+
+旧 Tauri/Svelte 规格只保留在历史 specs/verification 中，不应重新复制到当前 guideline。
 
 ---
 *返回: [README.md](./README.md)*

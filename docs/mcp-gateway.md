@@ -193,6 +193,6 @@ Gateway/Workspace runtime 和共享隧道恢复使用有上限的指数退避。
 - SSE 并发许可与强制关闭；
 - Header 清理、多值响应 Header 和 URL 负向校验；
 - observed owner/signature 失配；
-- CLI 与桌面构建组合。
+- CLI 与 Web Admin 构建组合。
 
 发布候选仍应进行真实 Web Admin、两个 ChatGPT App 的 OAuth 授权、真实固定隧道/Quick Tunnel、Linux systemd-user service 和外部压力测试。代码测试通过不等同于这些外部环境已经验证。

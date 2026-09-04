@@ -5,23 +5,19 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest"><img src="https://img.shields.io/github/v/release/mybolide/coding-tools-mcp?label=Release" alt="Latest release"></a>
+  <a href="https://github.com/orz-i/Anchor/releases/latest"><img src="https://img.shields.io/github/v/release/orz-i/Anchor?label=Release" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows" alt="Windows x64">
   <img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple" alt="macOS Apple Silicon">
   <a href="https://www.apache.org/licenses/LICENSE-2.0"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/mybolide/coding-tools-mcp/releases/latest">下载最新版</a>
+  <a href="README.md">中文</a> · <a href="README.en.md">English</a> · <a href="https://github.com/orz-i/Anchor/releases/latest">下载最新版</a>
 </p>
 
 Anchor 是一个 **Rust CLI/daemon + 浏览器 Web Admin** 工作区网关。管理面使用 pnpm + Vite + React + React Router + shadcn/ui + Tailwind CSS；运行时由 `anchor` CLI/daemon 承担。注册项目并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存到项目内的 Session。
 
 Anchor 只读取当前配置目录和当前配置格式，不再自动导入早期产品目录或兼容格式。升级前请先备份现有配置，并在 Anchor 中重新注册需要保留的工作区。
-
-![Anchor 工作区总览](docs/images/workspace-overview.png)
-
-*浏览器 Web Admin 统一管理工作区、MCP 服务、连接信息与会话恢复提示词。*
 
 ## 30 秒看懂怎么用
 
@@ -71,10 +67,6 @@ Windows 对应可执行文件为 `crates/anchor/target/release/anchor.exe`。`an
 - 在“FRP 配置”中保存服务器、端口和 Token，或在工作区选择 Cloudflare。
 - 每个工作区填写独立子域名。应用会统一管理 FRP 进程和多条代理线路。
 
-![FRP 配置页面](docs/images/frp-configuration.png)
-
-*FRP 服务器配置集中保存，各工作区只需选择配置并填写自己的子域名。*
-
 如果还没有可用的 FRPS 服务端，可以参考：[FRPS 服务端安装教程（微信公众号）](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q)。安装完成后，把服务端地址、端口和 Token 填入客户端的“FRP 配置”即可。
 
 ### 4. 启动 MCP
@@ -86,19 +78,11 @@ Windows 对应可执行文件为 `crates/anchor/target/release/anchor.exe`。`an
 - ChatGPT 连接所需的认证信息；
 - 实时日志和健康检查结果。
 
-![MCP 本地、公网与 ChatGPT 连接信息](docs/images/workspace-connection.png)
+启动后可以直接检查本地与公网端点、OAuth 元数据和 MCP 受保护资源。
 
-启动后可以直接检查本地与公网端点、OAuth 元数据和 MCP 受保护资源：
+遇到连接问题时，无需离开 Web Admin 即可查看最近的 MCP 请求日志。
 
-![MCP 健康检查结果](docs/images/health-check.png)
-
-*健康检查会逐项显示连接和认证元数据是否可用。*
-
-遇到连接问题时，无需离开 Web Admin 即可查看最近的 MCP 请求日志：
-
-![MCP 运行日志](docs/images/runtime-logs.png)
-
-*日志可快速确认工具列表、历史初始化和检查点调用是否真正到达服务端。*
+健康检查会逐项显示连接和认证元数据是否可用；日志可快速确认工具发现、`session open/checkpoint` 等调用是否真正到达服务端。
 
 ### 5. 连接 AI 客户端
 
@@ -192,7 +176,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 ## 为什么需要它
 
 - **面向真实开发**：文件、命令、Git、测试和长时间运行的进程都在同一个 Workspace 中。
-- **跨会话持续开发**：新对话可以读取全部历史摘要和最近一次完整交接，不必反复向 AI 解释项目背景和当前进度。
+- **跨会话持续开发**：新对话可以通过 `session` facade 恢复当前 Session，并读取最近保存的结构化检查点，不必依赖聊天窗口保存工程进度。
 - **进度可追溯**：每轮任务完成后可保存结构化检查点，决策、修改、测试结果和下一步都留在项目目录中。
 - **多工作区管理**：一个浏览器 Web Admin 可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
 - **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
@@ -202,9 +186,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 
 普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Anchor 当前把持久 Session 写入项目的 `docs/session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。旧 `docs/history-session/` 仅作为冻结归档保留，当前 Session store 不扫描、不迁移也不向其写入。
 
-![ChatGPT 新会话启动提示词](docs/images/history-session-prompt.png)
-
-*复制完整提示词到新会话，即可初始化或恢复历史；每轮任务完成后再保存检查点。*
+新对话中可以直接要求 Agent 先执行 `session { operation: "open" }`，再按需读取当前 Session；完成一轮工作后使用 `checkpoint` 保存结构化进度。
 
 当前使用单一 `session` facade：
 
@@ -221,7 +203,7 @@ MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用�
 ```text
 对话 1：分析项目 → 修改代码 → 运行测试 → 保存检查点
                                       ↓
-对话 2：读取历史摘要和最新交接 → 从上次进度继续 → 保存新检查点
+对话 2：打开/恢复当前 Session → 读取最近检查点 → 从上次进度继续 → 保存新检查点
 ```
 
 Session 文件使用可读的 Markdown 格式，并维护 `docs/session/index.json` 派生索引。Harness 默认把 `docs/session/` 当作本地 Session metadata，从业务 Git baseline 中排除；需要共享这些记录时应根据项目自己的版本控制策略显式决定，而不是依赖旧 history 目录语义。检查点要求 `session_id` 与 `expected_path` 对齐后才确认写入成功。
