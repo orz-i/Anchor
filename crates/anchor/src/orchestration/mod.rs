@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
 
 use futures_util::stream::{self, StreamExt};
@@ -211,19 +212,12 @@ pub async fn inspect_workflow(
         .collect::<BTreeMap<_, _>>();
     drop(store);
 
-    let futures = plan.steps.iter().cloned().enumerate().map(|(index, step)| {
+    let results = execute_plan_waves(&plan, |step| {
         let profiles = &profiles;
         let local_node_id = &local_node_id;
-        async move {
-            let result = observe_step(&step, local_node_id, profiles).await;
-            (index, step, result)
-        }
-    });
-    let mut results = stream::iter(futures)
-        .buffer_unordered(MAX_OBSERVATION_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-    results.sort_by_key(|(index, _, _)| *index);
+        async move { observe_step(&step, local_node_id, profiles).await }
+    })
+    .await?;
 
     let observations = results
         .into_iter()
@@ -243,6 +237,53 @@ pub async fn inspect_workflow(
             unavailable,
         },
     })
+}
+
+async fn execute_plan_waves<T, F, Fut>(
+    plan: &OrchestrationPlan,
+    execute: F,
+) -> AppResult<Vec<(usize, OrchestrationPlanStep, T)>>
+where
+    F: Fn(OrchestrationPlanStep) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let step_index = plan
+        .steps
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, step)| (step.id.clone(), (index, step)))
+        .collect::<BTreeMap<_, _>>();
+    let mut results = Vec::with_capacity(plan.steps.len());
+    for wave in &plan.waves {
+        let wave_steps = wave
+            .iter()
+            .map(|step_id| {
+                step_index.get(step_id).cloned().ok_or_else(|| {
+                    AppError::Message(format!(
+                        "ORCHESTRATION_PLAN_INVALID: dependency wave references unknown step `{step_id}`"
+                    ))
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        let futures = wave_steps.into_iter().map(|(index, step)| {
+            let future = execute(step.clone());
+            async move { (index, step, future.await) }
+        });
+        results.extend(
+            stream::iter(futures)
+                .buffer_unordered(MAX_OBSERVATION_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await,
+        );
+    }
+    if results.len() != plan.steps.len() {
+        return Err(AppError::Message(
+            "ORCHESTRATION_PLAN_INVALID: dependency waves do not cover every planned step".into(),
+        ));
+    }
+    results.sort_by_key(|(index, _, _)| *index);
+    Ok(results)
 }
 
 fn target_identity(target: &OrchestrationTarget) -> String {
@@ -884,5 +925,47 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("FEDERATION_REMOTE_TRANSPORT_UNAVAILABLE")));
+    }
+
+    #[tokio::test]
+    async fn inspection_execution_honors_dependency_waves() {
+        use std::sync::{Arc, Mutex};
+
+        let plan = plan_workflow_for_node(&base_spec(), &local_node()).expect("plan");
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let results = execute_plan_waves(&plan, {
+            let events = events.clone();
+            move |step| {
+                let events = events.clone();
+                async move {
+                    events
+                        .lock()
+                        .expect("events")
+                        .push(format!("start:{}", step.id));
+                    if step.id == "node" {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    events
+                        .lock()
+                        .expect("events")
+                        .push(format!("end:{}", step.id));
+                    step.id
+                }
+            }
+        })
+        .await
+        .expect("execute waves");
+
+        assert_eq!(results.len(), 2);
+        let events = events.lock().expect("events").clone();
+        let node_end = events
+            .iter()
+            .position(|event| event == "end:node")
+            .expect("node end");
+        let workspace_start = events
+            .iter()
+            .position(|event| event == "start:workspace")
+            .expect("workspace start");
+        assert!(node_end < workspace_start, "events={events:?}");
     }
 }
