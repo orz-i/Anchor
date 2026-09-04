@@ -16,7 +16,8 @@ use super::{
     valid_node_id, FederationPeerDescriptor, FEDERATION_CONTRACT, FEDERATION_SCHEMA_VERSION,
 };
 
-const SIGNING_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const LEGACY_SIGNING_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const SIGNING_IDENTITY_SCHEMA_VERSION: u16 = 2;
 const SIGNING_ALGORITHM: &str = "ed25519";
 const SIGNATURE_CONTRACT: &str = "anchor-node-signature-v1";
 const BOOTSTRAP_SCHEMA_VERSION: u16 = 1;
@@ -104,6 +105,18 @@ fn rotate_signing_identity_with_notice_at(
             },
         };
         validate_rotation_notice_shape(&notice)?;
+        let mut history = load_rotation_history_at(root)?;
+        if history
+            .last()
+            .is_some_and(|previous_notice| previous_notice.next_signing != previous.public)
+        {
+            history.clear();
+        }
+        history.push(notice.clone());
+        if history.len() > MAX_ROTATION_HISTORY_ENTRIES {
+            history.drain(..history.len() - MAX_ROTATION_HISTORY_ENTRIES);
+        }
+        write_rotation_history(root, &history)?;
         let mut notice_bytes = serde_json::to_vec_pretty(&notice)?;
         notice_bytes.push(b'\n');
         crate::data::atomic_write(&rotation_notice_path(root), &notice_bytes)?;
@@ -120,14 +133,7 @@ pub fn verify_rotation_notice(
 ) -> AppResult<FederationNodeSigningPublic> {
     validate_rotation_notice_shape(notice)?;
     let now = unix_time_ms()?;
-    if notice.issued_at_unix_ms > now.saturating_add(BOOTSTRAP_CLOCK_SKEW_MS)
-        || notice.expires_at_unix_ms < now
-    {
-        return Err(AppError::Message(
-            "FEDERATION_ROTATION_NOTICE_EXPIRED: rotation notice is outside the accepted time window"
-                .into(),
-        ));
-    }
+    validate_rotation_notice_time(notice, now)?;
     let bootstrap_signer = verify_bootstrap_bundle(bootstrap)?;
     if bootstrap.node_id != notice.node_id || bootstrap_signer != notice.next_signing {
         return Err(AppError::Message(
@@ -143,6 +149,64 @@ pub fn verify_rotation_notice(
         ));
     }
     Ok(notice.previous_signing.clone())
+}
+
+pub fn verify_rotation_chain(
+    notices: &[FederationSigningRotationNotice],
+    bootstrap: &FederationBootstrapBundle,
+) -> AppResult<Option<FederationNodeSigningPublic>> {
+    if notices.is_empty() {
+        return Ok(None);
+    }
+    if notices.len() > MAX_ROTATION_HISTORY_ENTRIES {
+        return Err(AppError::Message(format!(
+            "FEDERATION_ROTATION_CHAIN_TOO_LONG: rotation chain exceeds {MAX_ROTATION_HISTORY_ENTRIES} entries"
+        )));
+    }
+    let now = unix_time_ms()?;
+    for notice in notices {
+        validate_rotation_notice_shape(notice)?;
+        validate_rotation_notice_time(notice, now)?;
+    }
+    for pair in notices.windows(2) {
+        if pair[0].node_id != pair[1].node_id || pair[0].next_signing != pair[1].previous_signing {
+            return Err(AppError::Message(
+                "FEDERATION_ROTATION_CHAIN_INVALID: rotation notices do not form a contiguous signing chain"
+                    .into(),
+            ));
+        }
+    }
+    let last = notices.last().expect("non-empty rotation chain");
+    verify_rotation_notice(last, bootstrap)?;
+    Ok(notices
+        .first()
+        .map(|notice| notice.previous_signing.clone()))
+}
+
+pub fn verify_rotation_chain_from(
+    notices: &[FederationSigningRotationNotice],
+    bootstrap: &FederationBootstrapBundle,
+    expected_previous: &FederationNodeSigningPublic,
+) -> AppResult<bool> {
+    verify_rotation_chain(notices, bootstrap)?;
+    Ok(notices
+        .iter()
+        .any(|notice| &notice.previous_signing == expected_previous))
+}
+
+fn validate_rotation_notice_time(
+    notice: &FederationSigningRotationNotice,
+    now: u64,
+) -> AppResult<()> {
+    if notice.issued_at_unix_ms > now.saturating_add(BOOTSTRAP_CLOCK_SKEW_MS)
+        || notice.expires_at_unix_ms < now
+    {
+        return Err(AppError::Message(
+            "FEDERATION_ROTATION_NOTICE_EXPIRED: rotation notice is outside the accepted time window"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_rotation_notice_shape(notice: &FederationSigningRotationNotice) -> AppResult<()> {
@@ -206,26 +270,15 @@ fn validate_rotation_notice_shape(notice: &FederationSigningRotationNotice) -> A
     )
 }
 
-pub fn latest_local_rotation_notice() -> AppResult<Option<FederationSigningRotationNotice>> {
+pub fn local_rotation_history() -> AppResult<Vec<FederationSigningRotationNotice>> {
     let root = crate::platform::platform().app_config_dir()?;
-    let path = rotation_notice_path(&root);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read(&path)?;
-    let notice: FederationSigningRotationNotice =
-        serde_json::from_slice(&raw).map_err(|error| {
-            AppError::Message(format!(
-                "FEDERATION_ROTATION_NOTICE_INVALID: cannot parse {}: {error}",
-                path.display()
-            ))
-        })?;
-    validate_rotation_notice_shape(&notice)?;
+    let history = load_rotation_history_at(&root)?;
     let now = unix_time_ms()?;
-    if notice.expires_at_unix_ms < now {
-        return Ok(None);
-    }
-    Ok(Some(notice))
+    let first_valid = history
+        .iter()
+        .position(|notice| validate_rotation_notice_time(notice, now).is_ok())
+        .unwrap_or(history.len());
+    Ok(history[first_valid..].to_vec())
 }
 
 const ROTATION_NOTICE_SCHEMA_VERSION: u16 = 1;
@@ -233,6 +286,16 @@ const ROTATION_NOTICE_CONTRACT: &str = "anchor-federation-key-rotation-v1";
 const ROTATION_NOTICE_DOMAIN: &str = "anchor:federation:key-rotation:v1";
 const ROTATION_NOTICE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_ROTATION_NOTICE_BYTES: usize = 64 * 1024;
+const ROTATION_HISTORY_SCHEMA_VERSION: u16 = 1;
+const MAX_ROTATION_HISTORY_ENTRIES: usize = 8;
+const MAX_ROTATION_HISTORY_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRotationHistory {
+    schema_version: u16,
+    notices: Vec<FederationSigningRotationNotice>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -317,6 +380,16 @@ pub struct FederationBootstrapBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredSigningIdentity {
+    schema_version: u16,
+    algorithm: String,
+    key_epoch: u64,
+    protection: String,
+    protected_private_key_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyStoredSigningIdentity {
     schema_version: u16,
     algorithm: String,
     key_epoch: u64,
@@ -604,11 +677,16 @@ fn generate_signing_record(key_epoch: u64) -> AppResult<StoredSigningIdentity> {
             "FEDERATION_SIGNING_KEY_GENERATION_FAILED: Ed25519 key generation failed".into(),
         )
     })?;
+    let (protection, protected) = crate::data::protect_machine_secret_bytes(document.as_ref())
+        .map_err(|error| {
+            AppError::Message(format!("FEDERATION_SIGNING_KEY_PROTECTION_FAILED: {error}"))
+        })?;
     Ok(StoredSigningIdentity {
         schema_version: SIGNING_IDENTITY_SCHEMA_VERSION,
         algorithm: SIGNING_ALGORITHM.into(),
         key_epoch,
-        private_key_pkcs8_base64: BASE64.encode(document.as_ref()),
+        protection: protection.into(),
+        protected_private_key_base64: BASE64.encode(protected),
     })
 }
 
@@ -623,15 +701,125 @@ fn rotation_notice_path(root: &Path) -> std::path::PathBuf {
     root.join("data").join("federation-rotation-notice.json")
 }
 
+fn rotation_history_path(root: &Path) -> std::path::PathBuf {
+    root.join("data").join("federation-rotation-history.json")
+}
+
+fn load_rotation_history_at(root: &Path) -> AppResult<Vec<FederationSigningRotationNotice>> {
+    let history_path = rotation_history_path(root);
+    let mut notices = if history_path.exists() {
+        let raw = std::fs::read(&history_path)?;
+        if raw.len() > MAX_ROTATION_HISTORY_BYTES {
+            return Err(AppError::Message(format!(
+                "FEDERATION_ROTATION_HISTORY_TOO_LARGE: {} exceeds {MAX_ROTATION_HISTORY_BYTES} bytes",
+                history_path.display()
+            )));
+        }
+        let stored: StoredRotationHistory = serde_json::from_slice(&raw).map_err(|error| {
+            AppError::Message(format!(
+                "FEDERATION_ROTATION_HISTORY_INVALID: cannot parse {}: {error}",
+                history_path.display()
+            ))
+        })?;
+        if stored.schema_version != ROTATION_HISTORY_SCHEMA_VERSION
+            || stored.notices.len() > MAX_ROTATION_HISTORY_ENTRIES
+        {
+            return Err(AppError::Message(
+                "FEDERATION_ROTATION_HISTORY_INVALID: unsupported schema or entry count".into(),
+            ));
+        }
+        stored.notices
+    } else {
+        let legacy_path = rotation_notice_path(root);
+        if !legacy_path.exists() {
+            Vec::new()
+        } else {
+            let raw = std::fs::read(&legacy_path)?;
+            let notice: FederationSigningRotationNotice =
+                serde_json::from_slice(&raw).map_err(|error| {
+                    AppError::Message(format!(
+                        "FEDERATION_ROTATION_NOTICE_INVALID: cannot parse {}: {error}",
+                        legacy_path.display()
+                    ))
+                })?;
+            vec![notice]
+        }
+    };
+    for notice in &notices {
+        validate_rotation_notice_shape(notice)?;
+    }
+    for pair in notices.windows(2) {
+        if pair[0].node_id != pair[1].node_id || pair[0].next_signing != pair[1].previous_signing {
+            return Err(AppError::Message(
+                "FEDERATION_ROTATION_HISTORY_INVALID: stored notices are not contiguous".into(),
+            ));
+        }
+    }
+    if notices.len() > MAX_ROTATION_HISTORY_ENTRIES {
+        notices.drain(..notices.len() - MAX_ROTATION_HISTORY_ENTRIES);
+    }
+    Ok(notices)
+}
+
+fn write_rotation_history(
+    root: &Path,
+    notices: &[FederationSigningRotationNotice],
+) -> AppResult<()> {
+    let stored = StoredRotationHistory {
+        schema_version: ROTATION_HISTORY_SCHEMA_VERSION,
+        notices: notices.to_vec(),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&stored)?;
+    if bytes.len() > MAX_ROTATION_HISTORY_BYTES {
+        return Err(AppError::Message(format!(
+            "FEDERATION_ROTATION_HISTORY_TOO_LARGE: rotation history exceeds {MAX_ROTATION_HISTORY_BYTES} bytes"
+        )));
+    }
+    bytes.push(b'\n');
+    crate::data::atomic_write(&rotation_history_path(root), &bytes)
+}
+
 fn read_signing_identity(path: &Path) -> AppResult<LocalSigningIdentity> {
     let raw = std::fs::read(path)?;
-    let record: StoredSigningIdentity = serde_json::from_slice(&raw).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|error| {
         AppError::Message(format!(
             "FEDERATION_SIGNING_KEY_INVALID: could not parse {}: {error}",
             path.display()
         ))
     })?;
-    identity_from_record(record)
+    let schema_version = value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            AppError::Message(
+                "FEDERATION_SIGNING_KEY_INVALID: signing identity schemaVersion is missing".into(),
+            )
+        })? as u16;
+    match schema_version {
+        SIGNING_IDENTITY_SCHEMA_VERSION => {
+            let record =
+                serde_json::from_value::<StoredSigningIdentity>(value).map_err(|error| {
+                    AppError::Message(format!(
+                        "FEDERATION_SIGNING_KEY_INVALID: could not parse {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            identity_from_record(record)
+        }
+        LEGACY_SIGNING_IDENTITY_SCHEMA_VERSION => {
+            let legacy =
+                serde_json::from_value::<LegacyStoredSigningIdentity>(value).map_err(|error| {
+                    AppError::Message(format!(
+                        "FEDERATION_SIGNING_KEY_INVALID: could not parse legacy {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            migrate_legacy_signing_identity(path, legacy)
+        }
+        version => Err(AppError::Message(format!(
+            "FEDERATION_SIGNING_KEY_INVALID: unsupported signing identity schema version {version}"
+        ))),
+    }
 }
 
 fn identity_from_record(record: StoredSigningIdentity) -> AppResult<LocalSigningIdentity> {
@@ -643,14 +831,59 @@ fn identity_from_record(record: StoredSigningIdentity) -> AppResult<LocalSigning
             "FEDERATION_SIGNING_KEY_INVALID: unsupported signing identity record".into(),
         ));
     }
-    let private = BASE64
-        .decode(record.private_key_pkcs8_base64.as_bytes())
+    let protected = BASE64
+        .decode(record.protected_private_key_base64.as_bytes())
         .map_err(|_| {
             AppError::Message(
-                "FEDERATION_SIGNING_KEY_INVALID: private key is not valid base64".into(),
+                "FEDERATION_SIGNING_KEY_INVALID: protected private key is not valid base64".into(),
             )
         })?;
-    let key_pair = Ed25519KeyPair::from_pkcs8(&private).map_err(|_| {
+    let private = crate::data::unprotect_machine_secret_bytes(&record.protection, &protected)
+        .map_err(|error| {
+            AppError::Message(format!(
+                "FEDERATION_SIGNING_KEY_INVALID: private key protection cannot be opened: {error}"
+            ))
+        })?;
+    identity_from_private_key(record.key_epoch, &private)
+}
+
+fn migrate_legacy_signing_identity(
+    path: &Path,
+    legacy: LegacyStoredSigningIdentity,
+) -> AppResult<LocalSigningIdentity> {
+    if legacy.schema_version != LEGACY_SIGNING_IDENTITY_SCHEMA_VERSION
+        || legacy.algorithm != SIGNING_ALGORITHM
+        || legacy.key_epoch == 0
+    {
+        return Err(AppError::Message(
+            "FEDERATION_SIGNING_KEY_INVALID: unsupported legacy signing identity record".into(),
+        ));
+    }
+    let private = BASE64
+        .decode(legacy.private_key_pkcs8_base64.as_bytes())
+        .map_err(|_| {
+            AppError::Message(
+                "FEDERATION_SIGNING_KEY_INVALID: legacy private key is not valid base64".into(),
+            )
+        })?;
+    let identity = identity_from_private_key(legacy.key_epoch, &private)?;
+    let (protection, protected) =
+        crate::data::protect_machine_secret_bytes(&private).map_err(|error| {
+            AppError::Message(format!("FEDERATION_SIGNING_KEY_PROTECTION_FAILED: {error}"))
+        })?;
+    let migrated = StoredSigningIdentity {
+        schema_version: SIGNING_IDENTITY_SCHEMA_VERSION,
+        algorithm: SIGNING_ALGORITHM.into(),
+        key_epoch: legacy.key_epoch,
+        protection: protection.into(),
+        protected_private_key_base64: BASE64.encode(protected),
+    };
+    write_signing_record(path, &migrated)?;
+    Ok(identity)
+}
+
+fn identity_from_private_key(key_epoch: u64, private: &[u8]) -> AppResult<LocalSigningIdentity> {
+    let key_pair = Ed25519KeyPair::from_pkcs8(private).map_err(|_| {
         AppError::Message(
             "FEDERATION_SIGNING_KEY_INVALID: private key is not valid Ed25519 PKCS#8".into(),
         )
@@ -659,7 +892,7 @@ fn identity_from_record(record: StoredSigningIdentity) -> AppResult<LocalSigning
     let public = FederationNodeSigningPublic {
         contract: SIGNATURE_CONTRACT.into(),
         algorithm: SIGNING_ALGORITHM.into(),
-        key_epoch: record.key_epoch,
+        key_epoch,
         public_key_base64: BASE64.encode(public_key),
         fingerprint: public_key_fingerprint(public_key),
     };
@@ -778,10 +1011,63 @@ mod tests {
         let first = load_or_create_signing_identity_at(root.path()).expect("first identity");
         let second = load_or_create_signing_identity_at(root.path()).expect("second identity");
         assert_eq!(first.public, second.public);
+        let stored: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("data/federation-signing.json"))
+                .expect("stored signing identity"),
+        )
+        .expect("stored signing json");
+        assert_eq!(
+            stored["schemaVersion"],
+            serde_json::json!(SIGNING_IDENTITY_SCHEMA_VERSION)
+        );
+        assert!(stored.get("privateKeyPkcs8Base64").is_none());
+        assert!(stored.get("protectedPrivateKeyBase64").is_some());
+        #[cfg(windows)]
+        assert_eq!(stored["protection"], "windows-dpapi-local-machine-v1");
+        #[cfg(not(windows))]
+        assert_eq!(stored["protection"], "private-file-permissions-v1");
         let rotated = rotate_signing_identity_at(root.path()).expect("rotate");
         assert_eq!(rotated.key_epoch, first.public.key_epoch + 1);
         assert_ne!(rotated.fingerprint, first.public.fingerprint);
         assert_ne!(rotated.public_key_base64, first.public.public_key_base64);
+    }
+
+    #[test]
+    fn legacy_plaintext_signing_record_migrates_without_rotating_identity() {
+        let root = tempfile::tempdir().expect("signing root");
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let rng = SystemRandom::new();
+        let document = Ed25519KeyPair::generate_pkcs8(&rng).expect("legacy private key");
+        let expected = identity_from_private_key(7, document.as_ref())
+            .expect("legacy identity")
+            .public;
+        let legacy = LegacyStoredSigningIdentity {
+            schema_version: LEGACY_SIGNING_IDENTITY_SCHEMA_VERSION,
+            algorithm: SIGNING_ALGORITHM.into(),
+            key_epoch: 7,
+            private_key_pkcs8_base64: BASE64.encode(document.as_ref()),
+        };
+        let path = data_dir.join("federation-signing.json");
+        crate::data::atomic_write(
+            &path,
+            &serde_json::to_vec_pretty(&legacy).expect("legacy json"),
+        )
+        .expect("write legacy signing identity");
+
+        let migrated = read_signing_identity(&path).expect("migrate legacy identity");
+        assert_eq!(migrated.public, expected);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("migrated file"))
+                .expect("migrated json");
+        assert_eq!(
+            stored["schemaVersion"],
+            serde_json::json!(SIGNING_IDENTITY_SCHEMA_VERSION)
+        );
+        assert_eq!(stored["keyEpoch"], 7);
+        assert!(stored.get("privateKeyPkcs8Base64").is_none());
+        let reopened = read_signing_identity(&path).expect("reopen migrated identity");
+        assert_eq!(reopened.public, expected);
     }
 
     #[test]
@@ -806,6 +1092,62 @@ mod tests {
         let mut tampered = notice;
         tampered.next_signing.fingerprint = "sha256:deadbeef".into();
         assert!(verify_rotation_notice(&tampered, &bootstrap).is_err());
+    }
+
+    #[test]
+    fn bounded_rotation_history_verifies_multi_hop_continuity() {
+        let root = tempfile::tempdir().expect("signing root");
+        let descriptor = local_descriptor();
+        let now = unix_time_ms().expect("now");
+        let origin = load_or_create_signing_identity_at(root.path())
+            .expect("origin identity")
+            .public;
+        for offset in 0..3 {
+            rotate_signing_identity_with_notice_at(root.path(), &descriptor, now + offset)
+                .expect("rotation");
+        }
+        let history = load_rotation_history_at(root.path()).expect("rotation history");
+        assert_eq!(history.len(), 3);
+        let current = load_or_create_signing_identity_at(root.path()).expect("current identity");
+        let bootstrap =
+            build_bootstrap_bundle(&current, &descriptor, now + 4).expect("current bootstrap");
+        assert_eq!(
+            verify_rotation_chain(&history, &bootstrap).expect("rotation chain"),
+            Some(origin)
+        );
+        assert!(
+            verify_rotation_chain_from(&history, &bootstrap, &history[1].previous_signing)
+                .expect("intermediate retained key must verify to current bootstrap")
+        );
+
+        let mut reordered = history.clone();
+        reordered.swap(0, 1);
+        assert!(verify_rotation_chain(&reordered, &bootstrap).is_err());
+    }
+
+    #[test]
+    fn rotation_history_is_bounded_and_remains_contiguous() {
+        let root = tempfile::tempdir().expect("signing root");
+        let descriptor = local_descriptor();
+        let now = unix_time_ms().expect("now");
+        load_or_create_signing_identity_at(root.path()).expect("origin identity");
+        for offset in 0..(MAX_ROTATION_HISTORY_ENTRIES + 2) {
+            rotate_signing_identity_with_notice_at(root.path(), &descriptor, now + offset as u64)
+                .expect("rotation");
+        }
+        let history = load_rotation_history_at(root.path()).expect("rotation history");
+        assert_eq!(history.len(), MAX_ROTATION_HISTORY_ENTRIES);
+        for pair in history.windows(2) {
+            assert_eq!(pair[0].next_signing, pair[1].previous_signing);
+        }
+        let current = load_or_create_signing_identity_at(root.path()).expect("current identity");
+        let bootstrap = build_bootstrap_bundle(
+            &current,
+            &descriptor,
+            now + MAX_ROTATION_HISTORY_ENTRIES as u64 + 3,
+        )
+        .expect("bootstrap");
+        verify_rotation_chain(&history, &bootstrap).expect("bounded chain");
     }
 
     #[test]

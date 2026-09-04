@@ -124,6 +124,33 @@ pub(super) fn unprotect(protection: &str, data: &[u8]) -> Result<Vec<u8>, String
     Ok(data.to_vec())
 }
 
+/// Protect a machine-local identity secret that must remain readable by both
+/// interactive Anchor and the machine's service-managed control plane.
+#[cfg(windows)]
+pub(crate) fn protect_machine(data: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
+    protect_windows(data, true)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn protect_machine(data: &[u8]) -> Result<(&'static str, Vec<u8>), String> {
+    protect(data)
+}
+
+#[cfg(windows)]
+pub(crate) fn unprotect_machine(protection: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    if protection != "windows-dpapi-local-machine-v1" {
+        return Err(format!(
+            "unsupported Windows machine secret protection: {protection}"
+        ));
+    }
+    unprotect_windows(data)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn unprotect_machine(protection: &str, data: &[u8]) -> Result<Vec<u8>, String> {
+    unprotect(protection, data)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

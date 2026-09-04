@@ -5,14 +5,16 @@ use crate::error::{AppError, AppResult};
 use crate::workspace::WorkspaceProfile;
 
 use super::{
-    canonical_federation_endpoint, latest_local_rotation_notice, local_bootstrap_bundle,
-    local_peer_descriptor, verify_bootstrap_bundle, verify_rotation_notice,
+    canonical_federation_endpoint, local_bootstrap_bundle, local_peer_descriptor,
+    local_rotation_history, verify_bootstrap_bundle, verify_rotation_chain, verify_rotation_notice,
     FederationBootstrapBundle, FederationNodeSigningPublic, FederationSigningRotationNotice,
     TRANSPORT_CONNECT_TIMEOUT, TRANSPORT_REQUEST_TIMEOUT,
 };
 
-const DISCOVERY_SCHEMA_VERSION: u16 = 1;
-const DISCOVERY_CONTRACT: &str = "anchor-federation-discovery-v1";
+const LEGACY_DISCOVERY_SCHEMA_VERSION: u16 = 1;
+const LEGACY_DISCOVERY_CONTRACT: &str = "anchor-federation-discovery-v1";
+const DISCOVERY_SCHEMA_VERSION: u16 = 2;
+const DISCOVERY_CONTRACT: &str = "anchor-federation-discovery-v2";
 pub(crate) const FEDERATION_MAX_DISCOVERY_BYTES: usize = 768 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,8 +24,11 @@ pub struct FederationDiscoveryDocument {
     pub contract: String,
     pub node_id: String,
     pub bootstrap: FederationBootstrapBundle,
+    /// Legacy v1 one-hop proof. New v2 documents use `rotationChain`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation: Option<FederationSigningRotationNotice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotation_chain: Vec<FederationSigningRotationNotice>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,14 +57,37 @@ pub fn local_discovery_document(
 ) -> AppResult<FederationDiscoveryDocument> {
     let descriptor = public_discovery_descriptor(local_peer_descriptor(profiles)?);
     let bootstrap = local_bootstrap_bundle(&descriptor)?;
-    let rotation = latest_local_rotation_notice()?
-        .filter(|notice| verify_rotation_notice(notice, &bootstrap).is_ok());
+    let rotation_chain = local_rotation_history()?;
+    let rotation_chain = if verify_rotation_chain(&rotation_chain, &bootstrap).is_ok() {
+        rotation_chain
+    } else {
+        Vec::new()
+    };
     let document = FederationDiscoveryDocument {
         schema_version: DISCOVERY_SCHEMA_VERSION,
         contract: DISCOVERY_CONTRACT.into(),
         node_id: bootstrap.node_id.clone(),
         bootstrap,
+        rotation: None,
+        rotation_chain,
+    };
+    validate_discovery_document(&document, Some(&document.node_id))?;
+    Ok(document)
+}
+
+pub fn local_legacy_discovery_document(
+    profiles: &[WorkspaceProfile],
+) -> AppResult<FederationDiscoveryDocument> {
+    let descriptor = public_discovery_descriptor(local_peer_descriptor(profiles)?);
+    let bootstrap = local_bootstrap_bundle(&descriptor)?;
+    let rotation = local_rotation_history()?.last().cloned();
+    let document = FederationDiscoveryDocument {
+        schema_version: LEGACY_DISCOVERY_SCHEMA_VERSION,
+        contract: LEGACY_DISCOVERY_CONTRACT.into(),
+        node_id: bootstrap.node_id.clone(),
+        bootstrap,
         rotation,
+        rotation_chain: Vec::new(),
     };
     validate_discovery_document(&document, Some(&document.node_id))?;
     Ok(document)
@@ -84,10 +112,11 @@ pub fn validate_discovery_document(
             "FEDERATION_DISCOVERY_TOO_LARGE: discovery document exceeds {FEDERATION_MAX_DISCOVERY_BYTES} bytes"
         )));
     }
-    if document.schema_version != DISCOVERY_SCHEMA_VERSION
-        || document.contract != DISCOVERY_CONTRACT
-        || document.node_id != document.bootstrap.node_id
-    {
+    let legacy = document.schema_version == LEGACY_DISCOVERY_SCHEMA_VERSION
+        && document.contract == LEGACY_DISCOVERY_CONTRACT;
+    let current = document.schema_version == DISCOVERY_SCHEMA_VERSION
+        && document.contract == DISCOVERY_CONTRACT;
+    if (!legacy && !current) || document.node_id != document.bootstrap.node_id {
         return Err(AppError::Message(
             "FEDERATION_DISCOVERY_INVALID: discovery identity or contract is invalid".into(),
         ));
@@ -99,8 +128,24 @@ pub fn validate_discovery_document(
         ));
     }
     let signer = verify_bootstrap_bundle(&document.bootstrap)?;
-    if let Some(rotation) = document.rotation.as_ref() {
-        verify_rotation_notice(rotation, &document.bootstrap)?;
+    if legacy {
+        if !document.rotation_chain.is_empty() {
+            return Err(AppError::Message(
+                "FEDERATION_DISCOVERY_INVALID: v1 discovery documents cannot carry a rotation chain"
+                    .into(),
+            ));
+        }
+        if let Some(rotation) = document.rotation.as_ref() {
+            verify_rotation_notice(rotation, &document.bootstrap)?;
+        }
+    } else {
+        if document.rotation.is_some() {
+            return Err(AppError::Message(
+                "FEDERATION_DISCOVERY_INVALID: v2 discovery documents must use rotationChain"
+                    .into(),
+            ));
+        }
+        verify_rotation_chain(&document.rotation_chain, &document.bootstrap)?;
     }
     Ok(signer)
 }
@@ -110,9 +155,6 @@ pub async fn fetch_discovery_document(
     expected_node_id: Option<&str>,
 ) -> AppResult<FederationDiscoveryDocument> {
     let origin = canonical_federation_endpoint(endpoint)?;
-    let url = origin
-        .join("federation/v2/bootstrap")
-        .map_err(|error| AppError::Message(format!("invalid federation endpoint: {error}")))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -124,6 +166,32 @@ pub async fn fetch_discovery_document(
                 "failed to build federation discovery client: {error}"
             ))
         })?;
+    let discovery_url = origin
+        .join("federation/v2/discovery")
+        .map_err(|error| AppError::Message(format!("invalid federation endpoint: {error}")))?;
+    if let Some(document) = fetch_discovery_url(&client, discovery_url, true).await? {
+        validate_discovery_document(&document, expected_node_id)?;
+        return Ok(document);
+    }
+    let legacy_url = origin
+        .join("federation/v2/bootstrap")
+        .map_err(|error| AppError::Message(format!("invalid federation endpoint: {error}")))?;
+    let document = fetch_discovery_url(&client, legacy_url, false)
+        .await?
+        .ok_or_else(|| {
+            AppError::Message(
+                "FEDERATION_DISCOVERY_REJECTED: legacy discovery endpoint returned HTTP 404".into(),
+            )
+        })?;
+    validate_discovery_document(&document, expected_node_id)?;
+    Ok(document)
+}
+
+async fn fetch_discovery_url(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    allow_not_found: bool,
+) -> AppResult<Option<FederationDiscoveryDocument>> {
     let response = client
         .get(url)
         .header("accept", "application/json")
@@ -134,6 +202,9 @@ pub async fn fetch_discovery_document(
                 "FEDERATION_DISCOVERY_UNAVAILABLE: bootstrap discovery request failed: {error}"
             ))
         })?;
+    if allow_not_found && response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !response.status().is_success() {
         return Err(AppError::Message(format!(
             "FEDERATION_DISCOVERY_REJECTED: discovery endpoint returned HTTP {}",
@@ -180,8 +251,7 @@ pub async fn fetch_discovery_document(
             "FEDERATION_DISCOVERY_RESPONSE_INVALID: discovery document is invalid: {error}"
         ))
     })?;
-    validate_discovery_document(&document, expected_node_id)?;
-    Ok(document)
+    Ok(Some(document))
 }
 
 #[cfg(test)]
@@ -205,8 +275,17 @@ mod tests {
             node_id: bundle.node_id.clone(),
             bootstrap: bundle,
             rotation: None,
+            rotation_chain: Vec::new(),
         };
         validate_discovery_document(&document, Some(&document.node_id)).expect("valid discovery");
+
+        let mut legacy = document.clone();
+        legacy.schema_version = LEGACY_DISCOVERY_SCHEMA_VERSION;
+        legacy.contract = LEGACY_DISCOVERY_CONTRACT.into();
+        legacy.rotation_chain.clear();
+        validate_discovery_document(&legacy, Some(&legacy.node_id))
+            .expect("legacy v1 discovery remains readable");
+
         assert!(validate_discovery_document(
             &document,
             Some("node_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")

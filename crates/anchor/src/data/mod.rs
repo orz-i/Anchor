@@ -9,6 +9,10 @@ pub(crate) use migration::{
     WorkspacePathMapping,
 };
 pub use model::AppData;
+pub(crate) use secret_protection::{
+    protect_machine as protect_machine_secret_bytes,
+    unprotect_machine as unprotect_machine_secret_bytes,
+};
 pub(crate) use storage::atomic_write;
 pub(crate) use store::validate_workspace_profile;
 pub use store::DataStore;

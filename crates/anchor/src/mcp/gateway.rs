@@ -508,6 +508,7 @@ async fn spawn_with_limits(
             "/federation/v2/bootstrap",
             get(federation_bootstrap_discovery),
         )
+        .route("/federation/v2/discovery", get(federation_discovery))
         .route("/federation/v2/read", post(federation_read_request))
         .route("/w/{workspace_id}/{*upstream_path}", any(proxy_request))
         .with_state(state);
@@ -538,6 +539,18 @@ async fn federation_bootstrap_discovery(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
+    federation_discovery_response(state, headers, true).await
+}
+
+async fn federation_discovery(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    federation_discovery_response(state, headers, false).await
+}
+
+async fn federation_discovery_response(
+    state: GatewayState,
+    headers: HeaderMap,
+    legacy: bool,
+) -> Response {
     if !state.rate_limiter.allow() {
         return gateway_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -563,7 +576,11 @@ async fn federation_bootstrap_discovery(
         let store = crate::data::DataStore::load()?;
         let profiles = store.list().to_vec();
         drop(store);
-        crate::federation::local_discovery_document(&profiles)
+        if legacy {
+            crate::federation::local_legacy_discovery_document(&profiles)
+        } else {
+            crate::federation::local_discovery_document(&profiles)
+        }
     })();
     match document.and_then(|document| {
         let body = serde_json::to_vec(&document)?;

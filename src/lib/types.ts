@@ -170,10 +170,11 @@ export interface FederationSigningRotationNotice {
 
 export interface FederationDiscoveryDocument {
   schemaVersion: number;
-  contract: "anchor-federation-discovery-v1";
+  contract: "anchor-federation-discovery-v1" | "anchor-federation-discovery-v2";
   nodeId: string;
   bootstrap: FederationBootstrapBundle;
   rotation?: FederationSigningRotationNotice;
+  rotationChain?: FederationSigningRotationNotice[];
 }
 
 export type FederationDiscoveryState =
