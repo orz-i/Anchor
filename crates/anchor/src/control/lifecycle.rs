@@ -30,32 +30,11 @@ pub fn desired_service_selection(
 ) -> Option<ServiceSelection> {
     match (current, service, enabled) {
         (None, WorkspaceService::Mcp, true) => Some(ServiceSelection::Mcp),
-        (None, WorkspaceService::Actions, true) => Some(ServiceSelection::Actions),
-        (None, _, false) => None,
-        (Some(ServiceSelection::Mcp), WorkspaceService::Mcp, true)
-        | (Some(ServiceSelection::Mcp), WorkspaceService::Actions, false) => {
-            Some(ServiceSelection::Mcp)
-        }
-        (Some(ServiceSelection::Actions), WorkspaceService::Actions, true)
-        | (Some(ServiceSelection::Actions), WorkspaceService::Mcp, false) => {
-            Some(ServiceSelection::Actions)
-        }
-        (Some(ServiceSelection::Mcp), WorkspaceService::Actions, true)
-        | (Some(ServiceSelection::Actions), WorkspaceService::Mcp, true) => {
-            Some(ServiceSelection::All)
-        }
-        (Some(ServiceSelection::Mcp), WorkspaceService::Mcp, false)
-        | (Some(ServiceSelection::Actions), WorkspaceService::Actions, false) => None,
-        (Some(ServiceSelection::All), WorkspaceService::Mcp, true)
-        | (Some(ServiceSelection::All), WorkspaceService::Actions, true) => {
-            Some(ServiceSelection::All)
-        }
-        (Some(ServiceSelection::All), WorkspaceService::Mcp, false) => {
-            Some(ServiceSelection::Actions)
-        }
-        (Some(ServiceSelection::All), WorkspaceService::Actions, false) => {
-            Some(ServiceSelection::Mcp)
-        }
+        (None, WorkspaceService::Mcp, false) => None,
+        (Some(ServiceSelection::Mcp), WorkspaceService::Mcp, true) => Some(ServiceSelection::Mcp),
+        (Some(ServiceSelection::Mcp), WorkspaceService::Mcp, false) => None,
+        (Some(ServiceSelection::All), WorkspaceService::Mcp, true) => Some(ServiceSelection::All),
+        (Some(ServiceSelection::All), WorkspaceService::Mcp, false) => None,
     }
 }
 
@@ -313,7 +292,6 @@ pub async fn restart_daemon_service(
     {
         let control_service = match service {
             WorkspaceService::Mcp => ControlService::Mcp,
-            WorkspaceService::Actions => ControlService::Actions,
         };
         request_reload_operation(profile, control_service, timeout)
             .await
@@ -354,7 +332,6 @@ pub async fn restart_daemon_service(
 pub fn service_is_selected(selection: ServiceSelection, service: WorkspaceService) -> bool {
     match service {
         WorkspaceService::Mcp => selection.includes_mcp(),
-        WorkspaceService::Actions => selection.includes_actions(),
     }
 }
 
@@ -379,53 +356,33 @@ mod tests {
     use crate::workspace::WorkspaceProfile;
 
     #[test]
-    fn service_transition_matrix_preserves_independent_toggles() {
+    fn service_transition_matrix_handles_mcp_toggle() {
         assert_eq!(
             desired_service_selection(None, WorkspaceService::Mcp, true),
             Some(ServiceSelection::Mcp)
         );
         assert_eq!(
-            desired_service_selection(Some(ServiceSelection::Actions), WorkspaceService::Mcp, true,),
-            Some(ServiceSelection::All)
+            desired_service_selection(Some(ServiceSelection::Mcp), WorkspaceService::Mcp, true,),
+            Some(ServiceSelection::Mcp)
         );
         assert_eq!(
             desired_service_selection(Some(ServiceSelection::All), WorkspaceService::Mcp, false,),
-            Some(ServiceSelection::Actions)
+            None
         );
         assert_eq!(
             desired_service_selection(Some(ServiceSelection::Mcp), WorkspaceService::Mcp, false,),
             None
         );
-        assert_eq!(
-            desired_service_selection(
-                Some(ServiceSelection::Mcp),
-                WorkspaceService::Actions,
-                false,
-            ),
-            Some(ServiceSelection::Mcp)
-        );
     }
 
     #[test]
-    fn tunnel_transition_matrix_preserves_independent_toggles() {
+    fn tunnel_transition_matrix_handles_mcp_toggle() {
         assert_eq!(
             desired_tunnel_selection(None, WorkspaceService::Mcp, true),
             Some(ServiceSelection::Mcp)
         );
         assert_eq!(
-            desired_tunnel_selection(Some(ServiceSelection::Mcp), WorkspaceService::Actions, true,),
-            Some(ServiceSelection::All)
-        );
-        assert_eq!(
             desired_tunnel_selection(Some(ServiceSelection::All), WorkspaceService::Mcp, false,),
-            Some(ServiceSelection::Actions)
-        );
-        assert_eq!(
-            desired_tunnel_selection(
-                Some(ServiceSelection::Actions),
-                WorkspaceService::Actions,
-                false,
-            ),
             None
         );
     }

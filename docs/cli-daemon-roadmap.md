@@ -97,7 +97,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 - 运行中 daemon 的日志读取使用有界游标 IPC，单响应日志内容预算为 8 KiB；daemon 已停止时仍可离线读取历史日志；
 - `stop` 和 `restart` 必须先由目标 daemon 通过 IPC 接受并协调优雅退出；IPC 不可用时不得回退到客户端直接进程控制；
 - `start` 在 daemon 不存在时仍是引导命令；若状态显示 daemon 已运行，则必须先通过 IPC `ping` 验证控制面。
-- daemon 状态同时保存 `tunnelServices=mcp|actions|all`，MCP/Actions listener 与 tunnel ownership 可独立组合；公开 CLI `--tunnel` 仍保持“为所选服务启用隧道”的兼容语义；
+- daemon 状态同时保存 `tunnelServices=mcp|all`，MCP listener 与 tunnel ownership 可独立组合；公开 CLI `--tunnel` 仍保持“为所选服务启用隧道”的兼容语义；
 - tunnel 写操作采用 `accepted → pending/running → succeeded/failed` 的异步操作模型：初始响应完整写回后，daemon 才在自身 Tunnel Supervisor 内执行 start/stop/restart；FRP 重载继续使用原子 route replacement，失败时恢复旧线路和旧配置。
 - daemon 事件使用进程内有界 journal：每 Workspace 最多保留 256 条，单批最多 32 条，游标为 `streamId + sequence`；长轮询最长 25 秒，daemon 重启或游标越过 retained window 时显式返回 reset；
 - `reload` 复用异步 operation 模型，运行中的目标服务只重建该 listener，Workspace daemon、另一 listener 和 Tunnel ownership 保持不变；新 listener 启动失败时尝试恢复旧 listener；
@@ -110,7 +110,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 - `anchor gateway status/start/stop/restart/reload` 使用专用 Gateway control client；`gateway serve` 继续保留为前台调试/外部 supervisor 入口；
 - `shutdown`、`prepare_restart`、`reload` 和运行中配置应用都禁止本地运行时回退；`reload`/`apply_config` 使用 accepted → operation status 异步模型；
 - 运行中配置修改由 Gateway daemon 先切换运行态、更新 daemon state，再持久化；失败会停止新运行态并尝试恢复旧 listener/routes/tunnel；禁用配置采用 daemon shutdown → 确认退出 → 持久化 disabled；
-- Gateway route/owner 实际使用的 MCP tunnel identity 变化会触发 Gateway daemon reload；名称、Actions 或普通 MCP listener 策略变化不会无谓 reload Gateway；失败时控制层恢复旧 Workspace/settings 并重新对齐旧运行态；活动 route Workspace 在 daemon 停止前禁止删除/注销；
+- Gateway route/owner 实际使用的 MCP tunnel identity 变化会触发 Gateway daemon reload；名称或普通 MCP listener 策略变化不会无谓 reload Gateway；失败时控制层恢复旧 Workspace/settings 并重新对齐旧运行态；活动 route Workspace 在 daemon 停止前禁止删除/注销；
 - GUI Gateway 状态和 route 列表直接来自 Gateway daemon 状态，不再逐 Workspace 轮询来猜测 route；桌面配置缓存每次操作前从磁盘刷新，避免覆盖 daemon 的异步 observation 写入。
 - Gateway protocol v1 已以 additive methods 增加有界 `logs` 与 `events`：日志正文单响应最多 8 KiB；事件 journal 保留 256 条、单批 32 条、最长 25 秒 long-poll，并使用 `streamId + sequence` 可恢复游标；
 - CLI 新增 `gateway logs/events`；运行中日志和事件不允许在 protocol/remote 错误时回退到本地文件或状态 polling，只有 daemon 明确停止时可离线读取历史日志；
@@ -119,13 +119,13 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 
 GUI 工作区控制迁移现状：
 
-- Workspace 的 MCP/Actions 状态、启动、停止和重启已改为 daemon 控制客户端；GUI 不再为这些命令创建进程内 `RuntimeSupervisor` listener；
-- MCP 与 Actions 的独立开关映射为 daemon 的 `mcp`、`actions` 或 `all` 服务选择；调整其中一个服务时可能需要协调重启整个 Workspace daemon；
+- Workspace 的 MCP 状态、启动、停止和重启已改为 daemon 控制客户端；GUI 不再为这些命令创建进程内 `RuntimeSupervisor` listener；
+- MCP 开关映射为 daemon 的 MCP 服务选择；配置变化需要时由控制面协调对应 Workspace daemon；
 - GUI 日志在 daemon 运行时强制使用有界 IPC，daemon 停止时才允许使用同一套有界本地读取器查看历史日志；
 - Workspace 删除和密钥再生成会先通过 daemon 控制面停止或重启目标进程；
-- MCP/Actions tunnel 状态、启动、停止、重载和测试已迁入 Workspace daemon；GUI 保存 tunnel 配置不再追加一次整 daemon 重启；
+- MCP tunnel 状态、启动、停止、重载和测试已迁入 Workspace daemon；GUI 保存 tunnel 配置不再追加一次整 daemon 重启；
 - Workspace 页面已从固定 5 秒双 runtime 轮询迁移为 daemon event-first 长轮询；只有 endpoint unavailable 才进入 polling fallback，协议/远端错误不会静默降级，fallback 会继续探测并自动恢复事件模式；
-- Workspace 配置保存已把差异判断从 GUI 收回 Rust 控制层：纯元数据不 reload，MCP/Actions 运行参数与认证身份只 reload 对应活动 listener；GUI 不再自行读取运行状态后调用 restart；
+- Workspace 配置保存已把差异判断从 GUI 收回 Rust 控制层：纯元数据不 reload，MCP 运行参数与认证身份只 reload 对应活动 listener；GUI 不再自行读取运行状态后调用 restart；
 - Workspace protocol 升级为 v6：OAuth Callback URI/Host 支持 daemon 进程内字段级 hot update；新增 daemon-owner `apply_config`，由运行权威以当前内存 profile 对比磁盘 desired profile，事务协调 listener/direct tunnel 并回滚失败操作；
 - Windows Workspace GUI 已切到 Workspace daemon Named Pipe；Gateway 也使用独立 Windows Gateway daemon。Windows GUI 不再以进程内 `RuntimeSupervisor`/Tunnel Supervisor/Gateway 作为运行权威；
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
@@ -160,7 +160,7 @@ GUI 工作区控制迁移现状：
 1. **运行权威只属于 daemon/CLI**：不存在 desktop 进程运行所有权；Workspace/Gateway/Tunnel 只归对应 daemon 或显式前台 CLI `serve` 所有。
 2. **业务 UI 是 Web-only**：`src/` 不依赖 Tauri，transport/dialog 均使用浏览器与 Web Admin HTTP API。
 3. **Web 管理 API 是可复用控制客户端**：浏览器端通过版本化、本地优先的管理 HTTP API 调用与 CLI 相同的 Rust 控制语义，不允许在 HTTP handler 中复制 Workspace、daemon、Tunnel、Gateway 或 secret 业务规则。
-4. **管理 HTTP 默认本机安全**：默认只监听 loopback；写请求必须具备独立管理会话认证，并校验 Origin/CSRF。不得复用 MCP/Actions 对公网暴露的认证入口，也不得把 secrets 放入 URL、日志或静态资源。
+4. **管理 HTTP 默认本机安全**：默认只监听 loopback；写请求必须具备独立管理会话认证，并校验 Origin/CSRF。不得复用 MCP 对公网暴露的认证入口，也不得把 secrets 放入 URL、日志或静态资源。
 5. **离线配置与运行控制分离**：Web 管理面可以在 daemon 未运行时编辑磁盘配置；启动、停止、重载、Tunnel、Gateway 等运行操作仍必须通过对应 daemon 控制域，禁止 HTTP 层创建第二套运行时。
 
 退役顺序固定为：
@@ -182,11 +182,11 @@ GUI 工作区控制迁移现状：
 - Web Admin 已新增独立的 persistent Admin daemon/service 层：`anchor admin start|stop|restart|status` 管理后台 Admin daemon，内部 `admin daemon-run` 只托管 loopback Web Admin HTTP/UI，不持有 Workspace、Gateway、Tunnel 或 RuntimeSupervisor。daemon 使用独立 `admin.lock/admin.pid/admin.json` 与 `logs/admin/daemon.log`，状态发布 PID、port、config scope、executable 和 `BuildIdentity`；启动前检查端口所有者，绝不接管其他进程监听；
 - `anchor admin install|uninstall|enable|disable|upgrade` 提供 OS autostart 治理。Linux 使用按 config scope 隔离的 `systemd --user` unit，并要求当前用户 linger 可用以保证重启后启动；Windows 使用当前用户 Task Scheduler、InteractiveToken/LeastPrivilege。两端 crash recovery 都限定为 5 秒间隔、最多 3 次，避免无限 crash loop。`admin upgrade` 使用当前 CLI executable/build 重建 OS 注册并重启，`status` 在运行态和停止态都能识别 build drift；本地 service config 与 OS 注册不一致时 fail closed，要求 upgrade/install 修复，不静默降级为非托管进程；
 - Admin daemon 对状态文件丢失/陈旧 PID 有受控恢复：Linux 可通过 `/proc` 的完整 `--config-dir ... admin daemon-run` 命令行重建同 config-scope 运行态；已注册服务还可通过 loopback 监听 PID + 注册 executable identity 恢复缺失状态。恢复来源无法证明 build identity 时显式报告 `unknown`，不会伪造 current。Linux 本轮已用隔离 config dir live 验证 start → 删除 pid/state → `/proc` 恢复 status → stop；OS autostart install 未在开发主机上做副作用型 live install，Windows Task Scheduler 实机启动/重启仍属于发布验收；
-- 浏览器必须先 `POST /api/v1/session` 建立进程内独立管理会话。会话 ID 只通过 `HttpOnly; SameSite=Strict` cookie 发送，CSRF token 单独返回给同源页面；所有管理 command 都要求精确 `Host`、精确 `Origin`、same-origin Fetch 标记、有效 session 与 CSRF token，不复用 MCP/Actions 的公网认证凭据；
-- Web Admin 已迁移工作区/控制面状态与事件、MCP/Actions runtime 状态、Workspace/Gateway 日志、Gateway 状态/事件、FRP profile 列表、software 状态、secret **读取**和 Windows Service 状态读取，用于现有管理 UI 的首屏和诊断展示；
+- 浏览器必须先 `POST /api/v1/session` 建立进程内独立管理会话。会话 ID 只通过 `HttpOnly; SameSite=Strict` cookie 发送，CSRF token 单独返回给同源页面；所有管理 command 都要求精确 `Host`、精确 `Origin`、same-origin Fetch 标记、有效 session 与 CSRF token，不复用 MCP 的公网认证凭据；
+- Web Admin 已迁移工作区/控制面状态与事件、MCP runtime 状态、Workspace/Gateway 日志、Gateway 状态/事件、FRP profile 列表、software 状态、secret **读取**和 Windows Service 状态读取，用于现有管理 UI 的首屏和诊断展示；
 - 普通管理能力已继续补齐：Workspace 创建/删除、目录打开、Skill inspection、Health checks、Canvs snapshot/task、FRP 非敏感 metadata 保存与 profile 删除均进入共享 `management.rs` 并由 Web dispatcher 暴露；FRP metadata 与 Token 写入已经拆成两个独立权限域，浏览器先持久化非敏感 metadata，再对稳定 profile ID 单独执行高权限 Token 确认；
 - Workspace 配置更新已切换为共享 `preview/stage/apply` 事务：浏览器提交时携带加载时的 `baseProfile`，服务端在 staging 前要求它仍与 active 配置一致，防止旧页面覆盖 CLI 的并发修改；pending/apply 继续复用 CLI 既有字段级 diff、资源校验、apply plan、daemon hot reload 与 stale-base 保护；
-- Web Admin 已迁移 Workspace MCP/Actions daemon 启停/重启和 Tunnel start/restart/stop/test，全部经 `management.rs` 委托现有 `control` daemon 协议；Tunnel test 的临时服务运行态用 `reconcile_daemon` 恢复，不会把探测动作写成持久化 autostart desired-state；Web HTTP handler 不直接拥有 listener、RuntimeSupervisor 或 Tunnel Supervisor；
+- Web Admin 已迁移 Workspace MCP daemon 启停/重启和 Tunnel start/restart/stop/test，全部经 `management.rs` 委托现有 `control` daemon 协议；Tunnel test 的临时服务运行态用 `reconcile_daemon` 恢复，不会把探测动作写成持久化 autostart desired-state；Web HTTP handler 不直接拥有 listener、RuntimeSupervisor 或 Tunnel Supervisor；
 - Gateway 配置保存继续使用共享热应用/关闭语义。Gateway protocol v1 以 additive `set_routes` 增加 per-workspace route 生命周期：已有 Gateway daemon 在同一 PID 内重建内部 Workspace MCP/routes/tunnel 并使用 accepted → operation status 反馈；失败会恢复旧 route 集合。首个 route 在 daemon 停止时可启动 Gateway，最后一个 route 移除走受控 shutdown。Web 管理页可逐 Workspace 启停 route，存在未保存 Gateway 配置草稿时禁止 route mutation；
 - Gateway 启用时，Web Admin 仍不允许绕过 Gateway 控制域直接启停单 Workspace MCP daemon/Tunnel；共享 `management.rs` 是唯一 route mutation 业务语义；
 - Web Admin 高权限确认已进入 Secret/FRP、Software 与 Windows Service 三个真实执行域：prepare ticket 绑定当前 HttpOnly session + allowlisted action + 非敏感 target fingerprint，批准后得到短 TTL、一次性 grant。Windows Service 的浏览器请求不提供可信 target；服务端会按 action 重建 `serviceName + opaque revision`，revision 哈希当前构建/可执行文件、配置域、SCM 注册与状态、配置 owner，以及 install/sync 需要的 desired/running plan 快照。执行前再次重建，任一相关状态漂移都会要求重新确认；

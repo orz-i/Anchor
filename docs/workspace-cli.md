@@ -11,10 +11,10 @@ anchor workspace list
 anchor workspace register PATH [--name NAME]
 anchor workspace unregister WORKSPACE --force
 anchor workspace show WORKSPACE
-anchor workspace start WORKSPACE [--service mcp|actions|all] [--tunnel]
+anchor workspace start WORKSPACE [--service mcp|all] [--tunnel]
 anchor workspace stop WORKSPACE [--timeout SECONDS] [--force]
-anchor workspace gpt-config WORKSPACE [--service mcp|actions|all]
-anchor workspace test WORKSPACE [--service mcp|actions|all]
+anchor workspace gpt-config WORKSPACE [--service mcp|all]
+anchor workspace test WORKSPACE [--service mcp|all]
 ```
 
 别名：
@@ -41,9 +41,9 @@ anchor workspace register /srv/projects/example --name Example
 1. 解析并 canonicalize 项目目录；
 2. 同一路径已注册时返回 `already_registered`，不创建重复 profile；
 3. 名称必须唯一，避免名称选择器产生歧义；
-4. 分配不与其他 profile 冲突、且当前没有进程监听的 MCP/Actions 端口；
+4. 分配不与其他 profile 冲突、且当前没有进程监听的 MCP 端口；
 5. 创建 WorkspaceProfile；
-6. 初始化 OAuth Password、Token Secret、Bearer Token、Actions API Key 等 workspace 密钥；
+6. 初始化 OAuth Password、Token Secret、Bearer Token 等 workspace 密钥；
 7. profile 与密钥在一次配置保存中持久化。
 
 默认 OAuth Client Secret 不自动生成，因为 MCP OAuth 支持公开 PKCE 客户端。
@@ -59,7 +59,6 @@ anchor workspace register /srv/projects/example --name Example
     "path": "/srv/projects/example"
   },
   "mcpPort": 28768,
-  "actionsPort": 8789,
   "projectFilesDeleted": false,
   "warnings": []
 }
@@ -123,19 +122,6 @@ anchor workspace gpt-config Example
 - Scope；
 - 密钥是否已配置。
 
-### GPT Actions
-
-```bash
-anchor workspace gpt-config Example --service actions
-```
-
-输出：
-
-- OpenAPI Schema URL；
-- Privacy Policy URL；
-- API Key 或 OAuth 配置；
-- GPT Editor 中的配置入口提示。
-
 ### 同时查看
 
 ```bash
@@ -171,7 +157,7 @@ Endpoint 选择：
 anchor workspace gpt-config Example --show-secrets
 ```
 
-该输出可能包含 OAuth Client Secret、Authorization Password、Bearer Token 或 Actions API Key。不要写入日志、CI artifact、工单或公共聊天。
+该输出可能包含 OAuth Client Secret、Authorization Password 或 Bearer Token。不要写入日志、CI artifact、工单或公共聊天。
 
 ## 连接测试
 
@@ -187,15 +173,6 @@ anchor workspace test Example --service all --public --timeout 15
 - OAuth Protected Resource Metadata；
 - OAuth 模式下未认证 initialize 返回 `401` 和 `resource_metadata` challenge；
 - Bearer/无认证模式下实际发送 JSON-RPC initialize，并验证 `serverInfo`。
-
-### Actions 检查
-
-- `/health` 返回 200；
-- `/openapi.json` 返回 OpenAPI 文档；
-- `/privacy` 可访问；
-- API Key 模式使用已保存 Bearer Key 实际调用只读 `server_info`；
-- 无认证模式实际调用只读 `server_info`；
-- OAuth 模式验证 metadata 和未认证 401 challenge。
 
 测试内部可以使用已保存密钥，但报告不会输出密钥值。
 

@@ -37,7 +37,7 @@ anchor/
 
 ## 当前状态
 
-Anchor 当前是 Rust CLI/daemon + Vite/React Web Admin 产品，并提供 MCP/Actions 服务、Gateway、隧道监督、Agent Skills 和持久 Harness。Tauri desktop 与 SvelteKit 均已物理删除；当前实现与测试均以 Rust 源码和 Web 管理契约为权威。
+Anchor 当前是 Rust CLI/daemon + Vite/React Web Admin 产品，并提供 MCP 服务、Gateway、隧道监督、Agent Skills 和持久 Harness。Tauri desktop 与 SvelteKit 均已物理删除；当前实现与测试均以 Rust 源码和 Web 管理契约为权威。
 
 ## 架构模式
 
@@ -84,11 +84,11 @@ Anchor 当前是 Rust CLI/daemon + Vite/React Web Admin 产品，并提供 MCP/A
 - 管理 HTTP handler 只做认证、参数编解码和共享控制客户端调用，不复制 daemon/CLI 业务编排。
 - 不存在桌面进程运行所有权；listener、Tunnel 与 Gateway 只归 daemon/CLI 控制域。
 
-当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 保留为前台调试入口；生产持久运行由独立 `admin daemon-run` 承担，两者都只绑定 loopback 并同源托管嵌入 CLI 的生产 Vite/React 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP/Actions 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
+当前实现已经把 `/api/v1` Web Admin 从 bootstrap 推进为带认证的本机管理入口。`anchor admin serve` 保留为前台调试入口；生产持久运行由独立 `admin daemon-run` 承担，两者都只绑定 loopback 并同源托管嵌入 CLI 的生产 Vite/React 静态站点。浏览器使用独立进程内管理 session：session ID 是 `HttpOnly; SameSite=Strict` cookie，CSRF token 由 session bootstrap 响应返回；command 请求必须同时通过 canonical Host、精确同源 Origin、same-origin Fetch、session 与 CSRF 校验。管理会话完全独立于 MCP 公网认证。Session/health 同时发布正向 `supportedCommands`、全部 `privilegedCommands`、已评审 `privilegedExecutors` 和显式 `unavailableCommands`；Web transport 只执行正向 manifest 中存在的命令，避免 UI 与 dispatcher 版本漂移形成可点击死入口。
 
 Persistent Admin daemon 是单独的**管理面托管域**，不是新的业务运行 supervisor。它使用独立 `admin.lock/admin.pid/admin.json` 与 Admin log；状态包含 config scope、PID、port、executable 和 build identity。Linux 通过 systemd user + linger 注册 autostart，Windows 通过当前用户 Task Scheduler 注册；两端失败重启均有固定次数/时间窗上限。Admin service 只负责让 Web Admin 在 desktop 不存在时持续可达，不允许调用 Workspace/Gateway/Tunnel supervisor 的内部运行编排。状态文件丢失时只允许通过受验证的 config-scope 命令行或监听 PID + executable identity 恢复；无法证明 build identity 时状态为 unknown。OS 注册丢失而本地 service config 尚在时 fail closed，要求 `anchor admin upgrade/install` 修复。
 
-`management.rs` 是 CLI/Web Admin 共用的管理语义边界。除读取能力外，Workspace 创建/删除、目录打开、Skill inspection、Health、Canvs、FRP 非敏感 metadata CRUD 均由共享层提供；Workspace 配置通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP/Actions runtime 与 Tunnel start/restart/stop/test 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层；per-workspace route selector 使用 Gateway control protocol 的 additive `set_routes`，运行中的 Gateway 在同一 daemon PID 内切换 route 集合并在失败时恢复旧运行态，不允许 HTTP 直接写 Gateway runtime。HTTP handler 只负责安全校验、参数反序列化和调用共享层，不持有 daemon/Tunnel/Gateway 运行权威。
+`management.rs` 是 CLI/Web Admin 共用的管理语义边界。除读取能力外，Workspace 创建/删除、目录打开、Skill inspection、Health、Canvs、FRP 非敏感 metadata CRUD 均由共享层提供；Workspace 配置通过 CLI 共用的 `preview/stage/apply` 事务写入，浏览器使用 `baseProfile` 做 optimistic concurrency guard；MCP runtime 与 Tunnel start/restart/stop/test 都只通过 Workspace daemon 控制域执行。Gateway 配置热应用、关闭和 reload 同样进入共享层；per-workspace route selector 使用 Gateway control protocol 的 additive `set_routes`，运行中的 Gateway 在同一 daemon PID 内切换 route 集合并在失败时恢复旧运行态，不允许 HTTP 直接写 Gateway runtime。HTTP handler 只负责安全校验、参数反序列化和调用共享层，不持有 daemon/Tunnel/Gateway 运行权威。
 
 Gateway 启用时，单 Workspace MCP/Tunnel 直接控制继续 fail closed；对应运行权只能通过 Gateway route selector 变更。首 route 可启动 Gateway daemon，最后 route 移除走受控 shutdown，普通非空 route 变更使用 `set_routes` 而不是进程重启。Secret/FRP、Software 以及 Windows Service lifecycle 均已成为已评审 Web privileged executor；Service executor 只在 Windows capability manifest 中发布，非 Windows 明确 unavailable。Tauri desktop 已物理删除，Windows Service 与其余管理语义统一复用 `management.rs`。
 
@@ -116,7 +116,7 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **实现**: `crates/anchor/src/workspace/` 与 `crates/anchor/src/data/`
 
 ### runtime/
-- **职责**: MCP/Actions 运行时生命周期与恢复状态机（Stopped → Starting → Running / Recovering → Stopping → Error）以及 machine-local runtime capability / Node identity
+- **职责**: MCP 运行时生命周期与恢复状态机（Stopped → Starting → Running / Recovering → Stopping → Error）以及 machine-local runtime capability / Node identity
 - **实现**: `crates/anchor/src/runtime/`
 - **能力契约**: `anchor-runtime-capabilities-v1`；`gateway` / `federationReadOnly` / `localControl` / `durableCommands` 按当前平台支持派生，不无条件宣称可用
 
@@ -128,7 +128,7 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **升级协商**: daemon state 与 `version` additive 发布 build identity。普通写请求要求当前协议；新客户端只可用旧协议执行 read-only `version` 和稳定的 lifecycle drain（Workspace v2+、Gateway v1+），用于优雅退出旧运行权威后再由当前构建启动
 - **Web Admin 接入**: Windows/Linux 上 Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Web Admin 不提供 process-local Server 回退，检测到旧/外部 listener 时按冲突处理而不是接管
 - **配置应用**: 已运行服务使用 daemon 内单 listener reload；daemon PID、另一 listener 与 Tunnel ownership 不因普通配置应用而重启，新 listener 失败时尝试恢复旧 listener
-- **聚合读取**: `control::aggregate` 并发读取独立 Workspace/Gateway 控制域，返回 canonical MCP/Actions 状态和按 source 保留游标的事件批；聚合层不持有 Runtime/Tunnel/Gateway 运行权威
+- **聚合读取**: `control::aggregate` 并发读取独立 Workspace/Gateway 控制域，返回 canonical MCP 状态和按 source 保留游标的事件批；聚合层不持有 Runtime/Tunnel/Gateway 运行权威
 
 ### Gateway 控制域
 - **职责**: 多 Workspace 共享 MCP Gateway listener、路由集合和唯一公网 Gateway tunnel

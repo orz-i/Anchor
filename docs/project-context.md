@@ -10,7 +10,7 @@
 | 版本 | 0.1.23 |
 | 语言 | Rust + TypeScript |
 | 框架 | Rust + Vite/React Web Admin |
-| 类型 | CLI / daemon + 本机 Web 管理面 + MCP/Actions Gateway |
+| 类型 | CLI / daemon + 本机 Web 管理面 + MCP Gateway |
 | 描述 | 以 `anchor` CLI/daemon 为运行权威，并通过 persistent Web Admin 提供浏览器管理面 |
 
 ## 文档导航

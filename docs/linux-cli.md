@@ -87,7 +87,7 @@ anchor upgrade --all
 # 前台启动 MCP，Ctrl+C 优雅停止
 anchor serve <workspace>
 
-# 同时启动 MCP 与 Actions
+# 同时启动 MCP
 anchor serve <workspace> --service all
 
 # 按 profile 中的隧道配置一并启动隧道
@@ -183,7 +183,7 @@ anchor serve PROFILE_ID --service mcp
 
 ## 自动恢复
 
-`serve` 会持续检测 MCP/Actions listener，而不是只等待 `Ctrl+C`：
+`serve` 会持续检测 MCP listener，而不是只等待 `Ctrl+C`：
 
 - listener 意外退出后最多自动恢复五次；
 - `starting` 超过 10 秒会进入恢复状态；

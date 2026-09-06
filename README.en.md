@@ -100,12 +100,11 @@ environment { operation: "check" }
 
 This gives the agent explicit project and capability state instead of guessing from the current chat window.
 
-## Two ways to connect ChatGPT
+## Connect ChatGPT
 
 | Mode | Best for | Use this endpoint |
 | --- | --- | --- |
 | MCP Connector | Direct access to files, commands, and Git | the workspace's public `/mcp` URL |
-| GPT Actions | Importing OpenAPI tools into a custom GPT | the Actions panel's `/openapi.json` URL |
 
 ### MCP Connector
 
@@ -164,22 +163,13 @@ If ChatGPT still shows an old tool list, disconnect and reconnect the plugin or 
 | New tools are missing | Disconnect and reconnect the plugin, then start a new conversation |
 | A tool call fails | Open **Logs** and **Health checks** in the Web Admin and confirm that the request reached the MCP service |
 
-### GPT Actions
-
-1. Start the workspace Actions service.
-2. Copy the OpenAPI URL from the Actions panel.
-3. Import the URL in the GPT editor's Actions page.
-4. Select None, API Key, or OAuth to match the Web Admin configuration.
-
-MCP and Actions can run together for the same workspace, with separate ports and subdomains when needed.
-
 ## Why use it
 
 - **Built for real development**: files, commands, Git, tests, and retained processes live in one Workspace.
 - **Cross-conversation continuity**: a new conversation can resume the current Session through the `session` facade and read the latest structured checkpoint without relying on chat history as project state.
 - **Auditable progress**: structured checkpoints preserve decisions, changed files, test results, remaining issues, and next steps inside the project.
-- **Multiple workspaces**: one browser Web Admin stores multiple projects and manages their MCP, Actions, and public endpoints.
-- **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, FRP, and Cloudflare are built in.
+- **Multiple workspaces**: one browser Web Admin stores multiple projects and manages their MCP and public endpoints.
+- **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, FRP, and Cloudflare are built in.
 - **A focused default tool surface**: stable core tools are available by default; advanced Harness capabilities are opt-in.
 
 ## Let the project remember every development Session
@@ -286,7 +276,7 @@ The desktop/Tauri shell, installer scripts, and Tauri dependencies have been phy
 
 ### Headless Linux CLI
 
-Linux servers can build `anchor` directly. It reads the unified workspace/profile configuration and runs MCP or Actions in the foreground:
+Linux servers can build `anchor` directly. It reads the unified workspace/profile configuration and runs MCP in the foreground:
 
 ```bash
 pnpm cli:build
@@ -296,7 +286,7 @@ pnpm cli:build
 
 The Linux CLI also provides built-in daemon operations including `start`, `stop`, `restart`, `status`, `logs`, `doctor`, and `upgrade`. It will not take over a port already owned by another Anchor runtime or external process. For boot-time recovery, prefer Anchor's native `anchor service install` systemd-user control plane instead of putting repeated `restart` commands into shell profiles. See the [Linux CLI guide](docs/linux-cli.md) and [CLI daemon operations guide](docs/cli-daemon.md).
 
-Workspace-level commands include `register`, `unregister`, `show`, `start`, `stop`, `gpt-config`, and `test`, covering profile registration, redacted GPT connection settings, and MCP/Actions protocol checks. See the [Workspace CLI guide](docs/workspace-cli.md).
+Workspace-level commands include `register`, `unregister`, `show`, `start`, `stop`, `gpt-config`, and `test`, covering profile registration, redacted GPT connection settings, and MCP protocol checks. See the [Workspace CLI guide](docs/workspace-cli.md).
 
 For Windows/Linux migration, do not copy `secrets.json` directly. `anchor export` / `anchor import` (also available as `anchor config export/import`) decrypt on the source platform into a passphrase-encrypted migration bundle, then re-protect secrets with the target platform's native mechanism while preserving Workspace IDs, OAuth client IDs, and authentication secrets. `import` supports `--workspace-path WORKSPACE=ABSOLUTE_PATH` and `--dry-run` for path mapping and validation. See [cross-platform configuration migration](docs/config-migration.md).
 
@@ -318,7 +308,7 @@ See the [Anchor documentation center](docs/README.md) for the complete documenta
 
 ### Reconnection and OAuth renewal
 
-Anchor daemons and CLI detect MCP, Actions, and tunnel disconnects and recover them with bounded exponential backoff. OAuth now supports one-hour access tokens and rotating 90-day refresh tokens. Read-only status calls may retry automatically; writes and potentially side-effecting tool calls are never replayed blindly.
+Anchor daemons and CLI detect MCP and tunnel disconnects and recover them with bounded exponential backoff. OAuth now supports one-hour access tokens and rotating 90-day refresh tokens. Read-only status calls may retry automatically; writes and potentially side-effecting tool calls are never replayed blindly.
 
 See [Connection recovery, retries, and OAuth renewal](docs/reliability.md) for behavior and current limitations.
 
@@ -328,7 +318,6 @@ See [Connection recovery, retries, and OAuth renewal](docs/reliability.md) for b
 | --- | --- |
 | `crates/anchor/src/tools/` | Shared file, Patch, Exec, and Git tool kernel |
 | `crates/anchor/src/mcp/` | MCP Streamable HTTP server |
-| `crates/anchor/src/actions/` | ChatGPT Actions OpenAPI gateway |
 | `crates/anchor/src/tunnel/` | FRP / Cloudflare tunnel and process management |
 | `crates/anchor/tests/` | Rust contract, security, output-schema, and integration tests |
 | `src/` | Vite + React + React Router + shadcn/ui + Tailwind CSS Web Admin |

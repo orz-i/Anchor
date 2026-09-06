@@ -17,14 +17,12 @@ use super::frp::{self, FrpServerConfig};
 #[serde(rename_all = "lowercase")]
 pub enum TunnelServiceKind {
     Mcp,
-    Actions,
 }
 
 impl TunnelServiceKind {
     pub fn parse(service: &str) -> AppResult<Self> {
         match service.to_ascii_lowercase().as_str() {
             "mcp" => Ok(Self::Mcp),
-            "actions" => Ok(Self::Actions),
             other => Err(AppError::Message(format!(
                 "unknown tunnel service: {other}"
             ))),
@@ -273,10 +271,7 @@ impl TunnelSupervisor {
 
     pub async fn drop_workspace(&mut self, workspace_id: &str) -> AppResult<()> {
         let settings = AppSettings::load()?;
-        let keys = [
-            (workspace_id.to_string(), TunnelServiceKind::Mcp),
-            (workspace_id.to_string(), TunnelServiceKind::Actions),
-        ];
+        let keys = [(workspace_id.to_string(), TunnelServiceKind::Mcp)];
 
         // 非 FRP session 正常情况下必须持有 Child。先完成归属预检，再修改
         // FRP route；不能确认归属时保持所有线路原样，避免部分删除。
@@ -342,7 +337,7 @@ impl TunnelSupervisor {
 
     fn validate_frp_route_compatibility(
         &self,
-        workspace_id: &str,
+        _workspace_id: &str,
         config: &FrpServerConfig,
         settings: &AppSettings,
     ) -> AppResult<()> {
@@ -362,24 +357,6 @@ impl TunnelSupervisor {
             )));
         }
 
-        let Some(existing) = self
-            .frp_routes
-            .iter()
-            .find(|((route_workspace_id, _), _)| route_workspace_id == workspace_id)
-            .map(|(_, route)| route)
-        else {
-            return Ok(());
-        };
-        let existing_config =
-            frp::frp_server_config(&existing.profile, existing.kind, settings, None);
-        let same_connection = existing_config.server_addr.trim() == config.server_addr.trim()
-            && existing_config.server_port == config.server_port
-            && existing_config.token == config.token;
-        if !same_connection {
-            return Err(AppError::Message(
-                "同一工作区的 MCP 与 Actions 必须使用同一 FRP 服务器、端口和 Token。".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -575,21 +552,18 @@ fn proxy_already_exists(error: &AppError) -> bool {
 fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
-        TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
     }
 }
 
 fn tunnel_use_proxy(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.use_proxy,
-        TunnelServiceKind::Actions => profile.actions.use_proxy,
     }
 }
 
 fn tunnel_service_label(kind: TunnelServiceKind) -> &'static str {
     match kind {
         TunnelServiceKind::Mcp => "MCP",
-        TunnelServiceKind::Actions => "Actions",
     }
 }
 
@@ -600,7 +574,6 @@ fn public_url_for_profile(
 ) -> String {
     match kind {
         TunnelServiceKind::Mcp => profile.effective_public_url_with(settings),
-        TunnelServiceKind::Actions => profile.actions_effective_public_url_with(settings),
     }
 }
 
@@ -617,12 +590,6 @@ fn validate_tunnel_requirements(
                 profile.tunnel.frp_server.as_str(),
                 profile.tunnel.frp_subdomain.as_str(),
                 profile.tunnel.frp_server_port,
-            ),
-            TunnelServiceKind::Actions => (
-                profile.actions.frp_profile_id.as_str(),
-                profile.actions.frp_server.as_str(),
-                profile.actions.frp_subdomain.as_str(),
-                profile.actions.frp_server_port,
             ),
         };
         let server = resolve_frp_server(profile_id, server, settings);
@@ -648,11 +615,6 @@ fn validate_tunnel_requirements(
             profile.tunnel.cloudflare_mode.as_str(),
             "cloudflare_token",
             profile.tunnel.public_url.clone(),
-        ),
-        TunnelServiceKind::Actions => (
-            profile.actions.cloudflare_mode.as_str(),
-            "actions_cloudflare_token",
-            profile.actions.public_url.clone(),
         ),
     };
 
@@ -693,17 +655,6 @@ fn cloudflare_config(
                 token,
                 profile.tunnel.public_url.clone(),
                 "cloudflared.log",
-            ))
-        }
-        TunnelServiceKind::Actions => {
-            let token =
-                SecretStore::get(&profile.id, "actions_cloudflare_token")?.unwrap_or_default();
-            Ok((
-                profile.actions.local_port,
-                profile.actions.cloudflare_mode.as_str(),
-                token,
-                profile.actions.public_url.clone(),
-                "actions-cloudflared.log",
             ))
         }
     }
@@ -846,11 +797,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_frp_sessions_removes_stale_frp_entries_and_updates_urls() {
+    fn sync_frp_sessions_updates_urls() {
         let settings = AppSettings::default();
         let current = frp_profile("demo", "new-subdomain");
         let current_key = (current.id.clone(), TunnelServiceKind::Mcp);
-        let stale_key = (current_key.0.clone(), TunnelServiceKind::Actions);
         let mut supervisor = TunnelSupervisor::new();
         supervisor.frp_routes.insert(
             current_key.clone(),
@@ -859,15 +809,6 @@ mod tests {
                 kind: TunnelServiceKind::Mcp,
             },
         );
-        supervisor.sessions.insert(
-            stale_key,
-            TunnelSession {
-                public_url: "https://old.frp.example.com".into(),
-                pid: Some(1),
-                child: None,
-            },
-        );
-
         supervisor.sync_frp_sessions_for_workspace(&settings, &current_key.0, Some(42));
 
         assert_eq!(supervisor.sessions.len(), 1);

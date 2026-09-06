@@ -646,7 +646,7 @@ fn read_profiles_json(path: &Path) -> AppResult<(ProfilesData, bool)> {
                     path.display()
                 ))
             })?;
-            if !remove_legacy_skill_roots(&mut value) {
+            if !migrate_legacy_profiles(&mut value) {
                 return Err(crate::error::AppError::Message(format!(
                     "无法解析配置文件 {}：{primary_error}",
                     path.display()
@@ -663,7 +663,7 @@ fn read_profiles_json(path: &Path) -> AppResult<(ProfilesData, bool)> {
     }
 }
 
-fn remove_legacy_skill_roots(value: &mut serde_json::Value) -> bool {
+fn migrate_legacy_profiles(value: &mut serde_json::Value) -> bool {
     let Some(profiles) = value
         .get_mut("profiles")
         .and_then(serde_json::Value::as_array_mut)
@@ -672,6 +672,12 @@ fn remove_legacy_skill_roots(value: &mut serde_json::Value) -> bool {
     };
     let mut migrated = false;
     for profile in profiles {
+        if let Some(profile) = profile.as_object_mut() {
+            // Actions was removed from Anchor's product surface. Strip the
+            // retired per-workspace service config so pre-removal profiles
+            // upgrade cleanly to the canonical MCP-only schema.
+            migrated |= profile.remove("actions").is_some();
+        }
         let Some(runtime) = profile
             .get_mut("runtime")
             .and_then(serde_json::Value::as_object_mut)

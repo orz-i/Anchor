@@ -24,14 +24,7 @@ const MCP_KEYS: { key: SharedSecretKey; label: string }[] = [
   { key: "oauth_token_secret", label: "MCP Token Secret" },
 ];
 
-const ACTIONS_KEYS: { key: SharedSecretKey; label: string }[] = [
-  { key: "actions_api_key", label: "Actions API Key" },
-  { key: "actions_oauth_client_secret", label: "Actions OAuth 客户端密钥" },
-  { key: "actions_oauth_password", label: "Actions 授权口令" },
-  { key: "actions_oauth_token_secret", label: "Actions Token Secret" },
-];
-
-const ALL_KEYS = [...MCP_KEYS, ...ACTIONS_KEYS];
+const ALL_KEYS = MCP_KEYS;
 
 export function KeysSettingsPage() {
   const [secrets, setSecrets] = useState<Record<string, string>>({});
@@ -141,7 +134,7 @@ export function KeysSettingsPage() {
     <PageLayout
       kicker="全局设置"
       title="共享密钥"
-      description="统一管理 MCP 与 Actions 的共享认证材料。工作区启用共享密钥后，ChatGPT 可以复用同一组凭据。"
+      description="统一管理 MCP 的共享认证材料。工作区启用共享密钥后，ChatGPT 可以复用同一组凭据。"
     >
       <div className="flex flex-col gap-5">
         {!mutationsSupported && !loading && (
@@ -151,7 +144,6 @@ export function KeysSettingsPage() {
           </Alert>
         )}
         {renderGroup("MCP 认证密钥", "MCP OAuth、Bearer 与 Token Secret。", MCP_KEYS)}
-        {renderGroup("Actions 认证密钥", "ChatGPT Actions 的 API Key 与 OAuth 凭据。", ACTIONS_KEYS)}
         <div className="flex justify-end">
           <Button type="button" disabled={!mutationsSupported || !dirty || saving} onClick={() => void save()}>
             {saving ? "保存中…" : "保存更改"}

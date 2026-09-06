@@ -345,7 +345,6 @@ pub async fn request_oauth_redirect_policy_update(
         })?;
     let selected = match service {
         ControlService::Mcp => state.service.includes_mcp(),
-        ControlService::Actions => state.service.includes_actions(),
     };
     if !selected {
         return Ok(false);
@@ -463,14 +462,12 @@ pub async fn request_reload_operation(
         })?;
     let selected = match service {
         ControlService::Mcp => state.service.includes_mcp(),
-        ControlService::Actions => state.service.includes_actions(),
     };
     if !selected {
         return Err(ControlClientError::Protocol(format!(
             "daemon is not currently running the requested {} service; reload only applies to active services",
             match service {
                 ControlService::Mcp => "mcp",
-                ControlService::Actions => "actions",
             }
         )));
     }
@@ -1457,11 +1454,6 @@ async fn handle_request_with_settings(
                         crate::tunnel::TunnelServiceKind::Mcp,
                         &settings,
                     ));
-                    status.actions_tunnel = Some(tunnels.status(
-                        profile,
-                        crate::tunnel::TunnelServiceKind::Actions,
-                        &settings,
-                    ));
                     handled(ControlResponse::success(
                         request_id,
                         ControlResult::WorkspaceStatus {
@@ -1703,7 +1695,6 @@ async fn handle_request_with_settings(
             }
             let service_name = match service {
                 ControlService::Mcp => "mcp",
-                ControlService::Actions => "actions",
             };
             match crate::auth::update_oauth_redirect_policy(
                 &profile.id,
@@ -2318,11 +2309,8 @@ mod tests {
         let expected = ControlConfigApplyResult {
             changed: true,
             mcp_listener_reloaded: true,
-            actions_listener_reloaded: false,
             mcp_callback_hot_updated: false,
-            actions_callback_hot_updated: true,
             mcp_tunnel_reloaded: false,
-            actions_tunnel_reloaded: false,
         };
         finish_config_apply_operation(&operation_id, Ok(expected.clone()));
         let completed = handle_request(
@@ -2406,7 +2394,7 @@ mod tests {
                 request_id: "oauth-hot-update-missing".into(),
                 method: ControlMethod::UpdateOauthRedirectPolicy {
                     workspace_id: profile.id.clone(),
-                    service: ControlService::Actions,
+                    service: ControlService::Mcp,
                     redirect_uris: "https://chatgpt.com/callback".into(),
                     redirect_hosts: "chatgpt.com".into(),
                 },

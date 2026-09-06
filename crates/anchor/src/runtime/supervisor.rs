@@ -4,14 +4,12 @@ use std::time::Duration;
 
 use crate::async_runtime::JoinHandle;
 
-use crate::actions;
 use crate::error::AppResult;
 use crate::mcp;
 use crate::platform::platform;
 use crate::runtime::port::{is_own_process, port_busy_message, wait_for_port_free_blocking};
 use crate::secret::SecretStore;
 use crate::settings::AppSettings;
-use crate::tools::policy::PolicySettings;
 use crate::tunnel::append_profile_log;
 use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
 
@@ -23,7 +21,6 @@ const STARTING_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceKind {
     Mcp,
-    Actions,
 }
 
 fn starting_stalled(entry: &RuntimeEntry) -> bool {
@@ -79,10 +76,6 @@ impl RuntimeSupervisor {
 
     pub fn start_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.start(profile, ServiceKind::Mcp)
-    }
-
-    pub fn start_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.start(profile, ServiceKind::Actions)
     }
 
     #[cfg(unix)]
@@ -180,10 +173,6 @@ impl RuntimeSupervisor {
 
     pub fn maintain_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
         self.maintain(profile, ServiceKind::Mcp)
-    }
-
-    pub fn maintain_actions(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
-        self.maintain(profile, ServiceKind::Actions)
     }
 
     pub fn active_mcp_workspace_ids(&self) -> HashSet<String> {
@@ -501,68 +490,6 @@ impl RuntimeSupervisor {
                     (shutdown, handle, listener, Some(readiness))
                 })
             }
-            ServiceKind::Actions => {
-                let auth_type = profile.actions.auth_type.clone();
-                let use_shared = profile.actions.use_shared_secrets;
-                let api_key = if auth_type == "api_key" {
-                    resolve_secret(&profile.id, "actions_api_key", use_shared)?
-                } else {
-                    None
-                };
-                let oauth_client_secret = if auth_type == "oauth" {
-                    if use_shared {
-                        resolve_secret(&profile.id, "actions_oauth_client_secret", true)?
-                    } else {
-                        Some(actions_oauth_secret(
-                            &profile.id,
-                            "actions_oauth_client_secret",
-                        )?)
-                    }
-                } else {
-                    None
-                };
-                let oauth_password = if auth_type == "oauth" {
-                    if use_shared {
-                        resolve_secret(&profile.id, "actions_oauth_password", true)?
-                    } else {
-                        Some(actions_oauth_secret(&profile.id, "actions_oauth_password")?)
-                    }
-                } else {
-                    None
-                };
-                let oauth_token_secret = if auth_type == "oauth" {
-                    if use_shared {
-                        resolve_secret(&profile.id, "actions_oauth_token_secret", true)?
-                    } else {
-                        Some(actions_oauth_secret(
-                            &profile.id,
-                            "actions_oauth_token_secret",
-                        )?)
-                    }
-                } else {
-                    None
-                };
-                let public_base_url = profile.actions_public_base_url()?;
-                let policy = PolicySettings::from_actions_config(&profile.actions);
-                actions::spawn_listener_with_handoff(
-                    &profile.id,
-                    profile.name.clone(),
-                    port,
-                    PathBuf::from(&profile.path),
-                    public_base_url,
-                    auth_type,
-                    api_key,
-                    profile.actions.oauth_client_id.clone(),
-                    profile.actions.oauth_redirect_uris.clone(),
-                    profile.actions.oauth_redirect_hosts.clone(),
-                    oauth_client_secret,
-                    oauth_password,
-                    oauth_token_secret,
-                    policy,
-                    imported_listener,
-                )
-                .map(|(shutdown, handle, listener)| (shutdown, handle, listener, None))
-            }
         };
 
         match spawn_result {
@@ -830,7 +757,6 @@ fn should_mark_runtime_error(entry: &mut RuntimeEntry, listening: bool) -> bool 
 fn port_for(profile: &WorkspaceProfile, kind: ServiceKind) -> u16 {
     match kind {
         ServiceKind::Mcp => profile.runtime.local_port,
-        ServiceKind::Actions => profile.actions.local_port,
     }
 }
 
@@ -844,10 +770,6 @@ fn endpoints(
             profile.local_endpoint(),
             profile.public_endpoint_with(settings),
         ),
-        ServiceKind::Actions => (
-            profile.actions_local_base_url(),
-            profile.actions_openapi_url_with(settings),
-        ),
     }
 }
 
@@ -858,21 +780,18 @@ fn public_message_for(
 ) -> String {
     match kind {
         ServiceKind::Mcp => profile.mcp_external_base_url_with(settings),
-        ServiceKind::Actions => profile.actions_effective_public_url_with(settings),
     }
 }
 
 fn service_label(kind: ServiceKind) -> &'static str {
     match kind {
         ServiceKind::Mcp => "本地 MCP ",
-        ServiceKind::Actions => "本地 Actions ",
     }
 }
 
 fn stderr_log_name(kind: ServiceKind) -> &'static str {
     match kind {
         ServiceKind::Mcp => "stderr.log",
-        ServiceKind::Actions => "actions-stderr.log",
     }
 }
 
@@ -882,13 +801,6 @@ fn resolve_secret(profile_id: &str, key: &str, use_shared: bool) -> AppResult<Op
         SecretStore::get_shared(key)
     } else {
         SecretStore::get(profile_id, key)
-    }
-}
-
-fn actions_oauth_secret(profile_id: &str, key: &str) -> AppResult<String> {
-    match SecretStore::get(profile_id, key)? {
-        Some(value) if !value.is_empty() => Ok(value),
-        _ => SecretStore::regenerate(profile_id, key),
     }
 }
 

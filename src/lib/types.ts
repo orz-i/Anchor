@@ -7,7 +7,6 @@ export type RuntimeState =
   | "error";
 
 export const DEFAULT_SERVICE_PORT = 28766;
-export const DEFAULT_ACTIONS_PORT = 8787;
 
 export interface TunnelConfig {
   type: string;
@@ -310,31 +309,6 @@ export interface RuntimeConfig {
   external_paid_max_duration_seconds?: number;
 }
 
-export interface ActionsConfig {
-  public_url: string;
-  tunnel_type: string;
-  frp_server: string;
-  frp_subdomain: string;
-  frp_profile_id?: string;
-  frp_server_port?: number;
-  frp_proxy_type?: string;
-  frp_cert_path?: string;
-  frp_key_path?: string;
-  cloudflare_mode: string;
-  use_proxy?: boolean;
-  local_port: number;
-  permission_mode: string;
-  runtime_command?: string;
-  auth_type: string;
-  oauth_client_id?: string;
-  oauth_redirect_uris?: string;
-  oauth_redirect_hosts?: string;
-  oauth_scopes?: string;
-  allowed_commands?: string;
-  max_patch_bytes?: number;
-  use_shared_secrets?: boolean;
-}
-
 export interface WorkspaceProfile {
   id: string;
   name: string;
@@ -342,7 +316,6 @@ export interface WorkspaceProfile {
   tunnel: TunnelConfig;
   auth: AuthConfig;
   runtime: RuntimeConfig;
-  actions?: ActionsConfig;
 }
 
 export interface RuntimeStatus {
@@ -363,9 +336,9 @@ export interface DaemonState {
   workspacePath: string;
   pid: number;
   startedAtUnix: number;
-  service: "mcp" | "actions" | "all";
+  service: "mcp" | "all";
   tunnel: boolean;
-  tunnelServices?: "mcp" | "actions" | "all" | null;
+  tunnelServices?: "mcp" | "all" | null;
   logPath: string;
   version: string;
   buildIdentity?: {
@@ -408,13 +381,11 @@ export interface WorkspaceControlStatus {
   path: string;
   daemon: DaemonInspection;
   mcp: WorkspacePortStatus;
-  actions: WorkspacePortStatus;
   mcpActivity?: McpActivity | null;
   mcpTunnel?: WorkspaceTunnelStatus | null;
-  actionsTunnel?: WorkspaceTunnelStatus | null;
 }
 
-export type ControlService = "mcp" | "actions";
+export type ControlService = "mcp";
 export type ControlEventKind =
   | "daemon_ready"
   | "daemon_stopping"
@@ -506,7 +477,6 @@ export interface GatewayEventBatch {
 
 export interface ControlPlaneWorkspaceStatus extends WorkspaceControlStatus {
   mcpState: RuntimeState;
-  actionsState: RuntimeState;
 }
 
 export interface NodeIdentity {
@@ -678,7 +648,6 @@ export interface FederationNodeControlStatus {
   gatewayState: string;
   workspaceCount: number;
   mcpActiveCount: number;
-  actionsActiveCount: number;
 }
 
 export interface FederationWorkspaceStatus {
@@ -686,7 +655,6 @@ export interface FederationWorkspaceStatus {
   workspaceId: string;
   displayName: string;
   mcpState: string;
-  actionsState: string;
 }
 
 export type FederationReadResult =
@@ -755,38 +723,8 @@ export interface RuntimeRecovery {
   lastError: string;
 }
 
-export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {
-  return {
-    public_url: "",
-    tunnel_type: "cloudflare",
-    frp_server: "",
-    frp_subdomain: "",
-    cloudflare_mode: "named",
-    local_port: DEFAULT_ACTIONS_PORT,
-    permission_mode: "trusted",
-    auth_type: "api_key",
-    allowed_commands:
-      "pytest,python,python3,npm,npx,node,pnpm,yarn,make,mvn,mvnw,gradle,gradlew,cargo,go,ruff,mypy,eslint,tsc",
-    max_patch_bytes: 200_000,
-    ...profile.actions,
-  };
-}
-
 export function mcpLocalEndpoint(port: number): string {
   return `http://127.0.0.1:${port}/mcp`;
-}
-
-export function actionsLocalEndpoint(port: number): string {
-  return `http://127.0.0.1:${port}`;
-}
-
-export interface ActionsAuthDraft {
-  authType: string;
-  oauthClientId: string;
-  oauthRedirectUris: string;
-  oauthRedirectHosts: string;
-  oauthScopes: string;
-  useSharedSecrets?: boolean;
 }
 
 export interface FrpProfileSummary {
@@ -813,53 +751,4 @@ export function frpPublicUrl(
     profiles.find((profile) => profile.id === frpProfileId)?.server ?? frpServer;
   if (!server) return publicUrl.replace(/\/$/, "");
   return `https://${frpSubdomain}.${server}`;
-}
-
-export function actionsPublicBaseUrl(
-  profile: WorkspaceProfile,
-  frpProfiles: FrpProfileSummary[] = [],
-): string {
-  const actions = actionsConfig(profile);
-  const publicUrl = frpPublicUrl(
-    actions.tunnel_type,
-    actions.frp_subdomain,
-    actions.frp_server,
-    actions.frp_profile_id,
-    frpProfiles,
-    actions.public_url,
-  );
-  if (publicUrl) return publicUrl;
-  return actionsLocalEndpoint(actions.local_port);
-}
-
-export function actionsOpenApiUrl(
-  profile: WorkspaceProfile,
-  frpProfiles: FrpProfileSummary[] = [],
-): string {
-  const base = actionsPublicBaseUrl(profile, frpProfiles);
-  return base ? `${base.replace(/\/$/, "")}/openapi.json` : "";
-}
-
-export function actionsPrivacyUrl(
-  profile: WorkspaceProfile,
-  frpProfiles: FrpProfileSummary[] = [],
-): string {
-  const base = actionsPublicBaseUrl(profile, frpProfiles);
-  return base ? `${base.replace(/\/$/, "")}/privacy` : "";
-}
-
-export function actionsOAuthAuthorizeUrl(
-  profile: WorkspaceProfile,
-  frpProfiles: FrpProfileSummary[] = [],
-): string {
-  const base = actionsPublicBaseUrl(profile, frpProfiles);
-  return base ? `${base.replace(/\/$/, "")}/oauth/authorize` : "";
-}
-
-export function actionsOAuthTokenUrl(
-  profile: WorkspaceProfile,
-  frpProfiles: FrpProfileSummary[] = [],
-): string {
-  const base = actionsPublicBaseUrl(profile, frpProfiles);
-  return base ? `${base.replace(/\/$/, "")}/oauth/token` : "";
 }

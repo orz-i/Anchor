@@ -26,7 +26,6 @@ const SIGTERM_VALUE: i32 = 15;
 #[serde(rename_all = "lowercase")]
 pub enum ServiceSelection {
     Mcp,
-    Actions,
     All,
 }
 
@@ -260,7 +259,6 @@ impl ServiceSelection {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mcp => "mcp",
-            Self::Actions => "actions",
             Self::All => "all",
         }
     }
@@ -268,18 +266,13 @@ impl ServiceSelection {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "mcp" => Ok(Self::Mcp),
-            "actions" => Ok(Self::Actions),
             "all" => Ok(Self::All),
-            _ => Err(format!("无效服务类型：{value}；可选值为 mcp、actions、all")),
+            _ => Err(format!("无效服务类型：{value}；可选值为 mcp、all")),
         }
     }
 
     pub fn includes_mcp(self) -> bool {
         matches!(self, Self::Mcp | Self::All)
-    }
-
-    pub fn includes_actions(self) -> bool {
-        matches!(self, Self::Actions | Self::All)
     }
 }
 
@@ -817,7 +810,6 @@ pub(crate) fn spawn_handoff_successor(
     handoff_id: &str,
     predecessor_pid: u32,
     mcp_listener: Option<&crate::runtime::InheritableListener>,
-    actions_listener: Option<&crate::runtime::InheritableListener>,
 ) -> AppResult<u32> {
     ensure_daemon_supported()?;
     validate_handoff_id(handoff_id)?;
@@ -852,12 +844,6 @@ pub(crate) fn spawn_handoff_successor(
             "handoff is missing the MCP listener".into(),
         ));
     }
-    if service.includes_actions() && actions_listener.is_none() {
-        return Err(AppError::Message(
-            "handoff is missing the Actions listener".into(),
-        ));
-    }
-
     let log_path = daemon_log_path(&profile.id);
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
@@ -879,11 +865,6 @@ pub(crate) fn spawn_handoff_successor(
     if let Some(listener) = mcp_listener {
         command
             .arg("--handoff-mcp-fd")
-            .arg(listener.raw_fd().to_string());
-    }
-    if let Some(listener) = actions_listener {
-        command
-            .arg("--handoff-actions-fd")
             .arg(listener.raw_fd().to_string());
     }
     command
@@ -1093,9 +1074,6 @@ fn selected_ports_owned_by(
     let mut ports = Vec::new();
     if service.includes_mcp() {
         ports.push(profile.runtime.local_port);
-    }
-    if service.includes_actions() {
-        ports.push(profile.actions.local_port);
     }
     for port in ports {
         if platform().find_pid_listening_on_port(port)? != Some(pid) {

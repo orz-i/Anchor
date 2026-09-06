@@ -47,7 +47,7 @@ export function LogViewer({ workspaceId, service, autoRefresh = false, title }: 
   return (
     <Card>
       <CardHeader className="flex-row items-start justify-between gap-4">
-        <div><CardTitle>{title ?? (service === "mcp" ? "MCP 日志" : "Actions 日志")}</CardTitle><CardDescription className="mt-1">Daemon 有界日志快照（最多 8KB）</CardDescription></div>
+        <div><CardTitle>{title ?? "MCP 日志"}</CardTitle><CardDescription className="mt-1">Daemon 有界日志快照（最多 8KB）</CardDescription></div>
         <div className="flex items-center gap-3"><label className="flex items-center gap-2 text-xs text-muted-foreground"><Checkbox checked={autoRefreshEnabled} onCheckedChange={(checked) => setAutoRefreshEnabled(Boolean(checked))} />自动刷新（3 秒）</label><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => void refresh(true)}><RefreshCw data-icon="inline-start" className={busy ? "animate-spin" : undefined} />刷新</Button></div>
       </CardHeader>
       <CardContent>

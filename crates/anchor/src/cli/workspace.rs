@@ -23,7 +23,6 @@ struct WorkspaceMutationResult {
     event: &'static str,
     workspace: WorkspaceIdentity,
     mcp_port: u16,
-    actions_port: u16,
     project_files_deleted: bool,
     warnings: Vec<String>,
 }
@@ -34,11 +33,10 @@ fn assign_os_available_ports(
 ) -> AppResult<()> {
     let mut reserved = profiles
         .iter()
-        .flat_map(|item| [item.runtime.local_port, item.actions.local_port])
+        .map(|item| item.runtime.local_port)
         .collect::<std::collections::HashSet<_>>();
     profile.runtime.local_port = next_available_port(profile.runtime.local_port, &reserved)?;
     reserved.insert(profile.runtime.local_port);
-    profile.actions.local_port = next_available_port(profile.actions.local_port, &reserved)?;
     Ok(())
 }
 
@@ -200,10 +198,7 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
     }
 
     let mut warnings = Vec::new();
-    for (label, port) in [
-        ("MCP", profile.runtime.local_port),
-        ("Actions", profile.actions.local_port),
-    ] {
+    for (label, port) in [("MCP", profile.runtime.local_port)] {
         if let Some(pid) = platform().find_pid_listening_on_port(port)? {
             warnings.push(format!(
                 "{label} 端口 {port} 当前由外部 PID {pid} 监听；注销不会停止该进程"
@@ -240,12 +235,6 @@ fn show_gpt_config(options: GptConfigOptions, as_json: bool) -> AppResult<()> {
         root.insert(
             "mcp".into(),
             mcp_gpt_config(&store, profile, options.endpoint, options.show_secrets)?,
-        );
-    }
-    if options.service.includes_actions() {
-        root.insert(
-            "actions".into(),
-            actions_gpt_config(&store, profile, options.endpoint, options.show_secrets)?,
         );
     }
     let value = Value::Object(root);
@@ -320,55 +309,6 @@ fn mcp_gpt_config(
     }))
 }
 
-fn actions_gpt_config(
-    store: &DataStore,
-    profile: &WorkspaceProfile,
-    mode: EndpointSelection,
-    show_secrets: bool,
-) -> AppResult<Value> {
-    let (base, source) = select_actions_base(profile, mode)?;
-    let shared = profile.actions.use_shared_secrets;
-    let auth = match profile.actions.auth_type.as_str() {
-        "api_key" => {
-            let key = secret(store, profile, "actions_api_key", shared)?;
-            json!({
-                "type": "api_key",
-                "header": "Authorization",
-                "scheme": "Bearer",
-                "apiKey": visible_secret(key, show_secrets),
-                "usesSharedSecrets": shared
-            })
-        }
-        "oauth" => {
-            let secret = secret(store, profile, "actions_oauth_client_secret", shared)?;
-            let redirect_uris = redirect_uri_list(&profile.actions.oauth_redirect_uris);
-            let redirect_hosts = redirect_uri_list(&profile.actions.oauth_redirect_hosts);
-            json!({
-                "type": "oauth",
-                "clientId": profile.actions.oauth_client_id,
-                "clientSecret": visible_secret(secret, show_secrets),
-                "authorizationUrl": format!("{base}/oauth/authorize"),
-                "tokenUrl": format!("{base}/oauth/token"),
-                "scope": profile.actions.oauth_scopes,
-                "usesSharedSecrets": shared,
-                "registeredRedirectUris": redirect_uris,
-                "builtInCallbackHosts": builtin_redirect_hosts(),
-                "callbackEnrollmentHosts": redirect_hosts,
-                "callbackRegistrationRequired": false,
-                "callbackRegistrationNote": "Official ChatGPT callbacks are accepted automatically. Additional configured callback hosts auto-enroll the exact redirect URI without GUI interaction or service restart."
-            })
-        }
-        other => json!({ "type": other }),
-    };
-    Ok(json!({
-        "openApiSchemaUrl": format!("{base}/openapi.json"),
-        "privacyPolicyUrl": format!("{base}/privacy"),
-        "endpointSource": source,
-        "auth": auth,
-        "setupPath": "GPT Editor → Actions → Import from URL"
-    }))
-}
-
 async fn test_workspace(options: WorkspaceTestOptions, as_json: bool) -> AppResult<i32> {
     let store = DataStore::load()?;
     let profile = super::resolve_workspace(store.list(), &options.workspace)?.clone();
@@ -379,9 +319,6 @@ async fn test_workspace(options: WorkspaceTestOptions, as_json: bool) -> AppResu
     let mut checks = Vec::new();
     if options.service.includes_mcp() {
         checks.extend(test_mcp(&client, &store, &profile, options.endpoint).await);
-    }
-    if options.service.includes_actions() {
-        checks.extend(test_actions(&client, &store, &profile, options.endpoint).await);
     }
     let ok = checks.iter().all(|check| check.ok);
     let report = ConnectionTestReport {
@@ -527,140 +464,6 @@ async fn test_mcp(
     checks
 }
 
-async fn test_actions(
-    client: &reqwest::Client,
-    store: &DataStore,
-    profile: &WorkspaceProfile,
-    mode: EndpointSelection,
-) -> Vec<ConnectionCheck> {
-    let base = match select_actions_base(profile, mode) {
-        Ok((base, _)) => base,
-        Err(error) => {
-            return vec![failed_check(
-                "actions",
-                "Endpoint",
-                error.to_string(),
-                "配置公网 URL 或改用 --local",
-            )]
-        }
-    };
-    let mut checks = vec![
-        test_status_url(client, "actions", "Health", &format!("{base}/health"), 200).await,
-        test_json_url(
-            client,
-            "actions",
-            "OpenAPI Schema",
-            &format!("{base}/openapi.json"),
-            "openapi",
-        )
-        .await,
-        test_status_url(
-            client,
-            "actions",
-            "Privacy Policy",
-            &format!("{base}/privacy"),
-            200,
-        )
-        .await,
-    ];
-    match profile.actions.auth_type.as_str() {
-        "oauth" => {
-            checks.push(
-                test_json_url(
-                    client,
-                    "actions",
-                    "OAuth Metadata",
-                    &format!("{base}/.well-known/oauth-authorization-server"),
-                    "token_endpoint_auth_methods_supported",
-                )
-                .await,
-            );
-            match client
-                .post(format!("{base}/actions/server_info"))
-                .json(&json!({}))
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let challenge = response
-                        .headers()
-                        .get(WWW_AUTHENTICATE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("");
-                    checks.push(check(
-                        "actions",
-                        "OAuth Challenge",
-                        status == 401 && challenge.contains("resource_metadata"),
-                        format!("POST server_info → HTTP {status}; WWW-Authenticate={challenge}"),
-                        "确认反向代理保留 WWW-Authenticate 响应头",
-                    ));
-                }
-                Err(error) => checks.push(failed_check(
-                    "actions",
-                    "OAuth Challenge",
-                    error.to_string(),
-                    "确认 Actions 服务和公网入口可达",
-                )),
-            }
-        }
-        "api_key" => {
-            let api_key = secret(
-                store,
-                profile,
-                "actions_api_key",
-                profile.actions.use_shared_secrets,
-            )
-            .ok()
-            .flatten();
-            checks.push(
-                test_actions_call(
-                    client,
-                    &base,
-                    api_key.as_deref().map(bearer_value),
-                    "API Key 调用",
-                )
-                .await,
-            );
-        }
-        _ => checks.push(test_actions_call(client, &base, None, "无认证调用").await),
-    }
-    checks
-}
-
-async fn test_actions_call(
-    client: &reqwest::Client,
-    base: &str,
-    authorization: Option<String>,
-    name: &str,
-) -> ConnectionCheck {
-    let mut request = client
-        .post(format!("{base}/actions/server_info"))
-        .json(&json!({}));
-    if let Some(authorization) = authorization {
-        request = request.header(AUTHORIZATION, authorization);
-    }
-    match request.send().await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            check(
-                "actions",
-                name,
-                status == 200 && text.contains("\"ok\":true"),
-                format!("POST server_info → HTTP {status}"),
-                "确认 Actions 认证密钥、工具暴露和服务状态",
-            )
-        }
-        Err(error) => failed_check(
-            "actions",
-            name,
-            error.to_string(),
-            "确认 Actions 服务可达并检查认证配置",
-        ),
-    }
-}
-
 async fn test_mcp_initialize(
     client: &reqwest::Client,
     endpoint: &str,
@@ -744,28 +547,6 @@ async fn test_json_url(
     }
 }
 
-async fn test_status_url(
-    client: &reqwest::Client,
-    service: &'static str,
-    name: &str,
-    url: &str,
-    expected: u16,
-) -> ConnectionCheck {
-    match client.get(url).send().await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            check(
-                service,
-                name,
-                status == expected,
-                format!("GET {url} → HTTP {status}"),
-                "确认 Actions 服务、隧道和反向代理状态",
-            )
-        }
-        Err(error) => failed_check(service, name, error.to_string(), "确认 URL、DNS 和服务状态"),
-    }
-}
-
 fn select_mcp_endpoint(
     profile: &WorkspaceProfile,
     mode: EndpointSelection,
@@ -773,15 +554,6 @@ fn select_mcp_endpoint(
     let local = profile.local_endpoint();
     let public = profile.public_endpoint()?;
     select_endpoint(local, public, mode, "MCP")
-}
-
-fn select_actions_base(
-    profile: &WorkspaceProfile,
-    mode: EndpointSelection,
-) -> AppResult<(String, &'static str)> {
-    let local = profile.actions_local_base_url();
-    let public = profile.actions_effective_public_url()?;
-    select_endpoint(local, public, mode, "Actions")
 }
 
 fn select_endpoint(
@@ -887,7 +659,6 @@ fn print_mutation(
         event,
         workspace: identity(profile),
         mcp_port: profile.runtime.local_port,
-        actions_port: profile.actions.local_port,
         project_files_deleted,
         warnings,
     };
@@ -895,8 +666,8 @@ fn print_mutation(
         super::print_json(&result)?;
     } else {
         println!(
-            "{}\t{}\t{}\tMCP:{}\tActions:{}",
-            event, result.workspace.id, result.workspace.path, result.mcp_port, result.actions_port
+            "{}\t{}\t{}\tMCP:{}",
+            event, result.workspace.id, result.workspace.path, result.mcp_port
         );
         if event == "unregistered" {
             println!("项目文件未删除。");
@@ -927,22 +698,6 @@ fn print_human_gpt_config(value: &Value) {
         );
         print_secret("Bearer Token", &mcp["auth"]["bearerToken"]);
         print_redirect_uris(&mcp["auth"]);
-    }
-    if let Some(actions) = value.get("actions") {
-        println!("\n[GPT Actions]");
-        println!(
-            "OpenAPI: {}",
-            actions["openApiSchemaUrl"].as_str().unwrap_or("")
-        );
-        println!(
-            "Privacy: {}",
-            actions["privacyPolicyUrl"].as_str().unwrap_or("")
-        );
-        println!("Auth: {}", actions["auth"]["type"].as_str().unwrap_or(""));
-        print_optional("Client ID", &actions["auth"]["clientId"]);
-        print_secret("Client Secret", &actions["auth"]["clientSecret"]);
-        print_secret("API Key", &actions["auth"]["apiKey"]);
-        print_redirect_uris(&actions["auth"]);
     }
 }
 

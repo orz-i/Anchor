@@ -55,7 +55,7 @@ POST /federation/v2/read        # authenticated + signed read-only transport
 打开 **设置 → 通用 → 单一 MCP Gateway**：
 
 1. 选择“启用单一 Gateway”；
-2. 设置一个未被任何 MCP/Actions 服务占用的本地端口，默认 `28765`；
+2. 设置一个未被任何 MCP 服务占用的本地端口，默认 `28765`；
 3. 选择“隧道所有者工作区”；
 4. 固定 FRP/Named Tunnel 可以预填公网基础地址；Quick Tunnel 可留空；
 5. 保存后，启动需要暴露的工作区 MCP 服务。
@@ -154,8 +154,7 @@ RestartSec=3
 - Gateway 只允许受控 method 和固定 MCP/OAuth/Federation 路径；Workspace reverse proxy 不能访问 Federation handler，Federation handler 也不能切换 Workspace；
 - Gateway 内部转发显式禁用系统代理，移除 hop-by-hop 与 `Connection` 动态声明的 Header，并由 HTTP 客户端重算请求长度；
 - Gateway 模式下文件工具拒绝显式绝对路径、父目录路径和解析后越出 Workspace 的路径；子进程命令也拒绝绝对路径与父目录路径参数；
-- Actions 服务与隧道不合并，仍按工作区独立运行；
-- Gateway 端口不能与任何工作区 MCP/Actions 端口冲突。
+- Gateway 端口不能与任何工作区 MCP 端口冲突。
 
 ## 资源与恢复策略
 

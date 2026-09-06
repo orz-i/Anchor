@@ -87,10 +87,6 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "start_runtime",
     "stop_runtime",
     "restart_runtime",
-    "get_actions_runtime_status",
-    "start_actions_runtime",
-    "stop_actions_runtime",
-    "restart_actions_runtime",
     "get_workspace_control_status",
     "get_workspace_control_events",
     "get_workspace_secret",
@@ -181,9 +177,6 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "start_runtime",
     "stop_runtime",
     "restart_runtime",
-    "start_actions_runtime",
-    "stop_actions_runtime",
-    "restart_actions_runtime",
     "start_tunnel",
     "restart_tunnel",
     "stop_tunnel",
@@ -1640,38 +1633,6 @@ async fn dispatch_command(
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
                 management::restart_workspace_service(&input.id, WorkspaceService::Mcp).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "get_actions_runtime_status" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::runtime_status(&input.id, WorkspaceService::Actions).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "start_actions_runtime" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::start_workspace_service(&input.id, WorkspaceService::Actions).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "stop_actions_runtime" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::stop_workspace_service(&input.id, WorkspaceService::Actions).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "restart_actions_runtime" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::restart_workspace_service(&input.id, WorkspaceService::Actions).await?,
             )
             .map_err(AppError::from)
             .map_err(Into::into)

@@ -100,12 +100,11 @@ environment { operation: "check" }
 
 这样 Agent 不需要依赖聊天上下文猜测当前项目、工作目录和执行能力。
 
-## ChatGPT 的两种接入方式
+## ChatGPT 接入方式
 
 | 方式 | 适合场景 | 在客户端中使用什么 |
 | --- | --- | --- |
 | MCP Connector | ChatGPT 直接使用文件、命令和 Git 工具 | 工作区的公网 `/mcp` 地址 |
-| GPT Actions | 在自定义 GPT 中导入 OpenAPI 工具 | Actions 面板中的 `/openapi.json` 地址 |
 
 ### MCP Connector
 
@@ -164,22 +163,13 @@ environment { operation: "check" }
 | 看不到新增工具 | 断开并重新连接插件，然后创建一个新对话 |
 | 工具调用失败 | 打开 Web Admin“日志”和“健康检查”，确认请求是否到达 MCP 服务 |
 
-### GPT Actions
-
-1. 启动工作区的 Actions 服务。
-2. 复制 Actions 面板中的 OpenAPI URL。
-3. 在 GPT 编辑器的 Actions 页面导入该 URL。
-4. 根据 Web Admin 配置选择 None、API Key 或 OAuth。
-
-MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用不同端口和子域名。
-
 ## 为什么需要它
 
 - **面向真实开发**：文件、命令、Git、测试和长时间运行的进程都在同一个 Workspace 中。
 - **跨会话持续开发**：新对话可以通过 `session` facade 恢复当前 Session，并读取最近保存的结构化检查点，不必依赖聊天窗口保存工程进度。
 - **进度可追溯**：每轮任务完成后可保存结构化检查点，决策、修改、测试结果和下一步都留在项目目录中。
-- **多工作区管理**：一个浏览器 Web Admin 可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
-- **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
+- **多工作区管理**：一个浏览器 Web Admin 可以保存多个项目，并管理各自的 MCP 和公网地址。
+- **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、FRP 和 Cloudflare 隧道。
 - **默认工具面保持简单**：稳定的核心工具默认可用，高级 Harness 能力按需开启。
 
 ## 让项目记住每次开发 Session
@@ -294,7 +284,7 @@ cd crates/anchor && cargo clippy --all-targets -- -D warnings
 
 ### Linux 无界面 CLI
 
-Linux 服务器可以直接构建 `anchor`，读取统一的 workspace/profile 配置，并以前台模式运行 MCP 或 Actions：
+Linux 服务器可以直接构建 `anchor`，读取统一的 workspace/profile 配置，并以前台模式运行 MCP：
 
 ```bash
 pnpm cli:build
@@ -304,7 +294,7 @@ pnpm cli:build
 
 CLI 也提供 Linux 后台 daemon 与 `start/stop/restart/status/logs/doctor/upgrade` 运维命令。它不会接管已被其他 Anchor runtime 或外部进程占用的端口；需要节点重启后自动恢复时，推荐使用 Anchor 原生的 `anchor service install` systemd-user control-plane，而不是在 shell profile 中重复 `restart`。完整说明见 [Linux CLI 使用指南](docs/linux-cli.md) 和 [CLI Daemon 与运维命令](docs/cli-daemon.md)。
 
-Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`，可直接注册项目、查看脱敏的 GPT 连接配置并验证 MCP/Actions 协议。见 [Workspace CLI 注册与 GPT 连接运维](docs/workspace-cli.md)。
+Workspace 级 CLI 支持 `register/unregister/show/start/stop/gpt-config/test`，可直接注册项目、查看脱敏的 GPT 连接配置并验证 MCP 协议。见 [Workspace CLI 注册与 GPT 连接运维](docs/workspace-cli.md)。
 
 跨 Windows/Linux 迁移不要直接复制 `secrets.json`。使用 `anchor export` / `anchor import`（或 `anchor config export/import`）可在源平台解密后生成 passphrase 加密迁移包，并在目标平台按本机 secret protection 重新保存，同时保留 Workspace ID、OAuth client ID 和认证 secrets。`import` 支持 `--workspace-path WORKSPACE=ABSOLUTE_PATH` 与 `--dry-run` 进行目录映射和预检。完整说明见 [跨平台配置迁移](docs/config-migration.md)。
 
@@ -326,7 +316,7 @@ MCP 仍只公开一个 `skill` facade：read-only/core 可 list/get/read_resourc
 
 ### 断联恢复与 OAuth 续约
 
-Anchor daemon/CLI 会检测 MCP、Actions 与隧道断联，并使用有限次数的指数退避自动恢复。OAuth 支持 1 小时 Access Token 和轮换的 90 天 Refresh Token。只读状态查询可自动重试，保存和可能产生副作用的工具调用不会盲目重放。
+Anchor daemon/CLI 会检测 MCP 与隧道断联，并使用有限次数的指数退避自动恢复。OAuth 支持 1 小时 Access Token 和轮换的 90 天 Refresh Token。只读状态查询可自动重试，保存和可能产生副作用的工具调用不会盲目重放。
 
 详细策略和当前限制见 [连接恢复、自动重试与 OAuth 续约](docs/reliability.md)。
 
@@ -336,7 +326,6 @@ Anchor daemon/CLI 会检测 MCP、Actions 与隧道断联，并使用有限次�
 | --- | --- |
 | `crates/anchor/src/tools/` | 文件、Patch、Exec、Git 等共享工具内核 |
 | `crates/anchor/src/mcp/` | MCP Streamable HTTP 服务 |
-| `crates/anchor/src/actions/` | ChatGPT Actions OpenAPI 网关 |
 | `crates/anchor/src/tunnel/` | FRP / Cloudflare 隧道和进程管理 |
 | `crates/anchor/tests/` | Rust 合约、安全、输出 Schema 与集成测试 |
 | `src/` | Vite + React + React Router + shadcn/ui + Tailwind CSS Web Admin |

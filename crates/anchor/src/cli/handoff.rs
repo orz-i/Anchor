@@ -38,7 +38,6 @@ pub(crate) async fn acquire_successor_ownership(
 pub(crate) struct ImportedListeners {
     pub(crate) mcp: Option<HandoffListener>,
     pub(crate) mcp_snapshot: Option<crate::mcp::McpHandoffSnapshot>,
-    pub(crate) actions: Option<HandoffListener>,
 }
 
 pub(crate) async fn prepare_successor(
@@ -71,21 +70,6 @@ pub(crate) async fn prepare_successor(
     } else {
         (None, None)
     };
-    let actions_listener = if service.includes_actions() {
-        match runtime.duplicate_listener_for_handoff(
-            &profile.id,
-            ServiceKind::Actions,
-            initiator_pid,
-        ) {
-            Ok((listener, _)) => Some(listener),
-            Err(error) => {
-                mark_failed(profile, handoff_id, &error.to_string());
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
     let mut state = daemon::read_handoff_state(&profile.id, handoff_id)?
         .ok_or_else(|| AppError::Message("daemon handoff state disappeared before spawn".into()))?;
     state.mcp_snapshot = mcp_snapshot.clone();
@@ -97,7 +81,6 @@ pub(crate) async fn prepare_successor(
         handoff_id,
         std::process::id(),
         mcp_listener.as_ref(),
-        actions_listener.as_ref(),
     ) {
         Ok(pid) => pid,
         Err(error) => {
@@ -108,7 +91,6 @@ pub(crate) async fn prepare_successor(
     // Parent copies can close immediately after spawn; the successor inherited
     // its own descriptors and the predecessor still owns its retained copies.
     drop(mcp_listener);
-    drop(actions_listener);
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -230,10 +212,6 @@ async fn prepare_child_inner(
             "daemon handoff is missing the MCP state snapshot".into(),
         ));
     }
-    let actions = match options.actions_fd {
-        Some(fd) => Some(unsafe { HandoffListener::from_inherited_fd(fd) }?),
-        None => None,
-    };
     state.successor_pid = Some(std::process::id());
     state.stage = DaemonHandoffStage::SuccessorPrepared;
     state.failure = None;
@@ -280,11 +258,7 @@ async fn prepare_child_inner(
     // Give the predecessor's graceful-shutdown signal one scheduler turn to
     // stop its accept loop before this generation activates the inherited fd.
     tokio::time::sleep(CHILD_ACTIVATION_GRACE).await;
-    Ok(ImportedListeners {
-        mcp,
-        mcp_snapshot,
-        actions,
-    })
+    Ok(ImportedListeners { mcp, mcp_snapshot })
 }
 
 pub(crate) fn mark_ownership_released(

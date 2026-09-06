@@ -4,7 +4,7 @@ mod oauth_flow;
 mod oauth_registry;
 
 pub use bearer::verify_bearer_header;
-pub(crate) use bearer::{bearer_token, constant_time_eq_str, BearerHeaderError};
+pub(crate) use bearer::{bearer_token, constant_time_eq_str};
 pub use oauth::{
     authorization_server_metadata, external_base_url, protected_resource_metadata,
     request_origin_allowed,

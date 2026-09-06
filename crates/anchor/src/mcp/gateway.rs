@@ -252,11 +252,9 @@ pub fn validate_workspace_ports(
     if !config.enabled {
         return Ok(());
     }
-    if profile.runtime.local_port == config.local_port
-        || profile.actions.local_port == config.local_port
-    {
+    if profile.runtime.local_port == config.local_port {
         return Err(AppError::Message(format!(
-            "MCP Gateway 端口 {} 已保留，不能作为工作区“{}”的 MCP 或 Actions 端口。",
+            "MCP Gateway 端口 {} 已保留，不能作为工作区“{}”的 MCP 端口。",
             config.local_port, profile.name
         )));
     }

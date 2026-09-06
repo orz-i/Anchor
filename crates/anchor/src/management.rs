@@ -682,7 +682,6 @@ pub(crate) async fn get_gateway_control_events(
 fn tunnel_configured_for_service(profile: &WorkspaceProfile, service: WorkspaceService) -> bool {
     match service {
         WorkspaceService::Mcp => profile.tunnel.tunnel_type != "none",
-        WorkspaceService::Actions => profile.actions.tunnel_type != "none",
     }
 }
 
@@ -741,9 +740,6 @@ pub(crate) async fn start_workspace_service(
             WorkspaceService::Mcp => {
                 ensure_management_port_available(profile.runtime.local_port, "MCP")?
             }
-            WorkspaceService::Actions => {
-                ensure_management_port_available(profile.actions.local_port, "Actions")?
-            }
         }
     }
     control::set_daemon_service(
@@ -796,9 +792,6 @@ pub(crate) async fn restart_workspace_service(
             WorkspaceService::Mcp => {
                 ensure_management_port_available(profile.runtime.local_port, "MCP")?
             }
-            WorkspaceService::Actions => {
-                ensure_management_port_available(profile.actions.local_port, "Actions")?
-            }
         }
     }
     control::restart_daemon_service(
@@ -815,7 +808,6 @@ pub(crate) async fn restart_workspace_service(
 fn workspace_service_for_tunnel(kind: TunnelServiceKind) -> WorkspaceService {
     match kind {
         TunnelServiceKind::Mcp => WorkspaceService::Mcp,
-        TunnelServiceKind::Actions => WorkspaceService::Actions,
     }
 }
 
@@ -825,7 +817,6 @@ fn configured_tunnel_status(
 ) -> AppResult<TunnelStatus> {
     let public_url = match kind {
         TunnelServiceKind::Mcp => profile.effective_public_url()?,
-        TunnelServiceKind::Actions => profile.actions_effective_public_url()?,
     };
     Ok(TunnelStatus {
         state: "stopped".into(),
@@ -844,13 +835,11 @@ fn persist_tunnel_public_url(id: &str, kind: TunnelServiceKind, public_url: &str
         };
         match kind {
             TunnelServiceKind::Mcp => profile.tunnel.public_url = public_url.to_string(),
-            TunnelServiceKind::Actions => profile.actions.public_url = public_url.to_string(),
         }
         Ok(())
     })?;
     let service = match kind {
         TunnelServiceKind::Mcp => "mcp",
-        TunnelServiceKind::Actions => "actions",
     };
     crate::runtime::update_public_url(id, service, public_url);
     Ok(())
@@ -869,7 +858,6 @@ async fn daemon_tunnel_status(
         .map_err(|error| AppError::Message(format!("读取 daemon 隧道状态失败：{error}")))?;
     match kind {
         TunnelServiceKind::Mcp => status.mcp_tunnel,
-        TunnelServiceKind::Actions => status.actions_tunnel,
     }
     .ok_or_else(|| AppError::Message("daemon control status omitted tunnel state".into()))
 }
@@ -895,7 +883,6 @@ fn load_tunnel_workspace(
 fn tunnel_is_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.tunnel_type != "none",
-        TunnelServiceKind::Actions => profile.actions.tunnel_type != "none",
     }
 }
 
@@ -972,7 +959,6 @@ async fn probe_public_tunnel(public_url: &str, kind: TunnelServiceKind) -> AppRe
     }
     let endpoint = match kind {
         TunnelServiceKind::Mcp => format!("{base}/mcp"),
-        TunnelServiceKind::Actions => format!("{base}/openapi.json"),
     };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -1246,7 +1232,6 @@ pub(crate) fn sync_windows_service_plan() -> AppResult<serde_json::Value> {
 fn control_log_service(service: &str) -> AppResult<ControlLogSelection> {
     Ok(match service {
         "mcp" => ControlLogSelection::Mcp,
-        "actions" => ControlLogSelection::Actions,
         other => return Err(AppError::Message(format!("unknown log service: {other}"))),
     })
 }
@@ -1301,13 +1286,7 @@ const WORKSPACE_SECRET_KEYS: &[&str] = &[
     "oauth_token_secret",
     "bearer_token",
     "cloudflare_token",
-    "actions_cloudflare_token",
-    "actions_api_key",
-    "actions_oauth_client_secret",
-    "actions_oauth_password",
-    "actions_oauth_token_secret",
     "frp_token",
-    "actions_frp_token",
     "ilink_bot_token",
     "ilink_target_user_id",
     "ilink_context_token",
@@ -1322,10 +1301,6 @@ const SHARED_SECRET_KEYS: &[&str] = &[
     "oauth_client_secret",
     "oauth_password",
     "oauth_token_secret",
-    "actions_api_key",
-    "actions_oauth_client_secret",
-    "actions_oauth_password",
-    "actions_oauth_token_secret",
 ];
 
 pub(crate) fn validate_workspace_secret_key(key: &str) -> AppResult<()> {
@@ -1470,13 +1445,6 @@ const MCP_SHARED_SECRET_KEYS: &[&str] = &[
     "oauth_token_secret",
 ];
 
-const ACTIONS_SHARED_SECRET_KEYS: &[&str] = &[
-    "actions_api_key",
-    "actions_oauth_client_secret",
-    "actions_oauth_password",
-    "actions_oauth_token_secret",
-];
-
 fn schedule_secret_restart(profiles: Vec<WorkspaceProfile>, key: String, shared: bool) {
     crate::async_runtime::spawn(async move {
         for profile in &profiles {
@@ -1492,8 +1460,6 @@ async fn restart_running_service_after_secret_change(
 ) {
     let mcp_relevant =
         MCP_SHARED_SECRET_KEYS.contains(&key) && profile.auth.use_shared_secrets == shared;
-    let actions_relevant =
-        ACTIONS_SHARED_SECRET_KEYS.contains(&key) && profile.actions.use_shared_secrets == shared;
     match crate::daemon::inspect(profile) {
         Ok(inspection) if inspection.running => {
             let Some(daemon_state) = inspection.state else {
@@ -1501,8 +1467,6 @@ async fn restart_running_service_after_secret_change(
             };
             let service = if mcp_relevant && daemon_state.service.includes_mcp() {
                 Some(WorkspaceService::Mcp)
-            } else if actions_relevant && daemon_state.service.includes_actions() {
-                Some(WorkspaceService::Actions)
             } else {
                 None
             };
@@ -1700,7 +1664,6 @@ fn selection_includes(
 ) -> bool {
     match service {
         WorkspaceService::Mcp => selection.includes_mcp(),
-        WorkspaceService::Actions => selection.includes_actions(),
     }
 }
 
@@ -1723,7 +1686,6 @@ pub(crate) fn runtime_status_from_control(
 ) -> RuntimeStatusDto {
     let active_tunnel_url = match service {
         WorkspaceService::Mcp => status.mcp_tunnel.as_ref(),
-        WorkspaceService::Actions => status.actions_tunnel.as_ref(),
     }
     .filter(|tunnel| tunnel.state == "running")
     .map(|tunnel| tunnel.public_url.trim().trim_end_matches('/'))
@@ -1742,21 +1704,6 @@ pub(crate) fn runtime_status_from_control(
                 },
                 public_base.to_string(),
                 "MCP",
-            )
-        }
-        WorkspaceService::Actions => {
-            let fallback_base = profile.actions_effective_public_url_with(settings);
-            let public_base = active_tunnel_url.unwrap_or(fallback_base.as_str());
-            (
-                &status.actions,
-                profile.actions_local_base_url(),
-                if public_base.is_empty() {
-                    String::new()
-                } else {
-                    format!("{public_base}/openapi.json")
-                },
-                public_base.to_string(),
-                "Actions",
             )
         }
     };
@@ -1867,7 +1814,6 @@ pub(crate) fn runtime_status_from_control(
         recovery,
         activity: match service {
             WorkspaceService::Mcp => status.mcp_activity.clone(),
-            WorkspaceService::Actions => None,
         },
     }
 }
@@ -2050,7 +1996,6 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.mcp_gateway.enabled = true;
         assert!(reject_gateway_managed_mcp(&settings, WorkspaceService::Mcp).is_err());
-        assert!(reject_gateway_managed_mcp(&settings, WorkspaceService::Actions).is_ok());
     }
 
     #[test]

@@ -238,7 +238,6 @@ fn validate_candidate_tunnel(
     for kind in service_kinds(service) {
         let tunnel_type = match kind {
             TunnelServiceKind::Mcp => candidate.tunnel.tunnel_type.as_str(),
-            TunnelServiceKind::Actions => candidate.actions.tunnel_type.as_str(),
         };
         if tunnel_type == "frp" {
             validate_workspace_frp_config(candidate, kind, settings)?;
@@ -282,21 +281,6 @@ fn service_view(
             workspace.tunnel.frp_key_path.as_str(),
             "frp_token",
         ),
-        TunnelServiceKind::Actions => (
-            "actions",
-            workspace.actions.tunnel_type.as_str(),
-            workspace.actions.public_url.as_str(),
-            workspace.actions.use_proxy,
-            workspace.actions.cloudflare_mode.as_str(),
-            workspace.actions.frp_profile_id.as_str(),
-            workspace.actions.frp_server.as_str(),
-            workspace.actions.frp_server_port,
-            workspace.actions.frp_subdomain.as_str(),
-            workspace.actions.frp_proxy_type.as_str(),
-            workspace.actions.frp_cert_path.as_str(),
-            workspace.actions.frp_key_path.as_str(),
-            "actions_frp_token",
-        ),
     };
     let selected_profile = settings.find_frp_profile(profile_id);
     let server = selected_profile
@@ -318,7 +302,6 @@ fn service_view(
         public_url: public_url.into(),
         effective_public_url: match kind {
             TunnelServiceKind::Mcp => workspace.effective_public_url_with(settings),
-            TunnelServiceKind::Actions => workspace.actions_effective_public_url_with(settings),
         },
         use_proxy,
         cloudflare_mode: cloudflare_mode.into(),
@@ -374,14 +357,12 @@ fn frp_token_configured(
 fn config_prefix(kind: TunnelServiceKind) -> &'static str {
     match kind {
         TunnelServiceKind::Mcp => "tunnel",
-        TunnelServiceKind::Actions => "actions",
     }
 }
 
 fn type_path(kind: TunnelServiceKind) -> &'static str {
     match kind {
         TunnelServiceKind::Mcp => "tunnel.type",
-        TunnelServiceKind::Actions => "actions.tunnel_type",
     }
 }
 
@@ -395,15 +376,13 @@ fn assignment(path: impl Into<String>, value: impl Into<String>) -> ConfigAssign
 fn service_kinds(service: ServiceSelection) -> Vec<TunnelServiceKind> {
     match service {
         ServiceSelection::Mcp => vec![TunnelServiceKind::Mcp],
-        ServiceSelection::Actions => vec![TunnelServiceKind::Actions],
-        ServiceSelection::All => vec![TunnelServiceKind::Mcp, TunnelServiceKind::Actions],
+        ServiceSelection::All => vec![TunnelServiceKind::Mcp],
     }
 }
 
 fn service_selection_name(service: ServiceSelection) -> &'static str {
     match service {
         ServiceSelection::Mcp => "mcp",
-        ServiceSelection::Actions => "actions",
         ServiceSelection::All => "all",
     }
 }
@@ -446,23 +425,19 @@ mod tests {
     }
 
     #[test]
-    fn global_profile_configuration_resolves_id_and_implies_frp_for_both_services() {
+    fn global_profile_configuration_resolves_id_and_implies_frp() {
         let mut options = options();
         options.service = ServiceSelection::All;
         options.frp_profile = Some("production".into());
         options.frp_subdomain = Some("anchor".into());
         let assignments = build_assignments(&options, &frp_settings()).expect("assignments");
 
-        for path in ["tunnel.type", "actions.tunnel_type"] {
-            assert!(assignments
-                .iter()
-                .any(|assignment| assignment.path == path && assignment.value == "frp"));
-        }
-        for path in ["tunnel.frp_profile_id", "actions.frp_profile_id"] {
-            assert!(assignments
-                .iter()
-                .any(|assignment| assignment.path == path && assignment.value == "p1"));
-        }
+        assert!(assignments
+            .iter()
+            .any(|assignment| assignment.path == "tunnel.type" && assignment.value == "frp"));
+        assert!(assignments.iter().any(|assignment| {
+            assignment.path == "tunnel.frp_profile_id" && assignment.value == "p1"
+        }));
     }
 
     #[test]

@@ -265,11 +265,8 @@ export interface WorkspaceConfigChange {
 
 export interface WorkspaceConfigApplyPlan {
   mcpListenerReload: boolean;
-  actionsListenerReload: boolean;
   mcpCallbackPolicyHotUpdate: boolean;
-  actionsCallbackPolicyHotUpdate: boolean;
   mcpTunnelChanged: boolean;
-  actionsTunnelChanged: boolean;
 }
 
 export interface WorkspaceConfigPreview {
@@ -396,22 +393,6 @@ export async function getWorkspaceControlEvents(
   });
 }
 
-export async function startActionsRuntime(id: string): Promise<RuntimeStatus> {
-  return invokeAdmin<RuntimeStatus>("start_actions_runtime", { id });
-}
-
-export async function stopActionsRuntime(id: string): Promise<RuntimeStatus> {
-  return invokeAdmin<RuntimeStatus>("stop_actions_runtime", { id });
-}
-
-export async function getActionsRuntimeStatus(id: string): Promise<RuntimeStatus> {
-  return invokeRead<RuntimeStatus>("get_actions_runtime_status", { id });
-}
-
 export async function restartRuntime(id: string): Promise<RuntimeStatus> {
   return invokeAdmin<RuntimeStatus>("restart_runtime", { id });
-}
-
-export async function restartActionsRuntime(id: string): Promise<RuntimeStatus> {
-  return invokeAdmin<RuntimeStatus>("restart_actions_runtime", { id });
 }

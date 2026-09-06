@@ -1424,7 +1424,6 @@ fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
     let mut handoff_id = None;
     let mut handoff_predecessor_pid = None;
     let mut handoff_mcp_fd = None;
-    let mut handoff_actions_fd = None;
     while let Some(option) = args.pop_front() {
         match option.as_str() {
             "--service" => {
@@ -1447,32 +1446,19 @@ fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
                 handoff_mcp_fd =
                     Some(parse_u64(args, "--handoff-mcp-fd", 0, i32::MAX as u64)? as i32)
             }
-            "--handoff-actions-fd" => {
-                handoff_actions_fd =
-                    Some(parse_u64(args, "--handoff-actions-fd", 0, i32::MAX as u64)? as i32)
-            }
             other => return Err(format!("daemon-run 不支持参数：{other}")),
         }
     }
-    let handoff = match (
-        handoff_id,
-        handoff_predecessor_pid,
-        handoff_mcp_fd,
-        handoff_actions_fd,
-    ) {
-        (None, None, None, None) => None,
-        (Some(handoff_id), Some(predecessor_pid), mcp_fd, actions_fd) => {
+    let handoff = match (handoff_id, handoff_predecessor_pid, handoff_mcp_fd) {
+        (None, None, None) => None,
+        (Some(handoff_id), Some(predecessor_pid), mcp_fd) => {
             if service.includes_mcp() && mcp_fd.is_none() {
                 return Err("daemon-run handoff 缺少 --handoff-mcp-fd".into());
-            }
-            if service.includes_actions() && actions_fd.is_none() {
-                return Err("daemon-run handoff 缺少 --handoff-actions-fd".into());
             }
             Some(DaemonHandoffOptions {
                 handoff_id,
                 predecessor_pid,
                 mcp_fd,
-                actions_fd,
             })
         }
         _ => return Err("daemon-run handoff 参数不完整".into()),
@@ -1539,7 +1525,6 @@ pub struct StatusOptions {
 pub enum LogSelection {
     Daemon,
     Mcp,
-    Actions,
     All,
 }
 
@@ -1548,11 +1533,8 @@ impl LogSelection {
         match value {
             "daemon" => Ok(Self::Daemon),
             "mcp" => Ok(Self::Mcp),
-            "actions" => Ok(Self::Actions),
             "all" => Ok(Self::All),
-            _ => Err(format!(
-                "无效日志类型：{value}；可选值为 daemon、mcp、actions、all"
-            )),
+            _ => Err(format!("无效日志类型：{value}；可选值为 daemon、mcp、all")),
         }
     }
 }
@@ -1806,7 +1788,6 @@ pub struct DaemonHandoffOptions {
     pub handoff_id: String,
     pub predecessor_pid: u32,
     pub mcp_fd: Option<i32>,
-    pub actions_fd: Option<i32>,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> {
@@ -1933,14 +1914,14 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] list\n\
   anchor [--config-dir PATH] [--json] show <workspace>\n\
   anchor [--config-dir PATH] [--json] status [<workspace>|--all|--control-plane] [--watch]\n\
-  anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|actions|all] [--tunnel]\n\n\
-  anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|all] [--tunnel]\n\n\
+  anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
-  anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|all] [--tunnel]\n\
   anchor [--config-dir PATH] [--json] upgrade (<workspace> [workspace ...]|--gateway|--all) [--gateway] [--timeout SECONDS] [--force] [--dry-run] [--allow-no-rollback]\n\
-  anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|actions|all] [--lines N] [-f]\n\
+  anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|all] [--lines N] [-f]\n\
   anchor [--config-dir PATH] [--json] events <workspace|--control-plane> [-f] [--wait SECONDS]\n\
-  anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|actions|all]\n\
+  anchor [--config-dir PATH] [--json] reload <workspace> [--service mcp|all]\n\
   anchor [--config-dir PATH] [--json] doctor <workspace>\n\n\
   anchor [--config-dir PATH] [--json] export <file> (--passphrase-file FILE|--passphrase-stdin) [--force]\n\
   anchor [--config-dir PATH] [--json] import <file> (--passphrase-file FILE|--passphrase-stdin) [--workspace-path WORKSPACE=ABSOLUTE_PATH ...] [--dry-run] [--force]\n\n\
@@ -1985,8 +1966,8 @@ FRP profile 是全局服务器连接配置；token 作为受保护 secret 保存
 
 pub fn tunnel_usage() -> &'static str {
     "Tunnel 配置命令：\n\
-  anchor tunnel show <workspace> [--service mcp|actions|all]\n\
-  anchor tunnel configure <workspace> [--service mcp|actions|all] [--type frp|cloudflare]\n\
+  anchor tunnel show <workspace> [--service mcp|all]\n\
+  anchor tunnel configure <workspace> [--service mcp|all] [--type frp|cloudflare]\n\
       [--frp-profile PROFILE|--frp-server HOST] [--clear-frp-profile] [--frp-port PORT]\n\
       [--subdomain NAME] [--public-url URL|--clear-public-url]\n\
       [--proxy-type http|https2http] [--cert PATH|--clear-cert] [--key PATH|--clear-key]\n\
@@ -2041,14 +2022,14 @@ pub fn workspace_usage() -> &'static str {
   anchor workspace register <path> [--name NAME]\n\
   anchor workspace unregister <workspace> --force [--timeout SECONDS]\n\
   anchor workspace show <workspace>\n\
-  anchor workspace start <workspace> [--service mcp|actions|all] [--tunnel]\n\
+  anchor workspace start <workspace> [--service mcp|all] [--tunnel]\n\
   anchor workspace stop <workspace> [--timeout SECONDS] [--force]\n\
   anchor workspace ilink login <workspace>\n\
   anchor workspace ilink start <workspace>\n\
   anchor workspace ilink stop <workspace>\n\
   anchor workspace ilink status <workspace>\n\
-  anchor workspace gpt-config <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--show-secrets]\n\
-  anchor workspace test <workspace> [--service mcp|actions|all] [--endpoint auto|local|public] [--timeout SECONDS]"
+  anchor workspace gpt-config <workspace> [--service mcp|all] [--endpoint auto|local|public] [--show-secrets]\n\
+  anchor workspace test <workspace> [--service mcp|all] [--endpoint auto|local|public] [--timeout SECONDS]"
 }
 
 #[cfg(test)]
@@ -2611,13 +2592,13 @@ mod tests {
             })
         );
 
-        let reload = parse(strings(&["reload", "workspace-a", "--service", "actions"]))
-            .expect("reload parse");
+        let reload =
+            parse(strings(&["reload", "workspace-a", "--service", "mcp"])).expect("reload parse");
         assert_eq!(
             reload.command,
             Command::Reload(ReloadOptions {
                 workspace: "workspace-a".into(),
-                service: ServiceSelection::Actions,
+                service: ServiceSelection::Mcp,
             })
         );
     }
@@ -2636,8 +2617,6 @@ mod tests {
             "4242",
             "--handoff-mcp-fd",
             "11",
-            "--handoff-actions-fd",
-            "12",
         ]))
         .expect("complete handoff child");
         assert_eq!(
@@ -2650,25 +2629,9 @@ mod tests {
                     handoff_id: "handoff-1".into(),
                     predecessor_pid: 4242,
                     mcp_fd: Some(11),
-                    actions_fd: Some(12),
                 }),
             }
         );
-
-        let missing_actions = parse(strings(&[
-            "daemon-run",
-            "workspace-a",
-            "--service",
-            "all",
-            "--handoff-id",
-            "handoff-1",
-            "--handoff-predecessor-pid",
-            "4242",
-            "--handoff-mcp-fd",
-            "11",
-        ]))
-        .expect_err("all-service handoff must include Actions fd");
-        assert!(missing_actions.contains("--handoff-actions-fd"));
 
         let partial = parse(strings(&[
             "daemon-run",

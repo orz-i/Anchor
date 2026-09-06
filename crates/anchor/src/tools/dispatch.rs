@@ -1117,8 +1117,8 @@ fn skill_script_permission_error(
     })
 }
 
-/// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
-/// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
+/// **唯一工具执行入口**。MCP `tools/call` 必须且只能调用此函数。
+/// 策略校验、分发和错误格式在此统一，传输层不得另做执行前校验。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     finalize_public_tool_output(call_tool_impl(
         ctx,

@@ -505,9 +505,6 @@ fn reject_uncoordinated_live_runtime(
     let mcp_runtime_change = plan.mcp_listener_reload
         || plan.mcp_callback_policy_hot_update
         || (!settings.mcp_gateway.enabled && plan.mcp_tunnel_changed);
-    let actions_runtime_change = plan.actions_listener_reload
-        || plan.actions_callback_policy_hot_update
-        || plan.actions_tunnel_changed;
     if mcp_runtime_change
         && platform()
             .find_pid_listening_on_port(active.runtime.local_port)?
@@ -515,16 +512,6 @@ fn reject_uncoordinated_live_runtime(
     {
         return Err(AppError::Message(
             "当前 Workspace daemon 未运行，但 MCP 端口存在活动 listener；CLI config apply 不会让活动 GUI Server/外部运行态与磁盘配置分叉。请先停止该 listener，或先启动并由 Workspace daemon 接管。"
-                .into(),
-        ));
-    }
-    if actions_runtime_change
-        && platform()
-            .find_pid_listening_on_port(active.actions.local_port)?
-            .is_some()
-    {
-        return Err(AppError::Message(
-            "当前 Workspace daemon 未运行，但 Actions 端口存在活动 listener；CLI config apply 不会让活动 GUI Server/外部运行态与磁盘配置分叉。请先停止该 listener，或先启动并由 Workspace daemon 接管。"
                 .into(),
         ));
     }
@@ -558,13 +545,6 @@ fn validate_candidate(
         validate_redirect_policy(
             &candidate.auth.oauth_redirect_uris,
             &candidate.auth.oauth_redirect_hosts,
-        )
-        .map_err(AppError::Message)?;
-    }
-    if plan.actions_callback_policy_hot_update {
-        validate_redirect_policy(
-            &candidate.actions.oauth_redirect_uris,
-            &candidate.actions.oauth_redirect_hosts,
         )
         .map_err(AppError::Message)?;
     }
@@ -889,19 +869,13 @@ mod tests {
         let current = profile();
         let mut next = current.clone();
         next.runtime.permission_mode = "read_only".into();
-        next.actions.max_patch_bytes += 10;
 
         let report = diff_report("config_diff", &current, &next, true);
-        assert_eq!(report.changes.len(), 2);
+        assert_eq!(report.changes.len(), 1);
         assert!(report
             .changes
             .iter()
             .any(|change| change.path == "runtime.permission_mode"));
-        assert!(report
-            .changes
-            .iter()
-            .any(|change| change.path == "actions.max_patch_bytes"));
         assert!(report.apply_plan.mcp_listener_reload);
-        assert!(report.apply_plan.actions_listener_reload);
     }
 }

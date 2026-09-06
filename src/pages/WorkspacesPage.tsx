@@ -12,7 +12,6 @@ import {
   Server,
   Square,
   Trash2,
-  Zap,
 } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
@@ -48,16 +47,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { createWorkspace, deleteWorkspace, startActionsRuntime, startRuntime, stopActionsRuntime, stopRuntime } from "@/lib/api/workspaces";
+import { createWorkspace, deleteWorkspace, startRuntime, stopRuntime } from "@/lib/api/workspaces";
 import { open } from "@/lib/platform/dialog";
 import { notifyStartFailure, runServiceToggle } from "@/lib/runtime/service";
 import type { RuntimeState, WorkspaceProfile } from "@/lib/types";
-import { actionsConfig } from "@/lib/types";
 
-type StatusFilter = "all" | "mcp_running" | "actions_running" | "any_running" | "stopped";
+type StatusFilter = "all" | "mcp_running" | "stopped";
 
 export function WorkspacesPage() {
-  const { workspaces, mcpRuntimeStates, actionsRuntimeStates, loading, refreshWorkspaces, setMcpRuntimeState, setActionsRuntimeState } = useAdmin();
+  const { workspaces, mcpRuntimeStates, loading, refreshWorkspaces, setMcpRuntimeState } = useAdmin();
   const navigate = useNavigate();
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -104,37 +102,25 @@ export function WorkspacesPage() {
   };
 
   // 快捷服务启停
-  const toggleService = async (workspace: WorkspaceProfile, service: "mcp" | "actions") => {
-    const key = `${workspace.id}-${service}`;
+  const toggleService = async (workspace: WorkspaceProfile) => {
+    const key = `${workspace.id}-mcp`;
     if (busyMap[key]) return;
-    
-    const currentState: RuntimeState =
-      service === "mcp"
-        ? (mcpRuntimeStates[workspace.id] ?? "stopped")
-        : (actionsRuntimeStates[workspace.id] ?? "stopped");
+    const currentState: RuntimeState = mcpRuntimeStates[workspace.id] ?? "stopped";
     
     setBusyMap((prev) => ({ ...prev, [key]: true }));
     try {
       const isRunning = currentState === "running";
       const result = await runServiceToggle(
         isRunning,
-        service === "mcp"
-          ? () => startRuntime(workspace.id)
-          : () => startActionsRuntime(workspace.id),
-        service === "mcp"
-          ? () => stopRuntime(workspace.id)
-          : () => stopActionsRuntime(workspace.id),
-        service === "mcp" ? "MCP" : "Actions",
+        () => startRuntime(workspace.id),
+        () => stopRuntime(workspace.id),
+        "MCP",
       );
 
       if (result) {
-        if (service === "mcp") {
-          setMcpRuntimeState(workspace.id, result.state);
-        } else {
-          setActionsRuntimeState(workspace.id, result.state);
-        }
+        setMcpRuntimeState(workspace.id, result.state);
         if (!isRunning && result.state === "error") {
-          notifyStartFailure(service === "mcp" ? "MCP" : "Actions", result);
+          notifyStartFailure("MCP", result);
         }
       }
     } finally {
@@ -160,21 +146,18 @@ export function WorkspacesPage() {
   const stats = useMemo(() => {
     const total = workspaces.length;
     let mcpRunning = 0;
-    let actionsRunning = 0;
     let tunnelsActive = 0;
 
     for (const ws of workspaces) {
       const mcpState = mcpRuntimeStates[ws.id] ?? "stopped";
-      const actState = actionsRuntimeStates[ws.id] ?? "stopped";
       if (mcpState === "running") mcpRunning++;
-      if (actState === "running") actionsRunning++;
-      if (ws.tunnel.type !== "none" || actionsConfig(ws).tunnel_type !== "none") {
+      if (ws.tunnel.type !== "none") {
         tunnelsActive++;
       }
     }
 
-    return { total, mcpRunning, actionsRunning, tunnelsActive };
-  }, [workspaces, mcpRuntimeStates, actionsRuntimeStates]);
+    return { total, mcpRunning, tunnelsActive };
+  }, [workspaces, mcpRuntimeStates]);
 
   // 过滤工作区
   const filteredWorkspaces = useMemo(() => {
@@ -188,16 +171,13 @@ export function WorkspacesPage() {
       if (!matchesSearch) return false;
 
       const mcpState = mcpRuntimeStates[ws.id] ?? "stopped";
-      const actState = actionsRuntimeStates[ws.id] ?? "stopped";
 
       if (statusFilter === "mcp_running") return mcpState === "running";
-      if (statusFilter === "actions_running") return actState === "running";
-      if (statusFilter === "any_running") return mcpState === "running" || actState === "running";
-      if (statusFilter === "stopped") return mcpState === "stopped" && actState === "stopped";
+      if (statusFilter === "stopped") return mcpState === "stopped";
 
       return true;
     });
-  }, [workspaces, searchQuery, statusFilter, mcpRuntimeStates, actionsRuntimeStates]);
+  }, [workspaces, searchQuery, statusFilter, mcpRuntimeStates]);
 
   // 分页计算
   const totalItems = filteredWorkspaces.length;
@@ -230,7 +210,7 @@ export function WorkspacesPage() {
     <PageLayout
       kicker="工作区管理"
       title="工作区概览"
-      description="集中管理已配置的工作区实例，监控 MCP / Actions 服务运行状态与公网隧道连接。"
+      description="集中管理已配置的工作区实例，监控 MCP 服务运行状态与公网隧道连接。"
       actions={
         <div className="flex items-center gap-2">
           <Button
@@ -252,7 +232,7 @@ export function WorkspacesPage() {
     >
       <div className="flex flex-col gap-6">
         {/* 统计指标卡片组 */}
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <Card className="bg-card/50 backdrop-blur-xs">
             <CardHeader className="flex flex-row items-center justify-between pb-2">
               <CardTitle className="text-xs font-medium text-muted-foreground">总工作区数</CardTitle>
@@ -276,19 +256,6 @@ export function WorkspacesPage() {
               <p className="mt-1 text-xs text-muted-foreground">
                 共 {stats.total} 个实例 ({stats.total > 0 ? Math.round((stats.mcpRunning / stats.total) * 100) : 0}%)
               </p>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-card/50 backdrop-blur-xs">
-            <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-xs font-medium text-muted-foreground">Actions 运行中</CardTitle>
-              <Zap className="size-4 text-blue-500" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">
-                {stats.actionsRunning}
-              </div>
-              <p className="mt-1 text-xs text-muted-foreground">GPT Actions 活跃服务</p>
             </CardContent>
           </Card>
 
@@ -326,9 +293,7 @@ export function WorkspacesPage() {
               <SelectContent>
                 <SelectItem value="all">全部状态</SelectItem>
                 <SelectItem value="mcp_running">MCP 运行中</SelectItem>
-                <SelectItem value="actions_running">Actions 运行中</SelectItem>
-                <SelectItem value="any_running">任一运行中</SelectItem>
-                <SelectItem value="stopped">已全部停止</SelectItem>
+                <SelectItem value="stopped">MCP 已停止</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -369,7 +334,7 @@ export function WorkspacesPage() {
             <EmptyHeader>
               <EmptyTitle>暂无工作区</EmptyTitle>
               <EmptyDescription>
-                通过添加本地代码项目目录，即可为其快速配置专属的 MCP 与 Actions 网关服务。
+                通过添加本地代码项目目录，即可为其快速配置专属的 MCP 网关服务。
               </EmptyDescription>
             </EmptyHeader>
             <Button className="mt-4" onClick={() => void handleAddWorkspace()}>
@@ -401,10 +366,7 @@ export function WorkspacesPage() {
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
               {paginatedWorkspaces.map((workspace) => {
                 const mcpState = mcpRuntimeStates[workspace.id] ?? "stopped";
-                const actState = actionsRuntimeStates[workspace.id] ?? "stopped";
                 const isMcpBusy = busyMap[`${workspace.id}-mcp`] ?? false;
-                const isActBusy = busyMap[`${workspace.id}-actions`] ?? false;
-                const actConfig = actionsConfig(workspace);
 
                 return (
                   <Card
@@ -443,11 +405,6 @@ export function WorkspacesPage() {
                             <span className="font-medium">MCP:</span>
                             <span className="capitalize text-muted-foreground">{mcpState}</span>
                           </div>
-                          <div className="flex items-center gap-1.5 rounded-md border bg-muted/30 px-2 py-1 text-xs">
-                            <RuntimeDot state={actState} />
-                            <span className="font-medium">Actions:</span>
-                            <span className="capitalize text-muted-foreground">{actState}</span>
-                          </div>
                         </div>
                       </CardHeader>
 
@@ -457,7 +414,7 @@ export function WorkspacesPage() {
                           <div className="flex items-center justify-between text-muted-foreground">
                             <span>本地端口</span>
                             <span className="font-mono text-foreground">
-                              MCP:{workspace.runtime.local_port} / Act:{actConfig.local_port}
+                              MCP:{workspace.runtime.local_port}
                             </span>
                           </div>
                           <div className="mt-1.5 flex items-center justify-between text-muted-foreground">
@@ -471,14 +428,14 @@ export function WorkspacesPage() {
                         </div>
 
                         {/* 快捷服务启停按钮 */}
-                        <div className="grid grid-cols-2 gap-2 pt-1">
+                        <div className="grid grid-cols-1 gap-2 pt-1">
                           <Button
                             type="button"
                             variant={mcpState === "running" ? "outline" : "secondary"}
                             size="sm"
                             className="w-full text-xs"
                             disabled={isMcpBusy}
-                            onClick={() => void toggleService(workspace, "mcp")}
+                            onClick={() => void toggleService(workspace)}
                           >
                             {mcpState === "running" ? (
                               <>
@@ -493,26 +450,6 @@ export function WorkspacesPage() {
                             )}
                           </Button>
 
-                          <Button
-                            type="button"
-                            variant={actState === "running" ? "outline" : "secondary"}
-                            size="sm"
-                            className="w-full text-xs"
-                            disabled={isActBusy}
-                            onClick={() => void toggleService(workspace, "actions")}
-                          >
-                            {actState === "running" ? (
-                              <>
-                                <Square data-icon="inline-start" className="size-3 text-destructive" />
-                                停止 Actions
-                              </>
-                            ) : (
-                              <>
-                                <Play data-icon="inline-start" className="size-3 text-emerald-500" />
-                                启动 Actions
-                              </>
-                            )}
-                          </Button>
                         </div>
                       </CardContent>
                     </div>

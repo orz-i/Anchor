@@ -1,6 +1,6 @@
 import { invokeAdmin } from "@/lib/api/invoke";
 
-export type TunnelService = "mcp" | "actions";
+export type TunnelService = "mcp";
 
 export interface TunnelStatus {
   state: string;

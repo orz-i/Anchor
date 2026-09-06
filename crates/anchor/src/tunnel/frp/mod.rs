@@ -84,12 +84,6 @@ pub fn frp_server_config(
             profile.tunnel.frp_server_port,
             profile.tunnel.public_url.clone(),
         ),
-        TunnelServiceKind::Actions => (
-            profile.actions.frp_profile_id.as_str(),
-            profile.actions.frp_server.clone(),
-            profile.actions.frp_server_port,
-            profile.actions.public_url.clone(),
-        ),
     };
 
     let (server_addr, server_port) =
@@ -137,7 +131,6 @@ fn resolve_frp_token(
 
     let workspace_key = match kind {
         TunnelServiceKind::Mcp => "frp_token",
-        TunnelServiceKind::Actions => "actions_frp_token",
     };
     if let Ok(Some(token)) = crate::secret::SecretStore::get(&workspace.id, workspace_key) {
         if !token.trim().is_empty() {
@@ -148,7 +141,6 @@ fn resolve_frp_token(
     // Manual inline server: reuse token from a global profile with the same host.
     let inline_server = match kind {
         TunnelServiceKind::Mcp => workspace.tunnel.frp_server.as_str(),
-        TunnelServiceKind::Actions => workspace.actions.frp_server.as_str(),
     };
     let inline_server = inline_server.trim();
     if !inline_server.is_empty() {
@@ -422,15 +414,6 @@ fn frp_proxy_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> FrpP
             key_path: profile.tunnel.frp_key_path.clone(),
             workspace_root: profile.path.clone(),
         },
-        TunnelServiceKind::Actions => FrpProxyConfig {
-            proxy_name: format!("{prefix}-actions"),
-            local_port: profile.actions.local_port,
-            subdomain: profile.actions.frp_subdomain.clone(),
-            proxy_type: profile.actions.frp_proxy_type.clone(),
-            cert_path: profile.actions.frp_cert_path.clone(),
-            key_path: profile.actions.frp_key_path.clone(),
-            workspace_root: profile.path.clone(),
-        },
     }
 }
 
@@ -632,36 +615,6 @@ mod tests {
         assert!(toml.contains(&format!("name = \"{second_name}\"")));
         assert!(toml.contains("localPort = 28766"));
         assert!(toml.contains("localPort = 28767"));
-    }
-
-    #[test]
-    fn build_frpc_toml_for_routes_supports_mcp_and_actions_together() {
-        let mut mcp = WorkspaceProfile::new("/tmp/mcp".into(), Some("MCP".into()));
-        mcp.tunnel.frp_server = "frp.example.com".into();
-        mcp.tunnel.frp_server_port = 7000;
-        mcp.tunnel.frp_subdomain = "mcp".into();
-        mcp.runtime.local_port = 28766;
-
-        let mut actions = WorkspaceProfile::new("/tmp/actions".into(), Some("Actions".into()));
-        actions.actions.frp_server = "frp.example.com".into();
-        actions.actions.frp_server_port = 7000;
-        actions.actions.frp_subdomain = "actions".into();
-        actions.actions.local_port = 8787;
-
-        let settings = AppSettings::default();
-        let configs = vec![
-            frp_server_config(&mcp, TunnelServiceKind::Mcp, &settings, None),
-            frp_server_config(&actions, TunnelServiceKind::Actions, &settings, None),
-        ];
-        let mcp_name = configs[0].proxy.proxy_name.clone();
-        let actions_name = configs[1].proxy.proxy_name.clone();
-        let toml = build_frpc_toml_for_routes(&configs);
-
-        assert_eq!(toml.matches("[[proxies]]").count(), 2);
-        assert!(toml.contains(&format!("name = \"{mcp_name}\"")));
-        assert!(toml.contains(&format!("name = \"{actions_name}\"")));
-        assert!(toml.contains("localPort = 28766"));
-        assert!(toml.contains("localPort = 8787"));
     }
 
     #[test]

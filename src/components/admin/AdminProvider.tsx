@@ -24,13 +24,11 @@ import type {
 interface AdminContextValue {
   workspaces: WorkspaceProfile[];
   mcpRuntimeStates: Record<string, RuntimeState>;
-  actionsRuntimeStates: Record<string, RuntimeState>;
   controlPlaneRevision: number;
   loading: boolean;
   refreshWorkspaces: () => Promise<WorkspaceProfile[]>;
   setWorkspaces: React.Dispatch<React.SetStateAction<WorkspaceProfile[]>>;
   setMcpRuntimeState: (workspaceId: string, state: RuntimeState) => void;
-  setActionsRuntimeState: (workspaceId: string, state: RuntimeState) => void;
 }
 
 const AdminContext = createContext<AdminContextValue | null>(null);
@@ -54,7 +52,6 @@ function runtimeStatesEqual(
 export function AdminProvider({ children }: { children: ReactNode }) {
   const [workspaces, setWorkspaces] = useState<WorkspaceProfile[]>([]);
   const [mcpRuntimeStates, setMcpRuntimeStates] = useState<Record<string, RuntimeState>>({});
-  const [actionsRuntimeStates, setActionsRuntimeStates] = useState<Record<string, RuntimeState>>({});
   const [controlPlaneRevision, setControlPlaneRevision] = useState(0);
   const [loading, setLoading] = useState(true);
   const mountedRef = useRef(true);
@@ -65,24 +62,13 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     );
   }, []);
 
-  const setActionsRuntimeState = useCallback((workspaceId: string, state: RuntimeState) => {
-    setActionsRuntimeStates((current) =>
-      current[workspaceId] === state ? current : { ...current, [workspaceId]: state },
-    );
-  }, []);
-
   const applyControlPlaneStatus = useCallback(
     (status: Awaited<ReturnType<typeof getControlPlaneStatus>>) => {
       const mcpStates: Record<string, RuntimeState> = {};
-      const actionsStates: Record<string, RuntimeState> = {};
       for (const item of status.workspaces) {
         mcpStates[item.id] = item.mcpState;
-        actionsStates[item.id] = item.actionsState;
       }
       setMcpRuntimeStates((current) => (runtimeStatesEqual(current, mcpStates) ? current : mcpStates));
-      setActionsRuntimeStates((current) =>
-        runtimeStatesEqual(current, actionsStates) ? current : actionsStates,
-      );
     },
     [],
   );
@@ -145,21 +131,17 @@ export function AdminProvider({ children }: { children: ReactNode }) {
     () => ({
       workspaces,
       mcpRuntimeStates,
-      actionsRuntimeStates,
       controlPlaneRevision,
       loading,
       refreshWorkspaces,
       setWorkspaces,
       setMcpRuntimeState,
-      setActionsRuntimeState,
     }),
     [
-      actionsRuntimeStates,
       controlPlaneRevision,
       loading,
       mcpRuntimeStates,
       refreshWorkspaces,
-      setActionsRuntimeState,
       setMcpRuntimeState,
       workspaces,
     ],

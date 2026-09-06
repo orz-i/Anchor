@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { Activity, ChevronLeft, Gauge, Network, Settings2, Trash2 } from "lucide-react";
+import { Activity, ChevronLeft, Gauge, Network, Trash2 } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 
-import { ActionsAuthForm } from "@/components/admin/ActionsAuthForm";
-import { ActionsPolicyForm, type ActionsPolicyDraft } from "@/components/admin/ActionsPolicyForm";
 import { useAdmin } from "@/components/admin/AdminProvider";
 import { CanvsPanel } from "@/components/admin/CanvsPanel";
 import { ChatGptSessionPrompt } from "@/components/admin/ChatGptSessionPrompt";
@@ -25,23 +23,20 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { listFrpProfiles, setLastWorkspace, type FrpProfileDto } from "@/lib/api/settings";
+import { setLastWorkspace } from "@/lib/api/settings";
 import {
   deleteWorkspace,
-  getActionsRuntimeStatus,
   getRuntimeStatus,
   listWorkspaces,
-  startActionsRuntime,
   startRuntime,
-  stopActionsRuntime,
   stopRuntime,
   updateWorkspace,
 } from "@/lib/api/workspaces";
 import { notifyStartFailure, runServiceToggle } from "@/lib/runtime/service";
-import type { ActionsAuthDraft, AuthConfig, McpActivity, RuntimeRecovery, RuntimeState, RuntimeStatus, WorkspaceProfile } from "@/lib/types";
-import { actionsConfig, actionsLocalEndpoint, actionsOAuthAuthorizeUrl, actionsOAuthTokenUrl, actionsOpenApiUrl, actionsPrivacyUrl, mcpLocalEndpoint } from "@/lib/types";
+import type { AuthConfig, McpActivity, RuntimeRecovery, RuntimeState, RuntimeStatus, WorkspaceProfile } from "@/lib/types";
+import { mcpLocalEndpoint } from "@/lib/types";
 
-type ServiceTab = "mcp" | "actions" | "canvs";
+type ServiceTab = "mcp" | "canvs";
 type SubTab = "config" | "logs" | "health";
 
 const EMPTY_RECOVERY: RuntimeRecovery = { enabled: false, attempt: 0, maxAttempts: 5, retryInMs: null, recoveredCount: 0, lastError: "" };
@@ -62,23 +57,6 @@ function tunnelForm(profile: WorkspaceProfile): TunnelFormConfig {
   };
 }
 
-function actionsTunnelForm(profile: WorkspaceProfile): TunnelFormConfig {
-  const actions = actionsConfig(profile);
-  return {
-    type: actions.tunnel_type,
-    public_url: actions.public_url,
-    frp_server: actions.frp_server,
-    frp_subdomain: actions.frp_subdomain,
-    frp_profile_id: actions.frp_profile_id ?? "",
-    frp_server_port: actions.frp_server_port ?? 7000,
-    frp_proxy_type: actions.frp_proxy_type ?? "http",
-    frp_cert_path: actions.frp_cert_path ?? "",
-    frp_key_path: actions.frp_key_path ?? "",
-    cloudflare_mode: actions.cloudflare_mode,
-    use_proxy: actions.use_proxy ?? true,
-  };
-}
-
 function canvsWebUrl(endpoint: string): string {
   const value = endpoint.trim().replace(/\/$/, "");
   return value ? `${value.replace(/\/mcp$/, "")}/canvs` : "";
@@ -90,34 +68,26 @@ export function WorkspaceDetailPage() {
   const {
     workspaces,
     mcpRuntimeStates,
-    actionsRuntimeStates,
     controlPlaneRevision,
     refreshWorkspaces,
     setWorkspaces,
     setMcpRuntimeState,
-    setActionsRuntimeState,
   } = useAdmin();
   const [profile, setProfile] = useState<WorkspaceProfile | null>(null);
-  const [frpProfiles, setFrpProfiles] = useState<FrpProfileDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [backendError, setBackendError] = useState("");
   const [activeService, setActiveService] = useState<ServiceTab>("mcp");
   const [mcpSubTab, setMcpSubTab] = useState<SubTab>("config");
-  const [actionsSubTab, setActionsSubTab] = useState<SubTab>("config");
   const [mcpBusy, setMcpBusy] = useState(false);
-  const [actionsBusy, setActionsBusy] = useState(false);
   const [mcpRuntime, setMcpRuntime] = useState<RuntimeStatus | null>(null);
-  const [actionsRuntime, setActionsRuntime] = useState<RuntimeStatus | null>(null);
 
   const workspaceId = params.id || workspaces[0]?.id || "";
 
   const refreshStatuses = useCallback(async (id: string) => {
-    const [mcp, actions] = await Promise.all([getRuntimeStatus(id), getActionsRuntimeStatus(id)]);
+    const mcp = await getRuntimeStatus(id);
     setMcpRuntime(mcp);
-    setActionsRuntime(actions);
     setMcpRuntimeState(id, mcp.state);
-    setActionsRuntimeState(id, actions.state);
-  }, [setActionsRuntimeState, setMcpRuntimeState]);
+  }, [setMcpRuntimeState]);
 
   const load = useCallback(async () => {
     if (!workspaceId) {
@@ -128,10 +98,9 @@ export function WorkspaceDetailPage() {
     setLoading(true);
     setBackendError("");
     try {
-      const [items, profiles] = await Promise.all([listWorkspaces(), listFrpProfiles()]);
+      const items = await listWorkspaces();
       const next = items.find((item) => item.id === workspaceId) ?? null;
       setProfile(next);
-      setFrpProfiles(profiles);
       if (next) {
         void setLastWorkspace(next.id).catch(() => undefined);
         await refreshStatuses(next.id);
@@ -150,30 +119,20 @@ export function WorkspaceDetailPage() {
   }, [controlPlaneRevision, refreshStatuses, workspaceId]);
 
   const mcpState: RuntimeState = mcpRuntime?.state ?? mcpRuntimeStates[workspaceId] ?? "stopped";
-  const actionsState: RuntimeState = actionsRuntime?.state ?? actionsRuntimeStates[workspaceId] ?? "stopped";
-  const actions = profile ? actionsConfig(profile) : null;
   const mcpLocal = mcpRuntime?.localEndpoint || (profile ? mcpLocalEndpoint(profile.runtime.local_port) : "");
-  const actionsLocal = actionsRuntime?.localEndpoint || (actions ? actionsLocalEndpoint(actions.local_port) : "");
   const mcpPublic = mcpRuntime?.publicEndpoint || "";
-  const actionsPublic = actionsRuntime?.publicEndpoint || "";
 
-  const applyRuntime = (service: "mcp" | "actions", runtime: RuntimeStatus) => {
-    if (service === "mcp") { setMcpRuntime(runtime); setMcpRuntimeState(workspaceId, runtime.state); }
-    else { setActionsRuntime(runtime); setActionsRuntimeState(workspaceId, runtime.state); }
-  };
-
-  const toggleService = async (service: "mcp" | "actions") => {
+  const toggleService = async () => {
     if (!workspaceId) return;
-    const current = service === "mcp" ? mcpState : actionsState;
-    const setBusy = service === "mcp" ? setMcpBusy : setActionsBusy;
-    setBusy(true);
+    setMcpBusy(true);
     try {
-      const result = await runServiceToggle(current === "running", service === "mcp" ? () => startRuntime(workspaceId) : () => startActionsRuntime(workspaceId), service === "mcp" ? () => stopRuntime(workspaceId) : () => stopActionsRuntime(workspaceId), service === "mcp" ? "MCP" : "Actions");
+      const result = await runServiceToggle(mcpState === "running", () => startRuntime(workspaceId), () => stopRuntime(workspaceId), "MCP");
       if (result) {
-        applyRuntime(service, result);
-        if (current !== "running" && result.state === "error") notifyStartFailure(service === "mcp" ? "MCP" : "Actions", result);
+        setMcpRuntime(result);
+        setMcpRuntimeState(workspaceId, result.state);
+        if (mcpState !== "running" && result.state === "error") notifyStartFailure("MCP", result);
       }
-    } finally { setBusy(false); }
+    } finally { setMcpBusy(false); }
   };
 
   const persist = async (next: WorkspaceProfile, reload = false) => {
@@ -187,13 +146,6 @@ export function WorkspaceDetailPage() {
   const saveMcpTunnel = async (config: TunnelFormConfig) => {
     if (!profile) return;
     const next: WorkspaceProfile = { ...profile, tunnel: { ...profile.tunnel, type: config.type, public_url: config.public_url, frp_server: config.frp_server, frp_subdomain: config.frp_subdomain, frp_profile_id: config.frp_profile_id, frp_server_port: config.frp_server_port, frp_proxy_type: config.frp_proxy_type, frp_cert_path: config.frp_cert_path, frp_key_path: config.frp_key_path, cloudflare_mode: config.cloudflare_mode, use_proxy: config.use_proxy } };
-    await persist(next);
-  };
-
-  const saveActionsTunnel = async (config: TunnelFormConfig) => {
-    if (!profile) return;
-    const current = actionsConfig(profile);
-    const next: WorkspaceProfile = { ...profile, actions: { ...current, tunnel_type: config.type, public_url: config.public_url, frp_server: config.frp_server, frp_subdomain: config.frp_subdomain, frp_profile_id: config.frp_profile_id, frp_server_port: config.frp_server_port, frp_proxy_type: config.frp_proxy_type, frp_cert_path: config.frp_cert_path, frp_key_path: config.frp_key_path, cloudflare_mode: config.cloudflare_mode, use_proxy: config.use_proxy } };
     await persist(next);
   };
 
@@ -263,18 +215,17 @@ export function WorkspaceDetailPage() {
         <Tabs value={activeService} onValueChange={(value) => setActiveService((value ?? "mcp") as ServiceTab)}>
           <TabsList variant="line" className="w-full justify-start border-b">
             <TabsTrigger value="mcp"><Network data-icon="inline-start" />MCP <Badge variant="outline" className="ml-1">{mcpState}</Badge></TabsTrigger>
-            <TabsTrigger value="actions"><Settings2 data-icon="inline-start" />Actions <Badge variant="outline" className="ml-1">{actionsState}</Badge></TabsTrigger>
             <TabsTrigger value="canvs"><Gauge data-icon="inline-start" />Canvs</TabsTrigger>
           </TabsList>
 
           <TabsContent value="mcp" className="mt-4 grid gap-4">
             <div className="grid gap-4 xl:grid-cols-2">
-              <ServicePanel title="MCP 服务" subtitle="ChatGPT Connector / MCP Server" status={mcpState} statusMessage={mcpRuntime?.localMessage ?? ""} recovery={mcpRuntime?.recovery ?? EMPTY_RECOVERY} activity={(mcpRuntime?.activity as McpActivity | null | undefined) ?? null} port={profile.runtime.local_port} portEditable busy={mcpBusy} tunnelType={profile.tunnel.type} localEndpoint={mcpLocal} publicEndpoint={mcpPublic} publicLabel="公网 MCP" onToggle={() => toggleService("mcp")} onPortChange={async (port) => { if (port === profile.runtime.local_port) return; await persist({ ...profile, runtime: { ...profile.runtime, local_port: port } }, true); }} />
-              <GptQuickCopy workspaceId={workspaceId} service="mcp" profile={profile} publicMcpEndpoint={mcpPublic} frpProfiles={frpProfiles} />
+              <ServicePanel title="MCP 服务" subtitle="ChatGPT Connector / MCP Server" status={mcpState} statusMessage={mcpRuntime?.localMessage ?? ""} recovery={mcpRuntime?.recovery ?? EMPTY_RECOVERY} activity={(mcpRuntime?.activity as McpActivity | null | undefined) ?? null} port={profile.runtime.local_port} portEditable busy={mcpBusy} tunnelType={profile.tunnel.type} localEndpoint={mcpLocal} publicEndpoint={mcpPublic} publicLabel="公网 MCP" onToggle={() => toggleService()} onPortChange={async (port) => { if (port === profile.runtime.local_port) return; await persist({ ...profile, runtime: { ...profile.runtime, local_port: port } }, true); }} />
+              <GptQuickCopy workspaceId={workspaceId} profile={profile} publicMcpEndpoint={mcpPublic} />
             </div>
             <Tabs value={mcpSubTab} onValueChange={(value) => setMcpSubTab((value ?? "config") as SubTab)}><TabsList><TabsTrigger value="config">配置</TabsTrigger><TabsTrigger value="logs">日志</TabsTrigger><TabsTrigger value="health"><Activity data-icon="inline-start" />健康</TabsTrigger></TabsList>
               <TabsContent value="config" className="mt-4 grid gap-4 lg:grid-cols-2">
-                <ConfigCard title="隧道" description="MCP 公网入口与隧道保活"><TunnelConfigForm workspaceId={workspaceId} service="mcp" config={tunnelForm(profile)} onSave={saveMcpTunnel} /></ConfigCard>
+                <ConfigCard title="隧道" description="MCP 公网入口与隧道保活"><TunnelConfigForm workspaceId={workspaceId} config={tunnelForm(profile)} onSave={saveMcpTunnel} /></ConfigCard>
                 <ConfigCard title="认证" description="OAuth、Bearer 与共享 Secret"><McpAuthForm workspaceId={workspaceId} auth={profile.auth} onSaveProfile={async (auth: AuthConfig, options) => { await persist({ ...profile, auth }); if (mcpState === "running" && options.callbackPolicyOnly) toast.success("OAuth Callback 信任策略已热更新"); }} /></ConfigCard>
                 <ConfigCard title="运行策略" description="工具档位、Shell 与命令边界"><RuntimePolicyForm toolProfile={profile.runtime.tool_profile} permissionMode={profile.runtime.permission_mode} preferredShell={profile.runtime.preferred_shell ?? "auto"} allowedCommands={profile.runtime.allowed_commands ?? ""} workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true} workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"} externalPaidCommandsEnabled={profile.runtime.external_paid_commands_enabled ?? false} externalPaidMaxRunsPerDay={profile.runtime.external_paid_max_runs_per_day ?? 1} externalPaidMaxDurationSeconds={profile.runtime.external_paid_max_duration_seconds ?? 1800} onSave={async (draft: RuntimePolicyDraft) => persist({ ...profile, runtime: { ...profile.runtime, tool_profile: draft.toolProfile, permission_mode: draft.permissionMode, preferred_shell: draft.preferredShell, allowed_commands: draft.allowedCommands, workspace_local_entries: draft.workspaceLocalEntries, workspace_script_extensions: draft.workspaceScriptExtensions, external_paid_commands_enabled: draft.externalPaidCommandsEnabled, external_paid_max_runs_per_day: draft.externalPaidMaxRunsPerDay, external_paid_max_duration_seconds: draft.externalPaidMaxDurationSeconds } }, true)} /></ConfigCard>
                 <ConfigCard title="Agent Skills" description="管理不可变 Skill packages 与激活 channel"><SkillServiceConfigForm workspaceId={workspaceId} enabled={profile.runtime.skill_service_enabled ?? true} onSave={async (config) => persist({ ...profile, runtime: { ...profile.runtime, skill_service_enabled: config.enabled } }, true)} /></ConfigCard>
@@ -283,16 +234,6 @@ export function WorkspaceDetailPage() {
               <TabsContent value="logs" className="mt-4"><LogViewer workspaceId={workspaceId} service="mcp" /></TabsContent>
               <TabsContent value="health" className="mt-4"><HealthPanel workspaceId={workspaceId} /></TabsContent>
             </Tabs>
-          </TabsContent>
-
-          <TabsContent value="actions" className="mt-4 grid gap-4">
-            {actions && <>
-              <div className="grid gap-4 xl:grid-cols-2"><ServicePanel title="Actions 服务" subtitle="GPT Actions / OpenAPI Gateway" status={actionsState} statusMessage={actionsRuntime?.localMessage ?? ""} recovery={actionsRuntime?.recovery ?? EMPTY_RECOVERY} port={actions.local_port} portEditable busy={actionsBusy} tunnelType={actions.tunnel_type} localEndpoint={actionsLocal} publicEndpoint={actionsPublic} publicLabel="公网 OpenAPI" onToggle={() => toggleService("actions")} onPortChange={async (port) => persist({ ...profile, actions: { ...actions, local_port: port } }, true)} /><GptQuickCopy workspaceId={workspaceId} service="actions" profile={profile} frpProfiles={frpProfiles} /></div>
-              <Tabs value={actionsSubTab} onValueChange={(value) => setActionsSubTab((value ?? "config") as SubTab)}><TabsList><TabsTrigger value="config">配置</TabsTrigger><TabsTrigger value="logs">日志</TabsTrigger><TabsTrigger value="health">健康</TabsTrigger></TabsList>
-                <TabsContent value="config" className="mt-4 grid gap-4 lg:grid-cols-2"><ConfigCard title="隧道" description="Actions OpenAPI 公网入口"><TunnelConfigForm workspaceId={workspaceId} service="actions" config={actionsTunnelForm(profile)} onSave={saveActionsTunnel} /></ConfigCard><ConfigCard title="认证" description="API Key / OAuth"><ActionsAuthForm workspaceId={workspaceId} authType={actions.auth_type} oauthClientId={actions.oauth_client_id ?? ""} oauthRedirectUris={actions.oauth_redirect_uris ?? ""} oauthRedirectHosts={actions.oauth_redirect_hosts ?? ""} oauthScopes={actions.oauth_scopes ?? ""} openapiUrl={actionsOpenApiUrl(profile, frpProfiles)} privacyUrl={actionsPrivacyUrl(profile, frpProfiles)} oauthAuthorizeUrl={actionsOAuthAuthorizeUrl(profile, frpProfiles)} oauthTokenUrl={actionsOAuthTokenUrl(profile, frpProfiles)} useSharedSecrets={actions.use_shared_secrets} onSave={async (draft: ActionsAuthDraft, options) => { const current = actionsConfig(profile); await persist({ ...profile, actions: { ...current, auth_type: draft.authType, oauth_client_id: draft.oauthClientId || current.oauth_client_id, oauth_redirect_uris: draft.oauthRedirectUris, oauth_redirect_hosts: draft.oauthRedirectHosts, oauth_scopes: draft.oauthScopes, use_shared_secrets: draft.useSharedSecrets } }); if (actionsState === "running" && options.callbackPolicyOnly) toast.success("Actions OAuth Callback 信任策略已热更新"); }} /></ConfigCard><div className="lg:col-span-2"><ConfigCard title="Actions 策略" description="命令白名单与 Patch 限制"><ActionsPolicyForm allowedCommands={actions.allowed_commands ?? ""} maxPatchBytes={actions.max_patch_bytes ?? 200000} permissionMode={actions.permission_mode} onSave={async (draft: ActionsPolicyDraft) => persist({ ...profile, actions: { ...actions, allowed_commands: draft.allowedCommands, max_patch_bytes: draft.maxPatchBytes, permission_mode: draft.permissionMode } }, true)} /></ConfigCard></div></TabsContent>
-                <TabsContent value="logs" className="mt-4"><LogViewer workspaceId={workspaceId} service="actions" /></TabsContent><TabsContent value="health" className="mt-4"><HealthPanel workspaceId={workspaceId} /></TabsContent>
-              </Tabs>
-            </>}
           </TabsContent>
 
           <TabsContent value="canvs" className="mt-4"><CanvsPanel workspaceId={workspaceId} localUrl={canvsWebUrl(mcpLocal)} publicUrl={canvsWebUrl(mcpPublic)} /></TabsContent>

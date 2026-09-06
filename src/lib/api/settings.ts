@@ -105,8 +105,8 @@ export async function setMcpGatewayRoute(
 
 export interface WindowsWorkspaceAutostartDto {
   workspaceId: string;
-  service: "mcp" | "actions" | "all";
-  tunnelServices?: "mcp" | "actions" | "all";
+  service: "mcp" | "all";
+  tunnelServices?: "mcp" | "all";
 }
 
 export interface WindowsServicePlanDto {

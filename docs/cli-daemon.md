@@ -21,7 +21,7 @@ Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT �
 # 后台启动 MCP
 anchor start PROFILE_ID
 
-# 后台启动 MCP + Actions + 隧道
+# 后台启动 MCP + 隧道
 anchor start PROFILE_ID --service all --tunnel
 
 # 查看 daemon、PID 与端口所有权
@@ -82,7 +82,7 @@ anchor gateway stop
 
 ```bash
 anchor start <workspace> \
-  [--service mcp|actions|all] \
+  [--service mcp|all] \
   [--tunnel|--no-tunnel] \
   [--wait SECONDS]
 ```
@@ -104,7 +104,7 @@ anchor stop <workspace> [--timeout SECONDS] [--force]
 
 - 根据状态文件读取 PID；
 - Linux 通过 `/proc/<pid>/cmdline` 验证目标命令；Windows state v2 记录 daemon `executablePath`，并与目标 PID 的进程镜像路径匹配；
-- 正常 `stop` 始终先通过版本化 IPC 发送 `shutdown`，由 daemon 自己停止 MCP、Actions、下游 MCP 和隧道；Windows 不提供绕过 Named Pipe 的本地 signal/kill 写路径；
+- 正常 `stop` 始终先通过版本化 IPC 发送 `shutdown`，由 daemon 自己停止 MCP、下游 MCP 和隧道；Windows 不提供绕过 Named Pipe 的本地 signal/kill 写路径；
 - 超时后只有显式 `--force` 才终止完整子进程树；
 - PID 不匹配时只清理过期状态，不会误杀其他进程；
 - daemon 未运行时返回 already stopped，不视为错误。
@@ -154,7 +154,7 @@ anchor status [<workspace>|--all] [--watch] [--interval SECONDS]
 
 - daemon 是否支持、是否存活、PID 是否匹配；
 - daemon 的 service/tunnel 参数；
-- MCP 与 Actions 端口；
+- MCP 端口；
 - 每个端口的 owner：
   - `daemon`：由当前 CLI daemon 监听；
   - `external`：由当前 control-plane 之外的进程监听；
@@ -168,13 +168,13 @@ anchor status [<workspace>|--all] [--watch] [--interval SECONDS]
 
 ```bash
 anchor logs <workspace> \
-  [--service daemon|mcp|actions|all] \
+  [--service daemon|mcp|all] \
   [--lines N] \
   [--follow|-f]
 ```
 
 - 默认显示 `daemon.log` 最后 100 行；
-- MCP/Actions 会同时显示 listener 与对应隧道日志；
+- MCP 会同时显示 listener 与对应隧道日志；
 - `--service all` 可一次读取全部日志；
 - follow 模式要求选择单个服务，避免多文件输出难以辨认；
 - `--json -f` 输出 `log_snapshot` 和 `log_append` NDJSON 事件。
@@ -196,7 +196,7 @@ anchor events <workspace> [--follow|-f] [--wait SECONDS]
 ### `reload`
 
 ```bash
-anchor reload <workspace> [--service mcp|actions|all]
+anchor reload <workspace> [--service mcp|all]
 ```
 
 - 默认 reload MCP；
@@ -213,7 +213,7 @@ anchor reload <workspace> [--service mcp|actions|all]
 - 当前平台是否支持 daemon；
 - workspace 路径是否有效；
 - daemon 状态是否过期或损坏；
-- MCP/Actions 端口是否空闲或由 daemon 所有；
+- MCP 端口是否空闲或由 daemon 所有；
 - profile 日志目录是否可写；
 - 已配置 FRP/Cloudflare 时对应二进制是否存在。
 
@@ -274,7 +274,7 @@ Workspace 控制协议当前版本为 `6`，支持 `ping`、`version`、`workspa
 
 `version` 与 daemon state 还以 additive optional 字段发布 `buildIdentity`（package version、Git SHA、dirty 标志和构建工作区）。旧 daemon 没有该字段时新客户端按 `None` 处理，因此同一 `0.1.x` 包版本下也能在新旧构建之间建立明确的升级可观察性，而不会把“package version 相同”误当成“运行构建相同”。
 
-Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|actions|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|actions|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
+Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
 
 Tunnel 写控制是异步操作：daemon 先返回 `OperationAccepted` 并完整关闭本次响应帧，然后主循环才执行 Tunnel Supervisor 的 start/stop/restart；客户端使用 `operation_status` 查询 `pending/running/succeeded/failed`。这保证协议响应不会被正在执行的 tunnel 替换操作截断。FRP restart 继续使用 supervisor 的原子 route replacement，失败时保留旧线路；非 FRP restart 失败时也尝试恢复上一线路和持久配置。
 
@@ -295,15 +295,15 @@ CLI 生命周期语义：
 
 Web Admin Workspace 控制使用同一生命周期客户端：
 
-- MCP/Actions 状态来自 `workspace_status`，包括 daemon PID、端口所有权和 MCP 活跃度；
+- MCP 状态来自 `workspace_status`，包括 daemon PID、端口所有权和 MCP 活跃度；
 - 启动、停止、重启和 Workspace 删除不再创建或接管进程内 listener；
-- MCP/Actions 独立开关会重新计算目标 daemon 服务选择，必要时协调重启整个 Workspace daemon；
+- MCP 独立开关会重新计算目标 daemon 服务选择，必要时协调重启整个 Workspace daemon；
 - 运行中日志必须走 daemon IPC；控制端点失败时不会回退为 Web Admin 直接读取正在写入的日志文件；
 - 密钥再生成会通过 IPC 重启真正使用该密钥的 daemon；
-- MCP/Actions Tunnel 的状态、启动、停止、重载和测试均通过 Workspace daemon；daemon 运行时失败不会回退到 Web Admin 进程内的第二套 Tunnel Supervisor；
+- MCP Tunnel 的状态、启动、停止、重载和测试均通过 Workspace daemon；daemon 运行时失败不会回退到 Web Admin 进程内的第二套 Tunnel Supervisor；
 - 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，Web Admin 优先使用该值；
 - Workspace 页面状态刷新优先使用 daemon `events` 长轮询，只有控制端点明确不存在时才回退到旧状态轮询；protocol/remote 错误会进入显式 fault 状态，不静默降级；fallback polling 会周期性重新探测事件端点，因此外部 CLI 启动 daemon 后可自动恢复 event-first 模式；
-- Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；Web Admin 不根据 `running` 状态自行猜测 restart。名称等纯元数据变化不触发 listener，MCP/Actions 运行参数与认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
+- Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；Web Admin 不根据 `running` 状态自行猜测 restart。名称等纯元数据变化不触发 listener，MCP 运行参数与认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
 - Workspace control protocol v6 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 Web Admin/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
 - Tunnel 仍保持独立事务语义：保存 tunnel 配置后由 tunnel control 执行 start/stop/restart；Workspace profile 更新本身不会把 tunnel 字段误判为 listener 配置。Gateway 仅在其实际使用的 MCP tunnel/owner 字段变化时 reload，不再因 Workspace 名称等无关配置变化重建；
 - Gateway 不归属于任何 Workspace daemon。Windows/Linux Web Admin/CLI 都使用独立 Gateway daemon；Windows 使用配置域级 Named Pipe，Linux 使用私有 UDS。Web Admin 不创建 process-local Gateway listener 或 Tunnel，route 始终由 Gateway daemon 持有并指向对应 Workspace 目标端口。
@@ -354,7 +354,7 @@ Gateway 写控制遵循 fail-closed：
 - 禁用运行中的 Gateway 不使用 `apply_config`，而是先优雅 shutdown，确认退出后再持久化 disabled；
 - endpoint 不可用、协议不兼容、scope/PID 不匹配时所有写请求直接失败，不会回退为 CLI/Web Admin 进程内 Gateway 或 Tunnel Supervisor。
 
-Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。只有影响 Gateway 所持 MCP tunnel/owner identity 的 Workspace 配置保存才触发 Gateway reload；失败时共享 management 层恢复旧 Workspace/settings 并再次对齐旧运行态。名称、Actions 或普通 MCP listener 策略变化不会无谓重建 Gateway。活动 route 在 Gateway daemon 停止前不能删除或注销。
+Gateway daemon 正在使用的 route Workspace 会被视为 live MCP 运行态。只有影响 Gateway 所持 MCP tunnel/owner identity 的 Workspace 配置保存才触发 Gateway reload；失败时共享 management 层恢复旧 Workspace/settings 并再次对齐旧运行态。名称或普通 MCP listener 策略变化不会无谓重建 Gateway。活动 route 在 Gateway daemon 停止前不能删除或注销。
 
 Web Admin Gateway 页面直接使用 `routeWorkspaceIds` 展示活动路由，并通过 Gateway control status/events 观测变化，不再逐个轮询 Workspace runtime。共享 management/data 层在执行配置操作时重新读取 canonical state，避免覆盖 Gateway daemon 在后台写入的 observed public URL。
 
@@ -392,15 +392,15 @@ anchor events --control-plane
 anchor events --control-plane --follow --wait 15
 ```
 
-聚合状态为每个 Workspace 返回原始 `WorkspaceControlStatus` 加 canonical `mcpState/actionsState`。当某 Workspace 是活动 Gateway route 时，MCP 只有在监听 PID 与 Gateway daemon PID 匹配时才标记为 running；错误 PID 会标记 error，route 已选但端口暂未监听则为 recovering。这样 Web Admin 不再把 Gateway daemon 持有的 MCP listener 误判为“外部进程”。
+聚合状态为每个 Workspace 返回原始 `WorkspaceControlStatus` 加 canonical `mcpState`。当某 Workspace 是活动 Gateway route 时，MCP 只有在监听 PID 与 Gateway daemon PID 匹配时才标记为 running；错误 PID 会标记 error，route 已选但端口暂未监听则为 recovering。这样 Web Admin 不再把 Gateway daemon 持有的 MCP listener 误判为“外部进程”。
 
 聚合事件保留 Gateway cursor 与每个 Workspace cursor，最多返回 64 个按时间合并的事件；aggregate truncation 只推进实际返回事件对应的 source cursor，避免跨源丢事件。每次底层 long-poll slice 最长 1 秒；所有 endpoint 都 unavailable 时仍遵守该 cadence，避免 idle busy-loop。endpoint unavailable 只表示该 source 本轮没有事件；protocol/remote 错误直接终止聚合请求。
 
-Web Admin 全局 layout 使用一次 `get_control_plane_status` 代替每个 Workspace 的 MCP/Actions 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
+Web Admin 全局 layout 使用一次 `get_control_plane_status` 代替每个 Workspace 的 MCP 双请求，并使用 `get_control_plane_events` 作为状态刷新唤醒。空长轮询只检查 Workspace 配置列表是否由外部 CLI 增删，不恢复旧的 N×service 状态 polling。
 
-Windows Workspace 使用真实后台 daemon：Web Admin/CLI 的 MCP/Actions 状态、启停、重启、Workspace Tunnel 和配置应用都走同一 Named Pipe 控制面。`anchor.exe` 自身承载内部 `daemon-run` / Gateway / Service 子命令，因此不依赖任何 desktop 启动镜像。
+Windows Workspace 使用真实后台 daemon：Web Admin/CLI 的 MCP 状态、启停、重启、Workspace Tunnel 和配置应用都走同一 Named Pipe 控制面。`anchor.exe` 自身承载内部 `daemon-run` / Gateway / Service 子命令，因此不依赖任何 desktop 启动镜像。
 
-Windows Gateway 也使用独立后台 daemon 与 Named Pipe 控制面。Gateway 开启时，选中的 Workspace MCP listener 由 Gateway daemon PID 直接持有，Workspace 独立 daemon 不再同时持有同一 MCP route；Actions 仍可由 Workspace daemon 独立运行。Web Admin 的 MCP 启停在 Gateway 模式下变成 route 集合更新，并通过受控 reload 完成。
+Windows Gateway 也使用独立后台 daemon 与 Named Pipe 控制面。Gateway 开启时，选中的 Workspace MCP listener 由 Gateway daemon PID 直接持有，Workspace 独立 daemon 不再同时持有同一 MCP route。Web Admin 的 MCP 启停在 Gateway 模式下变成 route 集合更新，并通过受控 reload 完成。
 
 Windows 还提供配置域级 SCM Service，用于开机自动恢复已选择的 Workspace/Gateway 运行计划：
 

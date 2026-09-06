@@ -321,9 +321,6 @@ fn profile_references(data: &AppData, id: &str) -> Vec<String> {
         if workspace.tunnel.frp_profile_id == id {
             references.push(format!("{}:mcp", workspace.name));
         }
-        if workspace.actions.frp_profile_id == id {
-            references.push(format!("{}:actions", workspace.name));
-        }
     }
     references
 }
@@ -336,9 +333,6 @@ fn all_profile_references(data: &AppData, id: &str) -> AppResult<Vec<String>> {
         };
         if pending.tunnel.frp_profile_id == id && workspace.tunnel.frp_profile_id != id {
             references.push(format!("{}:mcp(pending)", workspace.name));
-        }
-        if pending.actions.frp_profile_id == id && workspace.actions.frp_profile_id != id {
-            references.push(format!("{}:actions(pending)", workspace.name));
         }
     }
     references.sort();
@@ -369,11 +363,6 @@ fn ensure_profile_not_live(
                 && managed.is_some_and(|selection| selection.includes_mcp())
             {
                 live.push(format!("{}:mcp", workspace.name));
-            }
-            if workspace.actions.frp_profile_id == profile.id
-                && managed.is_some_and(|selection| selection.includes_actions())
-            {
-                live.push(format!("{}:actions", workspace.name));
             }
         }
     }

@@ -1,6 +1,5 @@
 #![cfg_attr(target_os = "windows", allow(linker_messages))]
 
-mod actions;
 #[cfg(feature = "cli")]
 pub mod admin;
 #[cfg(feature = "cli")]

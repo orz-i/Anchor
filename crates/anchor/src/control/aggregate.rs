@@ -31,7 +31,6 @@ pub struct ControlPlaneWorkspaceStatus {
     #[serde(flatten)]
     pub status: WorkspaceControlStatus,
     pub mcp_state: String,
-    pub actions_state: String,
 }
 
 pub async fn control_plane_status(profiles: &[WorkspaceProfile]) -> AppResult<ControlPlaneStatus> {
@@ -53,13 +52,7 @@ pub async fn control_plane_status(profiles: &[WorkspaceProfile]) -> AppResult<Co
     for result in workspace_results {
         let status = result?;
         let mcp_state = workspace_service_state(&status, ControlService::Mcp, &gateway).into();
-        let actions_state =
-            workspace_service_state(&status, ControlService::Actions, &gateway).into();
-        workspaces.push(ControlPlaneWorkspaceStatus {
-            status,
-            mcp_state,
-            actions_state,
-        });
+        workspaces.push(ControlPlaneWorkspaceStatus { status, mcp_state });
     }
     Ok(ControlPlaneStatus {
         runtime_capabilities,
@@ -101,15 +94,6 @@ pub fn workspace_service_state(
                 .as_ref()
                 .filter(|_| status.daemon.running)
                 .is_some_and(|state| state.service.includes_mcp()),
-        ),
-        ControlService::Actions => (
-            &status.actions,
-            status
-                .daemon
-                .state
-                .as_ref()
-                .filter(|_| status.daemon.running)
-                .is_some_and(|state| state.service.includes_actions()),
         ),
     };
     if status.daemon.ambiguous || (status.daemon.stale && status.daemon.state.is_some()) {
@@ -477,17 +461,8 @@ mod tests {
                 .into(),
                 endpoint: "http://127.0.0.1:28001/mcp".into(),
             },
-            actions: PortStatus {
-                service: "actions".into(),
-                port: 28_002,
-                listening: false,
-                pid: None,
-                owner: "none".into(),
-                endpoint: "http://127.0.0.1:28002".into(),
-            },
             mcp_activity: None,
             mcp_tunnel: None,
-            actions_tunnel: None,
         }
     }
 

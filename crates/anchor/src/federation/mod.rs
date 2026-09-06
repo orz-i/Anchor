@@ -81,18 +81,12 @@ pub async fn execute_local_read(
                 .iter()
                 .filter(|workspace| workspace.mcp_state == "running")
                 .count();
-            let actions_active_count = status
-                .workspaces
-                .iter()
-                .filter(|workspace| workspace.actions_state == "running")
-                .count();
             Ok(FederationReadResult::NodeControlStatus(
                 FederationNodeControlStatus {
                     node_id: local.runtime.node.id,
                     gateway_state: status.gateway.state,
                     workspace_count: status.workspaces.len(),
                     mcp_active_count,
-                    actions_active_count,
                 },
             ))
         }
@@ -124,7 +118,6 @@ pub async fn execute_local_read(
                     workspace_id: profile.id.clone(),
                     display_name: bounded_display_name(&profile.name, &profile.id),
                     mcp_state: workspace.mcp_state,
-                    actions_state: workspace.actions_state,
                 },
             ))
         }
@@ -138,7 +131,6 @@ pub struct FederationNodeControlStatus {
     pub gateway_state: String,
     pub workspace_count: usize,
     pub mcp_active_count: usize,
-    pub actions_active_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,7 +140,6 @@ pub struct FederationWorkspaceStatus {
     pub workspace_id: String,
     pub display_name: String,
     pub mcp_state: String,
-    pub actions_state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

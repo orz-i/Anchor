@@ -5,9 +5,9 @@ Anchor 对 Workspace/Gateway runtime、隧道、下游 MCP、Web Admin 状态同
 1. 能安全重复的连接与读取操作自动重试；
 2. 结果可能已经生效的写入和工具调用不盲目重放。
 
-## MCP 与 Actions 本地服务
+## MCP 本地服务
 
-MCP/Actions listener 的恢复逻辑属于实际持有运行态的 `RuntimeSupervisor`；在 daemon 模式中由 Workspace daemon 持有，在前台 `serve` 模式中由前台 CLI 持有。Web Admin 只读取 control-plane 状态，不创建第二套本地 listener 来“补救” daemon。
+MCP listener 的恢复逻辑属于实际持有运行态的 `RuntimeSupervisor`；在 daemon 模式中由 Workspace daemon 持有，在前台 `serve` 模式中由前台 CLI 持有。Web Admin 只读取 control-plane 状态，不创建第二套本地 listener 来“补救” daemon。
 
 以下情况会进入 `recovering`：
 
@@ -125,7 +125,7 @@ Web Admin 不维护业务 runtime。Workspace/Gateway 页面优先消费版本�
 
 ## OAuth 续约
 
-MCP 和 Actions OAuth authorization server metadata 现在声明：
+MCP OAuth authorization server metadata 现在声明：
 
 ```json
 {
@@ -148,7 +148,7 @@ Cache-Control: no-store
 Pragma: no-cache
 ```
 
-已经使用过的 Refresh Token 再次提交会返回 `invalid_grant`，提示重新授权。Workspace MCP/Actions runtime 会给 OAuth runtime 提供稳定 replay key，已消费 refresh-token JTI 通过 SecretStore 持久化，因此防重放状态可跨 daemon 调用/重启保存；没有 replay key 的孤立测试/临时 runtime 才使用进程内 fallback map。
+已经使用过的 Refresh Token 再次提交会返回 `invalid_grant`，提示重新授权。Workspace MCP runtime 会给 OAuth runtime 提供稳定 replay key，已消费 refresh-token JTI 通过 SecretStore 持久化，因此防重放状态可跨 daemon 调用/重启保存；没有 replay key 的孤立测试/临时 runtime 才使用进程内 fallback map。
 
 重新生成 OAuth Token Secret 会立即使现有 Access Token 和 Refresh Token 全部失效，客户端需要重新授权。
 

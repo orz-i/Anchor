@@ -121,7 +121,6 @@ pub enum ControlMethod {
 #[serde(rename_all = "snake_case")]
 pub enum ControlService {
     Mcp,
-    Actions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,11 +197,8 @@ pub struct ControlAsyncOperation {
 pub struct ControlConfigApplyResult {
     pub changed: bool,
     pub mcp_listener_reloaded: bool,
-    pub actions_listener_reloaded: bool,
     pub mcp_callback_hot_updated: bool,
-    pub actions_callback_hot_updated: bool,
     pub mcp_tunnel_reloaded: bool,
-    pub actions_tunnel_reloaded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +206,6 @@ pub struct ControlConfigApplyResult {
 pub enum ControlLogSelection {
     Daemon,
     Mcp,
-    Actions,
     All,
 }
 
@@ -458,14 +453,14 @@ mod tests {
             request_id: "request-5".into(),
             method: ControlMethod::TunnelControl {
                 workspace_id: "workspace-1".into(),
-                service: crate::tunnel::TunnelServiceKind::Actions,
+                service: crate::tunnel::TunnelServiceKind::Mcp,
                 action: ControlTunnelAction::Restart,
             },
         })
         .expect("serialize tunnel request");
         assert_eq!(tunnel["method"], "tunnel_control");
         assert_eq!(tunnel["workspaceId"], "workspace-1");
-        assert_eq!(tunnel["service"], "actions");
+        assert_eq!(tunnel["service"], "mcp");
         assert_eq!(tunnel["action"], "restart");
 
         let operation = serde_json::to_value(ControlRequest {
@@ -516,7 +511,7 @@ mod tests {
             request_id: "request-9".into(),
             method: ControlMethod::UpdateOauthRedirectPolicy {
                 workspace_id: "workspace-1".into(),
-                service: ControlService::Actions,
+                service: ControlService::Mcp,
                 redirect_uris: "https://chatgpt.com/callback".into(),
                 redirect_hosts: "*.chatgpt.com".into(),
             },
@@ -524,7 +519,7 @@ mod tests {
         .expect("serialize hot update request");
         assert_eq!(hot_update["method"], "update_oauth_redirect_policy");
         assert_eq!(hot_update["workspaceId"], "workspace-1");
-        assert_eq!(hot_update["service"], "actions");
+        assert_eq!(hot_update["service"], "mcp");
         assert_eq!(hot_update["redirectUris"], "https://chatgpt.com/callback");
         assert_eq!(hot_update["redirectHosts"], "*.chatgpt.com");
 

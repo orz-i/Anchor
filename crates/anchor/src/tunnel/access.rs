@@ -65,7 +65,6 @@ pub async fn ensure_for_runtime(
 fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
-        TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
     }
 }
 
@@ -128,14 +127,12 @@ fn publish_listener_url(profile: &WorkspaceProfile, kind: TunnelServiceKind, url
 fn service_key(kind: TunnelServiceKind) -> &'static str {
     match kind {
         TunnelServiceKind::Mcp => "mcp",
-        TunnelServiceKind::Actions => "actions",
     }
 }
 
 fn configured_public_url(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
     match kind {
         TunnelServiceKind::Mcp => &profile.tunnel.public_url,
-        TunnelServiceKind::Actions => &profile.actions.public_url,
     }
 }
 
@@ -143,10 +140,6 @@ fn is_quick_cloudflare(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> b
     match kind {
         TunnelServiceKind::Mcp => {
             profile.tunnel.tunnel_type == "cloudflare" && profile.tunnel.cloudflare_mode == "quick"
-        }
-        TunnelServiceKind::Actions => {
-            profile.actions.tunnel_type == "cloudflare"
-                && profile.actions.cloudflare_mode == "quick"
         }
     }
 }
@@ -170,7 +163,7 @@ pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
 
 /// Reconcile the one public MCP tunnel used by gateway mode. Existing direct
 /// workspace MCP tunnels are stopped before the owner tunnel is pointed at the
-/// gateway port. Actions tunnels remain independent.
+/// gateway port.
 pub async fn reconcile_mcp_gateway(
     config: &McpGatewayConfig,
     profiles: &[WorkspaceProfile],

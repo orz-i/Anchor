@@ -63,13 +63,10 @@ pub struct WorkspaceControlStatus {
     pub path: String,
     pub daemon: DaemonInspection,
     pub mcp: PortStatus,
-    pub actions: PortStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_activity: Option<McpActivityDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_tunnel: Option<TunnelStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actions_tunnel: Option<TunnelStatus>,
 }
 
 pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceControlStatus> {
@@ -103,16 +100,8 @@ pub fn workspace_status(profile: &WorkspaceProfile) -> AppResult<WorkspaceContro
         path: profile.path.clone(),
         daemon,
         mcp,
-        actions: port_status(
-            "actions",
-            profile.actions.local_port,
-            profile.actions_local_base_url(),
-            daemon_pid,
-            None,
-        )?,
         mcp_activity,
         mcp_tunnel: None,
-        actions_tunnel: None,
     })
 }
 

@@ -162,9 +162,7 @@ anchor import /secure/anchor-migration.json \
 
 - Workspace ID；
 - MCP OAuth client ID；
-- Actions OAuth client ID；
 - OAuth password / token secret；
-- Actions API key / OAuth secret；
 - Bearer token；
 - OAuth refresh/replay 状态；
 - tunnel/public URL 配置；

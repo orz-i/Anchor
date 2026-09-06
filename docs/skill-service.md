@@ -261,7 +261,6 @@ Web Admin 与 CLI/MCP 不维护第二套状态；三者都操作 `.anchor/skills
 - store 状态损坏时 fail closed：active catalog 为空并报告错误，mutation 不会覆盖损坏状态。
 - active scripts 延续已有 snapshot digest 校验；文件发生变化后不能借由原有授权继续执行。
 - resources 读取持续执行 manifest + digest 校验。
-- Skill service 不加入 Actions OpenAPI 网关。
 
 ## 运维
 

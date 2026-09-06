@@ -499,8 +499,6 @@ fn remap_known_profile_paths(
     for (label, value) in [
         ("MCP FRP 证书", &mut profile.tunnel.frp_cert_path),
         ("MCP FRP 私钥", &mut profile.tunnel.frp_key_path),
-        ("Actions FRP 证书", &mut profile.actions.frp_cert_path),
-        ("Actions FRP 私钥", &mut profile.actions.frp_key_path),
     ] {
         if let Some(remapped) =
             remap_path_under_workspace(value, source_root, target_root, source_platform)
@@ -574,12 +572,6 @@ fn collect_portability_warnings(
     if profile.tunnel.tunnel_type == "cloudflare" && profile.tunnel.cloudflare_mode == "quick" {
         warnings.push(format!(
             "workspace {} 的 MCP 使用 Cloudflare quick tunnel；URL 可能变化，无法保证复用 ChatGPT 中原有注册入口",
-            profile.name
-        ));
-    }
-    if profile.actions.tunnel_type == "cloudflare" && profile.actions.cloudflare_mode == "quick" {
-        warnings.push(format!(
-            "workspace {} 的 Actions 使用 Cloudflare quick tunnel；URL 可能变化，无法保证复用原有注册入口",
             profile.name
         ));
     }
@@ -718,7 +710,6 @@ mod tests {
         let mut profile = WorkspaceProfile::new(path, Some("demo".into()));
         profile.id = "stable-workspace-id".into();
         profile.auth.oauth_client_id = "chatgpt-client-stable".into();
-        profile.actions.oauth_client_id = "chatgpt-actions-stable".into();
         let mut data = AppData {
             profiles: vec![profile],
             last_workspace_id: "stable-workspace-id".into(),
@@ -741,10 +732,6 @@ mod tests {
         assert_eq!(
             decoded.profiles[0].auth.oauth_client_id,
             "chatgpt-client-stable"
-        );
-        assert_eq!(
-            decoded.profiles[0].actions.oauth_client_id,
-            "chatgpt-actions-stable"
         );
         assert_eq!(
             decoded.workspace_secrets["stable-workspace-id"]["bearer_token"],

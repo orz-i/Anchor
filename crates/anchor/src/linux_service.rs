@@ -728,7 +728,7 @@ mod tests {
                 },
                 LinuxWorkspaceAutostart {
                     workspace_id: "b".into(),
-                    service: ServiceSelection::Actions,
+                    service: ServiceSelection::All,
                     tunnel_services: None,
                 },
             ],
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(plan.schema_version, PLAN_SCHEMA_VERSION);
         assert_eq!(plan.workspaces.len(), 1);
         assert_eq!(plan.workspaces[0].workspace_id, "b");
-        assert_eq!(plan.workspaces[0].service, ServiceSelection::Actions);
+        assert_eq!(plan.workspaces[0].service, ServiceSelection::All);
         assert_eq!(plan.gateway_workspace_ids, vec!["a", "z"]);
     }
 }

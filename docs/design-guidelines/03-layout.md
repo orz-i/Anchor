@@ -53,7 +53,7 @@ PageLayout
 - loading skeleton；
 - empty / no-result state；
 - Workspace card grid；
-- MCP / Actions 快捷启停。
+- MCP 快捷启停。
 
 卡片网格断点为：
 
@@ -64,13 +64,13 @@ xl:   3 columns
 gap:  1rem
 ```
 
-每张卡片按当前实现展示名称、路径、MCP/Actions 状态、端口摘要、隧道摘要和快捷操作。路径等长文本必须允许 truncate，并通过 title/copy 等方式保留完整值的访问路径。
+每张卡片按当前实现展示名称、路径、MCP 状态、端口摘要、隧道摘要和快捷操作。路径等长文本必须允许 truncate，并通过 title/copy 等方式保留完整值的访问路径。
 
 ## Workspace 详情
 
 详情页按业务能力分区，而不是把所有配置平铺到一个长表单：
 
-- MCP / Actions 服务状态与 Endpoint；
+- MCP 服务状态与 Endpoint；
 - 配置 Tab；
 - 日志；
 - 健康检查；

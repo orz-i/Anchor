@@ -70,12 +70,6 @@ impl SecretStore {
         DataStore::read_file(|data| Ok(workspace_secret_from(data, profile_id, key)))
     }
 
-    pub fn regenerate(profile_id: &str, key: &str) -> AppResult<String> {
-        let value = random_secret();
-        Self::set(profile_id, key, &value)?;
-        Ok(value)
-    }
-
     pub fn get_shared(key: &str) -> AppResult<Option<String>> {
         DataStore::read_file(|data| Ok(data.shared_secrets.get(key).cloned()))
     }
@@ -173,18 +167,9 @@ fn workspace_secret_map<'a>(
         .or_default()
 }
 
-fn random_secret() -> String {
-    format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()).replace('-', "")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn random_secret_is_non_empty() {
-        assert!(random_secret().len() > 32);
-    }
 
     #[test]
     fn workspace_secret_roundtrip() {

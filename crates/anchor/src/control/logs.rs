@@ -71,16 +71,6 @@ fn selected_log_files(
                 .map(|(label, file_name)| (label.into(), log_dir.join(file_name))),
         );
     }
-    if matches!(
-        selection,
-        ControlLogSelection::Actions | ControlLogSelection::All
-    ) {
-        files.extend(
-            profile_log_files(profile, ProfileLogService::Actions)
-                .into_iter()
-                .map(|(label, file_name)| (label.into(), log_dir.join(file_name))),
-        );
-    }
     files
 }
 

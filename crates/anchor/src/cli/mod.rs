@@ -399,11 +399,8 @@ fn print_control_plane_status(status: &control::ControlPlaneStatus) {
     );
     for workspace in &status.workspaces {
         println!(
-            "{} ({})\tMCP={}\tActions={}",
-            workspace.status.name,
-            workspace.status.id,
-            workspace.mcp_state,
-            workspace.actions_state
+            "{} ({})\tMCP={}",
+            workspace.status.name, workspace.status.id, workspace.mcp_state
         );
     }
 }
@@ -781,15 +778,10 @@ async fn reload_daemon_config(options: ReloadOptions, as_json: bool) -> AppResul
         })?;
     let requested = match options.service {
         ServiceSelection::Mcp => vec![control::ControlService::Mcp],
-        ServiceSelection::Actions => vec![control::ControlService::Actions],
-        ServiceSelection::All => vec![
-            control::ControlService::Mcp,
-            control::ControlService::Actions,
-        ],
+        ServiceSelection::All => vec![control::ControlService::Mcp],
     };
     if requested.iter().any(|service| match service {
         control::ControlService::Mcp => !state.service.includes_mcp(),
-        control::ControlService::Actions => !state.service.includes_actions(),
     }) {
         return Err(AppError::Message(format!(
             "daemon 当前 service={}，不能 reload 未运行的目标服务；请先启动该服务或只选择活动服务",
@@ -805,13 +797,11 @@ async fn reload_daemon_config(options: ReloadOptions, as_json: bool) -> AppResul
                     "daemon reload {} 失败：{error}",
                     match service {
                         control::ControlService::Mcp => "mcp",
-                        control::ControlService::Actions => "actions",
                     }
                 ))
             })?;
         reloaded.push(match service {
             control::ControlService::Mcp => "mcp",
-            control::ControlService::Actions => "actions",
         });
     }
     if as_json {
@@ -2070,7 +2060,6 @@ async fn show_logs_via_daemon(
     let selection = match options.service {
         LogSelection::Daemon => control::ControlLogSelection::Daemon,
         LogSelection::Mcp => control::ControlLogSelection::Mcp,
-        LogSelection::Actions => control::ControlLogSelection::Actions,
         LogSelection::All => control::ControlLogSelection::All,
     };
     let tail_lines = u32::try_from(options.lines).unwrap_or(u32::MAX);
@@ -2247,13 +2236,6 @@ fn selected_log_files(
                 .map(|(label, file_name)| (label.into(), log_dir.join(file_name))),
         );
     }
-    if matches!(selection, LogSelection::Actions | LogSelection::All) {
-        files.extend(
-            profile_log_files(profile, ProfileLogService::Actions)
-                .into_iter()
-                .map(|(label, file_name)| (label.into(), log_dir.join(file_name))),
-        );
-    }
     files
 }
 
@@ -2364,25 +2346,19 @@ async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
     }
 
     let owner_pid = inspection.state.as_ref().map(|state| state.pid);
-    for (label, port) in [
-        ("MCP 端口", profile.runtime.local_port),
-        ("Actions 端口", profile.actions.local_port),
-    ] {
-        let pid = platform().find_pid_listening_on_port(port)?;
-        let owned = pid.is_none() || (inspection.running && pid == owner_pid);
-        checks.push(doctor_check(
-            label,
-            owned,
-            match pid {
-                Some(pid) if Some(pid) == owner_pid => {
-                    format!("{port} 由 daemon PID {pid} 监听")
-                }
-                Some(pid) => format!("{port} 被外部 PID {pid} 占用"),
-                None => format!("{port} 可用"),
-            },
-            "停止 GUI/其他进程或修改 profile 端口",
-        ));
-    }
+    let port = profile.runtime.local_port;
+    let pid = platform().find_pid_listening_on_port(port)?;
+    let owned = pid.is_none() || (inspection.running && pid == owner_pid);
+    checks.push(doctor_check(
+        "MCP 端口",
+        owned,
+        match pid {
+            Some(pid) if Some(pid) == owner_pid => format!("{port} 由 daemon PID {pid} 监听"),
+            Some(pid) => format!("{port} 被外部 PID {pid} 占用"),
+            None => format!("{port} 可用"),
+        },
+        "停止 GUI/其他进程或修改 profile 端口",
+    ));
 
     let log_dir = log_dir_for_profile(&profile.id);
     let log_ok = path_or_parent_writable(&log_dir);
@@ -2418,10 +2394,7 @@ async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
 }
 
 fn append_tunnel_doctor_checks(profile: &WorkspaceProfile, checks: &mut Vec<DoctorCheck>) {
-    for (label, tunnel_type) in [
-        ("MCP 隧道依赖", profile.tunnel.tunnel_type.as_str()),
-        ("Actions 隧道依赖", profile.actions.tunnel_type.as_str()),
-    ] {
+    for (label, tunnel_type) in [("MCP 隧道依赖", profile.tunnel.tunnel_type.as_str())] {
         let result = match tunnel_type {
             "frp" => crate::tunnel::resolve_frpc().map(|path| path.display().to_string()),
             "cloudflare" => {
@@ -2670,9 +2643,6 @@ fn ensure_selected_ports_available(
     let mut selected = Vec::new();
     if service.includes_mcp() {
         selected.push(("MCP", profile.runtime.local_port));
-    }
-    if service.includes_actions() {
-        selected.push(("Actions", profile.actions.local_port));
     }
     for (label, port) in selected {
         if let Some(pid) = platform().find_pid_listening_on_port(port)? {
@@ -2935,7 +2905,6 @@ struct WorkspaceSummary<'a> {
     name: &'a str,
     path: &'a str,
     mcp_port: u16,
-    actions_port: u16,
 }
 
 fn list_workspaces(as_json: bool) -> AppResult<()> {
@@ -2948,7 +2917,6 @@ fn list_workspaces(as_json: bool) -> AppResult<()> {
             name: &profile.name,
             path: &profile.path,
             mcp_port: profile.runtime.local_port,
-            actions_port: profile.actions.local_port,
         })
         .collect();
 
@@ -2961,8 +2929,8 @@ fn list_workspaces(as_json: bool) -> AppResult<()> {
     } else {
         for item in summaries {
             println!(
-                "{}\t{}\t{}\tMCP:{}\tActions:{}",
-                item.id, item.name, item.path, item.mcp_port, item.actions_port
+                "{}\t{}\t{}\tMCP:{}",
+                item.id, item.name, item.path, item.mcp_port
             );
         }
     }
@@ -3043,7 +3011,6 @@ fn print_workspace_status(status: &WorkspaceControlStatus) {
     println!("{} ({})", status.name, status.id);
     println!("daemon\t{}", status.daemon.detail);
     print_port_status(&status.mcp);
-    print_port_status(&status.actions);
 }
 
 fn print_port_status(status: &control::PortStatus) {
@@ -3114,24 +3081,6 @@ async fn serve_workspace(
             ensure_running(status, "MCP")?;
             started_services.push(ServiceKind::Mcp);
         }
-        if service.includes_actions() {
-            #[cfg(unix)]
-            let status = match serve_context
-                .imported_listeners
-                .as_mut()
-                .and_then(|listeners| listeners.actions.take())
-            {
-                Some(listener) => {
-                    runtime.start_from_handoff(&profile, ServiceKind::Actions, listener, None)?
-                }
-                None => runtime.start_actions(&profile)?,
-            };
-            #[cfg(not(unix))]
-            let status = runtime.start_actions(&profile)?;
-            ensure_running(status, "Actions")?;
-            started_services.push(ServiceKind::Actions);
-        }
-
         if let Some(tunnel_services) = tunnel_services {
             for kind in selected_tunnels(tunnel_services) {
                 managed_tunnels.push(kind);
@@ -3357,12 +3306,6 @@ async fn serve_workspace(
                                     runtime.begin_stop(&profile.id, ServiceKind::Mcp),
                                 ));
                             }
-                            if service.includes_actions() {
-                                drains.push((
-                                    ServiceKind::Actions,
-                                    runtime.begin_stop(&profile.id, ServiceKind::Actions),
-                                ));
-                            }
                             ownership.release();
 
                             match handoff::wait_canonical_ready(
@@ -3518,7 +3461,6 @@ async fn serve_workspace(
                 for kind in started_services.iter().copied() {
                     let status_result = match kind {
                         ServiceKind::Mcp => runtime.maintain_mcp(&profile),
-                        ServiceKind::Actions => runtime.maintain_actions(&profile),
                     };
                     let status = match status_result {
                         Ok(status) => status,
@@ -3720,28 +3662,20 @@ fn selected_tunnels(service: ServiceSelection) -> Vec<TunnelServiceKind> {
     if service.includes_mcp() {
         values.push(TunnelServiceKind::Mcp);
     }
-    if service.includes_actions() {
-        values.push(TunnelServiceKind::Actions);
-    }
     values
 }
 
 fn managed_tunnel_selection(tunnels: &[TunnelServiceKind]) -> Option<ServiceSelection> {
-    match (
-        tunnels.contains(&TunnelServiceKind::Mcp),
-        tunnels.contains(&TunnelServiceKind::Actions),
-    ) {
-        (true, true) => Some(ServiceSelection::All),
-        (true, false) => Some(ServiceSelection::Mcp),
-        (false, true) => Some(ServiceSelection::Actions),
-        (false, false) => None,
+    if tunnels.contains(&TunnelServiceKind::Mcp) {
+        Some(ServiceSelection::Mcp)
+    } else {
+        None
     }
 }
 
 fn tunnel_type_for_profile(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
     match kind {
         TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
-        TunnelServiceKind::Actions => profile.actions.tunnel_type.as_str(),
     }
 }
 
@@ -3764,19 +3698,6 @@ fn tunnel_config_matches(
                 && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
                 && left.tunnel.use_proxy == right.tunnel.use_proxy
         }
-        TunnelServiceKind::Actions => {
-            left.actions.public_url == right.actions.public_url
-                && left.actions.tunnel_type == right.actions.tunnel_type
-                && left.actions.frp_server == right.actions.frp_server
-                && left.actions.frp_subdomain == right.actions.frp_subdomain
-                && left.actions.frp_profile_id == right.actions.frp_profile_id
-                && left.actions.frp_server_port == right.actions.frp_server_port
-                && left.actions.frp_proxy_type == right.actions.frp_proxy_type
-                && left.actions.frp_cert_path == right.actions.frp_cert_path
-                && left.actions.frp_key_path == right.actions.frp_key_path
-                && left.actions.cloudflare_mode == right.actions.cloudflare_mode
-                && left.actions.use_proxy == right.actions.use_proxy
-        }
     }
 }
 
@@ -3796,19 +3717,6 @@ fn restore_daemon_tunnel_config(
     }
     match kind {
         TunnelServiceKind::Mcp => current.tunnel = restored.tunnel.clone(),
-        TunnelServiceKind::Actions => {
-            current.actions.public_url = restored.actions.public_url.clone();
-            current.actions.tunnel_type = restored.actions.tunnel_type.clone();
-            current.actions.frp_server = restored.actions.frp_server.clone();
-            current.actions.frp_subdomain = restored.actions.frp_subdomain.clone();
-            current.actions.frp_profile_id = restored.actions.frp_profile_id.clone();
-            current.actions.frp_server_port = restored.actions.frp_server_port;
-            current.actions.frp_proxy_type = restored.actions.frp_proxy_type.clone();
-            current.actions.frp_cert_path = restored.actions.frp_cert_path.clone();
-            current.actions.frp_key_path = restored.actions.frp_key_path.clone();
-            current.actions.cloudflare_mode = restored.actions.cloudflare_mode.clone();
-            current.actions.use_proxy = restored.actions.use_proxy;
-        }
     }
     store.update(current)
 }
@@ -3833,11 +3741,6 @@ fn persist_daemon_tunnel_url(
             current.tunnel.public_url = public_url.to_string();
             profile.tunnel.public_url = public_url.to_string();
             update_public_url(&profile.id, "mcp", public_url);
-        }
-        TunnelServiceKind::Actions => {
-            current.actions.public_url = public_url.to_string();
-            profile.actions.public_url = public_url.to_string();
-            update_public_url(&profile.id, "actions", public_url);
         }
     }
     store.update(current)
@@ -3955,11 +3858,9 @@ async fn apply_daemon_reload_command(
 
     let kind = match service {
         control::ControlService::Mcp => ServiceKind::Mcp,
-        control::ControlService::Actions => ServiceKind::Actions,
     };
     let selected = match service {
         control::ControlService::Mcp => service_selection.includes_mcp(),
-        control::ControlService::Actions => service_selection.includes_actions(),
     };
     if !selected {
         return Err(AppError::Message(format!(
@@ -3977,9 +3878,6 @@ async fn apply_daemon_reload_command(
         ServiceKind::Mcp => runtime
             .start_mcp(&latest)
             .and_then(|status| ensure_running(status, "MCP")),
-        ServiceKind::Actions => runtime
-            .start_actions(&latest)
-            .and_then(|status| ensure_running(status, "Actions")),
     };
     if let Err(error) = reload_result {
         let handle = runtime.begin_stop(&profile.id, kind);
@@ -3989,9 +3887,6 @@ async fn apply_daemon_reload_command(
             ServiceKind::Mcp => runtime
                 .start_mcp(&previous)
                 .and_then(|status| ensure_running(status, "MCP")),
-            ServiceKind::Actions => runtime
-                .start_actions(&previous)
-                .and_then(|status| ensure_running(status, "Actions")),
         };
         return match rollback {
             Ok(()) => Err(AppError::Message(format!(
@@ -4035,9 +3930,6 @@ async fn reload_runtime_service_to_profile(
         ServiceKind::Mcp => runtime
             .start_mcp(target)
             .and_then(|status| ensure_running(status, "MCP")),
-        ServiceKind::Actions => runtime
-            .start_actions(target)
-            .and_then(|status| ensure_running(status, "Actions")),
     };
     if let Err(error) = start_target {
         let handle = runtime.begin_stop(&target.id, kind);
@@ -4047,9 +3939,6 @@ async fn reload_runtime_service_to_profile(
             ServiceKind::Mcp => runtime
                 .start_mcp(current)
                 .and_then(|status| ensure_running(status, "MCP")),
-            ServiceKind::Actions => runtime
-                .start_actions(current)
-                .and_then(|status| ensure_running(status, "Actions")),
         };
         return match rollback {
             Ok(()) => Err(AppError::Message(format!(
@@ -4083,14 +3972,6 @@ async fn apply_runtime_config_change(
             target.auth.auth_type == "oauth",
             target.auth.oauth_redirect_uris.as_str(),
             target.auth.oauth_redirect_hosts.as_str(),
-        ),
-        control::ControlService::Actions => (
-            service_selection.includes_actions(),
-            ServiceKind::Actions,
-            "actions",
-            target.actions.auth_type == "oauth",
-            target.actions.oauth_redirect_uris.as_str(),
-            target.actions.oauth_redirect_hosts.as_str(),
         ),
     };
     if !selected {
@@ -4129,7 +4010,6 @@ async fn rollback_runtime_config_change(
         AppliedRuntimeConfigChange::ListenerReload => {
             let kind = match service {
                 control::ControlService::Mcp => ServiceKind::Mcp,
-                control::ControlService::Actions => ServiceKind::Actions,
             };
             reload_runtime_service_to_profile(runtime, target, current, kind).await
         }
@@ -4139,11 +4019,6 @@ async fn rollback_runtime_config_change(
                     "mcp",
                     current.auth.oauth_redirect_uris.as_str(),
                     current.auth.oauth_redirect_hosts.as_str(),
-                ),
-                control::ControlService::Actions => (
-                    "actions",
-                    current.actions.oauth_redirect_uris.as_str(),
-                    current.actions.oauth_redirect_hosts.as_str(),
                 ),
             };
             let updated = crate::auth::update_oauth_redirect_policy(
@@ -4236,11 +4111,8 @@ async fn apply_daemon_config_command(
         return Ok(control::ControlConfigApplyResult {
             changed: false,
             mcp_listener_reloaded: false,
-            actions_listener_reloaded: false,
             mcp_callback_hot_updated: false,
-            actions_callback_hot_updated: false,
             mcp_tunnel_reloaded: false,
-            actions_tunnel_reloaded: false,
         });
     }
 
@@ -4254,50 +4126,13 @@ async fn apply_daemon_config_command(
         plan.mcp_callback_policy_hot_update,
     )
     .await?;
-    let actions_change = match apply_runtime_config_change(
-        runtime,
-        &previous,
-        &latest,
-        service_selection,
-        control::ControlService::Actions,
-        plan.actions_listener_reload,
-        plan.actions_callback_policy_hot_update,
-    )
-    .await
-    {
-        Ok(change) => change,
-        Err(error) => {
-            let rollback = rollback_runtime_config_change(
-                runtime,
-                &previous,
-                &latest,
-                control::ControlService::Mcp,
-                mcp_change,
-            )
-            .await;
-            return match rollback {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(AppError::Message(format!(
-                    "Actions 配置应用失败：{error}；恢复 MCP 运行态也失败：{rollback_error}"
-                ))),
-            };
-        }
-    };
-
     let mcp_tunnel_managed =
         managed_tunnels.contains(&TunnelServiceKind::Mcp) && !settings.mcp_gateway.enabled;
-    let actions_tunnel_managed = managed_tunnels.contains(&TunnelServiceKind::Actions);
     let mut applied_tunnels = Vec::new();
-    for (kind, should_apply) in [
-        (
-            TunnelServiceKind::Mcp,
-            mcp_tunnel_managed && plan.mcp_tunnel_changed,
-        ),
-        (
-            TunnelServiceKind::Actions,
-            actions_tunnel_managed && plan.actions_tunnel_changed,
-        ),
-    ] {
+    for (kind, should_apply) in [(
+        TunnelServiceKind::Mcp,
+        mcp_tunnel_managed && plan.mcp_tunnel_changed,
+    )] {
         if !should_apply {
             continue;
         }
@@ -4312,17 +4147,6 @@ async fn apply_daemon_config_command(
                     {
                         rollback_errors.push(rollback_error.to_string());
                     }
-                }
-                if let Err(rollback_error) = rollback_runtime_config_change(
-                    runtime,
-                    &previous,
-                    &latest,
-                    control::ControlService::Actions,
-                    actions_change,
-                )
-                .await
-                {
-                    rollback_errors.push(rollback_error.to_string());
                 }
                 if let Err(rollback_error) = rollback_runtime_config_change(
                     runtime,
@@ -4363,30 +4187,22 @@ async fn apply_daemon_config_command(
     Ok(control::ControlConfigApplyResult {
         changed: true,
         mcp_listener_reloaded: mcp_change == AppliedRuntimeConfigChange::ListenerReload,
-        actions_listener_reloaded: actions_change == AppliedRuntimeConfigChange::ListenerReload,
         mcp_callback_hot_updated: mcp_change == AppliedRuntimeConfigChange::CallbackHotUpdate,
-        actions_callback_hot_updated: actions_change
-            == AppliedRuntimeConfigChange::CallbackHotUpdate,
         mcp_tunnel_reloaded: applied_tunnels
             .iter()
             .any(|(kind, _)| *kind == TunnelServiceKind::Mcp),
-        actions_tunnel_reloaded: applied_tunnels
-            .iter()
-            .any(|(kind, _)| *kind == TunnelServiceKind::Actions),
     })
 }
 
 fn control_service_for_runtime(kind: ServiceKind) -> control::ControlService {
     match kind {
         ServiceKind::Mcp => control::ControlService::Mcp,
-        ServiceKind::Actions => control::ControlService::Actions,
     }
 }
 
 fn control_service_for_tunnel(kind: TunnelServiceKind) -> control::ControlService {
     match kind {
         TunnelServiceKind::Mcp => control::ControlService::Mcp,
-        TunnelServiceKind::Actions => control::ControlService::Actions,
     }
 }
 
@@ -4449,28 +4265,24 @@ fn normalize_path(value: &str) -> String {
 fn port_for(profile: &WorkspaceProfile, kind: ServiceKind) -> u16 {
     match kind {
         ServiceKind::Mcp => profile.runtime.local_port,
-        ServiceKind::Actions => profile.actions.local_port,
     }
 }
 
 fn endpoint_for(profile: &WorkspaceProfile, kind: ServiceKind) -> String {
     match kind {
         ServiceKind::Mcp => profile.local_endpoint(),
-        ServiceKind::Actions => profile.actions_local_base_url(),
     }
 }
 
 fn service_label(kind: ServiceKind) -> &'static str {
     match kind {
         ServiceKind::Mcp => "mcp",
-        ServiceKind::Actions => "actions",
     }
 }
 
 fn tunnel_label(kind: TunnelServiceKind) -> &'static str {
     match kind {
         TunnelServiceKind::Mcp => "mcp",
-        TunnelServiceKind::Actions => "actions",
     }
 }
 
@@ -4535,14 +4347,11 @@ mod tests {
     fn cli_log_selection_includes_diagnostic_logs() {
         let mut profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
         profile.tunnel.tunnel_type = "none".into();
-        profile.actions.tunnel_type = "none".into();
 
         let mcp = selected_log_files(&profile, LogSelection::Mcp);
-        let actions = selected_log_files(&profile, LogSelection::Actions);
 
         assert!(mcp.iter().any(|(name, _)| name == "mcp-oauth"));
         assert!(mcp.iter().any(|(name, _)| name == "mcp-requests"));
-        assert!(actions.iter().any(|(name, _)| name == "actions-oauth"));
     }
 
     #[test]

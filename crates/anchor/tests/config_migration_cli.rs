@@ -107,10 +107,10 @@ fn portable_config_roundtrip_recovers_incompatible_dpapi_and_preserves_registrat
         .as_str()
         .expect("MCP client id")
         .to_string();
-    let source_actions_client_id = source_profile["actions"]["oauth_client_id"]
-        .as_str()
-        .expect("Actions client id")
-        .to_string();
+    assert!(
+        source_profile.get("actions").is_none(),
+        "new profiles must not serialize the retired Actions configuration"
+    );
     let source_gpt_config = run(&cli_args(
         &source_config,
         &[
@@ -165,7 +165,6 @@ fn portable_config_roundtrip_recovers_incompatible_dpapi_and_preserves_registrat
     assert!(bundle_text.contains("aes-256-gcm-v1"));
     assert!(!bundle_text.contains(&workspace_id));
     assert!(!bundle_text.contains(&source_mcp_client_id));
-    assert!(!bundle_text.contains(&source_actions_client_id));
 
     let tampered_bundle = temp.path().join("tampered-migration.json");
     let mut tampered: Value = serde_json::from_str(&bundle_text).expect("bundle json");
@@ -262,9 +261,9 @@ fn portable_config_roundtrip_recovers_incompatible_dpapi_and_preserves_registrat
         target_profile["auth"]["oauth_client_id"],
         source_mcp_client_id
     );
-    assert_eq!(
-        target_profile["actions"]["oauth_client_id"],
-        source_actions_client_id
+    assert!(
+        target_profile.get("actions").is_none(),
+        "import must not restore the retired Actions configuration"
     );
     assert_eq!(
         target_profile["path"],

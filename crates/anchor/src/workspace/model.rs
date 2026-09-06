@@ -11,7 +11,6 @@ pub struct WorkspaceProfile {
     pub tunnel: TunnelConfig,
     pub auth: AuthConfig,
     pub runtime: RuntimeConfig,
-    pub actions: ActionsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,38 +71,6 @@ pub struct RuntimeConfig {
     pub external_paid_commands_enabled: bool,
     pub external_paid_max_runs_per_day: u64,
     pub external_paid_max_duration_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActionsConfig {
-    pub public_url: String,
-    pub tunnel_type: String,
-    pub frp_server: String,
-    pub frp_subdomain: String,
-    pub frp_profile_id: String,
-    pub frp_server_port: u16,
-    #[serde(default = "default_frp_proxy_type")]
-    pub frp_proxy_type: String,
-    #[serde(default)]
-    pub frp_cert_path: String,
-    #[serde(default)]
-    pub frp_key_path: String,
-    pub cloudflare_mode: String,
-    pub use_proxy: bool,
-    pub local_port: u16,
-    pub permission_mode: String,
-    pub runtime_command: String,
-    pub auth_type: String,
-    pub oauth_client_id: String,
-    /// Exact OAuth callback URLs registered for this Actions client, one per line.
-    pub oauth_redirect_uris: String,
-    /// Callback host enrollment allowlist, one host or `*.suffix` per line.
-    pub oauth_redirect_hosts: String,
-    pub oauth_scopes: String,
-    pub allowed_commands: String,
-    pub max_patch_bytes: u32,
-    pub use_shared_secrets: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,27 +147,12 @@ fn default_frp_proxy_type() -> String {
     "http".to_string()
 }
 
-fn default_actions_auth_type() -> String {
-    "api_key".to_string()
-}
-
-fn default_actions_oauth_client_id() -> String {
-    format!(
-        "chatgpt-actions-{}",
-        &uuid::Uuid::new_v4().to_string()[..12]
-    )
-}
-
 fn default_oauth_client_id() -> String {
     format!("chatgpt-client-{}", &uuid::Uuid::new_v4().to_string()[..12])
 }
 
 fn default_mcp_port() -> u16 {
     28766
-}
-
-fn default_actions_port() -> u16 {
-    8787
 }
 
 fn default_tool_profile() -> String {
@@ -241,10 +193,6 @@ fn default_external_paid_max_runs_per_day() -> u64 {
 
 fn default_external_paid_max_duration_seconds() -> u64 {
     1800
-}
-
-fn default_max_patch_bytes() -> u32 {
-    200_000
 }
 
 impl Default for TunnelConfig {
@@ -298,35 +246,6 @@ impl Default for RuntimeConfig {
     }
 }
 
-impl Default for ActionsConfig {
-    fn default() -> Self {
-        Self {
-            public_url: String::new(),
-            tunnel_type: default_tunnel_type(),
-            frp_server: String::new(),
-            frp_subdomain: String::new(),
-            frp_profile_id: String::new(),
-            frp_server_port: default_frp_server_port(),
-            frp_proxy_type: default_frp_proxy_type(),
-            frp_cert_path: String::new(),
-            frp_key_path: String::new(),
-            cloudflare_mode: default_new_cloudflare_mode(),
-            use_proxy: default_use_proxy(),
-            local_port: default_actions_port(),
-            permission_mode: default_permission_mode(),
-            runtime_command: String::new(),
-            auth_type: default_actions_auth_type(),
-            oauth_client_id: default_actions_oauth_client_id(),
-            oauth_redirect_uris: String::new(),
-            oauth_redirect_hosts: String::new(),
-            oauth_scopes: String::new(),
-            allowed_commands: default_allowed_commands(),
-            max_patch_bytes: default_max_patch_bytes(),
-            use_shared_secrets: false,
-        }
-    }
-}
-
 impl WorkspaceProfile {
     pub fn new(path: String, name: Option<String>) -> Self {
         let cleaned = path.trim_end_matches(['\\', '/']).to_string();
@@ -345,7 +264,6 @@ impl WorkspaceProfile {
             tunnel: TunnelConfig::default(),
             auth: AuthConfig::default(),
             runtime: RuntimeConfig::default(),
-            actions: ActionsConfig::default(),
         }
     }
 
@@ -389,51 +307,6 @@ impl WorkspaceProfile {
         }
         format!("{}/mcp", base.trim_end_matches('/'))
     }
-
-    pub fn actions_local_base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.actions.local_port)
-    }
-
-    pub fn actions_effective_public_url(&self) -> crate::error::AppResult<String> {
-        Ok(self.actions_effective_public_url_with(&AppSettings::load()?))
-    }
-
-    pub fn actions_effective_public_url_with(&self, settings: &AppSettings) -> String {
-        computed_public_url(
-            &self.actions.tunnel_type,
-            &self.actions.frp_server,
-            &self.actions.frp_subdomain,
-            &self.actions.public_url,
-            &self.actions.frp_profile_id,
-            settings,
-        )
-    }
-
-    pub fn actions_openapi_url(&self) -> crate::error::AppResult<String> {
-        Ok(self.actions_openapi_url_with(&AppSettings::load()?))
-    }
-
-    pub fn actions_openapi_url_with(&self, settings: &AppSettings) -> String {
-        let base = self.actions_public_base_url_with(settings);
-        if base.is_empty() {
-            return String::new();
-        }
-        format!("{}/openapi.json", base.trim_end_matches('/'))
-    }
-
-    /// Public URL for GPT schema import; falls back to localhost when no tunnel is configured.
-    pub fn actions_public_base_url(&self) -> crate::error::AppResult<String> {
-        Ok(self.actions_public_base_url_with(&AppSettings::load()?))
-    }
-
-    pub fn actions_public_base_url_with(&self, settings: &AppSettings) -> String {
-        let public = self.actions_effective_public_url_with(settings);
-        if public.is_empty() {
-            self.actions_local_base_url()
-        } else {
-            public
-        }
-    }
 }
 
 fn computed_public_url(
@@ -462,7 +335,7 @@ fn computed_public_url(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActionsConfig, McpActivityDto, RuntimeConfig, TunnelConfig, WorkspaceProfile};
+    use super::{McpActivityDto, RuntimeConfig, TunnelConfig, WorkspaceProfile};
     use crate::settings::AppSettings;
 
     #[test]
@@ -471,14 +344,11 @@ mod tests {
 
         assert_eq!(profile.tunnel.tunnel_type, "cloudflare");
         assert_eq!(profile.tunnel.cloudflare_mode, "named");
-        assert_eq!(profile.actions.tunnel_type, "cloudflare");
-        assert_eq!(profile.actions.cloudflare_mode, "named");
     }
 
     #[test]
     fn persisted_tunnel_configs_reject_missing_fields() {
         assert!(serde_json::from_value::<TunnelConfig>(serde_json::json!({})).is_err());
-        assert!(serde_json::from_value::<ActionsConfig>(serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -504,17 +374,6 @@ mod tests {
         assert_eq!(tunnel.frp_proxy_type, "http");
         assert!(tunnel.frp_cert_path.is_empty());
         assert!(tunnel.frp_key_path.is_empty());
-
-        let mut actions = serde_json::to_value(ActionsConfig::default()).expect("actions config");
-        let object = actions.as_object_mut().expect("actions object");
-        object.remove("frp_proxy_type");
-        object.remove("frp_cert_path");
-        object.remove("frp_key_path");
-
-        let actions: ActionsConfig = serde_json::from_value(actions).expect("legacy actions");
-        assert_eq!(actions.frp_proxy_type, "http");
-        assert!(actions.frp_cert_path.is_empty());
-        assert!(actions.frp_key_path.is_empty());
     }
 
     #[test]

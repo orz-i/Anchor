@@ -4,10 +4,6 @@ use std::path::{Component, Path};
 use serde_json::Value;
 
 use crate::tools::workspace::Workspace;
-use crate::workspace::ActionsConfig;
-
-use super::registry::is_allowed_tool;
-
 static NETWORK_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 static DANGEROUS_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 static INTERPRETER_MUTATION_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -148,20 +144,6 @@ impl PolicySettings {
         }
     }
 
-    pub fn from_actions_config(actions: &ActionsConfig) -> Self {
-        Self {
-            allowed_commands: merge_default_allowed_commands(&actions.allowed_commands),
-            workspace_local_entries: true,
-            workspace_script_extensions: default_workspace_script_extension_set(),
-            max_patch_bytes: actions.max_patch_bytes as usize,
-            permission_mode: actions.permission_mode.clone(),
-            preferred_shell: "auto".into(),
-            external_paid_commands_enabled: false,
-            external_paid_max_runs_per_day: 1,
-            external_paid_max_duration_seconds: 1800,
-        }
-    }
-
     pub fn network_allowed(&self) -> bool {
         self.permission_mode == "trusted" || self.permission_mode == "dangerous"
     }
@@ -266,7 +248,7 @@ pub fn parse_allowed_commands(configured: &str) -> HashSet<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    // 基础诊断命令是工作区可用性的最低保障，不应因 Actions 配置遗漏而失效。
+    // 基础诊断命令是工作区可用性的最低保障，不应因工作区配置遗漏而失效。
     commands.extend(BASIC_READ_ONLY_COMMANDS.iter().map(|s| s.to_string()));
     commands
 }
@@ -329,15 +311,6 @@ pub fn validate_tool_arguments_for_workspace(
         "exec_command" => validate_command_for_workspace(arguments, policy, workspace),
         "apply_patch" | "patch_check" => validate_patch(arguments, policy),
         _ => Ok(()),
-    }
-}
-
-/// Actions OpenAPI 暴露层校验：仅限制「能否调用」，不参与执行逻辑。
-pub fn validate_actions_exposure(tool_name: &str) -> Result<(), PolicyError> {
-    if is_allowed_tool(tool_name) {
-        Ok(())
-    } else {
-        Err(PolicyError(format!("Tool is not exposed: {tool_name}")))
     }
 }
 
@@ -1498,11 +1471,11 @@ mod tests {
 
     #[test]
     fn workspace_allowed_commands_override_defaults() {
-        let actions = ActionsConfig {
+        let runtime = crate::workspace::RuntimeConfig {
             allowed_commands: "cargo,go".into(),
-            ..ActionsConfig::default()
+            ..crate::workspace::RuntimeConfig::default()
         };
-        let policy = PolicySettings::from_actions_config(&actions);
+        let policy = PolicySettings::from_runtime(&runtime);
         assert!(policy.allowed_commands.contains("cargo"));
         assert!(policy.allowed_commands.contains("pytest"));
     }
@@ -1546,11 +1519,10 @@ mod tests {
 
     #[test]
     fn patch_size_uses_workspace_limit() {
-        let actions = ActionsConfig {
+        let policy = PolicySettings {
             max_patch_bytes: 10,
-            ..ActionsConfig::default()
+            ..PolicySettings::default()
         };
-        let policy = PolicySettings::from_actions_config(&actions);
         let err = validate_patch(&json!({ "patch": "01234567890" }), &policy).unwrap_err();
         assert!(err.0.contains("too large"));
     }
@@ -1575,11 +1547,11 @@ mod tests {
 
     #[test]
     fn configured_commands_keep_basic_diagnostics() {
-        let actions = ActionsConfig {
+        let runtime = crate::workspace::RuntimeConfig {
             allowed_commands: "cargo,go".into(),
-            ..ActionsConfig::default()
+            ..crate::workspace::RuntimeConfig::default()
         };
-        let policy = PolicySettings::from_actions_config(&actions);
+        let policy = PolicySettings::from_runtime(&runtime);
         assert!(validate_command(&json!({"cmd": "pwd"}), &policy).is_ok());
         assert!(validate_command(&json!({"cmd": "pytest"}), &policy).is_ok());
     }
@@ -1677,16 +1649,5 @@ mod tests {
             ..PolicySettings::default()
         };
         assert!(validate_command(&json!({"cmd": "git reset --hard HEAD"}), &dangerous).is_ok());
-    }
-
-    #[test]
-    fn actions_exposure_rejects_internal_facade_operation_tools() {
-        assert!(validate_actions_exposure("read_file").is_ok());
-        for name in ["list_skills", "load_skill", "read_skill_resource"] {
-            assert!(
-                validate_actions_exposure(name).is_err(),
-                "MCP-only Skill helper leaked into Actions exposure: {name}"
-            );
-        }
     }
 }

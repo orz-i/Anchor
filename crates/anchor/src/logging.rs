@@ -39,7 +39,6 @@ pub(crate) fn redirect_stdio_to_file(path: &std::path::Path) -> crate::error::Ap
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileLogService {
     Mcp,
-    Actions,
 }
 
 pub(crate) type ProfileLogFile = (&'static str, &'static str);
@@ -49,12 +48,6 @@ const MCP_LOG_FILES: &[ProfileLogFile] = &[
     ("mcp-requests", "mcp-requests.log"),
     ("mcp-stderr", "stderr.log"),
     ("mcp-stdout", "stdout.log"),
-];
-
-const ACTIONS_LOG_FILES: &[ProfileLogFile] = &[
-    ("actions-oauth", "actions-oauth.log"),
-    ("actions-stderr", "actions-stderr.log"),
-    ("actions-stdout", "actions-stdout.log"),
 ];
 
 pub(crate) fn profile_log_files(
@@ -71,16 +64,6 @@ pub(crate) fn profile_log_files(
                 "frpc-mcp.log",
             ),
             MCP_LOG_FILES,
-        ),
-        ProfileLogService::Actions => (
-            profile.actions.tunnel_type.as_str(),
-            (
-                "actions-cloudflare",
-                "actions-frp",
-                "actions-cloudflared.log",
-                "frpc-actions.log",
-            ),
-            ACTIONS_LOG_FILES,
         ),
     };
     let mut files = Vec::with_capacity(base_files.len() + 1);
@@ -119,15 +102,11 @@ mod tests {
     fn gui_and_cli_share_complete_profile_log_catalogs() {
         let mut profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
         profile.tunnel.tunnel_type = "cloudflare".into();
-        profile.actions.tunnel_type = "frp".into();
 
         let mcp = profile_log_files(&profile, ProfileLogService::Mcp);
-        let actions = profile_log_files(&profile, ProfileLogService::Actions);
 
         assert!(mcp.iter().any(|file| file.1 == "cloudflared.log"));
         assert!(mcp.iter().any(|file| file.1 == "mcp-oauth.log"));
         assert!(mcp.iter().any(|file| file.1 == "mcp-requests.log"));
-        assert!(actions.iter().any(|file| file.1 == "frpc-actions.log"));
-        assert!(actions.iter().any(|file| file.1 == "actions-oauth.log"));
     }
 }
