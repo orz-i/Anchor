@@ -492,16 +492,6 @@ where
     })))
 }
 
-/// Compatibility entry point for callers that have not refreshed the renamed
-/// tool catalog yet. New catalogs expose only `grep`.
-pub fn search_text(
-    ws: &Workspace,
-    args: &Value,
-    cancellation: &CancellationToken,
-) -> Result<Value, WorkspaceError> {
-    grep(ws, args, cancellation)
-}
-
 #[derive(Default)]
 struct RepositoryScan {
     files: Vec<PathBuf>,
@@ -1781,7 +1771,7 @@ mod tests {
         assert_eq!(read["encoding"], "utf-16le");
         assert_eq!(read["content"], text);
 
-        let searched = search_text(
+        let searched = grep(
             &workspace,
             &json!({"path": ".", "query": "needle"}),
             &cancellation,

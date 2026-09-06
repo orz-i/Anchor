@@ -4,7 +4,6 @@ import test from "node:test";
 
 const adminProviderPath = new URL("../src/components/admin/AdminProvider.tsx", import.meta.url);
 const workspaceDetailPath = new URL("../src/pages/WorkspaceDetailPage.tsx", import.meta.url);
-const workspaceCompatPath = new URL("../src/pages/WorkspacePage.tsx", import.meta.url);
 const canvsPanelPath = new URL("../src/components/admin/CanvsPanel.tsx", import.meta.url);
 const logViewerPath = new URL("../src/components/admin/LogViewer.tsx", import.meta.url);
 
@@ -12,7 +11,7 @@ test("AdminProvider keeps runtime setters stable and avoids no-op context churn"
   const source = await readFile(adminProviderPath, "utf8");
 
   assert.match(source, /const setMcpRuntimeState = useCallback/, "MCP runtime setter should have stable identity");
-  assert.match(source, /const setActionsRuntimeState = useCallback/, "Actions runtime setter should have stable identity");
+  assert.doesNotMatch(source, /ActionsRuntime|actionsRuntime|setActionsRuntimeState/, "retired Actions runtime state must not return to AdminProvider");
   assert.match(
     source,
     /current\[workspaceId\] === state \? current : \{ \.\.\.current, \[workspaceId\]: state \}/,
@@ -43,19 +42,14 @@ test("high-frequency Canvs and log refreshes are opt-in", async () => {
 });
 
 test("Workspace detail refreshes runtime details from control-plane events instead of a fixed timer", async () => {
-  const sources = await Promise.all([
-    readFile(workspaceDetailPath, "utf8"),
-    readFile(workspaceCompatPath, "utf8"),
-  ]);
+  const source = await readFile(workspaceDetailPath, "utf8");
 
-  for (const source of sources) {
-    assert.doesNotMatch(source, /setInterval\(/, "workspace detail should not continuously poll runtime endpoints");
-    assert.doesNotMatch(source, /\[admin\]/, "workspace detail callbacks must not depend on the whole context object");
-    assert.match(source, /controlPlaneRevision/, "runtime detail refresh should follow control-plane events");
-    assert.match(
-      source,
-      /\[setActionsRuntimeState, setMcpRuntimeState\]/,
-      "runtime refresh callback should depend only on stable setters",
-    );
-  }
+  assert.doesNotMatch(source, /setInterval\(/, "workspace detail should not continuously poll runtime endpoints");
+  assert.doesNotMatch(source, /\[admin\]/, "workspace detail callbacks must not depend on the whole context object");
+  assert.match(source, /controlPlaneRevision/, "runtime detail refresh should follow control-plane events");
+  assert.match(
+    source,
+    /\}, \[setMcpRuntimeState\]\);/,
+    "runtime refresh callback should depend only on the stable MCP setter",
+  );
 });

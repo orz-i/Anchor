@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const workspacePagePath = new URL("../src/pages/WorkspacePage.tsx", import.meta.url);
+const workspacePagePath = new URL("../src/pages/WorkspaceDetailPage.tsx", import.meta.url);
 const quickCopyPath = new URL("../src/components/admin/GptQuickCopy.tsx", import.meta.url);
 const sessionPromptPath = new URL(
   "../src/components/admin/ChatGptSessionPrompt.tsx",

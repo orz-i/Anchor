@@ -13,7 +13,7 @@ Browser React Web Admin
   → /api/v1 management HTTP
   → admin security / shared management
   → Workspace / Gateway control protocol
-  → daemon-owned MCP / Actions / Tunnel runtime
+  → daemon-owned MCP / Tunnel runtime
 
 anchor CLI
   → shared management / control / config engine
