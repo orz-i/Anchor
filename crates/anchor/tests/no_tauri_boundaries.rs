@@ -53,7 +53,7 @@ fn package_and_lockfiles_have_no_tauri_or_svelte_dependencies_or_scripts() {
         ] {
             assert!(
                 !command.contains(forbidden),
-                "npm script {name} retains Tauri runtime entrypoint: {forbidden}"
+                "package script {name} retains Tauri runtime entrypoint: {forbidden}"
             );
         }
     }
@@ -68,6 +68,40 @@ fn package_and_lockfiles_have_no_tauri_or_svelte_dependencies_or_scripts() {
         "Svelte package remains in pnpm-lock.yaml"
     );
     assert!(!repository_root().join("package-lock.json").exists());
+}
+
+#[test]
+fn github_workflows_follow_current_cli_build_pipeline() {
+    for path in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/macos-release.yml",
+    ] {
+        let workflow = read(path);
+        for forbidden in [
+            "src-tauri",
+            "npm ci",
+            "npm run",
+            "cache: npm",
+            "tauri --",
+            "--bundles",
+            "bundle/nsis",
+            "bundle/dmg",
+        ] {
+            assert!(
+                !workflow.contains(forbidden),
+                "workflow {path} retains retired desktop build path: {forbidden}"
+            );
+        }
+        assert!(
+            workflow.contains("pnpm"),
+            "workflow {path} does not use the repository package manager"
+        );
+    }
+
+    let ci = read(".github/workflows/ci.yml");
+    assert!(ci.contains("crates/anchor/Cargo.toml"));
+    assert!(ci.contains("pnpm install --frozen-lockfile"));
 }
 
 #[test]

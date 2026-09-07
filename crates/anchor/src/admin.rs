@@ -76,7 +76,6 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "revoke_federation_peer",
     "probe_federation_peer",
     "read_federation_remote",
-    "get_last_workspace_id",
     "set_last_workspace",
     "list_frp_profiles",
     "save_frp_profile_metadata",
@@ -86,9 +85,6 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "test_tunnel",
     "start_runtime",
     "stop_runtime",
-    "restart_runtime",
-    "get_workspace_control_status",
-    "get_workspace_control_events",
     "get_workspace_secret",
     "set_workspace_secret",
     "regenerate_workspace_secret",
@@ -103,10 +99,7 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "get_gateway_control_events",
     "read_gateway_logs",
     "read_workspace_logs",
-    "restart_tunnel",
     "start_tunnel",
-    "stop_tunnel",
-    "preview_workspace_config",
     "stage_workspace_config",
     "apply_workspace_config",
     "get_windows_service_status",
@@ -176,10 +169,7 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "apply_workspace_config",
     "start_runtime",
     "stop_runtime",
-    "restart_runtime",
     "start_tunnel",
-    "restart_tunnel",
-    "stop_tunnel",
     "test_tunnel",
     "set_mcp_gateway",
     "reload_mcp_gateway",
@@ -373,16 +363,6 @@ struct CanvsTaskArgs {
 #[derive(Debug, Deserialize)]
 struct FrpProfileMetadataArgs {
     profile: FrpProfileInput,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceEventsArgs {
-    id: String,
-    #[serde(default)]
-    cursor: Option<control::ControlEventCursor>,
-    #[serde(default = "default_event_wait_ms")]
-    wait_ms: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1535,7 +1515,6 @@ async fn dispatch_command(
             .map_err(AppError::from)
             .map_err(Into::into)
         }
-        "get_last_workspace_id" => Ok(Value::String(management::get_last_workspace_id()?)),
         "set_last_workspace" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             management::set_last_workspace(input.id)?;
@@ -1625,30 +1604,6 @@ async fn dispatch_command(
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
                 management::stop_workspace_service(&input.id, WorkspaceService::Mcp).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "restart_runtime" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::restart_workspace_service(&input.id, WorkspaceService::Mcp).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "get_workspace_control_status" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(management::workspace_control_status(&input.id).await?)
-                .map_err(AppError::from)
-                .map_err(Into::into)
-        }
-        "get_workspace_control_events" => {
-            let input: WorkspaceEventsArgs =
-                serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::workspace_control_events(&input.id, input.cursor, input.wait_ms)
-                    .await?,
             )
             .map_err(AppError::from)
             .map_err(Into::into)
@@ -1786,37 +1741,11 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
-        "restart_tunnel" => {
-            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::restart_workspace_tunnel(&input.id, &input.service).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
         "start_tunnel" => {
             let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
                 management::start_workspace_tunnel(&input.id, &input.service).await?,
             )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "stop_tunnel" => {
-            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::stop_workspace_tunnel(&input.id, &input.service).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
-        }
-        "preview_workspace_config" => {
-            let input: WorkspaceConfigArgs =
-                serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(management::preview_workspace_config(
-                &input.base_profile,
-                &input.profile,
-            )?)
             .map_err(AppError::from)
             .map_err(Into::into)
         }

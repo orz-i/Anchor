@@ -4,8 +4,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::control::{
-    self, ControlEventBatch, ControlEventCursor, ControlLogChunk, ControlLogSelection,
-    DaemonLaunchSpec, WorkspaceControlStatus,
+    self, ControlLogChunk, ControlLogSelection, DaemonLaunchSpec, WorkspaceControlStatus,
 };
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
@@ -525,14 +524,6 @@ pub(crate) fn get_canvs_task_snapshot(
 }
 
 #[cfg(feature = "cli")]
-pub(crate) fn preview_workspace_config(
-    base: &WorkspaceProfile,
-    candidate: &WorkspaceProfile,
-) -> AppResult<crate::cli::ConfigSetReport> {
-    crate::cli::preview_profile_config(base, candidate)
-}
-
-#[cfg(feature = "cli")]
 pub(crate) fn stage_workspace_config(
     base: &WorkspaceProfile,
     candidate: &WorkspaceProfile,
@@ -772,39 +763,6 @@ pub(crate) async fn stop_workspace_service(
     runtime_status(id, service).await
 }
 
-pub(crate) async fn restart_workspace_service(
-    id: &str,
-    service: WorkspaceService,
-) -> AppResult<RuntimeStatusDto> {
-    let (profile, settings) = load_workspace_for_control(id, Some(service))?;
-    reject_gateway_managed_mcp(&settings, service)?;
-    let inspection = crate::daemon::inspect(&profile)?;
-    if inspection.ambiguous {
-        return Err(AppError::Message(inspection.detail));
-    }
-    let selected = inspection
-        .state
-        .as_ref()
-        .filter(|_| inspection.running && inspection.pid_matches)
-        .is_some_and(|state| control::service_is_selected(state.service, service));
-    if !selected {
-        match service {
-            WorkspaceService::Mcp => {
-                ensure_management_port_available(profile.runtime.local_port, "MCP")?
-            }
-        }
-    }
-    control::restart_daemon_service(
-        &profile,
-        service,
-        tunnel_configured_for_service(&profile, service),
-        MANAGEMENT_DAEMON_TIMEOUT,
-        true,
-    )
-    .await?;
-    runtime_status(id, service).await
-}
-
 fn workspace_service_for_tunnel(kind: TunnelServiceKind) -> WorkspaceService {
     match kind {
         TunnelServiceKind::Mcp => WorkspaceService::Mcp,
@@ -862,16 +820,10 @@ async fn daemon_tunnel_status(
     .ok_or_else(|| AppError::Message("daemon control status omitted tunnel state".into()))
 }
 
-fn load_tunnel_workspace(
-    id: &str,
-    kind: TunnelServiceKind,
-    validate_start: bool,
-) -> AppResult<WorkspaceProfile> {
+fn load_tunnel_workspace(id: &str, kind: TunnelServiceKind) -> AppResult<WorkspaceProfile> {
     let service = workspace_service_for_tunnel(kind);
     let store = DataStore::load()?;
-    if validate_start {
-        validate_service_start(store.list(), id, service)?;
-    }
+    validate_service_start(store.list(), id, service)?;
     let profile = store
         .get(id)
         .cloned()
@@ -888,7 +840,7 @@ fn tunnel_is_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> 
 
 pub(crate) async fn start_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelStatus> {
     let kind = TunnelServiceKind::parse(service)?;
-    let profile = load_tunnel_workspace(id, kind, true)?;
+    let profile = load_tunnel_workspace(id, kind)?;
     if !tunnel_is_configured(&profile, kind) {
         return configured_tunnel_status(&profile, kind);
     }
@@ -902,45 +854,6 @@ pub(crate) async fn start_workspace_tunnel(id: &str, service: &str) -> AppResult
     .map_err(|error| AppError::Message(format!("daemon 隧道启动失败：{error}")))?;
     persist_tunnel_public_url(id, kind, &status.public_url)?;
     Ok(status)
-}
-
-pub(crate) async fn restart_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelStatus> {
-    let kind = TunnelServiceKind::parse(service)?;
-    let profile = load_tunnel_workspace(id, kind, true)?;
-    if !crate::daemon::inspect(&profile)?.running {
-        return configured_tunnel_status(&profile, kind);
-    }
-    if !tunnel_is_configured(&profile, kind) {
-        return configured_tunnel_status(&profile, kind);
-    }
-    let current = daemon_tunnel_status(&profile, kind).await?;
-    let action = if current.state == "running" {
-        control::ControlTunnelAction::Restart
-    } else {
-        control::ControlTunnelAction::Start
-    };
-    let status =
-        control::request_tunnel_operation(&profile, kind, action, MANAGEMENT_TUNNEL_TIMEOUT)
-            .await
-            .map_err(|error| AppError::Message(format!("daemon 隧道重载失败：{error}")))?;
-    persist_tunnel_public_url(id, kind, &status.public_url)?;
-    Ok(status)
-}
-
-pub(crate) async fn stop_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelStatus> {
-    let kind = TunnelServiceKind::parse(service)?;
-    let profile = load_tunnel_workspace(id, kind, false)?;
-    if !crate::daemon::inspect(&profile)?.running {
-        return configured_tunnel_status(&profile, kind);
-    }
-    control::request_tunnel_operation(
-        &profile,
-        kind,
-        control::ControlTunnelAction::Stop,
-        MANAGEMENT_TUNNEL_TIMEOUT,
-    )
-    .await
-    .map_err(|error| AppError::Message(format!("daemon 隧道停止失败：{error}")))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -990,7 +903,7 @@ async fn restore_tunnel_test_runtime(
 pub(crate) async fn test_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelTestResult> {
     let kind = TunnelServiceKind::parse(service)?;
     let target_service = workspace_service_for_tunnel(kind);
-    let profile = load_tunnel_workspace(id, kind, true)?;
+    let profile = load_tunnel_workspace(id, kind)?;
     if !tunnel_is_configured(&profile, kind) {
         return Err(AppError::Message("当前服务未配置隧道。".into()));
     }
@@ -1625,10 +1538,6 @@ pub(crate) fn delete_frp_profile(id: &str) -> AppResult<()> {
     })
 }
 
-pub(crate) fn get_last_workspace_id() -> AppResult<String> {
-    DataStore::read_file(|data| Ok(data.last_workspace_id.clone()))
-}
-
 pub(crate) fn set_last_workspace(id: String) -> AppResult<()> {
     DataStore::update_file(|data| {
         data.last_workspace_id = id;
@@ -1900,34 +1809,6 @@ async fn gateway_route_runtime_status(
         status.recovery.enabled = false;
     }
     Ok(status)
-}
-
-pub(crate) async fn workspace_control_status(id: &str) -> AppResult<WorkspaceControlStatus> {
-    let store = DataStore::load()?;
-    let profile = store
-        .get(id)
-        .cloned()
-        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
-    drop(store);
-    control::workspace_status_via_daemon_or_local(&profile).await
-}
-
-pub(crate) async fn workspace_control_events(
-    id: &str,
-    cursor: Option<ControlEventCursor>,
-    wait_ms: u32,
-) -> AppResult<Option<ControlEventBatch>> {
-    let store = DataStore::load()?;
-    let profile = store
-        .get(id)
-        .cloned()
-        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
-    drop(store);
-    match control::request_events(&profile, cursor, 64, wait_ms).await {
-        Ok(batch) => Ok(Some(batch)),
-        Err(error) if error.is_unavailable() => Ok(None),
-        Err(error) => Err(AppError::Message(error.to_string())),
-    }
 }
 
 #[cfg(test)]

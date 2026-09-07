@@ -38,14 +38,10 @@ export function App() {
         <Routes>
           <Route element={<AppShell />}>
             <Route index element={<Navigate replace to="/workspaces" />} />
-            
+
             {/* 工作区管理路由 */}
             <Route path="workspaces" element={<WorkspacesPage />} />
             <Route path="workspaces/:id" element={<WorkspaceDetailPage />} />
-            
-            {/* 兼容旧路由 */}
-            <Route path="workspace" element={<Navigate replace to="/workspaces" />} />
-            <Route path="workspace/:id" element={<WorkspaceDetailPage />} />
 
             {/* 系统设置路由 */}
             <Route path="settings/general" element={<GeneralSettingsPage />} />

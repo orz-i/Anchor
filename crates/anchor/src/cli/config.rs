@@ -111,31 +111,28 @@ struct ConfigImportReport {
     summary: ConfigImportSummary,
 }
 
-pub async fn execute(command: ConfigCommand, as_json: bool) -> AppResult<i32> {
+pub async fn execute(command: ConfigCommand) -> AppResult<i32> {
     match command {
-        ConfigCommand::Get(options) => get_config(options, as_json).map(|_| 0),
-        ConfigCommand::Diff(options) => diff_config(options, as_json).map(|_| 0),
-        ConfigCommand::Set(options) => set_config(options, as_json).map(|_| 0),
-        ConfigCommand::Apply(options) => apply_config(options, as_json).await.map(|_| 0),
-        ConfigCommand::Export(options) => export_config(options, as_json).map(|_| 0),
-        ConfigCommand::Import(options) => import_config(options, as_json).map(|_| 0),
+        ConfigCommand::Get(options) => get_config(options).map(|_| 0),
+        ConfigCommand::Diff(options) => diff_config(options).map(|_| 0),
+        ConfigCommand::Set(options) => set_config(options).map(|_| 0),
+        ConfigCommand::Apply(options) => apply_config(options).await.map(|_| 0),
+        ConfigCommand::Export(options) => export_config(options).map(|_| 0),
+        ConfigCommand::Import(options) => import_config(options).map(|_| 0),
     }
 }
 
-fn export_config(options: ConfigExportOptions, as_json: bool) -> AppResult<()> {
+fn export_config(options: ConfigExportOptions) -> AppResult<()> {
     let passphrase = read_migration_passphrase(&options.passphrase)?;
     let summary = export_portable_config(&options.output, &passphrase, options.force)?;
-    print_report(
-        &ConfigExportReport {
-            event: "config_export",
-            registration_identity_preserved: true,
-            summary,
-        },
-        as_json,
-    )
+    print_report(&ConfigExportReport {
+        event: "config_export",
+        registration_identity_preserved: true,
+        summary,
+    })
 }
 
-fn import_config(options: ConfigImportOptions, as_json: bool) -> AppResult<()> {
+fn import_config(options: ConfigImportOptions) -> AppResult<()> {
     let passphrase = read_migration_passphrase(&options.passphrase)?;
     let mappings = options
         .workspace_paths
@@ -152,15 +149,12 @@ fn import_config(options: ConfigImportOptions, as_json: bool) -> AppResult<()> {
         options.dry_run,
         options.force,
     )?;
-    print_report(
-        &ConfigImportReport {
-            event: "config_import",
-            registration_identity_preserved: true,
-            target_platform: std::env::consts::OS,
-            summary,
-        },
-        as_json,
-    )
+    print_report(&ConfigImportReport {
+        event: "config_import",
+        registration_identity_preserved: true,
+        target_platform: std::env::consts::OS,
+        summary,
+    })
 }
 
 fn read_migration_passphrase(input: &MigrationPassphraseInput) -> AppResult<Vec<u8>> {
@@ -207,7 +201,7 @@ fn read_migration_passphrase(input: &MigrationPassphraseInput) -> AppResult<Vec<
     Ok(bytes)
 }
 
-fn get_config(options: ConfigGetOptions, as_json: bool) -> AppResult<()> {
+fn get_config(options: ConfigGetOptions) -> AppResult<()> {
     let store = DataStore::load()?;
     let active = super::resolve_workspace(store.list(), &options.workspace)?.clone();
     let (source, profile) = if options.pending {
@@ -230,10 +224,10 @@ fn get_config(options: ConfigGetOptions, as_json: bool) -> AppResult<()> {
         key: options.key,
         value,
     };
-    print_report(&report, as_json)
+    print_report(&report)
 }
 
-fn diff_config(options: ConfigMutationOptions, as_json: bool) -> AppResult<()> {
+fn diff_config(options: ConfigMutationOptions) -> AppResult<()> {
     let store = DataStore::load()?;
     let active = super::resolve_workspace(store.list(), &options.workspace)?.clone();
     let staged = load_pending_for_active(&active)?;
@@ -244,12 +238,12 @@ fn diff_config(options: ConfigMutationOptions, as_json: bool) -> AppResult<()> {
     candidate = apply_assignments(&candidate, &options.assignments)?;
     validate_candidate(&store, &active, &candidate)?;
     let report = diff_report("config_diff", &active, &candidate, staged.is_some());
-    print_report(&report, as_json)
+    print_report(&report)
 }
 
-fn set_config(options: ConfigMutationOptions, as_json: bool) -> AppResult<()> {
+fn set_config(options: ConfigMutationOptions) -> AppResult<()> {
     let output = stage_config(options)?;
-    print_report(&output, as_json)
+    print_report(&output)
 }
 
 pub(crate) fn stage_config(options: ConfigMutationOptions) -> AppResult<ConfigSetReport> {
@@ -345,9 +339,9 @@ pub(crate) fn pending_candidate(active: &WorkspaceProfile) -> AppResult<Option<W
     Ok(load_pending_for_active(active)?.map(|pending| pending.candidate))
 }
 
-async fn apply_config(options: ConfigApplyOptions, as_json: bool) -> AppResult<()> {
+async fn apply_config(options: ConfigApplyOptions) -> AppResult<()> {
     let output = apply_staged_config(options).await?;
-    print_report(&output, as_json)
+    print_report(&output)
 }
 
 pub(crate) async fn apply_staged_config(
@@ -801,7 +795,7 @@ fn set_private_file(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn print_report(report: &impl Serialize, _as_json: bool) -> AppResult<()> {
+fn print_report(report: &impl Serialize) -> AppResult<()> {
     super::print_json(report)
 }
 

@@ -2,7 +2,7 @@ use crate::error::AppResult;
 
 use super::args::SoftwareCommand;
 
-pub async fn execute(command: SoftwareCommand, _as_json: bool) -> AppResult<i32> {
+pub async fn execute(command: SoftwareCommand) -> AppResult<i32> {
     match command {
         SoftwareCommand::List => {
             super::print_json(&crate::tunnel::list_software())?;

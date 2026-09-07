@@ -66,7 +66,7 @@ struct ConfigAssignmentView {
     value: String,
 }
 
-pub async fn execute(command: TunnelCommand, _as_json: bool) -> AppResult<i32> {
+pub async fn execute(command: TunnelCommand) -> AppResult<i32> {
     match command {
         TunnelCommand::Show(options) => show(options)?,
         TunnelCommand::Configure(options) => configure(*options).await?,

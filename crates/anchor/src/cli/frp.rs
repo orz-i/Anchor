@@ -39,7 +39,7 @@ struct FrpDeleteReport {
     deleted: bool,
 }
 
-pub async fn execute(command: FrpCommand, _as_json: bool) -> AppResult<i32> {
+pub async fn execute(command: FrpCommand) -> AppResult<i32> {
     match command {
         FrpCommand::List => {
             let profiles = DataStore::read_file(|data| Ok(profile_views(data)))?;

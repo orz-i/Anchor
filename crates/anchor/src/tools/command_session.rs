@@ -103,6 +103,8 @@ struct DurableCommandState {
     started_at: String,
     finished_at: Option<String>,
     last_output_at: String,
+    #[serde(default)]
+    heartbeat_at: Option<String>,
     stdout_total_bytes: u64,
     stderr_total_bytes: u64,
 }
@@ -437,6 +439,7 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     state.supervisor_pid = Some(std::process::id());
     state.status = "starting".into();
     state.termination_reason = "running".into();
+    state.heartbeat_at = Some(timestamp());
     persist_durable_state(&paths, &state);
 
     let mut command = tokio::process::Command::new(&spec.program);
@@ -468,6 +471,7 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
         state.status = "running".into();
         state.child_pid = child_pid;
         state.stdin_open = stdin.is_some();
+        state.heartbeat_at = Some(timestamp());
         persist_durable_state(&paths, &state);
         state
     }));
@@ -506,9 +510,16 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     }
 
     let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(1));
+    let mut last_heartbeat = Instant::now();
     let exit_status = 'wait: loop {
         if let Ok(Some(status)) = child.try_wait() {
             break status;
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(2) {
+            let mut current = state.lock().expect("durable state lock");
+            current.heartbeat_at = Some(timestamp());
+            persist_durable_state(&paths, &current);
+            last_heartbeat = Instant::now();
         }
         if Instant::now() >= deadline {
             let grace_deadline = Instant::now() + TERMINAL_RECONCILIATION_GRACE;
@@ -584,6 +595,7 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     current.exit_code = exit_status.code();
     current.stdin_open = false;
     current.finished_at = Some(timestamp());
+    current.heartbeat_at = current.finished_at.clone();
     persist_durable_state(&paths, &current);
     Ok(exit_status.code().unwrap_or(1))
 }
@@ -1159,6 +1171,17 @@ fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn elapsed_since_timestamp(value: &str) -> Option<Duration> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|started| {
+            Utc::now()
+                .signed_duration_since(started.with_timezone(&Utc))
+                .to_std()
+                .ok()
+        })
+}
+
 impl Default for CommandSessionStore {
     fn default() -> Self {
         Self::with_retention_limits(
@@ -1433,6 +1456,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn stale_running_state_with_dead_child_is_reconciled_even_if_supervisor_pid_is_alive() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let creator = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let job = creator
+            .create_durable_job(durable_test_spec(
+                session_id.clone(),
+                "tools::command_session::tests::durable_supervisor_output_child",
+                5_000,
+            ))
+            .expect("durable job");
+        let dead_child_pid = (2_000_000_000_u32..2_000_000_100_u32)
+            .find(|pid| !crate::platform::platform().is_process_alive(*pid))
+            .expect("find unused pid");
+        let mut state = job.read_state().expect("state");
+        state.status = "running".into();
+        state.supervisor_pid = Some(std::process::id());
+        state.child_pid = Some(dead_child_pid);
+        state.heartbeat_at = Some(
+            (Utc::now() - chrono::Duration::seconds(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        persist_durable_state(&job.paths, &state);
+
+        let recovered = CommandSessionStore::with_durable_root(root);
+        recovered
+            .ensure_execution_capacity(1)
+            .expect("dead durable child must not retain execution capacity");
+        let session = recovered.get(&session_id).expect("recovered session");
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
+        assert_eq!(snapshot["termination_reason"], "child_lost");
+        assert_eq!(snapshot["retryable"], true);
     }
 
     fn spawn_test_session() -> ExecSession {
@@ -1865,6 +1925,7 @@ impl CommandSessionStore {
             started_at: spec.started_at.clone(),
             finished_at: None,
             last_output_at: spec.started_at.clone(),
+            heartbeat_at: Some(spec.started_at.clone()),
             stdout_total_bytes: 0,
             stderr_total_bytes: 0,
         };
@@ -2602,21 +2663,23 @@ impl ExecSession {
             .is_some_and(|pid| !crate::platform::platform().is_process_alive(pid));
         let launcher_never_published_pid = state.status == "starting"
             && state.supervisor_pid.is_none()
-            && chrono::DateTime::parse_from_rfc3339(&state.started_at)
-                .ok()
-                .and_then(|started| {
-                    Utc::now()
-                        .signed_duration_since(started.with_timezone(&Utc))
-                        .to_std()
-                        .ok()
-                })
+            && elapsed_since_timestamp(&state.started_at)
                 .is_some_and(|elapsed| elapsed > Duration::from_secs(5));
+        let heartbeat = state.heartbeat_at.as_deref().unwrap_or(&state.started_at);
+        let child_lost = state.status == "running"
+            && state
+                .child_pid
+                .is_some_and(|pid| !crate::platform::platform().is_process_alive(pid))
+            && elapsed_since_timestamp(heartbeat)
+                .is_some_and(|elapsed| elapsed > Duration::from_secs(10));
         if matches!(state.status.as_str(), "starting" | "running")
-            && (supervisor_lost || launcher_never_published_pid)
+            && (supervisor_lost || launcher_never_published_pid || child_lost)
         {
             state.status = "interrupted".into();
             state.termination_reason = if launcher_never_published_pid {
                 "launch_interrupted".into()
+            } else if child_lost {
+                "child_lost".into()
             } else {
                 "supervisor_lost".into()
             };
@@ -2806,7 +2869,7 @@ impl ExecSession {
             "suggestion": match reason {
                 "timeout" => "读取保留输出，调整 timeout_ms 后重试",
                 "killed" => "确认终止原因后重新执行命令",
-                "supervisor_lost" | "launch_interrupted" => {
+                "supervisor_lost" | "launch_interrupted" | "child_lost" => {
                     "durable supervisor did not complete; start a new command rather than replaying this session"
                 }
                 "exited" => "检查 exit_code 和 stderr",

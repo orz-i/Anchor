@@ -79,11 +79,6 @@ fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
         let source = fs::read_to_string(&path).expect("frontend api source");
         for capture in invocation.captures_iter(&source) {
             let name = capture.get(1).expect("command name").as_str();
-            // update_workspace is a retired compatibility alias. The browser
-            // path for the same public API uses stage/apply instead.
-            if name == "update_workspace" {
-                continue;
-            }
             let quoted = format!("\"{name}\"");
             if !supported.contains(&quoted) && !privileged.contains(&quoted) {
                 uncovered.push(format!("{}: {name}", path.display()));
@@ -99,6 +94,25 @@ fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
     assert!(supported.contains("\"set_frp_profile_token\""));
     assert!(!supported.contains("\"save_frp_profile\""));
     assert!(privileged.contains("\"save_frp_profile\""));
+
+    for retired in [
+        "get_last_workspace_id",
+        "restart_runtime",
+        "get_workspace_control_status",
+        "get_workspace_control_events",
+        "restart_tunnel",
+        "stop_tunnel",
+        "preview_workspace_config",
+    ] {
+        assert!(
+            !supported.contains(&format!("\"{retired}\"")),
+            "retired Web Admin command returned to the supported manifest: {retired}"
+        );
+        assert!(
+            !admin.contains(&format!("\"{retired}\" =>")),
+            "retired Web Admin command returned to the dispatcher: {retired}"
+        );
+    }
 }
 
 #[test]
@@ -227,10 +241,7 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "management::apply_workspace_config",
         "management::start_workspace_service",
         "management::stop_workspace_service",
-        "management::restart_workspace_service",
         "management::start_workspace_tunnel",
-        "management::restart_workspace_tunnel",
-        "management::stop_workspace_tunnel",
         "management::test_workspace_tunnel",
         "management::set_mcp_gateway",
         "management::reload_mcp_gateway",

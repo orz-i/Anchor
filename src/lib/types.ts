@@ -408,12 +408,6 @@ export interface ControlEvent {
   message: string;
 }
 
-export interface ControlEventBatch {
-  events: ControlEvent[];
-  nextCursor: ControlEventCursor;
-  reset: boolean;
-}
-
 export interface GatewayControlStatus {
   daemonSupported: boolean;
   running: boolean;

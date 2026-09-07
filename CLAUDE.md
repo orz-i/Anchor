@@ -5,45 +5,7 @@ Before coding, read the `mcp-probe:context` block in `AGENTS.md` or Skill `.agen
 <!-- mcp-probe:harness end -->
 
 <!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+## GitNexus（可选）
 
-This project is indexed by GitNexus as **anchor** (2497 symbols, 5234 relationships, 210 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/anchor/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/anchor/clusters` | All functional areas |
-| `gitnexus://repo/anchor/processes` | All execution flows |
-| `gitnexus://repo/anchor/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
+GitNexus 仅作为可选的代码图谱辅助能力。可用且确有帮助时再使用；未安装、索引过期、MCP 不可用或调用失败，都不得阻断代码读取、修改、测试或提交。影响面判断可以使用 Anchor 内置 `search` 的 callers/impact、精确引用扫描、编译器和测试结果等证据替代，不要求在编辑或提交前执行任何 GitNexus 专用命令。
 <!-- gitnexus:end -->

@@ -36,9 +36,7 @@ export function AppShell() {
   const location = useLocation();
   const { resolvedTheme, setTheme } = useTheme();
 
-  const isWorkspaceRoute =
-    location.pathname.startsWith("/workspaces") ||
-    location.pathname.startsWith("/workspace");
+  const isWorkspaceRoute = location.pathname.startsWith("/workspaces");
 
   const addWorkspace = async () => {
     try {

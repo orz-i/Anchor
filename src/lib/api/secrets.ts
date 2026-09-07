@@ -55,8 +55,3 @@ export async function setSharedSecret(key: SharedSecretKey, value: string): Prom
 export async function regenerateSharedSecret(key: SharedSecretKey): Promise<string> {
   return invokePrivilegedAdmin<string>("regenerate_shared_secret", { key }, { key });
 }
-
-export async function secretIsSet(id: string, key: WorkspaceSecretKey): Promise<boolean> {
-  const value = await getWorkspaceSecret(id, key);
-  return Boolean(value);
-}

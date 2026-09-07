@@ -13,8 +13,7 @@ mod workspace;
 
 pub(crate) use args::ConfigApplyOptions;
 pub(crate) use config::{
-    apply_staged_config, preview_profile_config, stage_profile_config, ConfigApplyReport,
-    ConfigSetReport,
+    apply_staged_config, stage_profile_config, ConfigApplyReport, ConfigSetReport,
 };
 
 use std::fs::File;
@@ -2853,10 +2852,10 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Doctor { workspace } => doctor_workspace(&workspace, cli.json)
             .await
             .map(|healthy| if healthy { 0 } else { 1 }),
-        Command::Config(command) => config::execute(command, cli.json).await,
-        Command::Frp(command) => frp::execute(command, cli.json).await,
-        Command::Tunnel(command) => tunnel::execute(command, cli.json).await,
-        Command::Software(command) => software::execute(command, cli.json).await,
+        Command::Config(command) => config::execute(command).await,
+        Command::Frp(command) => frp::execute(command).await,
+        Command::Tunnel(command) => tunnel::execute(command).await,
+        Command::Software(command) => software::execute(command).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
         Command::Skill(command) => skill::execute(command, cli.json).await,
         Command::Plugin(command) => plugin::execute(command, cli.json).await,

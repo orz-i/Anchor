@@ -1,33 +1,7 @@
-export type DialogKind = "info" | "warning" | "error";
-
-export interface MessageOptions {
-  title?: string;
-  kind?: DialogKind;
-}
-
-export interface ConfirmOptions extends MessageOptions {
-  okLabel?: string;
-  cancelLabel?: string;
-}
-
 export interface OpenOptions {
   directory?: boolean;
   multiple?: boolean;
   defaultPath?: string;
-}
-
-function browserText(message: string, title?: string): string {
-  return title?.trim() ? `${title}\n\n${message}` : message;
-}
-
-export async function message(text: string, options: MessageOptions = {}): Promise<void> {
-  if (typeof window === "undefined") return;
-  window.alert(browserText(text, options.title));
-}
-
-export async function confirm(text: string, options: ConfirmOptions = {}): Promise<boolean> {
-  if (typeof window === "undefined") return false;
-  return window.confirm(browserText(text, options.title));
 }
 
 export async function open(options: OpenOptions = {}): Promise<string | string[] | null> {

@@ -41,10 +41,6 @@ export async function saveFrpProfile(
   );
 }
 
-export async function getLastWorkspaceId(): Promise<string> {
-  return invokeRead<string>("get_last_workspace_id");
-}
-
 export async function setLastWorkspace(id: string): Promise<void> {
   return invokeAdmin("set_last_workspace", { id });
 }

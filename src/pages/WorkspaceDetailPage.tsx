@@ -246,6 +246,3 @@ export function WorkspaceDetailPage() {
 function ConfigCard({ title, description, children }: { title: string; description: string; children: React.ReactNode }) {
   return <Card><CardHeader><CardTitle>{title}</CardTitle><CardDescription>{description}</CardDescription></CardHeader><CardContent>{children}</CardContent></Card>;
 }
-
-// 兼容别名
-export const WorkspacePage = WorkspaceDetailPage;

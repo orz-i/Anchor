@@ -86,13 +86,9 @@ mod tests {
 
     #[test]
     fn stale_listener_registration_is_removed() {
-        let url = register_public_url("stale", "actions", String::new());
+        let url = register_public_url("stale", "mcp", String::new());
         drop(url);
-        assert!(!update_public_url(
-            "stale",
-            "actions",
-            "https://example.com"
-        ));
-        assert!(current_public_url("stale", "actions").is_none());
+        assert!(!update_public_url("stale", "mcp", "https://example.com"));
+        assert!(current_public_url("stale", "mcp").is_none());
     }
 }

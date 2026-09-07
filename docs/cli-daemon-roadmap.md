@@ -155,7 +155,7 @@ GUI 工作区控制迁移现状：
 
 ### 阶段 3.5：Web 管理面与 Tauri 退役边界
 
-桌面配置壳不是长期管理入口。本阶段已经把同一套 Svelte 管理 UI 迁移为浏览器 Web Admin，并完成 Tauri 物理删除。当前边界为：
+桌面配置壳不是长期管理入口。本阶段先将原 Svelte 管理 UI 迁移为浏览器 Web Admin，随后完成 Tauri 物理删除；当前 Web Admin 已进一步迁移到 Vite + React。当前边界为：
 
 1. **运行权威只属于 daemon/CLI**：不存在 desktop 进程运行所有权；Workspace/Gateway/Tunnel 只归对应 daemon 或显式前台 CLI `serve` 所有。
 2. **业务 UI 是 Web-only**：`src/` 不依赖 Tauri，transport/dialog 均使用浏览器与 Web Admin HTTP API。
@@ -166,7 +166,7 @@ GUI 工作区控制迁移现状：
 退役顺序固定为：
 
 1. 删除桌面进程残留的 process-local runtime/maintenance/退出清理；
-2. 将 Svelte 前端切到 transport-neutral API，并提供 Tauri/Web 两个 adapter；
+2. 将当时的 Svelte 前端切到 transport-neutral API，并提供 Tauri/Web 两个 adapter；
 3. 提供 `anchor admin`（或等价常驻管理入口）承载静态 Web UI 与版本化 `/api`；
 4. Tauri 壳只负责本机安装期引导、打开管理页和必要的系统集成，不再暴露业务 invoke 命令；
 5. Web 管理面、CLI 与系统 service manager 达成功能等价后，停止发布桌面包；
@@ -174,11 +174,11 @@ GUI 工作区控制迁移现状：
 
 在第 5 步之前，桌面包仍属于兼容入口；在第 6 步之前，不得删除用户仍只能通过桌面完成的系统级能力。
 
-截至 2026-08-19，本阶段已完成第四轮 Web Admin 实用化：
+截至 2026-09-06，本阶段已完成 Web Admin 实用化与 React 迁移收口：
 
 - 原 Tauri `AppState`、commands adapter、desktop maintenance 与窗口退出清理已经全部删除；
-- Svelte 业务页面/API 已切为 Web-only，统一经 `invokeAdmin` 与 browser dialog adapter；前端依赖和锁文件中不存在 `@tauri-apps/*`；
-- `anchor admin serve [--port PORT]` 仍固定绑定 `127.0.0.1`，现在由同一进程同时托管版本化 `/api/v1` 与生产 Svelte 静态站点；`pnpm cli:build` 会先执行 adapter-static 构建，再把 `build/` 作为只读资源嵌入 CLI 二进制，因此运行时不依赖单独的 Node/Vite 服务；
+- 当前业务页面已迁移为 Vite + React + React Router，统一经 `invokeAdmin` 与 browser dialog adapter；前端依赖和锁文件中不存在 `@tauri-apps/*` 或 Svelte runtime/build 依赖；
+- `anchor admin serve [--port PORT]` 仍固定绑定 `127.0.0.1`，由同一进程同时托管版本化 `/api/v1` 与 `vite build` 产出的生产静态站点；`pnpm cli:build` 会先构建 Web Admin，再把 `dist/` 作为只读资源嵌入 CLI 二进制，因此运行时不依赖单独的 Node/Vite 服务；
 - Web Admin 已新增独立的 persistent Admin daemon/service 层：`anchor admin start|stop|restart|status` 管理后台 Admin daemon，内部 `admin daemon-run` 只托管 loopback Web Admin HTTP/UI，不持有 Workspace、Gateway、Tunnel 或 RuntimeSupervisor。daemon 使用独立 `admin.lock/admin.pid/admin.json` 与 `logs/admin/daemon.log`，状态发布 PID、port、config scope、executable 和 `BuildIdentity`；启动前检查端口所有者，绝不接管其他进程监听；
 - `anchor admin install|uninstall|enable|disable|upgrade` 提供 OS autostart 治理。Linux 使用按 config scope 隔离的 `systemd --user` unit，并要求当前用户 linger 可用以保证重启后启动；Windows 使用当前用户 Task Scheduler、InteractiveToken/LeastPrivilege。两端 crash recovery 都限定为 5 秒间隔、最多 3 次，避免无限 crash loop。`admin upgrade` 使用当前 CLI executable/build 重建 OS 注册并重启，`status` 在运行态和停止态都能识别 build drift；本地 service config 与 OS 注册不一致时 fail closed，要求 upgrade/install 修复，不静默降级为非托管进程；
 - Admin daemon 对状态文件丢失/陈旧 PID 有受控恢复：Linux 可通过 `/proc` 的完整 `--config-dir ... admin daemon-run` 命令行重建同 config-scope 运行态；已注册服务还可通过 loopback 监听 PID + 注册 executable identity 恢复缺失状态。恢复来源无法证明 build identity 时显式报告 `unknown`，不会伪造 current。Linux 本轮已用隔离 config dir live 验证 start → 删除 pid/state → `/proc` 恢复 status → stop；OS autostart install 未在开发主机上做副作用型 live install，Windows Task Scheduler 实机启动/重启仍属于发布验收；

@@ -3,8 +3,6 @@ import type {
   ControlPlaneEventBatch,
   ControlPlaneEventCursor,
   ControlPlaneStatus,
-  ControlEventBatch,
-  ControlEventCursor,
   FederationHandshakeValidation,
   FederationBootstrapBundle,
   FederationDiscoveryDocument,
@@ -30,7 +28,6 @@ import type {
   SkillChannel,
   SkillInspection,
   SkillPackage,
-  WorkspaceControlStatus,
   WorkspaceProfile,
 } from "@/lib/types";
 
@@ -257,56 +254,12 @@ export async function createWorkspace(
   return invokeAdmin<WorkspaceProfile>("create_workspace", { path, name });
 }
 
-export interface WorkspaceConfigChange {
-  path: string;
-  before: unknown;
-  after: unknown;
-}
-
-export interface WorkspaceConfigApplyPlan {
-  mcpListenerReload: boolean;
-  mcpCallbackPolicyHotUpdate: boolean;
-  mcpTunnelChanged: boolean;
-}
-
-export interface WorkspaceConfigPreview {
-  event: string;
-  workspaceId: string;
-  staged: boolean;
-  changes: WorkspaceConfigChange[];
-  applyPlan: WorkspaceConfigApplyPlan;
-}
-
-export async function previewWorkspaceConfig(
-  baseProfile: WorkspaceProfile,
-  profile: WorkspaceProfile,
-): Promise<WorkspaceConfigPreview> {
-  return invokeAdmin<WorkspaceConfigPreview>("preview_workspace_config", {
-    baseProfile,
-    profile,
-  });
-}
-
-export async function stageWorkspaceConfig(
-  baseProfile: WorkspaceProfile,
-  profile: WorkspaceProfile,
-): Promise<WorkspaceConfigPreview> {
-  return invokeAdmin<WorkspaceConfigPreview>("stage_workspace_config", {
-    baseProfile,
-    profile,
-  });
-}
-
-export async function applyWorkspaceConfig(id: string, waitSeconds = 20): Promise<void> {
-  await invokeAdmin("apply_workspace_config", { id, waitSeconds });
-}
-
 export async function updateWorkspace(
   profile: WorkspaceProfile,
   baseProfile: WorkspaceProfile,
 ): Promise<void> {
-  await stageWorkspaceConfig(baseProfile, profile);
-  await applyWorkspaceConfig(profile.id);
+  await invokeAdmin("stage_workspace_config", { baseProfile, profile });
+  await invokeAdmin("apply_workspace_config", { id: profile.id, waitSeconds: 20 });
 }
 
 export async function inspectWorkspaceSkills(
@@ -375,24 +328,4 @@ export async function stopRuntime(id: string): Promise<RuntimeStatus> {
 
 export async function getRuntimeStatus(id: string): Promise<RuntimeStatus> {
   return invokeRead<RuntimeStatus>("get_runtime_status", { id });
-}
-
-export async function getWorkspaceControlStatus(id: string): Promise<WorkspaceControlStatus> {
-  return invokeRead<WorkspaceControlStatus>("get_workspace_control_status", { id });
-}
-
-export async function getWorkspaceControlEvents(
-  id: string,
-  cursor: ControlEventCursor | null,
-  waitMs = 15_000,
-): Promise<ControlEventBatch | null> {
-  return invokeRead<ControlEventBatch | null>("get_workspace_control_events", {
-    id,
-    cursor,
-    waitMs,
-  });
-}
-
-export async function restartRuntime(id: string): Promise<RuntimeStatus> {
-  return invokeAdmin<RuntimeStatus>("restart_runtime", { id });
 }

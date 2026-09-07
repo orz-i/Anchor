@@ -1,6 +1,6 @@
 # 项目图谱洞察
 
-更新时间：2026-08-19（UTC+8）
+更新时间：2026-09-06（UTC+8）
 
 ## 当前定位
 
@@ -44,7 +44,7 @@ MCP 工具执行仍由 Rust 工具目录、dispatcher 与 Harness 统一治理�
 - desktop/legacy desktop npm scripts、desktop build manifest/installer helpers、`dev-desktop.cmd`。
 - macOS desktop bundle reclaim 和 Windows `anchor-desktop.exe` runtime identity fixtures。
 
-`crates/anchor/tests/no_tauri_boundaries.rs` 对 active source、package/Cargo manifest、锁文件和应删除路径做机器验证。
+`crates/anchor/tests/no_tauri_boundaries.rs` 对 active source、package/Cargo manifest、锁文件、应删除路径和 GitHub CI/Release workflow 做机器验证。
 
 ## 分发与验证
 
@@ -55,6 +55,8 @@ pnpm release:build
 ```
 
 它产出 Vite/React Web Admin 静态资源和 `anchor` CLI，不生成 MSI/NSIS/DMG/Tauri bundle。
+
+GitHub CI/Release 已使用 pnpm + Vite + `crates/anchor`：CI 在 push/PR 上执行前端 check/test/build 与 Rust fmt/clippy/test；Release 直接构建 Linux、Windows、macOS CLI 产物，不再安装 GTK/WebKit/Tauri 依赖，也不再引用 `src-tauri` 或 desktop bundle 路径。
 
 发布门禁覆盖 Rust library/integration、Web Admin/privileged boundary、persistent Admin service、no-Tauri boundary、严格 Clippy、前端 check/build、release build、rustfmt 与 diff check。
 

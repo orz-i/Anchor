@@ -202,6 +202,8 @@ list_command_sessions
 
 命令工具的外部结果仍使用既有 `session_id` 表示 command session handle，以保持命令工具协议稳定；当命令信息被投影到 Harness operation log 时，字段明确命名为 `command_session_id`，而 `session_id` 专门表示开发 Session。
 
+durable command session 会在持久状态中维护轻量 heartbeat。若磁盘满等 I/O 故障导致终态 `state.json` 未能落盘，后续恢复会同时检查 supervisor、child PID 与 heartbeat；当 child 已不存在且 heartbeat 明显过期时，将该 session 标记为 `child_lost` / interrupted 并释放 execution capacity，而不是让一个陈旧 `running` 记录永久占用执行槽。恢复仍不会重放原命令。
+
 ### 输出 offset
 
 `read_output.offset` 是从进程输出流起点计算的绝对字节位置。返回值包含：
