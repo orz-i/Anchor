@@ -2804,7 +2804,9 @@ impl ExecSession {
             "timeout" => "timed_out",
             "killed" => "killed",
             "spawn_failed" => "spawn_failed",
-            "server_restart" | "supervisor_lost" | "launch_interrupted" => "interrupted",
+            "server_restart" | "supervisor_lost" | "launch_interrupted" | "child_lost" => {
+                "interrupted"
+            }
             _ => "failed",
         };
         let retryable = matches!(
@@ -2815,6 +2817,7 @@ impl ExecSession {
                 | "server_restart"
                 | "supervisor_lost"
                 | "launch_interrupted"
+                | "child_lost"
         );
         let session_age_ms = self
             .durable_job

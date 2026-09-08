@@ -4,7 +4,20 @@ use std::path::Path;
 use crate::error::{AppError, AppResult};
 
 pub fn is_process_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).is_dir()
+    let stat = Path::new("/proc").join(pid.to_string()).join("stat");
+    let Ok(stat) = fs::read_to_string(stat) else {
+        return false;
+    };
+    !matches!(process_state_from_stat(&stat), Some('Z' | 'X' | 'x') | None)
+}
+
+fn process_state_from_stat(stat: &str) -> Option<char> {
+    let command_end = stat.rfind(')')?;
+    stat.get(command_end + 1..)?
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 pub fn process_image_path(pid: u32) -> AppResult<Option<String>> {
@@ -82,4 +95,48 @@ fn signal_pid(pid: u32, signal: i32) -> AppResult<()> {
         "kill({pid}, {signal}) failed: {}",
         std::io::Error::last_os_error()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_state_parser_handles_parentheses_in_command_name() {
+        assert_eq!(
+            process_state_from_stat("123 (anchor ) worker) S 1 2 3"),
+            Some('S')
+        );
+        assert_eq!(process_state_from_stat("123 (anchor) Z 1 2 3"), Some('Z'));
+    }
+
+    #[test]
+    fn zombie_process_is_not_reported_as_alive() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+            if stat
+                .as_deref()
+                .and_then(process_state_from_stat)
+                .is_some_and(|state| state == 'Z')
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.wait();
+                panic!("child did not reach zombie state before timeout");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(!is_process_alive(pid));
+        let _ = child.wait();
+    }
 }
