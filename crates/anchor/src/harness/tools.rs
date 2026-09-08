@@ -1352,6 +1352,13 @@ fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Works
             strict["outcome"] = Value::String("completed".into());
             strict["_completion_via_work_session"] = Value::Bool(true);
             outbox.finish_args = strict;
+        }
+        if matches!(
+            outbox.phase,
+            WorkSessionClosePhase::Prepared
+                | WorkSessionClosePhase::TaskClosed
+                | WorkSessionClosePhase::CheckpointPending
+        ) {
             outbox.session_status = HarnessSessionStatus::Completed;
             if let Some(checkpoint) = args.get("checkpoint").and_then(Value::as_object) {
                 if let Some(target) = outbox.checkpoint_args.as_object_mut() {
