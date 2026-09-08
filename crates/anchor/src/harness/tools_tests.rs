@@ -69,17 +69,13 @@ fn begin_work_session_reports_session_reactivation_without_conflating_task_state
     )
     .expect("resume begin");
 
-    assert_eq!(resumed["session_state_transition"]["from"], "paused");
-    assert_eq!(resumed["session_state_transition"]["to"], "active");
-    assert_eq!(resumed["session_state_transition"]["changed"], true);
-    assert_eq!(
-        resumed["session_state_transition"]["reason"],
-        "begin_work_session"
-    );
-    assert_eq!(resumed["state_scopes"]["session_lease"]["status"], "active");
-    assert_eq!(resumed["state_scopes"]["harness_task"]["status"], "active");
+    assert!(resumed.get("session_state_transition").is_none());
+    assert!(resumed.get("state_scopes").is_none());
     assert_eq!(resumed["session"]["previous_status"], "paused");
     assert_eq!(resumed["session"]["reactivated"], true);
+    assert_eq!(resumed["session"]["session_status"], "active");
+    assert_eq!(resumed["task"]["status"], "active");
+    assert_eq!(resumed["harness"]["task_state"], "active");
 }
 
 #[test]

@@ -1046,7 +1046,7 @@ pub fn wait_command(store: &CommandSessionStore, args: &Value) -> Result<Value, 
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
-        .unwrap_or(65_536)
+        .unwrap_or(4_096)
         .clamp(1, 1_048_576) as usize;
     let return_incremental = args
         .get("return_incremental_output")
@@ -1110,28 +1110,13 @@ pub fn wait_command(store: &CommandSessionStore, args: &Value) -> Result<Value, 
 
     Ok(finalize_execution_result(json!({
         "session_id": session_id,
-        "command": snapshot["command"],
-        "resolved_cwd": snapshot["resolved_cwd"],
         "state": state,
-        "status": snapshot["status"],
         "termination_reason": termination_reason,
         "exit_code": snapshot["exit_code"],
         "command_ok": snapshot["command_ok"],
-        "transport_status": snapshot["transport_status"],
         "execution_status": snapshot["execution_status"],
-        "success": snapshot["success"],
-        "retryable": snapshot["retryable"],
-        "started_at": snapshot["started_at"],
-        "elapsed_ms": snapshot["elapsed_ms"],
         "execution_duration_ms": snapshot["execution_duration_ms"],
-        "session_age_ms": snapshot["session_age_ms"],
-        "retained_ms": snapshot["retained_ms"],
-        "finished_at": snapshot["finished_at"],
         "result_observed": snapshot["result_observed"],
-        "durable": snapshot["durable"],
-        "process_bound": snapshot["process_bound"],
-        "last_output_at": snapshot["last_output_at"],
-        "stdin_open": snapshot["stdin_open"],
         "stdout": stdout,
         "stderr": stderr,
         "stdout_complete": stdout.get("complete").and_then(Value::as_bool).unwrap_or(false),
@@ -2291,7 +2276,6 @@ pub struct ExecSession {
     terminal_observed: AtomicBool,
     externally_retained: AtomicBool,
     resource_lease: Mutex<Option<ExecutionLease>>,
-    execution_resources: Option<Value>,
     expected_exit_codes: Vec<i32>,
     durable_job: Option<DurableJobHandle>,
 }
@@ -2391,7 +2375,6 @@ impl ExecSession {
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
         let started_at_iso = timestamp();
-        let execution_resources = resource_lease.as_ref().map(ExecutionLease::to_value);
         Self {
             session_id,
             child: AsyncMutex::new(Some(child)),
@@ -2420,7 +2403,6 @@ impl ExecSession {
             terminal_observed: AtomicBool::new(false),
             externally_retained: AtomicBool::new(false),
             resource_lease: Mutex::new(resource_lease),
-            execution_resources,
             expected_exit_codes: vec![0],
             durable_job: None,
         }
@@ -2456,7 +2438,6 @@ impl ExecSession {
             terminal_observed: AtomicBool::new(job.paths.observed.is_file()),
             externally_retained: AtomicBool::new(true),
             resource_lease: Mutex::new(None),
-            execution_resources: job.spec.execution_resources.clone(),
             expected_exit_codes: job.spec.expected_exit_codes.clone(),
             durable_job: Some(job),
         }
@@ -2900,8 +2881,7 @@ impl ExecSession {
                 "stdout": format!("session:{}:stdout", self.session_id),
                 "stderr": format!("session:{}:stderr", self.session_id)
             },
-            "execution_resources": self.execution_resources
-            ,"process_bound": !self.is_durable()
+            "process_bound": !self.is_durable()
             ,"durable": self.is_durable()
         })
     }

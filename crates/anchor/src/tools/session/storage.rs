@@ -261,7 +261,7 @@ pub fn scan(workspace: &Workspace, session_dir: &Path) -> WorkspaceResult<ScanRe
             path: relative_display(workspace.root(), &path),
             title: markdown::document_title(&content),
             size_bytes,
-            host_session_key: markdown::metadata(&content, "Host session key"),
+            host_session_scope: markdown::metadata(&content, "Host session scope"),
             parent_session_id: markdown::metadata(&content, "Parent session id"),
             created_at: markdown::metadata(&content, "Created"),
             updated_at: markdown::metadata(&content, "Updated"),
@@ -277,30 +277,30 @@ pub fn scan(workspace: &Workspace, session_dir: &Path) -> WorkspaceResult<ScanRe
     report.empty_files.sort();
 
     let mut ids = BTreeMap::<String, usize>::new();
-    let mut host_keys = BTreeMap::<String, usize>::new();
+    let mut host_scopes = BTreeMap::<String, usize>::new();
     for document in &report.documents {
         *ids.entry(document.session_id.clone()).or_default() += 1;
-        if let Some(key) = document.host_session_key.as_ref() {
-            *host_keys.entry(key.clone()).or_default() += 1;
+        if let Some(scope) = document.host_session_scope.as_ref() {
+            *host_scopes.entry(scope.clone()).or_default() += 1;
         }
     }
     report.duplicate_session_ids = ids
         .into_iter()
         .filter_map(|(id, count)| (count > 1).then_some(id))
         .collect();
-    report.duplicate_host_session_keys = host_keys
+    report.duplicate_host_session_scopes = host_scopes
         .into_iter()
-        .filter_map(|(key, count)| {
-            (count > 1 && !valid_continuation_chain(&report.documents, &key)).then_some(key)
+        .filter_map(|(scope, count)| {
+            (count > 1 && !valid_continuation_chain(&report.documents, &scope)).then_some(scope)
         })
         .collect();
     Ok(report)
 }
 
-fn valid_continuation_chain(documents: &[SessionDocument], host_key: &str) -> bool {
+fn valid_continuation_chain(documents: &[SessionDocument], host_scope: &str) -> bool {
     let members = documents
         .iter()
-        .filter(|document| document.host_session_key.as_deref() == Some(host_key))
+        .filter(|document| document.host_session_scope.as_deref() == Some(host_scope))
         .collect::<Vec<_>>();
     if members.len() <= 1 {
         return true;
@@ -336,7 +336,7 @@ fn valid_continuation_chain(documents: &[SessionDocument], host_key: &str) -> bo
 pub fn rebuild_index(report: &ScanReport) -> SessionIndex {
     let duplicate_ids = report.duplicate_session_ids.iter().collect::<BTreeSet<_>>();
     let duplicate_hosts = report
-        .duplicate_host_session_keys
+        .duplicate_host_session_scopes
         .iter()
         .collect::<BTreeSet<_>>();
     let mut index = SessionIndex::default();
@@ -355,13 +355,13 @@ pub fn rebuild_index(report: &ScanReport) -> SessionIndex {
                 parent_session_id: document.parent_session_id.clone(),
             },
         );
-        if let Some(host_key) = document.host_session_key.as_ref() {
-            if !duplicate_hosts.contains(host_key) {
+        if let Some(host_scope) = document.host_session_scope.as_ref() {
+            if !duplicate_hosts.contains(host_scope) {
                 // report.documents is ordered oldest -> newest, so a valid continuation
                 // chain naturally leaves the current leaf bound to the host conversation.
                 index
-                    .host_sessions
-                    .insert(host_key.clone(), document.session_id.clone());
+                    .host_scopes
+                    .insert(host_scope.clone(), document.session_id.clone());
             }
         }
     }
@@ -387,15 +387,33 @@ pub fn read_index(session_dir: &Path) -> WorkspaceResult<Option<SessionIndex>> {
     }
     let content =
         fs::read_to_string(&path).map_err(|error| io_error("SESSION_READ_FAILED", error, true))?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .map_err(|error| WorkspaceError::ToolDetails {
+    let index = serde_json::from_str::<SessionIndex>(&content).map_err(|error| {
+        WorkspaceError::ToolDetails {
             code: "SESSION_INDEX_INVALID",
-            message: "Session index is not valid JSON.".into(),
+            message: "Session index does not match the current schema.".into(),
             category: "validation",
             retryable: true,
-            details: serde_json::json!({"error": error.to_string()}),
-        })
+            details: serde_json::json!({
+                "error": error.to_string(),
+                "required_version": super::model::SESSION_INDEX_VERSION,
+                "suggestion": "Run session operation=validate with repair=true to rebuild the current index from Session documents."
+            }),
+        }
+    })?;
+    if index.version != super::model::SESSION_INDEX_VERSION {
+        return Err(WorkspaceError::ToolDetails {
+            code: "SESSION_INDEX_VERSION_UNSUPPORTED",
+            message: "Session index version is not supported by this Anchor build.".into(),
+            category: "validation",
+            retryable: true,
+            details: serde_json::json!({
+                "version": index.version,
+                "required_version": super::model::SESSION_INDEX_VERSION,
+                "suggestion": "Run session operation=validate with repair=true to rebuild the current index from Session documents."
+            }),
+        });
+    }
+    Ok(Some(index))
 }
 
 pub fn write_index(session_dir: &Path, index: &SessionIndex) -> WorkspaceResult<()> {

@@ -22,7 +22,7 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
 
 #[test]
 fn get_exposes_latest_canonical_snapshot_while_manual_history_remains_append_only() {
-    let (_workspace, _harness, ctx) = test_context();
+    let (workspace, _harness, ctx) = test_context();
     let opened = open_session(&ctx, "chat-snapshot", "snapshot");
     for (turn_id, runtime, issue, next) in [
         ("old", "task_status=active", "old issue", "old action"),
@@ -46,7 +46,7 @@ fn get_exposes_latest_canonical_snapshot_while_manual_history_remains_append_onl
     let fetched = invoke(
         &ctx,
         "session_get",
-        json!({"session_id": opened["session_id"], "max_bytes": 131072}),
+        json!({"session_id": opened["session_id"]}),
     );
     let fetched = assert_ok(&fetched);
     assert_eq!(fetched["checkpoint_count"], 2);
@@ -61,9 +61,14 @@ fn get_exposes_latest_canonical_snapshot_while_manual_history_remains_append_onl
     );
     assert_eq!(fetched["snapshot"]["next_actions"], json!(["new action"]));
 
-    let current_sections = fetched["content"]
-        .as_str()
-        .expect("content")
+    assert!(fetched.get("content").is_none());
+    let content = fs::read_to_string(
+        workspace
+            .path()
+            .join(opened["session_path"].as_str().expect("session path")),
+    )
+    .expect("session file");
+    let current_sections = content
         .split("## 本轮检查点")
         .next()
         .expect("current sections");
@@ -119,7 +124,7 @@ fn completed_session_creates_a_continuation_instead_of_reactivating_implicitly()
     let validated = invoke(&ctx, "session_validate", json!({"repair": false}));
     let validated = assert_ok(&validated);
     assert_eq!(validated["valid"], true);
-    assert_eq!(validated["duplicate_host_session_keys"], json!([]));
+    assert_eq!(validated["duplicate_host_session_scopes"], json!([]));
 }
 
 #[test]
@@ -221,10 +226,46 @@ fn open_creates_opaque_isolated_session_without_loading_legacy_history() {
 
     let content = fs::read_to_string(workspace.path().join(session_path)).expect("session file");
     assert!(content.contains(&format!("**Session id:** {session_id}")));
-    assert!(content.contains("**Host session key:** chat-a"));
+    assert!(content.contains("**Host session scope:** host-session:"));
+    assert!(!content.contains("chat-a"));
     assert!(!content.contains("THIS_LEGACY_SECRET_MUST_NOT_BE_INJECTED"));
     assert!(!content.contains("继承的历史摘要"));
     assert!(legacy.join("999.md").exists());
+}
+
+#[test]
+fn v2_session_index_is_rejected_until_explicit_repair_rebuilds_v3() {
+    let (workspace, _harness, ctx) = test_context();
+    let opened = open_session(&ctx, "chat-v3-hardcut", "v3 hard cut");
+    let session_id = opened["session_id"].as_str().expect("session id");
+    let index_path = workspace.path().join("docs/session/index.json");
+    fs::write(
+        &index_path,
+        r#"{"version":2,"sessions":{},"host_sessions":{"chat-v3-hardcut":"legacy"}}"#,
+    )
+    .expect("write v2 index");
+
+    let rejected = invoke(
+        &ctx,
+        "session_open",
+        json!({"title": "must not dual-read v2"}),
+    );
+    assert_eq!(
+        assert_err(&rejected)["error"]["code"],
+        "SESSION_INDEX_INVALID"
+    );
+
+    let repaired = invoke(&ctx, "session_validate", json!({"repair": true}));
+    let repaired = assert_ok(&repaired);
+    assert_eq!(repaired["repaired"], true);
+    assert_eq!(repaired["index_status"], "invalid");
+
+    let fetched = invoke(&ctx, "session_get", json!({"session_id": session_id}));
+    assert_eq!(assert_ok(&fetched)["session_id"], session_id);
+    let index = fs::read_to_string(index_path).expect("rebuilt v3 index");
+    assert!(index.contains("\"version\": 3"));
+    assert!(index.contains("\"host_scopes\""));
+    assert!(!index.contains("host_sessions"));
 }
 
 #[test]
@@ -304,21 +345,15 @@ fn list_reads_metadata_only_and_get_reads_one_explicit_session() {
     assert!(!serialized.contains("content\""));
     assert!(!serialized.contains("summary\""));
 
-    let fetched = invoke(
-        &ctx,
-        "session_get",
-        json!({"session_id": first_id, "max_bytes": 131072}),
-    );
+    let fetched = invoke(&ctx, "session_get", json!({"session_id": first_id}));
     let fetched = assert_ok(&fetched);
     assert_eq!(fetched["session_id"], first["session_id"]);
-    assert!(fetched["content"]
-        .as_str()
-        .expect("content")
-        .contains("alpha-body-only-marker"));
-    assert!(!fetched["content"]
-        .as_str()
-        .expect("content")
-        .contains("beta-title"));
+    assert_eq!(
+        fetched["snapshot"]["findings"],
+        json!(["alpha-body-only-marker"])
+    );
+    assert!(fetched.get("content").is_none());
+    assert!(!fetched.to_string().contains("beta-title"));
     assert_eq!(second["created"], true);
 }
 
@@ -407,7 +442,7 @@ fn checkpoint_is_idempotent_and_cannot_cross_session_targets() {
 
 #[test]
 fn automatic_milestone_checkpoint_uses_explicit_session_id_binding() {
-    let (_workspace, _harness, ctx) = test_context();
+    let (workspace, _harness, ctx) = test_context();
     let opened = open_session(&ctx, "chat-auto-checkpoint", "automatic checkpoint");
     let session_id = opened["session_id"]
         .as_str()
@@ -448,15 +483,15 @@ fn automatic_milestone_checkpoint_uses_explicit_session_id_binding() {
         json!({"session_id": checkpoint["session_id"]}),
     );
     let fetched = assert_ok(&fetched_result);
-    assert!(fetched["content"]
-        .as_str()
-        .expect("content")
-        .contains("自动阶段检查点"));
+    assert_eq!(fetched["snapshot"]["turn_id"], checkpoint["turn_id"]);
+    assert!(fetched.get("content").is_none());
+    let content = fs::read_to_string(workspace.path().join(session_path)).expect("session file");
+    assert!(content.contains("自动阶段检查点"));
 }
 
 #[test]
 fn automatic_progress_checkpoint_reuses_stable_slots_and_clears_recovered_verification() {
-    let (_workspace, _harness, ctx) = test_context();
+    let (workspace, _harness, ctx) = test_context();
     let opened = open_session(&ctx, "chat-auto-compact", "automatic compaction");
     let session_id = opened["session_id"]
         .as_str()
@@ -546,7 +581,8 @@ fn automatic_progress_checkpoint_reuses_stable_slots_and_clears_recovered_verifi
         fetched["snapshot"]["tests"],
         json!(["verification_kind=lint, success=true"])
     );
-    let content = fetched["content"].as_str().expect("content");
+    assert!(fetched.get("content").is_none());
+    let content = fs::read_to_string(workspace.path().join(session_path)).expect("session file");
     assert!(content.contains("src/current.rs"));
     assert!(!content.contains("src/old.rs"));
     assert!(!content.contains("lint failed"));
@@ -666,15 +702,26 @@ fn checkpoint_rejects_running_or_unconsumed_command_results_for_the_same_caller(
 }
 
 #[test]
-fn get_is_bounded_on_utf8_boundaries() {
+fn get_is_snapshot_only_and_rejects_removed_max_bytes() {
     let (_workspace, _harness, ctx) = test_context();
     let opened = open_session(&ctx, "chat-utf8", "中文会话");
-    let fetched = invoke(
+    let rejected = invoke(
         &ctx,
         "session_get",
         json!({"session_id": opened["session_id"], "max_bytes": 17}),
     );
+    assert_eq!(
+        assert_err(&rejected)["error"]["code"],
+        "INVALID_TOOL_ARGUMENTS"
+    );
+
+    let fetched = invoke(
+        &ctx,
+        "session_get",
+        json!({"session_id": opened["session_id"]}),
+    );
     let fetched = assert_ok(&fetched);
-    assert_eq!(fetched["content_truncated"], true);
-    assert!(fetched["content"].as_str().is_some());
+    assert!(fetched.get("content").is_none());
+    assert!(fetched.get("content_truncated").is_none());
+    assert!(fetched.get("max_bytes").is_none());
 }

@@ -160,7 +160,7 @@ pub fn document_title(content: &str) -> String {
 pub struct DocumentMetadata<'a> {
     pub session_id: &'a str,
     pub title: &'a str,
-    pub host_session_key: Option<&'a str>,
+    pub host_session_scope: Option<&'a str>,
     pub parent_session_id: Option<&'a str>,
     pub created_at: &'a str,
     pub updated_at: &'a str,
@@ -171,7 +171,7 @@ pub fn render_document(metadata: DocumentMetadata<'_>, records: &[CheckpointReco
     let DocumentMetadata {
         session_id,
         title,
-        host_session_key,
+        host_session_scope,
         parent_session_id,
         created_at,
         updated_at,
@@ -189,8 +189,8 @@ pub fn render_document(metadata: DocumentMetadata<'_>, records: &[CheckpointReco
 **Updated:** {updated_at}\n\
 **Status:** {status}\n"
     );
-    if let Some(host_session_key) = host_session_key.filter(|value| !value.trim().is_empty()) {
-        output.push_str(&format!("**Host session key:** {host_session_key}\n"));
+    if let Some(host_session_scope) = host_session_scope.filter(|value| !value.trim().is_empty()) {
+        output.push_str(&format!("**Host session scope:** {host_session_scope}\n"));
     }
     if let Some(parent_session_id) = parent_session_id.filter(|value| !value.trim().is_empty()) {
         output.push_str(&format!("**Parent session id:** {parent_session_id}\n"));

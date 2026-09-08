@@ -509,8 +509,30 @@ impl Workspace {
     /// This is reserved for recovery operations that must be able to address a
     /// broken symlink or Windows junction by its workspace-local path.
     pub fn resolve_lexical_write_path(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
+        self.resolve_lexical_write_path_with_repository_config(raw_path, false)
+    }
+
+    /// Resolve a repository-config mutation target lexically. `.github` is a
+    /// repository-owned configuration surface and may be staged/committed after
+    /// the patch engine has admitted it; `.git` remains unconditionally protected.
+    pub fn resolve_repository_config_lexical_write_path(
+        &self,
+        raw_path: &str,
+    ) -> WorkspaceResult<ResolvedPath> {
+        self.resolve_lexical_write_path_with_repository_config(raw_path, true)
+    }
+
+    fn resolve_lexical_write_path_with_repository_config(
+        &self,
+        raw_path: &str,
+        allow_repository_config: bool,
+    ) -> WorkspaceResult<ResolvedPath> {
         self.reject_unsafe_text(raw_path)?;
-        self.reject_protected_write_path(raw_path)?;
+        if allow_repository_config {
+            self.reject_git_metadata_write_path(raw_path)?;
+        } else {
+            self.reject_protected_write_path(raw_path)?;
+        }
         let pure = Path::new(raw_path);
         if pure.file_name().is_none() || raw_path == "." || raw_path == ".." {
             return Err(WorkspaceError::invalid_argument("Invalid write target"));

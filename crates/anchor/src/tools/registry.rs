@@ -2317,10 +2317,7 @@ pub fn output_schema(name: &str) -> Value {
         "wait_command" => success_output_schema(
             json!({
                 "session_id": { "type": "string", "minLength": 1 },
-                "command": { "type": "string", "minLength": 1 },
-                "resolved_cwd": { "type": "string", "minLength": 1 },
                 "state": { "type": "string", "enum": ["running", "completed", "failed", "cancelled"] },
-                "status": { "type": "string", "minLength": 1 },
                 "termination_reason": { "type": "string", "minLength": 1 },
                 "exit_code": nullable_integer_property(),
                 "command_ok": { "type": ["boolean", "null"] },
@@ -2328,23 +2325,13 @@ pub fn output_schema(name: &str) -> Value {
                 "execution_status": { "type": "string", "enum": ["running", "succeeded", "failed", "cancelled", "timed_out", "killed", "spawn_failed", "rejected", "interrupted"] },
                 "success": { "type": ["boolean", "null"] },
                 "retryable": { "type": "boolean" },
-                "started_at": { "type": "string", "minLength": 1 },
-                "elapsed_ms": { "type": "integer", "minimum": 0 },
                 "execution_duration_ms": { "type": "integer", "minimum": 0 },
-                "session_age_ms": { "type": "integer", "minimum": 0 },
-                "retained_ms": { "type": "integer", "minimum": 0 },
-                "finished_at": { "type": ["string", "null"] },
                 "result_observed": { "type": "boolean" },
-                "durable": { "type": "boolean" },
-                "process_bound": { "type": "boolean" },
-                "last_output_at": { "type": "string", "minLength": 1 },
-                "stdin_open": { "type": "boolean" },
                 "stdout": { "type": "object" },
                 "stderr": { "type": "object" },
                 "stdout_complete": { "type": "boolean" },
                 "stderr_complete": { "type": "boolean" },
                 "output_refs": { "type": "object" },
-                "execution_resources": { "type": ["object", "null"], "additionalProperties": true },
                 "stop_pattern_matched": { "type": ["string", "null"] },
                 "wait_timeout_ms": { "type": "integer", "minimum": 0 },
                 "affected_files": { "type": "array", "items": { "type": "object" } },
@@ -2353,10 +2340,7 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &[
                 "session_id",
-                "command",
-                "resolved_cwd",
                 "state",
-                "status",
                 "termination_reason",
                 "exit_code",
                 "command_ok",
@@ -2364,17 +2348,8 @@ pub fn output_schema(name: &str) -> Value {
                 "execution_status",
                 "success",
                 "retryable",
-                "started_at",
-                "elapsed_ms",
                 "execution_duration_ms",
-                "session_age_ms",
-                "retained_ms",
-                "finished_at",
                 "result_observed",
-                "durable",
-                "process_bound",
-                "last_output_at",
-                "stdin_open",
                 "stdout",
                 "stderr",
                 "stdout_complete",
@@ -2758,10 +2733,7 @@ pub fn output_schema(name: &str) -> Value {
                 "updated_at": { "type": "string" },
                 "parent_session_id": { "type": ["string", "null"] },
                 "checkpoint_count": { "type": "integer", "minimum": 0 },
-                "snapshot": { "type": ["object", "null"] },
-                "content": { "type": "string" },
-                "content_truncated": { "type": "boolean" },
-                "max_bytes": { "type": "integer", "minimum": 1 }
+                "snapshot": { "type": ["object", "null"] }
             }),
             &[
                 "session_id",
@@ -2773,16 +2745,13 @@ pub fn output_schema(name: &str) -> Value {
                 "parent_session_id",
                 "checkpoint_count",
                 "snapshot",
-                "content",
-                "content_truncated",
-                "max_bytes",
             ],
         ),
         "session_validate" => success_output_schema(
             json!({
                 "valid": { "type": "boolean" },
                 "duplicate_session_ids": { "type": "array", "items": { "type": "string" } },
-                "duplicate_host_session_keys": { "type": "array", "items": { "type": "string" } },
+                "duplicate_host_session_scopes": { "type": "array", "items": { "type": "string" } },
                 "invalid_files": { "type": "array", "items": { "type": "string" } },
                 "empty_files": { "type": "array", "items": { "type": "string" } },
                 "document_count": { "type": "integer", "minimum": 0 },
@@ -2812,7 +2781,7 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "valid",
                 "duplicate_session_ids",
-                "duplicate_host_session_keys",
+                "duplicate_host_session_scopes",
                 "invalid_files",
                 "empty_files",
                 "document_count",
@@ -2902,8 +2871,6 @@ pub fn output_schema(name: &str) -> Value {
             json!({
                 "work_session": { "type": "object" },
                 "session": { "type": "object" },
-                "session_state_transition": { "type": "object" },
-                "state_scopes": { "type": "object" },
                 "task": { "type": "object" },
                 "harness": { "type": "object" },
                 "reconnect_required": { "type": "boolean", "const": false }
@@ -2911,8 +2878,6 @@ pub fn output_schema(name: &str) -> Value {
             &[
                 "work_session",
                 "session",
-                "session_state_transition",
-                "state_scopes",
                 "task",
                 "harness",
                 "reconnect_required",
@@ -3765,8 +3730,7 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
                 "session_dir": { "type": "string", "default": "docs/session" },
-                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
-                "max_bytes": { "type": "integer", "minimum": 1, "maximum": 262144, "default": 65536 }
+                "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" }
             },
             "additionalProperties": false
         }),
@@ -4303,7 +4267,7 @@ pub fn input_schema(name: &str) -> Value {
                 "workdir": { "type": "string", "default": ".", "description": "Working directory relative to the current session cwd. '.' means the session cwd. Paths already prefixed by the current cwd are de-duplicated instead of being joined twice." },
                 "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 30000 },
                 "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 32768 },
-                "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
+                "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 10000, "description": "Wait inline for up to this long before returning a retained running session; the 10s default completes ordinary short commands without a follow-up wait." },
                 "tty": { "type": "boolean", "default": false },
                 "durable": {
                     "type": "boolean",
@@ -4403,7 +4367,7 @@ pub fn input_schema(name: &str) -> Value {
                 "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "default": 30000 },
                 "stdout_offset": { "type": "integer", "minimum": 0, "description": "Optional explicit cursor. Omit it to continue from the caller session's last returned stdout offset." },
                 "stderr_offset": { "type": "integer", "minimum": 0, "description": "Optional explicit cursor. Omit it to continue from the caller session's last returned stderr offset." },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096 },
                 "return_incremental_output": { "type": "boolean", "default": true },
                 "stop_on_patterns": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1 } }
             },

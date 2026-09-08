@@ -49,7 +49,20 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
         "begin_work_session",
         &json!({
             "objective": "research only",
-            "workspace_root": workspace.to_string_lossy()
+            "workspace_root": workspace.to_string_lossy(),
+            "pending_steps": ["stale pending step"],
+            "contract": {
+                "completion_policy": {
+                    "require_pending_steps_empty": true,
+                    "require_all_slices_completed": true
+                }
+            },
+            "slices": [{
+                "id": "OLD",
+                "title": "stale slice",
+                "status": "in_progress"
+            }],
+            "working_set": {"primary": ["README.md"]}
         }),
         "objective-revision-transport",
     );
@@ -59,6 +72,25 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
         .as_str()
         .expect("session id")
         .to_string();
+    let stale_verification = ctx
+        .harness
+        .record_verification(
+            &task_id,
+            "test",
+            "stale-plan-check",
+            Some("stale-plan-check"),
+            None,
+            None,
+            Some(0),
+            true,
+            Some(1),
+            None,
+            None,
+            None,
+            "blocking",
+            true,
+        )
+        .expect("stale verification");
 
     let conflict = call_tool_for_session(
         &ctx,
@@ -95,23 +127,47 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
     assert_eq!(resumed["ok"], true, "{resumed}");
     assert_eq!(resumed["work_session"]["task_created"], false);
     assert_eq!(resumed["work_session"]["objective_revised"], true);
+    assert!(resumed["work_session"].get("previous_objective").is_none());
+    assert!(resumed["task"].get("objective").is_none());
+    let revised = ctx.harness.task(&task_id).expect("revised durable task");
+    assert_eq!(revised.objective, "implement and verify");
+    assert_eq!(revised.phase, anchor_lib::harness::TaskPhase::Planning);
+    assert!(revised.slices.is_empty());
+    assert!(revised.current_slice_id.is_none());
+    assert!(revised.pending_steps.is_empty());
+    assert!(revised.completed_steps.is_empty());
+    assert!(revised.working_set.primary.is_empty());
+    assert!(
+        !revised
+            .contract
+            .completion_policy
+            .require_pending_steps_empty
+    );
+    assert!(revised.latest_verification_id.is_none());
+    let stale_verification = ctx
+        .harness
+        .list_verifications(&task_id)
+        .expect("verifications")
+        .into_iter()
+        .find(|record| record.id == stale_verification.id)
+        .expect("stale verification retained as history");
     assert_eq!(
-        resumed["work_session"]["previous_objective"],
+        stale_verification
+            .dispositions
+            .last()
+            .map(|entry| entry.disposition.as_str()),
+        Some("superseded")
+    );
+
+    let events = ctx.harness.list_events(&task_id, 0, 100).expect("events");
+    let revision = events
+        .iter()
+        .find(|event| event.kind == "task_plan_revised")
+        .expect("plan revision event");
+    assert_eq!(
+        revision.input_summary["payload"]["previous_objective"],
         "research only"
     );
-    assert_eq!(resumed["task"]["objective"], "implement and verify");
-
-    let events = call_tool(
-        &ctx,
-        "list_task_events",
-        &json!({"task_id": resumed["task"]["id"], "limit": 100}),
-    );
-    assert_eq!(events["ok"], true, "{events}");
-    assert!(events["events"]
-        .as_array()
-        .expect("events")
-        .iter()
-        .any(|event| event["kind"] == "task_objective_revised"));
 }
 
 #[test]
@@ -140,7 +196,7 @@ fn durable_task_can_be_explicitly_reclaimed_by_a_new_session_with_head_cas() {
         .as_str()
         .expect("old session id")
         .to_string();
-    let expected_head = first["task"]["expected_state"]["head"]
+    let expected_head = first["work_session"]["expected_head"]
         .as_str()
         .expect("expected head")
         .to_string();
@@ -328,7 +384,7 @@ fn workspace_toolchain_resolution_is_consistent_in_shared_and_worktree_modes() {
     );
     assert_eq!(isolated["ok"], true, "{isolated}");
     let worktree_path = std::path::PathBuf::from(
-        isolated["task"]["git_worktree"]["path"]
+        isolated["work_session"]["git_worktree"]["path"]
             .as_str()
             .expect("worktree path"),
     );
@@ -715,7 +771,7 @@ fn complete_work_session_checkpoints_before_removed_worktree_becomes_unavailable
     assert_eq!(started["ok"], true, "{started}");
     let task_id = started["task"]["id"].as_str().expect("task id");
     let worktree_path = std::path::PathBuf::from(
-        started["task"]["git_worktree"]["path"]
+        started["work_session"]["git_worktree"]["path"]
             .as_str()
             .expect("worktree path"),
     );
@@ -1421,7 +1477,7 @@ fn begin_work_session_create_if_missing_false_never_creates_replacement_task_or_
         .expect("session id")
         .to_string();
     let worktree_path = std::path::PathBuf::from(
-        started["task"]["git_worktree"]["path"]
+        started["work_session"]["git_worktree"]["path"]
             .as_str()
             .expect("worktree path"),
     );
@@ -1510,11 +1566,11 @@ fn new_task_can_bind_existing_managed_worktree_after_previous_task_is_closed() {
     assert_eq!(first["ok"], true, "{first}");
     assert_eq!(first["work_session"]["worktree_reused"], false);
     let first_task_id = first["task"]["id"].as_str().expect("first task id");
-    let worktree_path = first["task"]["git_worktree"]["path"]
+    let worktree_path = first["work_session"]["git_worktree"]["path"]
         .as_str()
         .expect("worktree path")
         .to_string();
-    let branch = first["task"]["git_worktree"]["branch"]
+    let branch = first["work_session"]["git_worktree"]["branch"]
         .as_str()
         .expect("worktree branch")
         .to_string();
@@ -1563,9 +1619,12 @@ fn new_task_can_bind_existing_managed_worktree_after_previous_task_is_closed() {
     assert_eq!(second["ok"], true, "{second}");
     let second_task_id = second["task"]["id"].as_str().expect("second task id");
     assert_ne!(second_task_id, first_task_id);
-    assert_eq!(second["task"]["git_worktree"]["path"], worktree_path);
-    assert_eq!(second["task"]["git_worktree"]["branch"], branch);
-    assert_eq!(second["task"]["git_worktree"]["managed"], true);
+    assert_eq!(
+        second["work_session"]["git_worktree"]["path"],
+        worktree_path
+    );
+    assert_eq!(second["work_session"]["git_worktree"]["branch"], branch);
+    assert_eq!(second["work_session"]["git_worktree"]["managed"], true);
     assert_eq!(second["work_session"]["worktree_reused"], true);
 
     let worktrees = call_tool(&ctx, "git_worktree_list", &json!({}));
@@ -1691,7 +1750,7 @@ fn aborted_worktree_task_releases_remove_guard_and_initial_conflict_is_logged() 
     let task_id = started["task"]["id"].as_str().expect("task id").to_string();
     let managed_path = format!(".anchor/worktrees/{task_id}");
     let worktree_path = std::path::PathBuf::from(
-        started["task"]["git_worktree"]["path"]
+        started["work_session"]["git_worktree"]["path"]
             .as_str()
             .expect("worktree path"),
     );
@@ -1785,8 +1844,21 @@ fn begin_work_session_binds_session_and_task_idempotently() {
 
     let first = call_tool_for_session(&ctx, "begin_work_session", &initial_arguments, mcp_session);
     assert_eq!(first["ok"], true);
+    assert!(
+        serde_json::to_vec(&first)
+            .expect("serialize compact begin response")
+            .len()
+            < 16 * 1024
+    );
     assert_eq!(first["work_session"]["status"], "active");
     assert_eq!(first["work_session"]["task_created"], true);
+    assert!(first.get("state_scopes").is_none());
+    assert!(first.get("session_state_transition").is_none());
+    assert!(first["task"].get("objective").is_none());
+    assert!(first["task"].get("contract").is_none());
+    assert!(first["task"].get("slices").is_none());
+    assert!(first["harness"].get("journal_health").is_none());
+    assert!(first["harness"].get("capabilities").is_none());
     let session_id = first["work_session"]["session_id"]
         .as_str()
         .expect("session id")
@@ -2513,6 +2585,9 @@ fn failed_controlled_command_with_mutation_returns_the_refreshed_baseline() {
     assert_eq!(failed["mutation_attributed"], true, "{failed}");
     assert_eq!(failed["harness"]["baseline_matches"], true, "{failed}");
     assert_eq!(failed["harness"]["writable"], true, "{failed}");
+    assert!(failed["harness"].get("journal_health").is_none());
+    assert!(failed["harness"].get("capabilities").is_none());
+    assert!(failed["harness"].get("expected_fingerprint").is_none());
     assert!(workspace.join("changed.txt").exists());
 
     let follow_up = call_tool_for_session(
@@ -2686,11 +2761,10 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     );
     assert_eq!(started["ok"], true, "{started}");
     assert_eq!(started["work_session"]["workspace_mode"], "worktree");
-    assert_eq!(started["work_session"]["parallel"], true);
-    assert_eq!(started["harness"]["baseline_matches"], true);
+    assert!(started["work_session"].get("parallel").is_none());
     let task_id = started["task"]["id"].as_str().expect("task id");
     let worktree_path = std::path::PathBuf::from(
-        started["task"]["git_worktree"]["path"]
+        started["work_session"]["git_worktree"]["path"]
             .as_str()
             .expect("worktree path"),
     );
@@ -3094,7 +3168,7 @@ fn close_work_session_can_remove_a_clean_managed_worktree_when_explicitly_reques
     assert_eq!(started["ok"], true, "{started}");
     let task_id = started["task"]["id"].as_str().expect("task id");
     let worktree_path = std::path::PathBuf::from(
-        started["task"]["git_worktree"]["path"]
+        started["work_session"]["git_worktree"]["path"]
             .as_str()
             .expect("worktree path"),
     );
@@ -4685,10 +4759,14 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
     let task_id = started["work_session"]["task_id"]
         .as_str()
         .expect("task id");
-    assert_eq!(started["task"]["contract"]["no_early_stop"], true);
-    assert_eq!(started["task"]["slices"][0]["id"], "S1");
+    assert!(started["task"].get("contract").is_none());
+    assert!(started["task"].get("slices").is_none());
+    assert!(started["task"].get("working_set").is_none());
+    let durable = ctx.harness.task(task_id).expect("durable task");
+    assert!(durable.contract.no_early_stop);
+    assert_eq!(durable.slices[0].id, "S1");
     assert_eq!(
-        started["task"]["working_set"]["primary"][0],
+        durable.working_set.primary[0],
         "crates/anchor/src/harness/tools.rs"
     );
 

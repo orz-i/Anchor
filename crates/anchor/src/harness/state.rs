@@ -1280,7 +1280,18 @@ impl Harness {
             })
     }
 
-    pub fn revise_objective(&self, task_id: &str, objective: &str) -> HarnessResult<TaskSession> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn revise_plan(
+        &self,
+        task_id: &str,
+        objective: &str,
+        phase: Option<TaskPhase>,
+        contract: Option<TaskContract>,
+        slices: Option<Vec<TaskSlice>>,
+        working_set: Option<TaskWorkingSet>,
+        completed_steps: Option<Vec<String>>,
+        pending_steps: Option<Vec<String>>,
+    ) -> HarnessResult<TaskSession> {
         let objective = objective.trim();
         if objective.is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
@@ -1291,24 +1302,80 @@ impl Harness {
                 if !task.status.is_writable() {
                     return Err(HarnessError::new(
                         "TASK_NOT_WRITABLE",
-                        "当前任务已经关闭，不能修订任务目标",
+                        "当前任务已经关闭，不能修订任务计划",
                     ));
                 }
-                if task.objective == objective {
-                    return Ok(task);
+                let next_phase = phase.unwrap_or(TaskPhase::Planning);
+                if matches!(next_phase, TaskPhase::Completed | TaskPhase::Aborted) {
+                    return Err(HarnessError::new(
+                        "TASK_COMPLETION_TOOL_REQUIRED",
+                        "Plan revision cannot set a terminal task phase",
+                    ));
                 }
                 let previous_objective = task.objective.clone();
+                let previous_phase = task.phase;
+                let previous_slices = task.slices.clone();
+                let previous_pending_steps = task.pending_steps.clone();
+                let previous_completed_steps = task.completed_steps.clone();
+                let previous_recovery = task.recovery.clone();
+
+                let mut superseded_verification_ids = Vec::new();
+                for mut verification in self.list_verifications(task_id)? {
+                    if verification_effective_disposition(&verification) == "superseded" {
+                        continue;
+                    }
+                    verification
+                        .dispositions
+                        .push(VerificationDispositionRecord {
+                            id: Uuid::new_v4().simple().to_string(),
+                            disposition: "superseded".into(),
+                            reason: "Superseded by explicit task plan revision".into(),
+                            source: "plan_revision".into(),
+                            created_at: timestamp(),
+                        });
+                    superseded_verification_ids.push(verification.id.clone());
+                    transaction.save_verification(&verification)?;
+                }
+
                 task.objective = objective.to_string();
+                task.phase = next_phase;
+                task.contract = contract.unwrap_or_default();
+                task.slices = slices.unwrap_or_default();
+                task.current_slice_id = task
+                    .slices
+                    .iter()
+                    .find(|slice| {
+                        matches!(
+                            slice.status,
+                            TaskSliceStatus::InProgress | TaskSliceStatus::Verifying
+                        )
+                    })
+                    .map(|slice| slice.id.clone());
+                task.working_set = working_set.unwrap_or_default();
+                task.completed_steps = completed_steps.unwrap_or_default();
+                task.pending_steps = pending_steps.unwrap_or_default();
+                task.recovery = None;
+                task.latest_verification_id = None;
                 task.updated_at = timestamp();
                 transaction.save_task(&task)?;
                 transaction.append_event(&harness_event(
                     &self.workspace_id,
                     task_id,
-                    "task_objective_revised",
+                    "task_plan_revised",
                     Some("update_task"),
                     json!({
                         "previous_objective": previous_objective,
-                        "objective": task.objective
+                        "previous_phase": previous_phase,
+                        "previous_slices": previous_slices,
+                        "previous_pending_steps": previous_pending_steps,
+                        "previous_completed_steps": previous_completed_steps,
+                        "previous_recovery": previous_recovery,
+                        "objective": task.objective,
+                        "phase": task.phase,
+                        "slices": task.slices,
+                        "pending_steps": task.pending_steps,
+                        "completed_steps": task.completed_steps,
+                        "superseded_verification_ids": superseded_verification_ids
                     }),
                     json!({"ok": true}),
                 ))?;

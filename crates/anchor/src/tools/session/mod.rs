@@ -17,8 +17,6 @@ const MAX_SESSION_TITLE_CHARS: usize = 200;
 const MAX_EXPECTED_PATH_CHARS: usize = 1024;
 const DEFAULT_LIST_LIMIT: usize = 20;
 const MAX_LIST_LIMIT: usize = 100;
-const DEFAULT_GET_BYTES: usize = 64 * 1024;
-const MAX_GET_BYTES: usize = 256 * 1024;
 
 pub(crate) fn host_session_scope(host_session_key: &str) -> String {
     format!(
@@ -47,9 +45,7 @@ pub(crate) fn session_path_matches_host_scope(
     let Ok(content) = fs::read_to_string(path) else {
         return false;
     };
-    markdown::metadata(&content, "Host session key")
-        .map(|key| host_session_scope(&key) == host_scope)
-        .unwrap_or(false)
+    markdown::metadata(&content, "Host session scope").as_deref() == Some(host_scope)
 }
 
 pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
@@ -95,9 +91,10 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         validate_session_id(session_id)?;
     }
     let host_session_key = resolve_host_session_key(args)?;
-    let mapped_session_id = host_session_key
+    let host_session_scope = host_session_key.as_deref().map(host_session_scope);
+    let mapped_session_id = host_session_scope
         .as_deref()
-        .and_then(|key| index.host_sessions.get(key).map(String::as_str));
+        .and_then(|scope| index.host_scopes.get(scope).map(String::as_str));
     let selected_session_id = explicit_session_id.or(mapped_session_id);
     let create_if_missing = args
         .get("create_if_missing")
@@ -177,7 +174,7 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 markdown::DocumentMetadata {
                     session_id: &child_session_id,
                     title,
-                    host_session_key: host_session_key.as_deref(),
+                    host_session_scope: host_session_scope.as_deref(),
                     parent_session_id: Some(parent_session_id.as_str()),
                     created_at: &timestamp,
                     updated_at: &timestamp,
@@ -200,10 +197,10 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                     parent_session_id: Some(parent_session_id.clone()),
                 },
             );
-            if let Some(host_session_key) = host_session_key.as_ref() {
+            if let Some(host_session_scope) = host_session_scope.as_ref() {
                 index
-                    .host_sessions
-                    .insert(host_session_key.clone(), child_session_id.clone());
+                    .host_scopes
+                    .insert(host_session_scope.clone(), child_session_id.clone());
             }
             storage::write_index(&session_dir, &index)?;
             (
@@ -271,7 +268,7 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             markdown::DocumentMetadata {
                 session_id: &session_id,
                 title,
-                host_session_key: host_session_key.as_deref(),
+                host_session_scope: host_session_scope.as_deref(),
                 parent_session_id: None,
                 created_at: &timestamp,
                 updated_at: &timestamp,
@@ -291,10 +288,10 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 parent_session_id: None,
             },
         );
-        if let Some(host_session_key) = host_session_key.as_ref() {
+        if let Some(host_session_scope) = host_session_scope.as_ref() {
             index
-                .host_sessions
-                .insert(host_session_key.clone(), session_id.clone());
+                .host_scopes
+                .insert(host_session_scope.clone(), session_id.clone());
         }
         storage::write_index(&session_dir, &index)?;
         (
@@ -452,14 +449,8 @@ pub fn get(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             json!({"path": entry.path}),
         )
     })?;
-    let max_bytes = args
-        .get("max_bytes")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_GET_BYTES as u64)
-        .clamp(1, MAX_GET_BYTES as u64) as usize;
     let records = markdown::parse_checkpoint_records(&content);
     let latest_checkpoint = records.last().cloned();
-    let (content, content_truncated) = truncate_utf8_bytes(&content, max_bytes);
     Ok(tool_ok(json!({
         "session_id": session_id,
         "path": entry.path,
@@ -469,10 +460,7 @@ pub fn get(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "updated_at": entry.updated_at,
         "parent_session_id": entry.parent_session_id,
         "checkpoint_count": records.len(),
-        "snapshot": latest_checkpoint,
-        "content": content,
-        "content_truncated": content_truncated,
-        "max_bytes": max_bytes
+        "snapshot": latest_checkpoint
     })))
 }
 
@@ -661,12 +649,12 @@ pub fn checkpoint(
         let created_at =
             markdown::metadata(&document_content, "Created").unwrap_or_else(|| timestamp.clone());
         let title = markdown::document_title(&document_content);
-        let host_session_key = markdown::metadata(&document_content, "Host session key");
+        let host_session_scope = markdown::metadata(&document_content, "Host session scope");
         markdown::render_document(
             markdown::DocumentMetadata {
                 session_id: &session_id,
                 title: &title,
-                host_session_key: host_session_key.as_deref(),
+                host_session_scope: host_session_scope.as_deref(),
                 parent_session_id: entry.parent_session_id.as_deref(),
                 created_at: &created_at,
                 updated_at: &timestamp,
@@ -1084,8 +1072,8 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     if !report.duplicate_session_ids.is_empty() {
         warnings.push("存在重复 session_id，相关 Session 不会写入索引。".into());
     }
-    if !report.duplicate_host_session_keys.is_empty() {
-        warnings.push("存在重复 Host session key，相关宿主映射不会写入索引。".into());
+    if !report.duplicate_host_session_scopes.is_empty() {
+        warnings.push("存在重复 Host session scope，相关宿主映射不会写入索引。".into());
     }
     let mut status_counts = serde_json::Map::new();
     for status in ["active", "paused", "completed", "unknown"] {
@@ -1126,7 +1114,7 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     Ok(tool_ok(json!({
         "valid": report.sequence_valid(),
         "duplicate_session_ids": report.duplicate_session_ids,
-        "duplicate_host_session_keys": report.duplicate_host_session_keys,
+        "duplicate_host_session_scopes": report.duplicate_host_session_scopes,
         "invalid_files": report.invalid_files,
         "empty_files": report.empty_files,
         "document_count": report.documents.len(),
@@ -1234,17 +1222,6 @@ fn indexed_store_bytes(root: &std::path::Path, index: &model::SessionIndex) -> u
         .filter_map(|entry| fs::metadata(root.join(&entry.path)).ok())
         .map(|metadata| metadata.len())
         .sum()
-}
-
-fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> (String, bool) {
-    if value.len() <= max_bytes {
-        return (value.to_string(), false);
-    }
-    let mut end = max_bytes.min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    (value[..end].to_string(), true)
 }
 
 fn now_timestamp() -> String {

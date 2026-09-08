@@ -2,20 +2,22 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub const SESSION_INDEX_VERSION: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionIndex {
     pub version: u32,
     pub sessions: BTreeMap<String, IndexEntry>,
-    #[serde(default)]
-    pub host_sessions: BTreeMap<String, String>,
+    pub host_scopes: BTreeMap<String, String>,
 }
 
 impl Default for SessionIndex {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: SESSION_INDEX_VERSION,
             sessions: BTreeMap::new(),
-            host_sessions: BTreeMap::new(),
+            host_scopes: BTreeMap::new(),
         }
     }
 }
@@ -37,7 +39,7 @@ pub struct SessionDocument {
     pub path: String,
     pub title: String,
     pub size_bytes: u64,
-    pub host_session_key: Option<String>,
+    pub host_session_scope: Option<String>,
     pub parent_session_id: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -48,7 +50,7 @@ pub struct SessionDocument {
 pub struct ScanReport {
     pub documents: Vec<SessionDocument>,
     pub duplicate_session_ids: Vec<String>,
-    pub duplicate_host_session_keys: Vec<String>,
+    pub duplicate_host_session_scopes: Vec<String>,
     pub invalid_files: Vec<String>,
     pub empty_files: Vec<String>,
 }
@@ -56,7 +58,7 @@ pub struct ScanReport {
 impl ScanReport {
     pub fn sequence_valid(&self) -> bool {
         self.duplicate_session_ids.is_empty()
-            && self.duplicate_host_session_keys.is_empty()
+            && self.duplicate_host_session_scopes.is_empty()
             && self.invalid_files.is_empty()
             && self.empty_files.is_empty()
     }

@@ -692,13 +692,16 @@ fn facade_filters_public_arguments_that_belong_to_other_operations() {
     let opened = assert_ok(&opened);
     let session_id = opened["session_id"].as_str().expect("session id");
 
-    let listed = invoke(
+    let rejected_removed_argument = invoke(
         &ctx,
         "session",
         json!({"operation": "list", "max_bytes": 131072}),
     );
-    let listed = assert_ok(&listed);
-    assert_eq!(listed["ignored_arguments"], json!(["max_bytes"]));
+    let rejected_removed_argument = assert_err(&rejected_removed_argument);
+    assert_eq!(
+        rejected_removed_argument["error"]["code"],
+        "INVALID_TOOL_ARGUMENTS"
+    );
 
     let fetched = invoke(
         &ctx,
@@ -1622,12 +1625,9 @@ fn wait_command_returns_terminal_state_and_incremental_output() {
     assert_eq!(waited["command_ok"], true);
     assert_eq!(waited["affected_files"], json!([]));
     assert_eq!(waited["mutation_attributed"], false);
-    assert!(waited["started_at"]
-        .as_str()
-        .is_some_and(|value| value.ends_with('Z')));
-    assert!(waited["last_output_at"]
-        .as_str()
-        .is_some_and(|value| value.ends_with('Z')));
+    assert!(waited.get("started_at").is_none());
+    assert!(waited.get("last_output_at").is_none());
+    assert!(waited["execution_duration_ms"].as_u64().is_some());
     let stdout = waited["stdout"]["content"].as_str().expect("stdout");
     assert!(stdout.contains("started"));
     assert!(stdout.contains("finished"));
@@ -1686,7 +1686,8 @@ fn durable_wait_recovers_after_tool_context_reconstruction() {
     );
     let waited = assert_ok(&waited);
     assert_eq!(waited["state"], "completed", "{waited}");
-    assert_eq!(waited["durable"], true, "{waited}");
+    assert!(waited.get("durable").is_none(), "{waited}");
+    assert!(waited.get("process_bound").is_none(), "{waited}");
     let stdout = waited["stdout"]["content"].as_str().expect("stdout");
     assert!(stdout.contains("before-reconnect"), "{waited}");
     assert!(stdout.contains("after-reconnect"), "{waited}");

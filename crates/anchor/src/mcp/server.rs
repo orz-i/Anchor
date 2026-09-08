@@ -2647,7 +2647,9 @@ mod tests {
         assert!(path.starts_with("docs/session/"));
         let content = fs::read_to_string(workspace.path().join(&path)).expect("read session file");
         assert!(content.contains(&format!("**Session id:** {session_id}")));
-        assert!(content.contains("**Host session key:** chatgpt-session"));
+        let host_scope = crate::tools::session::host_session_scope("chatgpt-session");
+        assert!(content.contains(&format!("**Host session scope:** {host_scope}")));
+        assert!(!content.contains("chatgpt-session"));
         assert!(!workspace.path().join("docs/history-session").exists());
 
         let checkpoint = handle_request(

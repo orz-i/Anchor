@@ -1087,7 +1087,7 @@ pub fn exec_command_with_cancellation(
     let yield_ms = args
         .get("yield_time_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(1000)
+        .unwrap_or(10_000)
         .min(30_000);
     let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
     let stdin_text = args.get("stdin").and_then(Value::as_str).unwrap_or("");

@@ -1049,20 +1049,28 @@ fn begin_work_session(
         .or(session_task)
         .or(explicit_task)
         .or(unique_session_task);
-    let mut objective_revised_from = None::<String>;
+    let mut objective_revised = false;
     let (task, task_created, previous_task_id) = match selected_task {
         Some(task) => {
             validate_requested_workspace_mode(ctx, args, &task)?;
             if task.objective != objective {
                 if objective_revision_requested {
                     ensure_writer_handoff_available(ctx, Some(&task.id), None)?;
-                    let previous_objective = task.objective.clone();
                     ctx.harness.switch_task(&task.id).map_err(map_error)?;
                     let task = ctx
                         .harness
-                        .revise_objective(&task.id, objective)
+                        .revise_plan(
+                            &task.id,
+                            objective,
+                            configuration.phase,
+                            configuration.contract.clone(),
+                            configuration.slices.clone(),
+                            configuration.working_set.clone(),
+                            completed_steps.clone(),
+                            pending_steps.clone(),
+                        )
                         .map_err(map_error)?;
-                    objective_revised_from = Some(previous_objective);
+                    objective_revised = true;
                     (task, false, None)
                 } else if requested_task_id.is_some() {
                     return Err(WorkspaceError::ToolDetails {
@@ -1257,18 +1265,9 @@ fn begin_work_session(
         .harness
         .status_for_task(Some(&task.id))
         .map_err(map_error)?;
-    let previous_session_status = session_state
-        .get("previous_status")
-        .cloned()
-        .unwrap_or_else(|| json!("active"));
-    let current_session_status = session_state
-        .get("session_status")
-        .cloned()
-        .unwrap_or_else(|| json!("active"));
-    let session_reactivated = session_state
-        .get("reactivated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let harness_value = serde_json::to_value(&harness)
+        .map_err(|error| tool_error("SERIALIZE_FAILED", error.to_string()))?;
+    let task_value = task_view(&task);
     Ok(json!({
         "work_session": {
             "status": "active",
@@ -1277,40 +1276,21 @@ fn begin_work_session(
             "task_id": task.id,
             "task_created": task_created,
             "previous_task_id": previous_task_id,
-            "objective_revised": objective_revised_from.is_some(),
-            "previous_objective": objective_revised_from,
+            "objective_revised": objective_revised,
             "auto_paused_previous_task_ids": auto_paused_previous_task_ids,
-            "parallel": task.git_worktree.is_some(),
             "workspace_mode": task_workspace_mode(&task),
             "worktree_reused": task_created && args.get("worktree_path").is_some(),
-            "writer_mode": if task.git_worktree.is_some() { "isolated_worktree" } else { "single_shared_writer" },
-            "git_worktree": task.git_worktree,
-            "baseline": baseline_view(&task),
-            "expected_state": task.expected_state
+            "expected_head": task.expected_state.head,
+            "git_worktree": task.git_worktree.as_ref().map(|worktree| json!({
+                "path": worktree.path,
+                "branch": worktree.branch,
+                "managed": worktree.managed,
+                "remove_on_close": worktree.remove_on_close
+            }))
         },
         "session": compact_session_view(&session_state),
-        "session_state_transition": {
-            "from": previous_session_status,
-            "to": current_session_status,
-            "changed": session_reactivated,
-            "reason": if session_reactivated { "begin_work_session" } else { "already_active" }
-        },
-        "state_scopes": {
-            "session_lease": {
-                "status": session_state.get("session_status").cloned().unwrap_or(Value::Null),
-                "reactivated": session_reactivated
-            },
-            "harness_task": {
-                "status": task.status,
-                "phase": task.phase
-            },
-            "checkpoint": {
-                "count": session_state.get("checkpoint_count").cloned().unwrap_or(Value::Null),
-                "session_lifecycle_status": session_state.get("session_status").cloned().unwrap_or(Value::Null)
-            }
-        },
-        "task": task_view(&task),
-        "harness": harness,
+        "task": compact_task_value(&task_value),
+        "harness": compact_harness_value(&harness_value),
         "reconnect_required": false
     }))
 }
@@ -2511,31 +2491,42 @@ fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     let completed_steps = string_list(args.get("completed_steps"))?;
     let pending_steps = string_list(args.get("pending_steps"))?;
     let configuration = parse_task_configuration(args)?;
-    let mut task = if let Some(objective) = objective {
+    let current = ctx.harness.task(task_id).map_err(map_error)?;
+    let task = if let Some(objective) = objective.filter(|value| *value != current.objective) {
         ctx.harness
-            .revise_objective(task_id, objective)
-            .map_err(map_error)?
-    } else {
-        ctx.harness.task(task_id).map_err(map_error)?
-    };
-    if completed_steps.is_some() || pending_steps.is_some() {
-        task = ctx
-            .harness
-            .update_steps(task_id, completed_steps, pending_steps)
-            .map_err(map_error)?;
-    }
-    if !configuration.is_empty() {
-        task = ctx
-            .harness
-            .configure_task(
+            .revise_plan(
                 task_id,
+                objective,
                 configuration.phase,
                 configuration.contract,
                 configuration.slices,
                 configuration.working_set,
+                completed_steps,
+                pending_steps,
             )
-            .map_err(map_error)?;
-    }
+            .map_err(map_error)?
+    } else {
+        let mut task = current;
+        if completed_steps.is_some() || pending_steps.is_some() {
+            task = ctx
+                .harness
+                .update_steps(task_id, completed_steps, pending_steps)
+                .map_err(map_error)?;
+        }
+        if !configuration.is_empty() {
+            task = ctx
+                .harness
+                .configure_task(
+                    task_id,
+                    configuration.phase,
+                    configuration.contract,
+                    configuration.slices,
+                    configuration.working_set,
+                )
+                .map_err(map_error)?;
+        }
+        task
+    };
     Ok(json!({"task": task_view(&task)}))
 }
 

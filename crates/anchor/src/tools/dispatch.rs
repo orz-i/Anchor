@@ -224,9 +224,17 @@ fn task_recovery_trackable(tool: &str) -> bool {
     )
 }
 
-fn recovery_step_identity(tool: &str, args: &Value, output: &Value) -> (String, String) {
-    let step = if tool == "wait_command" && output.get("command").and_then(Value::as_str).is_some()
-    {
+fn recovery_step_identity(
+    tool: &str,
+    args: &Value,
+    output: &Value,
+    retained_command: Option<&str>,
+) -> (String, String) {
+    let logical_command = output
+        .get("command")
+        .and_then(Value::as_str)
+        .or(retained_command);
+    let step = if tool == "wait_command" && logical_command.is_some() {
         "exec_command"
     } else {
         tool
@@ -238,7 +246,7 @@ fn recovery_step_identity(tool: &str, args: &Value, output: &Value) -> (String, 
         .or_else(|| args.get("idempotency_key").and_then(Value::as_str));
     let material = if let Some(stable_key) = stable_key {
         json!({"step": step, "stable_key": stable_key})
-    } else if let Some(command) = output.get("command").and_then(Value::as_str) {
+    } else if let Some(command) = logical_command {
         json!({
             "step": step,
             "command": command,
@@ -296,7 +304,23 @@ fn track_task_recovery(
     {
         return;
     }
-    let (recovery_step, step_fingerprint) = recovery_step_identity(tool, args, output);
+    let retained_harness_metadata =
+        if matches!(tool, "wait_command" | "write_stdin" | "kill_session") {
+            args.get("session_id")
+                .and_then(Value::as_str)
+                .and_then(|session_id| ctx.sessions.get(session_id).ok())
+                .and_then(|session| session.harness_metadata())
+        } else {
+            None
+        };
+    let (recovery_step, step_fingerprint) = recovery_step_identity(
+        tool,
+        args,
+        output,
+        retained_harness_metadata
+            .as_ref()
+            .map(|metadata| metadata.command.as_str()),
+    );
     let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
     let command_like = matches!(
         tool,
@@ -304,20 +328,13 @@ fn track_task_recovery(
     );
     let terminal_success = succeeded && (!command_like || command_output_is_terminal(output));
     if terminal_success {
-        let retained_recovery_key =
-            if matches!(tool, "wait_command" | "write_stdin" | "kill_session") {
-                args.get("session_id")
-                    .and_then(Value::as_str)
-                    .and_then(|session_id| ctx.sessions.get(session_id).ok())
-                    .and_then(|session| session.harness_metadata())
-                    .and_then(|metadata| metadata.recovery_key)
-            } else {
-                None
-            };
+        let retained_recovery_key = retained_harness_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.recovery_key.as_deref());
         let recovery_key = args
             .get("recovery_key")
             .and_then(Value::as_str)
-            .or(retained_recovery_key.as_deref());
+            .or(retained_recovery_key);
         if let Ok(Some(recovery)) = ctx.harness.resolve_recovery_for_attempt(
             task_id,
             &recovery_step,
@@ -2304,13 +2321,24 @@ fn attach_harness_status(
         }
         status.next_actions = filter_exposed_actions(ctx, status.next_actions);
         if let Some(object) = output.as_object_mut() {
+            let status = serde_json::to_value(status).unwrap_or(Value::Null);
             object.insert(
                 "harness".into(),
-                serde_json::to_value(status).unwrap_or_else(|_| {
-                    json!({
-                        "status": "unavailable",
-                        "reason": "无法序列化 Harness 状态"
-                    })
+                json!({
+                    "workspace_id": status.get("workspace_id").cloned().unwrap_or(Value::Null),
+                    "task_id": status.get("task_id").cloned().unwrap_or(Value::Null),
+                    "task_state": status.get("task_state").cloned().unwrap_or(Value::Null),
+                    "session_status": status.get("session_status").cloned().unwrap_or(Value::Null),
+                    "branch": status.get("branch").cloned().unwrap_or(Value::Null),
+                    "head": status.get("head").cloned().unwrap_or(Value::Null),
+                    "expected_head": status.get("expected_head").cloned().unwrap_or(Value::Null),
+                    "baseline_matches": status.get("baseline_matches").cloned().unwrap_or(Value::Null),
+                    "writable": status.get("writable").cloned().unwrap_or(Value::Null),
+                    "observation_token": status.get("observation_token").cloned().unwrap_or(Value::Null),
+                    "next_actions": status.get("next_actions").cloned().unwrap_or_else(|| json!([])),
+                    "reason": status.get("reason").cloned().unwrap_or(Value::Null),
+                    "recoverable": status.get("recoverable").cloned().unwrap_or(Value::Null),
+                    "warnings": status.get("warnings").cloned().unwrap_or_else(|| json!([]))
                 }),
             );
             if standalone {

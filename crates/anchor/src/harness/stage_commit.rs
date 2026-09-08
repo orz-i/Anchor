@@ -2127,9 +2127,13 @@ mod tests {
 
         let stored = dev_session::get(&ctx, &json!({"session_id": opened["session_id"]}))
             .expect("read primary session");
-        assert!(stored["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("checkpoint from scoped stage commit")));
+        assert_eq!(
+            stored["snapshot"]["user_intent"],
+            "checkpoint from scoped stage commit"
+        );
+        let content = fs::read_to_string(workspace.path().join(&session_path))
+            .expect("read primary session document");
+        assert!(content.contains("checkpoint from scoped stage commit"));
         assert!(workspace.path().join("docs/session/index.json").exists());
     }
 
@@ -2231,8 +2235,12 @@ mod tests {
         );
         let stored = dev_session::get(&ctx, &json!({"session_id": opened["session_id"]}))
             .expect("read resumed primary session");
-        assert!(stored["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("resume persisted stage checkpoint")));
+        assert_eq!(
+            stored["snapshot"]["user_intent"],
+            "resume persisted stage checkpoint"
+        );
+        let content = fs::read_to_string(workspace.path().join(&session_path))
+            .expect("read resumed primary session document");
+        assert!(content.contains("resume persisted stage checkpoint"));
     }
 }

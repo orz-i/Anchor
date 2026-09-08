@@ -1170,7 +1170,7 @@ fn git_write_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, Workspac
             .filter(|path| !path.trim().is_empty())
             .ok_or_else(|| WorkspaceError::invalid_argument("paths must contain strings"))?;
         ws.reject_unsafe_text(path)?;
-        let resolved = ws.resolve_lexical_write_path(path)?;
+        let resolved = ws.resolve_repository_config_lexical_write_path(path)?;
         if resolved.display == ".git" || resolved.display.starts_with(".git/") {
             return Err(WorkspaceError::invalid_argument(
                 "Git internal paths cannot be modified through Git tools",
@@ -1338,6 +1338,35 @@ mod tests {
             parse_branch_line("main...origin/main [ahead 6, behind 2]"),
             ("main".into(), "origin/main".into(), 6, 2)
         );
+    }
+
+    #[test]
+    fn git_stage_accepts_repository_config_but_keeps_git_metadata_protected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join(".github/workflows")).expect("github dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(
+            &repo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(&repo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(repo.join("README.md"), "initial\n").expect("readme");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        fs::write(repo.join(".github/workflows/ci.yml"), "name: ci\n").expect("workflow");
+        let workspace = Workspace::new(repo.clone()).expect("workspace");
+        let staged = git_stage(&workspace, &json!({"paths": [".github/workflows/ci.yml"]}))
+            .expect("stage repository config");
+        assert_eq!(staged["staged_files"], json!([".github/workflows/ci.yml"]));
+
+        let protected = git_stage(&workspace, &json!({"paths": [".git/config"]}))
+            .expect_err("git metadata must remain protected");
+        assert!(matches!(
+            protected.to_error_value()["code"].as_str(),
+            Some("INVALID_ARGUMENT") | Some("PROTECTED_PATH")
+        ));
     }
 
     #[test]

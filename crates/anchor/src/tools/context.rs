@@ -823,12 +823,13 @@ mod tests {
         .expect("context");
         let task = ctx.harness.start_task("host scoped task").expect("task");
 
-        ctx.bind_cursor_scope_for_session("transport-a", Some("host-session:conversation-a"));
+        let host_scope = crate::tools::session::host_session_scope("conversation-a");
+        ctx.bind_cursor_scope_for_session("transport-a", Some(&host_scope));
         ctx.bind_task_for_session(Some("transport-a"), &task.id)
             .expect("bind first transport");
         ctx.clear_session_state("transport-a");
 
-        ctx.bind_cursor_scope_for_session("transport-b", Some("host-session:conversation-a"));
+        ctx.bind_cursor_scope_for_session("transport-b", Some(&host_scope));
         assert_eq!(
             ctx.task_for_session(Some("transport-b"))
                 .map(|task| task.id),
@@ -854,14 +855,16 @@ mod tests {
         let second = ctx.harness.start_task("second task").expect("second task");
         let first_path = "docs/session/ses_first.md";
         let second_path = "docs/session/ses_second.md";
+        let first_scope = crate::tools::session::host_session_scope("conversation-a");
+        let second_scope = crate::tools::session::host_session_scope("conversation-b");
         std::fs::write(
             workspace.path().join(first_path),
-            "# Anchor Session\n\n**Host session key:** conversation-a\n",
+            format!("# Anchor Session\n\n**Host session scope:** {first_scope}\n"),
         )
         .expect("first session");
         std::fs::write(
             workspace.path().join(second_path),
-            "# Anchor Session\n\n**Host session key:** conversation-b\n",
+            format!("# Anchor Session\n\n**Host session scope:** {second_scope}\n"),
         )
         .expect("second session");
         ctx.harness
