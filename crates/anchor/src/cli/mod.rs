@@ -49,8 +49,8 @@ use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
 use args::{
     AdminCommand, CliArgs, Command, EventsOptions, EventsTarget, GatewayCommand,
     GatewayConfigureOptions, GatewayEventsOptions, GatewayLogsOptions, GatewayStartOptions,
-    GatewayStopOptions, LogSelection, LogsOptions, ReloadOptions, RunOptions, ServiceCommand,
-    ServiceSelection, StatusOptions, StopOptions,
+    GatewayStopOptions, LogSelection, LogsOptions, NotificationCommand, ReloadOptions, RunOptions,
+    ServiceCommand, ServiceSelection, StatusOptions, StopOptions,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -2857,6 +2857,9 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Tunnel(command) => tunnel::execute(command).await,
         Command::Software(command) => software::execute(command).await,
         Command::Workspace(command) => workspace::execute(command, cli.json).await,
+        Command::Notification(NotificationCommand::Ilink(command)) => {
+            ilink::execute(command, cli.json).await
+        }
         Command::Skill(command) => skill::execute(command, cli.json).await,
         Command::Plugin(command) => plugin::execute(command, cli.json).await,
         Command::Gateway(command) => execute_gateway(command, cli.json).await,

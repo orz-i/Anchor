@@ -13,8 +13,8 @@ struct CursorState {
     cursor: String,
 }
 
-pub fn load_cursor(profile_id: &str, account_key: &str) -> Result<String, String> {
-    let path = cursor_path(profile_id)?;
+pub fn load_cursor(account_key: &str) -> Result<String, String> {
+    let path = cursor_path()?;
     load_cursor_from_path(&path, account_key)
 }
 
@@ -31,8 +31,8 @@ fn load_cursor_from_path(path: &Path, account_key: &str) -> Result<String, Strin
     Ok(state.cursor)
 }
 
-pub fn save_cursor(profile_id: &str, account_key: &str, cursor: &str) -> Result<(), String> {
-    let path = cursor_path(profile_id)?;
+pub fn save_cursor(account_key: &str, cursor: &str) -> Result<(), String> {
+    let path = cursor_path()?;
     save_cursor_to_path(&path, account_key, cursor)
 }
 
@@ -45,22 +45,21 @@ fn save_cursor_to_path(path: &Path, account_key: &str, cursor: &str) -> Result<(
     write_private_json(path, &state)
 }
 
-pub fn reset_cursor(profile_id: &str) -> Result<(), String> {
-    let path = cursor_path(profile_id)?;
+pub fn reset_cursor() -> Result<(), String> {
+    let path = cursor_path()?;
     if path.exists() {
         fs::remove_file(path).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
-fn cursor_path(profile_id: &str) -> Result<PathBuf, String> {
-    validate_profile_id(profile_id)?;
+fn cursor_path() -> Result<PathBuf, String> {
     let root = crate::platform::platform()
         .app_config_dir()
         .map_err(|error| error.to_string())?
         .join("data")
-        .join("ilink")
-        .join(profile_id);
+        .join("notifications")
+        .join("ilink");
     ensure_private_dir(&root)?;
     Ok(root.join("cursor.json"))
 }
@@ -93,17 +92,6 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-fn validate_profile_id(value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-    {
-        return Err("invalid workspace profile id for iLink state".into());
     }
     Ok(())
 }

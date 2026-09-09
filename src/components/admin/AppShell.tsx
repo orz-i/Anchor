@@ -1,4 +1,5 @@
 import {
+  Bell,
   Boxes,
   ChevronRight,
   FolderPlus,
@@ -37,6 +38,7 @@ export function AppShell() {
   const { resolvedTheme, setTheme } = useTheme();
 
   const isWorkspaceRoute = location.pathname.startsWith("/workspaces");
+  const isNotificationRoute = location.pathname.startsWith("/notifications");
 
   const addWorkspace = async () => {
     try {
@@ -124,7 +126,29 @@ export function AppShell() {
               </NavLink>
             </div>
 
-            {/* 分组 2: 系统设置 */}
+            {/* 分组 2: 通知 */}
+            <div className="flex flex-col gap-1">
+              <p className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                Notification
+              </p>
+              <NavLink
+                to="/notifications"
+                className={cn(
+                  "flex items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                  isNotificationRoute
+                    ? "bg-sidebar-accent font-semibold text-sidebar-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Bell className="size-4 shrink-0 opacity-80" />
+                  <span>通知渠道</span>
+                </div>
+                <ChevronRight className="size-3 opacity-40" />
+              </NavLink>
+            </div>
+
+            {/* 分组 3: 系统设置 */}
             <div className="flex flex-col gap-1">
               <p className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 系统设置

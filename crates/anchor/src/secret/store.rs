@@ -50,22 +50,6 @@ impl SecretStore {
         })
     }
 
-    pub fn set(profile_id: &str, key: &str, value: &str) -> AppResult<()> {
-        DataStore::update_file(|data| {
-            set_workspace_secret_in(data, profile_id, key, value);
-            Ok(())
-        })
-    }
-
-    pub fn set_many(profile_id: &str, values: &[(&str, &str)]) -> AppResult<()> {
-        DataStore::update_file(|data| {
-            for (key, value) in values {
-                set_workspace_secret_in(data, profile_id, key, value);
-            }
-            Ok(())
-        })
-    }
-
     pub fn get(profile_id: &str, key: &str) -> AppResult<Option<String>> {
         DataStore::read_file(|data| Ok(workspace_secret_from(data, profile_id, key)))
     }
@@ -146,25 +130,12 @@ fn clear_refresh_replay_state_in(data: &mut AppData, workspace_id: &str) {
     }
 }
 
-fn set_workspace_secret_in(data: &mut AppData, profile_id: &str, key: &str, value: &str) {
-    workspace_secret_map(data, profile_id).insert(key.to_string(), value.to_string());
-}
-
 fn workspace_secret_from(data: &AppData, profile_id: &str, key: &str) -> Option<String> {
     data.workspace_secrets
         .get(profile_id)
         .and_then(|secrets| secrets.get(key))
         .filter(|value| !value.is_empty())
         .cloned()
-}
-
-fn workspace_secret_map<'a>(
-    data: &'a mut crate::data::AppData,
-    profile_id: &str,
-) -> &'a mut std::collections::HashMap<String, String> {
-    data.workspace_secrets
-        .entry(profile_id.to_string())
-        .or_default()
 }
 
 #[cfg(test)]
@@ -175,7 +146,10 @@ mod tests {
     fn workspace_secret_roundtrip() {
         let id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let mut data = AppData::default();
-        set_workspace_secret_in(&mut data, &id, "oauth_client_secret", "roundtrip-secret");
+        data.workspace_secrets
+            .entry(id.clone())
+            .or_default()
+            .insert("oauth_client_secret".into(), "roundtrip-secret".into());
         let loaded = workspace_secret_from(&data, &id, "oauth_client_secret");
         assert_eq!(loaded.as_deref(), Some("roundtrip-secret"));
     }

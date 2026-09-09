@@ -77,6 +77,11 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "probe_federation_peer",
     "read_federation_remote",
     "set_last_workspace",
+    "get_notification_channels",
+    "begin_notification_ilink_login",
+    "poll_notification_ilink_login",
+    "start_notification_ilink",
+    "stop_notification_ilink",
     "list_frp_profiles",
     "save_frp_profile_metadata",
     "set_frp_profile_token",
@@ -131,6 +136,10 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "prepare_privileged_action",
     "confirm_privileged_action",
     "set_last_workspace",
+    "begin_notification_ilink_login",
+    "poll_notification_ilink_login",
+    "start_notification_ilink",
+    "stop_notification_ilink",
     "save_frp_profile_metadata",
     "set_frp_profile_token",
     "delete_frp_profile",
@@ -373,6 +382,15 @@ struct ProxyArgs {
 #[derive(Debug, Deserialize)]
 struct DownloadConfigArgs {
     config: DownloadConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ILinkLoginPollArgs {
+    qr_id: String,
+    base_url: String,
+    #[serde(default)]
+    verify_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1520,6 +1538,39 @@ async fn dispatch_command(
             management::set_last_workspace(input.id)?;
             Ok(Value::Null)
         }
+        "get_notification_channels" => {
+            serde_json::to_value(crate::notifications::channel_statuses()?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "begin_notification_ilink_login" => {
+            serde_json::to_value(crate::notifications::begin_ilink_login().await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "poll_notification_ilink_login" => {
+            let input: ILinkLoginPollArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(
+                crate::notifications::poll_ilink_login(
+                    &input.qr_id,
+                    &input.base_url,
+                    input.verify_code.as_deref(),
+                )
+                .await?,
+            )
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "start_notification_ilink" => {
+            serde_json::to_value(crate::notifications::start_ilink_channel()?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "stop_notification_ilink" => {
+            serde_json::to_value(crate::notifications::stop_ilink_channel()?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
         "list_frp_profiles" => serde_json::to_value(management::list_frp_profiles()?)
             .map_err(AppError::from)
             .map_err(Into::into),
@@ -1986,6 +2037,22 @@ mod tests {
                 },
                 None,
             ),
+        }
+    }
+
+    #[test]
+    fn notification_admin_command_classification_is_explicit() {
+        assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&"get_notification_channels"));
+        assert!(!WEB_ADMIN_MUTATION_COMMANDS.contains(&"get_notification_channels"));
+        for command in [
+            "begin_notification_ilink_login",
+            "poll_notification_ilink_login",
+            "start_notification_ilink",
+            "stop_notification_ilink",
+        ] {
+            assert!(WEB_ADMIN_SUPPORTED_COMMANDS.contains(&command));
+            assert!(WEB_ADMIN_MUTATION_COMMANDS.contains(&command));
+            assert!(!privileged_actions().contains(&command));
         }
     }
 

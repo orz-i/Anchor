@@ -7,15 +7,13 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::secret::SecretStore;
-use crate::tunnel::append_profile_log;
-use crate::workspace::WorkspaceProfile;
 
 use super::ilink::{self, GetUpdatesOutcome, ILinkAccount, ILinkConfig, PollError};
 use super::state;
+use super::ILINK_SECRET_SCOPE;
 
 const WORKER_STATE_VERSION: u32 = 1;
 const RETRY_DELAYS: &[Duration] = &[
@@ -41,7 +39,7 @@ pub struct ILinkWorkerStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeState {
     schema_version: u32,
-    profile_id: String,
+    channel: String,
     pid: u32,
     state: String,
     executable_path: String,
@@ -64,24 +62,22 @@ impl Drop for WorkerLock {
     }
 }
 
-pub fn start(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
-    let current = status(profile)?;
+pub fn start() -> AppResult<ILinkWorkerStatus> {
+    let current = status()?;
     if current.running {
         return Ok(current);
     }
-    if SecretStore::get(&profile.id, "ilink_bot_token")?.is_none() {
+    if SecretStore::get_app(ILINK_SECRET_SCOPE, "bot_token")?.is_none() {
         return Err(AppError::Message(
-            "iLink 尚未登录；请先执行 `anchor workspace ilink login <workspace>`".into(),
+            "iLink 尚未登录；请先执行 `anchor notification ilink login`".into(),
         ));
     }
     let executable = std::env::current_exe()?;
     let mut command = Command::new(&executable);
     command
-        .arg("workspace")
+        .arg("notification")
         .arg("ilink")
         .arg("run")
-        .arg(&profile.id)
-        .current_dir(&profile.path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -104,7 +100,7 @@ pub fn start(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
         .map_err(|error| AppError::Message(format!("启动 iLink worker 失败：{error}")))?;
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(50));
-        let observed = status(profile)?;
+        let observed = status()?;
         if observed.running || observed.reauthorization_required {
             return Ok(observed);
         }
@@ -114,19 +110,19 @@ pub fn start(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
         pid: Some(child.id()),
         state: "starting".into(),
         logged_in: true,
-        bound: binding_configured(&profile.id)?,
+        bound: binding_configured()?,
         reauthorization_required: false,
         last_error: String::new(),
     })
 }
 
-pub fn stop(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
-    let Some(state) = load_runtime_state(&profile.id)? else {
-        return status(profile);
+pub fn stop() -> AppResult<ILinkWorkerStatus> {
+    let Some(state) = load_runtime_state()? else {
+        return status();
     };
     if !platform().is_process_alive(state.pid) {
-        let _ = remove_runtime_state(&profile.id);
-        return status(profile);
+        let _ = remove_runtime_state();
+        return status();
     }
     let actual = platform().process_image_path(state.pid)?.ok_or_else(|| {
         AppError::Message("无法验证 iLink worker 进程镜像，拒绝终止未知进程".into())
@@ -137,14 +133,14 @@ pub fn stop(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
         ));
     }
     platform().terminate_process_tree(state.pid)?;
-    let _ = remove_runtime_state(&profile.id);
-    status(profile)
+    let _ = remove_runtime_state();
+    status()
 }
 
-pub fn status(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
-    let logged_in = SecretStore::get(&profile.id, "ilink_bot_token")?.is_some();
-    let bound = binding_configured(&profile.id)?;
-    let Some(state) = load_runtime_state(&profile.id)? else {
+pub fn status() -> AppResult<ILinkWorkerStatus> {
+    let logged_in = SecretStore::get_app(ILINK_SECRET_SCOPE, "bot_token")?.is_some();
+    let bound = binding_configured()?;
+    let Some(state) = load_runtime_state()? else {
         return Ok(ILinkWorkerStatus {
             running: false,
             pid: None,
@@ -186,17 +182,16 @@ pub fn status(profile: &WorkspaceProfile) -> AppResult<ILinkWorkerStatus> {
     })
 }
 
-pub fn clear_runtime_status(profile_id: &str) -> AppResult<()> {
-    remove_runtime_state(profile_id)
+pub fn clear_runtime_status() -> AppResult<()> {
+    remove_runtime_state()
 }
 
-pub async fn run(profile_id: &str) -> AppResult<()> {
-    let profile = load_profile(profile_id)?;
-    let _lock = acquire_worker_lock(profile_id)?;
+pub async fn run() -> AppResult<()> {
+    let _lock = acquire_worker_lock()?;
     let executable_path = std::env::current_exe()?.display().to_string();
     let mut runtime = RuntimeState {
         schema_version: WORKER_STATE_VERSION,
-        profile_id: profile.id.clone(),
+        channel: "ilink".into(),
         pid: std::process::id(),
         state: "running".into(),
         executable_path,
@@ -204,7 +199,7 @@ pub async fn run(profile_id: &str) -> AppResult<()> {
         last_error: String::new(),
     };
     save_runtime_state(&runtime)?;
-    let result = poll_loop(&profile, &mut runtime).await;
+    let result = poll_loop(&mut runtime).await;
     match &result {
         Err(AppError::Message(message)) if runtime.state == "reauthorization_required" => {
             runtime.last_error = bounded(message, 300);
@@ -216,15 +211,15 @@ pub async fn run(profile_id: &str) -> AppResult<()> {
             let _ = save_runtime_state(&runtime);
         }
         Ok(()) => {
-            let _ = remove_runtime_state(&profile.id);
+            let _ = remove_runtime_state();
         }
     }
     result
 }
 
-async fn poll_loop(profile: &WorkspaceProfile, runtime: &mut RuntimeState) -> AppResult<()> {
-    let (account, account_key) = load_account(&profile.id)?;
-    let mut cursor = state::load_cursor(&profile.id, &account_key).map_err(AppError::Message)?;
+async fn poll_loop(runtime: &mut RuntimeState) -> AppResult<()> {
+    let (account, account_key) = load_account()?;
+    let mut cursor = state::load_cursor(&account_key).map_err(AppError::Message)?;
     let mut timeout_ms = 35_000_u64;
     let mut failure_count = 0_usize;
     loop {
@@ -235,11 +230,10 @@ async fn poll_loop(profile: &WorkspaceProfile, runtime: &mut RuntimeState) -> Ap
             }
             Ok(GetUpdatesOutcome::Batch(batch)) => {
                 for message in &batch.messages {
-                    handle_inbound(profile, &account, message).await?;
+                    handle_inbound(&account, message).await?;
                 }
                 if batch.cursor != cursor {
-                    state::save_cursor(&profile.id, &account_key, &batch.cursor)
-                        .map_err(AppError::Message)?;
+                    state::save_cursor(&account_key, &batch.cursor).map_err(AppError::Message)?;
                     cursor = batch.cursor;
                 }
                 timeout_ms = batch.next_timeout_ms;
@@ -247,14 +241,13 @@ async fn poll_loop(profile: &WorkspaceProfile, runtime: &mut RuntimeState) -> Ap
                 set_runtime_state(runtime, "running", "")?;
             }
             Err(PollError::StaleToken) => {
-                let _ = state::reset_cursor(&profile.id);
+                let _ = state::reset_cursor();
                 set_runtime_state(
                     runtime,
                     "reauthorization_required",
                     "iLink bot token is stale; QR login is required",
                 )?;
-                append_profile_log(
-                    &profile.id,
+                append_notification_log(
                     "stderr.log",
                     "[ilink] bot token stale; worker stopped and QR login is required",
                 );
@@ -266,8 +259,7 @@ async fn poll_loop(profile: &WorkspaceProfile, runtime: &mut RuntimeState) -> Ap
                 failure_count = failure_count.saturating_add(1);
                 let message = error.safe_message();
                 set_runtime_state(runtime, "retrying", &message)?;
-                append_profile_log(
-                    &profile.id,
+                append_notification_log(
                     "stderr.log",
                     &format!(
                         "[ilink] getupdates transient failure: {}",
@@ -285,12 +277,11 @@ async fn poll_loop(profile: &WorkspaceProfile, runtime: &mut RuntimeState) -> Ap
 }
 
 async fn handle_inbound(
-    profile: &WorkspaceProfile,
     account: &ILinkAccount,
     message: &ilink::InboundTextMessage,
 ) -> AppResult<()> {
-    let scanner = SecretStore::get(&profile.id, "ilink_login_user_id")?;
-    let current_target = SecretStore::get(&profile.id, "ilink_target_user_id")?;
+    let scanner = SecretStore::get_app(ILINK_SECRET_SCOPE, "login_user_id")?;
+    let current_target = SecretStore::get_app(ILINK_SECRET_SCOPE, "target_user_id")?;
     match binding_action(
         scanner.as_deref(),
         current_target.as_deref(),
@@ -298,15 +289,11 @@ async fn handle_inbound(
         &message.text,
     ) {
         BindingAction::Bind => {
-            SecretStore::set_many(
-                &profile.id,
-                &[
-                    ("ilink_target_user_id", &message.from_user_id),
-                    ("ilink_context_token", &message.context_token),
-                ],
-            )?;
-            append_profile_log(
-                &profile.id,
+            SecretStore::set_app_many(&[
+                (ILINK_SECRET_SCOPE, "target_user_id", &message.from_user_id),
+                (ILINK_SECRET_SCOPE, "context_token", &message.context_token),
+            ])?;
+            append_notification_log(
                 "stdout.log",
                 "[ilink] notification target bound from explicit /bind message",
             );
@@ -319,12 +306,11 @@ async fn handle_inbound(
             .map_err(AppError::Message)?;
             if let Err(error) = ilink::send_text(
                 &ack,
-                "Anchor 已绑定此微信会话，Harness 任务完成后会发送通知。",
+                "Anchor 已绑定此微信会话，已注册工作区的 Harness 任务完成后会发送通知。",
             )
             .await
             {
-                append_profile_log(
-                    &profile.id,
+                append_notification_log(
                     "stderr.log",
                     &format!(
                         "[ilink] bind acknowledgement failed: {}",
@@ -334,11 +320,14 @@ async fn handle_inbound(
             }
         }
         BindingAction::Refresh => {
-            SecretStore::set(&profile.id, "ilink_context_token", &message.context_token)?;
+            SecretStore::set_app_many(&[(
+                ILINK_SECRET_SCOPE,
+                "context_token",
+                &message.context_token,
+            )])?;
         }
         BindingAction::Ignore if message.text.trim() == "/bind" => {
-            append_profile_log(
-                &profile.id,
+            append_notification_log(
                 "stderr.log",
                 "[ilink] ignored /bind from a user that did not authorize the QR login",
             );
@@ -368,36 +357,30 @@ fn binding_action(
     }
 }
 
-fn load_account(profile_id: &str) -> AppResult<(ILinkAccount, String)> {
-    let bot_token = SecretStore::get(profile_id, "ilink_bot_token")?
+fn load_account() -> AppResult<(ILinkAccount, String)> {
+    let bot_token = SecretStore::get_app(ILINK_SECRET_SCOPE, "bot_token")?
         .ok_or_else(|| AppError::Message("iLink bot token 未配置".into()))?;
-    let base_url = SecretStore::get(profile_id, "ilink_base_url")?;
+    let base_url = SecretStore::get_app(ILINK_SECRET_SCOPE, "base_url")?;
     let account = ILinkAccount::new(bot_token.clone(), base_url).map_err(AppError::Message)?;
-    let account_key = SecretStore::get(profile_id, "ilink_bot_id")?
+    let account_key = SecretStore::get_app(ILINK_SECRET_SCOPE, "bot_id")?
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("token:{:x}", Sha256::digest(bot_token.as_bytes())));
     Ok((account, account_key))
 }
 
-fn binding_configured(profile_id: &str) -> AppResult<bool> {
+fn binding_configured() -> AppResult<bool> {
     Ok(
-        SecretStore::get(profile_id, "ilink_target_user_id")?.is_some()
-            && SecretStore::get(profile_id, "ilink_context_token")?.is_some(),
+        SecretStore::get_app(ILINK_SECRET_SCOPE, "target_user_id")?.is_some()
+            && SecretStore::get_app(ILINK_SECRET_SCOPE, "context_token")?.is_some(),
     )
 }
 
-fn load_profile(profile_id: &str) -> AppResult<WorkspaceProfile> {
-    let store = DataStore::load()?;
-    store
-        .list()
-        .iter()
-        .find(|profile| profile.id == profile_id)
-        .cloned()
-        .ok_or_else(|| AppError::Message(format!("workspace not found: {profile_id}")))
-}
-
 fn runtime_dir() -> AppResult<PathBuf> {
-    let path = platform().app_config_dir()?.join("runtime").join("ilink");
+    let path = platform()
+        .app_config_dir()?
+        .join("runtime")
+        .join("notifications")
+        .join("ilink");
     fs::create_dir_all(&path)?;
     #[cfg(unix)]
     {
@@ -407,18 +390,16 @@ fn runtime_dir() -> AppResult<PathBuf> {
     Ok(path)
 }
 
-fn runtime_state_path(profile_id: &str) -> AppResult<PathBuf> {
-    validate_profile_id(profile_id)?;
-    Ok(runtime_dir()?.join(format!("{profile_id}.json")))
+fn runtime_state_path() -> AppResult<PathBuf> {
+    Ok(runtime_dir()?.join("state.json"))
 }
 
-fn runtime_lock_path(profile_id: &str) -> AppResult<PathBuf> {
-    validate_profile_id(profile_id)?;
-    Ok(runtime_dir()?.join(format!("{profile_id}.lock")))
+fn runtime_lock_path() -> AppResult<PathBuf> {
+    Ok(runtime_dir()?.join("worker.lock"))
 }
 
-fn acquire_worker_lock(profile_id: &str) -> AppResult<WorkerLock> {
-    let path = runtime_lock_path(profile_id)?;
+fn acquire_worker_lock() -> AppResult<WorkerLock> {
+    let path = runtime_lock_path()?;
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -433,14 +414,14 @@ fn acquire_worker_lock(profile_id: &str) -> AppResult<WorkerLock> {
     Ok(WorkerLock(file))
 }
 
-fn load_runtime_state(profile_id: &str) -> AppResult<Option<RuntimeState>> {
-    let path = runtime_state_path(profile_id)?;
+fn load_runtime_state() -> AppResult<Option<RuntimeState>> {
+    let path = runtime_state_path()?;
     if !path.exists() {
         return Ok(None);
     }
     let bytes = fs::read(&path)?;
     let state: RuntimeState = serde_json::from_slice(&bytes)?;
-    if state.schema_version != WORKER_STATE_VERSION || state.profile_id != profile_id {
+    if state.schema_version != WORKER_STATE_VERSION || state.channel != "ilink" {
         return Err(AppError::Message(
             "iLink worker state 不兼容或已损坏".into(),
         ));
@@ -449,7 +430,7 @@ fn load_runtime_state(profile_id: &str) -> AppResult<Option<RuntimeState>> {
 }
 
 fn save_runtime_state(state: &RuntimeState) -> AppResult<()> {
-    let path = runtime_state_path(&state.profile_id)?;
+    let path = runtime_state_path()?;
     let mut bytes = serde_json::to_vec_pretty(state)?;
     bytes.push(b'\n');
     let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
@@ -471,8 +452,8 @@ fn save_runtime_state(state: &RuntimeState) -> AppResult<()> {
     Ok(())
 }
 
-fn remove_runtime_state(profile_id: &str) -> AppResult<()> {
-    let path = runtime_state_path(profile_id)?;
+fn remove_runtime_state() -> AppResult<()> {
+    let path = runtime_state_path()?;
     if path.exists() {
         fs::remove_file(path)?;
     }
@@ -492,15 +473,21 @@ fn same_executable(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn validate_profile_id(value: &str) -> AppResult<()> {
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-    {
-        return Err(AppError::Message("invalid workspace profile id".into()));
+fn append_notification_log(file_name: &str, line: &str) {
+    use std::io::Write;
+
+    let Ok(root) = platform().app_config_dir() else {
+        return;
+    };
+    let dir = root.join("logs").join("notifications").join("ilink");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
     }
-    Ok(())
+    let path = dir.join(file_name);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let line = crate::logging::timestamped_line(line);
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn bounded(value: &str, max_chars: usize) -> String {
@@ -527,12 +514,6 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn profile_ids_are_path_safe() {
-        assert!(validate_profile_id("abc_123-def").is_ok());
-        assert!(validate_profile_id("../escape").is_err());
-    }
 
     #[test]
     fn binding_requires_scanner_and_refreshes_only_bound_user() {

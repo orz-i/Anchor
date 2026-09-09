@@ -5,14 +5,12 @@ use qrcode::render::unicode;
 use qrcode::QrCode as TerminalQrCode;
 use serde::Serialize;
 
-use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
 use crate::notifications::{
-    poll_qr_status, request_qr_code, reset_ilink_cursor, worker, LoginCredentials, QrCode,
-    QrStatus, DEFAULT_BASE_URL,
+    persist_ilink_login, poll_qr_status, request_qr_code, reset_ilink_cursor, worker, QrCode,
+    QrStatus, DEFAULT_BASE_URL, ILINK_SECRET_SCOPE,
 };
 use crate::secret::SecretStore;
-use crate::workspace::WorkspaceProfile;
 
 use super::args::ILinkCommand;
 
@@ -30,35 +28,30 @@ struct LoginResult {
 
 pub async fn execute(command: ILinkCommand, as_json: bool) -> AppResult<i32> {
     match command {
-        ILinkCommand::Login { workspace } => login(&workspace, as_json).await.map(|_| 0),
-        ILinkCommand::Start { workspace } => {
-            let profile = profile(&workspace)?;
-            print_status(worker::start(&profile)?, as_json)?;
+        ILinkCommand::Login => login(as_json).await.map(|_| 0),
+        ILinkCommand::Start => {
+            print_status(worker::start()?, as_json)?;
             Ok(0)
         }
-        ILinkCommand::Stop { workspace } => {
-            let profile = profile(&workspace)?;
-            print_status(worker::stop(&profile)?, as_json)?;
+        ILinkCommand::Stop => {
+            print_status(worker::stop()?, as_json)?;
             Ok(0)
         }
-        ILinkCommand::Status { workspace } => {
-            let profile = profile(&workspace)?;
-            print_status(worker::status(&profile)?, as_json)?;
+        ILinkCommand::Status => {
+            print_status(worker::status()?, as_json)?;
             Ok(0)
         }
-        ILinkCommand::Run { workspace } => {
-            let profile = profile(&workspace)?;
-            worker::run(&profile.id).await?;
+        ILinkCommand::Run => {
+            worker::run().await?;
             Ok(0)
         }
     }
 }
 
-async fn login(workspace: &str, as_json: bool) -> AppResult<()> {
-    let profile = profile(workspace)?;
-    let existing_token = SecretStore::get(&profile.id, "ilink_bot_token")?;
-    worker::stop(&profile)?;
-    let existing_scanner = SecretStore::get(&profile.id, "ilink_login_user_id")?;
+async fn login(as_json: bool) -> AppResult<()> {
+    let existing_token = SecretStore::get_app(ILINK_SECRET_SCOPE, "bot_token")?;
+    worker::stop()?;
+    let existing_scanner = SecretStore::get_app(ILINK_SECRET_SCOPE, "login_user_id")?;
     let local_tokens = if existing_scanner.is_some() {
         existing_token.clone().into_iter().collect::<Vec<_>>()
     } else {
@@ -123,7 +116,7 @@ async fn login(workspace: &str, as_json: bool) -> AppResult<()> {
                             .into(),
                     ));
                 }
-                let worker_status = worker::start(&profile)?;
+                let worker_status = worker::start()?;
                 print_login_result(
                     LoginResult {
                         connected: true,
@@ -136,10 +129,10 @@ async fn login(workspace: &str, as_json: bool) -> AppResult<()> {
                 return Ok(());
             }
             QrStatus::Confirmed(credentials) => {
-                persist_login(&profile, &credentials)?;
-                reset_ilink_cursor(&profile.id).map_err(AppError::Message)?;
-                worker::clear_runtime_status(&profile.id)?;
-                let worker_status = worker::start(&profile)?;
+                persist_ilink_login(&credentials)?;
+                reset_ilink_cursor().map_err(AppError::Message)?;
+                worker::clear_runtime_status()?;
+                let worker_status = worker::start()?;
                 print_login_result(
                     LoginResult {
                         connected: true,
@@ -153,20 +146,6 @@ async fn login(workspace: &str, as_json: bool) -> AppResult<()> {
             }
         }
     }
-}
-
-fn persist_login(profile: &WorkspaceProfile, credentials: &LoginCredentials) -> AppResult<()> {
-    SecretStore::set_many(
-        &profile.id,
-        &[
-            ("ilink_bot_token", &credentials.bot_token),
-            ("ilink_bot_id", &credentials.bot_id),
-            ("ilink_login_user_id", &credentials.login_user_id),
-            ("ilink_base_url", &credentials.base_url),
-            ("ilink_target_user_id", ""),
-            ("ilink_context_token", ""),
-        ],
-    )
 }
 
 fn display_qr(qr: &QrCode, as_json: bool) {
@@ -230,9 +209,4 @@ fn print_status(status: worker::ILinkWorkerStatus, as_json: bool) -> AppResult<(
         }
     }
     Ok(())
-}
-
-fn profile(selector: &str) -> AppResult<WorkspaceProfile> {
-    let store = DataStore::load()?;
-    super::resolve_workspace(store.list(), selector).cloned()
 }

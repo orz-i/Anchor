@@ -1200,12 +1200,6 @@ const WORKSPACE_SECRET_KEYS: &[&str] = &[
     "bearer_token",
     "cloudflare_token",
     "frp_token",
-    "ilink_bot_token",
-    "ilink_target_user_id",
-    "ilink_context_token",
-    "ilink_base_url",
-    "ilink_bot_id",
-    "ilink_login_user_id",
 ];
 
 const SHARED_SECRET_KEYS: &[&str] = &[

@@ -24,28 +24,43 @@ pub fn skill_usage() -> &'static str {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ILinkCommand {
-    Login { workspace: String },
-    Start { workspace: String },
-    Stop { workspace: String },
-    Status { workspace: String },
-    Run { workspace: String },
+    Login,
+    Start,
+    Stop,
+    Status,
+    Run,
 }
 
 fn parse_ilink_command(args: &mut VecDeque<String>) -> Result<ILinkCommand, String> {
     let action = args
         .pop_front()
-        .ok_or_else(|| "workspace ilink 缺少子命令：login|start|stop|status|run".to_string())?;
-    let workspace = pop_value(args, &format!("workspace ilink {action}"))?;
-    ensure_empty(args, &format!("workspace ilink {action}"))?;
+        .ok_or_else(|| "notification ilink 缺少子命令：login|start|stop|status|run".to_string())?;
+    ensure_empty(args, &format!("notification ilink {action}"))?;
     match action.as_str() {
-        "login" => Ok(ILinkCommand::Login { workspace }),
-        "start" => Ok(ILinkCommand::Start { workspace }),
-        "stop" => Ok(ILinkCommand::Stop { workspace }),
-        "status" => Ok(ILinkCommand::Status { workspace }),
-        "run" => Ok(ILinkCommand::Run { workspace }),
+        "login" => Ok(ILinkCommand::Login),
+        "start" => Ok(ILinkCommand::Start),
+        "stop" => Ok(ILinkCommand::Stop),
+        "status" => Ok(ILinkCommand::Status),
+        "run" => Ok(ILinkCommand::Run),
         other => Err(format!(
-            "未知 workspace ilink 命令：{other}；可选 login|start|stop|status|run"
+            "未知 notification ilink 命令：{other}；可选 login|start|stop|status|run"
         )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationCommand {
+    Ilink(ILinkCommand),
+}
+
+fn parse_notification_command(args: &mut VecDeque<String>) -> Result<NotificationCommand, String> {
+    match args.pop_front().as_deref() {
+        Some("ilink") => Ok(NotificationCommand::Ilink(parse_ilink_command(args)?)),
+        Some(other) => Err(format!(
+            "未知 notification 渠道：{other}\n\n{}",
+            notification_usage()
+        )),
+        None => Err(format!("notification 缺少渠道\n\n{}", notification_usage())),
     }
 }
 
@@ -1217,7 +1232,6 @@ fn parse_workspace_command(args: &mut VecDeque<String>) -> Result<WorkspaceComma
                 timeout_seconds,
             }))
         }
-        Some("ilink") => Ok(WorkspaceCommand::Ilink(parse_ilink_command(args)?)),
         Some(other) => Err(format!(
             "未知 workspace 命令：{other}\n\n{}",
             workspace_usage()
@@ -1311,7 +1325,6 @@ pub enum WorkspaceCommand {
     Stop(StopOptions),
     GptConfig(GptConfigOptions),
     Test(WorkspaceTestOptions),
-    Ilink(ILinkCommand),
 }
 
 fn parse_run_options(args: &mut VecDeque<String>, command: &str) -> Result<RunOptions, String> {
@@ -1752,6 +1765,7 @@ pub enum Command {
     Tunnel(TunnelCommand),
     Software(SoftwareCommand),
     Workspace(WorkspaceCommand),
+    Notification(NotificationCommand),
     Skill(SkillCommand),
     Plugin(PluginCommand),
     Gateway(GatewayCommand),
@@ -1848,6 +1862,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
         Some("tunnel") => Command::Tunnel(parse_tunnel_command(&mut args)?),
         Some("software" | "sw") => Command::Software(parse_software_command(&mut args)?),
         Some("workspace" | "ws") => Command::Workspace(parse_workspace_command(&mut args)?),
+        Some("notification") => Command::Notification(parse_notification_command(&mut args)?),
         Some("skill" | "skills") => Command::Skill(parse_skill_command(&mut args)?),
         Some("plugin") => Command::Plugin(parse_plugin_command(&mut args)?),
         Some("gateway" | "gw") => Command::Gateway(parse_gateway_command(&mut args)?),
@@ -1930,6 +1945,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] tunnel <show|configure> ...\n\n\
   anchor [--config-dir PATH] [--json] software <list|install|uninstall> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
+  anchor [--config-dir PATH] [--json] notification <channel> <command> ...\n\n\
   anchor [--config-dir PATH] [--json] skill <command> ...\n\n\
   anchor [--config-dir PATH] [--json] plugin <command> ...\n\n\
   anchor [--config-dir PATH] [--json] gateway <command> ...\n\n\
@@ -2024,12 +2040,17 @@ pub fn workspace_usage() -> &'static str {
   anchor workspace show <workspace>\n\
   anchor workspace start <workspace> [--service mcp|all] [--tunnel]\n\
   anchor workspace stop <workspace> [--timeout SECONDS] [--force]\n\
-  anchor workspace ilink login <workspace>\n\
-  anchor workspace ilink start <workspace>\n\
-  anchor workspace ilink stop <workspace>\n\
-  anchor workspace ilink status <workspace>\n\
   anchor workspace gpt-config <workspace> [--service mcp|all] [--endpoint auto|local|public] [--show-secrets]\n\
   anchor workspace test <workspace> [--service mcp|all] [--endpoint auto|local|public] [--timeout SECONDS]"
+}
+
+pub fn notification_usage() -> &'static str {
+    "Notification 渠道命令：\n\
+  anchor notification ilink login\n\
+  anchor notification ilink start\n\
+  anchor notification ilink stop\n\
+  anchor notification ilink status\n\n\
+iLink 是应用级通知渠道，只需登录和绑定一次，不再绑定任何 workspace。"
 }
 
 #[cfg(test)]
@@ -2041,23 +2062,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_workspace_ilink_lifecycle_commands() {
+    fn parses_top_level_notification_ilink_lifecycle_commands() {
         assert_eq!(
-            parse(strings(&["workspace", "ilink", "login", "demo"]))
+            parse(strings(&["notification", "ilink", "login"]))
                 .expect("ilink login")
                 .command,
-            Command::Workspace(WorkspaceCommand::Ilink(ILinkCommand::Login {
-                workspace: "demo".into()
-            }))
+            Command::Notification(NotificationCommand::Ilink(ILinkCommand::Login))
         );
         assert_eq!(
-            parse(strings(&["workspace", "ilink", "status", "demo"]))
+            parse(strings(&["notification", "ilink", "status"]))
                 .expect("ilink status")
                 .command,
-            Command::Workspace(WorkspaceCommand::Ilink(ILinkCommand::Status {
-                workspace: "demo".into()
-            }))
+            Command::Notification(NotificationCommand::Ilink(ILinkCommand::Status))
         );
+        assert!(parse(strings(&["workspace", "ilink", "status", "demo"])).is_err());
     }
 
     #[test]

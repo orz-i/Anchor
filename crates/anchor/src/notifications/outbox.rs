@@ -15,7 +15,7 @@ impl Drop for OutboxLock {
 }
 
 pub fn enqueue(root: &Path, job: &NotificationJob) -> Result<bool, String> {
-    let dir = workspace_dir(root, &job.workspace_id);
+    let dir = channel_dir(root, job.channel.as_str());
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let _lock = acquire_lock(&dir)?;
     let delivered = delivered_path(&dir, &job.id);
@@ -30,8 +30,8 @@ pub fn enqueue(root: &Path, job: &NotificationJob) -> Result<bool, String> {
     Ok(true)
 }
 
-pub fn pending(root: &Path, workspace_id: &str) -> Result<Vec<NotificationJob>, String> {
-    let dir = workspace_dir(root, workspace_id);
+pub fn pending(root: &Path, channel: &str) -> Result<Vec<NotificationJob>, String> {
+    let dir = channel_dir(root, channel);
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -51,7 +51,7 @@ pub fn pending(root: &Path, workspace_id: &str) -> Result<Vec<NotificationJob>, 
         let bytes = fs::read(&path).map_err(|error| error.to_string())?;
         let job: NotificationJob = serde_json::from_slice(&bytes)
             .map_err(|error| format!("invalid notification outbox {}: {error}", path.display()))?;
-        if job.schema_version != OUTBOX_SCHEMA_VERSION || job.workspace_id != workspace_id {
+        if job.schema_version != OUTBOX_SCHEMA_VERSION || job.channel.as_str() != channel {
             continue;
         }
         jobs.push(job);
@@ -65,7 +65,7 @@ pub fn pending(root: &Path, workspace_id: &str) -> Result<Vec<NotificationJob>, 
 }
 
 pub fn mark_delivered(root: &Path, job: &NotificationJob) -> Result<(), String> {
-    let dir = workspace_dir(root, &job.workspace_id);
+    let dir = channel_dir(root, job.channel.as_str());
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let _lock = acquire_lock(&dir)?;
     let marker = delivered_path(&dir, &job.id);
@@ -85,8 +85,8 @@ pub fn mark_delivered(root: &Path, job: &NotificationJob) -> Result<(), String> 
     }
 }
 
-fn workspace_dir(root: &Path, workspace_id: &str) -> PathBuf {
-    root.join("notifications").join(workspace_id).join("ilink")
+fn channel_dir(root: &Path, channel: &str) -> PathBuf {
+    root.join("notifications").join("outbox").join(channel)
 }
 
 fn job_path(dir: &Path, id: &str) -> PathBuf {
@@ -127,7 +127,13 @@ mod tests {
     use super::*;
 
     fn job() -> NotificationJob {
-        NotificationJob::new("workspace", "profile", "task", "done".into(), 10)
+        NotificationJob::new(
+            super::super::model::NotificationChannel::Ilink,
+            "workspace",
+            "task",
+            "done".into(),
+            10,
+        )
     }
 
     #[test]
@@ -136,11 +142,9 @@ mod tests {
         let job = job();
         assert!(enqueue(temp.path(), &job).expect("first enqueue"));
         assert!(!enqueue(temp.path(), &job).expect("second enqueue"));
-        assert_eq!(pending(temp.path(), "workspace").expect("pending").len(), 1);
+        assert_eq!(pending(temp.path(), "ilink").expect("pending").len(), 1);
         mark_delivered(temp.path(), &job).expect("delivered");
-        assert!(pending(temp.path(), "workspace")
-            .expect("pending")
-            .is_empty());
+        assert!(pending(temp.path(), "ilink").expect("pending").is_empty());
         assert!(!enqueue(temp.path(), &job).expect("delivered enqueue"));
     }
 }
