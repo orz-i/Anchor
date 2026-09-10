@@ -20,7 +20,7 @@ dependency waves
 read-only observations
     ├─ Runtime capability provider
     ├─ Existing control plane
-    ├─ Harness store / Canvs projection
+    ├─ Harness store / task read projection
     └─ Trusted Federation read
 ```
 
@@ -268,7 +268,7 @@ unavailable
 
 ## Harness Task observation
 
-本地 `harness_task_status` 读取既有 Harness/Canvs 投影，例如：
+本地 `harness_task_status` 读取既有 Harness task 投影，例如：
 
 ```text
 workspaceId

@@ -46,9 +46,8 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "open_workspace_directory",
     "delete_workspace",
     "run_health_checks",
-    "get_canvs_snapshot",
-    "list_canvs_tasks",
-    "get_canvs_task_snapshot",
+    "list_tasks",
+    "get_task_snapshot",
     "get_control_plane_status",
     "get_control_plane_events",
     "plan_orchestration_workflow",
@@ -364,7 +363,7 @@ struct WorkspacePathArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CanvsTaskArgs {
+struct TaskSnapshotArgs {
     id: String,
     task_id: String,
 }
@@ -1189,26 +1188,14 @@ async fn dispatch_command(
                 .map_err(AppError::from)
                 .map_err(Into::into)
         }
-        "get_canvs_snapshot" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(management::get_canvs_snapshot(&input.id)?)
-                .map_err(AppError::from)
-                .map_err(Into::into)
-        }
-        "list_canvs_tasks" => {
-            let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(management::list_canvs_tasks(&input.id)?)
-                .map_err(AppError::from)
-                .map_err(Into::into)
-        }
-        "get_canvs_task_snapshot" => {
-            let input: CanvsTaskArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(management::get_canvs_task_snapshot(
-                &input.id,
-                &input.task_id,
-            )?)
+        "list_tasks" => serde_json::to_value(management::list_tasks()?)
             .map_err(AppError::from)
-            .map_err(Into::into)
+            .map_err(Into::into),
+        "get_task_snapshot" => {
+            let input: TaskSnapshotArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_task_snapshot(&input.id, &input.task_id)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
         }
         "get_control_plane_status" => {
             let store = DataStore::load()?;

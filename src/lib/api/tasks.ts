@@ -1,19 +1,20 @@
 import { invokeRead } from "@/lib/api/invoke";
 
-export type CanvsTaskStatus =
+export type TaskStatus =
   | "active"
   | "paused"
   | "verifying"
   | "failed"
+  | "incomplete"
   | "completed"
   | "completed_unverified"
   | "rolled_back"
   | "unknown";
 
-export interface CanvsTask {
+export interface TaskSummary {
   id: string;
   objective: string;
-  status: CanvsTaskStatus;
+  status: TaskStatus;
   workspaceMode: "shared" | "worktree";
   current: boolean;
   active: boolean;
@@ -27,15 +28,28 @@ export interface CanvsTask {
   latestVerificationId: string | null;
   createdAt: string;
   updatedAt: string;
+  lastActivityAt: string | null;
 }
 
-export interface CanvsTaskList {
+export interface AdminTaskEntry {
   workspaceId: string;
-  tasks: CanvsTask[];
+  workspaceName: string;
+  task: TaskSummary;
+}
+
+export interface TaskWorkspaceError {
+  workspaceId: string;
+  workspaceName: string;
+  message: string;
+}
+
+export interface TaskListResult {
+  tasks: AdminTaskEntry[];
+  workspaceErrors: TaskWorkspaceError[];
   refreshedAt: string;
 }
 
-export interface CanvsEvent {
+export interface TaskEvent {
   id: string;
   kind: string;
   toolName: string | null;
@@ -44,7 +58,7 @@ export interface CanvsEvent {
   createdAt: string;
 }
 
-export interface CanvsOperation {
+export interface TaskOperation {
   id: string;
   tool: string;
   kind: string;
@@ -55,7 +69,7 @@ export interface CanvsOperation {
   createdAt: string;
 }
 
-export interface CanvsChange {
+export interface TaskChange {
   id: string;
   commitSha: string | null;
   committedFiles: string[];
@@ -63,7 +77,7 @@ export interface CanvsChange {
   createdAt: string;
 }
 
-export interface CanvsVerification {
+export interface TaskVerification {
   id: string;
   kind: string;
   command: string;
@@ -76,30 +90,23 @@ export interface CanvsVerification {
   createdAt: string;
 }
 
-export interface CanvsSnapshot {
+export interface TaskSnapshot {
   workspaceId: string;
-  task: CanvsTask | null;
-  recentEvents: CanvsEvent[];
-  recentOperations: CanvsOperation[];
-  changes: CanvsChange[];
-  verifications: CanvsVerification[];
+  task: TaskSummary | null;
+  recentEvents: TaskEvent[];
+  recentOperations: TaskOperation[];
+  changes: TaskChange[];
+  verifications: TaskVerification[];
   refreshedAt: string;
 }
 
-export function getCanvsSnapshot(workspaceId: string): Promise<CanvsSnapshot> {
-  return invokeRead<CanvsSnapshot>("get_canvs_snapshot", { id: workspaceId }, { attempts: 1 });
+export function listTasks(): Promise<TaskListResult> {
+  return invokeRead<TaskListResult>("list_tasks", {}, { attempts: 1 });
 }
 
-export function listCanvsTasks(workspaceId: string): Promise<CanvsTaskList> {
-  return invokeRead<CanvsTaskList>("list_canvs_tasks", { id: workspaceId }, { attempts: 1 });
-}
-
-export function getCanvsTaskSnapshot(
-  workspaceId: string,
-  taskId: string,
-): Promise<CanvsSnapshot> {
-  return invokeRead<CanvsSnapshot>(
-    "get_canvs_task_snapshot",
+export function getTaskSnapshot(workspaceId: string, taskId: string): Promise<TaskSnapshot> {
+  return invokeRead<TaskSnapshot>(
+    "get_task_snapshot",
     { id: workspaceId, taskId },
     { attempts: 1 },
   );

@@ -140,14 +140,6 @@ fn task_list(harness: &TaskHarness) -> HarnessResult<CanvsTaskList> {
     })
 }
 
-pub fn current_workspace_snapshot(workspace_path: &Path) -> HarnessResult<CanvsSnapshot> {
-    let (tasks, coding) = workspace_harness(workspace_path)?;
-    let Some(task) = tasks.current_task()? else {
-        return Ok(empty_snapshot(&coding));
-    };
-    task_snapshot(&coding, task, true)
-}
-
 pub fn workspace_task_snapshot(
     workspace_path: &Path,
     task_id: &str,
@@ -170,18 +162,6 @@ fn workspace_harness(workspace_path: &Path) -> HarnessResult<(TaskHarness, Codin
         PathBuf::from(workspace_path),
         CodingHarness::default_root()?,
     )
-}
-
-fn empty_snapshot(harness: &CodingHarness) -> CanvsSnapshot {
-    CanvsSnapshot {
-        workspace_id: harness.workspace_id().to_string(),
-        task: None,
-        recent_events: Vec::new(),
-        recent_operations: Vec::new(),
-        changes: Vec::new(),
-        verifications: Vec::new(),
-        refreshed_at: now(),
-    }
 }
 
 fn task_snapshot(

@@ -13,6 +13,9 @@ const WorkspaceDetailPage = lazy(() =>
 const NotificationsPage = lazy(() =>
   import("@/pages/NotificationsPage").then((module) => ({ default: module.NotificationsPage })),
 );
+const TasksPage = lazy(() =>
+  import("@/pages/TasksPage").then((module) => ({ default: module.TasksPage })),
+);
 const GeneralSettingsPage = lazy(() =>
   import("@/pages/settings/GeneralSettingsPage").then((module) => ({ default: module.GeneralSettingsPage })),
 );
@@ -45,6 +48,9 @@ export function App() {
             {/* 工作区管理路由 */}
             <Route path="workspaces" element={<WorkspacesPage />} />
             <Route path="workspaces/:id" element={<WorkspaceDetailPage />} />
+
+            {/* 顶级任务管理 */}
+            <Route path="tasks" element={<TasksPage />} />
 
             {/* 顶级通知渠道 */}
             <Route path="notifications" element={<NotificationsPage />} />

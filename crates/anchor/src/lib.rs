@@ -13,7 +13,6 @@ mod auth;
 mod brand;
 pub mod build_identity;
 mod canvs;
-mod canvs_web;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod control;

@@ -4,7 +4,7 @@ import test from "node:test";
 
 const adminProviderPath = new URL("../src/components/admin/AdminProvider.tsx", import.meta.url);
 const workspaceDetailPath = new URL("../src/pages/WorkspaceDetailPage.tsx", import.meta.url);
-const canvsPanelPath = new URL("../src/components/admin/CanvsPanel.tsx", import.meta.url);
+const tasksPagePath = new URL("../src/pages/TasksPage.tsx", import.meta.url);
 const logViewerPath = new URL("../src/components/admin/LogViewer.tsx", import.meta.url);
 
 test("AdminProvider keeps runtime setters stable and avoids no-op context churn", async () => {
@@ -29,15 +29,15 @@ test("AdminProvider keeps runtime setters stable and avoids no-op context churn"
   );
 });
 
-test("high-frequency Canvs and log refreshes are opt-in", async () => {
-  const [canvsSource, logSource] = await Promise.all([
-    readFile(canvsPanelPath, "utf8"),
+test("high-frequency task and log refreshes are opt-in", async () => {
+  const [tasksSource, logSource] = await Promise.all([
+    readFile(tasksPagePath, "utf8"),
     readFile(logViewerPath, "utf8"),
   ]);
 
-  assert.match(canvsSource, /useState\(false\)/, "Canvs auto refresh should be disabled by default");
+  assert.match(tasksSource, /useState\(false\)/, "Tasks auto refresh should be disabled by default");
   assert.match(logSource, /autoRefresh = false/, "log auto refresh should be disabled by default");
-  assert.match(canvsSource, /自动刷新（2 秒）/, "Canvs users should still be able to opt into live refresh");
+  assert.match(tasksSource, /自动刷新（2 秒）/, "Tasks users should still be able to opt into live refresh");
   assert.match(logSource, /自动刷新（3 秒）/, "log users should still be able to opt into live refresh");
 });
 

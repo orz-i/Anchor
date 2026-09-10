@@ -50,7 +50,7 @@ For a task bound to a worktree, Anchor routes these operations to the linked che
 - Git status, diff, stage, commit, restore, reset, revert, and clean;
 - stage-commit verification and task baseline checks;
 - Browser file paths, artifacts, uploads, and frontend build information;
-- Canvs task branch, HEAD, and workspace-mode display.
+- Admin Tasks task branch, HEAD, and workspace-mode display.
 
 History Session files and portable handoff exports remain in the primary configured workspace.
 

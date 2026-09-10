@@ -722,20 +722,56 @@ pub(crate) async fn run_health_checks(id: &str) -> AppResult<Vec<crate::health::
     crate::health::run_health_checks(&workspace_profile(id)?).await
 }
 
-pub(crate) fn get_canvs_snapshot(id: &str) -> AppResult<crate::canvs::CanvsSnapshot> {
-    crate::canvs::current_workspace_snapshot(&workspace_path(id)?)
-        .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTaskEntry {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub task: crate::canvs::CanvsTask,
 }
 
-pub(crate) fn list_canvs_tasks(id: &str) -> AppResult<crate::canvs::CanvsTaskList> {
-    crate::canvs::list_workspace_tasks(&workspace_path(id)?)
-        .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTaskWorkspaceError {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub message: String,
 }
 
-pub(crate) fn get_canvs_task_snapshot(
-    id: &str,
-    task_id: &str,
-) -> AppResult<crate::canvs::CanvsSnapshot> {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTaskList {
+    pub tasks: Vec<AdminTaskEntry>,
+    pub workspace_errors: Vec<AdminTaskWorkspaceError>,
+    pub refreshed_at: String,
+}
+
+pub(crate) fn list_tasks() -> AppResult<AdminTaskList> {
+    let profiles = list_workspaces()?;
+    let mut tasks = Vec::new();
+    let mut workspace_errors = Vec::new();
+    for profile in profiles {
+        match crate::canvs::list_workspace_tasks(Path::new(&profile.path)) {
+            Ok(list) => tasks.extend(list.tasks.into_iter().map(|task| AdminTaskEntry {
+                workspace_id: profile.id.clone(),
+                workspace_name: profile.name.clone(),
+                task,
+            })),
+            Err(error) => workspace_errors.push(AdminTaskWorkspaceError {
+                workspace_id: profile.id,
+                workspace_name: profile.name,
+                message: crate::canvs::harness_error_message(error),
+            }),
+        }
+    }
+    Ok(AdminTaskList {
+        tasks,
+        workspace_errors,
+        refreshed_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+pub(crate) fn get_task_snapshot(id: &str, task_id: &str) -> AppResult<crate::canvs::CanvsSnapshot> {
     crate::canvs::workspace_task_snapshot(&workspace_path(id)?, task_id)
         .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
 }
