@@ -12,7 +12,6 @@ mod async_runtime;
 mod auth;
 mod brand;
 pub mod build_identity;
-mod canvs;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod control;
@@ -37,6 +36,7 @@ mod runtime;
 mod secret;
 mod settings;
 mod skills;
+mod tasks;
 pub mod tools;
 mod tunnel;
 #[cfg(target_os = "windows")]

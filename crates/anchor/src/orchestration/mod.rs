@@ -622,7 +622,7 @@ fn observe_harness_task(
             "ORCHESTRATION_WORKSPACE_NOT_FOUND: local workspace {workspace_id} is not registered"
         ))
     })?;
-    let tasks = crate::canvs::list_workspace_tasks(Path::new(&profile.path))
+    let tasks = crate::tasks::list_workspace_tasks(Path::new(&profile.path))
         .map_err(|error| AppError::Message(error.to_string()))?;
     if tasks.workspace_id != workspace_id {
         return Err(AppError::Message(
@@ -642,7 +642,7 @@ fn observe_harness_task(
 
 fn harness_task_status(
     workspace_id: &str,
-    task: crate::canvs::CanvsTask,
+    task: crate::tasks::TaskView,
 ) -> OrchestrationHarnessTaskStatus {
     OrchestrationHarnessTaskStatus {
         workspace_id: workspace_id.into(),

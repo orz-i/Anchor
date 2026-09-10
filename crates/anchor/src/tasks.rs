@@ -16,9 +16,9 @@ const MAX_EFFECTIVE_VERIFICATIONS: usize = 20;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsTaskList {
+pub struct TaskList {
     pub workspace_id: String,
-    pub tasks: Vec<CanvsTask>,
+    pub tasks: Vec<TaskView>,
     pub refreshed_at: String,
 }
 
@@ -32,19 +32,19 @@ fn safe_task_id(value: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsSnapshot {
+pub struct TaskSnapshot {
     pub workspace_id: String,
-    pub task: Option<CanvsTask>,
-    pub recent_events: Vec<CanvsEvent>,
-    pub recent_operations: Vec<CanvsOperation>,
-    pub changes: Vec<CanvsChange>,
-    pub verifications: Vec<CanvsVerification>,
+    pub task: Option<TaskView>,
+    pub recent_events: Vec<TaskEventView>,
+    pub recent_operations: Vec<TaskOperationView>,
+    pub changes: Vec<TaskChangeView>,
+    pub verifications: Vec<TaskVerificationView>,
     pub refreshed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsTask {
+pub struct TaskView {
     pub id: String,
     pub objective: String,
     pub status: String,
@@ -66,7 +66,7 @@ pub struct CanvsTask {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsEvent {
+pub struct TaskEventView {
     pub id: String,
     pub kind: String,
     pub tool_name: Option<String>,
@@ -77,7 +77,7 @@ pub struct CanvsEvent {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsOperation {
+pub struct TaskOperationView {
     pub id: String,
     pub tool: String,
     pub kind: String,
@@ -90,7 +90,7 @@ pub struct CanvsOperation {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsChange {
+pub struct TaskChangeView {
     pub id: String,
     pub commit_sha: Option<String>,
     pub committed_files: Vec<String>,
@@ -100,7 +100,7 @@ pub struct CanvsChange {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanvsVerification {
+pub struct TaskVerificationView {
     pub id: String,
     pub kind: String,
     pub command: String,
@@ -113,12 +113,12 @@ pub struct CanvsVerification {
     pub created_at: String,
 }
 
-pub fn list_workspace_tasks(workspace_path: &Path) -> HarnessResult<CanvsTaskList> {
+pub fn list_workspace_tasks(workspace_path: &Path) -> HarnessResult<TaskList> {
     let (tasks, _coding) = workspace_harness(workspace_path)?;
     task_list(&tasks)
 }
 
-fn task_list(harness: &TaskHarness) -> HarnessResult<CanvsTaskList> {
+fn task_list(harness: &TaskHarness) -> HarnessResult<TaskList> {
     let current_task_id = harness.current_task()?.map(|task| task.id);
     let mut tasks = harness.list_tasks()?;
     tasks.sort_by(|left, right| {
@@ -127,7 +127,7 @@ fn task_list(harness: &TaskHarness) -> HarnessResult<CanvsTaskList> {
             .then_with(|| task_recency(right).cmp(task_recency(left)))
             .then_with(|| right.id.cmp(&left.id))
     });
-    Ok(CanvsTaskList {
+    Ok(TaskList {
         workspace_id: harness.workspace_id().to_string(),
         tasks: tasks
             .into_iter()
@@ -143,7 +143,7 @@ fn task_list(harness: &TaskHarness) -> HarnessResult<CanvsTaskList> {
 pub fn workspace_task_snapshot(
     workspace_path: &Path,
     task_id: &str,
-) -> HarnessResult<CanvsSnapshot> {
+) -> HarnessResult<TaskSnapshot> {
     if !safe_task_id(task_id) {
         return Err(HarnessError::new(
             "INVALID_TASK_ID",
@@ -168,7 +168,7 @@ fn task_snapshot(
     harness: &CodingHarness,
     task: TaskSession,
     current: bool,
-) -> HarnessResult<CanvsSnapshot> {
+) -> HarnessResult<TaskSnapshot> {
     let task_id = task.id.clone();
 
     let mut events = harness.list_events(&task_id, 0, usize::MAX)?;
@@ -176,7 +176,7 @@ fn task_snapshot(
     let recent_events = events
         .into_iter()
         .take(MAX_RECENT_EVENTS)
-        .map(|event| CanvsEvent {
+        .map(|event| TaskEventView {
             id: event.id,
             kind: event.kind,
             tool_name: event.tool_name,
@@ -215,7 +215,7 @@ fn task_snapshot(
                 .get("duration_ms")
                 .or_else(|| operation.result_summary.get("elapsed_ms"))
                 .and_then(serde_json::Value::as_u64);
-            CanvsOperation {
+            TaskOperationView {
                 id: operation.id,
                 tool: operation.tool,
                 kind: operation.kind,
@@ -237,7 +237,7 @@ fn task_snapshot(
     let changes = changes
         .into_iter()
         .take(MAX_RECENT_CHANGES)
-        .map(|change| CanvsChange {
+        .map(|change| TaskChangeView {
             id: change.id,
             commit_sha: change.commit_sha,
             committed_files: change.committed_files,
@@ -251,7 +251,7 @@ fn task_snapshot(
         .take(MAX_EFFECTIVE_VERIFICATIONS)
         .map(|verification| {
             let disposition = verification_disposition(&verification);
-            CanvsVerification {
+            TaskVerificationView {
                 id: verification.id,
                 kind: verification.kind,
                 command: verification.command,
@@ -266,7 +266,7 @@ fn task_snapshot(
         })
         .collect();
 
-    Ok(CanvsSnapshot {
+    Ok(TaskSnapshot {
         workspace_id: harness.workspace_id().to_string(),
         task: Some(task_view(task, current)),
         recent_events,
@@ -277,7 +277,7 @@ fn task_snapshot(
     })
 }
 
-fn task_view(task: TaskSession, current: bool) -> CanvsTask {
+fn task_view(task: TaskSession, current: bool) -> TaskView {
     let completed = task.completed_steps.len();
     let pending = task.pending_steps.len();
     let total = completed + pending;
@@ -295,7 +295,7 @@ fn task_view(task: TaskSession, current: bool) -> CanvsTask {
     } else {
         "shared"
     };
-    CanvsTask {
+    TaskView {
         id: task.id,
         objective: task.objective,
         status: task_status(task.status),

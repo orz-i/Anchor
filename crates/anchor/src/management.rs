@@ -727,7 +727,7 @@ pub(crate) async fn run_health_checks(id: &str) -> AppResult<Vec<crate::health::
 pub struct AdminTaskEntry {
     pub workspace_id: String,
     pub workspace_name: String,
-    pub task: crate::canvs::CanvsTask,
+    pub task: crate::tasks::TaskView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -751,7 +751,7 @@ pub(crate) fn list_tasks() -> AppResult<AdminTaskList> {
     let mut tasks = Vec::new();
     let mut workspace_errors = Vec::new();
     for profile in profiles {
-        match crate::canvs::list_workspace_tasks(Path::new(&profile.path)) {
+        match crate::tasks::list_workspace_tasks(Path::new(&profile.path)) {
             Ok(list) => tasks.extend(list.tasks.into_iter().map(|task| AdminTaskEntry {
                 workspace_id: profile.id.clone(),
                 workspace_name: profile.name.clone(),
@@ -760,7 +760,7 @@ pub(crate) fn list_tasks() -> AppResult<AdminTaskList> {
             Err(error) => workspace_errors.push(AdminTaskWorkspaceError {
                 workspace_id: profile.id,
                 workspace_name: profile.name,
-                message: crate::canvs::harness_error_message(error),
+                message: crate::tasks::harness_error_message(error),
             }),
         }
     }
@@ -771,9 +771,9 @@ pub(crate) fn list_tasks() -> AppResult<AdminTaskList> {
     })
 }
 
-pub(crate) fn get_task_snapshot(id: &str, task_id: &str) -> AppResult<crate::canvs::CanvsSnapshot> {
-    crate::canvs::workspace_task_snapshot(&workspace_path(id)?, task_id)
-        .map_err(|error| AppError::Message(crate::canvs::harness_error_message(error)))
+pub(crate) fn get_task_snapshot(id: &str, task_id: &str) -> AppResult<crate::tasks::TaskSnapshot> {
+    crate::tasks::workspace_task_snapshot(&workspace_path(id)?, task_id)
+        .map_err(|error| AppError::Message(crate::tasks::harness_error_message(error)))
 }
 
 #[cfg(feature = "cli")]

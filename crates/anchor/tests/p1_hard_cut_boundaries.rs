@@ -12,6 +12,28 @@ fn source(path: &str) -> String {
 }
 
 #[test]
+fn task_observation_layer_has_one_canonical_module() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib = source("src/lib.rs");
+    let tasks = source("src/tasks.rs");
+    let management = source("src/management.rs");
+    let orchestration = source("src/orchestration/mod.rs");
+
+    assert!(root.join("src/tasks.rs").is_file());
+    assert!(!root.join("src/canvs.rs").exists());
+    assert!(lib.contains("mod tasks;"));
+    assert!(!lib.contains("mod canvs;"));
+
+    for active_source in [&tasks, &management, &orchestration] {
+        assert!(!active_source.contains("crate::canvs"));
+        assert!(!active_source.contains("Canvs"));
+    }
+    assert!(management.contains("crate::tasks::TaskView"));
+    assert!(management.contains("crate::tasks::TaskSnapshot"));
+    assert!(orchestration.contains("crate::tasks::list_workspace_tasks"));
+}
+
+#[test]
 fn retired_command_arguments_are_rejected_at_the_public_schema() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
