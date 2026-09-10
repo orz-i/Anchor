@@ -753,10 +753,11 @@ async fn handle_mcp_facade_call(
     };
     let execution_state = scoped_context.as_ref().unwrap_or(state.as_ref());
     if let Some(task) = active_task.as_ref() {
-        match execution_state
-            .harness
-            .resume_task_for_activity(&task.id, &activity_name, session_id)
-        {
+        match execution_state.task_harness.resume_task_for_activity(
+            &task.id,
+            &activity_name,
+            session_id,
+        ) {
             Ok(task) => active_task = Some(task),
             Err(error) => {
                 return Err(serde_json::json!({
@@ -781,7 +782,7 @@ async fn handle_mcp_facade_call(
         Err(error) => return Ok(browser_workspace_path_error(tool, error)),
     };
     let operation_receipt = execution_state
-        .harness
+        .coding_harness
         .record_operation(
             None,
             active_task.as_ref().map(|task| task.id.as_str()),
@@ -837,7 +838,7 @@ async fn handle_mcp_facade_call(
         }
         let summary = proxy_operation_summary(&activity_name, session_id, &result);
         let succeeded = summary.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = execution_state.harness.record_operation(
+        let _ = execution_state.coding_harness.record_operation(
             Some(&operation_receipt.id),
             active_task.as_ref().map(|task| task.id.as_str()),
             session_id,
@@ -853,7 +854,7 @@ async fn handle_mcp_facade_call(
             summary.clone(),
         );
         if let Some(task) = active_task.as_ref() {
-            let _ = execution_state.harness.record_event(
+            let _ = execution_state.coding_harness.record_event(
                 &task.id,
                 "mcp_operation_finished",
                 Some(&activity_name),
@@ -1488,7 +1489,7 @@ fn attach_proxy_auto_checkpoint(
             if primary_succeeded {
                 if let Some(task_id) = task_id.as_deref() {
                     let _ = ctx
-                        .harness
+                        .coding_harness
                         .refresh_expected_state_for_operation(task_id, None);
                 }
             }
@@ -1993,7 +1994,7 @@ fn attach_local_browser_checkpoint(
             if succeeded {
                 if let Some(task_id) = task_id.as_deref() {
                     let _ = ctx
-                        .harness
+                        .coding_harness
                         .refresh_expected_state_for_operation(task_id, None);
                 }
             }

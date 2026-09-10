@@ -14,7 +14,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
-use crate::harness::{Harness, TaskSession};
+use crate::harness::TaskSession;
 use crate::secret::SecretStore;
 
 use self::ilink::ILinkConfig;
@@ -232,27 +232,32 @@ fn qr_data_url(content: &str) -> AppResult<String> {
     ))
 }
 
-pub(crate) fn task_completed(harness: &Harness, task: &TaskSession, verified: bool) {
+pub(crate) fn task_completed(
+    workspace_id: &str,
+    harness_store_root: &Path,
+    task: &TaskSession,
+    verified: bool,
+) {
     match load_ilink_config() {
         Ok(Some(_)) => {}
         Ok(None) => return,
         Err(error) => {
-            log_failure(harness.workspace_id(), &task.id, &error);
+            log_failure(workspace_id, &task.id, &error);
             return;
         }
     }
 
     let job = NotificationJob::new(
         NotificationChannel::Ilink,
-        harness.workspace_id(),
+        workspace_id,
         &task.id,
         completion_message(task, verified),
         unix_time_ms(),
     );
-    match outbox::enqueue(harness.store_root(), &job) {
-        Ok(_) => kick_dispatcher(harness.store_root().to_path_buf()),
+    match outbox::enqueue(harness_store_root, &job) {
+        Ok(_) => kick_dispatcher(harness_store_root.to_path_buf()),
         Err(error) => log_failure(
-            harness.workspace_id(),
+            workspace_id,
             &task.id,
             &format!("notification outbox enqueue failed: {error}"),
         ),

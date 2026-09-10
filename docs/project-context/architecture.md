@@ -15,7 +15,7 @@ anchor/
 │   │   ├── runtime/        # Runtime 状态机
 │   │   ├── mcp/            # 内嵌 MCP 协议 + 工具
 │   │   ├── admin*.rs       # Web Admin HTTP / daemon / service
-│   │   ├── harness/        # Task / baseline / verification / journal
+│   │   ├── harness/        # Task Harness / Coding Harness + private transaction kernel
 │   │   ├── tools/          # 共享开发工具内核
 │   │   ├── tunnel/         # FRP / Cloudflare 隧道管理
 │   │   ├── auth/           # OAuth / Bearer 认证
@@ -168,6 +168,14 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **依赖语义**: planner 生成 deterministic waves；inspection 真实按 wave barrier 执行，同一 wave 内有界并发
 - **状态权威**: `existing_harness_federation_control_plane`；不存在第二套 workflow database、persistent scheduler 或 remote executor
 - **管理入口**: 当前仅有 Web Admin backend/typed API 的 `plan_orchestration_workflow` / `inspect_orchestration_workflow`，尚无专用可视化页、CLI group 或一级 MCP tool
+
+### harness/
+- **Task Harness 权威**: `TaskHarness` 只负责 Task identity、objective、lifecycle/status、phase、steps、contract、Slice、working set 与 Development Session 绑定/切换。
+- **Coding Harness 权威**: `CodingHarness` 负责 coding execution scope，包括 managed Git worktree、baseline/expected state、writer safety evidence、Verification、Recovery、ChangeSet、stage-commit receipt、close-work-session outbox 与 coding status/project-state projection。
+- **组合方式**: `split_harness(...)` 在同一 workspace identity 和 durable store namespace 上创建两个 authority。`ToolContext` 显式持有 `task_harness` 与 `coding_harness`，不再提供万能 `harness` 字段。
+- **内部 Kernel**: `state.rs` 中的 `HarnessKernel` 仅是私有事务/存储实现底座，不对 crate 外导出，也不允许产品模块直接构造。新的业务调用必须先选择 Task 或 Coding authority。
+- **对外协议**: MCP 继续保持 `task`、`slice`、`commit_stage`、`begin_work_session` / `close_work_session` 等既有 facade；本轮拆分不增加兼容 facade，也不恢复旧 monolithic Harness API。
+- **防回退**: `harness_split_boundaries` 集成测试禁止 `ToolContext.harness`、公开 `Harness` 构造器以及 Task/Coding mutation API 互相泄漏。
 
 ### mcp/
 - **职责**: MCP 协议、OAuth、Session、工具目录、下游 Dynamic MCP proxy 聚合与 Streamable HTTP transport

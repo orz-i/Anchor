@@ -563,7 +563,7 @@ pub fn checkpoint(
         .unwrap_or(previous_status.as_str())
         .to_string();
     if session_status == "completed" {
-        let tasks = ctx.harness.list_tasks().map_err(|error| {
+        let tasks = ctx.task_harness.list_tasks().map_err(|error| {
             let message = error.to_string();
             session_error(
                 "SESSION_TASK_STATE_UNAVAILABLE",
@@ -732,8 +732,8 @@ pub fn auto_checkpoint_after_tool(
         return Ok(None);
     }
     let task = task_id
-        .and_then(|task_id| ctx.harness.task(task_id).ok())
-        .or_else(|| ctx.harness.current_task().ok().flatten());
+        .and_then(|task_id| ctx.task_harness.task(task_id).ok())
+        .or_else(|| ctx.task_harness.current_task().ok().flatten());
     let Some(task) = task else {
         return Ok(None);
     };
@@ -800,13 +800,13 @@ pub fn auto_checkpoint_after_tool(
         }
     }
     let scoped_harness = task.git_worktree.as_ref().and_then(|worktree| {
-        ctx.harness
-            .with_workspace_root(std::path::PathBuf::from(&worktree.path))
+        ctx.coding_harness
+            .scoped_to_workspace_root(std::path::PathBuf::from(&worktree.path))
             .ok()
     });
     let harness = scoped_harness
         .as_ref()
-        .unwrap_or(&ctx.harness)
+        .unwrap_or(&ctx.coding_harness)
         .status_for_task(Some(&task.id))
         .ok();
     let mut runtime_state = vec![

@@ -110,13 +110,13 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         .to_string();
     let session_index = fs::read(workspace.join("docs/session/index.json")).expect("session index");
     let session_markdown = fs::read(workspace.join(&expected_path)).expect("session markdown");
-    ctx.harness
+    ctx.task_harness
         .complete_task(&task_id, false, HarnessSessionStatus::Paused)
         .expect("complete task");
     fs::remove_dir_all(workspace.join("docs/session")).expect("remove session store");
 
     let now = timestamp();
-    ctx.harness
+    ctx.coding_harness
         .save_close_outbox(&WorkSessionCloseOutbox {
             schema_version: SCHEMA_VERSION,
             task_id: task_id.clone(),
@@ -146,7 +146,7 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
     let first = recover_close_outboxes(&ctx).expect("first recovery");
     assert_eq!(first.len(), 1);
     let pending = ctx
-        .harness
+        .coding_harness
         .load_close_outbox(&task_id)
         .expect("load")
         .expect("outbox");
@@ -160,7 +160,7 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
     drop(ctx);
     let restarted = ToolContext::for_test(workspace, harness_root).expect("restarted context");
     let still_pending = restarted
-        .harness
+        .coding_harness
         .load_close_outbox(&task_id)
         .expect("load")
         .expect("outbox");
@@ -183,7 +183,7 @@ fn close_outbox_recovers_on_next_harness_call_after_restart() {
         "task-scoped status must not surface peer/completed outbox diagnostics: {status}"
     );
     let completed = restarted
-        .harness
+        .coding_harness
         .load_close_outbox(&task_id)
         .expect("load")
         .expect("outbox");
@@ -221,12 +221,12 @@ fn complete_work_session_can_repair_checkpoint_pending_payload() {
         .as_str()
         .expect("session path")
         .to_string();
-    ctx.harness
+    ctx.task_harness
         .complete_task(&task_id, false, HarnessSessionStatus::Paused)
         .expect("complete task");
 
     let now = timestamp();
-    ctx.harness
+    ctx.coding_harness
         .save_close_outbox(&WorkSessionCloseOutbox {
             schema_version: SCHEMA_VERSION,
             task_id: task_id.clone(),
@@ -274,7 +274,7 @@ fn complete_work_session_can_repair_checkpoint_pending_payload() {
     assert_eq!(repaired["ok"], true, "{repaired}");
     assert_eq!(repaired["work_session"]["closed"], true, "{repaired}");
     let completed = ctx
-        .harness
+        .coding_harness
         .load_close_outbox(&task_id)
         .expect("load")
         .expect("outbox");

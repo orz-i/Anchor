@@ -53,10 +53,10 @@ fn ensure_real_index_clean(
 
 fn acquire_stage_commit_lock(ctx: &ToolContext) -> Result<StageCommitLock, WorkspaceError> {
     let path = ctx
-        .harness
+        .coding_harness
         .store_root()
         .join("workspaces")
-        .join(ctx.harness.workspace_id())
+        .join(ctx.coding_harness.workspace_id())
         .join("stage-commit.lock");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -144,7 +144,7 @@ pub fn run(
     let _workflow_lock = acquire_stage_commit_lock(ctx)?;
 
     if let Some(mut existing) = ctx
-        .harness
+        .coding_harness
         .load_stage_commit_receipt(idempotency_key)
         .map_err(harness_error)?
     {
@@ -258,7 +258,7 @@ fn execute_new_workflow(
     deferred: bool,
     wait_timeout_ms: u64,
 ) -> Result<Value, WorkspaceError> {
-    let task = ctx.harness.task(task_id).map_err(harness_error)?;
+    let task = ctx.task_harness.task(task_id).map_err(harness_error)?;
     if !task.status.is_writable() {
         return Err(stage_error(
             "TASK_NOT_WRITABLE",
@@ -268,7 +268,9 @@ fn execute_new_workflow(
         ));
     }
     ensure_real_index_clean(ctx, cancellation)?;
-    ctx.harness.check_baseline(task_id).map_err(harness_error)?;
+    ctx.coding_harness
+        .check_baseline(task_id)
+        .map_err(harness_error)?;
     ensure_repository_root(ctx, cancellation)?;
 
     let before = super::state::capture_baseline(ctx.workspace.root());
@@ -346,7 +348,7 @@ fn execute_new_workflow(
     receipt.check_timeout_ms = check_timeout_ms;
     save_receipt(ctx, &receipt)?;
     if is_new_receipt {
-        let _ = ctx.harness.record_operation(
+        let _ = ctx.coding_harness.record_operation(
             Some(&receipt.workflow_id),
             Some(task_id),
             None,
@@ -384,7 +386,7 @@ fn execute_new_workflow(
         )?;
         let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
         let verification = ctx
-            .harness
+            .coding_harness
             .record_verification(
                 task_id,
                 verification_kind(&command),
@@ -589,16 +591,16 @@ fn execute_new_workflow(
         return receipt_response(&receipt, false, false);
     }
 
-    ctx.harness
+    ctx.coding_harness
         .refresh_expected_state_for_operation(task_id, Some(&receipt.workflow_id))
         .map_err(harness_error)?;
     receipt.baseline_refreshed = true;
     let _ = ctx
-        .harness
+        .coding_harness
         .set_latest_change(task_id, &commit_sha)
         .map_err(harness_error)?;
     let _ = ctx
-        .harness
+        .coding_harness
         .save_change_set(
             task_id,
             &commit_sha,
@@ -609,7 +611,7 @@ fn execute_new_workflow(
             receipt.verification_ids.clone(),
         )
         .map_err(harness_error)?;
-    let _ = ctx.harness.record_event(
+    let _ = ctx.coding_harness.record_event(
         task_id,
         "stage_commit_committed",
         Some("stage_commit"),
@@ -636,7 +638,7 @@ pub fn status(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
     let task_id = required_string(args, "task_id")?;
     let idempotency_key = required_string(args, "idempotency_key")?;
     let receipt = ctx
-        .harness
+        .coding_harness
         .load_stage_commit_receipt(idempotency_key)
         .map_err(harness_error)?
         .ok_or_else(|| {
@@ -674,7 +676,7 @@ pub fn wait(
     let checkpoint = args.get("session_checkpoint");
     let _workflow_lock = acquire_stage_commit_lock(ctx)?;
     let mut receipt = ctx
-        .harness
+        .coding_harness
         .load_stage_commit_receipt(idempotency_key)
         .map_err(harness_error)?
         .ok_or_else(|| {
@@ -901,7 +903,7 @@ fn persist_deferred_check_result(
         .ok_or_else(|| invalid_argument("completed deferred check is out of range"))?;
     let passed = result.get("command_ok").and_then(Value::as_bool) == Some(true);
     let verification = ctx
-        .harness
+        .coding_harness
         .record_verification(
             &receipt.task_id,
             verification_kind(&command),
@@ -1174,7 +1176,7 @@ fn ensure_repository_root(
 }
 
 fn create_temp_index(ctx: &ToolContext) -> Result<TempIndex, WorkspaceError> {
-    let dir = ctx.harness.store_root().join("tmp");
+    let dir = ctx.coding_harness.store_root().join("tmp");
     fs::create_dir_all(&dir).map_err(|error| {
         stage_error(
             "STAGE_COMMIT_INDEX_FAILED",
@@ -1509,13 +1511,13 @@ fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, WorkspaceE
 }
 
 fn save_receipt(ctx: &ToolContext, receipt: &StageCommitReceipt) -> Result<(), WorkspaceError> {
-    ctx.harness
+    ctx.coding_harness
         .save_stage_commit_receipt(receipt)
         .map_err(harness_error)
 }
 
 fn finish_operation(ctx: &ToolContext, receipt: &StageCommitReceipt, complete: bool) {
-    let _ = ctx.harness.record_operation(
+    let _ = ctx.coding_harness.record_operation(
         Some(&receipt.workflow_id),
         Some(&receipt.task_id),
         None,
@@ -1718,10 +1720,13 @@ mod tests {
     }
 
     fn prepare_change(ctx: &ToolContext, path: &Path) -> (String, String, String) {
-        let task = ctx.harness.start_task("stage commit test").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("stage commit test")
+            .expect("task");
         fs::write(path.join("main.txt"), "after\n").expect("change");
         let refreshed = ctx
-            .harness
+            .coding_harness
             .refresh_expected_state_for_operation(&task.id, Some("test-change"))
             .expect("refresh");
         let expected = refreshed.expected_state;
@@ -1870,7 +1875,7 @@ mod tests {
             return;
         };
         let (task_id, expected_head, expected_fingerprint) = prepare_change(&ctx, workspace.path());
-        let initial_baseline_head = ctx.harness.task(&task_id).expect("task").baseline.head;
+        let initial_baseline_head = ctx.task_harness.task(&task_id).expect("task").baseline.head;
         let command = "python -c \"print('ok')\"";
         let arguments = json!({
             "task_id": task_id,
@@ -1895,15 +1900,15 @@ mod tests {
             .to_string();
         assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), commit_sha);
         assert!(git(workspace.path(), &["status", "--porcelain"]).is_empty());
-        ctx.harness
+        ctx.coding_harness
             .check_baseline(&task_id)
             .expect("baseline valid");
         assert_eq!(
-            ctx.harness.task(&task_id).expect("task").baseline.head,
+            ctx.task_harness.task(&task_id).expect("task").baseline.head,
             initial_baseline_head
         );
         let change = ctx
-            .harness
+            .coding_harness
             .load_change_set(&commit_sha)
             .expect("load change set")
             .expect("persisted change set");
@@ -2016,7 +2021,7 @@ mod tests {
         assert_eq!(first["workflow_status"], "committed_checkpoint_pending");
         let commit_sha = first["commit_sha"].as_str().expect("commit").to_string();
         assert_eq!(git(workspace.path(), &["rev-list", "--count", "HEAD"]), "2");
-        ctx.harness
+        ctx.coding_harness
             .check_baseline(&task_id)
             .expect("baseline valid");
 
@@ -2061,7 +2066,7 @@ mod tests {
         )
         .expect("managed worktree");
         let task = ctx
-            .harness
+            .coding_harness
             .start_task_in_git_worktree("stage checkpoint scope", task_id.clone(), worktree)
             .expect("worktree task");
         let scoped = ctx
@@ -2070,7 +2075,7 @@ mod tests {
             .expect("worktree context");
         fs::write(scoped.workspace.root().join("main.txt"), "after\n").expect("change");
         let refreshed = scoped
-            .harness
+            .coding_harness
             .refresh_expected_state_for_operation(&task_id, Some("worktree-change"))
             .expect("refresh");
         let expected = refreshed.expected_state;
@@ -2165,7 +2170,7 @@ mod tests {
         )
         .expect("managed worktree");
         let task = ctx
-            .harness
+            .coding_harness
             .start_task_in_git_worktree("stage checkpoint recovery", task_id.clone(), worktree)
             .expect("worktree task");
         let scoped = ctx
@@ -2174,7 +2179,7 @@ mod tests {
             .expect("worktree context");
         fs::write(scoped.workspace.root().join("main.txt"), "after\n").expect("change");
         let refreshed = scoped
-            .harness
+            .coding_harness
             .refresh_expected_state_for_operation(&task_id, Some("worktree-change"))
             .expect("refresh");
         let expected = refreshed.expected_state;

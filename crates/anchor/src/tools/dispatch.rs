@@ -335,7 +335,7 @@ fn track_task_recovery(
             .get("recovery_key")
             .and_then(Value::as_str)
             .or(retained_recovery_key);
-        if let Ok(Some(recovery)) = ctx.harness.resolve_recovery_for_attempt(
+        if let Ok(Some(recovery)) = ctx.coding_harness.resolve_recovery_for_attempt(
             task_id,
             &recovery_step,
             Some(&step_fingerprint),
@@ -461,7 +461,7 @@ fn track_task_recovery(
     recommendations.dedup();
     recommendations.truncate(16);
     let resume_target = ctx
-        .harness
+        .task_harness
         .task(task_id)
         .ok()
         .and_then(|task| {
@@ -472,7 +472,7 @@ fn track_task_recovery(
             })
         })
         .unwrap_or_else(|| "task".into());
-    if let Ok(recovery) = ctx.harness.record_recovery(
+    if let Ok(recovery) = ctx.coding_harness.record_recovery(
         task_id,
         &recovery_step,
         Some(&step_fingerprint),
@@ -526,7 +526,7 @@ fn persist_git_commit_change_set(ctx: &ToolContext, task_id: &str, output: &Valu
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let _ = ctx.harness.save_change_set(
+    let _ = ctx.coding_harness.save_change_set(
         task_id,
         commit_sha,
         committed_files,
@@ -564,7 +564,7 @@ fn worktree_remove_task_conflict(ctx: &ToolContext, args: &Value) -> Option<Valu
     };
     let candidate = candidate.canonicalize().unwrap_or(candidate);
     let blocking_tasks = ctx
-        .harness
+        .task_harness
         .list_tasks()
         .unwrap_or_default()
         .into_iter()
@@ -949,7 +949,7 @@ fn record_verification_from_output(
         .or_else(|| output.get("elapsed_ms").and_then(Value::as_u64));
     let terminal_at = output.get("finished_at").and_then(Value::as_str);
     let output_refs = output.get("output_refs").cloned();
-    if let Ok(verification) = ctx.harness.record_verification(
+    if let Ok(verification) = ctx.coding_harness.record_verification(
         task_id,
         identity.kind,
         identity.command,
@@ -967,7 +967,7 @@ fn record_verification_from_output(
     ) {
         let resolved_by_verification_id = verification.id.clone();
         let task_recovery = if verification.passed && !verification.supersedes.is_empty() {
-            let matching_step = ctx.harness.task(task_id).ok().and_then(|task| {
+            let matching_step = ctx.task_harness.task(task_id).ok().and_then(|task| {
                 task.recovery.as_ref().and_then(|recovery| {
                     (recovery.status == crate::harness::model::TaskRecoveryStatus::Open
                         && recovery
@@ -985,7 +985,7 @@ fn record_verification_from_output(
                 })
             });
             matching_step.and_then(|(step, fingerprint)| {
-                ctx.harness
+                ctx.coding_harness
                     .resolve_recovery_for_step(task_id, &step, fingerprint.as_deref())
                     .ok()
                     .flatten()
@@ -1017,7 +1017,7 @@ fn record_verification_from_output(
             );
             object.insert(
                 "affected_task_status".into(),
-                ctx.harness
+                ctx.task_harness
                     .task(task_id)
                     .ok()
                     .map(|task| serde_json::to_value(task.status).unwrap_or(Value::Null))
@@ -1449,7 +1449,7 @@ fn call_tool_impl(
                 ctx.sessions.running_task_ids().into_iter().any(|task_id| {
                     task_id != task.id
                         && ctx
-                            .harness
+                            .task_harness
                             .task(&task_id)
                             .map(|peer| tasks_share_write_domain(task, &peer))
                             .unwrap_or(true)
@@ -1470,7 +1470,7 @@ fn call_tool_impl(
                 // Read-only inspection can continue without transferring the writer lease.
             } else {
                 match ctx
-                    .harness
+                    .task_harness
                     .resume_task_for_activity(&task.id, name, session_id)
                 {
                     Ok(task) => selected_task = Some(task),
@@ -1488,7 +1488,7 @@ fn call_tool_impl(
     }
     if selected_task.is_none() && requires_write_baseline(name, &effective_args) {
         let active_writer_task_ids = ctx
-            .harness
+            .task_harness
             .list_tasks()
             .unwrap_or_default()
             .into_iter()
@@ -1523,7 +1523,7 @@ fn call_tool_impl(
         let operation = if name == "operation_log" {
             None
         } else {
-            ctx.harness
+            ctx.coding_harness
                 .record_operation(
                     None,
                     operation_task_id,
@@ -1556,7 +1556,7 @@ fn call_tool_impl(
                 crate::harness::tools::update_response_bytes(&mut output);
             }
             let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-            let _ = ctx.harness.record_operation(
+            let _ = ctx.coding_harness.record_operation(
                 Some(&operation.id),
                 result_task_id.as_deref(),
                 session_id,
@@ -1592,7 +1592,7 @@ fn call_tool_impl(
     };
     let task_id = if name == "git_worktree_remove" {
         if let Some(task) = worktree_target_task.as_ref() {
-            let _ = ctx.harness.record_event(
+            let _ = ctx.coding_harness.record_event(
                 &task.id,
                 "operation_started",
                 Some(name),
@@ -1605,7 +1605,7 @@ fn call_tool_impl(
         }
     } else if name == "remove_path" {
         if let Some(task) = active_task.as_ref() {
-            let _ = ctx.harness.record_event(
+            let _ = ctx.coding_harness.record_event(
                 &task.id,
                 "operation_started",
                 Some(name),
@@ -1618,7 +1618,7 @@ fn call_tool_impl(
         }
     } else if requires_write_baseline(name, &effective_args) {
         if let Some(task) = active_task.as_ref() {
-            if let Err(error) = ctx.harness.check_baseline(&task.id) {
+            if let Err(error) = ctx.coding_harness.check_baseline(&task.id) {
                 return attach_harness_status(
                     ctx,
                     tool_err_code(error.code(), error.to_string(), "permission"),
@@ -1626,7 +1626,7 @@ fn call_tool_impl(
                     session_id,
                 );
             }
-            let _ = ctx.harness.record_event(
+            let _ = ctx.coding_harness.record_event(
                 &task.id,
                 "operation_started",
                 Some(name),
@@ -1642,7 +1642,7 @@ fn call_tool_impl(
     };
 
     let operation = if should_log_operation(name) {
-        ctx.harness
+        ctx.coding_harness
             .record_operation(
                 None,
                 task_id
@@ -1809,7 +1809,7 @@ fn call_tool_impl(
     }
     if let Some(task_id) = task_id.as_deref() {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = ctx.harness.record_event(
+        let _ = ctx.coding_harness.record_event(
             task_id,
             "operation_finished",
             Some(name),
@@ -1825,7 +1825,7 @@ fn call_tool_impl(
         if should_advance_expected_state {
             let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
             let _ = ctx
-                .harness
+                .coding_harness
                 .refresh_expected_state_for_operation(task_id, operation_id);
         }
         if name == "git_commit" && succeeded {
@@ -1899,7 +1899,7 @@ fn call_tool_impl(
                 }
                 let operation_id = operation.as_ref().map(|operation| operation.id.as_str());
                 let _ = ctx
-                    .harness
+                    .coding_harness
                     .refresh_expected_state_for_operation(&metadata.task_id, operation_id);
                 if let Some(kind) = metadata.verification_kind.as_deref() {
                     record_verification_from_output(
@@ -1917,7 +1917,7 @@ fn call_tool_impl(
                         &mut output,
                     );
                 }
-                let _ = ctx.harness.record_event(
+                let _ = ctx.coding_harness.record_event(
                     &metadata.task_id,
                     "command_session_finalized",
                     Some(name),
@@ -1944,7 +1944,7 @@ fn call_tool_impl(
     );
     if let Some(operation) = operation {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = ctx.harness.record_operation(
+        let _ = ctx.coding_harness.record_operation(
             Some(&operation.id),
             task_id
                 .as_deref()
@@ -1956,7 +1956,7 @@ fn call_tool_impl(
             operation_result_summary(name, &output),
         );
     } else if output.get("ok").and_then(Value::as_bool) == Some(false) {
-        let _ = ctx.harness.record_operation(
+        let _ = ctx.coding_harness.record_operation(
             None,
             task_id
                 .as_deref()
@@ -1991,7 +1991,7 @@ fn attach_auto_checkpoint(
     task_id: Option<&str>,
 ) {
     let baseline_was_current = ctx
-        .harness
+        .coding_harness
         .status_for_task(task_id)
         .ok()
         .and_then(|status| status.baseline_matches)
@@ -2001,7 +2001,7 @@ fn attach_auto_checkpoint(
             if baseline_was_current {
                 if let Some(task_id) = task_id {
                     let _ = ctx
-                        .harness
+                        .coding_harness
                         .refresh_expected_state_for_operation(task_id, None);
                 }
             }
@@ -2186,7 +2186,7 @@ fn resolve_task_for_call(
         return ctx.bound_task_for_session(mcp_session_id);
     }
     if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-        if let Ok(task) = ctx.harness.task(task_id) {
+        if let Ok(task) = ctx.task_harness.task(task_id) {
             return Some(task);
         }
     }
@@ -2196,7 +2196,7 @@ fn resolve_task_for_call(
             .and_then(Value::as_str)
             .and_then(|command_session_id| ctx.sessions.get(command_session_id).ok())
             .and_then(|session| session.harness_metadata())
-            .and_then(|metadata| ctx.harness.task(&metadata.task_id).ok())
+            .and_then(|metadata| ctx.task_harness.task(&metadata.task_id).ok())
         {
             return Some(task);
         }
@@ -2282,20 +2282,24 @@ fn task_for_managed_worktree(
 ) -> Option<crate::harness::model::TaskSession> {
     let raw_path = args.get("path")?.as_str()?;
     let target = git::managed_worktree_path(&ctx.workspace, raw_path).ok()?;
-    ctx.harness.list_tasks().ok()?.into_iter().find(|task| {
-        let Some(worktree) = task
-            .git_worktree
-            .as_ref()
-            .filter(|worktree| worktree.managed)
-        else {
-            return false;
-        };
-        let candidate = Path::new(&worktree.path);
-        candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.to_path_buf())
-            == target
-    })
+    ctx.task_harness
+        .list_tasks()
+        .ok()?
+        .into_iter()
+        .find(|task| {
+            let Some(worktree) = task
+                .git_worktree
+                .as_ref()
+                .filter(|worktree| worktree.managed)
+            else {
+                return false;
+            };
+            let candidate = Path::new(&worktree.path);
+            candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.to_path_buf())
+                == target
+        })
 }
 
 fn operation_input(args: &Value) -> Value {
@@ -2313,7 +2317,7 @@ fn attach_harness_status(
 ) -> Value {
     let selected = ctx.task_for_session(session_id);
     if let Ok(mut status) = ctx
-        .harness
+        .coding_harness
         .status_for_task(selected.as_ref().map(|task| task.id.as_str()))
     {
         if standalone && status.task_id.is_none() {
@@ -3028,7 +3032,10 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("policy rejection").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("policy rejection")
+            .expect("task");
         let mut output = json!({
             "ok": true,
             "status": "command_rejected",
@@ -3055,7 +3062,7 @@ mod tests {
         assert_eq!(output["verification_skipped"], true);
         assert_eq!(output["verification_skip_reason"], "command_not_executed");
         assert!(ctx
-            .harness
+            .coding_harness
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
@@ -3068,7 +3075,7 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("admin assets").expect("task");
+        let task = ctx.task_harness.start_task("admin assets").expect("task");
         let mut output = json!({
             "ok": false,
             "execution_started": true,
@@ -3100,7 +3107,7 @@ mod tests {
         assert_eq!(output["failure_classification"], "infrastructure");
         assert_eq!(output["verification_skipped"], true);
         assert!(ctx
-            .harness
+            .coding_harness
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
@@ -3114,7 +3121,7 @@ mod tests {
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
         let task = ctx
-            .harness
+            .task_harness
             .start_task("gradle startup failure")
             .expect("task");
         let mut output = json!({
@@ -3149,7 +3156,7 @@ mod tests {
             "infrastructure_failure_before_test"
         );
         assert!(ctx
-            .harness
+            .coding_harness
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
@@ -3162,7 +3169,10 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("real test failure").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("real test failure")
+            .expect("task");
         let mut output = json!({
             "ok": false,
             "execution_started": true,
@@ -3202,9 +3212,9 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("zero tests").expect("task");
+        let task = ctx.task_harness.start_task("zero tests").expect("task");
         let previous = ctx
-            .harness
+            .coding_harness
             .record_verification(
                 &task.id,
                 "test",
@@ -3253,14 +3263,14 @@ mod tests {
         assert_eq!(output["verification_test_count"], 0);
         assert!(output.get("verification").is_none());
         assert_eq!(
-            ctx.harness
+            ctx.coding_harness
                 .list_verifications(&task.id)
                 .expect("load verifications")
                 .len(),
             1
         );
         let previous = ctx
-            .harness
+            .coding_harness
             .list_verifications(&task.id)
             .expect("load verifications")
             .into_iter()
@@ -3276,7 +3286,7 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("android device").expect("task");
+        let task = ctx.task_harness.start_task("android device").expect("task");
         let mut output = json!({
             "ok": false,
             "execution_started": true,
@@ -3308,7 +3318,7 @@ mod tests {
         assert_eq!(output["failure_classification"], "infrastructure");
         assert_eq!(output["verification_skipped"], true);
         assert!(ctx
-            .harness
+            .coding_harness
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
@@ -3321,7 +3331,10 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("android provider").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("android provider")
+            .expect("task");
         let mut output = json!({
             "ok": false,
             "execution_started": true,
@@ -3352,7 +3365,7 @@ mod tests {
         assert_eq!(output["failure_classification"], "infrastructure");
         assert_eq!(output["verification_skipped"], true);
         assert!(ctx
-            .harness
+            .coding_harness
             .list_verifications(&task.id)
             .expect("verifications")
             .is_empty());
@@ -3365,7 +3378,10 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        let task = ctx.harness.start_task("aggregate tests").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("aggregate tests")
+            .expect("task");
         let mut output = json!({
             "ok": true,
             "execution_started": true,
@@ -3404,7 +3420,9 @@ mod tests {
         let ctx =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
-        ctx.harness.start_task("failing mutation").expect("task");
+        ctx.task_harness
+            .start_task("failing mutation")
+            .expect("task");
 
         let result = call_tool_with_cancellation(
             &ctx,
@@ -3422,7 +3440,10 @@ mod tests {
         assert_eq!(result["execution_started"], true, "{result}");
         assert!(workspace.path().join("failed-output.txt").is_file());
         assert_eq!(
-            ctx.harness.status().expect("status").baseline_matches,
+            ctx.coding_harness
+                .status()
+                .expect("status")
+                .baseline_matches,
             Some(true)
         );
     }
@@ -3435,7 +3456,7 @@ mod tests {
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("context");
         let task = ctx
-            .harness
+            .task_harness
             .start_task("missing retained session")
             .expect("task");
 
@@ -3457,6 +3478,11 @@ mod tests {
             );
             assert!(result.get("task_recovery").is_none(), "{tool}: {result}");
         }
-        assert!(ctx.harness.task(&task.id).expect("task").recovery.is_none());
+        assert!(ctx
+            .task_harness
+            .task(&task.id)
+            .expect("task")
+            .recovery
+            .is_none());
     }
 }

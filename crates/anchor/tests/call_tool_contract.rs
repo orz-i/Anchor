@@ -343,7 +343,7 @@ fn diagnostic_command_failure_does_not_open_task_recovery() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("diagnostic command recovery boundary")
         .expect("start task");
 
@@ -364,7 +364,7 @@ fn diagnostic_command_failure_does_not_open_task_recovery() {
     assert_eq!(result["exit_code"], 9);
     assert!(result.get("task_recovery").is_none(), "{result}");
     assert!(ctx
-        .harness
+        .task_harness
         .task(&task.id)
         .expect("reload task")
         .recovery
@@ -376,7 +376,7 @@ fn running_retry_resolves_recovery_only_after_terminal_success() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("terminal recovery resolution")
         .expect("start task");
 
@@ -410,7 +410,7 @@ fn running_retry_resolves_recovery_only_after_terminal_success() {
     let retry = assert_ok(&retry);
     assert_eq!(retry["execution_status"], "running");
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(&task.id)
             .expect("running retry task")
             .recovery
@@ -428,7 +428,7 @@ fn running_retry_resolves_recovery_only_after_terminal_success() {
     assert_eq!(waited["execution_status"], "succeeded");
     assert_eq!(waited["task_recovery"]["status"], "resolved");
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(&task.id)
             .expect("terminal retry task")
             .recovery
@@ -443,7 +443,7 @@ fn preflight_failure_with_verification_identity_still_does_not_open_recovery() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("preflight verification recovery boundary")
         .expect("start task");
 
@@ -461,7 +461,7 @@ fn preflight_failure_with_verification_identity_still_does_not_open_recovery() {
     assert_eq!(result["execution_started"], false);
     assert!(result.get("task_recovery").is_none(), "{result}");
     assert!(ctx
-        .harness
+        .task_harness
         .task(&task.id)
         .expect("reload task")
         .recovery
@@ -820,7 +820,7 @@ fn command_discovery_failure_does_not_open_task_recovery() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("command discovery recovery boundary")
         .expect("start task");
 
@@ -834,7 +834,7 @@ fn command_discovery_failure_does_not_open_task_recovery() {
     assert_eq!(result["execution_started"], false);
     assert!(result.get("task_recovery").is_none(), "{result}");
     assert!(ctx
-        .harness
+        .task_harness
         .task(&task.id)
         .expect("reload task")
         .recovery
@@ -846,7 +846,7 @@ fn command_that_started_and_failed_still_opens_task_recovery() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("started command recovery boundary")
         .expect("start task");
 
@@ -865,7 +865,7 @@ fn command_that_started_and_failed_still_opens_task_recovery() {
     assert_eq!(result["exit_code"], 7);
     assert_eq!(result["task_recovery"]["status"], "open");
     assert!(ctx
-        .harness
+        .task_harness
         .task(&task.id)
         .expect("reload task")
         .recovery
@@ -1152,7 +1152,7 @@ fn wait_command_cursor_survives_transport_session_rebinding_to_the_same_task() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("cursor transport rebind")
         .expect("task");
     let first_caller = "managed-cursor-transport-a";
@@ -1740,7 +1740,7 @@ fn durable_verification_finalizes_once_after_context_reconstruction() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
     let task = ctx
-        .harness
+        .task_harness
         .start_task("durable verification finalization")
         .expect("start task");
     let started = invoke(
@@ -1780,7 +1780,7 @@ fn durable_verification_finalizes_once_after_context_reconstruction() {
     assert!(waited["verification_id"].as_str().is_some(), "{waited}");
 
     let records = recovered_ctx
-        .harness
+        .coding_harness
         .list_verifications(&task.id)
         .expect("durable verification records");
     assert_eq!(records.len(), 1, "{records:?}");
@@ -1797,7 +1797,7 @@ fn durable_verification_finalizes_once_after_context_reconstruction() {
     );
     assert_ok(&waited_again);
     let records_after = recovered_ctx
-        .harness
+        .coding_harness
         .list_verifications(&task.id)
         .expect("verification records after second wait");
     assert_eq!(

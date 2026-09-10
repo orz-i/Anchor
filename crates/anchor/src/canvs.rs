@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::harness::model::VerificationRecord;
-use crate::harness::{Harness, HarnessError, HarnessResult, TaskSession};
+use crate::harness::{
+    split_harness, CodingHarness, HarnessError, HarnessResult, TaskHarness, TaskSession,
+};
 
 const MAX_RECENT_EVENTS: usize = 24;
 const MAX_RECENT_OPERATIONS: usize = 24;
@@ -112,11 +114,11 @@ pub struct CanvsVerification {
 }
 
 pub fn list_workspace_tasks(workspace_path: &Path) -> HarnessResult<CanvsTaskList> {
-    let harness = workspace_harness(workspace_path)?;
-    task_list(&harness)
+    let (tasks, _coding) = workspace_harness(workspace_path)?;
+    task_list(&tasks)
 }
 
-fn task_list(harness: &Harness) -> HarnessResult<CanvsTaskList> {
+fn task_list(harness: &TaskHarness) -> HarnessResult<CanvsTaskList> {
     let current_task_id = harness.current_task()?.map(|task| task.id);
     let mut tasks = harness.list_tasks()?;
     tasks.sort_by(|left, right| {
@@ -139,11 +141,11 @@ fn task_list(harness: &Harness) -> HarnessResult<CanvsTaskList> {
 }
 
 pub fn current_workspace_snapshot(workspace_path: &Path) -> HarnessResult<CanvsSnapshot> {
-    let harness = workspace_harness(workspace_path)?;
-    let Some(task) = harness.current_task()? else {
-        return Ok(empty_snapshot(&harness));
+    let (tasks, coding) = workspace_harness(workspace_path)?;
+    let Some(task) = tasks.current_task()? else {
+        return Ok(empty_snapshot(&coding));
     };
-    task_snapshot(&harness, task, true)
+    task_snapshot(&coding, task, true)
 }
 
 pub fn workspace_task_snapshot(
@@ -156,18 +158,21 @@ pub fn workspace_task_snapshot(
             "task id must contain only ASCII letters, numbers, hyphens, or underscores",
         ));
     }
-    let harness = workspace_harness(workspace_path)?;
-    let current_task_id = harness.current_task()?.map(|task| task.id);
-    let task = harness.task(task_id)?;
+    let (tasks, coding) = workspace_harness(workspace_path)?;
+    let current_task_id = tasks.current_task()?.map(|task| task.id);
+    let task = tasks.task(task_id)?;
     let current = current_task_id.as_deref() == Some(task.id.as_str());
-    task_snapshot(&harness, task, current)
+    task_snapshot(&coding, task, current)
 }
 
-fn workspace_harness(workspace_path: &Path) -> HarnessResult<Harness> {
-    Harness::new(PathBuf::from(workspace_path), Harness::default_root()?)
+fn workspace_harness(workspace_path: &Path) -> HarnessResult<(TaskHarness, CodingHarness)> {
+    split_harness(
+        PathBuf::from(workspace_path),
+        CodingHarness::default_root()?,
+    )
 }
 
-fn empty_snapshot(harness: &Harness) -> CanvsSnapshot {
+fn empty_snapshot(harness: &CodingHarness) -> CanvsSnapshot {
     CanvsSnapshot {
         workspace_id: harness.workspace_id().to_string(),
         task: None,
@@ -180,7 +185,7 @@ fn empty_snapshot(harness: &Harness) -> CanvsSnapshot {
 }
 
 fn task_snapshot(
-    harness: &Harness,
+    harness: &CodingHarness,
     task: TaskSession,
     current: bool,
 ) -> HarnessResult<CanvsSnapshot> {
@@ -489,24 +494,26 @@ mod tests {
     fn task_list_includes_current_and_history_with_newest_first() {
         let workspace = tempfile::tempdir().expect("workspace");
         let root = tempfile::tempdir().expect("harness root");
-        let harness =
-            crate::harness::Harness::new(workspace.path().to_path_buf(), root.path().to_path_buf())
-                .expect("harness");
+        let (tasks, _coding) = crate::harness::split_harness(
+            workspace.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .expect("harness");
 
-        let history = harness.start_task("history task").expect("history task");
-        harness
+        let history = tasks.start_task("history task").expect("history task");
+        tasks
             .transition(&history.id, crate::harness::TaskStatus::CompletedUnverified)
             .expect("complete history task");
         std::thread::sleep(Duration::from_millis(2));
-        let parallel = harness.start_task("parallel task").expect("parallel task");
+        let parallel = tasks.start_task("parallel task").expect("parallel task");
         std::thread::sleep(Duration::from_millis(2));
-        let current = harness.start_task("current task").expect("current task");
+        let current = tasks.start_task("current task").expect("current task");
         std::thread::sleep(Duration::from_millis(2));
-        harness
+        tasks
             .resume_task_for_activity(&parallel.id, "read_file", None)
             .expect("parallel activity");
 
-        let list = task_list(&harness).expect("task list");
+        let list = task_list(&tasks).expect("task list");
         assert_eq!(list.tasks.len(), 3);
         assert_eq!(list.tasks[0].id, parallel.id);
         assert!(!list.tasks[0].current);

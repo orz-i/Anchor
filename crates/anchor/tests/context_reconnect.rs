@@ -10,11 +10,11 @@ fn fresh_context_rebinds_unique_session_backed_task_for_host_scope() {
     )
     .expect("first context");
     let task = first
-        .harness
+        .task_harness
         .start_task("persisted reconnect")
         .expect("task");
     first
-        .harness
+        .task_harness
         .bind_session(
             &task.id,
             "ses_0123456789abcdef0123456789abcdef",

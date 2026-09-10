@@ -1,4 +1,5 @@
 pub mod model;
+mod split;
 mod stage_commit;
 pub mod state;
 pub mod store;
@@ -11,5 +12,5 @@ pub use model::{
     TaskRecoveryStatus, TaskSession, TaskSlice, TaskSliceStatus, TaskStatus, TaskTermination,
     TaskTerminationKind, TaskWorkingSet, VerificationRequirement,
 };
-pub use state::Harness;
+pub use split::{split_harness, CodingHarness, TaskHarness};
 pub use store::{HarnessError, HarnessResult, HarnessStore};

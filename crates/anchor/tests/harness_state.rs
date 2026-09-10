@@ -1,6 +1,6 @@
 use std::fs;
 
-use anchor_lib::harness::{Harness, TaskStatus};
+use anchor_lib::harness::{split_harness, TaskStatus};
 use serde_json::json;
 
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -15,17 +15,16 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 #[test]
 fn 任务创建会捕获基线并在重启后恢复() {
     let (_temp, workspace, harness_root) = fixture();
-    let harness = Harness::new(workspace.clone(), harness_root.clone()).expect("创建 Harness");
+    let (tasks, _coding) =
+        split_harness(workspace.clone(), harness_root.clone()).expect("创建 Harness");
 
-    let task = harness
-        .start_task("实现 Harness 基础能力")
-        .expect("启动任务");
+    let task = tasks.start_task("实现 Harness 基础能力").expect("启动任务");
 
     assert_eq!(task.status, TaskStatus::Active);
     assert_eq!(task.objective, "实现 Harness 基础能力");
     assert!(!task.baseline.worktree_fingerprint.is_empty());
     assert_eq!(
-        harness
+        tasks
             .current_task()
             .expect("读取任务")
             .expect("活动任务")
@@ -33,9 +32,10 @@ fn 任务创建会捕获基线并在重启后恢复() {
         task.id
     );
 
-    let restarted = Harness::new(workspace, harness_root).expect("重启 Harness");
+    let (restarted_tasks, _restarted_coding) =
+        split_harness(workspace, harness_root).expect("重启 Harness");
     assert_eq!(
-        restarted
+        restarted_tasks
             .current_task()
             .expect("恢复任务")
             .expect("活动任务")
@@ -47,19 +47,19 @@ fn 任务创建会捕获基线并在重启后恢复() {
 #[test]
 fn 同一工作区保留多个进行中任务与唯一默认路由且仍拒绝非法迁移() {
     let (_temp, workspace, harness_root) = fixture();
-    let harness = Harness::new(workspace, harness_root).expect("创建 Harness");
-    let first = harness.start_task("第一个任务").expect("启动任务");
-    let second = harness.start_task("第二个任务").expect("转移写租约");
+    let (tasks, _coding) = split_harness(workspace, harness_root).expect("创建 Harness");
+    let first = tasks.start_task("第一个任务").expect("启动任务");
+    let second = tasks.start_task("第二个任务").expect("转移写租约");
 
     assert_eq!(first.status, TaskStatus::Active);
     assert_eq!(second.status, TaskStatus::Active);
     assert_eq!(
-        harness.task(&first.id).expect("第一个任务").status,
+        tasks.task(&first.id).expect("第一个任务").status,
         TaskStatus::Active
     );
-    assert_eq!(harness.active_tasks().expect("活动任务").len(), 2);
+    assert_eq!(tasks.active_tasks().expect("活动任务").len(), 2);
     assert_eq!(
-        harness
+        tasks
             .current_task()
             .expect("读取默认任务")
             .expect("默认任务")
@@ -67,20 +67,20 @@ fn 同一工作区保留多个进行中任务与唯一默认路由且仍拒绝�
         second.id
     );
 
-    let invalid = harness
+    let invalid = tasks
         .transition(&second.id, TaskStatus::Completed)
         .expect_err("active 不应直接完成");
     assert_eq!(invalid.code(), "INVALID_TASK_TRANSITION");
 
-    let resumed = harness.switch_task(&first.id).expect("切换写任务");
+    let resumed = tasks.switch_task(&first.id).expect("切换写任务");
     assert_eq!(resumed.status, TaskStatus::Active);
     assert_eq!(
-        harness.task(&second.id).expect("第二个任务").status,
+        tasks.task(&second.id).expect("第二个任务").status,
         TaskStatus::Active
     );
-    assert_eq!(harness.active_tasks().expect("活动任务").len(), 2);
+    assert_eq!(tasks.active_tasks().expect("活动任务").len(), 2);
     assert_eq!(
-        harness
+        tasks
             .current_task()
             .expect("读取切换后的默认任务")
             .expect("切换后的默认任务")
@@ -92,16 +92,14 @@ fn 同一工作区保留多个进行中任务与唯一默认路由且仍拒绝�
 #[test]
 fn 外部文件变化会被识别且操作会留下事件() {
     let (_temp, workspace, harness_root) = fixture();
-    let harness = Harness::new(workspace.clone(), harness_root).expect("创建 Harness");
-    let task = harness.start_task("验证外部变更").expect("启动任务");
+    let (tasks, coding) = split_harness(workspace.clone(), harness_root).expect("创建 Harness");
+    let task = tasks.start_task("验证外部变更").expect("启动任务");
 
     fs::write(workspace.join("README.md"), "外部修改\n").expect("模拟外部修改");
-    let stale = harness
-        .check_baseline(&task.id)
-        .expect_err("应识别外部修改");
+    let stale = coding.check_baseline(&task.id).expect_err("应识别外部修改");
     assert_eq!(stale.code(), "FILE_CHANGED_EXTERNALLY");
 
-    harness
+    coding
         .record_event(
             &task.id,
             "operation_finished",
@@ -110,7 +108,7 @@ fn 外部文件变化会被识别且操作会留下事件() {
             json!({"ok": true}),
         )
         .expect("记录事件");
-    let events = harness.list_events(&task.id, 0, 10).expect("读取事件");
+    let events = coding.list_events(&task.id, 0, 10).expect("读取事件");
     assert!(events.len() >= 2);
     assert!(events
         .iter()
@@ -120,10 +118,10 @@ fn 外部文件变化会被识别且操作会留下事件() {
 #[test]
 fn project_state包含分支任务和脏状态摘要() {
     let (_temp, workspace, harness_root) = fixture();
-    let harness = Harness::new(workspace, harness_root).expect("创建 Harness");
-    let task = harness.start_task("生成项目状态").expect("启动任务");
+    let (tasks, coding) = split_harness(workspace, harness_root).expect("创建 Harness");
+    let task = tasks.start_task("生成项目状态").expect("启动任务");
 
-    let state = harness.project_state(20).expect("读取项目状态");
+    let state = coding.project_state(20).expect("读取项目状态");
 
     assert_eq!(state.active_task_id.as_deref(), Some(task.id.as_str()));
     assert!(!state.files.is_empty());

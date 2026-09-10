@@ -1604,7 +1604,7 @@ async fn run_command(
         .ensure_execution_capacity(ctx.resources.max_running_commands())?;
 
     let harness_metadata = task_id
-        .and_then(|task_id| ctx.harness.task(task_id).ok())
+        .and_then(|task_id| ctx.task_harness.task(task_id).ok())
         .map(|task| SessionHarnessMetadata {
             task_id: task.id,
             command: cmd.to_string(),

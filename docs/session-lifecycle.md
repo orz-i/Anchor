@@ -141,6 +141,24 @@ docs/history-session/
 
 `begin_work_session` 先打开当前开发 Session，再用明确的 `session_id + session_path` 绑定 Harness Task。
 
+Harness 内部现在明确拆成两套 authority：
+
+```text
+TaskHarness
+  ├─ task identity / objective
+  ├─ lifecycle / phase
+  ├─ steps / contract / Slice / working set
+  └─ Development Session association
+
+CodingHarness
+  ├─ workspace / managed worktree scope
+  ├─ baseline / expected state / writer safety
+  ├─ Verification / Recovery / ChangeSet
+  └─ stage commit / close outbox / coding completion evidence
+```
+
+两者共享同一个 workspace identity 与持久化事务底座，但调用方不能再通过单一 `ToolContext.harness` 跨域操作。内部 `HarnessKernel` 不作为业务 API 导出；它只保证跨 Task/Coding 状态更新仍可在当前文件型 store 上保持既有原子事务和 journal 语义。此次拆分是硬边界，不新增旧 `Harness` 兼容桥接。
+
 关键约束：
 
 - 不再回退到 workspace default Task 来“猜测”当前 Session 的任务；

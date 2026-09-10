@@ -453,10 +453,10 @@ fn automatic_milestone_checkpoint_uses_explicit_session_id_binding() {
         .expect("session path")
         .to_string();
     let task = ctx
-        .harness
+        .task_harness
         .start_task("automatic checkpoint binding")
         .expect("task");
-    ctx.harness
+    ctx.task_harness
         .bind_session(&task.id, &session_id, &session_path)
         .expect("bind session");
 
@@ -501,8 +501,11 @@ fn automatic_progress_checkpoint_reuses_stable_slots_and_clears_recovered_verifi
         .as_str()
         .expect("session path")
         .to_string();
-    let task = ctx.harness.start_task("stable auto slots").expect("task");
-    ctx.harness
+    let task = ctx
+        .task_harness
+        .start_task("stable auto slots")
+        .expect("task");
+    ctx.task_harness
         .bind_session(&task.id, &session_id, &session_path)
         .expect("bind session");
 

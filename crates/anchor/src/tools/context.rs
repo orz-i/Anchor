@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::harness::Harness;
+use crate::harness::{split_harness, CodingHarness, TaskHarness};
 use crate::tools::catalog::EffectiveCatalog;
 use crate::tools::command_cost::CommandCostGuard;
 use crate::tools::command_session::CommandSessionStore;
@@ -88,7 +88,8 @@ pub struct ToolContext {
     pub policy: PolicySettings,
     pub tool_profile: String,
     pub permission_mode: String,
-    pub harness: Harness,
+    pub task_harness: TaskHarness,
+    pub coding_harness: CodingHarness,
     pub mcp_proxies: crate::mcp::proxy::McpProxyRegistry,
     pub skills: crate::skills::SkillCatalog,
     pub(crate) ui_widget_domain: Option<String>,
@@ -149,9 +150,9 @@ impl ToolContext {
         let workspace = Workspace::new(root.clone())
             .map_err(|error| error.message())?
             .with_strict_read_boundary(self.workspace.strict_read_boundary());
-        let harness = self
-            .harness
-            .with_workspace_root(root.clone())
+        let coding_harness = self
+            .coding_harness
+            .scoped_to_workspace_root(root.clone())
             .map_err(|error| error.to_string())?;
         let scoped = Self {
             workspace,
@@ -159,7 +160,8 @@ impl ToolContext {
             policy: self.policy.clone(),
             tool_profile: self.tool_profile.clone(),
             permission_mode: self.permission_mode.clone(),
-            harness,
+            task_harness: self.task_harness.clone(),
+            coding_harness,
             mcp_proxies: self.mcp_proxies.clone(),
             skills: self.skills.clone(),
             ui_widget_domain: self.ui_widget_domain.clone(),
@@ -202,7 +204,7 @@ impl ToolContext {
         tool_profile: String,
         permission_mode: String,
     ) -> Self {
-        let harness_root = Harness::default_root().expect("无法初始化 Harness 数据目录");
+        let harness_root = CodingHarness::default_root().expect("无法初始化 Harness 数据目录");
         Self::from_workspace_with_harness_root(
             workspace,
             auth,
@@ -245,11 +247,12 @@ impl ToolContext {
         let root = workspace.root().to_path_buf();
         let command_cost = CommandCostGuard::new(&harness_root, &root);
         let resources = ExecutionResourceManager::new(&harness_root);
-        let harness = Harness::new(root.clone(), harness_root).expect("无法初始化 Harness");
-        let durable_command_root = harness
+        let (task_harness, coding_harness) =
+            split_harness(root.clone(), harness_root).expect("无法初始化 Harness");
+        let durable_command_root = coding_harness
             .store_root()
             .join("workspaces")
-            .join(harness.workspace_id())
+            .join(coding_harness.workspace_id())
             .join("command-jobs");
         let context = Self {
             workspace,
@@ -259,7 +262,8 @@ impl ToolContext {
                 .expect("tool profile must be validated")
                 .into(),
             permission_mode,
-            harness,
+            task_harness,
+            coding_harness,
             mcp_proxies: crate::mcp::proxy::McpProxyRegistry::default(),
             skills: crate::skills::SkillCatalog::new(root.clone()),
             ui_widget_domain: None,
@@ -485,7 +489,7 @@ impl ToolContext {
         task_id: &str,
     ) -> Result<crate::harness::model::TaskSession, String> {
         let task = self
-            .harness
+            .task_harness
             .task(task_id)
             .map_err(|error| error.to_string())?;
         if !task.status.is_writable() {
@@ -534,7 +538,7 @@ impl ToolContext {
                     .task_binding_scope_key_for_session(session_id)
                     .and_then(|scope| scope.strip_prefix("scope:").map(str::to_string));
                 let writable = self
-                    .harness
+                    .task_harness
                     .list_tasks()
                     .ok()?
                     .into_iter()
@@ -568,7 +572,7 @@ impl ToolContext {
             // Unscoped transports and ambiguous multi-writer workspaces remain fail-closed.
             return None;
         }
-        self.harness
+        self.task_harness
             .current_task()
             .ok()
             .flatten()
@@ -580,7 +584,7 @@ impl ToolContext {
                 )
             })
             .or_else(|| {
-                let tasks = self.harness.list_tasks().ok()?;
+                let tasks = self.task_harness.list_tasks().ok()?;
                 let writable_tasks = tasks
                     .into_iter()
                     .filter(|task| task.status.is_writable())
@@ -605,7 +609,7 @@ impl ToolContext {
                 .cloned()
                 .or_else(|| bindings.get(session_id).cloned())?
         };
-        if let Ok(task) = self.harness.task(&task_id) {
+        if let Ok(task) = self.task_harness.task(&task_id) {
             if task.status.is_writable() {
                 self.session_task_ids
                     .lock()
@@ -803,7 +807,10 @@ mod tests {
             harness_root.path().to_path_buf(),
         )
         .expect("context");
-        let task = ctx.harness.start_task("workspace default").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("workspace default")
+            .expect("task");
 
         assert_eq!(
             ctx.task_for_session(None).map(|task| task.id),
@@ -821,7 +828,10 @@ mod tests {
             harness_root.path().to_path_buf(),
         )
         .expect("context");
-        let task = ctx.harness.start_task("host scoped task").expect("task");
+        let task = ctx
+            .task_harness
+            .start_task("host scoped task")
+            .expect("task");
 
         let host_scope = crate::tools::session::host_session_scope("conversation-a");
         ctx.bind_cursor_scope_for_session("transport-a", Some(&host_scope));
@@ -851,8 +861,14 @@ mod tests {
             harness_root.path().to_path_buf(),
         )
         .expect("context");
-        let first = ctx.harness.start_task("first task").expect("first task");
-        let second = ctx.harness.start_task("second task").expect("second task");
+        let first = ctx
+            .task_harness
+            .start_task("first task")
+            .expect("first task");
+        let second = ctx
+            .task_harness
+            .start_task("second task")
+            .expect("second task");
         let first_path = "docs/session/ses_first.md";
         let second_path = "docs/session/ses_second.md";
         let first_scope = crate::tools::session::host_session_scope("conversation-a");
@@ -867,10 +883,10 @@ mod tests {
             format!("# Anchor Session\n\n**Host session scope:** {second_scope}\n"),
         )
         .expect("second session");
-        ctx.harness
+        ctx.task_harness
             .bind_session(&first.id, "ses_first", first_path)
             .expect("bind first durable session");
-        ctx.harness
+        ctx.task_harness
             .bind_session(&second.id, "ses_second", second_path)
             .expect("bind second durable session");
 
@@ -894,8 +910,8 @@ mod tests {
             harness_root.path().to_path_buf(),
         )
         .expect("context");
-        let task_a = ctx.harness.start_task("task a").expect("task a");
-        let task_b = ctx.harness.start_task("task b").expect("task b");
+        let task_a = ctx.task_harness.start_task("task a").expect("task a");
+        let task_b = ctx.task_harness.start_task("task b").expect("task b");
         let transport = "shared-transport";
 
         ctx.bind_task_for_session(Some(transport), &task_a.id)
@@ -932,7 +948,10 @@ mod tests {
             harness_root.path().to_path_buf(),
         )
         .expect("source context");
-        let task = source.harness.start_task("handoff task").expect("task");
+        let task = source
+            .task_harness
+            .start_task("handoff task")
+            .expect("task");
         let transport = "handoff-transport";
         source
             .bind_task_for_session(Some(transport), &task.id)
@@ -986,13 +1005,13 @@ mod tests {
     fn tool_context_construction_does_not_recover_close_outboxes() {
         let workspace = tempfile::tempdir().expect("workspace");
         let harness_root = tempfile::tempdir().expect("harness");
-        let harness = Harness::new(
+        let (_tasks, coding) = split_harness(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
         .expect("harness");
         let task_id = "missing-task-for-startup";
-        harness
+        coding
             .save_close_outbox(&WorkSessionCloseOutbox {
                 schema_version: SCHEMA_VERSION,
                 task_id: task_id.into(),
@@ -1018,7 +1037,7 @@ mod tests {
         )
         .expect("context");
         let persisted = ctx
-            .harness
+            .coding_harness
             .load_close_outbox(task_id)
             .expect("load outbox")
             .expect("persisted outbox");

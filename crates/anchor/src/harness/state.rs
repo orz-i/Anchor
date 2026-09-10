@@ -25,7 +25,7 @@ const ACTIVE_TASK_WARNING_THRESHOLD: usize = 8;
 const STALE_ACTIVE_TASK_AFTER_MS: u64 = 12 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
-pub struct Harness {
+pub(crate) struct HarnessKernel {
     workspace_root: PathBuf,
     workspace_id: String,
     store: HarnessStore,
@@ -222,7 +222,7 @@ fn baseline_observation_token(
     format!("anchor-observation-v1:{:x}", hasher.finalize())
 }
 
-impl Harness {
+impl HarnessKernel {
     pub fn new(workspace_root: PathBuf, harness_root: PathBuf) -> HarnessResult<Self> {
         let workspace_root = workspace_root
             .canonicalize()
@@ -1082,7 +1082,12 @@ impl Harness {
                 ))?;
                 Ok(task)
             })?;
-        crate::notifications::task_completed(self, &task, verified);
+        crate::notifications::task_completed(
+            self.workspace_id(),
+            self.store_root(),
+            &task,
+            verified,
+        );
         Ok(task)
     }
 
@@ -2794,7 +2799,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -2812,7 +2817,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -2832,7 +2837,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -2873,7 +2878,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -2915,7 +2920,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -2967,7 +2972,7 @@ mod tests {
     fn meaningful_tool_activity_updates_heartbeat_without_mutating_active_task_state() {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness root");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3002,7 +3007,7 @@ mod tests {
     fn status_and_lifecycle_tools_do_not_auto_resume_paused_tasks() {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3037,7 +3042,7 @@ mod tests {
     fn auto_resume_does_not_override_verifying_or_failed_states() {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3066,7 +3071,7 @@ mod tests {
     fn verifying_task_can_pause_without_claiming_completion() {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3090,7 +3095,7 @@ mod tests {
     fn no_early_stop_task_can_be_aborted_as_incomplete_from_verifying() {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3179,7 +3184,7 @@ mod tests {
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
         git(workspace.path(), &["add", "main.rs"]);
         git(workspace.path(), &["commit", "-m", "initial"]);
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3213,7 +3218,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "one\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3245,13 +3250,13 @@ mod tests {
         fs::write(first.join("main.rs"), "fn main() {}\n").expect("file");
 
         let first_harness =
-            Harness::new(first.clone(), harness_root.clone()).expect("first harness");
+            HarnessKernel::new(first.clone(), harness_root.clone()).expect("first harness");
         let workspace_id = first_harness.workspace_id().to_string();
         drop(first_harness);
         fs::rename(&first, &second).expect("move workspace");
 
         let second_harness =
-            Harness::new(second.clone(), harness_root.clone()).expect("second harness");
+            HarnessKernel::new(second.clone(), harness_root.clone()).expect("second harness");
         assert_eq!(second_harness.workspace_id(), workspace_id);
         let identity_path = harness_root
             .join("workspaces")
@@ -3275,7 +3280,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3306,7 +3311,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3353,7 +3358,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3444,7 +3449,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3502,7 +3507,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )
@@ -3527,7 +3532,7 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let harness_root = tempdir().expect("harness");
         fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
-        let harness = Harness::new(
+        let harness = HarnessKernel::new(
             workspace.path().to_path_buf(),
             harness_root.path().to_path_buf(),
         )

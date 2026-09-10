@@ -205,7 +205,7 @@ fn auto_pause_stale_tasks(ctx: &ToolContext) -> Result<Vec<String>, WorkspaceErr
         .task_ids_requiring_followup()
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    ctx.harness
+    ctx.task_harness
         .pause_stale_active_tasks(&protected)
         .map_err(map_error)
 }
@@ -224,10 +224,10 @@ fn resolve_recovery(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
     let evidence = string_list(args.get("evidence"))?.unwrap_or_default();
     let recovery = ctx
-        .harness
+        .coding_harness
         .resolve_recovery(task_id, recovery_id, reason, &evidence)
         .map_err(map_error)?;
-    let task = ctx.harness.task(task_id).map_err(map_error)?;
+    let task = ctx.task_harness.task(task_id).map_err(map_error)?;
     Ok(json!({
         "task_id": task_id,
         "recovery": recovery,
@@ -285,7 +285,7 @@ fn cleanup_closed_task_worktree(
     task_id: &str,
     source_tool: &str,
 ) -> Result<Value, WorkspaceError> {
-    let task = ctx.harness.task(task_id).map_err(map_error)?;
+    let task = ctx.task_harness.task(task_id).map_err(map_error)?;
     let Some(worktree) = task.git_worktree.as_ref() else {
         return Ok(json!({"requested": false, "removed": false}));
     };
@@ -320,7 +320,7 @@ fn cleanup_closed_task_worktree(
     };
     let workspace = primary_workspace.as_ref().unwrap_or(&ctx.workspace);
     crate::tools::git::remove_managed_task_worktree(workspace, worktree)?;
-    let _ = ctx.harness.record_event(
+    let _ = ctx.coding_harness.record_event(
         task_id,
         "git_worktree_removed",
         Some(source_tool),
@@ -341,7 +341,7 @@ fn finish_task_worktree_cleanup(ctx: &ToolContext, task_id: &str) -> Value {
         Ok(result) => result,
         Err(error) => {
             let error_value = error.to_error_value();
-            let _ = ctx.harness.record_event(
+            let _ = ctx.coding_harness.record_event(
                 task_id,
                 "git_worktree_cleanup_pending",
                 Some("finish_task"),
@@ -401,7 +401,7 @@ fn export_work_session(
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-        ctx.harness.task(task_id).map_err(map_error)?
+        ctx.task_harness.task(task_id).map_err(map_error)?
     } else {
         ctx.task_for_session(session_id)
             .ok_or_else(|| tool_error("TASK_STATE_REQUIRED", "没有可导出的任务"))?
@@ -442,7 +442,7 @@ fn export_work_session(
         session_id,
     )?;
     let verifications = ctx
-        .harness
+        .coding_harness
         .list_verifications(&task.id)
         .map_err(map_error)?;
     let git = crate::tools::git::git_status(
@@ -576,7 +576,10 @@ fn resume_task(
 ) -> Result<Value, WorkspaceError> {
     let target_task_id = task_id(args)?;
     ensure_writer_handoff_available(ctx, Some(target_task_id), None)?;
-    let task = ctx.harness.switch_task(target_task_id).map_err(map_error)?;
+    let task = ctx
+        .task_harness
+        .switch_task(target_task_id)
+        .map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     let parallel = task.git_worktree.is_some();
@@ -729,7 +732,10 @@ fn switch_task(
 ) -> Result<Value, WorkspaceError> {
     let target_task_id = task_id(args)?;
     ensure_writer_handoff_available(ctx, Some(target_task_id), None)?;
-    let task = ctx.harness.switch_task(target_task_id).map_err(map_error)?;
+    let task = ctx
+        .task_harness
+        .switch_task(target_task_id)
+        .map_err(map_error)?;
     ctx.bind_task_for_session(session_id, &task.id)
         .map_err(|error| tool_error("TASK_BIND_FAILED", error))?;
     let scoped = ctx
@@ -744,7 +750,7 @@ fn switch_task(
         "workspace_mode": task_workspace_mode(&task),
         "writer_mode": if parallel { "isolated_worktree" } else { "single_shared_writer" },
         "git_worktree": task.git_worktree,
-        "harness": status_context.harness.status_for_task(Some(&task.id)).map_err(map_error)?
+        "harness": status_context.coding_harness.status_for_task(Some(&task.id)).map_err(map_error)?
     }))
 }
 
@@ -754,7 +760,7 @@ fn ensure_writer_handoff_available(
     requested_worktree_path: Option<&str>,
 ) -> Result<(), WorkspaceError> {
     let target_domain = if let Some(task_id) = target_task_id {
-        let task = ctx.harness.task(task_id).map_err(map_error)?;
+        let task = ctx.task_harness.task(task_id).map_err(map_error)?;
         task.git_worktree
             .map(|worktree| worktree.path)
             .unwrap_or_else(|| "shared".to_string())
@@ -769,7 +775,7 @@ fn ensure_writer_handoff_available(
         .into_iter()
         .filter(|task_id| Some(task_id.as_str()) != target_task_id)
         .filter(|task_id| {
-            ctx.harness
+            ctx.task_harness
                 .task(task_id)
                 .map(|task| {
                     task.git_worktree
@@ -809,12 +815,12 @@ fn accept_latest_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, Work
         .unwrap_or(3)
         .clamp(1, 10) as u8;
     let (task, attempts, baseline) = ctx
-        .harness
+        .coding_harness
         .accept_latest_baseline(task_id, reason, max_attempts)
         .map_err(map_error)?;
     Ok(json!({
         "task": task_view(&task),
-        "harness": ctx.harness.status().map_err(map_error)?,
+        "harness": ctx.coding_harness.status().map_err(map_error)?,
         "accepted": true,
         "attempts": attempts,
         "accepted_state": {
@@ -876,12 +882,12 @@ fn accept_current_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, Wor
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
     let task = ctx
-        .harness
+        .coding_harness
         .accept_current_baseline(task_id, observation_token, reason)
         .map_err(map_error)?;
     Ok(json!({
         "task": task_view(&task),
-        "harness": ctx.harness.status().map_err(map_error)?,
+        "harness": ctx.coding_harness.status().map_err(map_error)?,
         "accepted": true
     }))
 }
@@ -918,11 +924,11 @@ fn update_verification_disposition(
         "audited_disposition"
     };
     let verification = ctx
-        .harness
+        .coding_harness
         .update_verification_disposition(task_id, verification_id, disposition, reason, source)
         .map_err(map_error)?;
     let task_recovery = if disposition != "active_failure" {
-        let task = ctx.harness.task(task_id).map_err(map_error)?;
+        let task = ctx.task_harness.task(task_id).map_err(map_error)?;
         let matching_step = task.recovery.as_ref().and_then(|recovery| {
             (recovery.status == TaskRecoveryStatus::Open
                 && recovery.related_verification_id.as_deref() == Some(verification_id))
@@ -934,7 +940,7 @@ fn update_verification_disposition(
             })
         });
         if let Some((step, fingerprint)) = matching_step {
-            ctx.harness
+            ctx.coding_harness
                 .resolve_recovery_for_step(task_id, &step, fingerprint.as_deref())
                 .map_err(map_error)?
         } else {
@@ -943,7 +949,10 @@ fn update_verification_disposition(
     } else {
         None
     };
-    let records = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    let records = ctx
+        .coding_harness
+        .list_verifications(task_id)
+        .map_err(map_error)?;
     Ok(json!({
         "verification": verification_view(&verification),
         "verification_status": verification_status(&records),
@@ -985,7 +994,7 @@ fn begin_work_session(
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("SESSION_INVALID", "Session 缺少 session_path"))?;
 
-    let tasks = ctx.harness.list_tasks().map_err(map_error)?;
+    let tasks = ctx.task_harness.list_tasks().map_err(map_error)?;
     let requested_task_id = args
         .get("task_id")
         .and_then(Value::as_str)
@@ -1056,9 +1065,9 @@ fn begin_work_session(
             if task.objective != objective {
                 if objective_revision_requested {
                     ensure_writer_handoff_available(ctx, Some(&task.id), None)?;
-                    ctx.harness.switch_task(&task.id).map_err(map_error)?;
+                    ctx.task_harness.switch_task(&task.id).map_err(map_error)?;
                     let task = ctx
-                        .harness
+                        .task_harness
                         .revise_plan(
                             &task.id,
                             objective,
@@ -1132,7 +1141,7 @@ fn begin_work_session(
                 }
             } else {
                 ensure_writer_handoff_available(ctx, Some(&task.id), None)?;
-                let task = ctx.harness.switch_task(&task.id).map_err(map_error)?;
+                let task = ctx.task_harness.switch_task(&task.id).map_err(map_error)?;
                 (task, false, None)
             }
         }
@@ -1201,17 +1210,17 @@ fn begin_work_session(
             });
         }
         ensure_session_reclaim_safe(ctx, &task, args)?;
-        ctx.harness
+        ctx.task_harness
             .reclaim_session(&task.id, session_id, session_path)
             .map_err(map_error)?
     } else {
-        ctx.harness
+        ctx.task_harness
             .bind_session(&task.id, session_id, session_path)
             .map_err(map_error)?
     };
     if task_created && !configuration.is_empty() {
         task = ctx
-            .harness
+            .task_harness
             .configure_task(
                 &task.id,
                 configuration.phase,
@@ -1223,13 +1232,13 @@ fn begin_work_session(
     }
     if task_created && (completed_steps.is_some() || pending_steps.is_some()) {
         task = ctx
-            .harness
+            .task_harness
             .update_steps(&task.id, completed_steps, pending_steps)
             .map_err(map_error)?;
     }
     let auto_paused_previous_task_ids = if task_created && task.git_worktree.is_none() {
         let running_task_ids = ctx.sessions.running_task_ids();
-        ctx.harness
+        ctx.task_harness
             .list_tasks()
             .map_err(map_error)?
             .into_iter()
@@ -1246,7 +1255,7 @@ fn begin_work_session(
                         .any(|task_id| task_id == &previous.id)
             })
             .filter_map(|previous| {
-                ctx.harness
+                ctx.task_harness
                     .transition(&previous.id, TaskStatus::Paused)
                     .ok()
                     .map(|_| previous.id)
@@ -1262,7 +1271,7 @@ fn begin_work_session(
         .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
     let status_context = scoped.as_ref().unwrap_or(ctx);
     let harness = status_context
-        .harness
+        .coding_harness
         .status_for_task(Some(&task.id))
         .map_err(map_error)?;
     let harness_value = serde_json::to_value(&harness)
@@ -1317,7 +1326,11 @@ fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Works
         .get("detail")
         .and_then(Value::as_str)
         .unwrap_or("compact");
-    if let Some(mut outbox) = ctx.harness.load_close_outbox(task_id).map_err(map_error)? {
+    if let Some(mut outbox) = ctx
+        .coding_harness
+        .load_close_outbox(task_id)
+        .map_err(map_error)?
+    {
         if parse_close_outcome(&outbox.finish_args)? == "incomplete" {
             return Err(tool_error(
                 "WORK_SESSION_ALREADY_ABORTING",
@@ -1353,7 +1366,9 @@ fn complete_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Works
             outbox.checkpoint_args["session_status"] = Value::String("completed".into());
             outbox.last_error = None;
             outbox.updated_at = harness_timestamp();
-            ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+            ctx.coding_harness
+                .save_close_outbox(&outbox)
+                .map_err(map_error)?;
         }
         return resume_close_outbox(ctx, outbox, true)
             .map(|value| present_complete_work_session(value, detail));
@@ -1439,10 +1454,14 @@ fn compact_harness_value(value: &Value) -> Value {
 
 fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let task_id = task_id(args)?;
-    if let Some(outbox) = ctx.harness.load_close_outbox(task_id).map_err(map_error)? {
+    if let Some(outbox) = ctx
+        .coding_harness
+        .load_close_outbox(task_id)
+        .map_err(map_error)?
+    {
         return resume_close_outbox(ctx, outbox, true);
     }
-    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let task_before = ctx.task_harness.task(task_id).map_err(map_error)?;
     let outcome = parse_close_outcome(args)?;
     if outcome == "completed" && task_before.status == TaskStatus::Incomplete {
         return Err(tool_error(
@@ -1522,12 +1541,17 @@ fn close_work_session(ctx: &ToolContext, args: &Value) -> Result<Value, Workspac
         created_at: now.clone(),
         updated_at: now,
     };
-    ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+    ctx.coding_harness
+        .save_close_outbox(&outbox)
+        .map_err(map_error)?;
     resume_close_outbox(ctx, outbox, true)
 }
 
 pub(crate) fn recover_close_outboxes(ctx: &ToolContext) -> Result<Vec<Value>, WorkspaceError> {
-    let outboxes = ctx.harness.list_close_outboxes().map_err(map_error)?;
+    let outboxes = ctx
+        .coding_harness
+        .list_close_outboxes()
+        .map_err(map_error)?;
     let mut recovered = Vec::new();
     for outbox in outboxes {
         if outbox.phase == WorkSessionClosePhase::Completed {
@@ -1556,13 +1580,15 @@ fn resume_close_outbox(
 ) -> Result<Value, WorkspaceError> {
     outbox.attempts = outbox.attempts.saturating_add(1);
     outbox.updated_at = harness_timestamp();
-    ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+    ctx.coding_harness
+        .save_close_outbox(&outbox)
+        .map_err(map_error)?;
 
     let mut finish = None;
     let mut checkpoint = None;
     let outcome = parse_close_outcome(&outbox.finish_args)?;
     if outbox.phase == WorkSessionClosePhase::Completed {
-        let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+        let task = ctx.task_harness.task(&outbox.task_id).map_err(map_error)?;
         finish = Some(json!({
             "ok": true,
             "task_status": task.status,
@@ -1581,7 +1607,7 @@ fn resume_close_outbox(
         }));
     }
     if outbox.phase == WorkSessionClosePhase::Prepared {
-        let task_before = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+        let task_before = ctx.task_harness.task(&outbox.task_id).map_err(map_error)?;
         let scoped = ctx
             .scoped_for_task(&task_before, None)
             .map_err(|message| tool_error("TASK_WORKTREE_UNAVAILABLE", message))?;
@@ -1636,7 +1662,9 @@ fn resume_close_outbox(
                 "result": result
             }));
             outbox.updated_at = harness_timestamp();
-            ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+            ctx.coding_harness
+                .save_close_outbox(&outbox)
+                .map_err(map_error)?;
             let (error_code, error_message) = if outcome == "incomplete" {
                 (
                     "WORK_SESSION_ABORT_BLOCKED",
@@ -1677,7 +1705,9 @@ fn resume_close_outbox(
         outbox.phase = WorkSessionClosePhase::TaskClosed;
         outbox.last_error = None;
         outbox.updated_at = harness_timestamp();
-        ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+        ctx.coding_harness
+            .save_close_outbox(&outbox)
+            .map_err(map_error)?;
     }
 
     if matches!(
@@ -1690,7 +1720,9 @@ fn resume_close_outbox(
                 outbox.phase = WorkSessionClosePhase::Completed;
                 outbox.last_error = None;
                 outbox.updated_at = harness_timestamp();
-                ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+                ctx.coding_harness
+                    .save_close_outbox(&outbox)
+                    .map_err(map_error)?;
             }
             Err(error) => {
                 outbox.phase = WorkSessionClosePhase::CheckpointPending;
@@ -1700,7 +1732,9 @@ fn resume_close_outbox(
                     "cause": cause.clone()
                 }));
                 outbox.updated_at = harness_timestamp();
-                ctx.harness.save_close_outbox(&outbox).map_err(map_error)?;
+                ctx.coding_harness
+                    .save_close_outbox(&outbox)
+                    .map_err(map_error)?;
                 if propagate_checkpoint_error {
                     return Ok(json!({
                         "ok": false,
@@ -1745,7 +1779,7 @@ fn resume_close_outbox(
     } else {
         Value::Null
     };
-    let task = ctx.harness.task(&outbox.task_id).map_err(map_error)?;
+    let task = ctx.task_harness.task(&outbox.task_id).map_err(map_error)?;
     Ok(json!({
         "ok": completed,
         "work_session": {
@@ -1763,7 +1797,7 @@ fn resume_close_outbox(
         "worktree_cleanup": worktree_cleanup,
         "outbox": close_outbox_view(&outbox),
         "task": task_view(&task),
-        "harness": ctx.harness.status().map_err(map_error)?
+        "harness": ctx.coding_harness.status().map_err(map_error)?
     }))
 }
 
@@ -1827,12 +1861,12 @@ fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "reason 是必填项"))?;
     let task = ctx
-        .harness
+        .coding_harness
         .refresh_baseline(task_id, observed_head, observed_fingerprint, reason)
         .map_err(map_error)?;
     Ok(json!({
         "task": task_view(&task),
-        "harness": ctx.harness.status().map_err(map_error)?
+        "harness": ctx.coding_harness.status().map_err(map_error)?
     }))
 }
 
@@ -1840,7 +1874,7 @@ fn harness_status(ctx: &ToolContext, session_id: Option<&str>) -> Result<Value, 
     let selected = ctx.task_for_session(session_id);
     let selected_task_id = selected.as_ref().map(|task| task.id.clone());
     let mut value = serde_json::to_value(
-        ctx.harness
+        ctx.coding_harness
             .status_for_task(selected.as_ref().map(|task| task.id.as_str()))
             .map_err(map_error)?,
     )
@@ -1904,7 +1938,10 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     let started_before = optional_text(args, "started_before")
         .map(parse_time_filter)
         .transpose()?;
-    let raw = ctx.harness.all_operations(20_000).map_err(map_error)?;
+    let raw = ctx
+        .coding_harness
+        .all_operations(20_000)
+        .map_err(map_error)?;
     let mut operations = if collapse {
         collapse_operations(raw)
     } else {
@@ -2194,13 +2231,13 @@ fn project_state(
     let max_files = args.get("max_files").and_then(Value::as_u64).unwrap_or(200) as usize;
     let selected_task = ctx.task_for_session(session_id);
     let state = ctx
-        .harness
+        .coding_harness
         .project_state_for_task(
             max_files,
             selected_task.as_ref().map(|task| task.id.as_str()),
         )
         .map_err(map_error)?;
-    let all_tasks = ctx.harness.list_tasks().map_err(map_error)?;
+    let all_tasks = ctx.task_harness.list_tasks().map_err(map_error)?;
     let task_count = all_tasks.len();
     let tasks = all_tasks
         .into_iter()
@@ -2242,7 +2279,7 @@ fn start_task(
     let mut task = start_task_for_workspace_mode(ctx, objective, args)?;
     if !configuration.is_empty() {
         task = ctx
-            .harness
+            .task_harness
             .configure_task(
                 &task.id,
                 configuration.phase,
@@ -2254,7 +2291,7 @@ fn start_task(
     }
     if completed_steps.is_some() || pending_steps.is_some() {
         task = ctx
-            .harness
+            .task_harness
             .update_steps(&task.id, completed_steps, pending_steps)
             .map_err(map_error)?;
     }
@@ -2289,7 +2326,7 @@ fn start_task_for_workspace_mode(
                     "worktree_path is valid only when workspace_mode=worktree",
                 ));
             }
-            ctx.harness.start_task(objective).map_err(map_error)
+            ctx.task_harness.start_task(objective).map_err(map_error)
         }
         "worktree" => {
             let task_id = Uuid::new_v4().simple().to_string();
@@ -2338,10 +2375,11 @@ fn start_task_for_workspace_mode(
                 }
                 return Err(error);
             }
-            match ctx
-                .harness
-                .start_task_in_git_worktree(objective, task_id, worktree.clone())
-            {
+            match ctx.coding_harness.start_task_in_git_worktree(
+                objective,
+                task_id,
+                worktree.clone(),
+            ) {
                 Ok(task) => Ok(task),
                 Err(error) => {
                     if created_now {
@@ -2367,7 +2405,7 @@ fn ensure_existing_managed_worktree_attachable(
 ) -> Result<(), WorkspaceError> {
     let target = crate::tools::git::managed_worktree_path(&ctx.workspace, raw_path)?;
     let blocking_tasks = ctx
-        .harness
+        .task_harness
         .list_tasks()
         .map_err(map_error)?
         .into_iter()
@@ -2491,9 +2529,9 @@ fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     let completed_steps = string_list(args.get("completed_steps"))?;
     let pending_steps = string_list(args.get("pending_steps"))?;
     let configuration = parse_task_configuration(args)?;
-    let current = ctx.harness.task(task_id).map_err(map_error)?;
+    let current = ctx.task_harness.task(task_id).map_err(map_error)?;
     let task = if let Some(objective) = objective.filter(|value| *value != current.objective) {
-        ctx.harness
+        ctx.task_harness
             .revise_plan(
                 task_id,
                 objective,
@@ -2509,13 +2547,13 @@ fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         let mut task = current;
         if completed_steps.is_some() || pending_steps.is_some() {
             task = ctx
-                .harness
+                .task_harness
                 .update_steps(task_id, completed_steps, pending_steps)
                 .map_err(map_error)?;
         }
         if !configuration.is_empty() {
             task = ctx
-                .harness
+                .task_harness
                 .configure_task(
                     task_id,
                     configuration.phase,
@@ -2536,13 +2574,13 @@ fn task_gate_status(
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-        ctx.harness.task(task_id).map_err(map_error)?
+        ctx.task_harness.task(task_id).map_err(map_error)?
     } else {
         ctx.task_for_session(session_id)
             .ok_or_else(|| tool_error("TASK_STATE_REQUIRED", "当前会话未绑定任务"))?
     };
     let verifications = ctx
-        .harness
+        .coding_harness
         .list_verifications(&task.id)
         .map_err(map_error)?;
     let completion_gate = completion_gate_value(ctx, &task, &verifications, false, false);
@@ -2658,7 +2696,10 @@ fn start_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         &now,
     )?;
     let slice_id = slice.id.clone();
-    let task = ctx.harness.start_slice(task_id, slice).map_err(map_error)?;
+    let task = ctx
+        .task_harness
+        .start_slice(task_id, slice)
+        .map_err(map_error)?;
     let slice = task
         .slices
         .iter()
@@ -2698,7 +2739,7 @@ fn update_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError
         .map(|value| optional_bounded_string(Some(value), "blocker", 2_000))
         .transpose()?;
     let task = ctx
-        .harness
+        .task_harness
         .update_slice(
             task_id,
             &slice_id,
@@ -2730,13 +2771,16 @@ fn complete_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
     let task_id = task_id(args)?;
     let slice_id = required_bounded_string(args.get("slice_id"), "slice_id", 128)?;
     let commit_sha = optional_bounded_string(args.get("commit_sha"), "commit_sha", 128)?;
-    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let task_before = ctx.task_harness.task(task_id).map_err(map_error)?;
     let slice = task_before
         .slices
         .iter()
         .find(|slice| slice.id == slice_id)
         .ok_or_else(|| tool_error("SLICE_NOT_FOUND", format!("Slice not found: {slice_id}")))?;
-    let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    let verifications = ctx
+        .coding_harness
+        .list_verifications(task_id)
+        .map_err(map_error)?;
     let effective_commit = commit_sha.clone().or_else(|| slice.commit_sha.clone());
     let mut missing = Vec::new();
     if slice.status != TaskSliceStatus::Verifying {
@@ -2797,7 +2841,7 @@ fn complete_slice(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErr
         }));
     }
     let task = ctx
-        .harness
+        .task_harness
         .complete_slice(task_id, &slice_id, effective_commit)
         .map_err(map_error)?;
     let completed_slice = task
@@ -3064,7 +3108,7 @@ fn transition(
     status: TaskStatus,
 ) -> Result<Value, WorkspaceError> {
     let task = ctx
-        .harness
+        .task_harness
         .transition(task_id(args)?, status)
         .map_err(map_error)?;
     Ok(json!({"task": task_view(&task)}))
@@ -3085,8 +3129,11 @@ fn abort_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
             "未完成任务终止后 session_status 只能是 active 或 paused",
         ));
     }
-    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
-    let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
+    let task_before = ctx.task_harness.task(task_id).map_err(map_error)?;
+    let verifications = ctx
+        .coding_harness
+        .list_verifications(task_id)
+        .map_err(map_error)?;
     let completion_gate = completion_gate_value(ctx, &task_before, &verifications, false, false);
     let running_sessions = completion_gate["running_sessions"]
         .as_array()
@@ -3102,7 +3149,7 @@ fn abort_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
             "task_status": task_before.status,
             "outcome": "incomplete",
             "closed": false,
-            "session_status": ctx.harness.status().map_err(map_error)?.session_status,
+            "session_status": ctx.coding_harness.status().map_err(map_error)?.session_status,
             "requested_session_status": requested_session_status,
             "reason": "任务仍有运行中或尚未消费终态的 retained command；请先终止/读取结果，再执行 abort。",
             "running_sessions": running_sessions,
@@ -3122,10 +3169,14 @@ fn abort_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
         }));
     }
     let task = ctx
-        .harness
+        .task_harness
         .abort_task(task_id, reason, requested_session_status)
         .map_err(map_error)?;
-    let workspace_session_status = ctx.harness.status().map_err(map_error)?.session_status;
+    let workspace_session_status = ctx
+        .coding_harness
+        .status()
+        .map_err(map_error)?
+        .session_status;
     let stored_reason = task
         .termination
         .as_ref()
@@ -3160,8 +3211,11 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .get("_completion_via_work_session")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let verifications = ctx.harness.list_verifications(task_id).map_err(map_error)?;
-    let task_before = ctx.harness.task(task_id).map_err(map_error)?;
+    let verifications = ctx
+        .coding_harness
+        .list_verifications(task_id)
+        .map_err(map_error)?;
+    let task_before = ctx.task_harness.task(task_id).map_err(map_error)?;
     let (task_before, reconciled_phases) = reconcile_completion_phase(
         ctx,
         task_before,
@@ -3185,7 +3239,9 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
                 .any(|item| item["code"] == "command_results_pending")
         });
     if !command_results_pending {
-        ctx.harness.check_baseline(task_id).map_err(map_error)?;
+        ctx.coding_harness
+            .check_baseline(task_id)
+            .map_err(map_error)?;
     }
     if completion_gate["ready"] != Value::Bool(true) {
         let missing_codes = completion_gate["missing"]
@@ -3201,7 +3257,9 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         let task = if closure_protocol_only {
             task_before.clone()
         } else {
-            ctx.harness.mark_verifying(task_id).map_err(map_error)?
+            ctx.task_harness
+                .mark_verifying(task_id)
+                .map_err(map_error)?
         };
         let (code, reason, message) = if missing_codes.contains(&"command_results_pending") {
             (
@@ -3284,11 +3342,15 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         None,
     )?;
     let task = ctx
-        .harness
+        .task_harness
         .complete_task(task_id, verified, session_status)
         .map_err(map_error)?;
     let worktree_cleanup = finish_task_worktree_cleanup(ctx, task_id);
-    let workspace_session_status = ctx.harness.status().map_err(map_error)?.session_status;
+    let workspace_session_status = ctx
+        .coding_harness
+        .status()
+        .map_err(map_error)?
+        .session_status;
     let mut response = json!({
         "ok": true,
         "task_status": if verified { "completed" } else { "completed_unverified" },
@@ -3366,7 +3428,7 @@ fn reconcile_completion_phase(
     let mut reconciled = Vec::new();
     for phase in phases {
         task = ctx
-            .harness
+            .task_harness
             .configure_task(&task.id, Some(phase), None, None, None)
             .map_err(map_error)?;
         if let Ok(Value::String(label)) = serde_json::to_value(phase) {
@@ -3382,7 +3444,7 @@ fn task_context(
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-        Some(ctx.harness.task(task_id).map_err(map_error)?)
+        Some(ctx.task_harness.task(task_id).map_err(map_error)?)
     } else {
         ctx.task_for_session(session_id)
     };
@@ -3395,11 +3457,11 @@ fn task_context(
         .unwrap_or(32_768)
         .clamp(8_192, 131_072) as usize;
     let events = ctx
-        .harness
+        .coding_harness
         .list_events(&task.id, 0, 200)
         .map_err(map_error)?;
     let verifications = ctx
-        .harness
+        .coding_harness
         .list_verifications(&task.id)
         .map_err(map_error)?;
     let completion_gate = completion_gate_value(ctx, &task, &verifications, false, false);
@@ -3443,7 +3505,7 @@ fn list_task_events(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .unwrap_or(50)
         .clamp(1, 200) as usize;
     let events = ctx
-        .harness
+        .coding_harness
         .list_events(task_id, offset, limit)
         .map_err(map_error)?;
     let event_count = events.len();
@@ -3468,7 +3530,7 @@ fn change_summary(
     session_id: Option<&str>,
 ) -> Result<Value, WorkspaceError> {
     let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
-        ctx.harness.task(task_id).map_err(map_error)?
+        ctx.task_harness.task(task_id).map_err(map_error)?
     } else {
         ctx.task_for_session(session_id)
             .ok_or_else(|| tool_error("TASK_STATE_REQUIRED", "没有可总结的活动任务"))?
@@ -3489,9 +3551,12 @@ fn change_summary(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let all_changes = ctx.harness.list_change_sets(&task.id).map_err(map_error)?;
+    let all_changes = ctx
+        .coding_harness
+        .list_change_sets(&task.id)
+        .map_err(map_error)?;
     let selected_changes = if let Some(change_id) = requested_change_id {
-        ctx.harness
+        ctx.coding_harness
             .load_change_set(change_id)
             .map_err(map_error)?
             .into_iter()
@@ -3634,13 +3699,13 @@ fn change_summary(
     ignored_files.sort();
     ignored_files.dedup();
     let verifications = ctx
-        .harness
+        .coding_harness
         .list_verifications(&task.id)
         .map_err(map_error)?;
     let verification = verification_views(&verifications, verification_history_mode);
     let verification_summary = verification_presentation_summary(&verifications);
     let events = ctx
-        .harness
+        .coding_harness
         .list_events(&task.id, 0, 100)
         .map_err(map_error)?;
     let evidence = events
@@ -4106,7 +4171,7 @@ fn classify_working_tree_ownership(
     working_tree_files: &[String],
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut owners = HashMap::<String, String>::new();
-    if let Ok(operations) = ctx.harness.all_operations(20_000) {
+    if let Ok(operations) = ctx.coding_harness.all_operations(20_000) {
         for operation in operations {
             let Some(owner) = operation.task_id else {
                 continue;

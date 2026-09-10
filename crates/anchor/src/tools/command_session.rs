@@ -391,7 +391,7 @@ fn validate_durable_spec_location(spec_path: &Path) -> Result<(), String> {
 
     #[cfg(not(test))]
     {
-        let harness_root = crate::harness::Harness::default_root()
+        let harness_root = crate::harness::CodingHarness::default_root()
             .map_err(|error| format!("resolve Harness root failed: {error}"))?;
         let harness_root = fs::canonicalize(&harness_root)
             .map_err(|error| format!("canonicalize Harness root failed: {error}"))?;

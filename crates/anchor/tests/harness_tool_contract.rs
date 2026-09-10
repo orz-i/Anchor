@@ -73,7 +73,7 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
         .expect("session id")
         .to_string();
     let stale_verification = ctx
-        .harness
+        .coding_harness
         .record_verification(
             &task_id,
             "test",
@@ -129,7 +129,10 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
     assert_eq!(resumed["work_session"]["objective_revised"], true);
     assert!(resumed["work_session"].get("previous_objective").is_none());
     assert!(resumed["task"].get("objective").is_none());
-    let revised = ctx.harness.task(&task_id).expect("revised durable task");
+    let revised = ctx
+        .task_harness
+        .task(&task_id)
+        .expect("revised durable task");
     assert_eq!(revised.objective, "implement and verify");
     assert_eq!(revised.phase, anchor_lib::harness::TaskPhase::Planning);
     assert!(revised.slices.is_empty());
@@ -145,7 +148,7 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
     );
     assert!(revised.latest_verification_id.is_none());
     let stale_verification = ctx
-        .harness
+        .coding_harness
         .list_verifications(&task_id)
         .expect("verifications")
         .into_iter()
@@ -159,7 +162,10 @@ fn durable_task_objective_can_be_revised_in_place_with_event_history() {
         Some("superseded")
     );
 
-    let events = ctx.harness.list_events(&task_id, 0, 100).expect("events");
+    let events = ctx
+        .coding_harness
+        .list_events(&task_id, 0, 100)
+        .expect("events");
     let revision = events
         .iter()
         .find(|event| event.kind == "task_plan_revised")
@@ -490,7 +496,7 @@ fn unbound_session_checkpoint_does_not_inherit_unrelated_default_task_baseline()
     assert_eq!(peer["ok"], true, "{peer}");
     let peer_id = peer["task"]["id"].as_str().expect("peer task id");
     let expected_before = ctx
-        .harness
+        .task_harness
         .task(peer_id)
         .expect("peer task")
         .expected_state
@@ -513,7 +519,7 @@ fn unbound_session_checkpoint_does_not_inherit_unrelated_default_task_baseline()
     assert_eq!(checkpoint["ok"], true, "{checkpoint}");
 
     let peer_after = ctx
-        .harness
+        .task_harness
         .task(peer_id)
         .expect("peer task after checkpoint");
     assert_eq!(
@@ -557,12 +563,12 @@ fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion()
     fs::create_dir_all(&workspace).expect("创建工作区");
     let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
     let task = ctx
-        .harness
+        .task_harness
         .start_task("旧版 Patch 预检恢复兼容")
         .expect("task");
 
     let recovery = ctx
-        .harness
+        .coding_harness
         .record_recovery(
             &task.id,
             "apply_patch",
@@ -581,7 +587,7 @@ fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion()
     assert!(!recovery.blocks_completion());
 
     let completed = ctx
-        .harness
+        .task_harness
         .complete_task(&task.id, true, HarnessSessionStatus::Active)
         .expect("complete task");
     let recovery = completed
@@ -662,7 +668,7 @@ fn patch_context_mismatch_without_stable_identity_does_not_open_task_recovery() 
     assert_eq!(rejected["ok"], false, "{rejected}");
     assert_eq!(rejected["error"]["code"], "PATCH_CONTEXT_MISMATCH");
     assert!(rejected.get("task_recovery").is_none(), "{rejected}");
-    assert!(ctx.harness.task(task_id).unwrap().recovery.is_none());
+    assert!(ctx.task_harness.task(task_id).unwrap().recovery.is_none());
 }
 
 #[test]
@@ -691,7 +697,7 @@ fn policy_rejection_without_stable_identity_does_not_open_task_recovery() {
     assert_eq!(rejected["error"]["code"], "POLICY_REJECTED");
     assert_eq!(rejected["execution_started"], false);
     assert!(rejected.get("task_recovery").is_none(), "{rejected}");
-    assert!(ctx.harness.task(task_id).unwrap().recovery.is_none());
+    assert!(ctx.task_harness.task(task_id).unwrap().recovery.is_none());
 }
 
 #[test]
@@ -701,12 +707,12 @@ fn legacy_nonmutating_policy_recovery_is_nonblocking_and_resolves_on_completion(
     fs::create_dir_all(&workspace).expect("创建工作区");
     let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
     let task = ctx
-        .harness
+        .task_harness
         .start_task("旧版策略预检恢复兼容")
         .expect("task");
 
     let recovery = ctx
-        .harness
+        .coding_harness
         .record_recovery(
             &task.id,
             "exec_command",
@@ -732,7 +738,7 @@ fn legacy_nonmutating_policy_recovery_is_nonblocking_and_resolves_on_completion(
         .any(|item| item["code"] == "recovery_open"));
 
     let completed = ctx
-        .harness
+        .task_harness
         .complete_task(&task.id, true, HarnessSessionStatus::Active)
         .expect("complete task");
     let recovery = completed
@@ -1006,7 +1012,7 @@ fn configured_contract_and_slice_plan_cannot_be_relaxed_or_replaced() {
     assert_eq!(replaced["ok"], false);
     assert_eq!(replaced["error"]["code"], "TASK_SLICE_UPDATE_TOOL_REQUIRED");
 
-    let task = ctx.harness.task(task_id).expect("task");
+    let task = ctx.task_harness.task(task_id).expect("task");
     assert!(task.contract.no_early_stop);
     assert_eq!(task.slices.len(), 1);
     assert_eq!(task.slices[0].id, "S-fixed");
@@ -1157,7 +1163,7 @@ fn policy_rejection_is_recoverable_with_a_stable_logical_step_key() {
         "exec_command"
     );
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(task_id)
             .unwrap()
             .recovery
@@ -1189,7 +1195,7 @@ fn task_phase_state_machine_rejects_skipped_engineering_stages() {
     assert_eq!(skipped["ok"], false);
     assert_eq!(skipped["error"]["code"], "TASK_PHASE_TRANSITION_INVALID");
     assert_eq!(
-        ctx.harness.task(task_id).unwrap().phase,
+        ctx.task_harness.task(task_id).unwrap().phase,
         anchor_lib::harness::TaskPhase::Planning
     );
 
@@ -1221,7 +1227,7 @@ fn task_phase_state_machine_rejects_skipped_engineering_stages() {
     assert_eq!(forged_complete["ok"], false);
     assert_eq!(forged_complete["error"]["code"], "INVALID_TOOL_ARGUMENTS");
     let state_error = ctx
-        .harness
+        .task_harness
         .configure_task(
             task_id,
             Some(anchor_lib::harness::TaskPhase::Completed),
@@ -1284,7 +1290,7 @@ fn strict_verifying_task_can_pause_and_abort_without_fake_completion() {
         &json!({"objective": "verifying pause regression"}),
     );
     let pause_task_id = pause_started["task"]["id"].as_str().expect("task id");
-    ctx.harness
+    ctx.task_harness
         .transition(pause_task_id, anchor_lib::harness::TaskStatus::Verifying)
         .expect("enter verifying");
     let paused = call_tool(&ctx, "pause_task", &json!({"task_id": pause_task_id}));
@@ -1327,7 +1333,10 @@ fn strict_verifying_task_can_pause_and_abort_without_fake_completion() {
     );
     assert_eq!(aborted["completion_gate"]["ready"], false);
     assert_eq!(
-        ctx.harness.task(task_id).expect("persisted task").status,
+        ctx.task_harness
+            .task(task_id)
+            .expect("persisted task")
+            .status,
         anchor_lib::harness::TaskStatus::Incomplete
     );
 }
@@ -1496,7 +1505,7 @@ fn begin_work_session_create_if_missing_false_never_creates_replacement_task_or_
     assert_eq!(aborted["ok"], true, "{aborted}");
     assert_eq!(aborted["task_status"], "incomplete");
 
-    let task_count_before = ctx.harness.list_tasks().expect("tasks before").len();
+    let task_count_before = ctx.task_harness.list_tasks().expect("tasks before").len();
     let worktrees_before = call_tool(&ctx, "git_worktree_list", &json!({}));
     assert_eq!(worktrees_before["ok"], true, "{worktrees_before}");
     let worktree_count_before = worktrees_before["count"].as_u64().expect("worktree count");
@@ -1528,7 +1537,7 @@ fn begin_work_session_create_if_missing_false_never_creates_replacement_task_or_
             .iter()
             .any(|task| { task["task_id"] == task_id && task["status"] == "incomplete" })));
     assert_eq!(
-        ctx.harness.list_tasks().expect("tasks after").len(),
+        ctx.task_harness.list_tasks().expect("tasks after").len(),
         task_count_before
     );
     let worktrees_after = call_tool(&ctx, "git_worktree_list", &json!({}));
@@ -1986,7 +1995,7 @@ fn begin_work_session_handoff_pauses_previous_same_session_shared_writer() {
         .to_string();
     assert_ne!(second_id, first_id);
     assert_eq!(
-        ctx.harness.task(&first_id).unwrap().status,
+        ctx.task_harness.task(&first_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Paused
     );
     assert_eq!(
@@ -2006,7 +2015,7 @@ fn begin_work_session_handoff_pauses_previous_same_session_shared_writer() {
     assert_eq!(switched["task"]["id"], first_id);
     assert_eq!(switched["task"]["status"], "active");
     assert_eq!(
-        ctx.harness.task(&second_id).unwrap().status,
+        ctx.task_harness.task(&second_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Active
     );
     assert_eq!(switched["harness"]["default_task_id"], first_id);
@@ -2064,7 +2073,7 @@ fn direct_finish_protocol_gate_does_not_downgrade_ready_task_to_verifying() {
     assert_eq!(rejected["ok"], false, "{rejected}");
     assert_eq!(rejected["task_status"], "active");
     assert_eq!(
-        ctx.harness.task(task_id).unwrap().status,
+        ctx.task_harness.task(task_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Active
     );
 }
@@ -2118,11 +2127,11 @@ fn shared_tasks_remain_active_and_serialize_workspace_writes() {
     assert_eq!(first_status["active_task_count"], 2);
     assert_eq!(second_status["active_task_count"], 2);
     assert_eq!(
-        ctx.harness.task(&first_id).unwrap().status,
+        ctx.task_harness.task(&first_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Active
     );
     assert_eq!(
-        ctx.harness.task(&second_id).unwrap().status,
+        ctx.task_harness.task(&second_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Active
     );
     let project = call_tool_for_session(
@@ -2190,7 +2199,7 @@ fn shared_tasks_remain_active_and_serialize_workspace_writes() {
     assert_eq!(second_after["baseline_matches"], true);
     assert_eq!(first_after["active_task_count"], 2);
     assert_eq!(second_after["active_task_count"], 2);
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
+    assert_eq!(ctx.task_harness.active_tasks().unwrap().len(), 2);
 
     let first_operations = call_tool(
         ctx.as_ref(),
@@ -2241,7 +2250,7 @@ fn unbound_transport_never_adopts_workspace_default_task() {
         "binding-session-b",
     );
     assert_eq!(second["ok"], true);
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
+    assert_eq!(ctx.task_harness.active_tasks().unwrap().len(), 2);
 
     let ambiguous_rejected = call_tool_for_session(
         &ctx,
@@ -2518,7 +2527,7 @@ fn running_command_allows_peer_task_creation_but_blocks_peer_writes() {
         "writer-busy-session-b",
     );
     assert_eq!(second["ok"], true, "{second}");
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
+    assert_eq!(ctx.task_harness.active_tasks().unwrap().len(), 2);
     let blocked_write = call_tool_for_session(
         &ctx,
         "apply_patch",
@@ -2550,7 +2559,7 @@ fn running_command_allows_peer_task_creation_but_blocks_peer_writes() {
     );
     assert_eq!(resumed_write["ok"], true, "{resumed_write}");
     assert!(ctx.workspace.root().join("peer-after-command.txt").exists());
-    assert_eq!(ctx.harness.active_tasks().unwrap().len(), 2);
+    assert_eq!(ctx.task_harness.active_tasks().unwrap().len(), 2);
 }
 
 #[test]
@@ -2771,7 +2780,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     assert!(worktree_path.is_dir());
     assert!(worktree_path.ends_with(task_id));
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared after worktree create")
             .expected_state
@@ -2802,7 +2811,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     assert_eq!(unbound_read["error"]["code"], "NOT_FOUND");
 
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared after isolated patch")
             .expected_state
@@ -2816,7 +2825,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     assert_eq!(status["branch"], format!("anchor/task/{task_id}"));
     assert_eq!(status["clean"], false);
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared after worktree status")
             .expected_state
@@ -2856,7 +2865,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
         worktree_path.to_string_lossy().as_ref()
     );
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared after export")
             .expected_state
@@ -2874,7 +2883,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     assert_eq!(remove_in_use["ok"], false, "{remove_in_use}");
     assert_eq!(remove_in_use["error"]["code"], "GIT_WORKTREE_IN_USE");
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared before switch")
             .expected_state
@@ -2900,13 +2909,13 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
         shared_task_id
     );
     assert!(ctx
-        .harness
+        .task_harness
         .task(shared_task_id)
         .expect("persisted shared task")
         .git_worktree
         .is_none());
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared after switch")
             .expected_state
@@ -2923,7 +2932,7 @@ fn worktree_mode_is_optional_and_routes_task_operations_without_touching_primary
     assert_eq!(cwd["ok"], true, "{cwd}");
     assert_eq!(cwd["default_cwd"], ".");
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(shared_task_id)
             .expect("shared after cwd")
             .expected_state
@@ -3093,7 +3102,10 @@ fn independent_worktree_tasks_remain_active_and_do_not_share_running_command_lea
     );
     assert_eq!(first["ok"], true, "{first}");
     assert_eq!(second["ok"], true, "{second}");
-    assert_eq!(ctx.harness.active_tasks().expect("active tasks").len(), 2);
+    assert_eq!(
+        ctx.task_harness.active_tasks().expect("active tasks").len(),
+        2
+    );
 
     let first_path = std::path::PathBuf::from(
         first["task"]["git_worktree"]["path"]
@@ -3227,7 +3239,7 @@ fn close_work_session_can_remove_a_clean_managed_worktree_when_explicitly_reques
     assert_eq!(closed["worktree_cleanup"]["removed"], true);
     assert!(!worktree_path.exists());
     assert_eq!(
-        ctx.harness.task(task_id).expect("task").status,
+        ctx.task_harness.task(task_id).expect("task").status,
         anchor_lib::harness::TaskStatus::Completed
     );
 }
@@ -3333,7 +3345,7 @@ fn parallel_task_can_finish_while_peer_owned_changes_remain_dirty() {
         json!(["peer-owned.txt"])
     );
     assert_eq!(
-        ctx.harness.task(second_id).unwrap().status,
+        ctx.task_harness.task(second_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Active
     );
     assert!(workspace.join("peer-owned.txt").exists());
@@ -3424,11 +3436,11 @@ fn sequential_retained_commands_keep_verifications_bound_to_their_sessions() {
     assert_eq!(second_waited["command_ok"], true, "{second_waited}");
 
     let first_verifications = ctx
-        .harness
+        .coding_harness
         .list_verifications(&first_id)
         .expect("first verifications");
     let second_verifications = ctx
-        .harness
+        .coding_harness
         .list_verifications(&second_id)
         .expect("second verifications");
     assert_eq!(first_verifications.len(), 1);
@@ -3484,7 +3496,10 @@ fn reconnected_transport_recovers_task_by_explicit_session_not_workspace_default
     );
     let second_id = second["task"]["id"].as_str().expect("second id");
     assert_ne!(first_id, second_id);
-    assert_eq!(ctx.harness.current_task().unwrap().unwrap().id, second_id);
+    assert_eq!(
+        ctx.task_harness.current_task().unwrap().unwrap().id,
+        second_id
+    );
 
     let renewed_status = call_tool_for_session(
         &ctx,
@@ -3508,7 +3523,7 @@ fn reconnected_transport_recovers_task_by_explicit_session_not_workspace_default
     assert_eq!(reconnected["harness"]["task_id"], first_id);
     assert_eq!(reconnected["harness"]["active_task_count"], 2);
     assert_eq!(
-        ctx.harness.task(second_id).unwrap().status,
+        ctx.task_harness.task(second_id).unwrap().status,
         anchor_lib::harness::TaskStatus::Active
     );
 }
@@ -3776,12 +3791,12 @@ fn operation_log_aggregates_repeated_failures_into_root_causes() {
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
     let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
-    let task = ctx.harness.start_task("失败聚合").expect("task");
+    let task = ctx.task_harness.start_task("失败聚合").expect("task");
     for (tool, code) in [
         ("exec_command", "WORKSPACE_LINK_UNRESOLVED"),
         ("git_stage", "WORKSPACE_LINK_ESCAPE"),
     ] {
-        ctx.harness
+        ctx.coding_harness
             .record_operation(
                 None,
                 Some(&task.id),
@@ -3918,8 +3933,8 @@ fn successful_verification_retry_supersedes_previous_failure() {
     );
     assert_eq!(failed["command_ok"], false);
     fs::write(workspace.join("ok.flag"), "ready\n").expect("写入验证标记");
-    let task = ctx.harness.current_task().unwrap().unwrap();
-    ctx.harness
+    let task = ctx.task_harness.current_task().unwrap().unwrap();
+    ctx.coding_harness
         .refresh_expected_state_for_operation(&task.id, Some("test-fixture"))
         .expect("refresh fixture change");
     let passed = call_tool(
@@ -3992,10 +4007,10 @@ fn change_summary_aggregates_every_task_commit_and_file() {
 
     let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("context");
     let task = ctx
-        .harness
+        .task_harness
         .start_task("multi commit summary")
         .expect("task");
-    ctx.harness
+    ctx.coding_harness
         .save_change_set(
             &task.id,
             "1111111111111111111111111111111111111111",
@@ -4006,7 +4021,7 @@ fn change_summary_aggregates_every_task_commit_and_file() {
             Vec::new(),
         )
         .expect("first change");
-    ctx.harness
+    ctx.coding_harness
         .save_change_set(
             &task.id,
             "2222222222222222222222222222222222222222",
@@ -4046,7 +4061,7 @@ fn ordinary_git_commit_is_persisted_as_a_task_change_set() {
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("context");
     let task = ctx
-        .harness
+        .task_harness
         .start_task("ordinary commit summary")
         .expect("task");
     let patched = call_tool(
@@ -4083,7 +4098,7 @@ fn change_summary_reconstructs_missing_change_sets_from_the_git_range() {
     initialize_git(&workspace);
     let ctx =
         ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("context");
-    let task = ctx.harness.start_task("range fallback").expect("task");
+    let task = ctx.task_harness.start_task("range fallback").expect("task");
 
     for (path, content, message) in [
         ("first.txt", "first\n", "first external commit"),
@@ -4105,7 +4120,7 @@ fn change_summary_reconstructs_missing_change_sets_from_the_git_range() {
             .expect("git commit");
         assert!(output.status.success());
     }
-    ctx.harness
+    ctx.coding_harness
         .refresh_expected_state_for_operation(&task.id, None)
         .expect("refresh expected state");
 
@@ -4658,7 +4673,7 @@ fn 外部修改会在写工具执行前被拒绝() {
     assert_eq!(result["ok"], false);
     assert_eq!(result["error"]["code"], "FILE_CHANGED_EXTERNALLY");
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .current_task()
             .expect("读取任务")
             .expect("活动任务")
@@ -4762,7 +4777,7 @@ fn task_contract_blocks_early_finish_until_every_declared_gate_passes() {
     assert!(started["task"].get("contract").is_none());
     assert!(started["task"].get("slices").is_none());
     assert!(started["task"].get("working_set").is_none());
-    let durable = ctx.harness.task(task_id).expect("durable task");
+    let durable = ctx.task_harness.task(task_id).expect("durable task");
     assert!(durable.contract.no_early_stop);
     assert_eq!(durable.slices[0].id, "S1");
     assert_eq!(
@@ -5077,7 +5092,7 @@ fn failed_tool_opens_recovery_and_same_step_success_resolves_it() {
     assert_eq!(unrelated["command_ok"], true);
     assert!(unrelated.get("task_recovery").is_none());
     assert_eq!(
-        ctx.harness
+        ctx.task_harness
             .task(task_id)
             .unwrap()
             .recovery
