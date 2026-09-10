@@ -844,14 +844,6 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
-        "grep",
-        "Grep repository",
-        "[anchor-core anchor-files] Search workspace text with structured results; uses ripgrep acceleration when available and falls back to Anchor's built-in scanner.",
-        true,
-        false,
-        false,
-    ),
-    (
         "search",
         "Search repository",
         "[anchor-core anchor-files] Search repository text and code structure through one deterministic interface; engine selection is managed internally by Anchor.",
@@ -2032,51 +2024,6 @@ pub fn output_schema(name: &str) -> Value {
                 "degraded",
                 "degraded_reason",
                 "data",
-                "warnings",
-            ],
-        ),
-        "grep" | "search_text" => success_output_schema(
-            json!({
-                "query": { "type": "string" },
-                "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"] },
-                "matches": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string" },
-                            "line": { "type": "integer", "minimum": 1 },
-                            "column": { "type": "integer", "minimum": 1 },
-                            "preview": { "type": "string" },
-                            "before": { "type": "array", "items": { "type": "string" } },
-                            "after": { "type": "array", "items": { "type": "string" } }
-                        },
-                        "required": ["path", "line", "column", "preview"],
-                        "additionalProperties": true
-                    }
-                },
-                "files": { "type": "array", "items": { "type": "string" } },
-                "summary": { "type": "array", "items": { "type": "object" } },
-                "total_matches": { "type": "integer", "minimum": 0 },
-                "matched_files": { "type": "integer", "minimum": 0 },
-                "cursor": { "type": "integer", "minimum": 0 },
-                "next_cursor": nullable_integer_property(),
-                "truncated": { "type": "boolean" },
-                "scan": { "type": "object" },
-                "warnings": warnings_property()
-            }),
-            &[
-                "query",
-                "output_mode",
-                "matches",
-                "files",
-                "summary",
-                "total_matches",
-                "matched_files",
-                "cursor",
-                "next_cursor",
-                "truncated",
-                "scan",
                 "warnings",
             ],
         ),
@@ -4120,27 +4067,6 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["query"],
             "additionalProperties": false
         }),
-        "grep" | "search_text" => json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "minLength": 1 },
-                "path": { "type": "string", "default": "." },
-                "include_globs": { "type": "array", "items": { "type": "string" } },
-                "exclude_globs": { "type": "array", "items": { "type": "string" } },
-                "regex": { "type": "boolean", "default": false },
-                "case_sensitive": { "type": "boolean", "default": false },
-                "context_lines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 0 },
-                "output_mode": { "type": "string", "enum": ["matches", "files", "count", "summary"], "default": "matches", "description": "Choose detailed matches or compact file/count/summary output." },
-                "cursor": { "type": "integer", "minimum": 0, "default": 0, "description": "Stable offset in the selected output mode; continue with next_cursor." },
-                "max_scan_files": { "type": "integer", "minimum": 1, "maximum": 250000, "default": 100000, "description": "Hard candidate-file budget. Exceeding it returns a retryable budget error rather than unstable partial results." },
-                "max_scan_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824, "default": 134217728, "description": "Hard aggregate source-byte budget for this search." },
-                "scan_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 120000, "default": 30000, "description": "Cooperative repository traversal and search deadline." },
-                "max_preview_bytes": { "type": "integer", "minimum": 64, "maximum": 4096, "default": 512 },
-                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        }),
         "replace_text" => json!({
             "type": "object",
             "properties": {
@@ -4631,8 +4557,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        exposed_tool_names, facade_operations_for_profile, input_schema, is_facade_operation_tool,
-        list_tools_for_profile, output_schema, require_tool_profile,
+        exposed_tool_names, facade_operations_for_profile, input_schema, is_allowed_tool,
+        is_facade_operation_tool, list_tools_for_profile, output_schema, require_tool_profile,
     };
 
     #[test]
@@ -4689,20 +4615,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_text_search_schemas_remain_available_without_public_exposure() {
-        assert_eq!(input_schema("search_text"), input_schema("grep"));
-        assert_eq!(output_schema("search_text"), output_schema("grep"));
-        assert!(!exposed_tool_names("core").contains(&"search_text"));
-        assert!(!exposed_tool_names("core").contains(&"grep"));
-        assert!(exposed_tool_names("core").contains(&"search"));
-    }
-
-    #[test]
-    fn unified_search_schema_is_distinct_from_legacy_text_contract() {
+    fn unified_search_schema_exposes_text_and_code_search_modes() {
         let search_input = input_schema("search");
         let search_output = output_schema("search");
 
-        assert_ne!(search_input, input_schema("grep"));
         assert!(search_input["properties"]["mode"]
             .get("enum")
             .and_then(serde_json::Value::as_array)
@@ -4710,6 +4626,8 @@ mod tests {
         assert!(search_output["properties"]["engine"].is_object());
         assert!(search_output["properties"]["degraded"].is_object());
         assert!(exposed_tool_names("core").contains(&"search"));
+        assert!(!is_allowed_tool("grep"));
+        assert!(!is_allowed_tool("search_text"));
     }
 
     #[test]

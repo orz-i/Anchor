@@ -13,7 +13,7 @@ use crate::platform::{open_path_in_file_manager, platform};
 use crate::settings::{
     AppSettings, DownloadConfig, FrpProfile, FrpProfileInput, McpGatewayConfig, ProxyConfig,
 };
-use crate::tunnel::{TunnelServiceKind, TunnelStatus};
+use crate::tunnel::{drop_workspace as drop_tunnel_workspace, TunnelServiceKind, TunnelStatus};
 use crate::workspace::resources::{
     assign_free_workspace_ports_with_reserved, validate_service_start, WorkspaceService,
 };
@@ -21,6 +21,7 @@ use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
 
 const MANAGEMENT_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGEMENT_TUNNEL_TIMEOUT: Duration = Duration::from_secs(15);
+const FRP_PROFILE_TOKEN_SCOPE: &str = "frp_profile_token";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GatewayConfigWriteAction {
@@ -322,7 +323,7 @@ pub(crate) fn frp_profile_has_token(id: &str) -> AppResult<bool> {
         }
         Ok(data
             .app_secrets
-            .get("frp_profile_token")
+            .get(FRP_PROFILE_TOKEN_SCOPE)
             .and_then(|tokens| tokens.get(id))
             .is_some_and(|value| !value.trim().is_empty()))
     })
@@ -333,6 +334,29 @@ pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfi
     if token.is_empty() {
         return Err(AppError::Message("FRP Token 不能为空。".into()));
     }
+    let (profile, workspaces, gateway, unchanged) = DataStore::read_file(|data| {
+        let profile = data
+            .frp_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
+        let unchanged = data
+            .app_secrets
+            .get(FRP_PROFILE_TOKEN_SCOPE)
+            .and_then(|tokens| tokens.get(id))
+            .is_some_and(|current| current == token);
+        Ok((
+            profile,
+            data.profiles.clone(),
+            data.mcp_gateway.clone(),
+            unchanged,
+        ))
+    })?;
+    if unchanged {
+        return DataStore::read_file(|data| Ok(frp_profile_dto(data, &profile)));
+    }
+    ensure_frp_profile_not_live(&profile, &workspaces, &gateway)?;
     DataStore::update_file(|data| {
         let profile = data
             .frp_profiles
@@ -341,9 +365,49 @@ pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfi
             .cloned()
             .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
         data.app_secrets
-            .entry("frp_profile_token".into())
+            .entry(FRP_PROFILE_TOKEN_SCOPE.into())
             .or_default()
             .insert(id.to_string(), token.to_string());
+        Ok(frp_profile_dto(data, &profile))
+    })
+}
+
+pub(crate) fn clear_frp_profile_token(id: &str) -> AppResult<FrpProfileDto> {
+    let (profile, workspaces, gateway, has_token) = DataStore::read_file(|data| {
+        let profile = data
+            .frp_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
+        let has_token = data
+            .app_secrets
+            .get(FRP_PROFILE_TOKEN_SCOPE)
+            .and_then(|tokens| tokens.get(id))
+            .is_some();
+        Ok((
+            profile,
+            data.profiles.clone(),
+            data.mcp_gateway.clone(),
+            has_token,
+        ))
+    })?;
+    if has_token {
+        ensure_frp_profile_not_live(&profile, &workspaces, &gateway)?;
+    }
+    DataStore::update_file(|data| {
+        let profile = data
+            .frp_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
+        if let Some(tokens) = data.app_secrets.get_mut(FRP_PROFILE_TOKEN_SCOPE) {
+            tokens.remove(id);
+            if tokens.is_empty() {
+                data.app_secrets.remove(FRP_PROFILE_TOKEN_SCOPE);
+            }
+        }
         Ok(frp_profile_dto(data, &profile))
     })
 }
@@ -438,9 +502,121 @@ pub(crate) fn remove_workspace_skill_package(
     )?)
 }
 
-pub(crate) fn create_workspace(path: String, name: Option<String>) -> AppResult<WorkspaceProfile> {
+fn workspace_path_string(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    value.into_owned()
+}
+
+fn canonical_workspace_path(raw: &str) -> AppResult<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Message("workspace path 不能为空".into()));
+    }
+    let path = PathBuf::from(trimmed);
+    let canonical = path.canonicalize().map_err(|error| {
+        AppError::Message(format!(
+            "workspace 目录不存在或无法访问：{trimmed}（{error}）"
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(AppError::Message(format!(
+            "workspace path 不是目录：{}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn normalize_workspace_path(value: &str) -> String {
+    let normalized = value.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn same_workspace_path(existing: &str, canonical: &Path) -> bool {
+    Path::new(existing)
+        .canonicalize()
+        .map(|path| path == canonical)
+        .unwrap_or_else(|_| {
+            normalize_workspace_path(existing)
+                == normalize_workspace_path(&canonical.to_string_lossy())
+        })
+}
+
+fn next_available_workspace_port(
+    preferred: u16,
+    reserved: &std::collections::HashSet<u16>,
+) -> AppResult<u16> {
+    for port in preferred.max(1)..=u16::MAX {
+        if reserved.contains(&port) {
+            continue;
+        }
+        if platform().find_pid_listening_on_port(port)?.is_none() {
+            return Ok(port);
+        }
+    }
+    Err(AppError::Message(format!(
+        "无法从端口 {preferred} 起找到可用端口"
+    )))
+}
+
+fn assign_os_available_workspace_ports(
+    profiles: &[WorkspaceProfile],
+    profile: &mut WorkspaceProfile,
+) -> AppResult<()> {
+    let reserved = profiles
+        .iter()
+        .map(|item| item.runtime.local_port)
+        .collect::<std::collections::HashSet<_>>();
+    profile.runtime.local_port =
+        next_available_workspace_port(profile.runtime.local_port, &reserved)?;
+    Ok(())
+}
+
+pub(crate) fn register_workspace(
+    path: &str,
+    name: Option<String>,
+) -> AppResult<(WorkspaceProfile, bool)> {
+    let canonical = canonical_workspace_path(path)?;
+    let canonical_text = workspace_path_string(&canonical);
     let mut store = DataStore::load()?;
-    let mut profile = WorkspaceProfile::new(path, name);
+
+    if let Some(existing) = store
+        .list()
+        .iter()
+        .find(|profile| same_workspace_path(&profile.path, &canonical))
+        .cloned()
+    {
+        return Ok((existing, false));
+    }
+
+    let requested_name = name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut profile = WorkspaceProfile::new(canonical_text, requested_name);
+    if store
+        .list()
+        .iter()
+        .any(|existing| existing.name.eq_ignore_ascii_case(&profile.name))
+    {
+        return Err(AppError::Message(format!(
+            "workspace 名称已存在：{}；请指定唯一名称",
+            profile.name
+        )));
+    }
     let gateway = store.settings().mcp_gateway;
     let reserved = if gateway.enabled {
         std::collections::HashSet::from([gateway.local_port])
@@ -448,15 +624,28 @@ pub(crate) fn create_workspace(path: String, name: Option<String>) -> AppResult<
         std::collections::HashSet::new()
     };
     assign_free_workspace_ports_with_reserved(store.list(), &mut profile, &reserved)?;
+    assign_os_available_workspace_ports(store.list(), &mut profile)?;
     store.register_workspace(profile.clone())?;
-    Ok(profile)
+    Ok((profile, true))
+}
+
+pub(crate) fn create_workspace(path: String, name: Option<String>) -> AppResult<WorkspaceProfile> {
+    register_workspace(&path, name).map(|(profile, _)| profile)
+}
+
+pub(crate) struct WorkspaceDeletion {
+    pub profile: WorkspaceProfile,
+    pub warnings: Vec<String>,
 }
 
 pub(crate) fn open_workspace_directory(path: &str) -> AppResult<()> {
     open_path_in_file_manager(&PathBuf::from(path.trim()))
 }
 
-pub(crate) async fn delete_workspace(id: &str) -> AppResult<()> {
+pub(crate) async fn delete_workspace_with_timeout(
+    id: &str,
+    timeout: Duration,
+) -> AppResult<WorkspaceDeletion> {
     let store = DataStore::load()?;
     crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, id)?;
     let profile = store
@@ -481,24 +670,52 @@ pub(crate) async fn delete_workspace(id: &str) -> AppResult<()> {
         ));
     }
 
-    control::request_daemon_exit_and_wait(
-        &profile,
-        control::ControlOperation::Shutdown,
-        MANAGEMENT_DAEMON_TIMEOUT,
-        true,
-    )
-    .await?;
+    let inspection = crate::daemon::inspect(&profile)?;
+    if inspection.running {
+        control::request_daemon_exit_and_wait(
+            &profile,
+            control::ControlOperation::Shutdown,
+            timeout,
+            true,
+        )
+        .await?;
+    } else if inspection.ambiguous {
+        return Err(AppError::Message(inspection.detail));
+    }
+
+    let mut warnings = Vec::new();
+    if let Some(pid) = platform().find_pid_listening_on_port(profile.runtime.local_port)? {
+        warnings.push(format!(
+            "MCP 端口 {} 当前由外部 PID {pid} 监听；删除 Workspace 不会停止该进程",
+            profile.runtime.local_port
+        ));
+    }
+
+    drop_tunnel_workspace(&profile.id).await?;
+    crate::daemon::cleanup(&profile)?;
 
     let mut store = DataStore::load()?;
     crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, id)?;
-    if store.remove(id)?.is_some() {
+    let removed = store
+        .remove(id)?
+        .ok_or_else(|| AppError::Message(format!("workspace 已不存在：{}", profile.id)))?;
+    if removed.id == profile.id {
         crate::secret::SecretStore::clear_refresh_replay_state(id)?;
     }
     #[cfg(windows)]
     crate::windows_service::forget_workspace(id)?;
     #[cfg(target_os = "linux")]
     crate::linux_service::forget_workspace(id)?;
-    Ok(())
+    Ok(WorkspaceDeletion {
+        profile: removed,
+        warnings,
+    })
+}
+
+pub(crate) async fn delete_workspace(id: &str) -> AppResult<()> {
+    delete_workspace_with_timeout(id, MANAGEMENT_DAEMON_TIMEOUT)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn run_health_checks(id: &str) -> AppResult<Vec<crate::health::HealthItem>> {
@@ -1481,7 +1698,7 @@ pub(crate) fn list_frp_profiles() -> AppResult<Vec<FrpProfileDto>> {
 fn frp_profile_dto(data: &crate::data::AppData, profile: &FrpProfile) -> FrpProfileDto {
     let has_token = data
         .app_secrets
-        .get("frp_profile_token")
+        .get(FRP_PROFILE_TOKEN_SCOPE)
         .and_then(|tokens| tokens.get(&profile.id))
         .is_some_and(|value| !value.trim().is_empty());
     FrpProfileDto {
@@ -1493,25 +1710,154 @@ fn frp_profile_dto(data: &crate::data::AppData, profile: &FrpProfile) -> FrpProf
     }
 }
 
-pub(crate) fn save_frp_profile_metadata(profile: FrpProfileInput) -> AppResult<FrpProfileDto> {
-    if profile.name.trim().is_empty() || profile.server.trim().is_empty() {
-        return Err(AppError::Message("FRP 配置名称和服务器不能为空。".into()));
+fn normalize_frp_required(label: &str, value: &str) -> AppResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::Message(format!("{label} 不能为空")));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_frp_server(value: &str) -> AppResult<String> {
+    let value = normalize_frp_required("FRP server", value)?;
+    if value.contains("//") || value.contains('/') || value.contains(char::is_whitespace) {
+        return Err(AppError::Message(
+            "FRP server 只接受主机名或 IP，不要包含协议、路径或空白字符".into(),
+        ));
+    }
+    Ok(value.trim_end_matches('.').to_string())
+}
+
+fn ensure_unique_frp_name(profiles: &[FrpProfile], name: &str, except_id: &str) -> AppResult<()> {
+    if profiles
+        .iter()
+        .any(|profile| profile.id != except_id && profile.name.trim().eq_ignore_ascii_case(name))
+    {
+        return Err(AppError::Message(format!("FRP profile 名称已存在：{name}")));
+    }
+    Ok(())
+}
+
+fn frp_profile_references(data: &crate::data::AppData, id: &str) -> Vec<String> {
+    let mut references = data
+        .profiles
+        .iter()
+        .filter(|workspace| workspace.tunnel.frp_profile_id == id)
+        .map(|workspace| format!("{}:mcp", workspace.name))
+        .collect::<Vec<_>>();
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn all_frp_profile_references(data: &crate::data::AppData, id: &str) -> AppResult<Vec<String>> {
+    let mut references = frp_profile_references(data, id);
+    #[cfg(feature = "cli")]
+    for workspace in &data.profiles {
+        let Some(pending) = crate::cli::pending_profile_candidate(workspace)? else {
+            continue;
+        };
+        if pending.tunnel.frp_profile_id == id && workspace.tunnel.frp_profile_id != id {
+            references.push(format!("{}:mcp(pending)", workspace.name));
+        }
+    }
+    references.sort();
+    references.dedup();
+    Ok(references)
+}
+
+fn ensure_frp_profile_not_live(
+    profile: &FrpProfile,
+    workspaces: &[WorkspaceProfile],
+    gateway: &McpGatewayConfig,
+) -> AppResult<()> {
+    let mut live = Vec::new();
+    for workspace in workspaces {
+        let inspection = crate::daemon::inspect(workspace)?;
+        if inspection.ambiguous {
+            return Err(AppError::Message(format!(
+                "无法安全更新 FRP profile：workspace {} daemon 状态不明确：{}",
+                workspace.name, inspection.detail
+            )));
+        }
+        if inspection.running && inspection.pid_matches {
+            let managed = inspection
+                .state
+                .as_ref()
+                .and_then(|state| state.managed_tunnels());
+            if workspace.tunnel.frp_profile_id == profile.id
+                && managed.is_some_and(|selection| selection.includes_mcp())
+            {
+                live.push(format!("{}:mcp", workspace.name));
+            }
+        }
     }
 
+    if gateway.enabled && !gateway.owner_workspace_id.trim().is_empty() {
+        if let Some(owner) = workspaces.iter().find(|workspace| {
+            workspace.id == gateway.owner_workspace_id
+                && workspace.tunnel.frp_profile_id == profile.id
+        }) {
+            let inspection = crate::gateway_daemon::inspect()?;
+            if inspection.ambiguous {
+                return Err(AppError::Message(format!(
+                    "无法安全更新 FRP profile：Gateway daemon 状态不明确：{}",
+                    inspection.detail
+                )));
+            }
+            if inspection.running && inspection.pid_matches {
+                live.push(format!("{}:gateway-mcp", owner.name));
+            }
+        }
+    }
+
+    if live.is_empty() {
+        return Ok(());
+    }
+    live.sort();
+    live.dedup();
+    Err(AppError::Message(format!(
+        "FRP profile {} 正被运行中的受管 tunnel 使用：{}。为避免磁盘配置与活动 frpc 分叉，请先停止对应 tunnel/daemon，修改 profile 后再启动。仅修改 profile 名称不受此限制。",
+        profile.name,
+        live.join(", ")
+    )))
+}
+
+pub(crate) fn save_frp_profile_metadata(profile: FrpProfileInput) -> AppResult<FrpProfileDto> {
     let mut saved = FrpProfile::from(profile);
-    saved.name = saved.name.trim().to_string();
-    saved.server = saved.server.trim().to_string();
+    saved.name = normalize_frp_required("FRP profile name", &saved.name)?;
+    saved.server = normalize_frp_server(&saved.server)?;
+    if saved.server_port == 0 {
+        return Err(AppError::Message("FRP 服务器端口必须大于 0".into()));
+    }
     if saved.id.trim().is_empty() {
         saved.id = uuid::Uuid::new_v4().to_string().replace('-', "");
     }
 
+    let (existing, workspaces, gateway) = DataStore::read_file(|data| {
+        Ok((
+            data.frp_profiles
+                .iter()
+                .find(|profile| profile.id == saved.id)
+                .cloned(),
+            data.profiles.clone(),
+            data.mcp_gateway.clone(),
+        ))
+    })?;
+    if let Some(existing) = existing.as_ref() {
+        if existing.server != saved.server || existing.server_port != saved.server_port {
+            ensure_frp_profile_not_live(existing, &workspaces, &gateway)?;
+        }
+    }
+
     DataStore::update_file(|data| {
-        if let Some(existing) = data
+        ensure_unique_frp_name(&data.frp_profiles, &saved.name, &saved.id)?;
+        if let Some(index) = data
             .frp_profiles
-            .iter_mut()
-            .find(|item| item.id == saved.id)
+            .iter()
+            .position(|item| item.id == saved.id)
         {
-            *existing = saved.clone();
+            data.frp_profiles[index] = saved.clone();
         } else {
             data.frp_profiles.push(saved.clone());
         }
@@ -1521,11 +1867,24 @@ pub(crate) fn save_frp_profile_metadata(profile: FrpProfileInput) -> AppResult<F
 
 pub(crate) fn delete_frp_profile(id: &str) -> AppResult<()> {
     DataStore::update_file(|data| {
-        data.frp_profiles.retain(|profile| profile.id != id);
-        if let Some(tokens) = data.app_secrets.get_mut("frp_profile_token") {
+        let index = data
+            .frp_profiles
+            .iter()
+            .position(|profile| profile.id == id)
+            .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
+        let references = all_frp_profile_references(data, id)?;
+        if !references.is_empty() {
+            return Err(AppError::Message(format!(
+                "FRP profile {} 仍被以下 tunnel 使用：{}。请先解除引用后再删除。",
+                data.frp_profiles[index].name,
+                references.join(", ")
+            )));
+        }
+        data.frp_profiles.remove(index);
+        if let Some(tokens) = data.app_secrets.get_mut(FRP_PROFILE_TOKEN_SCOPE) {
             tokens.remove(id);
             if tokens.is_empty() {
-                data.app_secrets.remove("frp_profile_token");
+                data.app_secrets.remove(FRP_PROFILE_TOKEN_SCOPE);
             }
         }
         Ok(())
@@ -1888,5 +2247,16 @@ mod tests {
             desired_gateway_routes(&current, "workspace-b", false),
             vec!["workspace-a"]
         );
+    }
+
+    #[test]
+    fn frp_server_normalization_rejects_urls_paths_and_whitespace() {
+        assert_eq!(
+            normalize_frp_server("frp.example.com.").expect("host"),
+            "frp.example.com"
+        );
+        assert!(normalize_frp_server("https://frp.example.com").is_err());
+        assert!(normalize_frp_server("frp.example.com/path").is_err());
+        assert!(normalize_frp_server("frp example.com").is_err());
     }
 }

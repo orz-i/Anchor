@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_mode_degrades_to_structured_text_search_when_backend_is_unavailable() {
+    fn semantic_backend_failure_degrades_to_structured_text_search() {
         let root = tempdir().expect("workspace");
         std::fs::write(
             root.path().join("lib.rs"),
@@ -713,13 +713,31 @@ mod tests {
         )
         .expect("source");
         let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let args = json!({"query": "dispatch", "mode": "callers"});
+        let missing_program = root.path().join("missing-codegraph");
 
-        let output = search(
+        let attempt = semantic_search_with_program(
             &workspace,
-            &json!({"query": "dispatch", "mode": "callers"}),
+            &missing_program,
+            "dispatch",
+            SearchMode::Callers,
+            &args,
             &CancellationToken::default(),
         )
-        .expect("search");
+        .expect("semantic attempt");
+        let SemanticSearchAttempt::Degraded(reason) = attempt else {
+            panic!("missing semantic backend must degrade")
+        };
+        let output = text_search(
+            &workspace,
+            "dispatch",
+            "callers",
+            SearchMode::Callers,
+            &args,
+            &CancellationToken::default(),
+            Some(&reason),
+        )
+        .expect("fallback text search");
 
         assert_eq!(output["ok"], true);
         assert_eq!(output["requested_mode"], "callers");
@@ -728,7 +746,7 @@ mod tests {
         assert_eq!(output["data"]["total_matches"], 1);
         assert!(output["degraded_reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("semantic backend unavailable")));
+            .is_some_and(|reason| reason.contains("CodeGraph index unavailable")));
     }
 
     #[test]

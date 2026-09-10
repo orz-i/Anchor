@@ -1949,24 +1949,17 @@ fn search_filters_by_glob() {
 }
 
 #[test]
-fn legacy_text_search_names_route_without_catalog_exposure() {
+fn retired_text_search_names_are_rejected() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    let result = invoke(
-        &ctx,
-        "search_text",
-        json!({"query": "function add", "include_globs": ["**/*.js"]}),
-    );
-    let payload = assert_ok(&result);
-    assert!(payload["total_matches"].as_u64().unwrap_or(0) > 0);
-
-    let grep_result = invoke(
-        &ctx,
-        "grep",
-        json!({"query": "function add", "include_globs": ["**/*.js"]}),
-    );
-    let grep_payload = assert_ok(&grep_result);
-    assert!(grep_payload["total_matches"].as_u64().unwrap_or(0) > 0);
+    for retired in ["grep", "search_text"] {
+        let result = invoke(&ctx, retired, json!({}));
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["code"], "INVALID_ARGUMENT", "{result}");
+        assert!(result["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unknown tool")));
+    }
 
     let tools = anchor_lib::tools::list_tools_for_profile("core");
     let names = tools

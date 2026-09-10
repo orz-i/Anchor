@@ -32,7 +32,7 @@ use super::protocol::{
     GatewayAsyncState, GatewayControlStatus, GatewayEventBatch, GatewayEventCursor,
     GatewayLogChunk, GatewayLogCursor, GatewayMethod, GatewayOperation, GatewayRequest,
     GatewayResponse, GatewayResult, GATEWAY_CONTROL_PROTOCOL_VERSION,
-    GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION, MAX_GATEWAY_CONTROL_FRAME_BYTES,
+    MAX_GATEWAY_CONTROL_FRAME_BYTES,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
@@ -457,15 +457,7 @@ pub async fn request_exit(operation: GatewayOperation) -> Result<u32, GatewayCon
         GatewayOperation::Shutdown => GatewayMethod::Shutdown,
         GatewayOperation::Restart => GatewayMethod::PrepareRestart,
     };
-    let result = match request(method.clone()).await {
-        Ok(result) => result,
-        Err(error) => {
-            let Some(protocol_version) = legacy_lifecycle_retry_protocol(&error) else {
-                return Err(error);
-            };
-            request_with_protocol_version(method, REQUEST_TIMEOUT, protocol_version).await?
-        }
-    };
+    let result = request(method).await?;
     match result {
         GatewayResult::Accepted {
             operation: accepted,
@@ -743,19 +735,6 @@ async fn request_with_protocol_version(
     response.result.ok_or_else(|| {
         GatewayControlClientError::Protocol("Gateway daemon returned ok=true without result".into())
     })
-}
-
-fn legacy_lifecycle_retry_protocol(error: &GatewayControlClientError) -> Option<u16> {
-    let GatewayControlClientError::VersionMismatch {
-        daemon_protocol,
-        client_protocol,
-    } = error
-    else {
-        return None;
-    };
-    (*daemon_protocol < *client_protocol
-        && *daemon_protocol >= GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION)
-        .then_some(*daemon_protocol)
 }
 
 #[cfg(unix)]
@@ -1291,23 +1270,6 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn gateway_lifecycle_drain_only_retries_supported_older_protocols() {
-        let compatible = GatewayControlClientError::VersionMismatch {
-            daemon_protocol: GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION,
-            client_protocol: GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION + 1,
-        };
-        assert_eq!(
-            legacy_lifecycle_retry_protocol(&compatible),
-            Some(GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION)
-        );
-
-        let newer = GatewayControlClientError::VersionMismatch {
-            daemon_protocol: GATEWAY_CONTROL_PROTOCOL_VERSION + 1,
-            client_protocol: GATEWAY_CONTROL_PROTOCOL_VERSION,
-        };
-        assert_eq!(legacy_lifecycle_retry_protocol(&newer), None);
-    }
     use crate::settings::McpGatewayConfig;
 
     #[tokio::test]

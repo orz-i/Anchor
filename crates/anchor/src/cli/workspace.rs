@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::header::{ALLOW, AUTHORIZATION, WWW_AUTHENTICATE};
@@ -8,9 +7,6 @@ use serde_json::{json, Value};
 use crate::auth::builtin_redirect_hosts;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
-use crate::platform::platform;
-use crate::tunnel::drop_workspace as drop_tunnel_workspace;
-use crate::workspace::resources::assign_free_workspace_ports_with_reserved;
 use crate::workspace::WorkspaceProfile;
 
 use super::args::{
@@ -25,50 +21,6 @@ struct WorkspaceMutationResult {
     mcp_port: u16,
     project_files_deleted: bool,
     warnings: Vec<String>,
-}
-
-fn assign_os_available_ports(
-    profiles: &[WorkspaceProfile],
-    profile: &mut WorkspaceProfile,
-) -> AppResult<()> {
-    let mut reserved = profiles
-        .iter()
-        .map(|item| item.runtime.local_port)
-        .collect::<std::collections::HashSet<_>>();
-    profile.runtime.local_port = next_available_port(profile.runtime.local_port, &reserved)?;
-    reserved.insert(profile.runtime.local_port);
-    Ok(())
-}
-
-fn next_available_port(
-    preferred: u16,
-    reserved: &std::collections::HashSet<u16>,
-) -> AppResult<u16> {
-    for port in preferred.max(1)..=u16::MAX {
-        if reserved.contains(&port) {
-            continue;
-        }
-        if platform().find_pid_listening_on_port(port)?.is_none() {
-            return Ok(port);
-        }
-    }
-    Err(AppError::Message(format!(
-        "无法从端口 {preferred} 起找到可用端口"
-    )))
-}
-
-fn workspace_path_string(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    #[cfg(windows)]
-    {
-        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
-        }
-        if let Some(rest) = value.strip_prefix(r"\\?\") {
-            return rest.to_string();
-        }
-    }
-    value.into_owned()
 }
 
 #[derive(Debug, Serialize)]
@@ -116,43 +68,18 @@ pub async fn execute(command: WorkspaceCommand, as_json: bool) -> AppResult<i32>
 }
 
 fn register_workspace(path: &str, name: Option<String>, as_json: bool) -> AppResult<()> {
-    let canonical = canonical_workspace_path(path)?;
-    let canonical_text = workspace_path_string(&canonical);
-    let mut store = DataStore::load()?;
-
-    if let Some(existing) = store
-        .list()
-        .iter()
-        .find(|profile| same_workspace_path(&profile.path, &canonical))
-        .cloned()
-    {
-        return print_mutation("already_registered", &existing, false, Vec::new(), as_json);
-    }
-
-    let requested_name = name
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let mut profile = WorkspaceProfile::new(canonical_text, requested_name);
-    if store
-        .list()
-        .iter()
-        .any(|existing| existing.name.eq_ignore_ascii_case(&profile.name))
-    {
-        return Err(AppError::Message(format!(
-            "workspace 名称已存在：{}；请使用 --name 指定唯一名称",
-            profile.name
-        )));
-    }
-    let gateway = store.settings().mcp_gateway;
-    let reserved = if gateway.enabled {
-        std::collections::HashSet::from([gateway.local_port])
-    } else {
-        std::collections::HashSet::new()
-    };
-    assign_free_workspace_ports_with_reserved(store.list(), &mut profile, &reserved)?;
-    assign_os_available_ports(store.list(), &mut profile)?;
-    store.register_workspace(profile.clone())?;
-    print_mutation("registered", &profile, false, Vec::new(), as_json)
+    let (profile, created) = crate::management::register_workspace(path, name)?;
+    print_mutation(
+        if created {
+            "registered"
+        } else {
+            "already_registered"
+        },
+        &profile,
+        false,
+        Vec::new(),
+        as_json,
+    )
 }
 
 async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppResult<i32> {
@@ -164,58 +91,19 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
     }
     let store = DataStore::load()?;
     let profile = super::resolve_workspace(store.list(), &options.workspace)?.clone();
-    crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, &profile.id)?;
     drop(store);
-
-    let gateway_inspection = crate::gateway_daemon::inspect()?;
-    if gateway_inspection.ambiguous {
-        return Err(AppError::Message(gateway_inspection.detail));
-    }
-    if gateway_inspection.running
-        && gateway_inspection
-            .state
-            .as_ref()
-            .is_some_and(|gateway_state| gateway_state.workspace_ids.contains(&profile.id))
-    {
-        return Err(AppError::Message(
-            "该 Workspace 正由 Gateway daemon 提供路由。请先执行 `anchor gateway stop`，再注销 Workspace。"
-                .into(),
-        ));
-    }
-
-    let inspection = super::daemon::inspect(&profile)?;
-    if inspection.running {
-        crate::control::request_daemon_exit_and_wait(
-            &profile,
-            crate::control::ControlOperation::Shutdown,
-            Duration::from_secs(options.timeout_seconds),
-            true,
-        )
-        .await?;
-    } else if inspection.ambiguous {
-        return Err(AppError::Message(inspection.detail));
-    }
-
-    let mut warnings = Vec::new();
-    for (label, port) in [("MCP", profile.runtime.local_port)] {
-        if let Some(pid) = platform().find_pid_listening_on_port(port)? {
-            warnings.push(format!(
-                "{label} 端口 {port} 当前由外部 PID {pid} 监听；注销不会停止该进程"
-            ));
-        }
-    }
-
-    drop_tunnel_workspace(&profile.id).await?;
-    super::daemon::cleanup(&profile)?;
-    let mut store = DataStore::load()?;
-    let removed = store
-        .remove(&profile.id)?
-        .ok_or_else(|| AppError::Message(format!("workspace 已不存在：{}", profile.id)))?;
-    #[cfg(windows)]
-    crate::windows_service::forget_workspace(&profile.id)?;
-    #[cfg(target_os = "linux")]
-    crate::linux_service::forget_workspace(&profile.id)?;
-    print_mutation("unregistered", &removed, false, warnings, as_json)?;
+    let removed = crate::management::delete_workspace_with_timeout(
+        &profile.id,
+        Duration::from_secs(options.timeout_seconds),
+    )
+    .await?;
+    print_mutation(
+        "unregistered",
+        &removed.profile,
+        false,
+        removed.warnings,
+        as_json,
+    )?;
     Ok(0)
 }
 
@@ -572,35 +460,6 @@ fn select_endpoint(
     }
 }
 
-fn canonical_workspace_path(raw: &str) -> AppResult<PathBuf> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::Message("workspace path 不能为空".into()));
-    }
-    let path = PathBuf::from(trimmed);
-    let canonical = path.canonicalize().map_err(|error| {
-        AppError::Message(format!(
-            "workspace 目录不存在或无法访问：{trimmed}（{error}）"
-        ))
-    })?;
-    if !canonical.is_dir() {
-        return Err(AppError::Message(format!(
-            "workspace path 不是目录：{}",
-            canonical.display()
-        )));
-    }
-    Ok(canonical)
-}
-
-fn same_workspace_path(existing: &str, canonical: &Path) -> bool {
-    Path::new(existing)
-        .canonicalize()
-        .map(|path| path == canonical)
-        .unwrap_or_else(|_| {
-            super::normalize_path(existing) == super::normalize_path(&canonical.to_string_lossy())
-        })
-}
-
 fn secret(
     store: &DataStore,
     profile: &WorkspaceProfile,
@@ -829,11 +688,5 @@ mod tests {
             visible_secret(Some("secret".into()), true),
             json!({"available": true, "value": "secret"})
         );
-    }
-
-    #[test]
-    fn workspace_path_string_is_stable_for_normal_paths() {
-        let path = Path::new("/srv/workspace");
-        assert_eq!(workspace_path_string(path), "/srv/workspace");
     }
 }

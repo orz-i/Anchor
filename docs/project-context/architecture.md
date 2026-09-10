@@ -124,8 +124,8 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **职责**: CLI/Web Admin 共用的 Workspace 控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal、单服务配置 reload，以及跨 Workspace/Gateway 的纯只读聚合
 - **传输**: Linux Unix Domain Socket；Windows owner/System protected-DACL Named Pipe
 - **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
-- **协议**: Workspace 当前 v6；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel/apply_config 写请求使用 accepted → operation status 异步状态机
-- **升级协商**: daemon state 与 `version` additive 发布 build identity。普通写请求要求当前协议；新客户端只可用旧协议执行 read-only `version` 和稳定的 lifecycle drain（Workspace v2+、Gateway v1+），用于优雅退出旧运行权威后再由当前构建启动
+- **协议**: Workspace 当前 v7；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel/apply_config 写请求使用 accepted → operation status 异步状态机
+- **升级协商**: daemon state 与 `version` additive 发布 build identity。Workspace 普通写请求要求当前协议；新客户端只可用受支持的旧 Workspace 协议执行 read-only `version` 和稳定 lifecycle drain（v2+），用于优雅退出旧运行权威后再由当前构建启动。Gateway 当前仅支持 protocol v1，不预置不存在的旧版本 retry bridge。
 - **Web Admin 接入**: Windows/Linux 上 Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Web Admin 不提供 process-local Server 回退，检测到旧/外部 listener 时按冲突处理而不是接管
 - **配置应用**: 已运行服务使用 daemon 内单 listener reload；daemon PID、另一 listener 与 Tunnel ownership 不因普通配置应用而重启，新 listener 失败时尝试恢复旧 listener
 - **聚合读取**: `control::aggregate` 并发读取独立 Workspace/Gateway 控制域，返回 canonical MCP 状态和按 source 保留游标的事件批；聚合层不持有 Runtime/Tunnel/Gateway 运行权威

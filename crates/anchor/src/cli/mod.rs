@@ -13,7 +13,8 @@ mod workspace;
 
 pub(crate) use args::ConfigApplyOptions;
 pub(crate) use config::{
-    apply_staged_config, stage_profile_config, ConfigApplyReport, ConfigSetReport,
+    apply_staged_config, pending_candidate as pending_profile_candidate, stage_profile_config,
+    ConfigApplyReport, ConfigSetReport,
 };
 
 use std::fs::File;
@@ -1411,8 +1412,7 @@ fn show_gateway(as_json: bool) -> AppResult<()> {
 
 async fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
-    let previous = store.settings().mcp_gateway;
-    let mut config = previous.clone();
+    let mut config = store.settings().mcp_gateway;
     if let Some(enabled) = options.enabled {
         config.enabled = enabled;
     }
@@ -1423,57 +1423,10 @@ async fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> A
         config.owner_workspace_id = resolve_workspace(store.list(), &selector)?.id.clone();
     }
     if let Some(public_url) = options.public_url {
-        config.public_url = public_url.trim().trim_end_matches('/').to_string();
+        config.public_url = public_url;
     }
-    if previous.identity_changed(&config) {
-        config.clear_observation();
-    } else {
-        config.observed_public_url = previous.observed_public_url;
-        config.observed_owner_workspace_id = previous.observed_owner_workspace_id;
-        config.observed_tunnel_signature = previous.observed_tunnel_signature;
-    }
-    gateway::validate_config(&config, store.list())?;
     drop(store);
-
-    let inspection = gateway_daemon::inspect()?;
-    if inspection.ambiguous {
-        return Err(AppError::Message(inspection.detail));
-    }
-    if inspection.running {
-        let state = inspection.state.ok_or_else(|| {
-            AppError::Message("Gateway daemon reports running without state metadata".into())
-        })?;
-        gateway_control::ping()
-            .await
-            .map_err(|error| AppError::Message(format!("Gateway daemon IPC 不可用：{error}")))?;
-        if config.enabled {
-            gateway_control::request_apply_config(config.clone(), Duration::from_secs(20))
-                .await
-                .map_err(|error| AppError::Message(error.to_string()))?;
-        } else {
-            let accepted_pid = gateway_control::request_exit(GatewayOperation::Shutdown)
-                .await
-                .map_err(|error| AppError::Message(error.to_string()))?;
-            if accepted_pid != state.pid {
-                return Err(AppError::Message(format!(
-                    "Gateway disable PID mismatch: state={}, response={accepted_pid}",
-                    state.pid
-                )));
-            }
-            gateway_daemon::wait_for_exit(state.pid, Duration::from_secs(10), false).await?;
-            gateway_control::persist_config(&config)?;
-        }
-    } else {
-        gateway_control::persist_config(&config)?;
-    }
-    #[cfg(windows)]
-    if !config.enabled {
-        crate::windows_service::set_gateway_desired(&[])?;
-    }
-    #[cfg(target_os = "linux")]
-    if !config.enabled {
-        crate::linux_service::set_gateway_desired(&[])?;
-    }
+    crate::management::set_mcp_gateway(config).await?;
     let applied_config = DataStore::load()?.settings().mcp_gateway;
     if as_json {
         print_json(&json!({ "event": "gateway_configured", "config": applied_config }))?;
@@ -2786,8 +2739,6 @@ pub fn run() -> i32 {
             | Command::GatewayDaemonRun { .. }
             | Command::ExecSupervisorRun { .. }
             | Command::Admin(AdminCommand::DaemonRun { .. })
-            | Command::ServiceRun { .. }
-            | Command::ServiceAdminRun { .. }
     );
     match crate::async_runtime::block_on(execute(parsed)) {
         Ok(exit_code) => exit_code,
@@ -2865,19 +2816,8 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Gateway(command) => execute_gateway(command, cli.json).await,
         Command::Service(command) => execute_service(command, cli.json),
         Command::Admin(command) => execute_admin(command, cli.json).await,
-        Command::ServiceRun { config_dir, .. } => {
-            let _ = config_dir;
-            Err(AppError::Message(
-                "service-run 必须由 OS service manager 入口直接分派".into(),
-            ))
-        }
-        Command::ServiceAdminRun {
-            action, config_dir, ..
-        } => {
-            let _ = (action, config_dir);
-            Err(AppError::Message(
-                "service-admin-run 必须由 Windows UAC helper 入口直接分派".into(),
-            ))
+        Command::ServiceRun { .. } | Command::ServiceAdminRun { .. } => {
+            unreachable!("service manager commands are dispatched before async CLI execution")
         }
         Command::GatewayDaemonRun {
             config_scope,

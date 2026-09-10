@@ -105,7 +105,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 
 独立 Gateway 控制域现已具备后台 daemon 基础：
 
-- Gateway control protocol 独立版本为 `1`，与 Workspace protocol v6 分离；每个请求携带 `configScope`，拒绝连接到其他配置域的 daemon；
+- Gateway control protocol 独立版本为 `1`，与 Workspace protocol v7 分离；每个请求携带 `configScope`，拒绝连接到其他配置域的 daemon；
 - Linux 使用全局 `gateway.lock`、`gateway.pid`、`gateway.json`、`gateway.sock`；状态保存 PID、配置域、所选 route Workspace IDs、Gateway 本地端口和版本；
 - `anchor gateway status/start/stop/restart/reload` 使用专用 Gateway control client；`gateway serve` 继续保留为前台调试/外部 supervisor 入口；
 - `shutdown`、`prepare_restart`、`reload` 和运行中配置应用都禁止本地运行时回退；`reload`/`apply_config` 使用 accepted → operation status 异步模型；
@@ -131,7 +131,7 @@ GUI 工作区控制迁移现状：
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
 - 若升级时检测到旧桌面进程仍持有 process-local listener，Windows GUI 将其报告为冲突并拒绝接管，防止旧进程与 daemon 控制域同时成为运行权威。
 
-尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及崩溃报告/升级编排的更高层自动化。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；本阶段已补 build identity、只读版本探测和 lifecycle-only 旧协议排空边界，真实 Windows reboot 后自动恢复与安装包升级后的实机滚动切换仍属于发布验收项。
+尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及崩溃报告/升级编排的更高层自动化。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；本阶段已补 build identity、只读版本探测和 Workspace lifecycle-only 旧协议排空边界；Gateway 当前只有 v1，不保留不存在的旧版本 retry bridge。真实 Windows reboot 后自动恢复与安装包升级后的实机滚动切换仍属于发布验收项。
 
 ### 阶段 2：CLI 能力闭环
 

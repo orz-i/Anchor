@@ -304,7 +304,7 @@ Web Admin Workspace 控制使用同一生命周期客户端：
 - 保存 tunnel 配置后只执行 daemon 内 tunnel reload，不再追加一次完整 Workspace daemon restart；实时公网 URL 由 daemon `workspace_status` 返回，Web Admin 优先使用该值；
 - Workspace 页面状态刷新优先使用 daemon `events` 长轮询，只有控制端点明确不存在时才回退到旧状态轮询；protocol/remote 错误会进入显式 fault 状态，不静默降级；fallback polling 会周期性重新探测事件端点，因此外部 CLI 启动 daemon 后可自动恢复 event-first 模式；
 - Workspace 配置保存由 Rust 控制层根据旧/新 profile 计算 apply plan；Web Admin 不根据 `running` 状态自行猜测 restart。名称等纯元数据变化不触发 listener，MCP 运行参数与认证身份变化只 reload 对应活动 listener，失败会恢复旧磁盘配置并回滚此前已成功触及的运行态；
-- Workspace control protocol v6 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 Web Admin/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
+- Workspace control protocol v7 保留 `update_oauth_redirect_policy` 并新增异步 `apply_config`。OAuth Callback URI/Host 变化在 daemon 进程内直接更新活动 OAuth runtime；若 runtime 尚未加载则由控制层受控 fallback 到单 listener reload，不允许 Web Admin/CLI 进程修改自己的 registry 后伪装 daemon 已热更新；`apply_config` 则由 daemon 使用其当前内存 profile 与磁盘 desired profile 计算同一份 apply plan，并原子协调活动 listener / direct tunnel，失败时回滚已触及运行态；
 - Tunnel 仍保持独立事务语义：保存 tunnel 配置后由 tunnel control 执行 start/stop/restart；Workspace profile 更新本身不会把 tunnel 字段误判为 listener 配置。Gateway 仅在其实际使用的 MCP tunnel/owner 字段变化时 reload，不再因 Workspace 名称等无关配置变化重建；
 - Gateway 不归属于任何 Workspace daemon。Windows/Linux Web Admin/CLI 都使用独立 Gateway daemon；Windows 使用配置域级 Named Pipe，Linux 使用私有 UDS。Web Admin 不创建 process-local Gateway listener 或 Tunnel，route 始终由 Gateway daemon 持有并指向对应 Workspace 目标端口。
 
@@ -324,7 +324,7 @@ anchor gateway stop [--timeout SECONDS] [--force]
 
 `anchor gateway serve <workspace ...>` 仍保留为前台调试、容器或外部 supervisor 入口；内置后台 daemon 与前台 serve 不应同时拥有同一 Gateway 端口。
 
-Gateway daemon 使用独立协议 v1，不复用 Workspace daemon protocol v6。每个请求都包含 `protocolVersion`、`requestId` 和 `configScope`；scope 根据当前应用配置目录派生，用于拒绝错误配置域的 PID/socket。Linux 运行文件位于与 Workspace daemon 相同的私有 runtime 根目录，但使用全局名称：
+Gateway daemon 使用独立协议 v1，不复用 Workspace daemon protocol v7。每个请求都包含 `protocolVersion`、`requestId` 和 `configScope`；scope 根据当前应用配置目录派生，用于拒绝错误配置域的 PID/socket。Linux 运行文件位于与 Workspace daemon 相同的私有 runtime 根目录，但使用全局名称：
 
 ```text
 gateway.lock
@@ -335,7 +335,7 @@ gateway.sock
 
 状态文件记录 daemon PID、配置域、route Workspace IDs、Gateway 本地端口、版本和 optional `buildIdentity`。Unix socket 父目录保持 `0700`、socket 为 `0600`。readiness 同时要求 Gateway 本地端口属于目标 PID 且 control `ping` 成功。
 
-Gateway lifecycle 从 protocol v1 起保持稳定，因此未来客户端协议升级后，只允许 `version` 与 `shutdown` / `prepare_restart` 对较旧且不低于 v1 的 daemon 使用其旧协议版本重试。其他 Gateway 写请求仍严格要求当前协议，避免“为了升级兼容”扩大运行控制权限或产生部分应用。
+Gateway 当前只有 protocol v1 一个受支持控制协议。`version`、`shutdown` / `prepare_restart` 与其他 Gateway 写请求都严格要求当前协议，不再保留“未来版本预置”的旧协议重试分支；如果后续引入 protocol v2，必须届时基于真实升级需求显式设计有界迁移，而不是提前长期保留兼容桥。
 
 Gateway protocol v1 的可观察性方法采用 additive tag 扩展，没有修改已有 v1 请求/响应形状：
 
@@ -372,7 +372,7 @@ anchor --json config apply <workspace> [--wait SECONDS]
 - `config get` 和 `config diff` 是只读操作；`--key` 与 `--set` 使用 `WorkspaceProfile` 的序列化字段路径，例如 `runtime.local_port`、`auth.oauth_redirect_hosts`、`tunnel.type`。
 - `config set` 不修改活动 `profiles.json`，只写入配置目录下受保护的 `pending-config/<workspace>.json`；pending 同时保存 staging 时的 base profile，活动配置被其他 Web Admin/CLI 进程修改后会检测 stale base 并拒绝覆盖。
 - `config diff` 默认比较活动 profile 与当前 pending candidate，也可追加临时 `--set` 预览；输出 field-level changes 和共享 `applyPlan`，不会写磁盘或运行态。
-- `config apply` 才把 pending candidate 提升为活动配置。Workspace daemon 运行时必须通过 protocol v6 `apply_config`；endpoint、协议或 PID 归属错误直接失败，不回退为 CLI 本地 `RuntimeSupervisor`。Gateway route/owner 需要更新时只通过独立 Gateway control reload。
+- `config apply` 才把 pending candidate 提升为活动配置。Workspace daemon 运行时必须通过 protocol v7 `apply_config`；endpoint、协议或 PID 归属错误直接失败，不回退为 CLI 本地 `RuntimeSupervisor`。Gateway route/owner 需要更新时只通过独立 Gateway control reload。
 - 任一运行态应用失败时会恢复旧 Workspace/settings，并对已经成功触及的 Workspace/Gateway 运行态执行受控回滚；pending 文件保留，便于修正后重试。全部成功后才删除 pending。
 - 对已停止的 Workspace，`apply` 只持久化配置，不会隐式启动 listener 或 tunnel。如果 Workspace daemon 未运行但相关 legacy/外部 listener 仍在监听，CLI 会 fail-closed，避免活动运行态继续使用旧配置；应先停止 listener，或先由 Workspace daemon 接管运行态。
 - pending 文件不包含独立 secret store 内容，单文件限制为 2 MiB；Unix staging 目录/文件分别使用 `0700` / `0600` 权限。

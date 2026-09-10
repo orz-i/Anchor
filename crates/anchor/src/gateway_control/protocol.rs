@@ -4,7 +4,6 @@ use crate::build_identity::BuildIdentity;
 use crate::settings::McpGatewayConfig;
 
 pub const GATEWAY_CONTROL_PROTOCOL_VERSION: u16 = 1;
-pub const GATEWAY_LIFECYCLE_PROTOCOL_MIN_VERSION: u16 = 1;
 pub const MAX_GATEWAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 
 pub const ERROR_PROTOCOL_VERSION_UNSUPPORTED: &str = "protocol_version_unsupported";

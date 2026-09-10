@@ -330,12 +330,11 @@ pub enum WorkSessionClosePhase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkSessionCloseOutbox {
     pub schema_version: u32,
     pub task_id: String,
-    #[serde(alias = "history_session_key")]
     pub session_id: String,
-    #[serde(alias = "history_session_path")]
     pub session_path: String,
     pub session_status: HarnessSessionStatus,
     pub finish_args: Value,
@@ -370,6 +369,7 @@ pub enum StageCommitStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageCommitReceipt {
     pub workflow_id: String,
     pub idempotency_key: String,
@@ -390,7 +390,6 @@ pub struct StageCommitReceipt {
     #[serde(default)]
     pub current_session_id: Option<String>,
     #[serde(default)]
-    #[serde(alias = "history_checkpoint")]
     pub session_checkpoint: Option<Value>,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -539,6 +538,7 @@ pub struct BaselineObject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskSession {
     pub schema_version: u32,
     pub id: String,
@@ -568,10 +568,8 @@ pub struct TaskSession {
     pub latest_change_id: Option<String>,
     pub latest_verification_id: Option<String>,
     #[serde(default)]
-    #[serde(alias = "history_session_key")]
     pub session_id: Option<String>,
     #[serde(default)]
-    #[serde(alias = "history_session_path")]
     pub session_path: Option<String>,
     #[serde(default)]
     pub git_worktree: Option<TaskGitWorktree>,
@@ -621,12 +619,12 @@ pub struct HarnessEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationRecord {
     pub id: String,
     pub workspace_id: String,
     pub task_id: Option<String>,
     #[serde(default)]
-    #[serde(alias = "history_session_key")]
     pub session_id: Option<String>,
     #[serde(default)]
     pub mcp_session_id: Option<String>,
@@ -759,4 +757,33 @@ pub struct HarnessIndex {
     pub schema_version: u32,
     #[serde(default)]
     pub workspaces: HashMap<String, WorkspaceHarnessState>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn work_session_outbox_rejects_retired_history_session_fields() {
+        let legacy = json!({
+            "schema_version": SCHEMA_VERSION,
+            "task_id": "task",
+            "history_session_key": "legacy-session",
+            "session_path": "docs/session/legacy.md",
+            "session_status": "active",
+            "finish_args": {},
+            "checkpoint_args": {},
+            "phase": "prepared",
+            "attempts": 0,
+            "last_error": null,
+            "created_at": "0",
+            "updated_at": "0"
+        });
+
+        let error = serde_json::from_value::<WorkSessionCloseOutbox>(legacy)
+            .expect_err("retired history session fields must be rejected");
+        assert!(error.to_string().contains("history_session_key"));
+    }
 }

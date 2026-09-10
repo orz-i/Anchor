@@ -4,8 +4,7 @@ use serde::Serialize;
 
 use crate::data::{AppData, DataStore};
 use crate::error::{AppError, AppResult};
-use crate::settings::{FrpProfile, McpGatewayConfig};
-use crate::workspace::WorkspaceProfile;
+use crate::settings::{FrpProfile, FrpProfileInput};
 
 use super::args::{FrpAddOptions, FrpCommand, FrpDeleteOptions, FrpTokenInput, FrpUpdateOptions};
 
@@ -80,75 +79,37 @@ pub async fn execute(command: FrpCommand) -> AppResult<i32> {
 }
 
 fn add_profile(options: FrpAddOptions) -> AppResult<FrpProfileView> {
-    let name = normalize_required("FRP profile name", &options.name)?;
-    let server = normalize_server(&options.server)?;
     let token = read_token_input(options.token)?;
-    DataStore::update_file(|data| {
-        ensure_unique_name(&data.frp_profiles, &name, None)?;
-        let profile = FrpProfile {
-            id: uuid::Uuid::new_v4().simple().to_string(),
-            name,
-            server,
-            server_port: options.server_port,
-        };
-        if let Some(token) = token.as_ref() {
-            data.app_secrets
-                .entry(FRP_PROFILE_TOKEN_SCOPE.into())
-                .or_default()
-                .insert(profile.id.clone(), token.clone());
-        }
-        data.frp_profiles.push(profile.clone());
-        Ok(profile_view(data, &profile))
-    })
+    let saved = crate::management::save_frp_profile_metadata(FrpProfileInput {
+        id: String::new(),
+        name: options.name,
+        server: options.server,
+        server_port: options.server_port,
+    })?;
+    if let Some(token) = token {
+        crate::management::set_frp_profile_token(&saved.id, &token)?;
+    }
+    profile_view_by_id(&saved.id)
 }
 
 fn update_profile(options: FrpUpdateOptions) -> AppResult<FrpProfileView> {
     let token = read_token_input(options.token)?;
-    let connection_changes = options.server.is_some()
-        || options.server_port.is_some()
-        || token.is_some()
-        || options.clear_token;
-    if connection_changes {
-        let (profile, workspaces, gateway) = DataStore::read_file(|data| {
-            let index = resolve_profile_index(&data.frp_profiles, &options.profile)?;
-            Ok((
-                data.frp_profiles[index].clone(),
-                data.profiles.clone(),
-                data.mcp_gateway.clone(),
-            ))
-        })?;
-        ensure_profile_not_live(&profile, &workspaces, &gateway)?;
-    }
-    DataStore::update_file(|data| {
+    let current = DataStore::read_file(|data| {
         let index = resolve_profile_index(&data.frp_profiles, &options.profile)?;
-        let id = data.frp_profiles[index].id.clone();
-
-        if let Some(name) = options.name.as_deref() {
-            let name = normalize_required("FRP profile name", name)?;
-            ensure_unique_name(&data.frp_profiles, &name, Some(&id))?;
-            data.frp_profiles[index].name = name;
-        }
-        if let Some(server) = options.server.as_deref() {
-            data.frp_profiles[index].server = normalize_server(server)?;
-        }
-        if let Some(port) = options.server_port {
-            if port == 0 {
-                return Err(AppError::Message("FRP 服务器端口必须大于 0".into()));
-            }
-            data.frp_profiles[index].server_port = port;
-        }
-        if let Some(token) = token.as_ref() {
-            data.app_secrets
-                .entry(FRP_PROFILE_TOKEN_SCOPE.into())
-                .or_default()
-                .insert(id.clone(), token.clone());
-        } else if options.clear_token {
-            delete_token(data, &id);
-        }
-
-        let profile = data.frp_profiles[index].clone();
-        Ok(profile_view(data, &profile))
-    })
+        Ok(data.frp_profiles[index].clone())
+    })?;
+    let saved = crate::management::save_frp_profile_metadata(FrpProfileInput {
+        id: current.id.clone(),
+        name: options.name.unwrap_or(current.name),
+        server: options.server.unwrap_or(current.server),
+        server_port: options.server_port.unwrap_or(current.server_port),
+    })?;
+    if let Some(token) = token {
+        crate::management::set_frp_profile_token(&saved.id, &token)?;
+    } else if options.clear_token {
+        crate::management::clear_frp_profile_token(&saved.id)?;
+    }
+    profile_view_by_id(&saved.id)
 }
 
 fn delete_profile(options: FrpDeleteOptions) -> AppResult<(String, String)> {
@@ -157,48 +118,12 @@ fn delete_profile(options: FrpDeleteOptions) -> AppResult<(String, String)> {
             "删除 FRP profile 需要显式添加 --force；不会删除任何 workspace。".into(),
         ));
     }
-    DataStore::update_file(|data| {
+    let profile = DataStore::read_file(|data| {
         let index = resolve_profile_index(&data.frp_profiles, &options.profile)?;
-        let profile = data.frp_profiles[index].clone();
-        let references = all_profile_references(data, &profile.id)?;
-        if !references.is_empty() {
-            return Err(AppError::Message(format!(
-                "FRP profile {} 仍被以下 tunnel 使用：{}。请先通过 `anchor tunnel configure ... --clear-frp-profile` 解除引用。",
-                profile.name,
-                references.join(", ")
-            )));
-        }
-        data.frp_profiles.remove(index);
-        delete_token(data, &profile.id);
-        Ok((profile.id, profile.name))
-    })
-}
-
-fn delete_token(data: &mut AppData, id: &str) {
-    if let Some(tokens) = data.app_secrets.get_mut(FRP_PROFILE_TOKEN_SCOPE) {
-        tokens.remove(id);
-        if tokens.is_empty() {
-            data.app_secrets.remove(FRP_PROFILE_TOKEN_SCOPE);
-        }
-    }
-}
-
-fn normalize_required(label: &str, value: &str) -> AppResult<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(AppError::Message(format!("{label} 不能为空")));
-    }
-    Ok(value.to_string())
-}
-
-fn normalize_server(value: &str) -> AppResult<String> {
-    let value = normalize_required("FRP server", value)?;
-    if value.contains("//") || value.contains('/') || value.contains(char::is_whitespace) {
-        return Err(AppError::Message(
-            "FRP server 只接受主机名或 IP，不要包含协议、路径或空白字符".into(),
-        ));
-    }
-    Ok(value.trim_end_matches('.').to_string())
+        Ok(data.frp_profiles[index].clone())
+    })?;
+    crate::management::delete_frp_profile(&profile.id)?;
+    Ok((profile.id, profile.name))
 }
 
 fn read_token_input(input: Option<FrpTokenInput>) -> AppResult<Option<String>> {
@@ -252,19 +177,6 @@ fn read_token_input(input: Option<FrpTokenInput>) -> AppResult<Option<String>> {
     Ok(Some(token))
 }
 
-fn ensure_unique_name(
-    profiles: &[FrpProfile],
-    name: &str,
-    except_id: Option<&str>,
-) -> AppResult<()> {
-    if profiles.iter().any(|profile| {
-        Some(profile.id.as_str()) != except_id && profile.name.trim().eq_ignore_ascii_case(name)
-    }) {
-        return Err(AppError::Message(format!("FRP profile 名称已存在：{name}")));
-    }
-    Ok(())
-}
-
 pub(crate) fn resolve_profile_id(profiles: &[FrpProfile], selector: &str) -> AppResult<String> {
     let index = resolve_profile_index(profiles, selector)?;
     Ok(profiles[index].id.clone())
@@ -300,6 +212,17 @@ fn profile_views(data: &AppData) -> Vec<FrpProfileView> {
         .collect()
 }
 
+fn profile_view_by_id(id: &str) -> AppResult<FrpProfileView> {
+    DataStore::read_file(|data| {
+        let profile = data
+            .frp_profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| AppError::Message(format!("FRP profile not found: {id}")))?;
+        Ok(profile_view(data, profile))
+    })
+}
+
 fn profile_view(data: &AppData, profile: &FrpProfile) -> FrpProfileView {
     FrpProfileView {
         id: profile.id.clone(),
@@ -323,78 +246,6 @@ fn profile_references(data: &AppData, id: &str) -> Vec<String> {
         }
     }
     references
-}
-
-fn all_profile_references(data: &AppData, id: &str) -> AppResult<Vec<String>> {
-    let mut references = profile_references(data, id);
-    for workspace in &data.profiles {
-        let Some(pending) = super::config::pending_candidate(workspace)? else {
-            continue;
-        };
-        if pending.tunnel.frp_profile_id == id && workspace.tunnel.frp_profile_id != id {
-            references.push(format!("{}:mcp(pending)", workspace.name));
-        }
-    }
-    references.sort();
-    references.dedup();
-    Ok(references)
-}
-
-fn ensure_profile_not_live(
-    profile: &FrpProfile,
-    workspaces: &[WorkspaceProfile],
-    gateway: &McpGatewayConfig,
-) -> AppResult<()> {
-    let mut live = Vec::new();
-    for workspace in workspaces {
-        let inspection = crate::daemon::inspect(workspace)?;
-        if inspection.ambiguous {
-            return Err(AppError::Message(format!(
-                "无法安全更新 FRP profile：workspace {} daemon 状态不明确：{}",
-                workspace.name, inspection.detail
-            )));
-        }
-        if inspection.running && inspection.pid_matches {
-            let managed = inspection
-                .state
-                .as_ref()
-                .and_then(|state| state.managed_tunnels());
-            if workspace.tunnel.frp_profile_id == profile.id
-                && managed.is_some_and(|selection| selection.includes_mcp())
-            {
-                live.push(format!("{}:mcp", workspace.name));
-            }
-        }
-    }
-
-    if gateway.enabled && !gateway.owner_workspace_id.trim().is_empty() {
-        if let Some(owner) = workspaces.iter().find(|workspace| {
-            workspace.id == gateway.owner_workspace_id
-                && workspace.tunnel.frp_profile_id == profile.id
-        }) {
-            let inspection = crate::gateway_daemon::inspect()?;
-            if inspection.ambiguous {
-                return Err(AppError::Message(format!(
-                    "无法安全更新 FRP profile：Gateway daemon 状态不明确：{}",
-                    inspection.detail
-                )));
-            }
-            if inspection.running && inspection.pid_matches {
-                live.push(format!("{}:gateway-mcp", owner.name));
-            }
-        }
-    }
-
-    if live.is_empty() {
-        return Ok(());
-    }
-    live.sort();
-    live.dedup();
-    Err(AppError::Message(format!(
-        "FRP profile {} 正被运行中的受管 tunnel 使用：{}。为避免磁盘配置与活动 frpc 分叉，请先停止对应 tunnel/daemon，修改 profile 后再启动。仅修改 profile 名称不受此限制。",
-        profile.name,
-        live.join(", ")
-    )))
 }
 
 #[cfg(test)]
@@ -447,16 +298,6 @@ mod tests {
         assert_eq!(view.references, vec!["demo:mcp"]);
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains("super-secret"));
-    }
-
-    #[test]
-    fn server_rejects_urls_and_paths() {
-        assert_eq!(
-            normalize_server("frp.example.com.").unwrap(),
-            "frp.example.com"
-        );
-        assert!(normalize_server("https://frp.example.com").is_err());
-        assert!(normalize_server("frp.example.com/path").is_err());
     }
 
     #[test]
