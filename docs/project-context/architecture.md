@@ -114,6 +114,8 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 ### workspace/
 - **职责**: Workspace 配置的 CRUD、持久化、密钥分离存储
 - **实现**: `crates/anchor/src/workspace/` 与 `crates/anchor/src/data/`
+- **持久化 schema**: `profiles.json` 与受保护 `secrets.json` 的解密 payload 分别使用独立 `schema_version=1`；无版本内容只允许在 storage 边界执行一次 v0 → v1 迁移并立即重写。当前 schema 对退休 Actions/Workspace-iLink secret key、未知字段和未来 schema fail closed，`DataStore` 读写主路径不再执行兼容清理扫描。
+- **Portable config**: 当前 envelope 为 v2；v1 已 hard-cut，不再为旧 inner payload 保留导入兼容桥。
 
 ### runtime/
 - **职责**: MCP 运行时生命周期与恢复状态机（Stopped → Starting → Running / Recovering → Stopping → Error）以及 machine-local runtime capability / Node identity

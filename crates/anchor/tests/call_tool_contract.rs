@@ -1013,7 +1013,7 @@ fn list_command_sessions_separates_execution_duration_from_retention_age() {
     let first = call_tool_for_session(
         &ctx,
         "list_command_sessions",
-        &json!({"include_terminal": true, "max_output_bytes": 1_024}),
+        &json!({"include_history": true, "max_output_bytes": 1_024}),
         caller_session,
     );
     let first = assert_ok(&first);
@@ -1046,7 +1046,7 @@ fn list_command_sessions_separates_execution_duration_from_retention_age() {
     let second = call_tool_for_session(
         &ctx,
         "list_command_sessions",
-        &json!({"include_terminal": true, "max_output_bytes": 1_024}),
+        &json!({"include_history": true, "max_output_bytes": 1_024}),
         caller_session,
     );
     let second = assert_ok(&second);
@@ -1062,17 +1062,18 @@ fn list_command_sessions_separates_execution_duration_from_retention_age() {
     assert!(second_session["session_age_ms"].as_u64().unwrap_or(0) > first_age);
     assert!(second_session["retained_ms"].as_u64().unwrap_or(0) >= first_retained);
 
-    let running_only = call_tool_for_session(
+    let pending_only = call_tool_for_session(
         &ctx,
         "list_command_sessions",
-        &json!({"include_terminal": false, "max_output_bytes": 0}),
+        &json!({"max_output_bytes": 0}),
         caller_session,
     );
-    let running_only = assert_ok(&running_only);
-    assert_eq!(running_only["session_count"], 0);
-    assert_eq!(running_only["pending_result_count"], 1);
-    assert_eq!(running_only["unobserved_terminal_count"], 1);
-    assert_eq!(running_only["requires_followup"], true);
+    let pending_only = assert_ok(&pending_only);
+    assert_eq!(pending_only["scope"], "pending");
+    assert_eq!(pending_only["session_count"], 1);
+    assert_eq!(pending_only["pending_result_count"], 1);
+    assert_eq!(pending_only["unobserved_terminal_count"], 1);
+    assert_eq!(pending_only["requires_followup"], true);
 
     let waited = call_tool_for_session(
         &ctx,
@@ -1087,7 +1088,7 @@ fn list_command_sessions_separates_execution_duration_from_retention_age() {
     let final_list = call_tool_for_session(
         &ctx,
         "list_command_sessions",
-        &json!({"include_terminal": true, "max_output_bytes": 0}),
+        &json!({"include_history": true, "max_output_bytes": 0}),
         caller_session,
     );
     let final_list = assert_ok(&final_list);
@@ -1138,7 +1139,7 @@ fn consumed_terminal_sessions_do_not_exhaust_the_sixty_four_session_limit() {
     let retained = call_tool_for_session(
         &ctx,
         "list_command_sessions",
-        &json!({"include_terminal": true, "max_output_bytes": 0}),
+        &json!({"include_history": true, "max_output_bytes": 0}),
         caller_session,
     );
     let retained = assert_ok(&retained);
@@ -1666,7 +1667,7 @@ fn durable_wait_recovers_after_tool_context_reconstruction() {
     let sessions = invoke(
         &recovered_ctx,
         "list_command_sessions",
-        json!({"include_terminal": true, "max_output_bytes": 0}),
+        json!({"include_history": true, "max_output_bytes": 0}),
     );
     let sessions = assert_ok(&sessions);
     assert!(sessions["sessions"]

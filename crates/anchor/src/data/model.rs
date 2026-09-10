@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::settings::{DownloadConfig, FrpProfile, McpGatewayConfig, ProxyConfig};
 use crate::workspace::WorkspaceProfile;
 
+pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;
+
 /// In-memory application state. Disk serialization is intentionally handled by
 /// `ProfilesData` and `SecretsData` so configuration and secrets cannot be
 /// silently mixed again.
@@ -21,10 +24,22 @@ pub struct AppData {
     pub profiles: Vec<WorkspaceProfile>,
 }
 
+impl Default for SecretsData {
+    fn default() -> Self {
+        Self {
+            schema_version: SECRETS_SCHEMA_VERSION,
+            shared_secrets: HashMap::new(),
+            workspace_secrets: HashMap::new(),
+            app_secrets: HashMap::new(),
+        }
+    }
+}
+
 /// Canonical on-disk payload stored in `data/profiles.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfilesData {
+    pub schema_version: u32,
     pub frp_profiles: Vec<FrpProfile>,
     pub last_workspace_id: String,
     pub download: DownloadConfig,
@@ -36,6 +51,7 @@ pub(crate) struct ProfilesData {
 impl ProfilesData {
     pub fn from_app_data(data: &AppData) -> Self {
         Self {
+            schema_version: PROFILES_SCHEMA_VERSION,
             frp_profiles: data.frp_profiles.clone(),
             last_workspace_id: data.last_workspace_id.clone(),
             download: data.download.clone(),
@@ -58,9 +74,10 @@ impl ProfilesData {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsData {
+    pub schema_version: u32,
     pub shared_secrets: HashMap<String, String>,
     pub workspace_secrets: HashMap<String, HashMap<String, String>>,
     pub app_secrets: HashMap<String, HashMap<String, String>>,
@@ -69,6 +86,7 @@ pub struct SecretsData {
 impl SecretsData {
     pub fn from_app_data(data: &AppData) -> Self {
         Self {
+            schema_version: SECRETS_SCHEMA_VERSION,
             shared_secrets: data.shared_secrets.clone(),
             workspace_secrets: data.workspace_secrets.clone(),
             app_secrets: data.app_secrets.clone(),
@@ -106,6 +124,7 @@ mod tests {
     #[test]
     fn profiles_reject_inline_secret_fields() {
         let error = serde_json::from_value::<ProfilesData>(serde_json::json!({
+            "schema_version": PROFILES_SCHEMA_VERSION,
             "frp_profiles": [],
             "last_workspace_id": "",
             "download": {

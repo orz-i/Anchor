@@ -129,7 +129,7 @@ GUI 工作区控制迁移现状：
 - Workspace protocol 升级为 v6：OAuth Callback URI/Host 支持 daemon 进程内字段级 hot update；新增 daemon-owner `apply_config`，由运行权威以当前内存 profile 对比磁盘 desired profile，事务协调 listener/direct tunnel 并回滚失败操作；
 - Windows Workspace GUI 已切到 Workspace daemon Named Pipe；Gateway 也使用独立 Windows Gateway daemon。Windows GUI 不再以进程内 `RuntimeSupervisor`/Tunnel Supervisor/Gateway 作为运行权威；
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
-- 若升级时检测到旧桌面进程仍持有 process-local listener，Windows GUI 将其报告为冲突并拒绝接管，防止旧进程与 daemon 控制域同时成为运行权威。
+- 未知/外部 listener 继续按 PID/端口 ownership 冲突 fail closed；Gateway 配置写入不再通过当前管理进程内的旧 process-local supervisor 状态做兼容探测，唯一运行权威是 Gateway daemon/control 状态。
 
 尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及崩溃报告/升级编排的更高层自动化。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；本阶段已补 build identity、只读版本探测和 Workspace lifecycle-only 旧协议排空边界；Gateway 当前只有 v1，不保留不存在的旧版本 retry bridge。真实 Windows reboot 后自动恢复与安装包升级后的实机滚动切换仍属于发布验收项。
 

@@ -945,10 +945,7 @@ pub fn list_command_sessions(
     let include_history = args
         .get("include_history")
         .and_then(Value::as_bool)
-        .or_else(|| args.get("include_terminal").and_then(Value::as_bool))
         .unwrap_or(false);
-    let running_only_compat = args.get("include_history").is_none()
-        && args.get("include_terminal").and_then(Value::as_bool) == Some(false);
     let max_output_bytes = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -972,11 +969,6 @@ pub fn list_command_sessions(
     let retained_total_count = all_sessions.len();
     let sessions = if include_history {
         all_sessions
-    } else if running_only_compat {
-        all_sessions
-            .into_iter()
-            .filter(|session| session.get("execution_status") == Some(&json!("running")))
-            .collect::<Vec<_>>()
     } else {
         all_sessions
             .into_iter()
@@ -1000,7 +992,7 @@ pub fn list_command_sessions(
         .count();
     Ok(tool_ok(json!({
         "sessions": sessions,
-        "scope": if include_history { "history" } else if running_only_compat { "running" } else { "pending" },
+        "scope": if include_history { "history" } else { "pending" },
         "history_included": include_history,
         "retained_total_count": retained_total_count,
         "session_count": session_count,
@@ -2033,7 +2025,7 @@ impl CommandSessionStore {
         Ok(session)
     }
 
-    pub fn list_snapshots(&self, include_terminal: bool, max_output_bytes: usize) -> Vec<Value> {
+    pub fn list_snapshots(&self, include_history: bool, max_output_bytes: usize) -> Vec<Value> {
         let sessions = {
             let mut sessions = self.sessions.lock().expect("sessions lock");
             prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
@@ -2043,7 +2035,7 @@ impl CommandSessionStore {
             .into_iter()
             .filter_map(|session| {
                 crate::async_runtime::block_on(session.refresh_status());
-                if !include_terminal && session.has_exited() {
+                if !include_history && session.has_exited() {
                     return None;
                 }
                 Some(session.snapshot(max_output_bytes))

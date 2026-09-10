@@ -14,24 +14,6 @@ use super::storage::{data_file_path, load, save};
 
 static DATA_FILE_LOCK: Mutex<()> = Mutex::new(());
 
-const RETIRED_ACTIONS_SECRET_KEYS: &[&str] = &[
-    "actions_api_key",
-    "actions_oauth_client_secret",
-    "actions_oauth_password",
-    "actions_oauth_token_secret",
-    "actions_cloudflare_token",
-    "actions_frp_token",
-];
-
-const RETIRED_WORKSPACE_NOTIFICATION_SECRET_KEYS: &[&str] = &[
-    "ilink_bot_token",
-    "ilink_target_user_id",
-    "ilink_context_token",
-    "ilink_base_url",
-    "ilink_bot_id",
-    "ilink_login_user_id",
-];
-
 struct DataFileGuard {
     _process_guard: MutexGuard<'static, ()>,
     lock_file: File,
@@ -72,33 +54,6 @@ fn populate_workspace_secrets(data: &mut AppData, profile_id: &str) {
     }
 }
 
-fn strip_retired_actions_secrets(data: &mut AppData) -> bool {
-    let mut changed = false;
-    for key in RETIRED_ACTIONS_SECRET_KEYS {
-        changed |= data.shared_secrets.remove(*key).is_some();
-    }
-    for secrets in data.workspace_secrets.values_mut() {
-        for key in RETIRED_ACTIONS_SECRET_KEYS {
-            changed |= secrets.remove(*key).is_some();
-        }
-    }
-    changed
-}
-
-fn strip_retired_workspace_notification_secrets(data: &mut AppData) -> bool {
-    let mut changed = false;
-    for secrets in data.workspace_secrets.values_mut() {
-        for key in RETIRED_WORKSPACE_NOTIFICATION_SECRET_KEYS {
-            changed |= secrets.remove(*key).is_some();
-        }
-    }
-    changed
-}
-
-fn strip_retired_secrets(data: &mut AppData) -> bool {
-    strip_retired_actions_secrets(data) | strip_retired_workspace_notification_secrets(data)
-}
-
 impl Drop for DataFileGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock_file);
@@ -115,11 +70,10 @@ impl DataStore {
         let _guard = lock_data_file()?;
         let path = data_file_path()?;
         let existed_before = path.exists();
-        let mut data = load()?;
-        let retired_secrets_removed = strip_retired_secrets(&mut data);
+        let data = load()?;
         validate_data(&data)?;
         let store = Self { data };
-        if !existed_before || retired_secrets_removed {
+        if !existed_before {
             store.persist_unlocked()?;
         }
         Ok(store)
@@ -139,8 +93,7 @@ impl DataStore {
 
     pub fn read_file<R>(f: impl FnOnce(&AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
-        let mut data = load()?;
-        strip_retired_secrets(&mut data);
+        let data = load()?;
         validate_data(&data)?;
         f(&data)
     }
@@ -148,7 +101,6 @@ impl DataStore {
     pub fn update_file<R>(f: impl FnOnce(&mut AppData) -> AppResult<R>) -> AppResult<R> {
         let _guard = lock_data_file()?;
         let mut data = load()?;
-        strip_retired_secrets(&mut data);
         validate_data(&data)?;
         let result = f(&mut data)?;
         validate_data(&data)?;
@@ -160,9 +112,8 @@ impl DataStore {
     /// decrypting the destination secrets file. Portable config import needs
     /// this path because a copied Windows DPAPI envelope is intentionally not
     /// decryptable on Linux/macOS (and vice versa).
-    pub(crate) fn replace_file(mut data: AppData) -> AppResult<()> {
+    pub(crate) fn replace_file(data: AppData) -> AppResult<()> {
         let _guard = lock_data_file()?;
-        strip_retired_secrets(&mut data);
         validate_data(&data)?;
         save(&data)
     }
@@ -313,34 +264,6 @@ mod tests {
         assert_eq!(secrets["bearer_token"], "keep-me");
         assert!(secrets.contains_key("oauth_password"));
         assert!(!secrets.contains_key("oauth_client_secret"));
-    }
-
-    #[test]
-    fn retired_actions_secrets_are_removed() {
-        let mut data = AppData::default();
-        data.shared_secrets
-            .insert("actions_api_key".into(), "legacy".into());
-        data.workspace_secrets
-            .entry("workspace".into())
-            .or_default()
-            .insert("actions_oauth_password".into(), "legacy".into());
-
-        assert!(strip_retired_actions_secrets(&mut data));
-        assert!(!data.shared_secrets.contains_key("actions_api_key"));
-        assert!(!data.workspace_secrets["workspace"].contains_key("actions_oauth_password"));
-    }
-
-    #[test]
-    fn retired_workspace_scoped_ilink_secrets_are_deleted_without_migration() {
-        let mut data = AppData::default();
-        data.workspace_secrets
-            .entry("workspace".into())
-            .or_default()
-            .insert("ilink_bot_token".into(), "legacy".into());
-
-        assert!(strip_retired_workspace_notification_secrets(&mut data));
-        assert!(!data.workspace_secrets["workspace"].contains_key("ilink_bot_token"));
-        assert!(!data.app_secrets.contains_key("notification.ilink"));
     }
 
     #[test]

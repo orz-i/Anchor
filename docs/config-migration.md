@@ -33,10 +33,13 @@ Linux private-file-permissions -> 加密迁移包 -> Windows DPAPI
 
 不要把 `profiles.json` / `secrets.json` 的直接复制作为跨平台迁移方案。
 
+当前本机持久化内容有独立的 schema 边界：`profiles.json` 与 `secrets.json` 解密后的 payload 都写入 `schema_version=1`。首次读取没有 `schema_version` 的旧内容时，只执行一次 v0 → v1 迁移：Profile 侧只移除已退休的 Actions 配置和 `runtime.skill_roots`；Secret 侧只移除已退休的 Actions key 与旧 Workspace-scoped iLink key，然后立即按当前 schema 重写。已经标记为当前 schema 的数据若仍包含这些退休字段，或声明未来/未知 schema version，会直接 fail closed，不再通过常驻兼容清理逻辑兜底。
+
 ## 迁移包安全模型
 
 迁移包包含完整配置和 secrets，因此必须视为敏感备份：
 
+- 当前 portable config 格式为 **v2**；v1 不再接受。v2 与本机显式配置内容 schema 同步切换，避免把旧无版本 payload 在新代码中静默解释为当前格式；
 - payload 使用 AES-256-GCM 加密；
 - 密钥通过 Argon2id 从 passphrase 派生；
 - 格式版本、导出时间、源平台和源 Anchor 版本均参与 AEAD 认证，篡改会导致导入失败；

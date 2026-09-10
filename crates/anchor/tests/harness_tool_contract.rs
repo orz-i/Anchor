@@ -5201,12 +5201,15 @@ fn catalog_v34_exposes_task_governance_facades_and_schemas() {
         "start_task 缺少 worktree_path schema"
     );
     let exec_schema = anchor_lib::tools::registry::input_schema("exec_command");
-    for property in ["expected_exit_codes", "allowed_exit_codes"] {
-        assert!(
-            exec_schema["properties"].get(property).is_some(),
-            "exec_command 缺少 {property} schema"
-        );
-    }
+    assert!(
+        exec_schema["properties"]
+            .get("expected_exit_codes")
+            .is_some(),
+        "exec_command 缺少 expected_exit_codes schema"
+    );
+    assert!(exec_schema["properties"]
+        .get("allowed_exit_codes")
+        .is_none());
     let verification_branches = begin["inputSchema"]["properties"]["contract"]["properties"]
         ["required_verifications"]["items"]["anyOf"]
         .as_array()

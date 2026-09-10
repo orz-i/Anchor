@@ -4209,13 +4209,6 @@ pub fn input_schema(name: &str) -> Value {
                     "default": [0],
                     "description": "Exit codes that should be treated as successful command completion. Transport, spawn, timeout, cancellation, and kill failures remain failures."
                 },
-                "allowed_exit_codes": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 32,
-                    "items": { "type": "integer" },
-                    "description": "Alias for expected_exit_codes. Do not provide both fields with different values."
-                },
                 "cost_intent": {
                     "type": "string",
                     "enum": ["auto", "local_only", "external_paid"],
@@ -4304,7 +4297,6 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "include_history": { "type": "boolean", "default": false, "description": "Include consumed terminal command-session history. By default only running and terminal-unconsumed sessions are returned." },
-                "include_terminal": { "type": "boolean", "description": "Compatibility alias: true includes terminal history; false requests running sessions only. Prefer include_history for new callers." },
                 "max_output_bytes": { "type": "integer", "minimum": 0, "maximum": 65536, "default": 4096 }
             },
             "additionalProperties": false

@@ -15,10 +15,10 @@ use super::storage::{atomic_write, data_file_path, secrets_file_path};
 use super::DataStore;
 
 const PORTABLE_CONFIG_KIND: &str = "anchor-portable-config";
-const PORTABLE_CONFIG_VERSION: u32 = 1;
+const PORTABLE_CONFIG_VERSION: u32 = 2;
 const PORTABLE_KDF: &str = "argon2id-v1";
 const PORTABLE_CIPHER: &str = "aes-256-gcm-v1";
-const PORTABLE_AAD_PREFIX: &str = "anchor-portable-config-v1";
+const PORTABLE_AAD_PREFIX: &str = "anchor-portable-config-v2";
 const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
 const ARGON2_ITERATIONS: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
@@ -788,6 +788,17 @@ mod tests {
         let error = decode_bundle(&envelope, b"different-passphrase")
             .expect_err("wrong passphrase must fail");
         assert!(error.to_string().contains("解密失败"));
+    }
+
+    #[test]
+    fn portable_config_v1_is_hard_rejected_after_content_schema_cutover() {
+        let data = sample_data("C:/work/demo".into());
+        let mut envelope = encode_bundle(&data, b"migration-passphrase").expect("encode");
+        envelope.version = 1;
+
+        let error = decode_bundle(&envelope, b"migration-passphrase")
+            .expect_err("retired portable bundle version must fail");
+        assert!(error.to_string().contains("不支持的 Anchor 迁移包"));
     }
 
     #[test]

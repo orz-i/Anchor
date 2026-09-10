@@ -123,14 +123,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
 }
 
 fn parse_expected_exit_codes(args: &Value) -> Result<Vec<i32>, WorkspaceError> {
-    let expected = args.get("expected_exit_codes");
-    let allowed = args.get("allowed_exit_codes");
-    if expected.is_some() && allowed.is_some() && expected != allowed {
-        return Err(WorkspaceError::invalid_argument(
-            "expected_exit_codes and allowed_exit_codes cannot specify different values",
-        ));
-    }
-    let Some(value) = expected.or(allowed) else {
+    let Some(value) = args.get("expected_exit_codes") else {
         return Ok(vec![0]);
     };
     let values = value.as_array().ok_or_else(|| {
@@ -2350,7 +2343,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn expected_exit_codes_accept_alias_and_reject_conflicting_aliases() {
+    fn expected_exit_codes_are_normalized_and_deduplicated() {
         assert_eq!(
             parse_expected_exit_codes(&json!({})).expect("default exit codes"),
             vec![0]
@@ -2360,16 +2353,6 @@ mod tests {
                 .expect("expected exit codes"),
             vec![0, 1]
         );
-        assert_eq!(
-            parse_expected_exit_codes(&json!({"allowed_exit_codes": [0, 2]}))
-                .expect("allowed exit codes"),
-            vec![0, 2]
-        );
-        assert!(parse_expected_exit_codes(&json!({
-            "expected_exit_codes": [0, 1],
-            "allowed_exit_codes": [0]
-        }))
-        .is_err());
     }
 
     #[test]
@@ -2590,7 +2573,7 @@ mod tests {
         let sessions = call_tool(
             &ctx,
             "list_command_sessions",
-            &json!({"include_terminal": true, "max_output_bytes": 0}),
+            &json!({"include_history": true, "max_output_bytes": 0}),
         );
         assert_eq!(sessions["pending_result_count"], 0, "{sessions}");
         assert_eq!(sessions["scope"], "history", "{sessions}");

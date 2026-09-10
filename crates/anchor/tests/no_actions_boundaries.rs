@@ -146,14 +146,16 @@ fn current_product_docs_have_no_actions_setup_or_runtime_instructions() {
 }
 
 #[test]
-fn legacy_actions_data_is_only_kept_as_removal_migration() {
+fn legacy_actions_data_is_only_kept_in_the_unversioned_storage_migration() {
     let root = repository_root();
     let storage = fs::read_to_string(root.join("crates/anchor/src/data/storage.rs"))
         .expect("read profile migration");
-    let store = fs::read_to_string(root.join("crates/anchor/src/data/store.rs"))
-        .expect("read secret migration");
+    let store =
+        fs::read_to_string(root.join("crates/anchor/src/data/store.rs")).expect("read data store");
 
     assert!(storage.contains("profile.remove(\"actions\")"));
-    assert!(store.contains("RETIRED_ACTIONS_SECRET_KEYS"));
-    assert!(store.contains("strip_retired_actions_secrets"));
+    assert!(storage.contains("LEGACY_V0_ACTIONS_SECRET_KEYS"));
+    assert!(storage.contains("migrate_unversioned_secrets"));
+    assert!(!store.contains("RETIRED_ACTIONS_SECRET_KEYS"));
+    assert!(!store.contains("strip_retired_actions_secrets"));
 }

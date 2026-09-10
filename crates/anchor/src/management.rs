@@ -803,13 +803,6 @@ pub(crate) async fn set_mcp_gateway(
     let previous = store.settings().mcp_gateway;
     drop(store);
 
-    let legacy_status = crate::mcp::gateway::status(&previous).await;
-    if legacy_status.state == "running" && previous != config {
-        return Err(AppError::Message(
-            "检测到旧版 process-local Gateway 正在运行；Web Admin 不会在该运行态上热改配置，请先退出旧桌面运行态。"
-                .into(),
-        ));
-    }
     if previous.identity_changed(&config) {
         config.clear_observation();
     } else {
