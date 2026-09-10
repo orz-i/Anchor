@@ -202,15 +202,12 @@ fn open_creates_opaque_isolated_session_without_loading_legacy_history() {
     assert!(session_path.starts_with("docs/session/ses_"));
     assert_eq!(opened["automatic_history_loading"], false);
     assert_eq!(opened["history_injected"], false);
-    assert_eq!(
-        opened["archive_access"]["legacy_path"],
-        "docs/history-session"
-    );
-    assert_eq!(
-        opened["archive_access"]["legacy_migration_performed"],
-        false
-    );
     for forbidden in [
+        "archive_access",
+        "legacy_path",
+        "legacy_included",
+        "legacy_scanned",
+        "legacy_migration_performed",
         "all_history_summary",
         "inherited_summary",
         "session_summaries",
@@ -402,9 +399,17 @@ fn validate_never_scans_or_migrates_the_legacy_archive() {
     let validated = assert_ok(&validated);
     assert_eq!(validated["valid"], true);
     assert_eq!(validated["document_count"], 1);
-    assert_eq!(validated["legacy_path"], "docs/history-session");
-    assert_eq!(validated["legacy_scanned"], false);
-    assert_eq!(validated["legacy_migration_performed"], false);
+    for retired in [
+        "legacy_path",
+        "legacy_included",
+        "legacy_scanned",
+        "legacy_migration_performed",
+    ] {
+        assert!(
+            validated.get(retired).is_none(),
+            "retired field leaked: {retired}"
+        );
+    }
     assert!(legacy.join("not-a-session.txt").exists());
 }
 

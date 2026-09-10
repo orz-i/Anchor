@@ -5,6 +5,23 @@ fn source(path: &str) -> String {
     fs::read_to_string(crate_path(path)).unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+#[test]
+fn gateway_does_not_forward_retired_canvs_routes() {
+    let gateway = source("src/mcp/gateway.rs");
+    let start = gateway
+        .find("fn allowed_upstream_path(")
+        .expect("allowed_upstream_path");
+    let end = gateway[start..]
+        .find("fn safe_workspace_segment(")
+        .map(|offset| start + offset)
+        .expect("safe_workspace_segment");
+    let allowlist = &gateway[start..end];
+
+    assert!(!allowlist.contains("canvs"));
+    assert!(allowlist.contains("\"mcp\""));
+    assert!(allowlist.contains("\"oauth/token\""));
+}
+
 fn crate_path(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
 }

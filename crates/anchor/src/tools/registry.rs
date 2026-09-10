@@ -1478,7 +1478,6 @@ fn session_open_output_properties() -> Value {
         "checkpoint_count": { "type": "integer", "minimum": 0 },
         "automatic_history_loading": { "type": "boolean", "const": false },
         "history_injected": { "type": "boolean", "const": false },
-        "archive_access": { "type": "object" },
         "checkpoint_policy": { "type": "object" },
         "persistence": { "type": "object" },
         "warnings": warnings_property()
@@ -2598,7 +2597,6 @@ pub fn output_schema(name: &str) -> Value {
                 "checkpoint_count",
                 "automatic_history_loading",
                 "history_injected",
-                "archive_access",
                 "checkpoint_policy",
                 "persistence",
                 "warnings",
@@ -2657,18 +2655,9 @@ pub fn output_schema(name: &str) -> Value {
                 "sessions": { "type": "array", "items": { "type": "object" } },
                 "cursor": { "type": "integer", "minimum": 0 },
                 "next_cursor": { "type": ["integer", "null"], "minimum": 0 },
-                "total": { "type": "integer", "minimum": 0 },
-                "legacy_path": { "type": "string", "const": "docs/history-session" },
-                "legacy_included": { "type": "boolean", "const": false }
+                "total": { "type": "integer", "minimum": 0 }
             }),
-            &[
-                "sessions",
-                "cursor",
-                "next_cursor",
-                "total",
-                "legacy_path",
-                "legacy_included",
-            ],
+            &["sessions", "cursor", "next_cursor", "total"],
         ),
         "session_get" => success_output_schema(
             json!({
@@ -2720,9 +2709,6 @@ pub fn output_schema(name: &str) -> Value {
                 "max_documents": { "type": "integer", "minimum": 1 },
                 "index_status": { "type": "string", "minLength": 1 },
                 "repaired": { "type": "boolean" },
-                "legacy_path": { "type": "string", "const": "docs/history-session" },
-                "legacy_scanned": { "type": "boolean", "const": false },
-                "legacy_migration_performed": { "type": "boolean", "const": false },
                 "warnings": warnings_property()
             }),
             &[
@@ -2740,9 +2726,6 @@ pub fn output_schema(name: &str) -> Value {
                 "max_documents",
                 "index_status",
                 "repaired",
-                "legacy_path",
-                "legacy_scanned",
-                "legacy_migration_performed",
                 "warnings",
             ],
         ),

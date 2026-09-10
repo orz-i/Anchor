@@ -319,12 +319,6 @@ pub fn open(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "checkpoint_count": checkpoint_count,
         "automatic_history_loading": false,
         "history_injected": false,
-        "archive_access": {
-            "index_path": format!("{}/index.json", session_dir_display(ctx, &session_dir)),
-            "legacy_path": storage::LEGACY_SESSION_DIR,
-            "legacy_migration_performed": false,
-            "read_method": "Use session operation=list to discover metadata and operation=get to read one explicit Session. Use read_file only for the frozen legacy archive when the user explicitly requests legacy history."
-        },
         "checkpoint_policy": {
             "tool": "session",
             "operation": "checkpoint",
@@ -374,9 +368,7 @@ pub fn list(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "sessions": [],
             "cursor": 0,
             "next_cursor": Value::Null,
-            "total": 0,
-            "legacy_path": storage::LEGACY_SESSION_DIR,
-            "legacy_included": false
+            "total": 0
         })));
     };
     let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -421,9 +413,7 @@ pub fn list(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "sessions": page,
         "cursor": cursor,
         "next_cursor": next_cursor,
-        "total": total,
-        "legacy_path": storage::LEGACY_SESSION_DIR,
-        "legacy_included": false
+        "total": total
     })))
 }
 
@@ -1126,9 +1116,6 @@ pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "max_documents": storage::MAX_SESSION_DOCUMENTS,
         "index_status": index_status,
         "repaired": repaired,
-        "legacy_path": storage::LEGACY_SESSION_DIR,
-        "legacy_scanned": false,
-        "legacy_migration_performed": false,
         "warnings": warnings
     })))
 }

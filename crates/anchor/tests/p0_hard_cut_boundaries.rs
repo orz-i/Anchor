@@ -7,6 +7,29 @@ fn source(path: &str) -> String {
 }
 
 #[test]
+fn active_session_contract_does_not_publish_legacy_archive_metadata() {
+    let session = source("src/tools/session/mod.rs");
+    let registry = source("src/tools/registry.rs");
+
+    for retired in [
+        "archive_access",
+        "legacy_path",
+        "legacy_included",
+        "legacy_scanned",
+        "legacy_migration_performed",
+    ] {
+        assert!(
+            !session.contains(retired),
+            "active Session output leaked retired field: {retired}"
+        );
+        assert!(
+            !registry.contains(&format!("\"{retired}\"")),
+            "active Session output schema leaked retired field: {retired}"
+        );
+    }
+}
+
+#[test]
 fn retired_text_search_tool_names_cannot_reenter_dispatch_or_registry() {
     let dispatch = source("src/tools/dispatch.rs");
     let registry = source("src/tools/registry.rs");

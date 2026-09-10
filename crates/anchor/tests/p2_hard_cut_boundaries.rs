@@ -6,6 +6,26 @@ fn crate_source(path: &str) -> String {
     fs::read_to_string(root.join(path)).unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+#[test]
+fn frontend_federation_discovery_contract_matches_v2_only_backend() {
+    let types =
+        fs::read_to_string(repository_root().join("src/lib/types.ts")).expect("frontend types");
+    let start = types
+        .find("export interface FederationDiscoveryDocument {")
+        .expect("FederationDiscoveryDocument");
+    let end = types[start..]
+        .find("export type FederationDiscoveryState")
+        .map(|offset| start + offset)
+        .expect("FederationDiscoveryState");
+    let contract = &types[start..end];
+
+    assert!(contract.contains("schemaVersion: 2;"));
+    assert!(contract.contains("contract: \"anchor-federation-discovery-v2\";"));
+    assert!(contract.contains("rotationChain?: FederationSigningRotationNotice[];"));
+    assert!(!contract.contains("anchor-federation-discovery-v1"));
+    assert!(!contract.contains("rotation?: FederationSigningRotationNotice;"));
+}
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
