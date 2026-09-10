@@ -12,9 +12,9 @@ mod signing;
 mod transport;
 
 pub(crate) use discovery::{
-    fetch_discovery_document, local_discovery_document, local_legacy_discovery_document,
-    validate_discovery_document, FederationDiscoveryDocument, FederationDiscoveryInspection,
-    FederationDiscoveryState, FEDERATION_MAX_DISCOVERY_BYTES,
+    fetch_discovery_document, local_discovery_document, validate_discovery_document,
+    FederationDiscoveryDocument, FederationDiscoveryInspection, FederationDiscoveryState,
+    FEDERATION_MAX_DISCOVERY_BYTES,
 };
 
 pub(crate) use registry::{
@@ -26,9 +26,8 @@ pub(crate) use registry::{
 pub(crate) use signing::{
     local_bootstrap_bundle, local_rotation_history, local_signing_status,
     rotate_local_signing_identity, verify_bootstrap_bundle, verify_rotation_chain,
-    verify_rotation_chain_from, verify_rotation_notice, FederationBootstrapBundle,
-    FederationDetachedSignature, FederationLocalSigningStatus, FederationNodeSigningPublic,
-    FederationSigningRotationNotice,
+    verify_rotation_chain_from, FederationBootstrapBundle, FederationDetachedSignature,
+    FederationLocalSigningStatus, FederationNodeSigningPublic, FederationSigningRotationNotice,
 };
 pub(crate) use transport::{
     canonical_federation_endpoint, canonical_remote_target, clear_peer_credential,

@@ -71,7 +71,7 @@ data/federation-signing.json
 
 - Windows：使用 DPAPI Local Machine protection，兼容 interactive Anchor 与 service-managed control plane；
 - Linux/其他非 Windows：沿用 private-file-permissions protection，并依赖私有文件权限；
-- 老 v1 signing record 首次读取时原地迁移到 v2，**不会改变 Node ID、key epoch、public key 或 fingerprint**。
+- v1 明文 signing record 已 hard-cut。当前版本不会读取、迁移或重写旧 `privateKeyPkcs8Base64`；检测到 schema v1 会 fail closed。需要重新建立本机 signing identity 时，应先归档/移除旧 record，再通过 out-of-band discovery/bootstrap 对所有受影响 peer 重新确认 fingerprint 和 trust。
 
 公钥身份形如：
 
@@ -89,20 +89,15 @@ fingerprint sha256:<hex>
 Federation 不启动独立公网 listener。所有远端 HTTP surface 都挂在**现有 MCP Gateway** 上：
 
 ```text
-GET  /federation/v2/bootstrap
 GET  /federation/v2/discovery
 POST /federation/v2/read
 ```
 
 如果 Gateway 没有启用/运行，就没有可远端访问的 Federation HTTP ingress。
 
-### `/federation/v2/bootstrap`
-
-这是兼容的 legacy discovery endpoint，返回 `anchor-federation-discovery-v1` one-hop rotation proof。
-
 ### `/federation/v2/discovery`
 
-当前 discovery endpoint，返回 `anchor-federation-discovery-v2`，可携带 bounded `rotationChain`。
+唯一 discovery endpoint，返回 `anchor-federation-discovery-v2`，其中包含当前 signed bootstrap bundle，并可携带 bounded `rotationChain`。客户端不会在 404 或协议失败后回退到旧 `/federation/v2/bootstrap`。
 
 Discovery 是**无需 bearer credential 的 public metadata**，但不会导出 Workspace catalog。用于发现的 descriptor 会把 `workspaces` 清空，因此不能用 discovery endpoint 枚举私有 Workspace。
 
@@ -202,19 +197,19 @@ revoked
 
 ### 1. 在远端获取 discovery/bootstrap
 
-优先使用：
+远端网络发现统一使用：
 
 ```text
 get_federation_discovery_document
 ```
 
-或在兼容场景使用：
+如果当前集成只需要生成本机 signed bootstrap bundle，而不是访问旧网络 endpoint，可使用：
 
 ```text
 get_federation_bootstrap_bundle
 ```
 
-把返回的 signed public bundle 通过可信的 out-of-band 渠道交给另一端。Bundle 不包含私钥或 bearer credential。
+`get_federation_bootstrap_bundle` 是当前 bootstrap 子契约的本地管理能力，不代表 `/federation/v2/bootstrap` 兼容路由仍存在。把返回的 signed public bundle 通过可信的 out-of-band 渠道交给另一端。Bundle 不包含私钥或 bearer credential。
 
 ### 2. 只读检查 candidate
 
@@ -335,7 +330,7 @@ K1 --signed notice--> K2 --signed notice--> K3
 data/federation-rotation-history.json
 ```
 
-最多保存 8 跳。Discovery v2 会发送仍有效、连续的 bounded chain；peer 可以从 retained chain 中自己已经 pin 的任意旧 key 验证到 current key。
+最多保存 8 跳。Discovery v2 会发送仍有效、连续的 bounded chain；peer 可以从 retained chain 中自己已经 pin 的任意旧 key 验证到 current key。旧单条 `data/federation-rotation-notice.json` 不再写入，也不会在 history 缺失时回读。
 
 即使 continuity 验证成功，也只得到 `rotation_available`，**不会自动接受新 signer**。
 
@@ -357,7 +352,7 @@ probe
 explicit trust
 ```
 
-如果 peer 离线超过 rotation history/notice retention 范围，需要重新通过 out-of-band bootstrap 建立信任链。这是当前 bounded 安全设计，不会自动越过缺失的 key history。
+如果 peer 离线超过 rotation history retention 范围，需要重新通过 out-of-band bootstrap 建立信任链。这是当前 bounded 安全设计，不会自动越过缺失的 key history。
 
 ## Trust health
 

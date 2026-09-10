@@ -21,9 +21,3 @@ Memory (requires MEMORY_* env):
 - After verified bugfix → MUST `memorize_asset` type=`bugfix` (sections: symptom, root cause, fix, verification)
 - Reusable feature/UI → `memorize_asset` type=`pattern`/`component`
 <!-- mcp-probe:context end -->
-
-<!-- gitnexus:start -->
-## GitNexus（可选）
-
-GitNexus 仅作为可选的代码图谱辅助能力。可用且确有帮助时再使用；未安装、索引过期、MCP 不可用或调用失败，都不得阻断代码读取、修改、测试或提交。影响面判断可以使用 Anchor 内置 `search` 的 callers/impact、精确引用扫描、编译器和测试结果等证据替代，不要求在编辑或提交前执行任何 GitNexus 专用命令。
-<!-- gitnexus:end -->

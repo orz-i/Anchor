@@ -13,10 +13,10 @@ use super::{
     canonical_remote_target, clear_peer_credential, fetch_discovery_document,
     peer_credential_status, probe_remote_peer, remote_read_verified, set_peer_credential,
     valid_node_id, validate_discovery_document, validate_peer_descriptor,
-    verify_rotation_chain_from, verify_rotation_notice, FederationBootstrapBundle,
-    FederationDiscoveryDocument, FederationDiscoveryInspection, FederationDiscoveryState,
-    FederationNodeSigningPublic, FederationPeerCredentialStatus, FederationPeerDescriptor,
-    FederationReadRequest, FederationReadResult, FederationRemoteTarget,
+    verify_rotation_chain_from, FederationBootstrapBundle, FederationDiscoveryDocument,
+    FederationDiscoveryInspection, FederationDiscoveryState, FederationNodeSigningPublic,
+    FederationPeerCredentialStatus, FederationPeerDescriptor, FederationReadRequest,
+    FederationReadResult, FederationRemoteTarget,
 };
 
 const PEER_REGISTRY_SCHEMA_VERSION: u16 = 2;
@@ -37,19 +37,11 @@ fn discovery_proves_rotation_from(
     discovery: &FederationDiscoveryDocument,
     expected_previous: &FederationNodeSigningPublic,
 ) -> AppResult<bool> {
-    if !discovery.rotation_chain.is_empty() {
-        return verify_rotation_chain_from(
-            &discovery.rotation_chain,
-            &discovery.bootstrap,
-            expected_previous,
-        );
-    }
-    Ok(match discovery.rotation.as_ref() {
-        Some(rotation) => {
-            verify_rotation_notice(rotation, &discovery.bootstrap)? == *expected_previous
-        }
-        None => false,
-    })
+    verify_rotation_chain_from(
+        &discovery.rotation_chain,
+        &discovery.bootstrap,
+        expected_previous,
+    )
 }
 
 pub async fn inspect_registered_peer_discovery(

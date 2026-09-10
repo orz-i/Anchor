@@ -4195,7 +4195,7 @@ fn classify_working_tree_ownership(
 }
 
 fn known_runtime_artifacts(root: &Path) -> Vec<String> {
-    [".codegraph", ".gitnexus"]
+    [".codegraph"]
         .into_iter()
         .filter(|path| root.join(path).exists() && is_git_ignored(root, path))
         .map(|path| format!("{path}/"))
@@ -4205,7 +4205,6 @@ fn known_runtime_artifacts(root: &Path) -> Vec<String> {
 fn known_ignored_paths(root: &Path) -> Vec<String> {
     [
         ".codegraph",
-        ".gitnexus",
         "docs/session",
         // Frozen pre-Catalog-37 archive; retained locally but never used by the new Session store.
         "docs/history-session",
@@ -4230,7 +4229,6 @@ fn is_git_ignored(root: &Path, path: &str) -> bool {
 
 fn is_runtime_artifact(path: &str) -> bool {
     path.starts_with(".codegraph/")
-        || path.starts_with(".gitnexus/")
         || path.ends_with(".db-wal")
         || path.ends_with(".db-shm")
         || path.ends_with("daemon.log")

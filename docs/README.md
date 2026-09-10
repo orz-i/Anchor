@@ -113,8 +113,8 @@ Federation 与 Orchestration 当前已有 Rust management contract 和 TypeScrip
 
 这些目录用于追溯，不是“当前使用手册”：
 
-- `docs/specs/`：历史需求、设计与任务拆解
-- `docs/verification/`：阶段性验证记录
+- [`docs/specs/`](specs/README.md)：历史需求、设计与任务拆解；目录内出现的旧产品名、旧协议和旧工具只代表当时设计上下文
+- [`docs/verification/`](verification/README.md)：阶段性验证记录；日期化验证结果不能覆盖当前源码和正式手册
 - `docs/*roadmap*.md`：历史阶段规划与收口记录
 - `docs/*audit*.md`：特定日期的代码/设计审计
 

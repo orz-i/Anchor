@@ -43,12 +43,11 @@ Workspace 路由只转发以下 MCP/OAuth 协议路径：
 同一个 Gateway listener 现在还承载 Node Federation 的固定根路径；它们不是 Workspace reverse-proxy 路由：
 
 ```text
-GET  /federation/v2/bootstrap   # legacy discovery v1
 GET  /federation/v2/discovery   # current bounded rotation-chain discovery
 POST /federation/v2/read        # authenticated + signed read-only transport
 ```
 
-`bootstrap` / `discovery` 只返回签名的 public Node/security metadata，明确清空 Workspace catalog；`read` 需要 pairwise bearer credential 并验证 signed response。完整边界见 [Federation](federation.md)。Gateway 停止时这些 Federation HTTP endpoints 同样不可用，不存在第二个 federation-only listener。
+`discovery` 返回签名的 public Node/security metadata（其中包含 current bootstrap bundle）并明确清空 Workspace catalog；`read` 需要 pairwise bearer credential 并验证 signed response。旧 `/federation/v2/bootstrap` discovery v1 路由已 hard-cut，不再作为 404 fallback。完整边界见 [Federation](federation.md)。Gateway 停止时这些 Federation HTTP endpoints 同样不可用，不存在第二个 federation-only listener。
 
 ## Web Admin 配置
 

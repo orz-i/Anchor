@@ -160,8 +160,8 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 - **职责**: Anchor Node / Workspace 间 authenticated + signed 的只读互联；wire contract 为 `anchor-federation-v2`
 - **读取边界**: 仅 `node_capabilities`、`node_control_status`、`workspace_catalog`、`workspace_status`；不导出 path/secret/Harness state，不提供 remote mutation/exec/Git
 - **信任模型**: machine-local peer registry + pairwise credential + signed bootstrap/probe + operator explicit trust；状态为 Untrusted/Trusted/Drifted/Revoked，discovery 本身不授予 trust
-- **签名与轮换**: Ed25519 machine-local signing identity 使用受平台保护的 v2 store；bounded rotation history 最多 8 跳，合法 continuity 仍要求显式 re-bootstrap → probe → trust
-- **传输**: 复用现有 MCP Gateway 根路径 `/federation/v2/bootstrap`、`/federation/v2/discovery`、`/federation/v2/read`；没有独立 federation listener
+- **签名与轮换**: Ed25519 machine-local signing identity 只接受受平台保护的 v2 store；旧明文 signing schema v1 直接拒绝。bounded rotation history 最多 8 跳，只写/读 `federation-rotation-history.json`，不再维护单条 notice 兼容文件；合法 continuity 仍要求显式 re-bootstrap → probe → trust
+- **传输**: 复用现有 MCP Gateway 根路径 `/federation/v2/discovery`、`/federation/v2/read`；没有独立 federation listener。Discovery 只接受 `anchor-federation-discovery-v2`，客户端和服务端都不再保留 `/federation/v2/bootstrap` / discovery v1 fallback
 - **状态权威**: registry/SecretStore/Gateway/control 仍是既有 authority，Federation 不复制 Workspace/Harness 数据
 
 ### orchestration/

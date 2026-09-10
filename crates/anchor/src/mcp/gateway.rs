@@ -502,10 +502,6 @@ async fn spawn_with_limits(
         )),
     };
     let app = Router::new()
-        .route(
-            "/federation/v2/bootstrap",
-            get(federation_bootstrap_discovery),
-        )
         .route("/federation/v2/discovery", get(federation_discovery))
         .route("/federation/v2/read", post(federation_read_request))
         .route("/w/{workspace_id}/{*upstream_path}", any(proxy_request))
@@ -533,22 +529,11 @@ async fn spawn_with_limits(
     })
 }
 
-async fn federation_bootstrap_discovery(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-) -> Response {
-    federation_discovery_response(state, headers, true).await
-}
-
 async fn federation_discovery(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    federation_discovery_response(state, headers, false).await
+    federation_discovery_response(state, headers).await
 }
 
-async fn federation_discovery_response(
-    state: GatewayState,
-    headers: HeaderMap,
-    legacy: bool,
-) -> Response {
+async fn federation_discovery_response(state: GatewayState, headers: HeaderMap) -> Response {
     if !state.rate_limiter.allow() {
         return gateway_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -574,11 +559,7 @@ async fn federation_discovery_response(
         let store = crate::data::DataStore::load()?;
         let profiles = store.list().to_vec();
         drop(store);
-        if legacy {
-            crate::federation::local_legacy_discovery_document(&profiles)
-        } else {
-            crate::federation::local_discovery_document(&profiles)
-        }
+        crate::federation::local_discovery_document(&profiles)
     })();
     match document.and_then(|document| {
         let body = serde_json::to_vec(&document)?;
@@ -603,7 +584,7 @@ async fn federation_discovery_response(
         }
         Err(_) => gateway_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Federation bootstrap discovery failed",
+            "Federation discovery failed",
         ),
     }
 }
@@ -1152,6 +1133,13 @@ mod tests {
             .await
             .expect("federation route response");
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let retired_bootstrap = client
+            .get(format!("http://127.0.0.1:{port}/federation/v2/bootstrap"))
+            .send()
+            .await
+            .expect("retired federation bootstrap route response");
+        assert_eq!(retired_bootstrap.status(), reqwest::StatusCode::NOT_FOUND);
 
         let _ = runtime.shutdown.send(());
         let _ = runtime.handle.await;
