@@ -2652,51 +2652,50 @@ pub fn run() -> i32 {
         std::env::set_var(crate::brand::CONFIG_DIR_ENV, absolute);
     }
 
+    #[cfg(windows)]
     if let Command::ServiceRun {
         config_dir,
         owner_sid,
         owner_username,
     } = &parsed.command
     {
-        #[cfg(windows)]
-        {
-            return match crate::windows_service::run_service_dispatcher(
-                config_dir.clone(),
-                owner_sid.clone(),
-                owner_username.clone(),
-            ) {
-                Ok(()) => 0,
-                Err(error) => {
-                    eprintln!(
-                        "{}",
-                        crate::logging::timestamped_line(&format!("错误：{error}"))
-                    );
-                    1
-                }
-            };
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = (owner_sid, owner_username);
-            return match crate::async_runtime::block_on(crate::linux_service::run_service(
-                config_dir.clone(),
-            )) {
-                Ok(()) => 0,
-                Err(error) => {
-                    eprintln!(
-                        "{}",
-                        crate::logging::timestamped_line(&format!("错误：{error}"))
-                    );
-                    1
-                }
-            };
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            let _ = (config_dir, owner_sid, owner_username);
-            eprintln!("错误：service-run 当前仅支持 Windows 和 Linux");
-            return 1;
-        }
+        return match crate::windows_service::run_service_dispatcher(
+            config_dir.clone(),
+            owner_sid.clone(),
+            owner_username.clone(),
+        ) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    crate::logging::timestamped_line(&format!("错误：{error}"))
+                );
+                1
+            }
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Command::ServiceRun { config_dir } = &parsed.command {
+        return match crate::async_runtime::block_on(crate::linux_service::run_service(
+            config_dir.clone(),
+        )) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    crate::logging::timestamped_line(&format!("错误：{error}"))
+                );
+                1
+            }
+        };
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    if let Command::ServiceRun { config_dir } = &parsed.command {
+        let _ = config_dir;
+        eprintln!("错误：service-run 当前仅支持 Windows 和 Linux");
+        return 1;
     }
 
     if let Command::ServiceAdminRun {

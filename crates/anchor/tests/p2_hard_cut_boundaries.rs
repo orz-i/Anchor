@@ -96,3 +96,74 @@ fn historical_specs_and_verification_have_explicit_archive_boundaries() {
     assert!(verification.contains("不是当前运行时契约"));
     assert!(federation.contains("不会在 404 或协议失败后回退到旧 `/federation/v2/bootstrap`"));
 }
+
+#[test]
+fn harness_recovery_blocking_is_explicit_and_not_error_code_driven() {
+    let model = crate_source("src/harness/model.rs");
+    let state = crate_source("src/harness/state.rs");
+
+    assert!(model.contains("RECOVERY_FAILURE_PREFLIGHT_REJECTION: &str = \"preflight_rejection\""));
+    assert!(model.contains("pub fn is_nonblocking_preflight(&self) -> bool"));
+    assert!(model.contains("self.failure_type == RECOVERY_FAILURE_PREFLIGHT_REJECTION"));
+    assert!(!model.contains("is_nonblocking_legacy_preflight"));
+    assert!(!model.contains("POLICY_REJECTED"));
+    assert!(!model.contains("PATCH_"));
+    assert!(state.contains("RECOVERY_CLASSIFICATION_INVALID"));
+}
+
+#[test]
+fn active_mcp_transport_sessions_have_no_legacy_type_lane() {
+    let protocol = crate_source("src/mcp/protocol.rs");
+    let listener = crate_source("src/mcp/listener.rs");
+
+    for active_source in [&protocol, &listener] {
+        assert!(!active_source.contains("LegacyMcpSession"));
+        assert!(!active_source.contains("DEFAULT_LEGACY_MCP"));
+    }
+    assert!(protocol.contains("pub struct McpTransportSessionStore"));
+    assert!(protocol.contains("pub struct McpTransportSessionInfo"));
+    assert!(protocol.contains("McpTransportSessionStoreSnapshot"));
+    assert!(listener.contains("sessions: McpTransportSessionStore"));
+}
+
+#[test]
+fn service_run_has_platform_specific_hard_cut_parser_contracts() {
+    let args = crate_source("src/cli/args.rs");
+    let cli = crate_source("src/cli/mod.rs");
+    let windows = crate_source("src/windows_service.rs");
+
+    let parser_start = args
+        .find("fn parse_service_run(")
+        .expect("service-run parser");
+    let parser_end = args[parser_start..]
+        .find("fn parse_service_admin_run(")
+        .map(|offset| parser_start + offset)
+        .expect("service-admin-run parser");
+    let parser = &args[parser_start..parser_end];
+    assert!(parser.contains("#[cfg(windows)]"));
+    assert!(parser.contains("let owner_sid = pop_value(args, \"service-run\")?;"));
+    assert!(parser.contains("let owner_username = pop_value(args, \"service-run\")?;"));
+    assert!(parser.contains("#[cfg(not(windows))]"));
+    assert!(parser.contains("Ok(Command::ServiceRun { config_dir })"));
+    assert!(!parser.contains("args.pop_front()"));
+
+    let enum_start = args.find("pub enum Command {").expect("Command enum");
+    let command_start = args[enum_start..]
+        .find("    ServiceRun {")
+        .map(|offset| enum_start + offset)
+        .expect("ServiceRun variant");
+    let command_end = args[command_start..]
+        .find("ServiceAdminRun {")
+        .map(|offset| command_start + offset)
+        .expect("ServiceAdminRun variant");
+    let command = &args[command_start..command_end];
+    assert!(command.contains("#[cfg(windows)]"));
+    assert!(command.contains("owner_sid: String"));
+    assert!(command.contains("owner_username: String"));
+    assert!(!command.contains("Option<String>"));
+
+    assert!(cli
+        .contains("#[cfg(target_os = \"linux\")]\n    if let Command::ServiceRun { config_dir }"));
+    assert!(windows.contains("owner_sid: String,\n    owner_username: String,"));
+    assert!(!windows.contains("registration 尚未固定配置 owner 身份"));
+}

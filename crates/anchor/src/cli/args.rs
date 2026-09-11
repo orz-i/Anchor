@@ -255,17 +255,22 @@ fn parse_service_command(args: &mut VecDeque<String>) -> Result<ServiceCommand, 
 
 fn parse_service_run(args: &mut VecDeque<String>) -> Result<Command, String> {
     let config_dir = PathBuf::from(pop_value(args, "service-run")?);
-    let owner_sid = args.pop_front();
-    let owner_username = args.pop_front();
-    if owner_sid.is_some() != owner_username.is_some() {
-        return Err("service-run owner SID 与 username 必须同时提供".into());
+    #[cfg(windows)]
+    {
+        let owner_sid = pop_value(args, "service-run")?;
+        let owner_username = pop_value(args, "service-run")?;
+        ensure_empty(args, "service-run")?;
+        Ok(Command::ServiceRun {
+            config_dir,
+            owner_sid,
+            owner_username,
+        })
     }
-    ensure_empty(args, "service-run")?;
-    Ok(Command::ServiceRun {
-        config_dir,
-        owner_sid,
-        owner_username,
-    })
+    #[cfg(not(windows))]
+    {
+        ensure_empty(args, "service-run")?;
+        Ok(Command::ServiceRun { config_dir })
+    }
 }
 
 fn parse_service_admin_run(args: &mut VecDeque<String>) -> Result<Command, String> {
@@ -1773,8 +1778,10 @@ pub enum Command {
     Admin(AdminCommand),
     ServiceRun {
         config_dir: PathBuf,
-        owner_sid: Option<String>,
-        owner_username: Option<String>,
+        #[cfg(windows)]
+        owner_sid: String,
+        #[cfg(windows)]
+        owner_username: String,
     },
     ServiceAdminRun {
         action: String,
@@ -2341,8 +2348,29 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn parses_windows_service_lifecycle_and_internal_service_run() {
+    fn non_windows_service_run_keeps_config_dir_only_shape() {
+        let internal = parse(strings(&["service-run", "/tmp/anchor"])).expect("service-run");
+        assert_eq!(
+            internal.command,
+            Command::ServiceRun {
+                config_dir: PathBuf::from("/tmp/anchor"),
+            }
+        );
+
+        let extra_owner = parse(strings(&[
+            "service-run",
+            "/tmp/anchor",
+            "S-1-5-21-100-200-300-1001",
+            "Demo User",
+        ]))
+        .expect_err("non-Windows service-run must reject Windows owner arguments");
+        assert!(extra_owner.contains("service-run 不支持多余参数"));
+    }
+
+    #[test]
+    fn parses_service_lifecycle_commands() {
         for (name, expected) in [
             ("status", ServiceCommand::Status),
             ("install", ServiceCommand::Install),
@@ -2355,7 +2383,11 @@ mod tests {
             let parsed = parse(strings(&["service", name])).expect("service command");
             assert_eq!(parsed.command, Command::Service(expected));
         }
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_run_requires_owner_identity_at_parse_time() {
         let internal = parse(strings(&[
             "service-run",
             r"C:\Users\Demo User\AppData\Roaming\anchor",
@@ -2367,24 +2399,17 @@ mod tests {
             internal.command,
             Command::ServiceRun {
                 config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor"),
-                owner_sid: Some("S-1-5-21-100-200-300-1001".into()),
-                owner_username: Some("Demo User".into()),
+                owner_sid: "S-1-5-21-100-200-300-1001".into(),
+                owner_username: "Demo User".into(),
             }
         );
 
-        let legacy = parse(strings(&[
+        let missing_owner = parse(strings(&[
             "service-run",
             r"C:\Users\Demo User\AppData\Roaming\anchor",
         ]))
-        .expect("legacy service-run shape is parsed so runtime can reject it explicitly");
-        assert_eq!(
-            legacy.command,
-            Command::ServiceRun {
-                config_dir: PathBuf::from(r"C:\Users\Demo User\AppData\Roaming\anchor"),
-                owner_sid: None,
-                owner_username: None,
-            }
-        );
+        .expect_err("Windows service-run must require owner SID and username");
+        assert!(missing_owner.contains("service-run 缺少参数"));
 
         let elevated = parse(strings(&[
             "service-admin-run",

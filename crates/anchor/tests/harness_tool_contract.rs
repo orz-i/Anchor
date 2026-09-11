@@ -557,14 +557,14 @@ fn unbound_session_checkpoint_does_not_inherit_unrelated_default_task_baseline()
 }
 
 #[test]
-fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion() {
+fn explicit_preflight_recovery_is_nonblocking_and_resolves_on_completion() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
     let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
     let task = ctx
         .task_harness
-        .start_task("旧版 Patch 预检恢复兼容")
+        .start_task("显式非阻断预检恢复")
         .expect("task");
 
     let recovery = ctx
@@ -572,8 +572,8 @@ fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion()
         .record_recovery(
             &task.id,
             "apply_patch",
-            Some("legacy-patch-fingerprint"),
-            "tooling_failure",
+            Some("preflight-patch-fingerprint"),
+            "preflight_rejection",
             Some("PATCH_CONTEXT_MISMATCH"),
             None,
             false,
@@ -582,7 +582,7 @@ fn legacy_nonmutating_patch_recovery_is_nonblocking_and_resolves_on_completion()
             vec!["读取当前上下文后重新生成 Patch".into()],
             "ready_to_close",
         )
-        .expect("record legacy patch recovery");
+        .expect("record explicit preflight recovery");
     assert_eq!(recovery.status, TaskRecoveryStatus::Open);
     assert!(!recovery.blocks_completion());
 
@@ -701,14 +701,14 @@ fn policy_rejection_without_stable_identity_does_not_open_task_recovery() {
 }
 
 #[test]
-fn legacy_nonmutating_policy_recovery_is_nonblocking_and_resolves_on_completion() {
+fn policy_error_code_does_not_make_a_blocking_recovery_nonblocking() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace).expect("创建工作区");
     let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
     let task = ctx
         .task_harness
-        .start_task("旧版策略预检恢复兼容")
+        .start_task("错误码不决定 Recovery 阻断语义")
         .expect("task");
 
     let recovery = ctx
@@ -716,7 +716,7 @@ fn legacy_nonmutating_policy_recovery_is_nonblocking_and_resolves_on_completion(
         .record_recovery(
             &task.id,
             "exec_command",
-            Some("legacy-policy-fingerprint"),
+            Some("policy-fingerprint"),
             "tooling_failure",
             Some("POLICY_REJECTED"),
             None,
@@ -726,29 +726,16 @@ fn legacy_nonmutating_policy_recovery_is_nonblocking_and_resolves_on_completion(
             vec!["修正命令参数后重试".into()],
             "ready_to_close",
         )
-        .expect("record legacy recovery");
+        .expect("record blocking recovery");
     assert_eq!(recovery.status, TaskRecoveryStatus::Open);
-    assert!(!recovery.blocks_completion());
+    assert!(recovery.blocks_completion());
 
     let gate = call_tool(&ctx, "task_gate_status", &json!({"task_id": task.id}));
-    assert!(!gate["completion_gate"]["missing"]
+    assert!(gate["completion_gate"]["missing"]
         .as_array()
         .expect("completion missing")
         .iter()
         .any(|item| item["code"] == "recovery_open"));
-
-    let completed = ctx
-        .task_harness
-        .complete_task(&task.id, true, HarnessSessionStatus::Active)
-        .expect("complete task");
-    let recovery = completed
-        .recovery
-        .expect("resolved recovery retained for audit");
-    assert_eq!(recovery.status, TaskRecoveryStatus::Resolved);
-    assert_eq!(
-        recovery.resolved_by_step.as_deref(),
-        Some("task_completion")
-    );
 }
 
 #[test]

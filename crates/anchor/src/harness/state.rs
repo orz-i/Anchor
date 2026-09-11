@@ -17,7 +17,7 @@ use super::model::{
     TaskContract, TaskGitWorktree, TaskPhase, TaskRecoveryState, TaskRecoveryStatus, TaskSession,
     TaskSlice, TaskSliceStatus, TaskStatus, TaskTermination, TaskTerminationKind, TaskWorkingSet,
     VerificationDispositionRecord, VerificationRecord, WorkSessionCloseOutbox,
-    WorkspaceHarnessState, SCHEMA_VERSION,
+    WorkspaceHarnessState, RECOVERY_FAILURE_PREFLIGHT_REJECTION, SCHEMA_VERSION,
 };
 use super::store::{baseline_object_id, HarnessError, HarnessResult, HarnessStore};
 
@@ -1028,7 +1028,7 @@ impl HarnessKernel {
                     ));
                 }
                 let auto_resolved_recovery_id = task.recovery.as_mut().and_then(|recovery| {
-                    if !recovery.is_nonblocking_legacy_preflight() {
+                    if !recovery.is_nonblocking_preflight() {
                         return None;
                     }
                     recovery.status = TaskRecoveryStatus::Resolved;
@@ -1669,6 +1669,14 @@ impl HarnessKernel {
         recommended_recovery: Vec<String>,
         resume_target: &str,
     ) -> HarnessResult<TaskRecoveryState> {
+        if failure_type == RECOVERY_FAILURE_PREFLIGHT_REJECTION
+            && (workspace_mutated || explicit_retry_identity)
+        {
+            return Err(HarnessError::new(
+                "RECOVERY_CLASSIFICATION_INVALID",
+                "preflight_rejection recovery must be non-mutating and must not carry an explicit retry identity",
+            ));
+        }
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let mut task = self.task(task_id)?;

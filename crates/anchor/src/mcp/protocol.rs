@@ -18,13 +18,13 @@ pub enum ClientMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LegacyMcpSessionStoreSnapshot {
-    sessions: Vec<LegacyMcpSessionSnapshot>,
+pub(crate) struct McpTransportSessionStoreSnapshot {
+    sessions: Vec<McpTransportSessionSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LegacyMcpSessionSnapshot {
+struct McpTransportSessionSnapshot {
     session_id: String,
     protocol_version: String,
     initialized: bool,
@@ -379,13 +379,13 @@ fn invalid_params(message: &str) -> Value {
     json!({ "code": -32602, "message": message })
 }
 
-const DEFAULT_LEGACY_MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_LEGACY_MCP_UNINITIALIZED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_MAX_LEGACY_MCP_SESSIONS: usize = 512;
-const DEFAULT_MAX_REQUEST_IDS_PER_LEGACY_MCP_SESSION: usize = 16_384;
+const DEFAULT_MCP_TRANSPORT_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_MCP_TRANSPORT_UNINITIALIZED_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_MAX_MCP_TRANSPORT_SESSIONS: usize = 512;
+const DEFAULT_MAX_REQUEST_IDS_PER_MCP_TRANSPORT_SESSION: usize = 16_384;
 
 #[derive(Debug, Clone)]
-struct LegacyMcpSession {
+struct McpTransportSession {
     protocol_version: String,
     initialized: bool,
     last_seen: Instant,
@@ -393,13 +393,13 @@ struct LegacyMcpSession {
 }
 
 #[derive(Debug, Default)]
-struct LegacyMcpSessionStoreState {
-    sessions: HashMap<String, LegacyMcpSession>,
+struct McpTransportSessionStoreState {
+    sessions: HashMap<String, McpTransportSession>,
     retired: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyMcpSessionInfo {
+pub struct McpTransportSessionInfo {
     pub protocol_version: String,
     pub initialized: bool,
 }
@@ -413,28 +413,28 @@ pub enum RequestReservation {
 }
 
 #[derive(Clone)]
-pub struct LegacyMcpSessionStore {
-    // Compatibility boundary for stateful MCP transport sessions. This is not
-    // the Anchor development Session domain exposed through the `session` tool.
-    inner: Arc<Mutex<LegacyMcpSessionStoreState>>,
+pub struct McpTransportSessionStore {
+    // Stateful MCP transport sessions are separate from the Anchor development
+    // Session domain exposed through the `session` tool.
+    inner: Arc<Mutex<McpTransportSessionStoreState>>,
     session_idle_ttl: Duration,
     uninitialized_ttl: Duration,
     max_sessions: usize,
     max_request_ids_per_session: usize,
 }
 
-impl Default for LegacyMcpSessionStore {
+impl Default for McpTransportSessionStore {
     fn default() -> Self {
         Self::with_limits(
-            DEFAULT_LEGACY_MCP_SESSION_IDLE_TTL,
-            DEFAULT_LEGACY_MCP_UNINITIALIZED_SESSION_TTL,
-            DEFAULT_MAX_LEGACY_MCP_SESSIONS,
-            DEFAULT_MAX_REQUEST_IDS_PER_LEGACY_MCP_SESSION,
+            DEFAULT_MCP_TRANSPORT_SESSION_IDLE_TTL,
+            DEFAULT_MCP_TRANSPORT_UNINITIALIZED_SESSION_TTL,
+            DEFAULT_MAX_MCP_TRANSPORT_SESSIONS,
+            DEFAULT_MAX_REQUEST_IDS_PER_MCP_TRANSPORT_SESSION,
         )
     }
 }
 
-impl LegacyMcpSessionStore {
+impl McpTransportSessionStore {
     pub fn with_limits(
         session_idle_ttl: Duration,
         uninitialized_ttl: Duration,
@@ -442,7 +442,7 @@ impl LegacyMcpSessionStore {
         max_request_ids_per_session: usize,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(LegacyMcpSessionStoreState::default())),
+            inner: Arc::new(Mutex::new(McpTransportSessionStoreState::default())),
             session_idle_ttl,
             uninitialized_ttl,
             max_sessions: max_sessions.max(1),
@@ -472,7 +472,7 @@ impl LegacyMcpSessionStore {
         }
         state.sessions.insert(
             id.clone(),
-            LegacyMcpSession {
+            McpTransportSession {
                 protocol_version: protocol_version.to_string(),
                 initialized: false,
                 last_seen: Instant::now(),
@@ -482,11 +482,11 @@ impl LegacyMcpSessionStore {
         id
     }
 
-    pub fn inspect(&self, id: &str) -> Option<LegacyMcpSessionInfo> {
+    pub fn inspect(&self, id: &str) -> Option<McpTransportSessionInfo> {
         let mut state = self.inner.lock().expect("MCP session lock");
         self.prune_locked(&mut state);
         let session = state.sessions.get(id)?;
-        Some(LegacyMcpSessionInfo {
+        Some(McpTransportSessionInfo {
             protocol_version: session.protocol_version.clone(),
             initialized: session.initialized,
         })
@@ -552,7 +552,7 @@ impl LegacyMcpSessionStore {
         state.sessions.len()
     }
 
-    pub(crate) fn handoff_snapshot(&self) -> LegacyMcpSessionStoreSnapshot {
+    pub(crate) fn handoff_snapshot(&self) -> McpTransportSessionStoreSnapshot {
         let mut state = self.inner.lock().expect("MCP session lock");
         self.prune_locked(&mut state);
         let mut sessions = state
@@ -562,7 +562,7 @@ impl LegacyMcpSessionStore {
                 let mut used_request_ids =
                     session.used_request_ids.iter().cloned().collect::<Vec<_>>();
                 used_request_ids.sort();
-                LegacyMcpSessionSnapshot {
+                McpTransportSessionSnapshot {
                     session_id: session_id.clone(),
                     protocol_version: session.protocol_version.clone(),
                     initialized: session.initialized,
@@ -571,10 +571,10 @@ impl LegacyMcpSessionStore {
             })
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-        LegacyMcpSessionStoreSnapshot { sessions }
+        McpTransportSessionStoreSnapshot { sessions }
     }
 
-    pub(crate) fn restore_handoff_snapshot(&self, snapshot: LegacyMcpSessionStoreSnapshot) {
+    pub(crate) fn restore_handoff_snapshot(&self, snapshot: McpTransportSessionStoreSnapshot) {
         let now = Instant::now();
         let mut state = self.inner.lock().expect("MCP session lock");
         state.sessions = snapshot
@@ -583,7 +583,7 @@ impl LegacyMcpSessionStore {
             .map(|session| {
                 (
                     session.session_id,
-                    LegacyMcpSession {
+                    McpTransportSession {
                         protocol_version: session.protocol_version,
                         initialized: session.initialized,
                         last_seen: now,
@@ -595,7 +595,7 @@ impl LegacyMcpSessionStore {
         state.retired.clear();
     }
 
-    fn prune_locked(&self, state: &mut LegacyMcpSessionStoreState) {
+    fn prune_locked(&self, state: &mut McpTransportSessionStoreState) {
         let now = Instant::now();
         let expired = state
             .sessions
@@ -621,7 +621,7 @@ impl LegacyMcpSessionStore {
     }
 }
 
-fn retire_session(state: &mut LegacyMcpSessionStoreState, id: String) {
+fn retire_session(state: &mut McpTransportSessionStoreState, id: String) {
     if !state.retired.iter().any(|existing| existing == &id) {
         state.retired.push(id);
     }
@@ -712,11 +712,11 @@ mod tests {
 
     #[test]
     fn session_store_tracks_initialized_state() {
-        let store = LegacyMcpSessionStore::default();
+        let store = McpTransportSessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
         assert_eq!(
             store.inspect(&id),
-            Some(LegacyMcpSessionInfo {
+            Some(McpTransportSessionInfo {
                 protocol_version: "2025-11-25".into(),
                 initialized: false
             })
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn session_store_handoff_snapshot_preserves_transport_identity_and_request_history() {
-        let source = LegacyMcpSessionStore::default();
+        let source = McpTransportSessionStore::default();
         let session_id = source.create("2025-11-25", &json!(1));
         assert!(source.mark_initialized(&session_id));
         assert_eq!(
@@ -741,12 +741,12 @@ mod tests {
         );
 
         let snapshot = source.handoff_snapshot();
-        let restored = LegacyMcpSessionStore::default();
+        let restored = McpTransportSessionStore::default();
         restored.restore_handoff_snapshot(snapshot);
 
         assert_eq!(
             restored.inspect(&session_id),
-            Some(LegacyMcpSessionInfo {
+            Some(McpTransportSessionInfo {
                 protocol_version: "2025-11-25".into(),
                 initialized: true,
             })
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn session_rejects_reused_request_ids() {
-        let store = LegacyMcpSessionStore::default();
+        let store = McpTransportSessionStore::default();
         let id = store.create("2025-11-25", &json!(1));
         assert_eq!(
             store.reserve_request_id(&id, &json!(1)),
@@ -785,7 +785,7 @@ mod tests {
 
     #[test]
     fn session_store_bounds_request_ids_and_total_sessions() {
-        let store = LegacyMcpSessionStore::with_limits(
+        let store = McpTransportSessionStore::with_limits(
             Duration::from_secs(60),
             Duration::from_secs(60),
             2,
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn uninitialized_sessions_expire_without_touching_other_sessions() {
         let store =
-            LegacyMcpSessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 4);
+            McpTransportSessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 4);
         let expired = store.create("2025-11-25", &json!(1));
         std::thread::sleep(Duration::from_millis(1));
         assert!(store.inspect(&expired).is_none());

@@ -237,19 +237,19 @@ total_stream_bytes
 
 若旧内容已被环形缓冲区淘汰，`offset` 会前移到 `retained_start_offset`、`truncated=true`，而 `next_offset` 仍可继续稳定分页。
 
-## 5. Legacy MCP transport Session compatibility
+## 5. MCP transport Session
 
-部分当前连接路径仍保留 stateful MCP transport compatibility。实现类型明确命名为：
+MCP listener 使用独立的 stateful transport Session。实现类型明确命名为：
 
 ```text
-LegacyMcpSession
-LegacyMcpSessionInfo
-LegacyMcpSessionStore
+McpTransportSession
+McpTransportSessionInfo
+McpTransportSessionStore
 ```
 
 它只负责 transport 初始化状态、request-id 去重、TTL 和连接清理，不是 Anchor 开发 Session，也不参与 `docs/session` 持久化。
 
-当前兼容边界：
+当前资源边界：
 
 | 项目 | 限制 |
 | --- | ---: |
@@ -258,7 +258,7 @@ LegacyMcpSessionStore
 | 单 listener 最大 transport Session | 512 |
 | 单 transport Session request ID 预算 | 16,384 |
 
-将它标记为 `LegacyMcp*` 的目的，是防止应用层开发 Session 和 transport compatibility state 再次发生概念耦合。未来移除旧式 transport 状态时，不需要迁移开发 Session 或 command session。
+transport Session 与应用层开发 Session、command session 保持类型和存储边界隔离；三者之间不存在 alias、双写或兼容映射。
 
 ## 6. Session 验证
 

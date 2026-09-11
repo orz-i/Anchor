@@ -10,8 +10,8 @@ use crate::auth::{
 };
 use crate::mcp::protocol::{
     requested_protocol_version, require_current_protocol_version, validate_client_message,
-    ClientMessage, InFlightRequests, InFlightReservation, KeyedRateLimiter, LegacyMcpSessionStore,
-    RateLimiter, RequestReservation,
+    ClientMessage, InFlightRequests, InFlightReservation, KeyedRateLimiter,
+    McpTransportSessionStore, RateLimiter, RequestReservation,
 };
 use crate::mcp::proxy::{parse_mcp_proxy_config, McpProxyServerSpec};
 use crate::mcp::server::{
@@ -61,7 +61,7 @@ struct ListenerState {
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     proxy_specs: Vec<McpProxyServerSpec>,
-    sessions: LegacyMcpSessionStore,
+    sessions: McpTransportSessionStore,
     mcp_rate_limiter: RateLimiter,
     mcp_identity_rate_limiter: KeyedRateLimiter,
     oauth_rate_limiter: RateLimiter,
@@ -73,7 +73,7 @@ struct ListenerState {
 
 #[derive(Clone)]
 pub(crate) struct McpHandoffReadiness {
-    sessions: LegacyMcpSessionStore,
+    sessions: McpTransportSessionStore,
     mcp: SharedState,
     in_flight: InFlightRequests,
 }
@@ -81,7 +81,7 @@ pub(crate) struct McpHandoffReadiness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct McpHandoffSnapshot {
-    transport_sessions: crate::mcp::protocol::LegacyMcpSessionStoreSnapshot,
+    transport_sessions: crate::mcp::protocol::McpTransportSessionStoreSnapshot,
     tool_context: crate::tools::context::ToolContextHandoffSnapshot,
 }
 
@@ -320,7 +320,7 @@ pub(crate) fn spawn_listener_with_handoff(
         register_oauth_runtime(&workspace_id, "mcp", runtime);
     }
     let activity = register_activity(&workspace_id);
-    let sessions = LegacyMcpSessionStore::default();
+    let sessions = McpTransportSessionStore::default();
     if let Some(snapshot) = handoff_snapshot {
         sessions.restore_handoff_snapshot(snapshot.transport_sessions);
         mcp.restore_handoff_snapshot(snapshot.tool_context);
@@ -1255,7 +1255,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use crate::mcp::protocol::{
-        InFlightRequests, KeyedRateLimiter, LegacyMcpSessionStore, RateLimiter,
+        InFlightRequests, KeyedRateLimiter, McpTransportSessionStore, RateLimiter,
     };
     use crate::mcp::server::new_state;
     use crate::mcp::McpActivityTracker;
@@ -1359,7 +1359,7 @@ mod tests {
                 oauth: None,
                 oauth_client_secret: None,
                 proxy_specs: Vec::new(),
-                sessions: LegacyMcpSessionStore::default(),
+                sessions: McpTransportSessionStore::default(),
                 mcp_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
                 mcp_identity_rate_limiter: KeyedRateLimiter::new(100, 32, Duration::from_secs(60)),
                 oauth_rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
@@ -1760,7 +1760,7 @@ mod tests {
     async fn expired_transport_session_clears_session_scoped_tool_state() {
         let (workspace, mut state) = test_listener_state();
         state.sessions =
-            LegacyMcpSessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 16);
+            McpTransportSessionStore::with_limits(Duration::from_secs(60), Duration::ZERO, 4, 16);
         let response = mcp_post(
             State(state.clone()),
             request_headers(),

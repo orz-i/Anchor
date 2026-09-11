@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const SCHEMA_VERSION: u32 = 5;
+pub(crate) const RECOVERY_FAILURE_PREFLIGHT_REJECTION: &str = "preflight_rejection";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityStatus {
@@ -225,27 +226,15 @@ pub struct TaskSlice {
 }
 
 impl TaskRecoveryState {
-    pub fn is_nonblocking_legacy_preflight(&self) -> bool {
-        if self.status != TaskRecoveryStatus::Open
-            || self.workspace_mutated
-            || self.explicit_retry_identity
-        {
-            return false;
-        }
-
-        self.error_code.as_deref().is_some_and(|code| {
-            matches!(
-                code,
-                "POLICY_REJECTED"
-                    | "DANGEROUS_OPERATION_REQUIRES_DANGEROUS_MODE"
-                    | "PROTECTED_REPOSITORY_ASSET"
-                    | "SESSION_NOT_FOUND"
-            ) || code.starts_with("PATCH_")
-        })
+    pub fn is_nonblocking_preflight(&self) -> bool {
+        self.status == TaskRecoveryStatus::Open
+            && !self.workspace_mutated
+            && !self.explicit_retry_identity
+            && self.failure_type == RECOVERY_FAILURE_PREFLIGHT_REJECTION
     }
 
     pub fn blocks_completion(&self) -> bool {
-        self.status == TaskRecoveryStatus::Open && !self.is_nonblocking_legacy_preflight()
+        self.status == TaskRecoveryStatus::Open && !self.is_nonblocking_preflight()
     }
 }
 

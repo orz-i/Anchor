@@ -1653,8 +1653,8 @@ fn normalized_ids(ids: &[String]) -> Vec<String> {
 
 pub fn run_service_dispatcher(
     config_dir: PathBuf,
-    owner_sid: Option<String>,
-    owner_username: Option<String>,
+    owner_sid: String,
+    owner_username: String,
 ) -> AppResult<()> {
     if !config_dir.is_absolute() {
         return Err(AppError::Message(
@@ -1662,17 +1662,6 @@ pub fn run_service_dispatcher(
         ));
     }
     std::env::set_var(crate::brand::CONFIG_DIR_ENV, &config_dir);
-    let (owner_sid, owner_username) = match (owner_sid, owner_username) {
-        (Some(owner_sid), Some(owner_username)) => (owner_sid, owner_username),
-        _ => {
-            let error = AppError::Message(
-                "Windows Service registration 尚未固定配置 owner 身份；请从配置 owner 会话重新执行 service install/update 后再启动"
-                    .into(),
-            );
-            append_service_log(&format!("[service] registration rejected: {error}"));
-            return Err(error);
-        }
-    };
     validate_service_owner(&owner_sid, &owner_username)?;
     std::env::set_var(crate::brand::WINDOWS_SERVICE_CONTEXT_ENV, "1");
     std::env::set_var(SERVICE_OWNER_SID_ENV, owner_sid.trim());
