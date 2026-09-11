@@ -501,7 +501,6 @@ pub fn checkpoint(
     let session_dir = storage::resolve_session_dir(
         session_workspace,
         args.get("workspace_root").and_then(Value::as_str),
-        args.get("session_dir").and_then(Value::as_str),
     )?;
     if !session_dir.exists() {
         return Err(session_not_opened());
@@ -1124,7 +1123,6 @@ fn resolve_dir(ctx: &ToolContext, args: &Value) -> WorkspaceResult<std::path::Pa
     storage::resolve_session_dir(
         &ctx.workspace,
         args.get("workspace_root").and_then(Value::as_str),
-        args.get("session_dir").and_then(Value::as_str),
     )
 }
 

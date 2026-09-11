@@ -1917,7 +1917,6 @@ impl ProxyServer {
             .expect("mcp proxy session id lock")
             .clone();
         let connection = self.status(self.downstream_tools.len());
-        let connection_status = proxy_connection_status(&connection);
         let transport_connected = connection
             .get("transport_connected")
             .and_then(Value::as_bool)
@@ -1926,6 +1925,7 @@ impl ProxyServer {
             .get("operational")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let connection_status = proxy_connection_status(transport_connected, operational);
         let browser_cdp_reachable = connection
             .get("browser_cdp_reachable")
             .cloned()
@@ -2375,19 +2375,7 @@ fn proxy_browser_cdp_reachable(client_status: &Value) -> Option<bool> {
     Some(browser_cdp_port_reachable(port))
 }
 
-fn proxy_connection_status(connection: &Value) -> &'static str {
-    let fallback_connected = connection
-        .get("connected")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let transport_connected = connection
-        .get("transport_connected")
-        .and_then(Value::as_bool)
-        .unwrap_or(fallback_connected);
-    let operational = connection
-        .get("operational")
-        .and_then(Value::as_bool)
-        .unwrap_or(fallback_connected);
+fn proxy_connection_status(transport_connected: bool, operational: bool) -> &'static str {
     if operational {
         "connected"
     } else if transport_connected {
@@ -4732,27 +4720,9 @@ mod tests {
 
         assert_eq!(proxy_browser_cdp_reachable(&status), Some(false));
         assert_eq!(proxy_browser_cdp_reachable(&json!({})), None);
-        assert_eq!(
-            proxy_connection_status(&json!({
-                "transport_connected": true,
-                "operational": true
-            })),
-            "connected"
-        );
-        assert_eq!(
-            proxy_connection_status(&json!({
-                "transport_connected": true,
-                "operational": false
-            })),
-            "degraded"
-        );
-        assert_eq!(
-            proxy_connection_status(&json!({
-                "transport_connected": false,
-                "operational": false
-            })),
-            "disconnected"
-        );
+        assert_eq!(proxy_connection_status(true, true), "connected");
+        assert_eq!(proxy_connection_status(true, false), "degraded");
+        assert_eq!(proxy_connection_status(false, false), "disconnected");
     }
 
     #[test]

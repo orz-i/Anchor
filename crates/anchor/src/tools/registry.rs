@@ -622,7 +622,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "session_validate",
         "Validate Session store",
-        "Validate the new docs/session store and optionally rebuild its metadata index. The frozen docs/history-session legacy archive is never scanned or migrated.",
+        "Validate the canonical docs/session store and optionally rebuild its metadata index.",
         false,
         false,
         false,
@@ -3615,7 +3615,6 @@ pub fn input_schema(name: &str) -> Value {
                 "workspace_root": { "type": "string", "minLength": 1 },
                 "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "title": { "type": "string", "maxLength": 200 },
-                "session_dir": { "type": "string", "default": "docs/session" },
                 "create_if_missing": { "type": "boolean", "default": true },
                 "resume_completed": { "type": "boolean", "default": false, "description": "Explicitly reactivate the selected completed Session instead of creating a continuation Session." }
             },
@@ -3628,7 +3627,6 @@ pub fn input_schema(name: &str) -> Value {
                 "workspace_root": { "type": "string", "minLength": 1 },
                 "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" },
                 "expected_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
-                "session_dir": { "type": "string", "default": "docs/session" },
                 "turn_id": { "type": "string", "minLength": 1, "maxLength": 128 },
                 "timestamp": { "type": "string", "maxLength": 128 },
                 "session_status": { "type": "string", "enum": ["active", "paused", "completed"] },
@@ -3648,7 +3646,6 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_dir": { "type": "string", "default": "docs/session" },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
             },
@@ -3659,7 +3656,6 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["session_id"],
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_dir": { "type": "string", "default": "docs/session" },
                 "session_id": { "type": "string", "pattern": "^ses_[0-9a-fA-F]{32}$" }
             },
             "additionalProperties": false
@@ -3668,7 +3664,6 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "workspace_root": { "type": "string", "minLength": 1 },
-                "session_dir": { "type": "string", "default": "docs/session" },
                 "repair": { "type": "boolean", "default": false }
             },
             "additionalProperties": false
@@ -3719,7 +3714,6 @@ pub fn input_schema(name: &str) -> Value {
                 "worktree_branch": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "worktree_base_ref": { "type": "string", "minLength": 1, "maxLength": 255, "default": "HEAD" },
                 "worktree_remove_on_close": { "type": "boolean", "default": false },
-                "session_dir": { "type": "string", "default": "docs/session" },
                 "workspace_root": { "type": "string", "minLength": 1 }
             }), task_configuration_input_properties()]),
             "required": ["objective"],

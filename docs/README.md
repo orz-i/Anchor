@@ -66,7 +66,7 @@ git { operation: "status" }
 environment { operation: "check" }
 ```
 
-旧目录 `docs/history-session/` 是冻结归档。当前 Session API 不扫描、不迁移、也不向该目录写入。
+开发 Session 的 canonical store 固定为 `docs/session/`；公开 Session/Harness schema 不再提供 `session_dir` 切换能力。
 
 需要长期、可恢复的工程任务时，再使用 `begin_work_session` / `task` / `slice` / `complete_work_session` 等 Harness 能力。普通代码阅读和简单修改不要求先创建 Harness Task。
 

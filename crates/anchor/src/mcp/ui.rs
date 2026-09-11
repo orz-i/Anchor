@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use crate::skills::SkillCatalog;
 
-pub(crate) const IMAGE_VIEWER_RESOURCE_URI: &str = "ui://anchor/image-viewer/v2.html";
+pub(crate) const IMAGE_VIEWER_RESOURCE_URI: &str = "ui://anchor/image-viewer/v3.html";
 const IMAGE_VIEWER_MIME_TYPE: &str = "text/html;profile=mcp-app";
 
 pub(crate) fn image_viewer_tool_meta(invoking: &str, invoked: &str) -> Value {
@@ -143,24 +143,13 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
         return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
       };
 
-      const unwrapResult = (value) => {
-        if (!value || typeof value !== "object") return value;
-        if (Array.isArray(value.content) || value.structuredContent) return value;
-        if (value.mcp_tool_result) return unwrapResult(value.mcp_tool_result);
-        if (value.call_tool_result) return unwrapResult(value.call_tool_result);
-        if (value.result) return unwrapResult(value.result);
-        return value;
-      };
-
       const structuredOf = (result) => {
-        const unwrapped = unwrapResult(result);
-        return unwrapped?.structuredContent || window.openai?.toolOutput || null;
+        return result?.structuredContent || window.openai?.toolOutput || null;
       };
 
       const imageContentOf = (result) => {
-        const unwrapped = unwrapResult(result);
-        return Array.isArray(unwrapped?.content)
-          ? unwrapped.content.find((item) => item?.type === "image" && typeof item.data === "string")
+        return Array.isArray(result?.content)
+          ? result.content.find((item) => item?.type === "image" && typeof item.data === "string")
           : null;
       };
 
@@ -233,9 +222,8 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
       };
 
       const render = (result) => {
-        const unwrapped = unwrapResult(result);
-        const structured = structuredOf(unwrapped);
-        const item = imageContentOf(unwrapped);
+        const structured = structuredOf(result);
+        const item = imageContentOf(result);
         if (item) {
           showImage(item, structured);
           return;
@@ -268,9 +256,6 @@ const IMAGE_VIEWER_HTML: &str = r###"<!doctype html>
       fullscreen.addEventListener("click", async () => {
         try { await window.openai?.requestDisplayMode?.({ mode: "fullscreen" }); } catch (_) {}
       });
-
-      const compatibility = window.openai?.toolResponseMetadata;
-      if (compatibility) render(compatibility.mcp_tool_result || compatibility.call_tool_result || compatibility);
     })();
   </script>
 </body>
@@ -311,7 +296,9 @@ mod tests {
         );
         let html = read["contents"][0]["text"].as_str().expect("html");
         assert!(html.contains("ui/notifications/tool-result"));
-        assert!(html.contains("toolResponseMetadata"));
+        assert!(!html.contains("toolResponseMetadata"));
+        assert!(!html.contains("mcp_tool_result"));
+        assert!(!html.contains("call_tool_result"));
         assert!(html.contains("name: \"view_image\""));
         assert!(html.contains("data:${mime};base64,${item.data}"));
         assert!(html.contains("image.onerror"));

@@ -127,6 +127,37 @@ fn active_mcp_transport_sessions_have_no_legacy_type_lane() {
 }
 
 #[test]
+fn p2_runtime_has_no_retired_result_or_session_store_bridges() {
+    let ui = crate_source("src/mcp/ui.rs");
+    let ui_runtime = ui.split("#[cfg(test)]").next().expect("MCP UI runtime");
+    let proxy = crate_source("src/mcp/proxy.rs");
+    let session_storage = crate_source("src/tools/session/storage.rs");
+    let session = crate_source("src/tools/session/mod.rs");
+    let registry = crate_source("src/tools/registry.rs");
+    let harness = crate_source("src/harness/tools.rs");
+    let server = crate_source("src/mcp/server.rs");
+
+    assert!(ui_runtime.contains("ui/notifications/tool-result"));
+    assert!(ui_runtime.contains("window.openai?.toolOutput"));
+    assert!(!ui_runtime.contains("toolResponseMetadata"));
+    assert!(!ui_runtime.contains("mcp_tool_result"));
+    assert!(!ui_runtime.contains("call_tool_result"));
+
+    assert!(
+        proxy.contains("fn proxy_connection_status(transport_connected: bool, operational: bool)")
+    );
+    assert!(!proxy.contains("fallback_connected"));
+
+    for active_source in [&session_storage, &session, &registry, &harness, &server] {
+        assert!(!active_source.contains("LEGACY_SESSION_DIR"));
+        assert!(!active_source.contains("LEGACY_SESSION_ARCHIVE_READ_ONLY"));
+        assert!(!active_source.contains("docs/history-session"));
+    }
+    assert!(!registry.contains("\"session_dir\": {"));
+    assert!(!session.contains("args.get(\"session_dir\")"));
+}
+
+#[test]
 fn service_run_has_platform_specific_hard_cut_parser_contracts() {
     let args = crate_source("src/cli/args.rs");
     let cli = crate_source("src/cli/mod.rs");

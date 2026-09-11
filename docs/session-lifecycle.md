@@ -1,6 +1,6 @@
 # Session 生命周期与隔离治理
 
-Anchor 使用三类完全不同的 Session 概念。开发 Session、命令进程 Session 和旧式 MCP transport Session 不共享标识、生命周期或持久化边界。
+Anchor 使用三类完全不同的 Session 概念。开发 Session、命令进程 Session 和 MCP transport Session 不共享标识、生命周期或持久化边界。
 
 ## 1. 开发 Session
 
@@ -23,7 +23,7 @@ session operation=validate
 - 返回 latest handoff、继承摘要或全局 resume state；
 - 自动暂停其他 active Session；
 - 自动选择或恢复其他 Session 的 Harness Task；
-- 扫描、迁移或改写 `docs/history-session/`。
+- 扫描 `docs/session/` 之外的其他目录。
 
 因此 Session 数量增长不会线性扩大 `open` 的模型上下文。只有用户明确要求恢复、查找、比较或引用以前的工作时，调用方才应先通过 `list` 获取有限元数据，再对一个明确相关的 `session_id` 使用 `get`。
 
@@ -35,7 +35,7 @@ Anchor 为开发 Session 生成 opaque handle：
 ses_<32 hex UUIDv4>
 ```
 
-新存储位于：
+canonical store 固定位于：
 
 ```text
 docs/session/
@@ -60,6 +60,8 @@ docs/session/
 | `session get` 最大读取 | 256 KiB |
 
 `session get` 在 UTF-8 字符边界截断，避免返回无效文本。
+
+公开 `session` facade 与 `begin_work_session` 不再暴露 `session_dir` 参数。所有开发 Session 的索引、容量治理、repair 与 checkpoint 都只作用于 `docs/session/`。
 
 ### Host conversation 映射
 
@@ -118,24 +120,9 @@ completed
 
 同一个 Session 被显式 reopen 时可重新激活为 `active`。这只修改当前 Session，不会改变其他 Session 的 lifecycle。
 
-## 2. 冻结的 legacy `docs/history-session/`
+## 2. 非 Session 文件
 
-旧目录：
-
-```text
-docs/history-session/
-```
-
-是冻结历史归档，不进行数据迁移。新 Session 实现遵循以下硬边界：
-
-- 不把它作为 `session_dir`；
-- 不扫描它来创建新索引；
-- 不把它计入 `docs/session` 容量；
-- `session validate` 不校验它；
-- 不自动读取、摘要或注入其中内容；
-- 不删除、不重写旧文件。
-
-只有用户明确要求查看 legacy 历史时，才通过 `read_file` 对一个精确旧路径进行按需读取。新工具不会提供自动 migration bridge。
+`docs/session/` 之外的 Markdown、归档或历史文件都只是普通 Workspace 文件，不属于 Session subsystem。Session runtime 不识别特殊旧目录名、不提供 migration/compatibility error，也不会把其他目录纳入索引、容量治理或 repair。需要查看普通历史文件时，使用文件工具按明确路径读取即可。
 
 ## 3. Harness Work Session 绑定
 
@@ -272,14 +259,14 @@ transport Session 与应用层开发 Session、command session 保持类型和�
 - 文档总量和容量边界；
 - `index.json` 状态。
 
-`repair=true` 只根据新的 Session Markdown 重建新的 metadata index，不接触 `docs/history-session/`。
+`repair=true` 只根据 canonical `docs/session/` 中的 Session Markdown 重建 metadata index。
 
 ## 7. 长期治理原则
 
 Anchor 将三个概念保持独立：
 
 ```text
-Development Session != Command Session != MCP Transport Compatibility Session
+Development Session != Command Session != MCP Transport Session
 ```
 
 开发 Session 也不等于跨会话 Memory。若未来增加项目级长期知识，应建立独立的检索式 Memory/knowledge 层，由调用方按需检索，而不是重新让开发 Session 自动继承所有历史内容。

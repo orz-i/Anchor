@@ -12,8 +12,7 @@ use crate::tools::workspace::{relative_display, Workspace, WorkspaceError, Works
 use super::markdown;
 use super::model::{IndexEntry, ScanReport, SessionDocument, SessionIndex};
 
-pub const DEFAULT_SESSION_DIR: &str = "docs/session";
-pub const LEGACY_SESSION_DIR: &str = "docs/history-session";
+pub const SESSION_DIR: &str = "docs/session";
 pub const MAX_SESSION_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SESSION_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SESSION_DOCUMENTS: usize = 4096;
@@ -44,7 +43,6 @@ fn capacity_error(message: &str, details: serde_json::Value) -> WorkspaceError {
 pub fn resolve_session_dir(
     workspace: &Workspace,
     workspace_root: Option<&str>,
-    session_dir: Option<&str>,
 ) -> WorkspaceResult<PathBuf> {
     if let Some(requested_root) = workspace_root {
         let requested_path = Path::new(requested_root.trim());
@@ -61,26 +59,7 @@ pub fn resolve_session_dir(
         }
     }
 
-    let raw = session_dir.unwrap_or(DEFAULT_SESSION_DIR).trim();
-    if raw.is_empty() || workspace.reject_unsafe_text(raw).is_err() {
-        return Err(WorkspaceError::path_outside_workspace());
-    }
-    if raw.replace('\\', "/").trim_end_matches('/') == LEGACY_SESSION_DIR {
-        return Err(WorkspaceError::ToolDetails {
-            code: "LEGACY_SESSION_ARCHIVE_READ_ONLY",
-            message: "docs/history-session is a frozen legacy archive and is not a writable Session store.".into(),
-            category: "validation",
-            retryable: false,
-            details: serde_json::json!({
-                "legacy_path": LEGACY_SESSION_DIR,
-                "session_path": DEFAULT_SESSION_DIR,
-                "migration_performed": false
-            }),
-        });
-    }
-    let candidate = workspace
-        .root()
-        .join(raw.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let candidate = workspace.root().join(SESSION_DIR);
     ensure_safe_candidate(workspace, &candidate)?;
     if candidate.exists() && !candidate.is_dir() {
         return Err(WorkspaceError::not_a_directory(

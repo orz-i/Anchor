@@ -157,7 +157,7 @@ fn high_value_local_tool_successes_match_published_output_schemas() {
 fn session_successes_match_published_output_schemas() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);
-    let opened = invoke(&ctx, "session_open", json!({"session_dir": "docs/session"}));
+    let opened = invoke(&ctx, "session_open", json!({}));
     assert_ok(&opened);
     assert_eq!(opened["history_injected"], false);
     assert_eq!(opened["automatic_history_loading"], false);
@@ -196,11 +196,7 @@ fn session_successes_match_published_output_schemas() {
     assert_ok(&get);
     assert_matches_output_schema("session_get", &get);
 
-    let validate = invoke(
-        &ctx,
-        "session_validate",
-        json!({"session_dir": "docs/session"}),
-    );
+    let validate = invoke(&ctx, "session_validate", json!({}));
     assert_ok(&validate);
     assert_matches_output_schema("session_validate", &validate);
 }

@@ -183,15 +183,15 @@ fn open_session(ctx: &ToolContext, host_session_key: &str, title: &str) -> Value
 }
 
 #[test]
-fn open_creates_opaque_isolated_session_without_loading_legacy_history() {
+fn open_creates_opaque_isolated_session_without_reading_unrelated_archives() {
     let (workspace, _harness, ctx) = test_context();
-    let legacy = workspace.path().join("docs/history-session");
-    fs::create_dir_all(&legacy).expect("legacy dir");
+    let archive = workspace.path().join("docs/unrelated-session-archive");
+    fs::create_dir_all(&archive).expect("archive dir");
     fs::write(
-        legacy.join("999.md"),
-        "# malformed legacy file\nTHIS_LEGACY_SECRET_MUST_NOT_BE_INJECTED\n",
+        archive.join("999.md"),
+        "# unrelated archive file\nTHIS_ARCHIVE_SECRET_MUST_NOT_BE_INJECTED\n",
     )
-    .expect("legacy file");
+    .expect("archive file");
 
     let opened = open_session(&ctx, "chat-a", "isolated-a");
     let session_id = opened["session_id"].as_str().expect("session id");
@@ -225,9 +225,9 @@ fn open_creates_opaque_isolated_session_without_loading_legacy_history() {
     assert!(content.contains(&format!("**Session id:** {session_id}")));
     assert!(content.contains("**Host session scope:** host-session:"));
     assert!(!content.contains("chat-a"));
-    assert!(!content.contains("THIS_LEGACY_SECRET_MUST_NOT_BE_INJECTED"));
+    assert!(!content.contains("THIS_ARCHIVE_SECRET_MUST_NOT_BE_INJECTED"));
     assert!(!content.contains("继承的历史摘要"));
-    assert!(legacy.join("999.md").exists());
+    assert!(archive.join("999.md").exists());
 }
 
 #[test]
@@ -372,27 +372,11 @@ fn open_response_size_is_constant_as_session_count_grows() {
 }
 
 #[test]
-fn legacy_archive_cannot_be_selected_as_the_new_writable_session_store() {
-    let (_workspace, _harness, ctx) = test_context();
-    let result = session::open(
-        &ctx,
-        &json!({
-            "_host_session_key": "legacy-write-attempt",
-            "session_dir": "docs/history-session"
-        }),
-    )
-    .expect_err("legacy store must be rejected")
-    .to_error_value();
-    assert_eq!(result["code"], "LEGACY_SESSION_ARCHIVE_READ_ONLY");
-    assert_eq!(result["details"]["migration_performed"], false);
-}
-
-#[test]
-fn validate_never_scans_or_migrates_the_legacy_archive() {
+fn validate_only_scans_the_canonical_session_store() {
     let (workspace, _harness, ctx) = test_context();
-    let legacy = workspace.path().join("docs/history-session");
-    fs::create_dir_all(&legacy).expect("legacy dir");
-    fs::write(legacy.join("not-a-session.txt"), vec![0xff, 0xfe, 0xfd]).expect("bad legacy");
+    let archive = workspace.path().join("docs/unrelated-session-archive");
+    fs::create_dir_all(&archive).expect("archive dir");
+    fs::write(archive.join("not-a-session.txt"), vec![0xff, 0xfe, 0xfd]).expect("bad archive");
     let _ = open_session(&ctx, "chat-a", "valid-new-session");
 
     let validated = invoke(&ctx, "session_validate", json!({"repair": false}));
@@ -410,7 +394,7 @@ fn validate_never_scans_or_migrates_the_legacy_archive() {
             "retired field leaked: {retired}"
         );
     }
-    assert!(legacy.join("not-a-session.txt").exists());
+    assert!(archive.join("not-a-session.txt").exists());
 }
 
 #[test]

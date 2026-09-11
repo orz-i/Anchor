@@ -174,7 +174,7 @@ environment { operation: "check" }
 
 ## 让项目记住每次开发 Session
 
-普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Anchor 当前把持久 Session 写入项目的 `docs/session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。旧 `docs/history-session/` 仅作为冻结归档保留，当前 Session store 不扫描、不迁移也不向其写入。
+普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Anchor 当前把持久 Session 固定写入项目的 `docs/session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。Session API 不再提供可切换存储目录或旧归档兼容入口。
 
 新对话中可以直接要求 Agent 先执行 `session { operation: "open" }`，再按需读取当前 Session；完成一轮工作后使用 `checkpoint` 保存结构化进度。
 
@@ -186,7 +186,7 @@ environment { operation: "check" }
 | `checkpoint` | 将决策、变更、测试和下一步写入 `open` 返回的明确 Session 目标；目标不一致时拒绝写入 |
 | `list` | 分页列出当前 `docs/session` 的 Session metadata |
 | `get` | 读取一个明确 `session_id` 的内容 |
-| `validate` | 验证当前 Session store/index，并可显式 repair；不会扫描旧 `docs/history-session` |
+| `validate` | 验证固定的 `docs/session` store/index，并可显式 repair |
 
 典型效果：
 
@@ -196,7 +196,7 @@ environment { operation: "check" }
 对话 2：打开/恢复当前 Session → 读取最近检查点 → 从上次进度继续 → 保存新检查点
 ```
 
-Session 文件使用可读的 Markdown 格式，并维护 `docs/session/index.json` 派生索引。Harness 默认把 `docs/session/` 当作本地 Session metadata，从业务 Git baseline 中排除；需要共享这些记录时应根据项目自己的版本控制策略显式决定，而不是依赖旧 history 目录语义。检查点要求 `session_id` 与 `expected_path` 对齐后才确认写入成功。
+Session 文件使用可读的 Markdown 格式，并维护 `docs/session/index.json` 派生索引。Harness 默认把 `docs/session/` 当作本地 Session metadata，从业务 Git baseline 中排除；需要共享这些记录时应根据项目自己的版本控制策略显式决定。检查点要求 `session_id` 与 `expected_path` 对齐后才确认写入成功。
 
 > 历史持久化由 AI 调用 MCP 工具完成，并非 Web Admin 在后台录制聊天内容。若客户端未触发工具调用，服务端无法凭空感知新的对话或任务进度。
 

@@ -9,7 +9,6 @@ export const CHATGPT_SESSION_PROMPT = `请使用当前工作区的 Anchor MCP �
 在回答本会话的第一个用户请求前，先且仅调用一次 session，operation=open；即使用户没有明确要求恢复，也必须执行。
 Session 默认自然隔离：open 不会读取、摘要或注入其他 Session 的内容，也不要主动调用 list/get 恢复历史。
 只有当用户明确要求恢复、查找或引用之前的工作时，才调用 session operation=list 获取有限元数据，再对明确相关的 session_id 调用 operation=get。
-旧 docs/history-session/ 是冻结归档，不迁移、不参与新 Session；仅在用户明确要求旧归档内容时才用 read_file 精确读取。
 不要在同一 ChatGPT 会话中重复创建 Session。保存 open 返回的 session_id 和 session_path；后续 checkpoint 原样使用 session_id，并将 session_path 作为 expected_path。
 插件会在受支持的代码变更、提交、命令阶段和浏览器证据阶段同步写入幂等里程碑检查点，但这不能替代最终交接。
 每个用户任务完成后、发送最终答复前调用 session operation=checkpoint，记录已脱敏的结论、决策、文件变更、验证结果、遗留问题和下一步。

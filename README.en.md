@@ -174,7 +174,7 @@ If ChatGPT still shows an old tool list, disconnect and reconnect the plugin or 
 
 ## Let the project remember every development Session
 
-Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Anchor now stores persistent Sessions under `docs/session/`, so context follows the project instead of staying trapped in one chat window. The old `docs/history-session/` directory is a frozen archive; the current Session store does not scan, migrate, or write to it.
+Chat transcripts are useful for rereading a discussion, but they are a poor long-term development handoff. Anchor stores persistent Sessions in the fixed `docs/session/` store, so context follows the project instead of staying trapped in one chat window. The Session API no longer exposes a selectable storage directory or a legacy-archive compatibility path.
 
 In a new conversation, ask the agent to start with `session { operation: "open" }`, read the current Session when needed, and save structured progress with `checkpoint` after a completed unit of work.
 
@@ -186,7 +186,7 @@ The current API is one `session` facade:
 | `checkpoint` | Persist decisions, changes, tests, and next actions to the exact Session target returned by `open`; mismatched targets are rejected |
 | `list` | Page through Session metadata from the current `docs/session` store |
 | `get` | Read one explicit `session_id` |
-| `validate` | Validate the current Session store/index and optionally repair it; the legacy archive is not scanned |
+| `validate` | Validate the fixed `docs/session` store/index and optionally repair it |
 
 Session documents use readable Markdown and a derived `docs/session/index.json`. Harness treats `docs/session/` as local Session metadata and excludes it from the business Git baseline by default; teams that want to version these records should make that a deliberate repository policy. A checkpoint is only considered saved when its `session_id` and `expected_path` match the active Session target.
 
