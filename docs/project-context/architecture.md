@@ -116,7 +116,7 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 ### workspace/
 - **职责**: Workspace 配置的 CRUD、持久化、密钥分离存储
 - **实现**: `crates/anchor/src/workspace/` 与 `crates/anchor/src/data/`
-- **持久化 schema**: `profiles.json` 与受保护 `secrets.json` 的解密 payload 分别使用独立 `schema_version=1`；无版本内容只允许在 storage 边界执行一次 v0 → v1 迁移并立即重写。当前 schema 对退休 Actions/Workspace-iLink secret key、未知字段和未来 schema fail closed，`DataStore` 读写主路径不再执行兼容清理扫描。
+- **持久化 schema**: `profiles.json` 与受保护 `secrets.json` 的解密 payload 分别要求显式 `schema_version=1`；无版本、未知版本和未来版本均 fail closed。storage 主路径不再执行 v0 → v1 迁移，也不再携带退休字段的识别/清理知识。
 - **Portable config**: 当前 envelope 为 v2；v1 已 hard-cut，不再为旧 inner payload 保留导入兼容桥。
 
 ### runtime/
@@ -127,9 +127,9 @@ Tauri/Svelte physical removal 已完成：Cargo 只保留 `anchor` CLI target；
 ### control/ 与 daemon.rs
 - **职责**: CLI/Web Admin 共用的 Workspace 控制状态、版本化本地 IPC、协议协商、daemon 状态文件、进程生命周期、Workspace Tunnel 异步写操作、事件 journal、单服务配置 reload，以及跨 Workspace/Gateway 的纯只读聚合
 - **传输**: Linux Unix Domain Socket；Windows owner/System protected-DACL Named Pipe
-- **安全边界**: 本地用户隔离、显式协议版本、只读查询的受控回退；生命周期写操作禁止回退
+- **安全边界**: 本地用户隔离、显式协议版本、只读状态的受控本地探测。Workspace/Gateway control 请求只接受当前精确协议版本；Unix 仅在控制端点物理不可达时允许经过 Workspace ID、PID 镜像与进程启动时间再次验证的 lifecycle recovery，这不是跨版本协议回退；Windows 不绕过 Named Pipe 控制面。
 - **协议**: Workspace 当前 v7；事件使用 `streamId + sequence` 有界游标和最长 25 秒长轮询，reload/Tunnel/apply_config 写请求使用 accepted → operation status 异步状态机
-- **升级协商**: daemon state 与 `version` additive 发布 build identity。Workspace 普通写请求要求当前协议；新客户端只可用受支持的旧 Workspace 协议执行 read-only `version` 和稳定 lifecycle drain（v2+），用于优雅退出旧运行权威后再由当前构建启动。Gateway 当前仅支持 protocol v1，不预置不存在的旧版本 retry bridge。
+- **升级协商**: daemon state 与 `version` 发布 build identity；Workspace v7 的 `version` 要求当前 build-identity/capability contract。Workspace v7 与 Gateway v1 都只接受各自当前精确协议，不再发送跨版本 `version` / lifecycle retry；Gateway v1 内既有 `buildIdentity` 仍是 additive optional 字段，不把字段收紧伪装成同版本 wire change。若活动 daemon 仍运行旧协议，应先由匹配该协议的旧 CLI 或对应 OS service manager 排空/升级，再交给当前构建；当前 rollout 只协调能够通过当前 control contract 验证的运行权威。
 - **Web Admin 接入**: Windows/Linux 上 Workspace 状态、日志、启停、重启、Tunnel、删除、密钥应用和事件唤醒均通过共享 daemon 客户端；Web Admin 不提供 process-local Server 回退，检测到旧/外部 listener 时按冲突处理而不是接管
 - **配置应用**: 已运行服务使用 daemon 内单 listener reload；daemon PID、另一 listener 与 Tunnel ownership 不因普通配置应用而重启，新 listener 失败时尝试恢复旧 listener
 - **聚合读取**: `control::aggregate` 并发读取独立 Workspace/Gateway 控制域，返回 canonical MCP 状态和按 source 保留游标的事件批；聚合层不持有 Runtime/Tunnel/Gateway 运行权威

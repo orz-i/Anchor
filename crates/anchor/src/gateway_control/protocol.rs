@@ -25,16 +25,8 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     pub fn new(config_scope: String, method: GatewayMethod) -> Self {
-        Self::with_protocol_version(config_scope, method, GATEWAY_CONTROL_PROTOCOL_VERSION)
-    }
-
-    pub fn with_protocol_version(
-        config_scope: String,
-        method: GatewayMethod,
-        protocol_version: u16,
-    ) -> Self {
         Self {
-            protocol_version,
+            protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
             request_id: uuid::Uuid::new_v4().to_string(),
             config_scope,
             method,
@@ -306,18 +298,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_version_result_without_build_identity_still_decodes() {
+    fn version_result_keeps_v1_additive_build_identity() {
         let result: GatewayResult = serde_json::from_value(serde_json::json!({
             "type": "version",
             "daemon_version": "0.1.22",
-            "protocol_version": 1
+            "protocol_version": GATEWAY_CONTROL_PROTOCOL_VERSION
         }))
-        .expect("legacy Gateway version response");
+        .expect("v1 version response without additive build identity");
         assert!(matches!(
             result,
             GatewayResult::Version {
                 daemon_version,
-                protocol_version: 1,
+                protocol_version: GATEWAY_CONTROL_PROTOCOL_VERSION,
                 build_identity: None,
             } if daemon_version == "0.1.22"
         ));

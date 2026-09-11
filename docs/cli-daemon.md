@@ -130,7 +130,7 @@ anchor upgrade --all [--dry-run]
 `upgrade` 是 **runtime rollout**，不是 CLI 下载器：先安装或运行目标 Anchor CLI 构建，再用该命令把正在运行的 Workspace/Gateway daemon 切换到当前 CLI 的 `BuildIdentity`。
 
 - 所有目标先整体执行 dry-run preflight；任何目标无法安全排空或无法准备 rollback 时，在停止第一个 daemon 前就 fail-closed；
-- 新客户端继续只对受支持的旧协议使用 `version` / `shutdown` / `prepare_restart` lifecycle 兼容，不扩大普通写权限；
+- preflight 必须先通过当前 control protocol 与 `BuildIdentity` 契约；协议不匹配时 fail closed，不再以旧协议重试 `version` / `shutdown` / `prepare_restart`。仍运行旧协议 daemon 的安装应先用与其匹配的旧 CLI 或 OS service manager 排空/升级；
 - 旧 daemon 完全退出后才启动新 daemon，因此不会让两代 listener 竞争同一固定端口；
 - readiness 同时验证 state PID、业务端口 owner 与本地 control ping；readiness 通过后还必须确认新 daemon `BuildIdentity` 与当前 CLI 一致；
 - Linux 在旧进程仍存活时从 `/proc/<pid>/exe` 保存真实运行映像。即使磁盘上的原路径已经被新版替换，新构建启动失败时仍能从该快照恢复旧 daemon；
@@ -270,9 +270,9 @@ Unix 运行目录权限为 `0700`，状态、PID 和锁文件使用当前用户�
 - Unix：`<runtime-dir>/<profile-id>.sock`，父目录 `0700`、socket `0600`；
 - Windows：`\\.\pipe\anchor-<user-config-scope>-<profile-id>`。服务端拒绝远程客户端，并使用受保护 DACL `D:P(A;;GA;;;SY)(A;;GA;;;OW)`，只授予 LocalSystem 与对象 owner 完全控制，不添加 Everyone/Anonymous ACE。
 
-Workspace 控制协议当前版本为 `6`，支持 `ping`、`version`、`workspace_status`、`logs`、`events`、`reload`、`apply_config`、`update_oauth_redirect_policy`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
+Workspace 控制协议当前版本为 `7`，支持 `ping`、`version`、`workspace_status`、`logs`、`events`、`reload`、`apply_config`、`update_oauth_redirect_policy`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status`。每条消息是最大 64 KiB 的单行 JSON；一个连接只处理一个请求，响应必须回显请求 ID。
 
-`version` 与 daemon state 还以 additive optional 字段发布 `buildIdentity`（package version、Git SHA、dirty 标志和构建工作区）。旧 daemon 没有该字段时新客户端按 `None` 处理，因此同一 `0.1.x` 包版本下也能在新旧构建之间建立明确的升级可观察性，而不会把“package version 相同”误当成“运行构建相同”。
+`version` 按当前协议必须发布 `buildIdentity`（package version、Git SHA、dirty 标志和构建工作区）以及当前 capability 集合；缺少这些当前字段的旧响应会按协议不兼容拒绝。同一 `0.1.x` 包版本下仍通过 build identity 区分不同构建，不把“package version 相同”误当成“运行构建相同”。
 
 Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
 
@@ -287,9 +287,9 @@ CLI 生命周期语义：
 - `start` 在 daemon 不存在时负责创建后台进程；若状态显示 daemon 已运行，必须先通过 IPC `ping` 验证目标控制面；
 - `stop` 先发送 `shutdown`，由目标 daemon 完成 Runtime、Tunnel 和监听器清理后退出；
 - `restart` 先发送 `prepare_restart`，等待原 PID 退出后再执行一次新的 `start` 引导；
-- 普通运行/配置写请求继续要求当前协议精确匹配。只有 `version` 只读探测，以及自 Workspace protocol v2 起未改变 wire shape 的 `shutdown` / `prepare_restart`，允许新客户端在发现**较旧且不低于 v2** 的 daemon 后以该旧协议版本重试；该兼容通道只用于识别和排空旧运行权威，不允许 tunnel/reload/apply_config 等新写语义跨版本执行；
-- IPC 不可用、生命周期协议低于兼容下限、新 daemon 比客户端更新、响应 PID 不匹配或普通写请求协议不兼容时，命令直接失败，不会回退到客户端直接发送信号或启动第二套运行时；
-- `--force` 只在 daemon 已接受 IPC 退出请求但超过等待时间后生效，并再次验证 PID 仍属于目标 Workspace。
+- 所有 control 请求（包括 `version`、`shutdown`、`prepare_restart`）都要求当前协议精确匹配；协议不兼容、新 daemon 比客户端更新、响应 PID/请求 ID 不匹配时直接 fail closed，不存在跨版本 retry bridge；
+- Unix 上若 state 仍证明目标 daemon 存活且属于当前 Workspace，但控制 socket 物理不可达，生命周期命令可进入唯一的 **verified recovery**：再次校验 Workspace ID、PID 镜像和进程启动时间后发送 TERM 并等待退出。这只处理“端点丢失/不可达”，不会在协议错误、remote error 或身份校验失败时触发，也不会启动第二套 Runtime/Tunnel 权威；Windows 不绕过 Named Pipe 控制面；
+- `--force` 仅在已经进入受控退出或上述 verified recovery 后等待超时才生效，并在终止进程树前再次验证 PID 仍属于目标 Workspace。
 
 运行中 daemon 的 `logs` 和 `logs --follow` 通过 IPC 获取有界日志快照和增量游标。单次响应日志内容最多 8 KiB，避免日志内容突破控制帧上限。daemon 已停止时，CLI 仍允许直接读取已有历史日志文件。
 

@@ -17,22 +17,6 @@ use super::model::{
 use super::secret_protection;
 
 const SECRETS_ENVELOPE_VERSION: u32 = 1;
-const LEGACY_V0_ACTIONS_SECRET_KEYS: &[&str] = &[
-    "actions_api_key",
-    "actions_oauth_client_secret",
-    "actions_oauth_password",
-    "actions_oauth_token_secret",
-    "actions_cloudflare_token",
-    "actions_frp_token",
-];
-const LEGACY_V0_WORKSPACE_NOTIFICATION_SECRET_KEYS: &[&str] = &[
-    "ilink_bot_token",
-    "ilink_target_user_id",
-    "ilink_context_token",
-    "ilink_base_url",
-    "ilink_bot_id",
-    "ilink_login_user_id",
-];
 #[cfg(windows)]
 const SERVICE_RUNTIME_APP_SECRET_SCOPES: &[&str] =
     &["oauth_refresh_replay", "federation_request_replay"];
@@ -177,13 +161,13 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_profiles_migrate_once_to_current_schema() {
+    fn unversioned_profiles_are_hard_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("profiles.json");
         let mut data = AppData::default();
         data.profiles.push(crate::workspace::WorkspaceProfile::new(
             ".".into(),
-            Some("legacy-skill-roots".into()),
+            Some("unversioned".into()),
         ));
         let mut value =
             serde_json::to_value(ProfilesData::from_app_data(&data)).expect("profiles json");
@@ -191,64 +175,16 @@ mod tests {
             .as_object_mut()
             .expect("profiles object")
             .remove("schema_version");
-        value["profiles"][0]["actions"] = serde_json::json!({"enabled": true});
-        value["profiles"][0]["runtime"]["skill_roots"] =
-            serde_json::Value::String(".agents/skills\n.codex/skills".into());
         fs::write(
             &path,
             format!("{}\n", serde_json::to_string_pretty(&value).expect("json")),
         )
-        .expect("legacy profiles");
+        .expect("unversioned profiles");
 
-        let migrated = load_profiles_with_backup(&path).expect("migrate profiles");
+        let error =
+            load_profiles_with_backup(&path).expect_err("unversioned profiles must be rejected");
 
-        assert_eq!(migrated.profiles.len(), 1);
-        let persisted: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).expect("read migrated profiles"))
-                .expect("parse migrated profiles");
-        assert_eq!(persisted["schema_version"], PROFILES_SCHEMA_VERSION);
-        assert!(persisted["profiles"][0].get("actions").is_none());
-        assert!(persisted["profiles"][0]["runtime"]
-            .get("skill_roots")
-            .is_none());
-        let backup: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(backup_path(&path)).expect("read pre-migration backup"),
-        )
-        .expect("parse pre-migration backup");
-        assert!(backup.get("schema_version").is_none());
-        assert!(backup["profiles"][0].get("actions").is_some());
-        assert!(backup["profiles"][0]["runtime"]
-            .get("skill_roots")
-            .is_some());
-    }
-
-    #[test]
-    fn unversioned_profile_migration_still_rejects_other_unknown_fields() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("profiles.json");
-        let mut data = AppData::default();
-        data.profiles.push(crate::workspace::WorkspaceProfile::new(
-            ".".into(),
-            Some("strict-migration".into()),
-        ));
-        let mut value =
-            serde_json::to_value(ProfilesData::from_app_data(&data)).expect("profiles json");
-        value
-            .as_object_mut()
-            .expect("profiles object")
-            .remove("schema_version");
-        value["profiles"][0]["runtime"]["skill_roots"] = serde_json::Value::String("skills".into());
-        value["profiles"][0]["runtime"]["unexpected_future_field"] = serde_json::Value::Bool(true);
-        fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&value).expect("json")),
-        )
-        .expect("legacy profiles");
-
-        let error = load_profiles_with_backup(&path)
-            .expect_err("unrelated unknown fields must remain rejected");
-
-        assert!(error.to_string().contains("unexpected_future_field"));
+        assert!(error.to_string().contains("缺少 schema_version"));
     }
 
     #[test]
@@ -291,26 +227,15 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_secrets_migrate_retired_keys_once() {
-        let legacy = serde_json::json!({
-            "shared_secrets": {
-                "actions_api_key": "retired",
-                "keep": "shared"
-            },
-            "workspace_secrets": {
-                "workspace": {
-                    "actions_oauth_password": "retired",
-                    "ilink_bot_token": "retired",
-                    "bearer_token": "keep"
-                }
-            },
-            "app_secrets": {
-                "notification.ilink": {"account": "keep"}
-            }
-        });
-        let plaintext = serde_json::to_vec(&legacy).expect("legacy secrets");
+    fn unversioned_secrets_are_hard_rejected() {
+        let mut unversioned = serde_json::to_value(SecretsData::default()).expect("secrets json");
+        unversioned
+            .as_object_mut()
+            .expect("secrets object")
+            .remove("schema_version");
+        let plaintext = serde_json::to_vec(&unversioned).expect("unversioned secrets");
         let (protection, protected) =
-            secret_protection::protect(&plaintext).expect("protect legacy secrets");
+            secret_protection::protect(&plaintext).expect("protect unversioned secrets");
         let envelope = SecretsEnvelope {
             version: SECRETS_ENVELOPE_VERSION,
             protection: protection.into(),
@@ -328,39 +253,11 @@ mod tests {
             )
             .as_bytes(),
         )
-        .expect("legacy envelope");
+        .expect("unversioned envelope");
 
-        let migrated = load_secrets_with_backup(&path, SecretAccess::User).expect("migrate");
-        assert_eq!(migrated.schema_version, SECRETS_SCHEMA_VERSION);
-        assert_eq!(
-            migrated.shared_secrets.get("keep").map(String::as_str),
-            Some("shared")
-        );
-        assert!(!migrated.shared_secrets.contains_key("actions_api_key"));
-        let workspace = &migrated.workspace_secrets["workspace"];
-        assert_eq!(
-            workspace.get("bearer_token").map(String::as_str),
-            Some("keep")
-        );
-        assert!(!workspace.contains_key("actions_oauth_password"));
-        assert!(!workspace.contains_key("ilink_bot_token"));
-        assert!(migrated.app_secrets.contains_key("notification.ilink"));
-
-        let current = read_secrets_file(&path, SecretAccess::User).expect("current secrets");
-        assert_eq!(current.schema_version, SECRETS_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn current_secrets_schema_rejects_retired_keys() {
-        let mut current = SecretsData::default();
-        current
-            .workspace_secrets
-            .entry("workspace".into())
-            .or_default()
-            .insert("ilink_bot_token".into(), "retired".into());
-
-        let error = validate_current_secrets(&current).expect_err("retired key must fail");
-        assert!(error.to_string().contains("已退休 secret key"));
+        let error = load_secrets_with_backup(&path, SecretAccess::User)
+            .expect_err("unversioned secrets must be rejected");
+        assert!(error.to_string().contains("缺少 schema_version"));
     }
 
     #[test]
@@ -532,7 +429,6 @@ fn write_data(path: &Path, data: &AppData) -> AppResult<()> {
 }
 
 fn write_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> {
-    validate_current_secrets(data)?;
     let plaintext = serde_json::to_vec(data)?;
     let (protection, protected) =
         secret_protection::protect(&plaintext).map_err(crate::error::AppError::Message)?;
@@ -577,7 +473,6 @@ fn service_secrets_for_user_write(path: &Path, data: &SecretsData) -> SecretsDat
 
 #[cfg(windows)]
 fn write_service_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> {
-    validate_current_secrets(data)?;
     let mut envelope = read_secrets_envelope(path).map_err(|error| {
         crate::error::AppError::Message(format!(
             "Windows Service 无法更新凭据镜像，因为用户凭据封装不可用：{error}"
@@ -593,14 +488,8 @@ fn write_service_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> 
 
 fn load_secrets_with_backup(path: &Path, access: SecretAccess) -> AppResult<SecretsData> {
     match read_secrets_file_versioned(path, access) {
-        Ok((data, migrated)) => {
-            if migrated {
-                match access {
-                    SecretAccess::User => write_secrets_data(path, &data)?,
-                    #[cfg(windows)]
-                    SecretAccess::Service => write_service_secrets_data(path, &data)?,
-                }
-            } else if access == SecretAccess::User {
+        Ok(data) => {
+            if access == SecretAccess::User {
                 ensure_service_secret_mirror(path, &data)?;
             }
             Ok(data)
@@ -610,8 +499,7 @@ fn load_secrets_with_backup(path: &Path, access: SecretAccess) -> AppResult<Secr
             if !backup.exists() {
                 return Err(primary_error);
             }
-            let (recovered, _migrated) =
-                read_secrets_file_versioned(&backup, access).map_err(|backup_error| {
+            let recovered = read_secrets_file_versioned(&backup, access).map_err(|backup_error| {
                 crate::error::AppError::Message(format!(
                     "凭据文件损坏且备份无法读取：主文件错误：{primary_error}；备份错误：{backup_error}"
                 ))
@@ -622,9 +510,6 @@ fn load_secrets_with_backup(path: &Path, access: SecretAccess) -> AppResult<Secr
                 SecretAccess::Service => {
                     let raw = fs::read(&backup)?;
                     atomic_write(path, &raw)?;
-                    if _migrated {
-                        write_service_secrets_data(path, &recovered)?;
-                    }
                 }
             }
             eprintln!(
@@ -656,13 +541,10 @@ fn read_secrets_envelope(path: &Path) -> AppResult<SecretsEnvelope> {
 
 #[cfg(any(test, windows))]
 fn read_secrets_file(path: &Path, access: SecretAccess) -> AppResult<SecretsData> {
-    read_secrets_file_versioned(path, access).map(|(data, _)| data)
+    read_secrets_file_versioned(path, access)
 }
 
-fn read_secrets_file_versioned(
-    path: &Path,
-    access: SecretAccess,
-) -> AppResult<(SecretsData, bool)> {
+fn read_secrets_file_versioned(path: &Path, access: SecretAccess) -> AppResult<SecretsData> {
     let envelope = read_secrets_envelope(path)?;
     let (protection, payload) = match access {
         SecretAccess::User => (envelope.protection.as_str(), envelope.payload.as_str()),
@@ -694,95 +576,31 @@ fn read_secrets_file_versioned(
     parse_secrets_payload(&plaintext)
 }
 
-fn parse_secrets_payload(plaintext: &[u8]) -> AppResult<(SecretsData, bool)> {
-    let mut value: serde_json::Value = serde_json::from_slice(plaintext).map_err(|error| {
+fn parse_secrets_payload(plaintext: &[u8]) -> AppResult<SecretsData> {
+    let value: serde_json::Value = serde_json::from_slice(plaintext).map_err(|error| {
         crate::error::AppError::Message(format!("无法解析解密后的凭据文件：{error}"))
     })?;
-    let migrated = match value.get("schema_version") {
-        Some(version) => {
-            let version = version.as_u64().ok_or_else(|| {
-                crate::error::AppError::Message("凭据内容 schema_version 必须是非负整数".into())
-            })?;
-            if version != u64::from(SECRETS_SCHEMA_VERSION) {
-                return Err(crate::error::AppError::Message(format!(
-                    "不支持的凭据内容 schema_version：{version}；当前仅支持 {SECRETS_SCHEMA_VERSION}"
-                )));
-            }
-            false
-        }
-        None => {
-            migrate_unversioned_secrets(&mut value)?;
-            value
-                .as_object_mut()
-                .ok_or_else(|| {
-                    crate::error::AppError::Message("凭据内容必须是 JSON object".into())
-                })?
-                .insert(
-                    "schema_version".into(),
-                    serde_json::Value::from(SECRETS_SCHEMA_VERSION),
-                );
-            true
-        }
-    };
+    let version = value
+        .get("schema_version")
+        .ok_or_else(|| {
+            crate::error::AppError::Message(
+                "凭据内容缺少 schema_version；无版本凭据已停止支持，请先使用支持旧格式的 Anchor 完成迁移"
+                    .into(),
+            )
+        })?
+        .as_u64()
+        .ok_or_else(|| {
+            crate::error::AppError::Message("凭据内容 schema_version 必须是非负整数".into())
+        })?;
+    if version != u64::from(SECRETS_SCHEMA_VERSION) {
+        return Err(crate::error::AppError::Message(format!(
+            "不支持的凭据内容 schema_version：{version}；当前仅支持 {SECRETS_SCHEMA_VERSION}"
+        )));
+    }
     let data = serde_json::from_value::<SecretsData>(value).map_err(|error| {
         crate::error::AppError::Message(format!("无法解析解密后的凭据文件：{error}"))
     })?;
-    validate_current_secrets(&data)?;
-    Ok((data, migrated))
-}
-
-fn validate_current_secrets(data: &SecretsData) -> AppResult<()> {
-    if let Some(key) = LEGACY_V0_ACTIONS_SECRET_KEYS
-        .iter()
-        .find(|key| data.shared_secrets.contains_key(**key))
-    {
-        return Err(crate::error::AppError::Message(format!(
-            "当前凭据 schema 不允许已退休的 shared secret key：{key}"
-        )));
-    }
-    for (workspace_id, secrets) in &data.workspace_secrets {
-        if let Some(key) = LEGACY_V0_ACTIONS_SECRET_KEYS
-            .iter()
-            .chain(LEGACY_V0_WORKSPACE_NOTIFICATION_SECRET_KEYS)
-            .find(|key| secrets.contains_key(**key))
-        {
-            return Err(crate::error::AppError::Message(format!(
-                "当前凭据 schema 不允许 Workspace {workspace_id} 的已退休 secret key：{key}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn migrate_unversioned_secrets(value: &mut serde_json::Value) -> AppResult<()> {
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| crate::error::AppError::Message("旧凭据内容必须是 JSON object".into()))?;
-    if let Some(shared) = object
-        .get_mut("shared_secrets")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        for key in LEGACY_V0_ACTIONS_SECRET_KEYS {
-            shared.remove(*key);
-        }
-    }
-    if let Some(workspaces) = object
-        .get_mut("workspace_secrets")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        for secrets in workspaces
-            .values_mut()
-            .filter_map(serde_json::Value::as_object_mut)
-        {
-            for key in LEGACY_V0_ACTIONS_SECRET_KEYS
-                .iter()
-                .chain(LEGACY_V0_WORKSPACE_NOTIFICATION_SECRET_KEYS)
-            {
-                secrets.remove(*key);
-            }
-        }
-    }
-    Ok(())
+    Ok(data)
 }
 
 fn ensure_service_secret_mirror(path: &Path, data: &SecretsData) -> AppResult<()> {
@@ -857,20 +675,13 @@ where
 
 fn load_profiles_with_backup(path: &Path) -> AppResult<ProfilesData> {
     match read_profiles_json(path) {
-        Ok((data, migrated)) => {
-            if migrated {
-                let legacy = fs::read(path)?;
-                atomic_write(&backup_path(path), &legacy)?;
-                write_json(path, &data)?;
-            }
-            Ok(data)
-        }
+        Ok(data) => Ok(data),
         Err(primary_error) => {
             let backup = backup_path(path);
             if !backup.exists() {
                 return Err(primary_error);
             }
-            let (recovered, _) = read_profiles_json(&backup).map_err(|backup_error| {
+            let recovered = read_profiles_json(&backup).map_err(|backup_error| {
                 crate::error::AppError::Message(format!(
                     "配置文件损坏且备份无法读取：主文件错误：{primary_error}；备份错误：{backup_error}"
                 ))
@@ -887,83 +698,40 @@ fn load_profiles_with_backup(path: &Path) -> AppResult<ProfilesData> {
     }
 }
 
-fn read_profiles_json(path: &Path) -> AppResult<(ProfilesData, bool)> {
+fn read_profiles_json(path: &Path) -> AppResult<ProfilesData> {
     let raw = fs::read_to_string(path)?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
         crate::error::AppError::Message(format!("无法解析配置文件 {}：{error}", path.display()))
     })?;
-    let migrated = match value.get("schema_version") {
-        Some(version) => {
-            let version = version.as_u64().ok_or_else(|| {
-                crate::error::AppError::Message(format!(
-                    "配置文件 {} 的 schema_version 必须是非负整数",
-                    path.display()
-                ))
-            })?;
-            if version != u64::from(PROFILES_SCHEMA_VERSION) {
-                return Err(crate::error::AppError::Message(format!(
-                    "不支持的配置 schema_version：{version}；当前仅支持 {PROFILES_SCHEMA_VERSION}"
-                )));
-            }
-            false
-        }
-        None => {
-            migrate_unversioned_profiles(&mut value)?;
-            value
-                .as_object_mut()
-                .ok_or_else(|| {
-                    crate::error::AppError::Message(format!(
-                        "配置文件 {} 必须是 JSON object",
-                        path.display()
-                    ))
-                })?
-                .insert(
-                    "schema_version".into(),
-                    serde_json::Value::from(PROFILES_SCHEMA_VERSION),
-                );
-            true
-        }
-    };
-    let data = serde_json::from_value::<ProfilesData>(value).map_err(|error| {
-        crate::error::AppError::Message(format!(
-            "{}配置文件 {}：{error}",
-            if migrated {
-                "无法迁移"
-            } else {
-                "无法解析"
-            },
-            path.display()
-        ))
-    })?;
-    Ok((data, migrated))
-}
-
-fn migrate_unversioned_profiles(value: &mut serde_json::Value) -> AppResult<()> {
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| crate::error::AppError::Message("旧配置文件必须是 JSON object".into()))?;
-    if let Some(profiles) = object
-        .get_mut("profiles")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for profile in profiles {
-            if let Some(profile) = profile.as_object_mut() {
-                profile.remove("actions");
-            }
-            if let Some(runtime) = profile
-                .get_mut("runtime")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                runtime.remove("skill_roots");
-            }
-        }
+    let version = value
+        .get("schema_version")
+        .ok_or_else(|| {
+            crate::error::AppError::Message(format!(
+                "配置文件 {} 缺少 schema_version；无版本配置已停止支持，请先使用支持旧格式的 Anchor 完成迁移",
+                path.display()
+            ))
+        })?
+        .as_u64()
+        .ok_or_else(|| {
+            crate::error::AppError::Message(format!(
+                "配置文件 {} 的 schema_version 必须是非负整数",
+                path.display()
+            ))
+        })?;
+    if version != u64::from(PROFILES_SCHEMA_VERSION) {
+        return Err(crate::error::AppError::Message(format!(
+            "不支持的配置 schema_version：{version}；当前仅支持 {PROFILES_SCHEMA_VERSION}"
+        )));
     }
-    Ok(())
+    let data = serde_json::from_value::<ProfilesData>(value).map_err(|error| {
+        crate::error::AppError::Message(format!("无法解析配置文件 {}：{error}", path.display(),))
+    })?;
+    Ok(data)
 }
 
 #[cfg(test)]
 fn read_data(path: &Path) -> AppResult<AppData> {
-    read_profiles_json(path).map(|(data, _)| data.into_app_data())
+    read_profiles_json(path).map(ProfilesData::into_app_data)
 }
 
 #[cfg(test)]

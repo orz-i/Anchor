@@ -112,16 +112,7 @@ fn should_log_connection_error(error: &AppError) -> bool {
 }
 
 pub async fn request_version() -> Result<GatewayVersionInfo, GatewayControlClientError> {
-    let result = match request(GatewayMethod::Version).await {
-        Ok(result) => result,
-        Err(GatewayControlClientError::VersionMismatch {
-            daemon_protocol, ..
-        }) if daemon_protocol > 0 && daemon_protocol < GATEWAY_CONTROL_PROTOCOL_VERSION => {
-            request_with_protocol_version(GatewayMethod::Version, REQUEST_TIMEOUT, daemon_protocol)
-                .await?
-        }
-        Err(error) => return Err(error),
-    };
+    let result = request(GatewayMethod::Version).await?;
     match result {
         GatewayResult::Version {
             daemon_version,
@@ -684,14 +675,6 @@ async fn request_with_timeout(
     method: GatewayMethod,
     timeout: Duration,
 ) -> Result<GatewayResult, GatewayControlClientError> {
-    request_with_protocol_version(method, timeout, GATEWAY_CONTROL_PROTOCOL_VERSION).await
-}
-
-async fn request_with_protocol_version(
-    method: GatewayMethod,
-    timeout: Duration,
-    protocol_version: u16,
-) -> Result<GatewayResult, GatewayControlClientError> {
     let config_scope = gateway_daemon::config_scope().map_err(|error| {
         GatewayControlClientError::Protocol(format!("cannot resolve Gateway config scope: {error}"))
     })?;
@@ -700,7 +683,7 @@ async fn request_with_protocol_version(
             "cannot resolve Gateway control endpoint: {error}"
         ))
     })?;
-    let request = GatewayRequest::with_protocol_version(config_scope, method, protocol_version);
+    let request = GatewayRequest::new(config_scope, method);
     let request_id = request.request_id.clone();
     let response = tokio::time::timeout(timeout, exchange_with_endpoint(&endpoint, &request))
         .await
@@ -709,7 +692,7 @@ async fn request_with_protocol_version(
                 "Gateway control endpoint timed out: {endpoint:?}"
             ))
         })??;
-    if response.protocol_version != protocol_version {
+    if response.protocol_version != GATEWAY_CONTROL_PROTOCOL_VERSION {
         return Err(GatewayControlClientError::VersionMismatch {
             daemon_protocol: response.protocol_version,
             client_protocol: GATEWAY_CONTROL_PROTOCOL_VERSION,

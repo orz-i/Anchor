@@ -234,7 +234,7 @@ Harness Task 默认继续使用当前 Workspace；需要并行隔离分支、索
 
 `search` 是统一的仓库搜索入口，支持 `auto`、`text`、`symbol`、`callers`、`callees`、`impact`、`explore`。`auto` 使用确定性规则路由，不调用额外的 LLM 分类器：显式路径/正则/glob/上下文等文本控制进入文本后端，标识符形态优先进入符号搜索，自然语言查询进入结构探索。
 
-文本后端会优先使用可用的 ripgrep (`rg`) 做候选文件预筛，再由 Anchor 内置实现负责路径边界、文本解码、结果排序、上下文、分页与预算控制；如果 `rg` 不存在或预筛失败，会自动回退到内置扫描器。语义后端由 Anchor 内部调用 CodeGraph，按 Workspace 懒初始化索引并在查询前同步；索引或查询失败时会显式标记 `degraded` 并回退文本搜索。`grep` 与更早的 `search_text` 仅保留为隐藏兼容入口，不再出现在工具目录或 OpenAPI 中。
+文本后端会优先使用可用的 ripgrep (`rg`) 做候选文件预筛，再由 Anchor 内置实现负责路径边界、文本解码、结果排序、上下文、分页与预算控制；如果 `rg` 不存在或预筛失败，会自动回退到内置扫描器。语义后端由 Anchor 内部调用 CodeGraph，按 Workspace 懒初始化索引并在查询前同步；索引或查询失败时会显式标记 `degraded` 并回退文本搜索。`grep` 与更早的 `search_text` 已从工具协议退役，不再作为隐藏 alias/兼容入口进入目录、OpenAPI 或 dispatcher；统一使用 `search`。
 
 Anchor 的 `software` 管理同时支持 ripgrep 与 CodeGraph：
 

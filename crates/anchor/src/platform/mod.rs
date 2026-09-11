@@ -12,10 +12,6 @@ pub trait Platform: Send + Sync {
 
     fn process_image_path(&self, pid: u32) -> AppResult<Option<String>>;
 
-    /// Return processes whose executable image exactly matches `image_path`.
-    #[cfg(windows)]
-    fn process_ids_by_image_path(&self, image_path: &Path) -> AppResult<Vec<u32>>;
-
     fn is_process_alive(&self, pid: u32) -> bool;
 
     fn terminate_process_tree(&self, pid: u32) -> AppResult<()>;

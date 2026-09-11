@@ -568,7 +568,7 @@ async fn verify_canonical_handoff_successor(
                     }
                     match control::request_version(&profile.id).await {
                         Ok(version) => {
-                            if build_is_current(version.build_identity.as_ref(), current_build) {
+                            if version.build_identity.same_build(current_build) {
                                 return Ok(state);
                             }
                             return Err(AppError::Message(format!(

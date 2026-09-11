@@ -2265,25 +2265,17 @@ async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
         match control::request_version(&profile.id).await {
             Ok(version) => {
                 let current = crate::build_identity::BuildIdentity::current();
-                let detail = match version.build_identity.as_ref() {
-                    Some(identity) => format!(
-                        "protocol={} package={} git={}{}",
-                        version.protocol_version,
-                        identity.package_version,
-                        identity.short_git_sha(),
-                        if identity.git_dirty { " dirty" } else { "" }
-                    ),
-                    None => format!(
-                        "protocol={} package={} build identity=unavailable",
-                        version.protocol_version, version.daemon_version
-                    ),
-                };
+                let identity = &version.build_identity;
+                let detail = format!(
+                    "protocol={} package={} git={}{}",
+                    version.protocol_version,
+                    identity.package_version,
+                    identity.short_git_sha(),
+                    if identity.git_dirty { " dirty" } else { "" }
+                );
                 checks.push(doctor_check(
                     "Daemon 构建",
-                    version
-                        .build_identity
-                        .as_ref()
-                        .is_some_and(|identity| identity.same_build(&current)),
+                    identity.same_build(&current),
                     detail,
                     "使用当前 Anchor 构建协调 restart；若由 Windows SCM 监督，请先更新 SCM Service，再确认 daemon 已由新构建恢复",
                 ));
@@ -2292,7 +2284,7 @@ async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
                 "Daemon 构建",
                 false,
                 error.to_string(),
-                "检查 daemon 控制协议；升级时仅 lifecycle drain 允许兼容旧协议，普通写操作仍会 fail-closed",
+                "检查 daemon 控制协议；当前构建只接受精确匹配的 Workspace control protocol",
             )),
         }
     }

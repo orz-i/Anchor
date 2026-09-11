@@ -196,9 +196,8 @@ pub fn process_ids_by_image_path(image_path: &Path) -> AppResult<Vec<u32>> {
     let expected = normalize_image_path(image_path);
     let mut matched = Vec::new();
     for pid in process_ids()? {
-        // Protected processes may deny PROCESS_QUERY_LIMITED_INFORMATION to an
-        // unprivileged caller. The SCM supervisor runs as LocalSystem and can
-        // therefore use the same primitive to find legacy service-owned children.
+        // Processes that deny image queries are skipped rather than treated as
+        // matches; this primitive only acts on an exact executable identity.
         if let Ok(Some(actual)) = process_image_path(pid) {
             if normalize_image_path(Path::new(&actual)) == expected {
                 matched.push(pid);

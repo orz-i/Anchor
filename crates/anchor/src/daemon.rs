@@ -493,10 +493,9 @@ pub(crate) fn control_pipe_name(profile_id: &str) -> AppResult<String> {
     let config_dir = crate::platform::app_config_dir_override()
         .map(Ok)
         .unwrap_or_else(|| platform().app_config_dir())?;
-    // Keep the historical per-user pipe identity for upgrade compatibility.
-    // The SCM supervisor uses the trusted registration owner username when it
-    // addresses the pipe; the owner-token daemon resolves the same username
-    // from its normal user environment.
+    // The canonical pipe identity is scoped by the trusted configuration owner
+    // and config directory. The SCM supervisor and the owner-token daemon must
+    // derive this exact same identity from their respective trusted contexts.
     let user = crate::windows_service::pipe_identity_user();
     let digest = Sha256::digest(format!("{user}\0{}", config_dir.display()).as_bytes());
     let scope = digest[..8]
@@ -981,7 +980,7 @@ pub async fn stop(
 }
 
 #[cfg(unix)]
-pub(crate) async fn stop_verified_without_control(
+pub(crate) async fn recover_unreachable_daemon_stop(
     profile: &WorkspaceProfile,
     state: &DaemonState,
     timeout: Duration,
@@ -999,7 +998,7 @@ pub(crate) async fn stop_verified_without_control(
     }
     if !process_matches_daemon_state(state, &profile.id) {
         return Err(AppError::Message(format!(
-            "PID {} 不再匹配已验证的当前 workspace daemon，拒绝绕过控制端点停止",
+            "PID {} 不再匹配已验证的当前 workspace daemon，拒绝执行控制端点不可达恢复",
             state.pid
         )));
     }

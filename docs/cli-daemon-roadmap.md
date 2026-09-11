@@ -88,14 +88,14 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 
 当前已完成只读接入、生命周期/Tunnel 写控制、事件消费和单服务配置 reload 的基础：
 
-- Workspace 协议版本为 `6`，请求和响应都包含 `protocolVersion` 与 `requestId`；
+- Workspace 当前协议版本为 `7`，请求和响应都包含 `protocolVersion` 与 `requestId`，所有请求要求精确版本匹配；
 - 单连接单请求，使用最大 64 KiB 的换行分隔 JSON 帧；
 - Unix daemon 在私有运行目录创建权限为 `0600` 的 UDS；其父目录保持 `0700`；
 - Windows Workspace daemon 使用按用户和配置域派生名称的 Named Pipe；服务端拒绝远程客户端，DACL 仅授予对象 owner 与 LocalSystem。Windows state v2 保存 daemon executable path，并与 PID 实际镜像共同校验归属；
 - daemon readiness 同时要求所选端口归属正确 PID 且 `ping` 成功；
 - `workspace_status`、`logs`、`events`、`reload`、`shutdown`、`prepare_restart`、`tunnel_control` 和 `operation_status` 请求必须与端点所属 Workspace ID 一致；
 - 运行中 daemon 的日志读取使用有界游标 IPC，单响应日志内容预算为 8 KiB；daemon 已停止时仍可离线读取历史日志；
-- `stop` 和 `restart` 必须先由目标 daemon 通过 IPC 接受并协调优雅退出；IPC 不可用时不得回退到客户端直接进程控制；
+- `stop` 和 `restart` 正常路径必须先由目标 daemon 通过 IPC 接受并协调优雅退出；Unix 控制 socket 物理不可达时只允许经过 Workspace/PID/进程启动身份复核的 verified recovery，协议不兼容绝不触发该恢复；Windows 不绕过 Named Pipe；
 - `start` 在 daemon 不存在时仍是引导命令；若状态显示 daemon 已运行，则必须先通过 IPC `ping` 验证控制面。
 - daemon 状态同时保存 `tunnelServices=mcp|all`，MCP listener 与 tunnel ownership 可独立组合；公开 CLI `--tunnel` 仍保持“为所选服务启用隧道”的兼容语义；
 - tunnel 写操作采用 `accepted → pending/running → succeeded/failed` 的异步操作模型：初始响应完整写回后，daemon 才在自身 Tunnel Supervisor 内执行 start/stop/restart；FRP 重载继续使用原子 route replacement，失败时恢复旧线路和旧配置。
@@ -131,7 +131,7 @@ GUI 工作区控制迁移现状：
 - Gateway 已明确为独立全局控制域。GUI `get/set_mcp_gateway` 使用专用 Gateway control client；运行中配置由 daemon 事务应用，GUI 不创建共享 listener 或 Gateway tunnel；
 - 未知/外部 listener 继续按 PID/端口 ownership 冲突 fail closed；Gateway 配置写入不再通过当前管理进程内的旧 process-local supervisor 状态做兼容探测，唯一运行权威是 Gateway daemon/control 状态。
 
-尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及崩溃报告/升级编排的更高层自动化。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；本阶段已补 build identity、只读版本探测和 Workspace lifecycle-only 旧协议排空边界；Gateway 当前只有 v1，不保留不存在的旧版本 retry bridge。真实 Windows reboot 后自动恢复与安装包升级后的实机滚动切换仍属于发布验收项。
+尚未完成：除 OAuth Callback 策略外的更多字段级 hot reload、跨控制域统一日志视图/历史事件持久化、Linux/macOS 原生 service manager 集成，以及崩溃报告/升级编排的更高层自动化。Windows SCM install/uninstall/开机计划与 Workspace/Gateway daemon 已落地；历史阶段曾引入旧协议排空能力，当前实现已 hard-cut 该跨版本 bridge：Workspace v7 与 Gateway v1 均只接受各自当前精确协议。真实 Windows reboot 后自动恢复与安装包升级后的实机滚动切换仍属于发布验收项。
 
 ### 阶段 2：CLI 能力闭环
 
@@ -200,10 +200,10 @@ GUI 工作区控制迁移现状：
 ### 阶段 4：运行与升级治理
 
 - daemon 自恢复、崩溃报告和升级前排空；
-- CLI 已新增 `anchor upgrade` runtime rollout：先对全部目标执行 preflight，再使用现有跨版本 `prepare_restart` 排空旧 Workspace/Gateway daemon；新 generation 必须通过 PID/端口/control readiness 和 `BuildIdentity` 校验。Linux 会从 `/proc/<pid>/exe` 保存真实旧映像并在新构建失败时自动回滚；Windows SCM 管理的 runtime 保持 supervisor 单一权威，普通 CLI fail-closed 并要求先更新 Service；
+- CLI 已新增 `anchor upgrade` runtime rollout：先对全部目标执行 preflight，并只对通过当前精确 control protocol 验证的 Workspace/Gateway daemon 执行 `prepare_restart`；新 generation 必须通过 PID/端口/control readiness 和 `BuildIdentity` 校验。旧协议 daemon 不再由当前 CLI 跨版本排空，应先由匹配旧协议的 CLI 或 OS service manager 处理。Linux 会从 `/proc/<pid>/exe` 保存真实旧映像并在新构建失败时自动回滚；Windows SCM 管理的 runtime 保持 supervisor 单一权威，普通 CLI fail-closed 并要求先更新 Service；
 - 当前 rollout 明确是固定端口下的 bounded-outage replacement，不宣称 zero-downtime。真正无缝切换仍需 listener FD/handle handoff 或稳定前置代理层；
 - Workspace/Gateway daemon state 与 `version` 已发布 additive `buildIdentity`；CLI doctor 可比较当前客户端构建与活动 Workspace daemon；Gateway canonical status 也携带 build identity；
-- 协议兼容严格限制在只读 `version` 与稳定 lifecycle drain：Workspace 仅允许新客户端对 v2+ 旧 daemon 发送 `shutdown/prepare_restart`，Gateway 下限为 v1；其他写操作仍精确版本 fail-closed；
+- control protocol 已 hard-cut 为单线：Workspace v7 与 Gateway v1 的 `version`、生命周期和其他写请求都只接受当前精确版本，不再保留跨版本 retry branch；
 - Windows SCM 发布经过 PID/image 校验的 runtime build identity；`service status` 区分 current/different/unknown，显式 `service install` 更新已有 Service 时会等待旧 supervisor 停止后启动当前二进制；
 - Web Admin 的持久运行权由独立 Admin daemon 承担：使用单独 lock/PID/state/build identity，OS autostart 仅负责拉起 `admin daemon-run`。Linux systemd user 与 Windows Task Scheduler 均使用 bounded restart policy；Admin service 不进入 Workspace/Gateway supervisor，也不会在自身退出时清理业务 runtime；
 - 服务安装状态、日志轮转和资源限制；

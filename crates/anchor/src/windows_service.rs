@@ -753,52 +753,6 @@ fn process_is_config_owner(pid: u32) -> AppResult<bool> {
     Ok(process_user_sid(pid)?.eq_ignore_ascii_case(&trusted_service_owner_sid()?))
 }
 
-fn managed_frpc_image_candidates() -> AppResult<Vec<PathBuf>> {
-    let mut candidates = vec![platform().app_config_dir()?.join("bin").join("frpc.exe")];
-    if let Some(parent) = std::env::current_exe()?.parent() {
-        candidates.push(parent.join("frpc.exe"));
-    }
-    // Also include the exact candidates visible to the LocalSystem supervisor.
-    // Legacy service-owned daemons resolved frpc in this same account context,
-    // so PATH / Program Files candidates are required to reclaim those children.
-    candidates.extend(platform().frpc_candidates());
-    candidates.sort_by_key(|path| normalize_windows_path(&path.display().to_string()));
-    candidates.dedup_by(|left, right| {
-        normalize_windows_path(&left.display().to_string())
-            == normalize_windows_path(&right.display().to_string())
-    });
-    Ok(candidates)
-}
-
-fn cleanup_wrong_owner_managed_frpc_processes() -> AppResult<usize> {
-    let expected_sid = trusted_service_owner_sid()?;
-    let mut terminated = 0_usize;
-    for image in managed_frpc_image_candidates()? {
-        for pid in platform().process_ids_by_image_path(&image)? {
-            let actual_sid = process_user_sid(pid)?;
-            if actual_sid.eq_ignore_ascii_case(&expected_sid) {
-                continue;
-            }
-            append_service_log(&format!(
-                "[service] legacy frpc PID {pid} owner mismatch: expected={expected_sid}, actual={actual_sid}; terminating {}",
-                image.display()
-            ));
-            platform().terminate_process_tree(pid)?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            while platform().is_process_alive(pid) && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if platform().is_process_alive(pid) {
-                return Err(AppError::Message(format!(
-                    "legacy frpc PID {pid} owner 不匹配且无法终止"
-                )));
-            }
-            terminated = terminated.saturating_add(1);
-        }
-    }
-    Ok(terminated)
-}
-
 fn active_owner_token() -> AppResult<OwnedWindowsHandle> {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::RemoteDesktop::{
@@ -1798,15 +1752,6 @@ async fn run_service_supervisor() -> AppResult<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_default()
     ));
-    match cleanup_wrong_owner_managed_frpc_processes() {
-        Ok(count) if count > 0 => append_service_log(&format!(
-            "[service] removed {count} legacy managed frpc process(es) owned by a non-config account"
-        )),
-        Ok(_) => {}
-        Err(error) => append_service_log(&format!(
-            "[service] legacy frpc owner cleanup failed: {error}"
-        )),
-    }
     let mut managed_workspaces = HashSet::<String>::new();
     let mut gateway_managed = false;
     loop {

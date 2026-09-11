@@ -168,11 +168,11 @@ pub async fn request_daemon_exit_and_wait(
         Err(error) => {
             #[cfg(unix)]
             if error.is_unavailable() {
-                daemon::stop_verified_without_control(profile, &state, timeout, force)
+                daemon::recover_unreachable_daemon_stop(profile, &state, timeout, force)
                     .await
-                    .map_err(|fallback| {
+                    .map_err(|recovery| {
                         AppError::Message(format!(
-                            "daemon 未接受 {} 请求：{error}；Unix 本地恢复也失败：{fallback}",
+                            "daemon 未接受 {} 请求：{error}；Unix 已验证生命周期恢复也失败：{recovery}",
                             operation_label(operation)
                         ))
                     })?;

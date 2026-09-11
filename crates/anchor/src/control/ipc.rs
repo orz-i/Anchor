@@ -32,8 +32,8 @@ use super::protocol::{
     ControlAsyncOperation, ControlAsyncState, ControlConfigApplyResult, ControlEventBatch,
     ControlEventCursor, ControlLogChunk, ControlLogCursor, ControlLogSelection, ControlMethod,
     ControlOperation, ControlRequest, ControlResponse, ControlResult, ControlService,
-    ControlTunnelAction, CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1,
-    CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION, CONTROL_PROTOCOL_VERSION, MAX_CONTROL_FRAME_BYTES,
+    ControlTunnelAction, CONTROL_CAPABILITY_ZERO_DOWNTIME_HANDOFF_V1, CONTROL_PROTOCOL_VERSION,
+    MAX_CONTROL_FRAME_BYTES,
 };
 use super::{workspace_status, WorkspaceControlStatus};
 
@@ -121,21 +121,7 @@ pub(crate) fn finish_config_apply_operation(
 }
 
 pub async fn request_version(profile_id: &str) -> Result<ControlVersionInfo, ControlClientError> {
-    let result = match request(profile_id, ControlMethod::Version).await {
-        Ok(result) => result,
-        Err(ControlClientError::VersionMismatch {
-            daemon_protocol, ..
-        }) if daemon_protocol > 0 && daemon_protocol < CONTROL_PROTOCOL_VERSION => {
-            request_with_protocol_version(
-                profile_id,
-                ControlMethod::Version,
-                CONTROL_REQUEST_TIMEOUT,
-                daemon_protocol,
-            )
-            .await?
-        }
-        Err(error) => return Err(error),
-    };
+    let result = request(profile_id, ControlMethod::Version).await?;
     match result {
         ControlResult::Version {
             daemon_version,
@@ -158,7 +144,7 @@ pub async fn request_version(profile_id: &str) -> Result<ControlVersionInfo, Con
 pub struct ControlVersionInfo {
     pub daemon_version: String,
     pub protocol_version: u16,
-    pub build_identity: Option<BuildIdentity>,
+    pub build_identity: BuildIdentity,
     pub capabilities: Vec<String>,
 }
 
@@ -774,21 +760,7 @@ pub async fn request_daemon_exit(
             workspace_id: profile_id.to_string(),
         },
     };
-    let result = match request(profile_id, method.clone()).await {
-        Ok(result) => result,
-        Err(error) => {
-            let Some(protocol_version) = legacy_lifecycle_retry_protocol(&error) else {
-                return Err(error);
-            };
-            request_with_protocol_version(
-                profile_id,
-                method,
-                CONTROL_REQUEST_TIMEOUT,
-                protocol_version,
-            )
-            .await?
-        }
-    };
+    let result = request(profile_id, method).await?;
     match result {
         ControlResult::Accepted {
             operation: accepted,
@@ -923,16 +895,7 @@ async fn request_with_timeout(
     method: ControlMethod,
     timeout: Duration,
 ) -> Result<ControlResult, ControlClientError> {
-    request_with_protocol_version(profile_id, method, timeout, CONTROL_PROTOCOL_VERSION).await
-}
-
-async fn request_with_protocol_version(
-    profile_id: &str,
-    method: ControlMethod,
-    timeout: Duration,
-    protocol_version: u16,
-) -> Result<ControlResult, ControlClientError> {
-    let request = ControlRequest::with_protocol_version(method, protocol_version);
+    let request = ControlRequest::new(method);
     let request_id = request.request_id.clone();
     let response = tokio::time::timeout(
         timeout,
@@ -945,7 +908,7 @@ async fn request_with_protocol_version(
         ))
     })??;
 
-    if response.protocol_version != protocol_version {
+    if response.protocol_version != CONTROL_PROTOCOL_VERSION {
         return Err(ControlClientError::VersionMismatch {
             daemon_protocol: response.protocol_version,
             client_protocol: CONTROL_PROTOCOL_VERSION,
@@ -969,19 +932,6 @@ async fn request_with_protocol_version(
     response.result.ok_or_else(|| {
         ControlClientError::Protocol("daemon returned ok=true without a result".into())
     })
-}
-
-fn legacy_lifecycle_retry_protocol(error: &ControlClientError) -> Option<u16> {
-    let ControlClientError::VersionMismatch {
-        daemon_protocol,
-        client_protocol,
-    } = error
-    else {
-        return None;
-    };
-    (*daemon_protocol < *client_protocol
-        && *daemon_protocol >= CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION)
-        .then_some(*daemon_protocol)
 }
 
 #[cfg(unix)]
@@ -1416,7 +1366,7 @@ async fn handle_request_with_settings(
             ControlResult::Version {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: super::protocol::CONTROL_PROTOCOL_VERSION,
-                build_identity: Some(crate::build_identity::BuildIdentity::current()),
+                build_identity: crate::build_identity::BuildIdentity::current(),
                 capabilities: control_capabilities(),
             },
         )),
@@ -1789,30 +1739,6 @@ mod tests {
         assert!(should_log_connection_error(&AppError::Io(
             io::Error::from_raw_os_error(5)
         )));
-    }
-
-    #[test]
-    fn lifecycle_drain_only_retries_supported_older_protocols() {
-        let compatible = ControlClientError::VersionMismatch {
-            daemon_protocol: CONTROL_PROTOCOL_VERSION - 1,
-            client_protocol: CONTROL_PROTOCOL_VERSION,
-        };
-        assert_eq!(
-            legacy_lifecycle_retry_protocol(&compatible),
-            Some(CONTROL_PROTOCOL_VERSION - 1)
-        );
-
-        let too_old = ControlClientError::VersionMismatch {
-            daemon_protocol: CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION - 1,
-            client_protocol: CONTROL_PROTOCOL_VERSION,
-        };
-        assert_eq!(legacy_lifecycle_retry_protocol(&too_old), None);
-
-        let newer = ControlClientError::VersionMismatch {
-            daemon_protocol: CONTROL_PROTOCOL_VERSION + 1,
-            client_protocol: CONTROL_PROTOCOL_VERSION,
-        };
-        assert_eq!(legacy_lifecycle_retry_protocol(&newer), None);
     }
 
     #[tokio::test]

@@ -73,7 +73,7 @@ fn data_store_no_longer_runs_retirement_cleanup_on_every_access() {
 }
 
 #[test]
-fn persisted_configuration_has_explicit_content_schema_versions() {
+fn persisted_configuration_requires_current_content_schema_versions() {
     let model = source("src/data/model.rs");
     let storage = source("src/data/storage.rs");
     let migration = source("src/data/migration.rs");
@@ -81,10 +81,56 @@ fn persisted_configuration_has_explicit_content_schema_versions() {
     assert!(model.contains("pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 1;"));
     assert!(model.contains("pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;"));
     assert!(model.contains("pub schema_version: u32"));
-    assert!(storage.contains("migrate_unversioned_profiles"));
-    assert!(storage.contains("migrate_unversioned_secrets"));
+    assert!(!storage.contains("migrate_unversioned_profiles"));
+    assert!(!storage.contains("migrate_unversioned_secrets"));
     assert!(!storage.contains("migrate_legacy_profiles"));
+    assert!(!storage.contains("LEGACY_V0_ACTIONS_SECRET_KEYS"));
+    assert!(!storage.contains("LEGACY_V0_WORKSPACE_NOTIFICATION_SECRET_KEYS"));
+    assert!(storage.contains("无版本配置已停止支持"));
+    assert!(storage.contains("无版本凭据已停止支持"));
     assert!(migration.contains("const PORTABLE_CONFIG_VERSION: u32 = 2;"));
+}
+
+#[test]
+fn control_planes_have_no_cross_version_retry_bridge() {
+    let workspace_protocol = source("src/control/protocol.rs");
+    let workspace_ipc = source("src/control/ipc.rs");
+    let gateway_protocol = source("src/gateway_control/protocol.rs");
+    let gateway_ipc = source("src/gateway_control/ipc.rs");
+
+    assert!(!workspace_protocol.contains("CONTROL_LIFECYCLE_PROTOCOL_MIN_VERSION"));
+    assert!(!workspace_protocol.contains("with_protocol_version"));
+    assert!(!workspace_ipc.contains("legacy_lifecycle_retry_protocol"));
+    assert!(!workspace_ipc.contains("request_with_protocol_version"));
+    assert!(!gateway_protocol.contains("with_protocol_version"));
+    assert!(!gateway_ipc.contains("request_with_protocol_version"));
+    assert!(
+        workspace_ipc.contains("let result = request(profile_id, ControlMethod::Version).await?;")
+    );
+    assert!(gateway_ipc.contains("let result = request(GatewayMethod::Version).await?;"));
+}
+
+#[test]
+fn unix_control_unavailable_stop_is_a_verified_recovery_not_a_protocol_bridge() {
+    let lifecycle = source("src/control/lifecycle.rs");
+    let daemon = source("src/daemon.rs");
+
+    assert!(lifecycle.contains("if error.is_unavailable()"));
+    assert!(lifecycle.contains("recover_unreachable_daemon_stop"));
+    assert!(daemon.contains("pub(crate) async fn recover_unreachable_daemon_stop("));
+    assert!(daemon.contains("process_matches_daemon_state(state, &profile.id)"));
+    assert!(!daemon.contains("stop_verified_without_control"));
+}
+
+#[test]
+fn windows_service_has_no_pre_owner_token_frpc_cleanup_lane() {
+    let service = source("src/windows_service.rs");
+    let platform = source("src/platform/mod.rs");
+
+    assert!(!service.contains("cleanup_wrong_owner_managed_frpc_processes"));
+    assert!(!service.contains("managed_frpc_image_candidates"));
+    assert!(!service.contains("legacy managed frpc"));
+    assert!(!platform.contains("fn process_ids_by_image_path(&self"));
 }
 
 #[test]
