@@ -2065,9 +2065,12 @@ mod tests {
             false,
         )
         .expect("managed worktree");
+        ctx.task_harness
+            .start_task_with_id("stage checkpoint scope", task_id.clone())
+            .expect("task identity");
         let task = ctx
             .coding_harness
-            .start_task_in_git_worktree("stage checkpoint scope", task_id.clone(), worktree)
+            .attach_git_worktree(&task_id, worktree)
             .expect("worktree task");
         let scoped = ctx
             .scoped_for_task(&task, None)
@@ -2169,9 +2172,12 @@ mod tests {
             false,
         )
         .expect("managed worktree");
+        ctx.task_harness
+            .start_task_with_id("stage checkpoint recovery", task_id.clone())
+            .expect("task identity");
         let task = ctx
             .coding_harness
-            .start_task_in_git_worktree("stage checkpoint recovery", task_id.clone(), worktree)
+            .attach_git_worktree(&task_id, worktree)
             .expect("worktree task");
         let scoped = ctx
             .scoped_for_task(&task, None)

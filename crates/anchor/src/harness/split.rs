@@ -52,6 +52,18 @@ impl TaskHarness {
         self.core.start_task(objective)
     }
 
+    pub(crate) fn allocate_task_id(&self) -> String {
+        self.core.allocate_task_id()
+    }
+
+    pub(crate) fn start_task_with_id(
+        &self,
+        objective: &str,
+        task_id: String,
+    ) -> HarnessResult<TaskSession> {
+        self.core.start_task_with_id(objective, task_id)
+    }
+
     pub fn task(&self, task_id: &str) -> HarnessResult<TaskSession> {
         self.core.task(task_id)
     }
@@ -251,19 +263,6 @@ impl CodingHarness {
 
     pub fn task(&self, task_id: &str) -> HarnessResult<TaskSession> {
         self.core.task(task_id)
-    }
-
-    /// Create a task whose coding execution root is an Anchor-managed Git
-    /// worktree. Task identity remains shared with Task Harness, while
-    /// worktree ownership and baseline initialization stay here.
-    pub fn start_task_in_git_worktree(
-        &self,
-        objective: &str,
-        task_id: String,
-        worktree: TaskGitWorktree,
-    ) -> HarnessResult<TaskSession> {
-        self.core
-            .start_task_in_git_worktree(objective, task_id, worktree)
     }
 
     pub fn attach_git_worktree(
@@ -492,6 +491,10 @@ impl CodingHarness {
         self.core.list_events(task_id, offset, limit)
     }
 
+    pub fn recent_events(&self, task_id: &str, limit: usize) -> HarnessResult<Vec<HarnessEvent>> {
+        self.core.recent_events(task_id, limit)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_operation(
         &self,
@@ -520,6 +523,14 @@ impl CodingHarness {
         limit: usize,
     ) -> HarnessResult<Vec<OperationRecord>> {
         self.core.list_operations(offset, limit)
+    }
+
+    pub fn recent_operations_for_task(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> HarnessResult<Vec<OperationRecord>> {
+        self.core.recent_operations_for_task(task_id, limit)
     }
 
     pub fn all_operations(&self, limit: usize) -> HarnessResult<Vec<OperationRecord>> {

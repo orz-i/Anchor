@@ -109,10 +109,26 @@ fn authority_apis_do_not_cross_task_and_coding_domains() {
         "complete_slice",
         "bind_session",
         "reclaim_session",
+        "allocate_task_id",
+        "start_task_with_id",
+        "start_task_in_git_worktree",
     ] {
         assert!(
             !coding_api.contains(forbidden),
             "task API {forbidden} leaked into CodingHarness"
         );
     }
+}
+
+#[test]
+fn worktree_task_start_uses_task_authority_then_coding_attachment() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tools = fs::read_to_string(root.join("src/harness/tools.rs")).expect("harness tools");
+    let state = fs::read_to_string(root.join("src/harness/state.rs")).expect("harness state");
+
+    assert!(tools.contains("ctx.task_harness.allocate_task_id()"));
+    assert!(tools.contains(".start_task_with_id(objective, task_id.clone())"));
+    assert!(tools.contains(".attach_git_worktree(&started.id, worktree.clone())"));
+    assert!(!tools.contains("coding_harness.start_task_in_git_worktree"));
+    assert!(!state.contains("pub fn start_task_in_git_worktree("));
 }

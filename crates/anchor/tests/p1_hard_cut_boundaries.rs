@@ -34,6 +34,22 @@ fn task_observation_layer_has_one_canonical_module() {
 }
 
 #[test]
+fn task_observation_uses_bounded_recent_harness_reads() {
+    let tasks = source("src/tasks.rs");
+    let split = source("src/harness/split.rs");
+    let store = source("src/harness/store.rs");
+
+    assert!(tasks.contains(".recent_events(&task_id, MAX_RECENT_EVENTS)?"));
+    assert!(tasks.contains(".recent_operations_for_task(&task_id, MAX_RECENT_OPERATIONS)?"));
+    assert!(!tasks.contains("list_events(&task_id, 0, usize::MAX)"));
+    assert!(!tasks.contains("list_operations(0, usize::MAX)"));
+    assert!(split.contains("pub fn recent_events("));
+    assert!(split.contains("pub fn recent_operations_for_task("));
+    assert!(store.contains("fn read_recent_journal<T, F>("));
+    assert!(store.contains("journal_segments(dir)?.into_iter().rev()"));
+}
+
+#[test]
 fn retired_command_arguments_are_rejected_at_the_public_schema() {
     let fx = tiny_js_fixture();
     let ctx = ctx_for(&fx.root);

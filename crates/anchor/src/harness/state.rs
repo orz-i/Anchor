@@ -643,33 +643,23 @@ impl HarnessKernel {
         self.store.root()
     }
 
+    pub fn allocate_task_id(&self) -> String {
+        Uuid::new_v4().simple().to_string()
+    }
+
     pub fn start_task(&self, objective: &str) -> HarnessResult<TaskSession> {
-        self.start_task_configured(objective, Uuid::new_v4().simple().to_string(), None)
+        self.start_task_with_id(objective, self.allocate_task_id())
     }
 
-    pub fn start_task_in_git_worktree(
+    pub fn start_task_with_id(
         &self,
         objective: &str,
         task_id: String,
-        worktree: TaskGitWorktree,
-    ) -> HarnessResult<TaskSession> {
-        self.start_task_configured(objective, task_id, Some(worktree))
-    }
-
-    fn start_task_configured(
-        &self,
-        objective: &str,
-        task_id: String,
-        git_worktree: Option<TaskGitWorktree>,
     ) -> HarnessResult<TaskSession> {
         if objective.trim().is_empty() {
             return Err(HarnessError::new("INVALID_ARGUMENT", "任务目标不能为空"));
         }
-        let baseline_root = git_worktree
-            .as_ref()
-            .map(|worktree| PathBuf::from(&worktree.path))
-            .unwrap_or_else(|| self.workspace_root.clone());
-        let captured = capture_baseline_snapshot(&baseline_root);
+        let captured = capture_baseline_snapshot(&self.workspace_root);
         self.store
             .with_workspace_transaction(&self.workspace_id, |transaction| {
                 let previous_writer_task_id = self
@@ -699,7 +689,7 @@ impl HarnessKernel {
                     latest_verification_id: None,
                     session_id: None,
                     session_path: None,
-                    git_worktree: git_worktree.clone(),
+                    git_worktree: None,
                     created_at: now.clone(),
                     updated_at: now.clone(),
                     last_activity_at: Some(now),
@@ -719,15 +709,12 @@ impl HarnessKernel {
                     json!({
                         "single_writer": true,
                         "previous_writer_task_id": previous_writer_task_id,
-                        "active_tasks_preserved": true,
-                        "workspace_mode": if task.git_worktree.is_some() { "worktree" } else { "shared" },
-                        "worktree": task.git_worktree
+                        "active_tasks_preserved": true
                     }),
                     json!({
                         "ok": true,
                         "single_writer": true,
-                        "active_tasks_preserved": true,
-                        "workspace_mode": if task.git_worktree.is_some() { "worktree" } else { "shared" }
+                        "active_tasks_preserved": true
                     }),
                 ))?;
                 Ok(task)
@@ -2042,6 +2029,10 @@ impl HarnessKernel {
             .list_events(&self.workspace_id, task_id, offset, limit)
     }
 
+    pub fn recent_events(&self, task_id: &str, limit: usize) -> HarnessResult<Vec<HarnessEvent>> {
+        self.store.recent_events(&self.workspace_id, task_id, limit)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_operation(
         &self,
@@ -2113,6 +2104,15 @@ impl HarnessKernel {
     ) -> HarnessResult<Vec<OperationRecord>> {
         self.store
             .list_operations(&self.workspace_id, offset, limit)
+    }
+
+    pub fn recent_operations_for_task(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> HarnessResult<Vec<OperationRecord>> {
+        self.store
+            .recent_operations_for_task(&self.workspace_id, task_id, limit)
     }
 
     pub fn load_stage_commit_receipt(

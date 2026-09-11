@@ -459,6 +459,32 @@ impl HarnessStore {
         )
     }
 
+    pub fn recent_operations_for_task(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        limit: usize,
+    ) -> HarnessResult<Vec<OperationRecord>> {
+        read_recent_journal(
+            &self.operation_journal_dir(workspace_id),
+            limit,
+            |operation: &OperationRecord| operation.task_id.as_deref() == Some(task_id),
+        )
+    }
+
+    pub fn recent_events(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        limit: usize,
+    ) -> HarnessResult<Vec<HarnessEvent>> {
+        read_recent_journal(
+            &self.event_journal_dir(workspace_id, task_id),
+            limit,
+            |_| true,
+        )
+    }
+
     pub fn append_operation(
         &self,
         workspace_id: &str,
@@ -794,6 +820,51 @@ fn read_journal<T: DeserializeOwned>(dir: &Path) -> HarnessResult<JournalRead<T>
     Ok(JournalRead { records, health })
 }
 
+/// Read only as far back through the retained journal as needed to collect the
+/// requested newest records. Results are newest-first. This is intentionally
+/// separate from `read_journal`, which validates and materializes the complete
+/// retained journal for health checks and forward cursor APIs.
+fn read_recent_journal<T, F>(dir: &Path, limit: usize, mut include: F) -> HarnessResult<Vec<T>>
+where
+    T: DeserializeOwned,
+    F: FnMut(&T) -> bool,
+{
+    let target = limit.max(1);
+    let mut records = Vec::with_capacity(target.min(256));
+    let mut newer_sequence = None;
+
+    for (_, path) in journal_segments(dir)?.into_iter().rev() {
+        let content = fs::read_to_string(path).map_err(io_error)?;
+        for line in content.lines().rev() {
+            let envelope: JournalEnvelope<serde_json::Value> = match serde_json::from_str(line) {
+                Ok(envelope) => envelope,
+                Err(_) => continue,
+            };
+            if envelope.schema_version != SCHEMA_VERSION {
+                continue;
+            }
+            if journal_checksum(envelope.sequence, &envelope.record)? != envelope.checksum {
+                continue;
+            }
+            if newer_sequence.is_some_and(|sequence| envelope.sequence >= sequence) {
+                continue;
+            }
+            newer_sequence = Some(envelope.sequence);
+            let Ok(record) = serde_json::from_value::<T>(envelope.record) else {
+                continue;
+            };
+            if include(&record) {
+                records.push(record);
+                if records.len() >= target {
+                    return Ok(records);
+                }
+            }
+        }
+    }
+
+    Ok(records)
+}
+
 fn last_valid_sequence(dir: &Path) -> HarnessResult<u64> {
     let mut last = 0;
     for (_, path) in journal_segments(dir)? {
@@ -1077,6 +1148,37 @@ mod tests {
         let read = read_journal::<serde_json::Value>(&journal).expect("read");
         assert_eq!(read.health.segment_count, 3);
         assert!(read.health.valid_records <= 3);
+    }
+
+    #[test]
+    fn recent_journal_reads_newest_matching_records_without_materializing_older_segments() {
+        let root = tempdir().expect("root");
+        let journal = root.path().join("journal");
+        append_journal(&journal, &json!({"task": "old", "value": 1}), 1, 4).expect("append old");
+        append_journal(&journal, &json!({"task": "keep", "value": 2}), 1, 4)
+            .expect("append keep 2");
+        append_journal(&journal, &json!({"task": "skip", "value": 3}), 1, 4).expect("append skip");
+        append_journal(&journal, &json!({"task": "keep", "value": 4}), 1, 4)
+            .expect("append keep 4");
+
+        // If bounded newest-first reading regresses into a full scan, this
+        // unreadable oldest retained segment would make the call fail.
+        let oldest = segment_path(&journal, 1);
+        fs::remove_file(&oldest).expect("remove oldest file");
+        fs::create_dir(&oldest).expect("replace oldest segment with unreadable directory");
+
+        let recent = read_recent_journal::<serde_json::Value, _>(&journal, 2, |record| {
+            record.get("task").and_then(serde_json::Value::as_str) == Some("keep")
+        })
+        .expect("bounded recent read");
+
+        assert_eq!(
+            recent
+                .iter()
+                .filter_map(|record| record.get("value").and_then(serde_json::Value::as_i64))
+                .collect::<Vec<_>>(),
+            vec![4, 2]
+        );
     }
 
     #[test]

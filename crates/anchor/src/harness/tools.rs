@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 use crate::tools::{CancellationToken, ToolContext};
@@ -2329,7 +2328,7 @@ fn start_task_for_workspace_mode(
             ctx.task_harness.start_task(objective).map_err(map_error)
         }
         "worktree" => {
-            let task_id = Uuid::new_v4().simple().to_string();
+            let task_id = ctx.task_harness.allocate_task_id();
             let existing_path = args
                 .get("worktree_path")
                 .and_then(Value::as_str)
@@ -2375,18 +2374,53 @@ fn start_task_for_workspace_mode(
                 }
                 return Err(error);
             }
-            match ctx.coding_harness.start_task_in_git_worktree(
-                objective,
-                task_id,
-                worktree.clone(),
-            ) {
-                Ok(task) => Ok(task),
+            let started = match ctx
+                .task_harness
+                .start_task_with_id(objective, task_id.clone())
+            {
+                Ok(task) => task,
                 Err(error) => {
                     if created_now {
                         let _ = crate::tools::git::remove_managed_task_worktree(
                             &ctx.workspace,
                             &worktree,
                         );
+                    }
+                    return Err(map_error(error));
+                }
+            };
+            match ctx
+                .coding_harness
+                .attach_git_worktree(&started.id, worktree.clone())
+            {
+                Ok(task) => Ok(task),
+                Err(error) => {
+                    let task_rollback = ctx.task_harness.abort_task(
+                        &started.id,
+                        "worktree attachment failed during task start",
+                        HarnessSessionStatus::Active,
+                    );
+                    let worktree_rollback = if created_now {
+                        crate::tools::git::remove_managed_task_worktree(&ctx.workspace, &worktree)
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(rollback_error) = task_rollback {
+                        return Err(tool_error(
+                            "TASK_START_ROLLBACK_FAILED",
+                            format!(
+                                "worktree attachment failed: {error}; task rollback also failed: {rollback_error}"
+                            ),
+                        ));
+                    }
+                    if let Err(rollback_error) = worktree_rollback {
+                        return Err(tool_error(
+                            "TASK_START_ROLLBACK_FAILED",
+                            format!(
+                                "worktree attachment failed: {error}; managed worktree rollback also failed: {rollback_error}"
+                            ),
+                        ));
                     }
                     Err(map_error(error))
                 }

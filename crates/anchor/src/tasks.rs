@@ -171,11 +171,9 @@ fn task_snapshot(
 ) -> HarnessResult<TaskSnapshot> {
     let task_id = task.id.clone();
 
-    let mut events = harness.list_events(&task_id, 0, usize::MAX)?;
-    events.reverse();
-    let recent_events = events
+    let recent_events = harness
+        .recent_events(&task_id, MAX_RECENT_EVENTS)?
         .into_iter()
-        .take(MAX_RECENT_EVENTS)
         .map(|event| TaskEventView {
             id: event.id,
             kind: event.kind,
@@ -189,12 +187,9 @@ fn task_snapshot(
         })
         .collect();
 
-    let mut operations = harness.list_operations(0, usize::MAX)?;
-    operations.reverse();
-    let recent_operations = operations
+    let recent_operations = harness
+        .recent_operations_for_task(&task_id, MAX_RECENT_OPERATIONS)?
         .into_iter()
-        .filter(|operation| operation.task_id.as_deref() == Some(task_id.as_str()))
-        .take(MAX_RECENT_OPERATIONS)
         .map(|operation| {
             let ok = operation
                 .result_summary
@@ -393,9 +388,11 @@ pub fn harness_error_message(error: HarnessError) -> String {
 mod tests {
     use std::time::Duration;
 
+    use serde_json::json;
+
     use super::{
-        effective_verifications, safe_task_id, task_list, task_status, timestamp_sort_key,
-        verification_disposition,
+        effective_verifications, safe_task_id, task_list, task_snapshot, task_status,
+        timestamp_sort_key, verification_disposition, MAX_RECENT_EVENTS, MAX_RECENT_OPERATIONS,
     };
     use crate::harness::model::{TaskStatus, VerificationDispositionRecord, VerificationRecord};
 
@@ -505,5 +502,70 @@ mod tests {
         assert_eq!(list.tasks[2].id, history.id);
         assert!(!list.tasks[2].current);
         assert!(!list.tasks[2].active);
+    }
+
+    #[test]
+    fn task_snapshot_uses_newest_bounded_task_scoped_journal_records() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = tempfile::tempdir().expect("harness root");
+        let (tasks, coding) = crate::harness::split_harness(
+            workspace.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = tasks.start_task("bounded task snapshot").expect("task");
+
+        for index in 0..30 {
+            coding
+                .record_event(
+                    &task.id,
+                    &format!("event-{index}"),
+                    Some("read_file"),
+                    json!({}),
+                    json!({"ok": true}),
+                )
+                .expect("event");
+            coding
+                .record_operation(
+                    None,
+                    Some(&task.id),
+                    None,
+                    "read_file",
+                    &format!("operation-{index}"),
+                    json!({}),
+                    json!({"ok": true}),
+                )
+                .expect("task operation");
+            coding
+                .record_operation(
+                    None,
+                    None,
+                    None,
+                    "environment",
+                    "workspace-noise",
+                    json!({}),
+                    json!({"ok": true}),
+                )
+                .expect("workspace operation");
+        }
+
+        let snapshot = task_snapshot(&coding, task, true).expect("snapshot");
+
+        assert_eq!(snapshot.recent_events.len(), MAX_RECENT_EVENTS);
+        assert_eq!(snapshot.recent_events[0].kind, "event-29");
+        assert_eq!(
+            snapshot.recent_events[MAX_RECENT_EVENTS - 1].kind,
+            "event-6"
+        );
+        assert_eq!(snapshot.recent_operations.len(), MAX_RECENT_OPERATIONS);
+        assert_eq!(snapshot.recent_operations[0].kind, "operation-29");
+        assert_eq!(
+            snapshot.recent_operations[MAX_RECENT_OPERATIONS - 1].kind,
+            "operation-6"
+        );
+        assert!(snapshot
+            .recent_operations
+            .iter()
+            .all(|operation| operation.tool == "read_file"));
     }
 }
