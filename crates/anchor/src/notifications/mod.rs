@@ -274,11 +274,11 @@ pub(crate) fn reset_ilink_cursor() -> Result<(), String> {
 
 fn completion_message(task: &TaskSession, verified: bool) -> String {
     let branch = task.baseline.branch.as_deref().unwrap_or("unknown");
-    let verification = if verified { "passed" } else { "unverified" };
+    let verification = if verified { "已通过" } else { "未验证" };
     let objective = bounded(&task.objective, 1_200);
     bounded(
         &format!(
-            "Anchor · Harness task completed\n\n任务：{}\n状态：completed\n验证：{}\n分支：{}\nTask：{}",
+            "## Anchor · Harness 任务已完成\n\n### 任务\n\n{}\n\n### 结果\n\n- **状态**：已完成\n- **验证**：{}\n- **分支**：`{}`\n- **Task**：`{}`",
             objective, verification, branch, task.id
         ),
         MAX_MESSAGE_CHARS,
@@ -514,9 +514,12 @@ mod tests {
         };
         let message = completion_message(&task, true);
         assert!(message.chars().count() <= MAX_MESSAGE_CHARS);
-        assert!(message.contains("验证：passed"));
-        assert!(message.contains("分支：main"));
-        assert!(message.contains("Task：task-1"));
+        assert!(message.starts_with("## Anchor · Harness 任务已完成\n\n### 任务\n\n"));
+        assert!(message.contains("\n\n### 结果\n\n"));
+        assert!(message.contains("- **状态**：已完成"));
+        assert!(message.contains("- **验证**：已通过"));
+        assert!(message.contains("- **分支**：`main`"));
+        assert!(message.contains("- **Task**：`task-1`"));
     }
 
     #[test]

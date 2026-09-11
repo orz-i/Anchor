@@ -495,6 +495,13 @@ mod tests {
     }
 
     #[test]
+    fn preserves_markdown_in_text_message_payload() {
+        let markdown = "## 完成\n\n- **状态**：`passed`";
+        let body = text_message_body("user", "context", markdown);
+        assert_eq!(body["msg"]["item_list"][0]["text_item"]["text"], markdown);
+    }
+
+    #[test]
     fn encodes_channel_version_like_ilink_client() {
         assert_eq!(encoded_client_version("2.4.6"), 132_102);
     }
