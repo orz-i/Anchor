@@ -126,7 +126,7 @@ fn delete_profile(options: FrpDeleteOptions) -> AppResult<(String, String)> {
     Ok((profile.id, profile.name))
 }
 
-fn read_token_input(input: Option<FrpTokenInput>) -> AppResult<Option<String>> {
+pub(super) fn read_token_input(input: Option<FrpTokenInput>) -> AppResult<Option<String>> {
     let Some(input) = input else {
         return Ok(None);
     };

@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::settings::{DownloadConfig, FrpProfile, McpGatewayConfig, ProxyConfig};
+use crate::tunnel::{TunnelConfig, TunnelProfile};
 use crate::workspace::WorkspaceProfile;
 
-pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 2;
 pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;
 
 /// In-memory application state. Disk serialization is intentionally handled by
@@ -14,6 +15,7 @@ pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Default)]
 pub struct AppData {
     pub frp_profiles: Vec<FrpProfile>,
+    pub tunnels: Vec<TunnelProfile>,
     pub last_workspace_id: String,
     pub download: DownloadConfig,
     pub proxy: ProxyConfig,
@@ -41,6 +43,7 @@ impl Default for SecretsData {
 pub(crate) struct ProfilesData {
     pub schema_version: u32,
     pub frp_profiles: Vec<FrpProfile>,
+    pub tunnels: Vec<TunnelProfile>,
     pub last_workspace_id: String,
     pub download: DownloadConfig,
     pub proxy: ProxyConfig,
@@ -53,6 +56,7 @@ impl ProfilesData {
         Self {
             schema_version: PROFILES_SCHEMA_VERSION,
             frp_profiles: data.frp_profiles.clone(),
+            tunnels: data.tunnels.clone(),
             last_workspace_id: data.last_workspace_id.clone(),
             download: data.download.clone(),
             proxy: data.proxy.clone(),
@@ -62,15 +66,40 @@ impl ProfilesData {
     }
 
     pub fn into_app_data(self) -> AppData {
-        AppData {
+        let mut data = AppData {
             frp_profiles: self.frp_profiles,
+            tunnels: self.tunnels,
             last_workspace_id: self.last_workspace_id,
             download: self.download,
             proxy: self.proxy,
             mcp_gateway: self.mcp_gateway,
             profiles: self.profiles,
             ..AppData::default()
+        };
+        data.hydrate_workspace_tunnels();
+        data
+    }
+}
+
+impl AppData {
+    pub(crate) fn hydrate_workspace_tunnels(&mut self) {
+        for workspace in &mut self.profiles {
+            let tunnel = self.tunnels.iter().find(|tunnel| {
+                tunnel.workspace_id == workspace.id && tunnel.service.eq_ignore_ascii_case("mcp")
+            });
+            workspace.tunnel = tunnel
+                .map(|tunnel| tunnel.config.clone())
+                .unwrap_or_else(TunnelConfig::disabled);
+            workspace.tunnel_id = tunnel.map(|tunnel| tunnel.id.clone()).unwrap_or_default();
+            workspace.tunnel_enabled = tunnel.is_some_and(|tunnel| tunnel.enabled);
+            workspace.tunnel_revision = tunnel.map_or(0, |tunnel| tunnel.revision);
         }
+    }
+
+    pub(crate) fn tunnel_for_workspace(&self, workspace_id: &str) -> Option<&TunnelProfile> {
+        self.tunnels.iter().find(|tunnel| {
+            tunnel.workspace_id == workspace_id && tunnel.service.eq_ignore_ascii_case("mcp")
+        })
     }
 }
 
@@ -126,6 +155,7 @@ mod tests {
         let error = serde_json::from_value::<ProfilesData>(serde_json::json!({
             "schema_version": PROFILES_SCHEMA_VERSION,
             "frp_profiles": [],
+            "tunnels": [],
             "last_workspace_id": "",
             "download": {
                 "githubMirror": "https://gh-proxy.com",
@@ -136,10 +166,10 @@ mod tests {
             "mcp_gateway": {
                 "enabled": false,
                 "localPort": 28765,
-                "ownerWorkspaceId": "",
+                "tunnelId": "",
                 "publicUrl": "",
                 "observedPublicUrl": "",
-                "observedOwnerWorkspaceId": "",
+                "observedTunnelId": "",
                 "observedTunnelSignature": ""
             },
             "shared_secrets": {"token": "ignored"},

@@ -199,8 +199,8 @@ pub async fn reconcile_mcp_gateway(
     crate::mcp::gateway::validate_config(config, profiles)?;
     let owner = profiles
         .iter()
-        .find(|profile| profile.id == config.owner_workspace_id)
-        .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
+        .find(|profile| profile.tunnel_id == config.tunnel_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 引用的 Tunnel 不存在。".into()))?;
     let mut gateway_profile = owner.clone();
     gateway_profile.runtime.local_port = config.local_port;
     if !config.public_url.trim().is_empty() {
@@ -373,7 +373,7 @@ mod tests {
         let config = McpGatewayConfig {
             enabled: true,
             local_port: 28765,
-            owner_workspace_id: profile.id.clone(),
+            tunnel_id: profile.id.clone(),
             public_url: "https://old.trycloudflare.com".into(),
             ..McpGatewayConfig::default()
         };
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    owner_workspace_id: first.id.clone(),
+                    tunnel_id: first.id.clone(),
                     ..McpGatewayConfig::default()
                 },
                 &first
@@ -404,7 +404,7 @@ mod tests {
             .unwrap(),
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    owner_workspace_id: second.id.clone(),
+                    tunnel_id: second.id.clone(),
                     ..McpGatewayConfig::default()
                 },
                 &second
@@ -415,7 +415,7 @@ mod tests {
         assert_ne!(
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    owner_workspace_id: first.id.clone(),
+                    tunnel_id: first.id.clone(),
                     ..McpGatewayConfig::default()
                 },
                 &first
@@ -423,7 +423,7 @@ mod tests {
             .unwrap(),
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    owner_workspace_id: second.id.clone(),
+                    tunnel_id: second.id.clone(),
                     ..McpGatewayConfig::default()
                 },
                 &second

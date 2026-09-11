@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 use crate::platform::platform;
+use crate::tunnel::{TunnelConfig, TunnelProfile};
 
 use super::model::{
     AppData, ProfilesData, SecretsData, PROFILES_SCHEMA_VERSION, SECRETS_SCHEMA_VERSION,
@@ -203,6 +204,91 @@ mod tests {
 
         let error = load_profiles_with_backup(&path).expect_err("future schema must fail");
         assert!(error.to_string().contains("不支持的配置 schema_version"));
+    }
+
+    #[test]
+    fn profiles_v1_migrate_workspace_tunnel_and_gateway_owner_to_top_level_tunnel() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("profiles.json");
+        let mut data = AppData::default();
+        let mut workspace = crate::workspace::WorkspaceProfile::new(
+            "C:/workspace/demo".into(),
+            Some("demo".into()),
+        );
+        workspace.id = "workspace-demo".into();
+        data.profiles.push(workspace);
+        let mut value =
+            serde_json::to_value(ProfilesData::from_app_data(&data)).expect("profiles json");
+        value["schema_version"] = serde_json::Value::from(1);
+        value.as_object_mut().expect("root").remove("tunnels");
+        value["profiles"][0]["tunnel"] =
+            serde_json::to_value(TunnelConfig::default()).expect("legacy tunnel");
+        let gateway = value["mcp_gateway"].as_object_mut().expect("gateway");
+        gateway.remove("tunnelId");
+        gateway.remove("observedTunnelId");
+        gateway.insert(
+            "ownerWorkspaceId".into(),
+            serde_json::Value::String("workspace-demo".into()),
+        );
+        gateway.insert(
+            "observedOwnerWorkspaceId".into(),
+            serde_json::Value::String("workspace-demo".into()),
+        );
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value).expect("json")),
+        )
+        .expect("legacy profiles");
+
+        let migrated = load_profiles_with_backup(&path).expect("migrate v1");
+        assert_eq!(migrated.schema_version, PROFILES_SCHEMA_VERSION);
+        assert_eq!(migrated.tunnels.len(), 1);
+        assert_eq!(migrated.tunnels[0].id, "workspace-demo-mcp");
+        assert_eq!(migrated.tunnels[0].workspace_id, "workspace-demo");
+        assert!(migrated.tunnels[0].enabled);
+        assert_eq!(migrated.mcp_gateway.tunnel_id, "workspace-demo-mcp");
+        assert_eq!(
+            migrated.mcp_gateway.observed_tunnel_id,
+            "workspace-demo-mcp"
+        );
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("rewritten profiles"))
+                .expect("rewritten json");
+        assert_eq!(rewritten["schema_version"], PROFILES_SCHEMA_VERSION);
+        assert!(rewritten["profiles"][0].get("tunnel").is_none());
+        assert_eq!(rewritten["tunnels"][0]["workspace_id"], "workspace-demo");
+        assert_eq!(rewritten["mcp_gateway"]["tunnelId"], "workspace-demo-mcp");
+        assert!(rewritten["mcp_gateway"].get("ownerWorkspaceId").is_none());
+    }
+
+    #[test]
+    fn legacy_workspace_tunnel_tokens_move_to_tunnel_scopes() {
+        let mut data = AppData::default();
+        data.tunnels.push(TunnelProfile::migrated(
+            "workspace-demo".into(),
+            "demo",
+            TunnelConfig::default(),
+        ));
+        data.workspace_secrets
+            .entry("workspace-demo".into())
+            .or_default()
+            .insert("frp_token".into(), "frp-secret".into());
+        data.workspace_secrets
+            .entry("workspace-demo".into())
+            .or_default()
+            .insert("cloudflare_token".into(), "cf-secret".into());
+
+        assert!(migrate_legacy_tunnel_secrets(&mut data));
+        assert!(data.workspace_secrets.get("workspace-demo").is_none());
+        assert_eq!(
+            data.app_secrets["tunnel_frp_token"]["workspace-demo-mcp"],
+            "frp-secret"
+        );
+        assert_eq!(
+            data.app_secrets["tunnel_cloudflare_token"]["workspace-demo-mcp"],
+            "cf-secret"
+        );
     }
 
     #[test]
@@ -409,7 +495,42 @@ pub(crate) fn load_profiles_only() -> AppResult<AppData> {
 fn load_with_secret_access(access: SecretAccess) -> AppResult<AppData> {
     let mut data = load_profiles_only()?;
     load_secrets(&mut data, access)?;
+    if migrate_legacy_tunnel_secrets(&mut data) {
+        let secrets_path = secrets_file_path()?;
+        let secrets = SecretsData::from_app_data(&data);
+        match access {
+            SecretAccess::User => write_secrets_data(&secrets_path, &secrets)?,
+            #[cfg(windows)]
+            SecretAccess::Service => write_service_secrets_data(&secrets_path, &secrets)?,
+        }
+    }
     Ok(data)
+}
+
+fn migrate_legacy_tunnel_secrets(data: &mut AppData) -> bool {
+    let mut changed = false;
+    for tunnel in &data.tunnels {
+        let Some(workspace_secrets) = data.workspace_secrets.get_mut(&tunnel.workspace_id) else {
+            continue;
+        };
+        for (legacy_key, scope) in [
+            ("frp_token", "tunnel_frp_token"),
+            ("cloudflare_token", "tunnel_cloudflare_token"),
+        ] {
+            let Some(value) = workspace_secrets.remove(legacy_key) else {
+                continue;
+            };
+            data.app_secrets
+                .entry(scope.to_string())
+                .or_default()
+                .entry(tunnel.id.clone())
+                .or_insert(value);
+            changed = true;
+        }
+    }
+    data.workspace_secrets
+        .retain(|_, secrets| !secrets.is_empty());
+    changed
 }
 
 pub fn save(data: &AppData) -> AppResult<()> {
@@ -674,14 +795,19 @@ where
 }
 
 fn load_profiles_with_backup(path: &Path) -> AppResult<ProfilesData> {
-    match read_profiles_json(path) {
-        Ok(data) => Ok(data),
+    match read_profiles_json_versioned(path) {
+        Ok((data, migrated)) => {
+            if migrated {
+                write_json(path, &data)?;
+            }
+            Ok(data)
+        }
         Err(primary_error) => {
             let backup = backup_path(path);
             if !backup.exists() {
                 return Err(primary_error);
             }
-            let recovered = read_profiles_json(&backup).map_err(|backup_error| {
+            let (recovered, _) = read_profiles_json_versioned(&backup).map_err(|backup_error| {
                 crate::error::AppError::Message(format!(
                     "配置文件损坏且备份无法读取：主文件错误：{primary_error}；备份错误：{backup_error}"
                 ))
@@ -698,9 +824,14 @@ fn load_profiles_with_backup(path: &Path) -> AppResult<ProfilesData> {
     }
 }
 
+#[cfg(test)]
 fn read_profiles_json(path: &Path) -> AppResult<ProfilesData> {
+    read_profiles_json_versioned(path).map(|(data, _)| data)
+}
+
+fn read_profiles_json_versioned(path: &Path) -> AppResult<(ProfilesData, bool)> {
     let raw = fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
         crate::error::AppError::Message(format!("无法解析配置文件 {}：{error}", path.display()))
     })?;
     let version = value
@@ -718,15 +849,102 @@ fn read_profiles_json(path: &Path) -> AppResult<ProfilesData> {
                 path.display()
             ))
         })?;
-    if version != u64::from(PROFILES_SCHEMA_VERSION) {
-        return Err(crate::error::AppError::Message(format!(
-            "不支持的配置 schema_version：{version}；当前仅支持 {PROFILES_SCHEMA_VERSION}"
-        )));
-    }
+    let migrated = match version {
+        current if current == u64::from(PROFILES_SCHEMA_VERSION) => false,
+        1 if PROFILES_SCHEMA_VERSION == 2 => {
+            migrate_profiles_v1_to_v2(&mut value)?;
+            true
+        }
+        _ => {
+            return Err(crate::error::AppError::Message(format!(
+                "不支持的配置 schema_version：{version}；当前仅支持 {PROFILES_SCHEMA_VERSION}"
+            )));
+        }
+    };
     let data = serde_json::from_value::<ProfilesData>(value).map_err(|error| {
         crate::error::AppError::Message(format!("无法解析配置文件 {}：{error}", path.display(),))
     })?;
-    Ok(data)
+    Ok((data, migrated))
+}
+
+fn migrate_profiles_v1_to_v2(value: &mut serde_json::Value) -> AppResult<()> {
+    let profiles = value
+        .get_mut("profiles")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            crate::error::AppError::Message("v1 配置缺少 profiles 数组，无法迁移".into())
+        })?;
+    let mut tunnels = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let object = profile.as_object_mut().ok_or_else(|| {
+            crate::error::AppError::Message("v1 workspace profile 不是对象，无法迁移".into())
+        })?;
+        let workspace_id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                crate::error::AppError::Message("v1 workspace 缺少 id，无法迁移 tunnel".into())
+            })?
+            .to_string();
+        let workspace_name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Workspace")
+            .to_string();
+        let tunnel = object.remove("tunnel").ok_or_else(|| {
+            crate::error::AppError::Message(format!(
+                "v1 workspace {workspace_id} 缺少 tunnel 配置，无法迁移"
+            ))
+        })?;
+        let config = serde_json::from_value::<TunnelConfig>(tunnel).map_err(|error| {
+            crate::error::AppError::Message(format!(
+                "v1 workspace {workspace_id} tunnel 配置无效：{error}"
+            ))
+        })?;
+        tunnels.push(serde_json::to_value(TunnelProfile::migrated(
+            workspace_id,
+            &workspace_name,
+            config,
+        ))?);
+    }
+    if let Some(gateway) = value
+        .get_mut("mcp_gateway")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let owner = gateway
+            .remove("ownerWorkspaceId")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let observed_owner = gateway
+            .remove("observedOwnerWorkspaceId")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        gateway.insert(
+            "tunnelId".into(),
+            serde_json::Value::String(if owner.is_empty() {
+                String::new()
+            } else {
+                format!("{owner}-mcp")
+            }),
+        );
+        gateway.insert(
+            "observedTunnelId".into(),
+            serde_json::Value::String(if observed_owner.is_empty() {
+                String::new()
+            } else {
+                format!("{observed_owner}-mcp")
+            }),
+        );
+    }
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| crate::error::AppError::Message("v1 配置根节点不是对象，无法迁移".into()))?;
+    root.insert("tunnels".into(), serde_json::Value::Array(tunnels));
+    root.insert(
+        "schema_version".into(),
+        serde_json::Value::from(PROFILES_SCHEMA_VERSION),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

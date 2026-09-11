@@ -518,15 +518,9 @@ fn parse_frp_command(args: &mut VecDeque<String>) -> Result<FrpCommand, String> 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TunnelShowOptions {
-    pub workspace: String,
-    pub service: ServiceSelection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelConfigureOptions {
-    pub workspace: String,
-    pub service: ServiceSelection,
+    pub tunnel: String,
+    pub name: Option<String>,
     pub tunnel_type: Option<String>,
     pub frp_profile: Option<String>,
     pub clear_frp_profile: bool,
@@ -539,37 +533,79 @@ pub struct TunnelConfigureOptions {
     pub frp_key_path: Option<String>,
     pub cloudflare_mode: Option<String>,
     pub use_proxy: Option<bool>,
-    pub apply: bool,
-    pub wait_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelCommand {
-    Show(TunnelShowOptions),
+    List,
+    Create {
+        workspace: String,
+        name: Option<String>,
+    },
+    Show {
+        tunnel: String,
+    },
     Configure(Box<TunnelConfigureOptions>),
+    Enable {
+        tunnel: String,
+    },
+    Disable {
+        tunnel: String,
+    },
+    Delete {
+        tunnel: String,
+    },
+    Status {
+        tunnel: String,
+    },
+    Start {
+        tunnel: String,
+    },
+    Stop {
+        tunnel: String,
+    },
+    Restart {
+        tunnel: String,
+    },
+    Test {
+        tunnel: String,
+    },
+    SecretSet {
+        tunnel: String,
+        key: String,
+        token: FrpTokenInput,
+    },
+    SecretClear {
+        tunnel: String,
+        key: String,
+    },
 }
 
 fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, String> {
     match args.pop_front().as_deref() {
-        Some("show") => {
-            let workspace = pop_value(args, "tunnel show")?;
-            let mut service = ServiceSelection::Mcp;
+        Some("list") => {
+            ensure_empty(args, "tunnel list")?;
+            Ok(TunnelCommand::List)
+        }
+        Some("create" | "add") => {
+            let workspace = pop_value(args, "tunnel create")?;
+            let mut name = None;
             while let Some(option) = args.pop_front() {
                 match option.as_str() {
-                    "--service" => {
-                        service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
-                    }
-                    other => return Err(format!("tunnel show 不支持参数：{other}")),
+                    "--name" => name = Some(pop_value(args, "--name")?),
+                    other => return Err(format!("tunnel create 不支持参数：{other}")),
                 }
             }
-            Ok(TunnelCommand::Show(TunnelShowOptions {
-                workspace,
-                service,
-            }))
+            Ok(TunnelCommand::Create { workspace, name })
+        }
+        Some("show") => {
+            let tunnel = pop_value(args, "tunnel show")?;
+            ensure_empty(args, "tunnel show")?;
+            Ok(TunnelCommand::Show { tunnel })
         }
         Some("configure" | "config" | "set") => {
-            let workspace = pop_value(args, "tunnel configure")?;
-            let mut service = ServiceSelection::Mcp;
+            let tunnel = pop_value(args, "tunnel configure")?;
+            let mut name = None;
             let mut tunnel_type = None;
             let mut frp_profile = None;
             let mut clear_frp_profile = false;
@@ -582,13 +618,9 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
             let mut frp_key_path = None;
             let mut cloudflare_mode = None;
             let mut use_proxy = None;
-            let mut apply = false;
-            let mut wait_seconds = 30;
             while let Some(option) = args.pop_front() {
                 match option.as_str() {
-                    "--service" => {
-                        service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
-                    }
+                    "--name" => name = Some(pop_value(args, "--name")?),
                     "--type" => {
                         let value = pop_value(args, "--type")?;
                         if !matches!(value.as_str(), "frp" | "cloudflare") {
@@ -625,8 +657,6 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
                     }
                     "--use-proxy" => use_proxy = Some(true),
                     "--no-proxy" => use_proxy = Some(false),
-                    "--apply" => apply = true,
-                    "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 300)?,
                     other => return Err(format!("tunnel configure 不支持参数：{other}")),
                 }
             }
@@ -639,7 +669,8 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
                         .into(),
                 );
             }
-            let has_change = tunnel_type.is_some()
+            let has_change = name.is_some()
+                || tunnel_type.is_some()
                 || frp_profile.is_some()
                 || clear_frp_profile
                 || frp_server.is_some()
@@ -651,14 +682,12 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
                 || frp_key_path.is_some()
                 || cloudflare_mode.is_some()
                 || use_proxy.is_some();
-            if !has_change && !apply {
-                return Err(
-                    "tunnel configure 至少需要一个配置参数，或使用 --apply 应用既有待配置".into(),
-                );
+            if !has_change {
+                return Err("tunnel configure 至少需要一个配置参数".into());
             }
             Ok(TunnelCommand::Configure(Box::new(TunnelConfigureOptions {
-                workspace,
-                service,
+                tunnel,
+                name,
                 tunnel_type,
                 frp_profile,
                 clear_frp_profile,
@@ -671,10 +700,87 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
                 frp_key_path,
                 cloudflare_mode,
                 use_proxy,
-                apply,
-                wait_seconds,
             })))
         }
+        Some("enable") => {
+            let tunnel = pop_value(args, "tunnel enable")?;
+            ensure_empty(args, "tunnel enable")?;
+            Ok(TunnelCommand::Enable { tunnel })
+        }
+        Some("disable") => {
+            let tunnel = pop_value(args, "tunnel disable")?;
+            ensure_empty(args, "tunnel disable")?;
+            Ok(TunnelCommand::Disable { tunnel })
+        }
+        Some("delete" | "remove") => {
+            let tunnel = pop_value(args, "tunnel delete")?;
+            ensure_empty(args, "tunnel delete")?;
+            Ok(TunnelCommand::Delete { tunnel })
+        }
+        Some("status") => {
+            let tunnel = pop_value(args, "tunnel status")?;
+            ensure_empty(args, "tunnel status")?;
+            Ok(TunnelCommand::Status { tunnel })
+        }
+        Some("start") => {
+            let tunnel = pop_value(args, "tunnel start")?;
+            ensure_empty(args, "tunnel start")?;
+            Ok(TunnelCommand::Start { tunnel })
+        }
+        Some("stop") => {
+            let tunnel = pop_value(args, "tunnel stop")?;
+            ensure_empty(args, "tunnel stop")?;
+            Ok(TunnelCommand::Stop { tunnel })
+        }
+        Some("restart") => {
+            let tunnel = pop_value(args, "tunnel restart")?;
+            ensure_empty(args, "tunnel restart")?;
+            Ok(TunnelCommand::Restart { tunnel })
+        }
+        Some("test") => {
+            let tunnel = pop_value(args, "tunnel test")?;
+            ensure_empty(args, "tunnel test")?;
+            Ok(TunnelCommand::Test { tunnel })
+        }
+        Some("secret") => match args.pop_front().as_deref() {
+            Some("set") => {
+                let tunnel = pop_value(args, "tunnel secret set")?;
+                let key = pop_value(args, "tunnel secret set")?;
+                if !matches!(key.as_str(), "frp" | "cloudflare") {
+                    return Err("tunnel secret key 仅支持 frp 或 cloudflare".into());
+                }
+                let mut token = None;
+                while let Some(option) = args.pop_front() {
+                    match option.as_str() {
+                        "--token" => set_frp_token_input(
+                            &mut token,
+                            FrpTokenInput::Inline(pop_value(args, "--token")?),
+                        )?,
+                        "--token-file" => set_frp_token_input(
+                            &mut token,
+                            FrpTokenInput::File(PathBuf::from(pop_value(args, "--token-file")?)),
+                        )?,
+                        "--token-stdin" => set_frp_token_input(&mut token, FrpTokenInput::Stdin)?,
+                        other => return Err(format!("tunnel secret set 不支持参数：{other}")),
+                    }
+                }
+                let token = token.ok_or_else(|| {
+                    "tunnel secret set 需要 --token-file、--token-stdin 或 --token".to_string()
+                })?;
+                Ok(TunnelCommand::SecretSet { tunnel, key, token })
+            }
+            Some("clear") => {
+                let tunnel = pop_value(args, "tunnel secret clear")?;
+                let key = pop_value(args, "tunnel secret clear")?;
+                if !matches!(key.as_str(), "frp" | "cloudflare") {
+                    return Err("tunnel secret key 仅支持 frp 或 cloudflare".into());
+                }
+                ensure_empty(args, "tunnel secret clear")?;
+                Ok(TunnelCommand::SecretClear { tunnel, key })
+            }
+            Some(other) => Err(format!("未知 tunnel secret 命令：{other}")),
+            None => Err("tunnel secret 需要 set 或 clear".into()),
+        },
         Some(other) => Err(format!("未知 tunnel 命令：{other}\n\n{}", tunnel_usage())),
         None => Err(tunnel_usage().to_string()),
     }
@@ -968,7 +1074,7 @@ fn parse_reload(args: &mut VecDeque<String>) -> Result<ReloadOptions, String> {
 pub struct GatewayConfigureOptions {
     pub enabled: Option<bool>,
     pub local_port: Option<u16>,
-    pub owner_workspace: Option<String>,
+    pub tunnel: Option<String>,
     pub public_url: Option<String>,
 }
 
@@ -1011,30 +1117,27 @@ fn parse_gateway_command(args: &mut VecDeque<String>) -> Result<GatewayCommand, 
         Some("configure" | "config") => {
             let mut enabled = None;
             let mut local_port = None;
-            let mut owner_workspace = None;
+            let mut tunnel = None;
             let mut public_url = None;
             while let Some(option) = args.pop_front() {
                 match option.as_str() {
                     "--enable" => enabled = Some(true),
                     "--disable" => enabled = Some(false),
                     "--port" => local_port = Some(parse_u64(args, "--port", 1, 65_535)? as u16),
-                    "--owner" => owner_workspace = Some(pop_value(args, "--owner")?),
+                    "--tunnel" => tunnel = Some(pop_value(args, "--tunnel")?),
                     "--public-url" => public_url = Some(pop_value(args, "--public-url")?),
                     "--clear-public-url" => public_url = Some(String::new()),
                     other => return Err(format!("gateway configure 不支持参数：{other}")),
                 }
             }
-            if enabled.is_none()
-                && local_port.is_none()
-                && owner_workspace.is_none()
-                && public_url.is_none()
+            if enabled.is_none() && local_port.is_none() && tunnel.is_none() && public_url.is_none()
             {
                 return Err("gateway configure 至少需要一个配置参数".into());
             }
             Ok(GatewayCommand::Configure(GatewayConfigureOptions {
                 enabled,
                 local_port,
-                owner_workspace,
+                tunnel,
                 public_url,
             }))
         }
@@ -1335,15 +1438,12 @@ pub enum WorkspaceCommand {
 fn parse_run_options(args: &mut VecDeque<String>, command: &str) -> Result<RunOptions, String> {
     let workspace = pop_value(args, command)?;
     let mut service = None;
-    let mut tunnel = None;
     let mut wait_seconds = 10;
     while let Some(option) = args.pop_front() {
         match option.as_str() {
             "--service" => {
                 service = Some(ServiceSelection::parse(&pop_value(args, "--service")?)?);
             }
-            "--tunnel" => tunnel = Some(true),
-            "--no-tunnel" => tunnel = Some(false),
             "--wait" => wait_seconds = parse_u64(args, "--wait", 1, 300)?,
             other => return Err(format!("{command} 不支持参数：{other}")),
         }
@@ -1351,7 +1451,6 @@ fn parse_run_options(args: &mut VecDeque<String>, command: &str) -> Result<RunOp
     Ok(RunOptions {
         workspace,
         service,
-        tunnel,
         wait_seconds,
     })
 }
@@ -1509,7 +1608,6 @@ fn parse_u64(
 pub struct RunOptions {
     pub workspace: String,
     pub service: Option<ServiceSelection>,
-    pub tunnel: Option<bool>,
     pub wait_seconds: u64,
 }
 
@@ -1753,7 +1851,6 @@ pub enum Command {
     Serve {
         workspace: String,
         service: ServiceSelection,
-        tunnel: bool,
     },
     Start(RunOptions),
     Stop(StopOptions),
@@ -1897,23 +1994,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<CliArgs, String> 
 fn parse_serve(args: &mut VecDeque<String>) -> Result<Command, String> {
     let workspace = pop_value(args, "serve")?;
     let mut service = ServiceSelection::Mcp;
-    let mut tunnel = false;
 
     while let Some(option) = args.pop_front() {
         match option.as_str() {
             "--service" => {
                 service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
             }
-            "--tunnel" => tunnel = true,
             other => return Err(format!("serve 不支持参数：{other}")),
         }
     }
 
-    Ok(Command::Serve {
-        workspace,
-        service,
-        tunnel,
-    })
+    Ok(Command::Serve { workspace, service })
 }
 
 fn pop_value(args: &mut VecDeque<String>, option: &str) -> Result<String, String> {
@@ -1936,10 +2027,10 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] list\n\
   anchor [--config-dir PATH] [--json] show <workspace>\n\
   anchor [--config-dir PATH] [--json] status [<workspace>|--all|--control-plane] [--watch]\n\
-  anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|all] [--tunnel]\n\n\
-  anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] serve <workspace> [--service mcp|all]\n\n\
+  anchor [--config-dir PATH] [--json] start <workspace> [--service mcp|all]\n\
   anchor [--config-dir PATH] [--json] stop <workspace> [--timeout SECONDS] [--force]\n\
-  anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|all] [--tunnel]\n\
+  anchor [--config-dir PATH] [--json] restart <workspace> [--service mcp|all]\n\
   anchor [--config-dir PATH] [--json] upgrade (<workspace> [workspace ...]|--gateway|--all) [--gateway] [--timeout SECONDS] [--force] [--dry-run] [--allow-no-rollback]\n\
   anchor [--config-dir PATH] [--json] logs <workspace> [--service daemon|mcp|all] [--lines N] [-f]\n\
   anchor [--config-dir PATH] [--json] events <workspace|--control-plane> [-f] [--wait SECONDS]\n\
@@ -1949,7 +2040,7 @@ pub fn usage() -> &'static str {
   anchor [--config-dir PATH] [--json] import <file> (--passphrase-file FILE|--passphrase-stdin) [--workspace-path WORKSPACE=ABSOLUTE_PATH ...] [--dry-run] [--force]\n\n\
   anchor [--config-dir PATH] [--json] config <get|diff|set|apply|export|import> ...\n\n\
   anchor [--config-dir PATH] [--json] frp <list|show|add|update|delete> ...\n\n\
-  anchor [--config-dir PATH] [--json] tunnel <show|configure> ...\n\n\
+  anchor [--config-dir PATH] [--json] tunnel <list|create|show|configure|enable|disable|delete|status|start|stop|restart|test|secret> ...\n\n\
   anchor [--config-dir PATH] [--json] software <list|install|uninstall> ...\n\n\
   anchor [--config-dir PATH] [--json] workspace <command> ...\n\n\
   anchor [--config-dir PATH] [--json] notification <channel> <command> ...\n\n\
@@ -1984,18 +2075,24 @@ pub fn frp_usage() -> &'static str {
   anchor frp update <profile-id|name> [--name NAME] [--server HOST] [--port PORT]\n\
       [--token-file PATH|--token-stdin|--token TOKEN|--clear-token]\n\
   anchor frp delete <profile-id|name> --force\n\n\
-FRP profile 是全局服务器连接配置；token 作为受保护 secret 保存且不会在 list/show 输出中回显。优先使用 --token-file 或 --token-stdin，避免 secret 进入 shell history/进程参数；--token 仅为兼容便捷场景保留。workspace tunnel 通过 profile ID 引用它。"
+FRP profile 是全局服务器连接配置；token 作为受保护 secret 保存且不会在 list/show 输出中回显。优先使用 --token-file 或 --token-stdin，避免 secret 进入 shell history/进程参数；--token 仅为兼容便捷场景保留。Tunnel 通过 profile ID 引用它。"
 }
 
 pub fn tunnel_usage() -> &'static str {
-    "Tunnel 配置命令：\n\
-  anchor tunnel show <workspace> [--service mcp|all]\n\
-  anchor tunnel configure <workspace> [--service mcp|all] [--type frp|cloudflare]\n\
+    "Tunnel 管理命令：\n\
+  anchor tunnel list\n\
+  anchor tunnel create <workspace> [--name NAME]\n\
+  anchor tunnel show <tunnel-id|name>\n\
+  anchor tunnel configure <tunnel-id|name> [--name NAME] [--type none|frp|cloudflare]\n\
       [--frp-profile PROFILE|--frp-server HOST] [--clear-frp-profile] [--frp-port PORT]\n\
       [--subdomain NAME] [--public-url URL|--clear-public-url]\n\
       [--proxy-type http|https2http] [--cert PATH|--clear-cert] [--key PATH|--clear-key]\n\
-      [--cloudflare-mode quick|named] [--use-proxy|--no-proxy] [--apply] [--wait SECONDS]\n\n\
-configure 复用 config pending/apply 事务模型；FRP 参数会自动切换为 frp 类型。使用 --apply 时会在落盘后协调正在运行的 Workspace daemon/Gateway，并在失败时回滚。"
+      [--cloudflare-mode quick|named] [--use-proxy|--no-proxy]\n\
+  anchor tunnel enable|disable|delete <tunnel-id|name>\n\
+  anchor tunnel status|start|stop|restart|test <tunnel-id|name>\n\
+  anchor tunnel secret set <tunnel-id|name> <frp|cloudflare> (--token-file PATH|--token-stdin|--token TOKEN)\n\
+  anchor tunnel secret clear <tunnel-id|name> <frp|cloudflare>\n\n\
+Tunnel 是应用级顶层资源；Workspace 仅作为 MCP 运行目标。enable/disable 控制 Workspace daemon 启动时是否自动托管 Tunnel；显式 start/stop/test 直接操作指定 Tunnel。"
 }
 
 pub fn software_usage() -> &'static str {
@@ -2016,7 +2113,7 @@ pub fn gateway_usage() -> &'static str {
     "Gateway 命令：\n\
   anchor gateway show\n\
   anchor gateway status\n\
-  anchor gateway configure [--enable|--disable] [--port PORT] [--owner WORKSPACE] [--public-url URL|--clear-public-url]\n\
+  anchor gateway configure [--enable|--disable] [--port PORT] [--tunnel TUNNEL] [--public-url URL|--clear-public-url]\n\
   anchor gateway start <workspace> [workspace ...] [--wait SECONDS]\n\
   anchor gateway stop [--timeout SECONDS] [--force]\n\
   anchor gateway restart [--timeout SECONDS] [--force]\n\
@@ -2045,7 +2142,7 @@ pub fn workspace_usage() -> &'static str {
   anchor workspace register <path> [--name NAME]\n\
   anchor workspace unregister <workspace> --force [--timeout SECONDS]\n\
   anchor workspace show <workspace>\n\
-  anchor workspace start <workspace> [--service mcp|all] [--tunnel]\n\
+  anchor workspace start <workspace> [--service mcp|all]\n\
   anchor workspace stop <workspace> [--timeout SECONDS] [--force]\n\
   anchor workspace gpt-config <workspace> [--service mcp|all] [--endpoint auto|local|public] [--show-secrets]\n\
   anchor workspace test <workspace> [--service mcp|all] [--endpoint auto|local|public] [--timeout SECONDS]"
@@ -2273,13 +2370,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_tunnel_frp_configuration_and_apply() {
+    fn parses_top_level_tunnel_frp_configuration() {
         let parsed = parse(strings(&[
             "tunnel",
             "configure",
-            "demo",
-            "--service",
-            "all",
+            "prod-tunnel",
             "--frp-profile",
             "prod",
             "--subdomain",
@@ -2293,17 +2388,14 @@ mod tests {
             "--key",
             ".anchor/cert/server.key",
             "--no-proxy",
-            "--apply",
-            "--wait",
-            "45",
         ]))
         .expect("tunnel configure");
 
         assert_eq!(
             parsed.command,
             Command::Tunnel(TunnelCommand::Configure(Box::new(TunnelConfigureOptions {
-                workspace: "demo".into(),
-                service: ServiceSelection::All,
+                tunnel: "prod-tunnel".into(),
+                name: None,
                 tunnel_type: None,
                 frp_profile: Some("prod".into()),
                 clear_frp_profile: false,
@@ -2316,15 +2408,13 @@ mod tests {
                 frp_key_path: Some(".anchor/cert/server.key".into()),
                 cloudflare_mode: None,
                 use_proxy: Some(false),
-                apply: true,
-                wait_seconds: 45,
             })))
         );
     }
 
     #[test]
-    fn parses_foreground_all_services_with_tunnel() {
-        let parsed = parse(strings(&[
+    fn foreground_serve_rejects_legacy_tunnel_flag() {
+        let error = parse(strings(&[
             "--config-dir",
             "/tmp/anchor",
             "--json",
@@ -2334,18 +2424,8 @@ mod tests {
             "all",
             "--tunnel",
         ]))
-        .expect("parse");
-
-        assert_eq!(parsed.config_dir, Some(PathBuf::from("/tmp/anchor")));
-        assert!(parsed.json);
-        assert_eq!(
-            parsed.command,
-            Command::Serve {
-                workspace: "workspace-a".into(),
-                service: ServiceSelection::All,
-                tunnel: true,
-            }
-        );
+        .expect_err("legacy --tunnel must be rejected");
+        assert!(error.contains("serve 不支持参数"));
     }
 
     #[cfg(not(windows))]
@@ -2431,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_defaults_to_mcp_without_tunnel() {
+    fn serve_defaults_to_mcp() {
         let parsed = parse(strings(&["serve", "workspace-a"])).expect("parse");
 
         assert_eq!(
@@ -2439,7 +2519,6 @@ mod tests {
             Command::Serve {
                 workspace: "workspace-a".into(),
                 service: ServiceSelection::Mcp,
-                tunnel: false,
             }
         );
     }
@@ -2460,8 +2539,8 @@ mod tests {
             "--enable",
             "--port",
             "29000",
-            "--owner",
-            "workspace-a",
+            "--tunnel",
+            "prod-tunnel",
         ]))
         .expect("gateway configure");
         assert_eq!(
@@ -2469,7 +2548,7 @@ mod tests {
             Command::Gateway(GatewayCommand::Configure(GatewayConfigureOptions {
                 enabled: Some(true),
                 local_port: Some(29000),
-                owner_workspace: Some("workspace-a".into()),
+                tunnel: Some("prod-tunnel".into()),
                 public_url: None,
             }))
         );
@@ -2569,7 +2648,6 @@ mod tests {
             "workspace-a",
             "--service",
             "all",
-            "--tunnel",
             "--wait",
             "20",
         ]))
@@ -2579,7 +2657,6 @@ mod tests {
             Command::Start(RunOptions {
                 workspace: "workspace-a".into(),
                 service: Some(ServiceSelection::All),
-                tunnel: Some(true),
                 wait_seconds: 20,
             })
         );

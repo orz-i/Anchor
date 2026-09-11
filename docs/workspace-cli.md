@@ -11,7 +11,7 @@ anchor workspace list
 anchor workspace register PATH [--name NAME]
 anchor workspace unregister WORKSPACE --force
 anchor workspace show WORKSPACE
-anchor workspace start WORKSPACE [--service mcp|all] [--tunnel]
+anchor workspace start WORKSPACE [--service mcp|all]
 anchor workspace stop WORKSPACE [--timeout SECONDS] [--force]
 anchor workspace gpt-config WORKSPACE [--service mcp|all]
 anchor workspace test WORKSPACE [--service mcp|all]
@@ -95,11 +95,13 @@ anchor workspace show Example
 ## 启动与停止
 
 ```bash
-anchor workspace start Example --service all --tunnel
+anchor workspace start Example --service all
 anchor workspace stop Example
 ```
 
 这两个命令是顶层 `start/stop` 的 workspace 级别名。Workspace 后台 daemon 当前支持 Windows 与 Linux；macOS 使用 `serve` 前台模式。浏览器 Web Admin 与 CLI 共用同一 daemon/control-plane 语义，不维护第二套运行权威。
+
+Tunnel 已从 WorkspaceProfile 抽离。需要公网入口时使用顶级 `anchor tunnel create/configure/enable`；Workspace 启动时会自动托管指向自己的已启用 Tunnel。详见 [Tunnel 统一管理](tunnel.md)。
 
 完整 daemon 行为见 [CLI Daemon 与运维命令](cli-daemon.md)。
 
@@ -195,19 +197,24 @@ anchor workspace register /srv/projects/example --name Example
 # 2. 查看配置
 anchor workspace show Example
 
-# 3. 后台启动
-anchor workspace start Example --service all --tunnel
+# 3. 如需公网入口，先创建并启用顶级 Tunnel
+anchor tunnel create Example --name example-mcp
+anchor tunnel configure example-mcp --type cloudflare --cloudflare-mode named
+anchor tunnel enable example-mcp
 
-# 4. 测试本地服务
+# 4. 后台启动
+anchor workspace start Example --service all
+
+# 5. 测试本地服务
 anchor workspace test Example --service all --local
 
-# 5. 查看 GPT 公网配置
+# 6. 查看 GPT 公网配置
 anchor workspace gpt-config Example --service all --public
 
-# 6. 测试公网连接
+# 7. 测试公网连接
 anchor workspace test Example --service all --public
 
-# 7. 停止
+# 8. 停止
 anchor workspace stop Example
 ```
 

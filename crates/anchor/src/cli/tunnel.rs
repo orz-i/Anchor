@@ -1,152 +1,222 @@
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
+use crate::management;
 use crate::secret::SecretStore;
 use crate::settings::{AppSettings, FrpProfile};
-use crate::tunnel::{validate_workspace_frp_config, TunnelServiceKind};
-use crate::workspace::WorkspaceProfile;
+use crate::tunnel::{validate_workspace_frp_config, TunnelProfile, TunnelServiceKind};
 
-use super::args::{
-    ConfigApplyOptions, ConfigAssignment, ConfigMutationOptions, ServiceSelection, TunnelCommand,
-    TunnelConfigureOptions, TunnelShowOptions,
-};
+use super::args::{TunnelCommand, TunnelConfigureOptions};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TunnelShowReport {
-    event: &'static str,
+struct TunnelView {
+    id: String,
+    name: String,
     workspace_id: String,
     workspace_name: String,
-    services: Vec<TunnelServiceView>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TunnelServiceView {
-    service: &'static str,
+    service: String,
+    enabled: bool,
     tunnel_type: String,
     public_url: String,
     effective_public_url: String,
     use_proxy: bool,
     cloudflare_mode: String,
-    frp: FrpBindingView,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FrpBindingView {
-    profile_id: String,
-    profile_name: String,
-    server: String,
-    server_port: u16,
-    subdomain: String,
-    proxy_type: String,
-    cert_path: String,
-    key_path: String,
-    has_token: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TunnelConfigureReport {
-    event: &'static str,
-    workspace: String,
-    service: String,
-    assignments: Vec<ConfigAssignmentView>,
-    staged: Option<Value>,
-    applied: Option<Value>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigAssignmentView {
-    path: String,
-    value: String,
+    frp_profile_id: String,
+    frp_profile_name: String,
+    frp_server: String,
+    frp_server_port: u16,
+    frp_subdomain: String,
+    frp_proxy_type: String,
+    frp_cert_path: String,
+    frp_key_path: String,
+    has_frp_token: bool,
+    has_cloudflare_token: bool,
 }
 
 pub async fn execute(command: TunnelCommand) -> AppResult<i32> {
     match command {
-        TunnelCommand::Show(options) => show(options)?,
+        TunnelCommand::List => list()?,
+        TunnelCommand::Create { workspace, name } => create(&workspace, name.as_deref())?,
+        TunnelCommand::Show { tunnel } => show(&tunnel)?,
         TunnelCommand::Configure(options) => configure(*options).await?,
+        TunnelCommand::Enable { tunnel } => set_enabled(&tunnel, true).await?,
+        TunnelCommand::Disable { tunnel } => set_enabled(&tunnel, false).await?,
+        TunnelCommand::Delete { tunnel } => delete(&tunnel).await?,
+        TunnelCommand::Status { tunnel } => status(&tunnel).await?,
+        TunnelCommand::Start { tunnel } => start(&tunnel).await?,
+        TunnelCommand::Stop { tunnel } => stop(&tunnel).await?,
+        TunnelCommand::Restart { tunnel } => restart(&tunnel).await?,
+        TunnelCommand::Test { tunnel } => test(&tunnel).await?,
+        TunnelCommand::SecretSet { tunnel, key, token } => set_secret(&tunnel, &key, token).await?,
+        TunnelCommand::SecretClear { tunnel, key } => clear_secret(&tunnel, &key).await?,
     }
     Ok(0)
 }
 
-fn show(options: TunnelShowOptions) -> AppResult<()> {
+fn list() -> AppResult<()> {
     let store = DataStore::load()?;
-    let workspace = super::resolve_workspace(store.list(), &options.workspace)?.clone();
     let settings = store.settings();
-    drop(store);
-
-    let services = service_kinds(options.service)
-        .into_iter()
-        .map(|kind| service_view(&workspace, kind, &settings))
+    let views = store
+        .list_tunnels()
+        .iter()
+        .map(|tunnel| tunnel_view(tunnel, &store, &settings))
         .collect::<AppResult<Vec<_>>>()?;
-    super::print_json(&TunnelShowReport {
-        event: "tunnel_show",
-        workspace_id: workspace.id,
-        workspace_name: workspace.name,
-        services,
-    })
+    super::print_json(&views)
+}
+
+fn create(workspace_selector: &str, name: Option<&str>) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let workspace = super::resolve_workspace(store.list(), workspace_selector)?.clone();
+    drop(store);
+    let tunnel = management::create_tunnel(&workspace.id, name)?;
+    super::print_json(&tunnel)
+}
+
+fn show(selector: &str) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let settings = store.settings();
+    let tunnel = resolve_tunnel(store.list_tunnels(), selector)?;
+    super::print_json(&tunnel_view(tunnel, &store, &settings)?)
 }
 
 async fn configure(options: TunnelConfigureOptions) -> AppResult<()> {
-    let settings = DataStore::load()?.settings();
-    let assignments = build_assignments(&options, &settings)?;
+    let store = DataStore::load()?;
+    let settings = store.settings();
+    let mut tunnel = resolve_tunnel(store.list_tunnels(), &options.tunnel)?.clone();
+    let mut workspace = store.get(&tunnel.workspace_id).cloned().ok_or_else(|| {
+        AppError::Message(format!("workspace not found: {}", tunnel.workspace_id))
+    })?;
+    drop(store);
 
-    let mut staged = None;
-    if !assignments.is_empty() {
-        let mutation = ConfigMutationOptions {
-            workspace: options.workspace.clone(),
-            assignments: assignments.clone(),
-        };
-        let (_active, candidate) = super::config::preview_config(&mutation)?;
-        validate_candidate_tunnel(&candidate, options.service, &settings)?;
-        staged = Some(serde_json::to_value(super::config::stage_config(
-            mutation,
-        )?)?);
+    apply_config_options(&mut tunnel, &options, &settings)?;
+    workspace.tunnel = tunnel.config.clone();
+    workspace.tunnel_id = tunnel.id.clone();
+    if tunnel.config.tunnel_type == "frp" {
+        validate_workspace_frp_config(&workspace, TunnelServiceKind::Mcp, &settings)?;
     }
 
-    let applied = if options.apply {
-        Some(serde_json::to_value(
-            super::config::apply_staged_config(ConfigApplyOptions {
-                workspace: options.workspace.clone(),
-                wait_seconds: options.wait_seconds,
-            })
-            .await?,
-        )?)
-    } else {
-        None
-    };
-
-    super::print_json(&TunnelConfigureReport {
-        event: "tunnel_configure",
-        workspace: options.workspace,
-        service: service_selection_name(options.service).into(),
-        assignments: assignments
-            .into_iter()
-            .map(|assignment| ConfigAssignmentView {
-                path: assignment.path,
-                value: assignment.value,
-            })
-            .collect(),
-        staged,
-        applied,
-    })
+    let saved = management::update_tunnel(tunnel).await?;
+    super::print_json(&saved)
 }
 
-fn build_assignments(
+async fn set_enabled(selector: &str, enabled: bool) -> AppResult<()> {
+    let store = DataStore::load()?;
+    let mut tunnel = resolve_tunnel(store.list_tunnels(), selector)?.clone();
+    drop(store);
+    if tunnel.enabled == enabled {
+        return super::print_json(&tunnel);
+    }
+    tunnel.enabled = enabled;
+    let tunnel = management::update_tunnel(tunnel).await?;
+    super::print_json(&tunnel)
+}
+
+async fn delete(selector: &str) -> AppResult<()> {
+    let id = {
+        let store = DataStore::load()?;
+        resolve_tunnel(store.list_tunnels(), selector)?.id.clone()
+    };
+    management::delete_tunnel(&id).await?;
+    super::print_json(&serde_json::json!({"event": "tunnel_deleted", "id": id}))
+}
+
+async fn status(selector: &str) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    super::print_json(&management::get_tunnel_status(&id).await?)
+}
+
+async fn start(selector: &str) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    super::print_json(&management::start_tunnel(&id).await?)
+}
+
+async fn stop(selector: &str) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    super::print_json(&management::stop_tunnel(&id).await?)
+}
+
+async fn restart(selector: &str) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    let _ = management::stop_tunnel(&id).await?;
+    super::print_json(&management::start_tunnel(&id).await?)
+}
+
+async fn test(selector: &str) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    super::print_json(&management::test_tunnel(&id).await?)
+}
+
+async fn set_secret(selector: &str, key: &str, token: super::args::FrpTokenInput) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    let token = super::frp::read_token_input(Some(token))?.unwrap_or_default();
+    let api_key = secret_api_key(key)?;
+    management::set_tunnel_secret(&id, api_key, &token).await?;
+    super::print_json(&serde_json::json!({
+        "event": "tunnel_secret_updated",
+        "id": id,
+        "key": key,
+        "configured": true
+    }))
+}
+
+async fn clear_secret(selector: &str, key: &str) -> AppResult<()> {
+    let id = resolve_tunnel_id(selector)?;
+    management::set_tunnel_secret(&id, secret_api_key(key)?, "").await?;
+    super::print_json(&serde_json::json!({
+        "event": "tunnel_secret_updated",
+        "id": id,
+        "key": key,
+        "configured": false
+    }))
+}
+
+fn secret_api_key(key: &str) -> AppResult<&'static str> {
+    match key {
+        "frp" => Ok("frp_token"),
+        "cloudflare" => Ok("cloudflare_token"),
+        _ => Err(AppError::Message(format!(
+            "unsupported tunnel secret key: {key}"
+        ))),
+    }
+}
+
+fn resolve_tunnel_id(selector: &str) -> AppResult<String> {
+    let store = DataStore::load()?;
+    Ok(resolve_tunnel(store.list_tunnels(), selector)?.id.clone())
+}
+
+pub(super) fn resolve_tunnel<'a>(
+    tunnels: &'a [TunnelProfile],
+    selector: &str,
+) -> AppResult<&'a TunnelProfile> {
+    if let Some(tunnel) = tunnels.iter().find(|tunnel| tunnel.id == selector) {
+        return Ok(tunnel);
+    }
+    let matches = tunnels
+        .iter()
+        .filter(|tunnel| tunnel.name.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [tunnel] => Ok(*tunnel),
+        [] => Err(AppError::Message(format!("tunnel not found: {selector}"))),
+        _ => Err(AppError::Message(format!(
+            "tunnel name is ambiguous: {selector}; use tunnel id"
+        ))),
+    }
+}
+
+fn apply_config_options(
+    tunnel: &mut TunnelProfile,
     options: &TunnelConfigureOptions,
     settings: &AppSettings,
-) -> AppResult<Vec<ConfigAssignment>> {
+) -> AppResult<()> {
     let frp_profile_id = options
         .frp_profile
         .as_deref()
         .map(|selector| super::frp::resolve_profile_id(&settings.frp_profiles, selector))
         .transpose()?;
-
     let has_frp_configuration = frp_profile_id.is_some()
         || options.frp_server.is_some()
         || options.frp_server_port.is_some()
@@ -172,6 +242,13 @@ fn build_assignments(
         ));
     }
 
+    if let Some(name) = options.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Message("Tunnel 名称不能为空".into()));
+        }
+        tunnel.name = name.to_string();
+    }
     let implied_type = if has_frp_configuration {
         Some("frp")
     } else if options.cloudflare_mode.is_some() {
@@ -179,167 +256,104 @@ fn build_assignments(
     } else {
         None
     };
-    let tunnel_type = options.tunnel_type.as_deref().or(implied_type);
-    let mut assignments = Vec::new();
-
-    for kind in service_kinds(options.service) {
-        let prefix = config_prefix(kind);
-        if let Some(value) = tunnel_type {
-            assignments.push(assignment(type_path(kind), value));
-        }
-        if let Some(profile_id) = frp_profile_id.as_deref() {
-            assignments.push(assignment(format!("{prefix}.frp_profile_id"), profile_id));
-        } else if options.clear_frp_profile || options.frp_server.is_some() {
-            assignments.push(assignment(format!("{prefix}.frp_profile_id"), ""));
-        }
-        if let Some(value) = options.frp_server.as_deref() {
-            assignments.push(assignment(format!("{prefix}.frp_server"), value.trim()));
-        }
-        if let Some(value) = options.frp_server_port {
-            assignments.push(assignment(
-                format!("{prefix}.frp_server_port"),
-                value.to_string(),
-            ));
-        }
-        if let Some(value) = options.frp_subdomain.as_deref() {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(AppError::Message("FRP subdomain 不能为空".into()));
-            }
-            assignments.push(assignment(format!("{prefix}.frp_subdomain"), value));
-        }
-        if let Some(value) = options.public_url.as_deref() {
-            assignments.push(assignment(format!("{prefix}.public_url"), value.trim()));
-        }
-        if let Some(value) = options.frp_proxy_type.as_deref() {
-            assignments.push(assignment(format!("{prefix}.frp_proxy_type"), value));
-        }
-        if let Some(value) = options.frp_cert_path.as_deref() {
-            assignments.push(assignment(format!("{prefix}.frp_cert_path"), value.trim()));
-        }
-        if let Some(value) = options.frp_key_path.as_deref() {
-            assignments.push(assignment(format!("{prefix}.frp_key_path"), value.trim()));
-        }
-        if let Some(value) = options.cloudflare_mode.as_deref() {
-            assignments.push(assignment(format!("{prefix}.cloudflare_mode"), value));
-        }
-        if let Some(value) = options.use_proxy {
-            assignments.push(assignment(format!("{prefix}.use_proxy"), value.to_string()));
-        }
+    if let Some(value) = options.tunnel_type.as_deref().or(implied_type) {
+        tunnel.config.tunnel_type = value.to_string();
     }
-    Ok(assignments)
-}
-
-fn validate_candidate_tunnel(
-    candidate: &WorkspaceProfile,
-    service: ServiceSelection,
-    settings: &AppSettings,
-) -> AppResult<()> {
-    for kind in service_kinds(service) {
-        let tunnel_type = match kind {
-            TunnelServiceKind::Mcp => candidate.tunnel.tunnel_type.as_str(),
-        };
-        if tunnel_type == "frp" {
-            validate_workspace_frp_config(candidate, kind, settings)?;
+    if let Some(profile_id) = frp_profile_id {
+        tunnel.config.frp_profile_id = profile_id;
+    } else if options.clear_frp_profile || options.frp_server.is_some() {
+        tunnel.config.frp_profile_id.clear();
+    }
+    if let Some(value) = options.frp_server.as_deref() {
+        tunnel.config.frp_server = value.trim().to_string();
+    }
+    if let Some(value) = options.frp_server_port {
+        tunnel.config.frp_server_port = value;
+    }
+    if let Some(value) = options.frp_subdomain.as_deref() {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AppError::Message("FRP subdomain 不能为空".into()));
         }
+        tunnel.config.frp_subdomain = value.to_string();
+    }
+    if let Some(value) = options.public_url.as_deref() {
+        tunnel.config.public_url = value.trim().trim_end_matches('/').to_string();
+    }
+    if let Some(value) = options.frp_proxy_type.as_deref() {
+        tunnel.config.frp_proxy_type = value.to_string();
+    }
+    if let Some(value) = options.frp_cert_path.as_deref() {
+        tunnel.config.frp_cert_path = value.trim().to_string();
+    }
+    if let Some(value) = options.frp_key_path.as_deref() {
+        tunnel.config.frp_key_path = value.trim().to_string();
+    }
+    if let Some(value) = options.cloudflare_mode.as_deref() {
+        tunnel.config.cloudflare_mode = value.to_string();
+    }
+    if let Some(value) = options.use_proxy {
+        tunnel.config.use_proxy = value;
     }
     Ok(())
 }
 
-fn service_view(
-    workspace: &WorkspaceProfile,
-    kind: TunnelServiceKind,
+fn tunnel_view(
+    tunnel: &TunnelProfile,
+    store: &DataStore,
     settings: &AppSettings,
-) -> AppResult<TunnelServiceView> {
-    let (
-        service,
-        tunnel_type,
-        public_url,
-        use_proxy,
-        cloudflare_mode,
-        profile_id,
-        inline_server,
-        inline_port,
-        subdomain,
-        proxy_type,
-        cert_path,
-        key_path,
-        secret_key,
-    ) = match kind {
-        TunnelServiceKind::Mcp => (
-            "mcp",
-            workspace.tunnel.tunnel_type.as_str(),
-            workspace.tunnel.public_url.as_str(),
-            workspace.tunnel.use_proxy,
-            workspace.tunnel.cloudflare_mode.as_str(),
-            workspace.tunnel.frp_profile_id.as_str(),
-            workspace.tunnel.frp_server.as_str(),
-            workspace.tunnel.frp_server_port,
-            workspace.tunnel.frp_subdomain.as_str(),
-            workspace.tunnel.frp_proxy_type.as_str(),
-            workspace.tunnel.frp_cert_path.as_str(),
-            workspace.tunnel.frp_key_path.as_str(),
-            "frp_token",
-        ),
-    };
-    let selected_profile = settings.find_frp_profile(profile_id);
-    let server = selected_profile
-        .map(|profile| profile.server.as_str())
-        .unwrap_or(inline_server);
-    let server_port = selected_profile
+) -> AppResult<TunnelView> {
+    let workspace = store.get(&tunnel.workspace_id).ok_or_else(|| {
+        AppError::Message(format!("workspace not found: {}", tunnel.workspace_id))
+    })?;
+    let selected_profile = settings.find_frp_profile(&tunnel.config.frp_profile_id);
+    let frp_server = selected_profile
+        .map(|profile| profile.server.clone())
+        .unwrap_or_else(|| tunnel.config.frp_server.clone());
+    let frp_server_port = selected_profile
         .map(|profile| profile.server_port)
-        .unwrap_or(inline_port);
-    let has_token = frp_token_configured(
-        workspace,
-        profile_id,
-        inline_server,
-        secret_key,
-        &settings.frp_profiles,
-    )?;
-    Ok(TunnelServiceView {
-        service,
-        tunnel_type: tunnel_type.into(),
-        public_url: public_url.into(),
-        effective_public_url: match kind {
-            TunnelServiceKind::Mcp => workspace.effective_public_url_with(settings),
-        },
-        use_proxy,
-        cloudflare_mode: cloudflare_mode.into(),
-        frp: FrpBindingView {
-            profile_id: profile_id.into(),
-            profile_name: selected_profile
-                .map(|profile| profile.name.clone())
-                .unwrap_or_default(),
-            server: server.into(),
-            server_port,
-            subdomain: subdomain.into(),
-            proxy_type: proxy_type.into(),
-            cert_path: cert_path.into(),
-            key_path: key_path.into(),
-            has_token,
-        },
+        .unwrap_or(tunnel.config.frp_server_port);
+    Ok(TunnelView {
+        id: tunnel.id.clone(),
+        name: tunnel.name.clone(),
+        workspace_id: tunnel.workspace_id.clone(),
+        workspace_name: workspace.name.clone(),
+        service: tunnel.service.clone(),
+        enabled: tunnel.enabled,
+        tunnel_type: tunnel.config.tunnel_type.clone(),
+        public_url: tunnel.config.public_url.clone(),
+        effective_public_url: tunnel.effective_public_url(settings),
+        use_proxy: tunnel.config.use_proxy,
+        cloudflare_mode: tunnel.config.cloudflare_mode.clone(),
+        frp_profile_id: tunnel.config.frp_profile_id.clone(),
+        frp_profile_name: selected_profile
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default(),
+        frp_server,
+        frp_server_port,
+        frp_subdomain: tunnel.config.frp_subdomain.clone(),
+        frp_proxy_type: tunnel.config.frp_proxy_type.clone(),
+        frp_cert_path: tunnel.config.frp_cert_path.clone(),
+        frp_key_path: tunnel.config.frp_key_path.clone(),
+        has_frp_token: frp_token_configured(tunnel, &settings.frp_profiles)?,
+        has_cloudflare_token: SecretStore::get_app("tunnel_cloudflare_token", &tunnel.id)?
+            .is_some_and(|value| !value.trim().is_empty()),
     })
 }
 
-fn frp_token_configured(
-    workspace: &WorkspaceProfile,
-    profile_id: &str,
-    inline_server: &str,
-    workspace_secret_key: &str,
-    profiles: &[FrpProfile],
-) -> AppResult<bool> {
-    if !profile_id.trim().is_empty()
-        && SecretStore::get_app("frp_profile_token", profile_id)?
+fn frp_token_configured(tunnel: &TunnelProfile, profiles: &[FrpProfile]) -> AppResult<bool> {
+    if !tunnel.config.frp_profile_id.trim().is_empty()
+        && SecretStore::get_app("frp_profile_token", &tunnel.config.frp_profile_id)?
             .is_some_and(|value| !value.trim().is_empty())
     {
         return Ok(true);
     }
-    if SecretStore::get(&workspace.id, workspace_secret_key)?
+    if SecretStore::get_app("tunnel_frp_token", &tunnel.id)?
         .is_some_and(|value| !value.trim().is_empty())
     {
         return Ok(true);
     }
-    let inline_server = inline_server.trim();
+    let inline_server = tunnel.config.frp_server.trim();
     if inline_server.is_empty() {
         return Ok(false);
     }
@@ -352,115 +366,4 @@ fn frp_token_configured(
         }
     }
     Ok(false)
-}
-
-fn config_prefix(kind: TunnelServiceKind) -> &'static str {
-    match kind {
-        TunnelServiceKind::Mcp => "tunnel",
-    }
-}
-
-fn type_path(kind: TunnelServiceKind) -> &'static str {
-    match kind {
-        TunnelServiceKind::Mcp => "tunnel.type",
-    }
-}
-
-fn assignment(path: impl Into<String>, value: impl Into<String>) -> ConfigAssignment {
-    ConfigAssignment {
-        path: path.into(),
-        value: value.into(),
-    }
-}
-
-fn service_kinds(service: ServiceSelection) -> Vec<TunnelServiceKind> {
-    match service {
-        ServiceSelection::Mcp => vec![TunnelServiceKind::Mcp],
-        ServiceSelection::All => vec![TunnelServiceKind::Mcp],
-    }
-}
-
-fn service_selection_name(service: ServiceSelection) -> &'static str {
-    match service {
-        ServiceSelection::Mcp => "mcp",
-        ServiceSelection::All => "all",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn frp_settings() -> AppSettings {
-        AppSettings {
-            frp_profiles: vec![FrpProfile {
-                id: "p1".into(),
-                name: "production".into(),
-                server: "frp.example.com".into(),
-                server_port: 17001,
-            }],
-            ..AppSettings::default()
-        }
-    }
-
-    fn options() -> TunnelConfigureOptions {
-        TunnelConfigureOptions {
-            workspace: "demo".into(),
-            service: ServiceSelection::Mcp,
-            tunnel_type: None,
-            frp_profile: None,
-            clear_frp_profile: false,
-            frp_server: None,
-            frp_server_port: None,
-            frp_subdomain: None,
-            public_url: None,
-            frp_proxy_type: None,
-            frp_cert_path: None,
-            frp_key_path: None,
-            cloudflare_mode: None,
-            use_proxy: None,
-            apply: false,
-            wait_seconds: 30,
-        }
-    }
-
-    #[test]
-    fn global_profile_configuration_resolves_id_and_implies_frp() {
-        let mut options = options();
-        options.service = ServiceSelection::All;
-        options.frp_profile = Some("production".into());
-        options.frp_subdomain = Some("anchor".into());
-        let assignments = build_assignments(&options, &frp_settings()).expect("assignments");
-
-        assert!(assignments
-            .iter()
-            .any(|assignment| assignment.path == "tunnel.type" && assignment.value == "frp"));
-        assert!(assignments.iter().any(|assignment| {
-            assignment.path == "tunnel.frp_profile_id" && assignment.value == "p1"
-        }));
-    }
-
-    #[test]
-    fn manual_server_clears_global_profile_binding() {
-        let mut options = options();
-        options.frp_server = Some("43.157.17.95".into());
-        options.frp_server_port = Some(17_001);
-        options.frp_subdomain = Some("anchor".into());
-        options.public_url = Some("https://anchor.taoyan.icu".into());
-        let assignments = build_assignments(&options, &frp_settings()).expect("assignments");
-        assert!(assignments.iter().any(|assignment| {
-            assignment.path == "tunnel.frp_profile_id" && assignment.value.is_empty()
-        }));
-        assert!(assignments.iter().any(|assignment| {
-            assignment.path == "tunnel.frp_server" && assignment.value == "43.157.17.95"
-        }));
-    }
-
-    #[test]
-    fn cloudflare_type_rejects_frp_specific_flags() {
-        let mut options = options();
-        options.tunnel_type = Some("cloudflare".into());
-        options.frp_subdomain = Some("anchor".into());
-        assert!(build_assignments(&options, &frp_settings()).is_err());
-    }
 }

@@ -630,7 +630,7 @@ async fn local_status() -> AppResult<GatewayControlStatus> {
         public_base_url: config.effective_public_url(),
         route_count: route_workspace_ids.len(),
         route_workspace_ids,
-        owner_workspace_id: config.owner_workspace_id,
+        tunnel_id: config.tunnel_id,
         error,
         detail: inspection.detail,
     })
@@ -661,7 +661,7 @@ async fn daemon_status() -> AppResult<GatewayControlStatus> {
         public_base_url: runtime.public_base_url,
         route_count: runtime.route_count,
         route_workspace_ids,
-        owner_workspace_id: runtime.owner_workspace_id,
+        tunnel_id: runtime.tunnel_id,
         error: runtime.error,
         detail: inspection.detail,
     })

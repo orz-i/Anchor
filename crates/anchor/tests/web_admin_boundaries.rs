@@ -101,7 +101,6 @@ fn frontend_admin_commands_are_supported_or_explicitly_privileged() {
         "get_workspace_control_status",
         "get_workspace_control_events",
         "restart_tunnel",
-        "stop_tunnel",
         "preview_workspace_config",
     ] {
         assert!(
@@ -241,8 +240,13 @@ fn web_admin_writes_delegate_to_shared_management_services() {
         "management::apply_workspace_config",
         "management::start_workspace_service",
         "management::stop_workspace_service",
-        "management::start_workspace_tunnel",
-        "management::test_workspace_tunnel",
+        "management::create_tunnel",
+        "management::update_tunnel",
+        "management::delete_tunnel",
+        "management::set_tunnel_secret",
+        "management::start_tunnel",
+        "management::stop_tunnel",
+        "management::test_tunnel",
         "management::set_mcp_gateway",
         "management::reload_mcp_gateway",
         "management::set_gateway_workspace_route",

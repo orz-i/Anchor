@@ -97,7 +97,7 @@ Anchor 的长期运行架构调整为按控制域建立唯一运行权威：
 - 运行中 daemon 的日志读取使用有界游标 IPC，单响应日志内容预算为 8 KiB；daemon 已停止时仍可离线读取历史日志；
 - `stop` 和 `restart` 正常路径必须先由目标 daemon 通过 IPC 接受并协调优雅退出；Unix 控制 socket 物理不可达时只允许经过 Workspace/PID/进程启动身份复核的 verified recovery，协议不兼容绝不触发该恢复；Windows 不绕过 Named Pipe；
 - `start` 在 daemon 不存在时仍是引导命令；若状态显示 daemon 已运行，则必须先通过 IPC `ping` 验证控制面。
-- daemon 状态同时保存 `tunnelServices=mcp|all`，MCP listener 与 tunnel ownership 可独立组合；公开 CLI `--tunnel` 仍保持“为所选服务启用隧道”的兼容语义；
+- 历史 daemon 状态曾保存 `tunnelServices=mcp|all`；当前公开 CLI 已将 Tunnel 提升为顶级资源，Workspace 启动参数不再承担 Tunnel ownership 配置。
 - tunnel 写操作采用 `accepted → pending/running → succeeded/failed` 的异步操作模型：初始响应完整写回后，daemon 才在自身 Tunnel Supervisor 内执行 start/stop/restart；FRP 重载继续使用原子 route replacement，失败时恢复旧线路和旧配置。
 - daemon 事件使用进程内有界 journal：每 Workspace 最多保留 256 条，单批最多 32 条，游标为 `streamId + sequence`；长轮询最长 25 秒，daemon 重启或游标越过 retained window 时显式返回 reset；
 - `reload` 复用异步 operation 模型，运行中的目标服务只重建该 listener，Workspace daemon、另一 listener 和 Tunnel ownership 保持不变；新 listener 启动失败时尝试恢复旧 listener；

@@ -361,7 +361,11 @@ pub(crate) async fn apply_staged_config(
             warnings: vec!["没有待应用配置".into()],
         });
     };
-    let candidate = pending.candidate;
+    let mut candidate = pending.candidate;
+    candidate.tunnel = active.tunnel.clone();
+    candidate.tunnel_id = active.tunnel_id.clone();
+    candidate.tunnel_enabled = active.tunnel_enabled;
+    candidate.tunnel_revision = active.tunnel_revision;
     validate_candidate(&store, &active, &candidate)?;
     let plan = plan_workspace_config_apply(&active, &candidate);
     let changes = config_changes(&active, &candidate)?;
@@ -379,7 +383,7 @@ pub(crate) async fn apply_staged_config(
     let gateway_live = gateway_inspection.running
         && gateway_inspection.state.as_ref().is_some_and(|state| {
             state.workspace_ids.contains(&active.id)
-                || previous_settings.mcp_gateway.owner_workspace_id == active.id
+                || previous_settings.mcp_gateway.tunnel_id == active.tunnel_id
         });
 
     let reset_gateway_observed =
@@ -835,17 +839,17 @@ mod tests {
     }
 
     #[test]
-    fn assignment_uses_serialized_tunnel_type_path_and_rejects_workspace_id() {
+    fn assignment_rejects_removed_workspace_tunnel_path_and_workspace_id() {
         let current = profile();
-        let updated = apply_assignments(
+        let tunnel_error = apply_assignments(
             &current,
             &[ConfigAssignment {
                 path: "tunnel.type".into(),
                 value: "frp".into(),
             }],
         )
-        .expect("tunnel type");
-        assert_eq!(updated.tunnel.tunnel_type, "frp");
+        .expect_err("workspace tunnel path must be removed");
+        assert!(tunnel_error.to_string().contains("tunnel.type"));
 
         let error = apply_assignments(
             &current,

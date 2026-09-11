@@ -94,9 +94,10 @@ fn persisted_configuration_requires_current_content_schema_versions() {
     let storage = source("src/data/storage.rs");
     let migration = source("src/data/migration.rs");
 
-    assert!(model.contains("pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 1;"));
+    assert!(model.contains("pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 2;"));
     assert!(model.contains("pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;"));
     assert!(model.contains("pub schema_version: u32"));
+    assert!(storage.contains("migrate_profiles_v1_to_v2"));
     assert!(!storage.contains("migrate_unversioned_profiles"));
     assert!(!storage.contains("migrate_unversioned_secrets"));
     assert!(!storage.contains("migrate_legacy_profiles"));

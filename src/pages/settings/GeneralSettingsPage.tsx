@@ -33,17 +33,17 @@ import {
   type ProxyConfigDto,
   type WindowsScmServiceStatusDto,
 } from "@/lib/api/settings";
+import { listTunnels } from "@/lib/api/tunnel";
 import { getGatewayControlEvents, listWorkspaces, readGatewayLogs } from "@/lib/api/workspaces";
-import type { GatewayEventCursor, GatewayLogChunk, WorkspaceProfile } from "@/lib/types";
+import type { GatewayEventCursor, GatewayLogChunk, TunnelProfile, WorkspaceProfile } from "@/lib/types";
 
 const DEFAULT_GATEWAY: McpGatewayConfigDto = {
-  urlModelVersion: 2,
   enabled: false,
   localPort: 28765,
-  ownerWorkspaceId: "",
+  tunnelId: "",
   publicUrl: "",
   observedPublicUrl: "",
-  observedOwnerWorkspaceId: "",
+  observedTunnelId: "",
   observedTunnelSignature: "",
 };
 
@@ -64,6 +64,7 @@ export function GeneralSettingsPage() {
   const [gatewayLog, setGatewayLog] = useState<GatewayLogChunk | null>(null);
   const [gatewayLogError, setGatewayLogError] = useState("");
   const [workspaces, setWorkspaces] = useState<WorkspaceProfile[]>([]);
+  const [tunnels, setTunnels] = useState<TunnelProfile[]>([]);
   const [windowsService, setWindowsService] = useState<WindowsScmServiceStatusDto | null>(null);
   const [windowsServiceBusy, setWindowsServiceBusy] = useState(false);
   const [windowsServiceMutationsSupported, setWindowsServiceMutationsSupported] = useState(false);
@@ -83,28 +84,32 @@ export function GeneralSettingsPage() {
   }, []);
 
   const refreshGatewayRuntime = useCallback(async () => {
-    const [nextGateway, nextStatus, nextWorkspaces] = await Promise.all([
+    const [nextGateway, nextStatus, nextWorkspaces, nextTunnels] = await Promise.all([
       getMcpGateway(),
       getMcpGatewayStatus(),
       listWorkspaces(),
+      listTunnels(),
     ]);
     setGatewayStatus(nextStatus);
     setWorkspaces(nextWorkspaces);
+    setTunnels(nextTunnels);
     if (!gatewayDraftDirty.current) setGatewayState(nextGateway);
   }, []);
 
   const refresh = useCallback(async () => {
-    const [nextProxy, nextGateway, nextGatewayStatus, nextWorkspaces, nextWindowsService] = await Promise.all([
+    const [nextProxy, nextGateway, nextGatewayStatus, nextWorkspaces, nextTunnels, nextWindowsService] = await Promise.all([
       getProxy(),
       getMcpGateway(),
       getMcpGatewayStatus(),
       listWorkspaces(),
+      listTunnels(),
       getWindowsServiceStatus(),
     ]);
     setProxyState(nextProxy);
     setGatewayState(nextGateway);
     setGatewayStatus(nextGatewayStatus);
     setWorkspaces(nextWorkspaces);
+    setTunnels(nextTunnels);
     setWindowsService(nextWindowsService);
     setProxyChanged(false);
     setGatewayChanged(false);
@@ -347,11 +352,12 @@ export function GeneralSettingsPage() {
                     <Input id="gateway-port" type="number" min={1} max={65535} value={gateway.localPort} onChange={(event) => updateGateway({ localPort: Number(event.target.value) })} />
                   </Field>
                   <Field>
-                    <FieldLabel>隧道所有者工作区</FieldLabel>
-                    <Select disabled={!gateway.enabled} value={gateway.ownerWorkspaceId || null} onValueChange={(value) => updateGateway({ ownerWorkspaceId: value ?? "" })}>
-                      <SelectTrigger className="w-full"><SelectValue placeholder="请选择工作区" /></SelectTrigger>
-                      <SelectContent>{workspaces.map((workspace) => <SelectItem key={workspace.id} value={workspace.id}>{workspace.name}</SelectItem>)}</SelectContent>
+                    <FieldLabel>Gateway Tunnel</FieldLabel>
+                    <Select disabled={!gateway.enabled} value={gateway.tunnelId || null} onValueChange={(value) => updateGateway({ tunnelId: value ?? "" })}>
+                      <SelectTrigger className="w-full"><SelectValue placeholder="请选择 Tunnel" /></SelectTrigger>
+                      <SelectContent>{tunnels.map((tunnel) => <SelectItem key={tunnel.id} value={tunnel.id}>{tunnel.name} · {workspaces.find((workspace) => workspace.id === tunnel.workspace_id)?.name ?? tunnel.workspace_id}</SelectItem>)}</SelectContent>
                     </Select>
+                    <FieldDescription>Gateway 直接引用顶级 Tunnel；目标 Workspace 仅提供 Tunnel 的本地运行上下文。</FieldDescription>
                   </Field>
                 </div>
                 <Field>

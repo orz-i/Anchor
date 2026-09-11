@@ -9,7 +9,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Server,
   Square,
   Trash2,
 } from "lucide-react";
@@ -19,7 +18,6 @@ import { toast } from "sonner";
 import { useAdmin } from "@/components/admin/AdminProvider";
 import { PageLayout } from "@/components/admin/PageLayout";
 import { RuntimeDot } from "@/components/admin/RuntimeBadge";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -146,17 +144,13 @@ export function WorkspacesPage() {
   const stats = useMemo(() => {
     const total = workspaces.length;
     let mcpRunning = 0;
-    let tunnelsActive = 0;
 
     for (const ws of workspaces) {
       const mcpState = mcpRuntimeStates[ws.id] ?? "stopped";
       if (mcpState === "running") mcpRunning++;
-      if (ws.tunnel.type !== "none") {
-        tunnelsActive++;
-      }
     }
 
-    return { total, mcpRunning, tunnelsActive };
+    return { total, mcpRunning };
   }, [workspaces, mcpRuntimeStates]);
 
   // 过滤工作区
@@ -232,7 +226,7 @@ export function WorkspacesPage() {
     >
       <div className="flex flex-col gap-6">
         {/* 统计指标卡片组 */}
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-2">
           <Card className="bg-card/50 backdrop-blur-xs">
             <CardHeader className="flex flex-row items-center justify-between pb-2">
               <CardTitle className="text-xs font-medium text-muted-foreground">总工作区数</CardTitle>
@@ -259,16 +253,6 @@ export function WorkspacesPage() {
             </CardContent>
           </Card>
 
-          <Card className="bg-card/50 backdrop-blur-xs">
-            <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-xs font-medium text-muted-foreground">配置公网隧道</CardTitle>
-              <Server className="size-4 text-purple-500" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{stats.tunnelsActive}</div>
-              <p className="mt-1 text-xs text-muted-foreground">Cloudflare / FRP 隧道接入</p>
-            </CardContent>
-          </Card>
         </div>
 
         {/* 筛选与搜索工具栏 */}
@@ -416,14 +400,6 @@ export function WorkspacesPage() {
                             <span className="font-mono text-foreground">
                               MCP:{workspace.runtime.local_port}
                             </span>
-                          </div>
-                          <div className="mt-1.5 flex items-center justify-between text-muted-foreground">
-                            <span>公网隧道</span>
-                            <Badge variant="outline" className="text-[10px]">
-                              {workspace.tunnel.type !== "none"
-                                ? workspace.tunnel.type.toUpperCase()
-                                : "未启用"}
-                            </Badge>
                           </div>
                         </div>
 

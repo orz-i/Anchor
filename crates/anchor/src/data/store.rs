@@ -5,6 +5,7 @@ use fs2::FileExt;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
+use crate::tunnel::TunnelProfile;
 use crate::workspace::WorkspaceProfile;
 
 use super::model::AppData;
@@ -39,6 +40,55 @@ pub(crate) fn validate_workspace_profile(profile: &WorkspaceProfile) -> AppResul
 fn validate_data(data: &AppData) -> AppResult<()> {
     for profile in &data.profiles {
         validate_workspace_profile(profile)?;
+    }
+    let mut tunnel_ids = std::collections::HashSet::new();
+    let mut targets = std::collections::HashSet::new();
+    for tunnel in &data.tunnels {
+        if tunnel.id.trim().is_empty() {
+            return Err(AppError::Message("tunnel id 不能为空".into()));
+        }
+        if !tunnel_ids.insert(tunnel.id.as_str()) {
+            return Err(AppError::Message(format!(
+                "duplicate tunnel id: {}",
+                tunnel.id
+            )));
+        }
+        if !data
+            .profiles
+            .iter()
+            .any(|workspace| workspace.id == tunnel.workspace_id)
+        {
+            return Err(AppError::Message(format!(
+                "tunnel {} targets missing workspace: {}",
+                tunnel.id, tunnel.workspace_id
+            )));
+        }
+        if !tunnel.service.eq_ignore_ascii_case("mcp") {
+            return Err(AppError::Message(format!(
+                "unsupported tunnel service `{}`; expected mcp",
+                tunnel.service
+            )));
+        }
+        let target = format!(
+            "{}:{}",
+            tunnel.workspace_id,
+            tunnel.service.to_ascii_lowercase()
+        );
+        if !targets.insert(target) {
+            return Err(AppError::Message(format!(
+                "workspace {} already has an MCP tunnel resource",
+                tunnel.workspace_id
+            )));
+        }
+        if !matches!(
+            tunnel.config.tunnel_type.as_str(),
+            "none" | "frp" | "cloudflare"
+        ) {
+            return Err(AppError::Message(format!(
+                "unsupported tunnel type `{}`",
+                tunnel.config.tunnel_type
+            )));
+        }
     }
     Ok(())
 }
@@ -103,6 +153,7 @@ impl DataStore {
         let mut data = load()?;
         validate_data(&data)?;
         let result = f(&mut data)?;
+        data.hydrate_workspace_tunnels();
         validate_data(&data)?;
         save(&data)?;
         Ok(result)
@@ -112,8 +163,9 @@ impl DataStore {
     /// decrypting the destination secrets file. Portable config import needs
     /// this path because a copied Windows DPAPI envelope is intentionally not
     /// decryptable on Linux/macOS (and vice versa).
-    pub(crate) fn replace_file(data: AppData) -> AppResult<()> {
+    pub(crate) fn replace_file(mut data: AppData) -> AppResult<()> {
         let _guard = lock_data_file()?;
+        data.hydrate_workspace_tunnels();
         validate_data(&data)?;
         save(&data)
     }
@@ -142,6 +194,72 @@ impl DataStore {
 
     pub fn get(&self, id: &str) -> Option<&WorkspaceProfile> {
         self.data.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    pub fn list_tunnels(&self) -> &[TunnelProfile] {
+        &self.data.tunnels
+    }
+
+    pub fn get_tunnel(&self, id: &str) -> Option<&TunnelProfile> {
+        self.data.tunnels.iter().find(|tunnel| tunnel.id == id)
+    }
+
+    pub fn tunnel_for_workspace(&self, workspace_id: &str) -> Option<&TunnelProfile> {
+        self.data.tunnel_for_workspace(workspace_id)
+    }
+
+    pub fn register_tunnel(&mut self, tunnel: TunnelProfile) -> AppResult<()> {
+        if self.data.tunnels.iter().any(|item| item.id == tunnel.id) {
+            return Err(AppError::Message(format!(
+                "tunnel already exists: {}",
+                tunnel.id
+            )));
+        }
+        self.data.tunnels.push(tunnel);
+        self.data.hydrate_workspace_tunnels();
+        validate_data(&self.data)?;
+        self.save()
+    }
+
+    pub fn update_tunnel(&mut self, tunnel: TunnelProfile) -> AppResult<()> {
+        let Some(index) = self
+            .data
+            .tunnels
+            .iter()
+            .position(|item| item.id == tunnel.id)
+        else {
+            return Err(AppError::Message(format!(
+                "tunnel not found: {}",
+                tunnel.id
+            )));
+        };
+        self.data.tunnels[index] = tunnel;
+        self.data.hydrate_workspace_tunnels();
+        validate_data(&self.data)?;
+        self.save()
+    }
+
+    pub fn remove_tunnel(&mut self, id: &str) -> AppResult<Option<TunnelProfile>> {
+        let Some(index) = self.data.tunnels.iter().position(|item| item.id == id) else {
+            return Ok(None);
+        };
+        let removed = self.data.tunnels.remove(index);
+        if self.data.mcp_gateway.tunnel_id == id {
+            self.data.mcp_gateway.enabled = false;
+            self.data.mcp_gateway.tunnel_id.clear();
+            self.data.mcp_gateway.clear_observation();
+        }
+        for scope in ["tunnel_frp_token", "tunnel_cloudflare_token"] {
+            if let Some(items) = self.data.app_secrets.get_mut(scope) {
+                items.remove(id);
+                if items.is_empty() {
+                    self.data.app_secrets.remove(scope);
+                }
+            }
+        }
+        self.data.hydrate_workspace_tunnels();
+        self.save()?;
+        Ok(Some(removed))
     }
 
     pub fn register_workspace(&mut self, profile: WorkspaceProfile) -> AppResult<()> {
@@ -179,7 +297,26 @@ impl DataStore {
             return Ok(None);
         };
         let removed = self.data.profiles.remove(index);
+        let tunnel_ids = self
+            .data
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.workspace_id == id)
+            .map(|tunnel| tunnel.id.clone())
+            .collect::<Vec<_>>();
+        self.data.tunnels.retain(|tunnel| tunnel.workspace_id != id);
+        for scope in ["tunnel_frp_token", "tunnel_cloudflare_token"] {
+            if let Some(items) = self.data.app_secrets.get_mut(scope) {
+                for tunnel_id in &tunnel_ids {
+                    items.remove(tunnel_id);
+                }
+                if items.is_empty() {
+                    self.data.app_secrets.remove(scope);
+                }
+            }
+        }
         self.data.workspace_secrets.remove(id);
+        self.data.hydrate_workspace_tunnels();
         self.save()?;
         Ok(Some(removed))
     }

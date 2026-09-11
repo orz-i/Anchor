@@ -36,16 +36,17 @@ impl From<FrpProfileInput> for FrpProfile {
 pub struct McpGatewayConfig {
     pub enabled: bool,
     pub local_port: u16,
-    /// Workspace whose existing MCP tunnel configuration owns the one public
-    /// gateway tunnel. This does not grant access to other workspaces.
-    pub owner_workspace_id: String,
+    /// Top-level Tunnel resource used as the one public gateway tunnel.
+    /// The Tunnel target workspace supplies runtime context only; it does not
+    /// own the tunnel configuration.
+    pub tunnel_id: String,
     /// Optional operator-configured public gateway base URL without a workspace
     /// path. Runtime-discovered tunnel URLs are stored separately.
     pub public_url: String,
     /// Last successfully observed public tunnel URL. This is maintained by the
     /// runtime and must be cleared when the gateway identity changes.
     pub observed_public_url: String,
-    pub observed_owner_workspace_id: String,
+    pub observed_tunnel_id: String,
     pub observed_tunnel_signature: String,
 }
 
@@ -54,10 +55,10 @@ impl Default for McpGatewayConfig {
         Self {
             enabled: false,
             local_port: default_mcp_gateway_port(),
-            owner_workspace_id: String::new(),
+            tunnel_id: String::new(),
             public_url: String::new(),
             observed_public_url: String::new(),
-            observed_owner_workspace_id: String::new(),
+            observed_tunnel_id: String::new(),
             observed_tunnel_signature: String::new(),
         }
     }
@@ -66,14 +67,14 @@ impl Default for McpGatewayConfig {
 impl McpGatewayConfig {
     pub fn clear_observation(&mut self) {
         self.observed_public_url.clear();
-        self.observed_owner_workspace_id.clear();
+        self.observed_tunnel_id.clear();
         self.observed_tunnel_signature.clear();
     }
 
     pub fn effective_public_url(&self) -> String {
         let observed = self.observed_public_url.trim().trim_end_matches('/');
-        let observed_owner_matches = self.observed_owner_workspace_id == self.owner_workspace_id;
-        if !observed.is_empty() && observed_owner_matches {
+        let observed_tunnel_matches = self.observed_tunnel_id == self.tunnel_id;
+        if !observed.is_empty() && observed_tunnel_matches {
             return observed.to_string();
         }
         let configured = self.public_url.trim().trim_end_matches('/');
@@ -86,7 +87,7 @@ impl McpGatewayConfig {
     pub fn identity_changed(&self, next: &Self) -> bool {
         self.enabled != next.enabled
             || self.local_port != next.local_port
-            || self.owner_workspace_id != next.owner_workspace_id
+            || self.tunnel_id != next.tunnel_id
             || self.public_url.trim().trim_end_matches('/')
                 != next.public_url.trim().trim_end_matches('/')
     }
@@ -235,9 +236,9 @@ mod tests {
         let gateway = McpGatewayConfig::default();
         assert!(!gateway.enabled);
         assert_eq!(gateway.local_port, 28765);
-        assert!(gateway.owner_workspace_id.is_empty());
+        assert!(gateway.tunnel_id.is_empty());
         assert!(gateway.observed_public_url.is_empty());
-        assert!(gateway.observed_owner_workspace_id.is_empty());
+        assert!(gateway.observed_tunnel_id.is_empty());
         assert!(gateway.observed_tunnel_signature.is_empty());
     }
 }

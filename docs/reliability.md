@@ -37,16 +37,16 @@ MCP listener 的恢复逻辑属于实际持有运行态的 `RuntimeSupervisor`�
 - 隧道进程退出后自动重新创建；
 - 重连失败使用指数退避，避免断网时持续刷进程和日志；
 - 本地服务进入最终错误状态后，清理其孤儿隧道；
-- 恢复后的公网 URL 会重新保存到当前 WorkspaceProfile。
+- 恢复后的公网 URL 会重新保存到当前顶级 Tunnel 资源。
 
-Linux CLI 的 `serve --tunnel` 同样会持续维护隧道，重试间隔最高为 60 秒。
+Linux CLI 的 `serve` 会自动持续维护指向该 Workspace 且已启用的顶级 Tunnel，重试间隔最高为 60 秒。
 
 ## Linux CLI
 
 `anchor serve` 不再只等待 `Ctrl+C`，而是持续维护已启动服务：
 
 ```bash
-anchor serve PROFILE_ID --service all --tunnel
+anchor serve PROFILE_ID --service all
 ```
 
 状态变化会输出：

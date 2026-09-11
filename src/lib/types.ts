@@ -22,6 +22,16 @@ export interface TunnelConfig {
   use_proxy?: boolean;
 }
 
+export interface TunnelProfile {
+  id: string;
+  name: string;
+  workspace_id: string;
+  service: string;
+  enabled: boolean;
+  revision: number;
+  config: TunnelConfig;
+}
+
 export type OrchestrationTargetKind = "node" | "workspace" | "harness_task";
 
 export interface OrchestrationTarget {
@@ -312,7 +322,6 @@ export interface WorkspaceProfile {
   id: string;
   name: string;
   path: string;
-  tunnel: TunnelConfig;
   auth: AuthConfig;
   runtime: RuntimeConfig;
 }
@@ -422,7 +431,7 @@ export interface GatewayControlStatus {
   publicBaseUrl: string;
   routeCount: number;
   routeWorkspaceIds: string[];
-  ownerWorkspaceId: string;
+  tunnelId: string;
   error: string;
   detail: string;
 }

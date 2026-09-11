@@ -46,7 +46,7 @@ pub struct McpGatewayStatus {
     pub public_base_url: String,
     pub route_count: usize,
     pub route_workspace_ids: Vec<String>,
-    pub owner_workspace_id: String,
+    pub tunnel_id: String,
     pub error: String,
 }
 
@@ -70,6 +70,8 @@ pub fn tunnel_identity_signature(
             ""
         };
     serde_json::to_string(&serde_json::json!({
+        "tunnelId": owner.tunnel_id,
+        "tunnelRevision": owner.tunnel_revision,
         "workspaceId": owner.id,
         "localPort": config.local_port,
         "type": owner.tunnel.tunnel_type,
@@ -88,7 +90,7 @@ pub fn tunnel_identity_signature(
 }
 
 pub fn observation_matches_tunnel(config: &McpGatewayConfig, signature: &str) -> bool {
-    config.observed_owner_workspace_id == config.owner_workspace_id
+    config.observed_tunnel_id == config.tunnel_id
         && (config.observed_tunnel_signature.trim().is_empty()
             || config.observed_tunnel_signature == signature)
 }
@@ -153,7 +155,10 @@ pub fn owner_tunnel_identity_changed(
     current: &WorkspaceProfile,
     next: &WorkspaceProfile,
 ) -> bool {
-    if !config.enabled || config.owner_workspace_id != current.id || current.id != next.id {
+    if !config.enabled
+        || config.tunnel_id != current.tunnel_id
+        || current.tunnel_id != next.tunnel_id
+    {
         return false;
     }
 
@@ -178,7 +183,7 @@ impl McpGatewayStatus {
             public_base_url: config.effective_public_url(),
             route_count: 0,
             route_workspace_ids: Vec::new(),
-            owner_workspace_id: config.owner_workspace_id.clone(),
+            tunnel_id: config.tunnel_id.clone(),
             error: String::new(),
         }
     }
@@ -220,17 +225,17 @@ pub fn validate_config(config: &McpGatewayConfig, profiles: &[WorkspaceProfile])
     if config.local_port == 0 {
         return Err(AppError::Message("MCP Gateway 本地端口无效。".into()));
     }
-    if !safe_workspace_segment(&config.owner_workspace_id) {
+    if config.tunnel_id.trim().is_empty() {
         return Err(AppError::Message(
-            "MCP Gateway 必须选择有效的隧道所有者工作区。".into(),
+            "MCP Gateway 必须选择有效的 Tunnel。".into(),
         ));
     }
     if !profiles
         .iter()
-        .any(|profile| profile.id == config.owner_workspace_id)
+        .any(|profile| profile.tunnel_id == config.tunnel_id)
     {
         return Err(AppError::Message(
-            "MCP Gateway 隧道所有者工作区不存在。".into(),
+            "MCP Gateway 引用的 Tunnel 不存在。".into(),
         ));
     }
     for profile in profiles {
@@ -263,11 +268,15 @@ pub fn validate_workspace_ports(
 
 pub fn ensure_workspace_is_not_owner(
     config: &McpGatewayConfig,
+    profiles: &[WorkspaceProfile],
     workspace_id: &str,
 ) -> AppResult<()> {
-    if config.enabled && config.owner_workspace_id == workspace_id {
+    let is_target = profiles
+        .iter()
+        .any(|profile| profile.id == workspace_id && profile.tunnel_id == config.tunnel_id);
+    if config.enabled && is_target {
         return Err(AppError::Message(
-            "该工作区是 MCP Gateway 隧道所有者；请先更换 owner 或禁用 Gateway。".into(),
+            "该工作区是 MCP Gateway 当前 Tunnel 的目标；请先更换 Tunnel 或禁用 Gateway。".into(),
         ));
     }
     Ok(())
@@ -355,7 +364,7 @@ pub async fn ensure(
         public_base_url: config.effective_public_url(),
         route_count,
         route_workspace_ids,
-        owner_workspace_id: config.owner_workspace_id.clone(),
+        tunnel_id: config.tunnel_id.clone(),
         error: String::new(),
     })
 }
@@ -396,7 +405,7 @@ pub async fn status(config: &McpGatewayConfig) -> McpGatewayStatus {
         public_base_url: config.effective_public_url(),
         route_count,
         route_workspace_ids,
-        owner_workspace_id: config.owner_workspace_id.clone(),
+        tunnel_id: config.tunnel_id.clone(),
         error,
     }
 }
@@ -1146,7 +1155,7 @@ mod tests {
         let config = McpGatewayConfig {
             enabled: true,
             local_port: 28765,
-            owner_workspace_id: "owner".into(),
+            tunnel_id: "owner".into(),
             public_url: "https://mcp.example.com/".into(),
             ..McpGatewayConfig::default()
         };
@@ -1158,12 +1167,12 @@ mod tests {
 
         let mut observed = config;
         observed.observed_public_url = "https://observed.example.com".into();
-        observed.observed_owner_workspace_id = observed.owner_workspace_id.clone();
+        observed.observed_tunnel_id = observed.tunnel_id.clone();
         assert_eq!(
             workspace_base_url(&observed, "workspace_a").unwrap(),
             "https://observed.example.com/w/workspace_a"
         );
-        observed.owner_workspace_id = "other-owner".into();
+        observed.tunnel_id = "other-owner".into();
         assert_eq!(
             workspace_base_url(&observed, "workspace_a").unwrap(),
             "https://mcp.example.com/w/workspace_a"
@@ -1174,15 +1183,15 @@ mod tests {
     fn observed_url_requires_matching_owner_and_tunnel_signature() {
         let mut config = McpGatewayConfig {
             enabled: true,
-            owner_workspace_id: "owner".into(),
+            tunnel_id: "owner".into(),
             observed_public_url: "https://observed.example.com".into(),
-            observed_owner_workspace_id: "owner".into(),
+            observed_tunnel_id: "owner".into(),
             observed_tunnel_signature: "sig-a".into(),
             ..McpGatewayConfig::default()
         };
         assert!(observation_matches_tunnel(&config, "sig-a"));
         assert!(!observation_matches_tunnel(&config, "sig-b"));
-        config.observed_owner_workspace_id = "other".into();
+        config.observed_tunnel_id = "other".into();
         assert!(!observation_matches_tunnel(&config, "sig-a"));
     }
 
@@ -1214,10 +1223,11 @@ mod tests {
     fn gateway_port_must_not_overlap_workspace_services() {
         let mut profile = WorkspaceProfile::new("C:/workspace".into(), None);
         profile.id = "owner".into();
+        profile.tunnel_id = "owner-tunnel".into();
         let config = McpGatewayConfig {
             enabled: true,
             local_port: profile.runtime.local_port,
-            owner_workspace_id: profile.id.clone(),
+            tunnel_id: profile.tunnel_id.clone(),
             ..McpGatewayConfig::default()
         };
         assert!(validate_config(&config, &[profile]).is_err());
@@ -1225,14 +1235,20 @@ mod tests {
 
     #[test]
     fn enabled_gateway_owner_cannot_be_removed() {
+        let mut owner = WorkspaceProfile::new("C:/owner".into(), Some("owner".into()));
+        owner.id = "owner".into();
+        owner.tunnel_id = "owner-tunnel".into();
+        let mut other = WorkspaceProfile::new("C:/other".into(), Some("other".into()));
+        other.id = "other".into();
         let config = McpGatewayConfig {
             enabled: true,
             local_port: 28765,
-            owner_workspace_id: "owner".into(),
+            tunnel_id: "owner-tunnel".into(),
             ..McpGatewayConfig::default()
         };
-        assert!(ensure_workspace_is_not_owner(&config, "owner").is_err());
-        assert!(ensure_workspace_is_not_owner(&config, "other").is_ok());
+        let profiles = [owner, other];
+        assert!(ensure_workspace_is_not_owner(&config, &profiles, "owner").is_err());
+        assert!(ensure_workspace_is_not_owner(&config, &profiles, "other").is_ok());
     }
 
     #[tokio::test]

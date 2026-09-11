@@ -69,8 +69,8 @@ anchor show <workspace>
 # 检查配置端口是否正在监听
 anchor status <workspace>
 
-# 后台启动并返回终端
-anchor start <workspace> --service all --tunnel
+# 后台启动并返回终端；已启用的顶级 Tunnel 会由 daemon 自动托管
+anchor start <workspace> --service all
 
 # 查看日志和诊断
 anchor logs <workspace> --service daemon
@@ -90,8 +90,11 @@ anchor serve <workspace>
 # 同时启动 MCP
 anchor serve <workspace> --service all
 
-# 按 profile 中的隧道配置一并启动隧道
-anchor serve <workspace> --service all --tunnel
+# 如需公网 Tunnel，单独创建/配置/启用
+anchor tunnel create <workspace> --name example-mcp
+anchor tunnel configure example-mcp --type cloudflare --cloudflare-mode named
+anchor tunnel enable example-mcp
+anchor serve <workspace> --service all
 
 # 自动化使用结构化输出
 anchor --json status <workspace>
@@ -106,7 +109,7 @@ anchor --json status <workspace>
 需要让多个工作区共用一条 MCP 隧道时：
 
 ```bash
-anchor gateway configure --enable --port 28765 --owner PROJECT_A
+anchor gateway configure --enable --port 28765 --tunnel TUNNEL_ID_OR_NAME
 anchor gateway show
 anchor gateway serve PROJECT_A PROJECT_B PROJECT_C
 ```
@@ -120,7 +123,7 @@ anchor gateway serve PROJECT_A PROJECT_B PROJECT_C
 Linux 现在由 Anchor 原生维护配置域专属的 systemd user control-plane service。先按需要启动 Workspace/Gateway，让 desired state 写入 service plan，然后安装：
 
 ```bash
-anchor start Anchor --service mcp --tunnel
+anchor start Anchor --service mcp
 anchor service install
 anchor service status
 ```
@@ -168,7 +171,7 @@ sudo loginctl enable-linger "$USER"
 - 可以共用同一个配置目录和 workspace/profile。
 - 配置文件写入有跨进程锁和最近有效备份。
 - 不要通过不同入口并发启动同一个 workspace 的同一种服务；control-plane/端口 ownership 检查会阻止重复接管。
-- CLI 默认不启动隧道，只有显式传入 `--tunnel` 才使用 profile 中已保存的隧道配置。
+- Tunnel 是顶级资源；Workspace daemon 是否自动托管由 `anchor tunnel enable/disable` 决定，公开的 Workspace `--tunnel` 参数已移除。
 - 修改配置后应通过当前 Workspace daemon/control-plane 的受控 apply/reload/restart 路径生效；不要另起第二个 listener 试图覆盖活动运行态。
 
 ## Agent Skills

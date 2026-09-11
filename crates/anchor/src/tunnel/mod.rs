@@ -2,6 +2,7 @@ mod access;
 mod cloudflare;
 mod download;
 mod frp;
+mod model;
 mod software;
 mod supervisor;
 
@@ -13,6 +14,7 @@ pub use access::{
 pub use cloudflare::resolve_cloudflared;
 pub use frp::resolve_frpc;
 pub(crate) use frp::validate_workspace_frp_config;
+pub use model::{TunnelConfig, TunnelProfile};
 pub(crate) use software::target_version as software_target_version;
 pub(crate) use software::{
     install_software, is_supported_kind as is_supported_software_kind, list_software,

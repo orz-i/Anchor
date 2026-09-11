@@ -13,7 +13,9 @@ use crate::platform::{open_path_in_file_manager, platform};
 use crate::settings::{
     AppSettings, DownloadConfig, FrpProfile, FrpProfileInput, McpGatewayConfig, ProxyConfig,
 };
-use crate::tunnel::{drop_workspace as drop_tunnel_workspace, TunnelServiceKind, TunnelStatus};
+use crate::tunnel::{
+    drop_workspace as drop_tunnel_workspace, TunnelProfile, TunnelServiceKind, TunnelStatus,
+};
 use crate::workspace::resources::{
     assign_free_workspace_ports_with_reserved, validate_service_start, WorkspaceService,
 };
@@ -647,7 +649,11 @@ pub(crate) async fn delete_workspace_with_timeout(
     timeout: Duration,
 ) -> AppResult<WorkspaceDeletion> {
     let store = DataStore::load()?;
-    crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, id)?;
+    crate::mcp::gateway::ensure_workspace_is_not_owner(
+        &store.settings().mcp_gateway,
+        store.list(),
+        id,
+    )?;
     let profile = store
         .get(id)
         .cloned()
@@ -695,7 +701,11 @@ pub(crate) async fn delete_workspace_with_timeout(
     crate::daemon::cleanup(&profile)?;
 
     let mut store = DataStore::load()?;
-    crate::mcp::gateway::ensure_workspace_is_not_owner(&store.settings().mcp_gateway, id)?;
+    crate::mcp::gateway::ensure_workspace_is_not_owner(
+        &store.settings().mcp_gateway,
+        store.list(),
+        id,
+    )?;
     let removed = store
         .remove(id)?
         .ok_or_else(|| AppError::Message(format!("workspace 已不存在：{}", profile.id)))?;
@@ -826,6 +836,248 @@ pub(crate) fn get_mcp_gateway() -> AppResult<crate::settings::McpGatewayConfig> 
     DataStore::read_file(|data| Ok(data.mcp_gateway.clone()))
 }
 
+pub(crate) fn list_tunnels() -> AppResult<Vec<TunnelProfile>> {
+    Ok(DataStore::load()?.list_tunnels().to_vec())
+}
+
+pub(crate) fn create_tunnel(workspace_id: &str, name: Option<&str>) -> AppResult<TunnelProfile> {
+    let mut store = DataStore::load()?;
+    let workspace = store
+        .get(workspace_id)
+        .cloned()
+        .ok_or_else(|| AppError::Message(format!("workspace not found: {workspace_id}")))?;
+    if store.tunnel_for_workspace(workspace_id).is_some() {
+        return Err(AppError::Message(format!(
+            "workspace {} 已存在 MCP Tunnel；请编辑现有 Tunnel",
+            workspace.name
+        )));
+    }
+    let mut tunnel = TunnelProfile::new(workspace.id, &workspace.name, "mcp");
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        tunnel.name = name.to_string();
+    }
+    store.register_tunnel(tunnel.clone())?;
+    Ok(tunnel)
+}
+
+pub(crate) async fn update_tunnel(mut tunnel: TunnelProfile) -> AppResult<TunnelProfile> {
+    tunnel.name = tunnel.name.trim().to_string();
+    tunnel.workspace_id = tunnel.workspace_id.trim().to_string();
+    tunnel.service = tunnel.service.trim().to_ascii_lowercase();
+    tunnel.config.public_url = tunnel
+        .config
+        .public_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if tunnel.name.is_empty() {
+        return Err(AppError::Message("Tunnel 名称不能为空".into()));
+    }
+    let store = DataStore::load()?;
+    let current = store
+        .get_tunnel(&tunnel.id)
+        .cloned()
+        .ok_or_else(|| AppError::Message(format!("tunnel not found: {}", tunnel.id)))?;
+    if tunnel.workspace_id != current.workspace_id || tunnel.service != current.service {
+        return Err(AppError::Message(
+            "Tunnel target is immutable; delete and recreate the Tunnel to retarget it".into(),
+        ));
+    }
+    let settings = store.settings();
+    let mut runtime_profile = store.get(&current.workspace_id).cloned().ok_or_else(|| {
+        AppError::Message(format!("workspace not found: {}", current.workspace_id))
+    })?;
+    runtime_profile.tunnel = current.config.clone();
+    runtime_profile.tunnel_id = current.id.clone();
+    runtime_profile.tunnel_enabled = current.enabled;
+    runtime_profile.tunnel_revision = current.revision;
+    drop(store);
+
+    let runtime_changed = current.config != tunnel.config;
+    tunnel.revision = if runtime_changed {
+        current.revision.saturating_add(1)
+    } else {
+        current.revision
+    };
+    let gateway_selected =
+        settings.mcp_gateway.enabled && settings.mcp_gateway.tunnel_id == tunnel.id;
+    let direct_daemon_running =
+        !settings.mcp_gateway.enabled && crate::daemon::inspect(&runtime_profile)?.running;
+    let direct_running = if direct_daemon_running {
+        daemon_tunnel_status(&runtime_profile, TunnelServiceKind::Mcp)
+            .await
+            .is_ok_and(|status| status.state == "running")
+    } else {
+        false
+    };
+
+    let mut store = DataStore::load()?;
+    store.update_tunnel(tunnel.clone())?;
+    drop(store);
+
+    let runtime_result = if gateway_selected && runtime_changed {
+        set_mcp_gateway(settings.mcp_gateway.clone())
+            .await
+            .map(|_| ())
+    } else if direct_running && (!tunnel.enabled || tunnel.config.tunnel_type == "none") {
+        stop_tunnel(&tunnel.id).await.map(|_| ())
+    } else if direct_daemon_running
+        && tunnel.enabled
+        && tunnel.config.tunnel_type != "none"
+        && (runtime_changed || (!current.enabled && tunnel.enabled))
+    {
+        async {
+            if direct_running {
+                stop_tunnel(&tunnel.id).await?;
+            }
+            start_tunnel(&tunnel.id).await?;
+            Ok(())
+        }
+        .await
+    } else {
+        Ok(())
+    };
+    if let Err(error) = runtime_result {
+        let mut store = DataStore::load()?;
+        store.update_tunnel(current.clone())?;
+        drop(store);
+        if gateway_selected {
+            let _ = set_mcp_gateway(settings.mcp_gateway).await;
+        } else if direct_running {
+            let _ = start_tunnel(&current.id).await;
+        }
+        return Err(error);
+    }
+    Ok(tunnel)
+}
+
+pub(crate) async fn delete_tunnel(id: &str) -> AppResult<()> {
+    let (tunnel, profile, settings) = load_tunnel_target_unchecked(id)?;
+    if settings.mcp_gateway.enabled && settings.mcp_gateway.tunnel_id == id {
+        return Err(AppError::Message(
+            "Tunnel is used by the enabled MCP Gateway; select another Tunnel or disable Gateway first"
+                .into(),
+        ));
+    }
+    if !settings.mcp_gateway.enabled && crate::daemon::inspect(&profile)?.running {
+        let _ = control::request_tunnel_operation(
+            &profile,
+            TunnelServiceKind::parse(&tunnel.service)?,
+            control::ControlTunnelAction::Stop,
+            MANAGEMENT_TUNNEL_TIMEOUT,
+        )
+        .await;
+    }
+    let mut store = DataStore::load()?;
+    if store.remove_tunnel(id)?.is_none() {
+        return Err(AppError::Message(format!("tunnel not found: {id}")));
+    }
+    Ok(())
+}
+
+fn tunnel_secret_scope(key: &str) -> AppResult<&'static str> {
+    match key {
+        "frp_token" => Ok("tunnel_frp_token"),
+        "cloudflare_token" => Ok("tunnel_cloudflare_token"),
+        _ => Err(AppError::Message(format!(
+            "invalid tunnel secret key: {key}"
+        ))),
+    }
+}
+
+pub(crate) fn get_tunnel_secret(id: &str, key: &str) -> AppResult<Option<String>> {
+    let scope = tunnel_secret_scope(key)?;
+    DataStore::read_file(|data| {
+        if !data.tunnels.iter().any(|tunnel| tunnel.id == id) {
+            return Err(AppError::Message(format!("tunnel not found: {id}")));
+        }
+        Ok(data
+            .app_secrets
+            .get(scope)
+            .and_then(|items| items.get(id))
+            .filter(|value| !value.is_empty())
+            .cloned())
+    })
+}
+
+pub(crate) async fn set_tunnel_secret(id: &str, key: &str, value: &str) -> AppResult<()> {
+    let scope = tunnel_secret_scope(key)?;
+    let (tunnel, profile, settings) = load_tunnel_target_unchecked(id)?;
+    let previous = get_tunnel_secret(id, key)?.unwrap_or_default();
+    let next = value.trim().to_string();
+    if previous == next {
+        return Ok(());
+    }
+    let direct_daemon_running =
+        !settings.mcp_gateway.enabled && crate::daemon::inspect(&profile)?.running;
+    let direct_running = if direct_daemon_running {
+        daemon_tunnel_status(&profile, TunnelServiceKind::parse(&tunnel.service)?)
+            .await
+            .is_ok_and(|status| status.state == "running")
+    } else {
+        false
+    };
+    DataStore::update_file(|data| {
+        let tunnel = data
+            .tunnels
+            .iter_mut()
+            .find(|tunnel| tunnel.id == id)
+            .ok_or_else(|| AppError::Message(format!("tunnel not found: {id}")))?;
+        tunnel.revision = tunnel.revision.saturating_add(1);
+        let items = data.app_secrets.entry(scope.to_string()).or_default();
+        if next.is_empty() {
+            items.remove(id);
+        } else {
+            items.insert(id.to_string(), next.clone());
+        }
+        Ok(())
+    })?;
+
+    let gateway_selected = settings.mcp_gateway.enabled && settings.mcp_gateway.tunnel_id == id;
+    let runtime_result = if gateway_selected {
+        set_mcp_gateway(settings.mcp_gateway.clone())
+            .await
+            .map(|_| ())
+    } else if direct_running
+        || (direct_daemon_running && tunnel.enabled && tunnel.config.tunnel_type != "none")
+    {
+        async {
+            if direct_running {
+                stop_tunnel(id).await?;
+            }
+            start_tunnel(id).await?;
+            Ok(())
+        }
+        .await
+    } else {
+        Ok(())
+    };
+    if let Err(error) = runtime_result {
+        DataStore::update_file(|data| {
+            let current = data
+                .tunnels
+                .iter_mut()
+                .find(|item| item.id == id)
+                .ok_or_else(|| AppError::Message(format!("tunnel not found: {id}")))?;
+            current.revision = tunnel.revision;
+            let items = data.app_secrets.entry(scope.to_string()).or_default();
+            if previous.is_empty() {
+                items.remove(id);
+            } else {
+                items.insert(id.to_string(), previous.clone());
+            }
+            Ok(())
+        })?;
+        if gateway_selected {
+            let _ = set_mcp_gateway(settings.mcp_gateway).await;
+        } else if direct_running {
+            let _ = start_tunnel(id).await;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub(crate) async fn get_mcp_gateway_status() -> AppResult<GatewayControlStatus> {
     gateway_control::status_via_daemon_or_local().await
 }
@@ -843,7 +1095,7 @@ pub(crate) async fn set_mcp_gateway(
         config.clear_observation();
     } else {
         config.observed_public_url = previous.observed_public_url.clone();
-        config.observed_owner_workspace_id = previous.observed_owner_workspace_id.clone();
+        config.observed_tunnel_id = previous.observed_tunnel_id.clone();
         config.observed_tunnel_signature = previous.observed_tunnel_signature.clone();
     }
     crate::mcp::gateway::validate_config(&config, &profiles)?;
@@ -1034,18 +1286,23 @@ fn persist_tunnel_public_url(id: &str, kind: TunnelServiceKind, public_url: &str
         return Ok(());
     }
     DataStore::update_file(|data| {
-        let Some(profile) = data.profiles.iter_mut().find(|profile| profile.id == id) else {
+        let Some(tunnel) = data.tunnels.iter_mut().find(|tunnel| tunnel.id == id) else {
             return Ok(());
         };
         match kind {
-            TunnelServiceKind::Mcp => profile.tunnel.public_url = public_url.to_string(),
+            TunnelServiceKind::Mcp => tunnel.config.public_url = public_url.to_string(),
         }
         Ok(())
     })?;
-    let service = match kind {
-        TunnelServiceKind::Mcp => "mcp",
-    };
-    crate::runtime::update_public_url(id, service, public_url);
+    let (workspace_id, service) = DataStore::read_file(|data| {
+        let tunnel = data
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == id)
+            .ok_or_else(|| AppError::Message(format!("tunnel not found: {id}")))?;
+        Ok((tunnel.workspace_id.clone(), tunnel.service.clone()))
+    })?;
+    crate::runtime::update_public_url(&workspace_id, &service, public_url);
     Ok(())
 }
 
@@ -1066,16 +1323,35 @@ async fn daemon_tunnel_status(
     .ok_or_else(|| AppError::Message("daemon control status omitted tunnel state".into()))
 }
 
-fn load_tunnel_workspace(id: &str, kind: TunnelServiceKind) -> AppResult<WorkspaceProfile> {
-    let service = workspace_service_for_tunnel(kind);
+fn load_tunnel_target_unchecked(
+    id: &str,
+) -> AppResult<(TunnelProfile, WorkspaceProfile, AppSettings)> {
     let store = DataStore::load()?;
-    validate_service_start(store.list(), id, service)?;
-    let profile = store
-        .get(id)
+    let tunnel = store
+        .get_tunnel(id)
         .cloned()
-        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
-    reject_gateway_managed_mcp(&store.settings(), service)?;
-    Ok(profile)
+        .ok_or_else(|| AppError::Message(format!("tunnel not found: {id}")))?;
+    let kind = TunnelServiceKind::parse(&tunnel.service)?;
+    let service = workspace_service_for_tunnel(kind);
+    validate_service_start(store.list(), &tunnel.workspace_id, service)?;
+    let mut profile = store.get(&tunnel.workspace_id).cloned().ok_or_else(|| {
+        AppError::Message(format!("workspace not found: {}", tunnel.workspace_id))
+    })?;
+    let settings = store.settings();
+    profile.tunnel = tunnel.config.clone();
+    profile.tunnel_id = tunnel.id.clone();
+    profile.tunnel_enabled = tunnel.enabled;
+    profile.tunnel_revision = tunnel.revision;
+    Ok((tunnel, profile, settings))
+}
+
+fn load_tunnel_target(id: &str) -> AppResult<(TunnelProfile, WorkspaceProfile, AppSettings)> {
+    let (tunnel, profile, settings) = load_tunnel_target_unchecked(id)?;
+    reject_gateway_managed_mcp(
+        &settings,
+        workspace_service_for_tunnel(TunnelServiceKind::parse(&tunnel.service)?),
+    )?;
+    Ok((tunnel, profile, settings))
 }
 
 fn tunnel_is_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
@@ -1084,9 +1360,9 @@ fn tunnel_is_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> 
     }
 }
 
-pub(crate) async fn start_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelStatus> {
-    let kind = TunnelServiceKind::parse(service)?;
-    let profile = load_tunnel_workspace(id, kind)?;
+pub(crate) async fn start_tunnel(id: &str) -> AppResult<TunnelStatus> {
+    let (tunnel, profile, _) = load_tunnel_target(id)?;
+    let kind = TunnelServiceKind::parse(&tunnel.service)?;
     if !tunnel_is_configured(&profile, kind) {
         return configured_tunnel_status(&profile, kind);
     }
@@ -1100,6 +1376,44 @@ pub(crate) async fn start_workspace_tunnel(id: &str, service: &str) -> AppResult
     .map_err(|error| AppError::Message(format!("daemon 隧道启动失败：{error}")))?;
     persist_tunnel_public_url(id, kind, &status.public_url)?;
     Ok(status)
+}
+
+pub(crate) async fn stop_tunnel(id: &str) -> AppResult<TunnelStatus> {
+    let (tunnel, profile, _) = load_tunnel_target(id)?;
+    let kind = TunnelServiceKind::parse(&tunnel.service)?;
+    if !crate::daemon::inspect(&profile)?.running {
+        return configured_tunnel_status(&profile, kind);
+    }
+    control::request_tunnel_operation(
+        &profile,
+        kind,
+        control::ControlTunnelAction::Stop,
+        MANAGEMENT_TUNNEL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| AppError::Message(format!("daemon 隧道停止失败：{error}")))?;
+    configured_tunnel_status(&profile, kind)
+}
+
+pub(crate) async fn get_tunnel_status(id: &str) -> AppResult<TunnelStatus> {
+    let (tunnel, profile, settings) = load_tunnel_target_unchecked(id)?;
+    let kind = TunnelServiceKind::parse(&tunnel.service)?;
+    if settings.mcp_gateway.enabled {
+        if settings.mcp_gateway.tunnel_id == id {
+            let status = get_mcp_gateway_status().await?;
+            return Ok(TunnelStatus {
+                state: if status.running {
+                    "running".into()
+                } else {
+                    status.state
+                },
+                public_url: status.public_base_url,
+                tunnel_pid: None,
+            });
+        }
+        return configured_tunnel_status(&profile, kind);
+    }
+    daemon_tunnel_status(&profile, kind).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1146,10 +1460,10 @@ async fn restore_tunnel_test_runtime(
         .map(|_| ())
 }
 
-pub(crate) async fn test_workspace_tunnel(id: &str, service: &str) -> AppResult<TunnelTestResult> {
-    let kind = TunnelServiceKind::parse(service)?;
+pub(crate) async fn test_tunnel(id: &str) -> AppResult<TunnelTestResult> {
+    let (tunnel, profile, _) = load_tunnel_target(id)?;
+    let kind = TunnelServiceKind::parse(&tunnel.service)?;
     let target_service = workspace_service_for_tunnel(kind);
-    let profile = load_tunnel_workspace(id, kind)?;
     if !tunnel_is_configured(&profile, kind) {
         return Err(AppError::Message("当前服务未配置隧道。".into()));
     }
@@ -1444,8 +1758,6 @@ const WORKSPACE_SECRET_KEYS: &[&str] = &[
     "oauth_password",
     "oauth_token_secret",
     "bearer_token",
-    "cloudflare_token",
-    "frp_token",
 ];
 
 const SHARED_SECRET_KEYS: &[&str] = &[
@@ -1822,9 +2134,9 @@ fn ensure_frp_profile_not_live(
         }
     }
 
-    if gateway.enabled && !gateway.owner_workspace_id.trim().is_empty() {
+    if gateway.enabled && !gateway.tunnel_id.trim().is_empty() {
         if let Some(owner) = workspaces.iter().find(|workspace| {
-            workspace.id == gateway.owner_workspace_id
+            workspace.tunnel_id == gateway.tunnel_id
                 && workspace.tunnel.frp_profile_id == profile.id
         }) {
             let inspection = crate::gateway_daemon::inspect()?;

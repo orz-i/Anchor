@@ -8,6 +8,7 @@ import {
   ListTodo,
   Moon,
   Network,
+  RadioTower,
   Settings2,
   Sun,
   Wrench,
@@ -39,6 +40,7 @@ export function AppShell() {
   const { resolvedTheme, setTheme } = useTheme();
 
   const isWorkspaceRoute = location.pathname.startsWith("/workspaces");
+  const isTunnelRoute = location.pathname.startsWith("/tunnels");
   const isTasksRoute = location.pathname.startsWith("/tasks");
   const isNotificationRoute = location.pathname.startsWith("/notifications");
 
@@ -128,7 +130,29 @@ export function AppShell() {
               </NavLink>
             </div>
 
-            {/* 分组 2: 任务 */}
+            {/* 分组 2: Tunnel */}
+            <div className="flex flex-col gap-1">
+              <p className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                Network
+              </p>
+              <NavLink
+                to="/tunnels"
+                className={cn(
+                  "flex items-center justify-between rounded-lg px-3 py-2 text-sm transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                  isTunnelRoute
+                    ? "bg-sidebar-accent font-semibold text-sidebar-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <div className="flex items-center gap-2.5">
+                  <RadioTower className="size-4 shrink-0 opacity-80" />
+                  <span>隧道</span>
+                </div>
+                <ChevronRight className="size-3 opacity-40" />
+              </NavLink>
+            </div>
+
+            {/* 分组 3: 任务 */}
             <div className="flex flex-col gap-1">
               <p className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 Tasks
@@ -150,7 +174,7 @@ export function AppShell() {
               </NavLink>
             </div>
 
-            {/* 分组 3: 通知 */}
+            {/* 分组 4: 通知 */}
             <div className="flex flex-col gap-1">
               <p className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 Notification
@@ -172,7 +196,7 @@ export function AppShell() {
               </NavLink>
             </div>
 
-            {/* 分组 4: 系统设置 */}
+            {/* 分组 5: 系统设置 */}
             <div className="flex flex-col gap-1">
               <p className="px-2 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
                 系统设置

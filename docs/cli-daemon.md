@@ -21,8 +21,8 @@ Workspace 注册、注销和 GPT 连接配置见 [Workspace CLI 注册与 GPT �
 # 后台启动 MCP
 anchor start PROFILE_ID
 
-# 后台启动 MCP + 隧道
-anchor start PROFILE_ID --service all --tunnel
+# 后台启动 MCP；指向该 Workspace 的已启用顶级 Tunnel 会自动托管
+anchor start PROFILE_ID --service all
 
 # 查看 daemon、PID 与端口所有权
 anchor status PROFILE_ID
@@ -83,11 +83,10 @@ anchor gateway stop
 ```bash
 anchor start <workspace> \
   [--service mcp|all] \
-  [--tunnel|--no-tunnel] \
   [--wait SECONDS]
 ```
 
-- 默认启动 MCP，不启动隧道；
+- 默认启动 MCP；Tunnel 是否自动托管由顶级 `anchor tunnel enable/disable` 配置决定；
 - 创建独立 session，stdin 关闭，stdout/stderr 写入 `daemon.log`；
 - 等待选中服务的本地端口由 daemon PID 监听后返回；
 - 默认最多等待 10 秒；
@@ -112,10 +111,10 @@ anchor stop <workspace> [--timeout SECONDS] [--force]
 ### `restart`
 
 ```bash
-anchor restart <workspace> [--service ...] [--tunnel|--no-tunnel]
+anchor restart <workspace> [--service ...]
 ```
 
-未提供 service/tunnel 参数时，沿用当前 daemon 状态文件中的参数。没有当前状态时回退为 MCP、无隧道。
+未提供 service 参数时沿用当前 daemon 状态；Tunnel desired state 始终从顶级 Tunnel 资源重新解析，不从 restart 参数或旧 daemon 状态继承。
 
 ### `upgrade`
 
@@ -369,7 +368,7 @@ anchor --json config set <workspace> --set PATH=VALUE [--set PATH=VALUE ...]
 anchor --json config apply <workspace> [--wait SECONDS]
 ```
 
-- `config get` 和 `config diff` 是只读操作；`--key` 与 `--set` 使用 `WorkspaceProfile` 的序列化字段路径，例如 `runtime.local_port`、`auth.oauth_redirect_hosts`、`tunnel.type`。
+- `config get` 和 `config diff` 是只读操作；`--key` 与 `--set` 只使用 `WorkspaceProfile` 当前仍持久化的序列化字段路径，例如 `runtime.local_port`、`auth.oauth_redirect_hosts`。Tunnel 配置必须使用独立的 `anchor tunnel configure`。
 - `config set` 不修改活动 `profiles.json`，只写入配置目录下受保护的 `pending-config/<workspace>.json`；pending 同时保存 staging 时的 base profile，活动配置被其他 Web Admin/CLI 进程修改后会检测 stale base 并拒绝覆盖。
 - `config diff` 默认比较活动 profile 与当前 pending candidate，也可追加临时 `--set` 预览；输出 field-level changes 和共享 `applyPlan`，不会写磁盘或运行态。
 - `config apply` 才把 pending candidate 提升为活动配置。Workspace daemon 运行时必须通过 protocol v7 `apply_config`；endpoint、协议或 PID 归属错误直接失败，不回退为 CLI 本地 `RuntimeSupervisor`。Gateway route/owner 需要更新时只通过独立 Gateway control reload。
@@ -429,7 +428,7 @@ Web Admin 的安装/卸载/启停操作会通过内部 `service-admin-run` helpe
 Linux 当前也由 Anchor 原生维护配置域专属的 systemd-user control-plane。推荐先通过正常 Workspace/Gateway 命令形成 desired state，再安装 service：
 
 ```bash
-anchor start PROFILE_ID --service mcp --tunnel
+anchor start PROFILE_ID --service mcp
 anchor service install
 anchor service status
 ```
@@ -454,7 +453,7 @@ anchor upgrade --all
 ```ini
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/anchor serve PROFILE_ID --service all --tunnel
+ExecStart=/usr/local/bin/anchor serve PROFILE_ID --service all
 Restart=on-failure
 RestartSec=3
 ```

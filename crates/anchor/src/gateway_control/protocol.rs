@@ -115,7 +115,7 @@ pub struct GatewayControlStatus {
     pub public_base_url: String,
     pub route_count: usize,
     pub route_workspace_ids: Vec<String>,
-    pub owner_workspace_id: String,
+    pub tunnel_id: String,
     pub error: String,
     pub detail: String,
 }

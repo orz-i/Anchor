@@ -64,7 +64,7 @@ POST /federation/v2/read        # authenticated + signed read-only transport
 启用后：
 
 - 旧的工作区直连 MCP 隧道会停止；
-- owner 的 MCP 隧道改为代理 Gateway 端口；
+- 所选顶级 Tunnel 改为代理 Gateway 端口；
 - 各工作区 listener 继续独立运行；
 - 停止一个工作区只删除其 Gateway 路由；
 - 最后一个工作区停止后，Gateway 和共享隧道才会停止。
@@ -100,9 +100,9 @@ Gateway 将用户填写的固定公网地址与运行时观测到的隧道地址
 
 - `publicUrl`：用户配置的固定入口；
 - `observedPublicUrl`：最近一次成功启动后观测到的运行时入口；
-- observed owner/signature：该观测地址所属的 owner 和隧道身份。
+- observed tunnel/signature：该观测地址所属的 Tunnel 和隧道身份。
 
-首次启动 Quick Tunnel 时，实际公网基础地址只写入运行时观测字段，不会覆盖用户配置，也不会触发隧道误重启。owner、Gateway 端口、固定地址或 owner 隧道配置变化时，旧观测状态会被清除。
+首次启动 Quick Tunnel 时，实际公网基础地址只写入运行时观测字段，不会覆盖用户配置，也不会触发隧道误重启。Tunnel、Gateway 端口、固定地址或 Tunnel 配置变化时，旧观测状态会被清除。
 
 后续若 Quick Tunnel 地址发生变化，服务会拒绝静默迁移并停止无效线路，因为所有 ChatGPT 工作区连接都需要更新。需要稳定地址时应使用 FRP、Cloudflare Named Tunnel 或其他固定域名入口。
 
@@ -114,13 +114,13 @@ Gateway 将用户填写的固定公网地址与运行时观测到的隧道地址
 anchor gateway show
 ```
 
-启用并指定 owner：
+启用并指定顶级 Tunnel：
 
 ```bash
 anchor gateway configure \
   --enable \
   --port 28765 \
-  --owner PROJECT_A
+  --tunnel TUNNEL_ID_OR_NAME
 ```
 
 启动多个工作区：
@@ -170,7 +170,7 @@ RestartSec=3
 
 并发许可会保持到响应流结束，不能通过建立长流后提前释放额度。Gateway graceful shutdown 最多等待 3 秒；存在未结束长流时会强制 abort 并等待任务退出。
 
-Gateway/Workspace runtime 和共享隧道恢复使用有上限的指数退避。Quick Tunnel 地址漂移进入阻断状态，只有修改 Gateway 或 owner 隧道配置后才重新尝试。Web Admin 通过 Gateway control events/status 刷新路由与日志状态，不创建第二套 Gateway runtime，也不会用后台刷新覆盖用户正在编辑的草稿。
+Gateway/Workspace runtime 和共享隧道恢复使用有上限的指数退避。Quick Tunnel 地址漂移进入阻断状态，只有修改 Gateway 或所选 Tunnel 配置后才重新尝试。Web Admin 通过 Gateway control events/status 刷新路由与日志状态，不创建第二套 Gateway runtime，也不会用后台刷新覆盖用户正在编辑的草稿。
 
 ## 当前第一阶段边界
 
@@ -190,7 +190,7 @@ Gateway/Workspace runtime 和共享隧道恢复使用有上限的指数退避。
 - 全局及每工作区限流；
 - SSE 并发许可与强制关闭；
 - Header 清理、多值响应 Header 和 URL 负向校验；
-- observed owner/signature 失配；
+- observed tunnel/signature 失配；
 - CLI 与 Web Admin 构建组合。
 
 发布候选仍应进行真实 Web Admin、两个 ChatGPT App 的 OAuth 授权、真实固定隧道/Quick Tunnel、Linux systemd-user service 和外部压力测试。代码测试通过不等同于这些外部环境已经验证。

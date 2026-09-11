@@ -17,6 +17,7 @@
 | --- | --- |
 | 第一次安装并连接 ChatGPT | [项目 README](../README.md) |
 | 注册、查看、启动 Workspace | [Workspace CLI](workspace-cli.md) |
+| 统一管理 FRP / Cloudflare Tunnel | [Tunnel 统一管理](tunnel.md) |
 | Linux/headless 部署 | [Linux CLI](linux-cli.md) |
 | daemon、upgrade、service 与故障恢复 | [CLI Daemon 与运维](cli-daemon.md) |
 | 多 Workspace 共用一个 MCP Gateway | [单一 MCP Gateway](mcp-gateway.md) |
@@ -77,6 +78,7 @@ environment { operation: "check" }
 以下文档以“如何使用产品”为主：
 
 - [Workspace CLI](workspace-cli.md)
+- [Tunnel 统一管理](tunnel.md)
 - [Dynamic MCP](dynamic-mcp.md)
 - [Agent Skill package lifecycle](skill-service.md)
 - [Git worktree](git-worktrees.md)
@@ -86,6 +88,7 @@ environment { operation: "check" }
 以下文档涉及部署、运行态与安全边界：
 
 - [Linux CLI](linux-cli.md)
+- [Tunnel 统一管理](tunnel.md)
 - [CLI Daemon 与运维](cli-daemon.md)
 - [单一 MCP Gateway](mcp-gateway.md)
 - [跨平台配置迁移](config-migration.md)

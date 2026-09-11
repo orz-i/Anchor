@@ -66,13 +66,12 @@ export async function setProxy(proxy: ProxyConfigDto): Promise<void> {
 }
 
 export interface McpGatewayConfigDto {
-  urlModelVersion: number;
   enabled: boolean;
   localPort: number;
-  ownerWorkspaceId: string;
+  tunnelId: string;
   publicUrl: string;
   observedPublicUrl: string;
-  observedOwnerWorkspaceId: string;
+  observedTunnelId: string;
   observedTunnelSignature: string;
 }
 

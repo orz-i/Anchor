@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::settings::AppSettings;
+use crate::tunnel::TunnelConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -8,30 +9,19 @@ pub struct WorkspaceProfile {
     pub id: String,
     pub name: String,
     pub path: String,
-    pub tunnel: TunnelConfig,
+    /// Derived runtime projection of the top-level Tunnel resource targeting
+    /// this workspace MCP service. It is intentionally excluded from the
+    /// workspace persistence/API model; Tunnel is the sole configuration owner.
+    #[serde(skip, default = "TunnelConfig::disabled")]
+    pub(crate) tunnel: TunnelConfig,
+    #[serde(skip, default)]
+    pub(crate) tunnel_id: String,
+    #[serde(skip, default)]
+    pub(crate) tunnel_enabled: bool,
+    #[serde(skip, default)]
+    pub(crate) tunnel_revision: u64,
     pub auth: AuthConfig,
     pub runtime: RuntimeConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TunnelConfig {
-    #[serde(rename = "type")]
-    pub tunnel_type: String,
-    pub public_url: String,
-    pub frp_server: String,
-    pub frp_subdomain: String,
-    pub frp_profile_id: String,
-    pub frp_server_port: u16,
-    #[serde(default = "default_frp_proxy_type")]
-    pub frp_proxy_type: String,
-    #[serde(default)]
-    pub frp_cert_path: String,
-    #[serde(default)]
-    pub frp_key_path: String,
-    pub cloudflare_mode: String,
-    /// When true, apply global proxy from Settings → General when starting the tunnel.
-    pub use_proxy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,28 +113,8 @@ pub struct RuntimeRecoveryDto {
     pub last_error: String,
 }
 
-fn default_tunnel_type() -> String {
-    "cloudflare".to_string()
-}
-
-fn default_new_cloudflare_mode() -> String {
-    "named".to_string()
-}
-
-fn default_use_proxy() -> bool {
-    true
-}
-
 fn default_auth_type() -> String {
     "oauth".to_string()
-}
-
-fn default_frp_server_port() -> u16 {
-    7000
-}
-
-fn default_frp_proxy_type() -> String {
-    "http".to_string()
 }
 
 fn default_oauth_client_id() -> String {
@@ -195,24 +165,6 @@ fn default_external_paid_max_duration_seconds() -> u64 {
     1800
 }
 
-impl Default for TunnelConfig {
-    fn default() -> Self {
-        Self {
-            tunnel_type: default_tunnel_type(),
-            public_url: String::new(),
-            frp_server: String::new(),
-            frp_subdomain: String::new(),
-            frp_profile_id: String::new(),
-            frp_server_port: default_frp_server_port(),
-            frp_proxy_type: default_frp_proxy_type(),
-            frp_cert_path: String::new(),
-            frp_key_path: String::new(),
-            cloudflare_mode: default_new_cloudflare_mode(),
-            use_proxy: default_use_proxy(),
-        }
-    }
-}
-
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -261,7 +213,10 @@ impl WorkspaceProfile {
             id: uuid::Uuid::new_v4().to_string().replace('-', ""),
             name: label,
             path: cleaned,
-            tunnel: TunnelConfig::default(),
+            tunnel: TunnelConfig::disabled(),
+            tunnel_id: String::new(),
+            tunnel_enabled: false,
+            tunnel_revision: 0,
             auth: AuthConfig::default(),
             runtime: RuntimeConfig::default(),
         }
@@ -276,14 +231,7 @@ impl WorkspaceProfile {
     }
 
     pub fn effective_public_url_with(&self, settings: &AppSettings) -> String {
-        computed_public_url(
-            &self.tunnel.tunnel_type,
-            &self.tunnel.frp_server,
-            &self.tunnel.frp_subdomain,
-            &self.tunnel.public_url,
-            &self.tunnel.frp_profile_id,
-            settings,
-        )
+        self.tunnel.effective_public_url(settings)
     }
 
     /// External base URL used by this logical MCP server. In gateway mode the
@@ -309,40 +257,17 @@ impl WorkspaceProfile {
     }
 }
 
-fn computed_public_url(
-    tunnel_type: &str,
-    frp_server: &str,
-    frp_subdomain: &str,
-    public_url: &str,
-    frp_profile_id: &str,
-    settings: &AppSettings,
-) -> String {
-    if tunnel_type == "frp" {
-        let explicit = public_url.trim().trim_end_matches('/');
-        if !explicit.is_empty() {
-            return explicit.to_string();
-        }
-        let server = settings
-            .find_frp_profile(frp_profile_id)
-            .map(|profile| profile.server.as_str())
-            .unwrap_or(frp_server);
-        if !server.is_empty() && !frp_subdomain.is_empty() {
-            return format!("https://{frp_subdomain}.{server}");
-        }
-    }
-    public_url.trim_end_matches('/').to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{McpActivityDto, RuntimeConfig, TunnelConfig, WorkspaceProfile};
+    use super::{McpActivityDto, RuntimeConfig, WorkspaceProfile};
     use crate::settings::AppSettings;
+    use crate::tunnel::TunnelConfig;
 
     #[test]
-    fn workspace_defaults_to_stable_cloudflare_named_tunnels() {
+    fn workspace_defaults_without_owned_tunnel_configuration() {
         let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
 
-        assert_eq!(profile.tunnel.tunnel_type, "cloudflare");
+        assert_eq!(profile.tunnel.tunnel_type, "none");
         assert_eq!(profile.tunnel.cloudflare_mode, "named");
     }
 

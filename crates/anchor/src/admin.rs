@@ -85,6 +85,13 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "save_frp_profile_metadata",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "list_tunnels",
+    "create_tunnel",
+    "update_tunnel",
+    "delete_tunnel",
+    "get_tunnel_status",
+    "get_tunnel_secret",
+    "set_tunnel_secret",
     "get_runtime_status",
     "test_tunnel",
     "start_runtime",
@@ -104,6 +111,7 @@ const WEB_ADMIN_SUPPORTED_COMMANDS: &[&str] = &[
     "read_gateway_logs",
     "read_workspace_logs",
     "start_tunnel",
+    "stop_tunnel",
     "stage_workspace_config",
     "apply_workspace_config",
     "get_windows_service_status",
@@ -142,6 +150,10 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "save_frp_profile_metadata",
     "set_frp_profile_token",
     "delete_frp_profile",
+    "create_tunnel",
+    "update_tunnel",
+    "delete_tunnel",
+    "set_tunnel_secret",
     "rotate_federation_signing_key",
     "register_federation_peer",
     "update_federation_peer",
@@ -178,6 +190,7 @@ const WEB_ADMIN_MUTATION_COMMANDS: &[&str] = &[
     "start_runtime",
     "stop_runtime",
     "start_tunnel",
+    "stop_tunnel",
     "test_tunnel",
     "set_mcp_gateway",
     "reload_mcp_gateway",
@@ -473,9 +486,31 @@ struct WorkspaceLogsArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TunnelArgs {
     id: String,
-    service: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateTunnelArgs {
+    workspace_id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateTunnelArgs {
+    tunnel: crate::tunnel::TunnelProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTunnelSecretArgs {
+    id: String,
+    key: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1614,6 +1649,47 @@ async fn dispatch_command(
             }
             Ok(Value::Null)
         }
+        "list_tunnels" => serde_json::to_value(management::list_tunnels()?)
+            .map_err(AppError::from)
+            .map_err(Into::into),
+        "create_tunnel" => {
+            let input: CreateTunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::create_tunnel(
+                &input.workspace_id,
+                input.name.as_deref(),
+            )?)
+            .map_err(AppError::from)
+            .map_err(Into::into)
+        }
+        "update_tunnel" => {
+            let input: UpdateTunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::update_tunnel(input.tunnel).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "delete_tunnel" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            management::delete_tunnel(&input.id).await?;
+            Ok(Value::Null)
+        }
+        "get_tunnel_status" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_tunnel_status(&input.id).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "get_tunnel_secret" => {
+            let input: SecretArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::get_tunnel_secret(&input.id, &input.key)?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "set_tunnel_secret" => {
+            let input: SetTunnelSecretArgs =
+                serde_json::from_value(args).map_err(AppError::from)?;
+            management::set_tunnel_secret(&input.id, &input.key, &input.value).await?;
+            Ok(Value::Null)
+        }
         "get_runtime_status" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
             serde_json::to_value(
@@ -1624,11 +1700,9 @@ async fn dispatch_command(
         }
         "test_tunnel" => {
             let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::test_workspace_tunnel(&input.id, &input.service).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
+            serde_json::to_value(management::test_tunnel(&input.id).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
         }
         "start_runtime" => {
             let input: IdArgs = serde_json::from_value(args).map_err(AppError::from)?;
@@ -1781,11 +1855,15 @@ async fn dispatch_command(
         }
         "start_tunnel" => {
             let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
-            serde_json::to_value(
-                management::start_workspace_tunnel(&input.id, &input.service).await?,
-            )
-            .map_err(AppError::from)
-            .map_err(Into::into)
+            serde_json::to_value(management::start_tunnel(&input.id).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
+        }
+        "stop_tunnel" => {
+            let input: TunnelArgs = serde_json::from_value(args).map_err(AppError::from)?;
+            serde_json::to_value(management::stop_tunnel(&input.id).await?)
+                .map_err(AppError::from)
+                .map_err(Into::into)
         }
         "stage_workspace_config" => {
             let input: WorkspaceConfigArgs =

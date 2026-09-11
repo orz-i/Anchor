@@ -428,7 +428,7 @@ mod tests {
             public_base_url: String::new(),
             route_count: route_workspace_ids.len(),
             route_workspace_ids,
-            owner_workspace_id: "owner".into(),
+            tunnel_id: "owner".into(),
             error: String::new(),
             detail: "running".into(),
         }

@@ -1169,7 +1169,7 @@ fn resolve_gateway_workspace_ids(selectors: &[String]) -> AppResult<Vec<String>>
     let config = store.settings().mcp_gateway;
     if !config.enabled {
         return Err(AppError::Message(
-            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --owner WORKSPACE".into(),
+            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --tunnel TUNNEL".into(),
         ));
     }
     gateway::validate_config(&config, store.list())?;
@@ -1419,8 +1419,10 @@ async fn configure_gateway(options: GatewayConfigureOptions, as_json: bool) -> A
     if let Some(port) = options.local_port {
         config.local_port = port;
     }
-    if let Some(selector) = options.owner_workspace {
-        config.owner_workspace_id = resolve_workspace(store.list(), &selector)?.id.clone();
+    if let Some(selector) = options.tunnel {
+        config.tunnel_id = tunnel::resolve_tunnel(store.list_tunnels(), &selector)?
+            .id
+            .clone();
     }
     if let Some(public_url) = options.public_url {
         config.public_url = public_url;
@@ -1458,7 +1460,7 @@ async fn serve_gateway(
     let mut config = store.settings().mcp_gateway;
     if !config.enabled {
         return Err(AppError::Message(
-            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --owner WORKSPACE".into(),
+            "MCP Gateway 尚未启用；请先运行 gateway configure --enable --tunnel TUNNEL".into(),
         ));
     }
     gateway::validate_config(&config, &all_profiles)?;
@@ -1829,11 +1831,11 @@ fn persist_cli_gateway_observation(
     }
     let owner = profiles
         .iter()
-        .find(|profile| profile.id == config.owner_workspace_id)
-        .ok_or_else(|| AppError::Message("MCP Gateway 隧道所有者工作区不存在。".into()))?;
+        .find(|profile| profile.tunnel_id == config.tunnel_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 引用的 Tunnel 不存在。".into()))?;
     let signature = gateway::tunnel_identity_signature(config, owner)?;
     config.observed_public_url = normalized.to_string();
-    config.observed_owner_workspace_id = config.owner_workspace_id.clone();
+    config.observed_tunnel_id = config.tunnel_id.clone();
     config.observed_tunnel_signature = signature.clone();
     gateway::validate_config(config, profiles)?;
     DataStore::update_file(|data| {
@@ -1841,13 +1843,13 @@ fn persist_cli_gateway_observation(
             return Ok(());
         }
         if data.mcp_gateway.observed_public_url == normalized
-            && data.mcp_gateway.observed_owner_workspace_id == config.owner_workspace_id
+            && data.mcp_gateway.observed_tunnel_id == config.tunnel_id
             && data.mcp_gateway.observed_tunnel_signature == signature
         {
             return Ok(());
         }
         data.mcp_gateway.observed_public_url = normalized.to_string();
-        data.mcp_gateway.observed_owner_workspace_id = config.owner_workspace_id.clone();
+        data.mcp_gateway.observed_tunnel_id = config.tunnel_id.clone();
         data.mcp_gateway.observed_tunnel_signature = signature.clone();
         Ok(())
     })
@@ -1879,7 +1881,7 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
     ensure_workspace_directory(&profile)?;
     let service = options.service.unwrap_or(ServiceSelection::Mcp);
-    let tunnel = options.tunnel.unwrap_or(false);
+    let tunnel = profile.tunnel_enabled && profile.tunnel.tunnel_type != "none";
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
             "MCP Gateway 模式不支持每工作区独立 MCP daemon；请使用 `anchor gateway start <workspace ...>` 管理 Gateway route。"
@@ -2355,7 +2357,7 @@ fn append_tunnel_doctor_checks(profile: &WorkspaceProfile, checks: &mut Vec<Doct
                 label,
                 false,
                 error.to_string(),
-                "安装对应隧道二进制或关闭 --tunnel",
+                "安装对应隧道二进制或运行 anchor tunnel disable <tunnel>",
             )),
         }
     }
@@ -2379,10 +2381,10 @@ async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         .service
         .or_else(|| current.map(|state| state.service))
         .unwrap_or(ServiceSelection::Mcp);
-    let tunnels = match options.tunnel {
-        Some(true) => Some(service),
-        Some(false) => None,
-        None => current.and_then(|state| state.managed_tunnels()),
+    let tunnels = if profile.tunnel_enabled && profile.tunnel.tunnel_type != "none" {
+        Some(service)
+    } else {
+        None
     };
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
@@ -2769,21 +2771,27 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::List => list_workspaces(cli.json).map(|_| 0),
         Command::Show { workspace } => show_workspace(&workspace, cli.json).map(|_| 0),
         Command::Status(options) => show_status(options, cli.json).await.map(|_| 0),
-        Command::Serve {
-            workspace,
-            service,
-            tunnel,
-        } => serve_workspace(
-            &workspace,
-            service,
-            tunnel.then_some(service),
-            cli.json,
-            true,
-            None,
-            WorkspaceServeContext::default(),
-        )
-        .await
-        .map(|_| 0),
+        Command::Serve { workspace, service } => {
+            let store = DataStore::load()?;
+            let profile = resolve_workspace(store.list(), &workspace)?;
+            let tunnels = if profile.tunnel_enabled && profile.tunnel.tunnel_type != "none" {
+                Some(service)
+            } else {
+                None
+            };
+            drop(store);
+            serve_workspace(
+                &workspace,
+                service,
+                tunnels,
+                cli.json,
+                true,
+                None,
+                WorkspaceServeContext::default(),
+            )
+            .await
+            .map(|_| 0)
+        }
         Command::Start(options) => start_daemon(options, cli.json).await.map(|_| 0),
         Command::Stop(options) => stop_daemon(options, cli.json).await.map(|_| 0),
         Command::Restart(options) => restart_daemon(options, cli.json).await.map(|_| 0),
@@ -3639,19 +3647,31 @@ fn restore_daemon_tunnel_config(
     restored: &WorkspaceProfile,
     kind: TunnelServiceKind,
 ) -> AppResult<()> {
-    let mut store = DataStore::load()?;
-    let Some(mut current) = store.get(&failed.id).cloned() else {
+    let tunnel_id = failed.tunnel_id.clone();
+    if tunnel_id.is_empty() {
         return Ok(());
-    };
-    if !tunnel_config_matches(&current, failed, kind) {
-        return Err(AppError::Message(
-            "检测到更新的隧道配置，已拒绝用旧 daemon 配置覆盖。".into(),
-        ));
     }
-    match kind {
-        TunnelServiceKind::Mcp => current.tunnel = restored.tunnel.clone(),
-    }
-    store.update(current)
+    DataStore::update_file(|data| {
+        let Some(current) = data
+            .tunnels
+            .iter_mut()
+            .find(|tunnel| tunnel.id == tunnel_id)
+        else {
+            return Ok(());
+        };
+        let current_config = current.config.clone();
+        let mut current_profile = failed.clone();
+        current_profile.tunnel = current_config;
+        if !tunnel_config_matches(&current_profile, failed, kind) {
+            return Err(AppError::Message(
+                "检测到更新的隧道配置，已拒绝用旧 daemon 配置覆盖。".into(),
+            ));
+        }
+        match kind {
+            TunnelServiceKind::Mcp => current.config = restored.tunnel.clone(),
+        }
+        Ok(())
+    })
 }
 
 fn persist_daemon_tunnel_url(
@@ -3662,21 +3682,33 @@ fn persist_daemon_tunnel_url(
     if public_url.is_empty() {
         return Ok(());
     }
-    let mut store = DataStore::load()?;
-    let Some(mut current) = store.get(&profile.id).cloned() else {
-        return Ok(());
-    };
-    if !tunnel_config_matches(&current, profile, kind) {
+    if profile.tunnel_id.is_empty() {
         return Ok(());
     }
-    match kind {
-        TunnelServiceKind::Mcp => {
-            current.tunnel.public_url = public_url.to_string();
-            profile.tunnel.public_url = public_url.to_string();
-            update_public_url(&profile.id, "mcp", public_url);
+    let tunnel_id = profile.tunnel_id.clone();
+    DataStore::update_file(|data| {
+        let Some(current) = data
+            .tunnels
+            .iter_mut()
+            .find(|tunnel| tunnel.id == tunnel_id)
+        else {
+            return Ok(());
+        };
+        let mut current_profile = profile.clone();
+        current_profile.tunnel = current.config.clone();
+        if !tunnel_config_matches(&current_profile, profile, kind) {
+            return Ok(());
         }
+        match kind {
+            TunnelServiceKind::Mcp => current.config.public_url = public_url.to_string(),
+        }
+        Ok(())
+    })?;
+    match kind {
+        TunnelServiceKind::Mcp => profile.tunnel.public_url = public_url.to_string(),
     }
-    store.update(current)
+    update_public_url(&profile.id, "mcp", public_url);
+    Ok(())
 }
 
 async fn apply_daemon_tunnel_command(

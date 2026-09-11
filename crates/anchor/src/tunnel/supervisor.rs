@@ -613,13 +613,13 @@ fn validate_tunnel_requirements(
     let (mode, secret_key, named_url) = match kind {
         TunnelServiceKind::Mcp => (
             profile.tunnel.cloudflare_mode.as_str(),
-            "cloudflare_token",
+            "tunnel_cloudflare_token",
             profile.tunnel.public_url.clone(),
         ),
     };
 
     if mode == "named" {
-        let token = SecretStore::get(&profile.id, secret_key)?.unwrap_or_default();
+        let token = SecretStore::get_app(secret_key, &profile.tunnel_id)?.unwrap_or_default();
         if token.trim().is_empty() {
             return Err(AppError::Message(
                 "Cloudflare 命名隧道模式需要填写 Tunnel Token。".into(),
@@ -648,7 +648,8 @@ fn cloudflare_config(
 ) -> AppResult<(u16, &str, String, String, &'static str)> {
     match kind {
         TunnelServiceKind::Mcp => {
-            let token = SecretStore::get(&profile.id, "cloudflare_token")?.unwrap_or_default();
+            let token = SecretStore::get_app("tunnel_cloudflare_token", &profile.tunnel_id)?
+                .unwrap_or_default();
             Ok((
                 profile.runtime.local_port,
                 profile.tunnel.cloudflare_mode.as_str(),

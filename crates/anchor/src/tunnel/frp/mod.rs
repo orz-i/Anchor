@@ -129,10 +129,9 @@ fn resolve_frp_token(
         }
     }
 
-    let workspace_key = match kind {
-        TunnelServiceKind::Mcp => "frp_token",
-    };
-    if let Ok(Some(token)) = crate::secret::SecretStore::get(&workspace.id, workspace_key) {
+    if let Ok(Some(token)) =
+        crate::secret::SecretStore::get_app("tunnel_frp_token", &workspace.tunnel_id)
+    {
         if !token.trim().is_empty() {
             return Some(token);
         }
