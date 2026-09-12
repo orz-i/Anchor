@@ -74,6 +74,8 @@ Tunnel 的目标 Workspace/service 创建后不可原地更换；需要重新绑
 
 当某个 Tunnel 已启用且目标 Workspace daemon 启动时，daemon 会自动托管该 Tunnel，并继续负责断线恢复和 Quick Tunnel 公网 URL 回写。公网 URL、运行身份 revision 与 Secret 都属于 Tunnel，而不是 WorkspaceProfile。
 
+运行时需要同时读取 Workspace 与 Tunnel 时，Anchor 只按需组合非持久化的 `WorkspaceRuntimeContext`；不会再把 Tunnel 配置、ID、启用状态或 revision 回填到 `WorkspaceProfile`。Workspace 配置 apply 只处理 Workspace listener/OAuth 等自身配置，Tunnel 变更必须通过独立 Tunnel control path 生效。
+
 因此 Workspace 启动命令保持单一职责：
 
 ```bash
@@ -96,11 +98,6 @@ Tunnel 的目标 Workspace 只提供本地运行上下文，不再是“Tunnel o
 
 ## 配置升级
 
-profiles 配置 schema 当前为 v2。首次读取 v1 配置时，Anchor 会执行一次性迁移：
+当前 `profiles.json` 与解密后的 `secrets.json` 都只接受 schema v2。v1、无版本以及其他非当前版本都会 fail closed；当前构建不会在正常读取路径迁移旧 `WorkspaceProfile.tunnel`、Workspace Tunnel Token 或 Gateway workspace owner 引用，也不会在加载后静默重写。
 
-- 每个旧 `WorkspaceProfile.tunnel` 转为顶级 Tunnel；
-- 旧 Workspace `frp_token` / `cloudflare_token` 移入对应 Tunnel secret scope；
-- Gateway 的旧 workspace owner 引用转换为 `tunnelId`；
-- 成功迁移后立即按 v2 重写配置，不保留运行期双格式读取路径。
-
-无 `schema_version` 的更早配置仍不受支持。
+仍持有旧格式配置的安装，应先使用能够读取该格式的旧 Anchor 完成迁移/导出，再升级到当前构建。portable config 虽然使用 envelope v2，导入时仍会校验 inner `profiles=2 / secrets=2`，不会借迁移包重新引入旧 schema 兼容桥。

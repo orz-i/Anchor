@@ -13,7 +13,7 @@ use crate::platform::platform;
 use crate::tunnel::cloudflare::stop_child;
 use crate::tunnel::supervisor::log_dir_for_profile;
 use crate::tunnel::TunnelServiceKind;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::WorkspaceRuntimeContext;
 
 use super::{
     build_frpc_toml_for_routes, frp_server_config, prepare_frp_server_config, FrpServerConfig,
@@ -276,7 +276,7 @@ fn same_process_image(left: &Path, right: &Path) -> bool {
 
 pub async fn spawn_frpc(
     workspace_id: &str,
-    routes: &[(&WorkspaceProfile, TunnelServiceKind)],
+    routes: &[(&WorkspaceRuntimeContext, TunnelServiceKind)],
     settings: &crate::settings::AppSettings,
 ) -> AppResult<FrpcHandle> {
     let Some((first_profile, _)) = routes.first() else {
@@ -369,9 +369,11 @@ pub async fn spawn_frpc(
     Ok(FrpcHandle { child, pid })
 }
 
-fn aggregate_uses_proxy(routes: &[(&WorkspaceProfile, TunnelServiceKind)]) -> bool {
+fn aggregate_uses_proxy(routes: &[(&WorkspaceRuntimeContext, TunnelServiceKind)]) -> bool {
     routes.iter().any(|(profile, kind)| match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.use_proxy,
+        TunnelServiceKind::Mcp => profile
+            .tunnel_profile()
+            .is_some_and(|tunnel| tunnel.config.use_proxy),
     })
 }
 
@@ -794,8 +796,9 @@ mod tests {
         successful_proxy_names, validate_frp_config,
     };
     use crate::tunnel::frp::{FrpProxyConfig, FrpServerConfig};
+    use crate::tunnel::TunnelProfile;
     use crate::tunnel::TunnelServiceKind;
-    use crate::workspace::WorkspaceProfile;
+    use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -819,10 +822,19 @@ mod tests {
 
     #[test]
     fn aggregate_proxy_is_enabled_when_any_route_requests_it() {
-        let mut direct = WorkspaceProfile::new("C:/workspace/direct".into(), None);
-        direct.tunnel.use_proxy = false;
-        let mut proxied = WorkspaceProfile::new("C:/workspace/proxied".into(), None);
-        proxied.tunnel.use_proxy = true;
+        let direct_workspace = WorkspaceProfile::new("C:/workspace/direct".into(), None);
+        let mut direct_tunnel =
+            TunnelProfile::new(direct_workspace.id.clone(), &direct_workspace.name, "mcp");
+        direct_tunnel.config.use_proxy = false;
+        let direct = WorkspaceRuntimeContext::new(direct_workspace, Some(direct_tunnel))
+            .expect("direct runtime context");
+
+        let proxied_workspace = WorkspaceProfile::new("C:/workspace/proxied".into(), None);
+        let mut proxied_tunnel =
+            TunnelProfile::new(proxied_workspace.id.clone(), &proxied_workspace.name, "mcp");
+        proxied_tunnel.config.use_proxy = true;
+        let proxied = WorkspaceRuntimeContext::new(proxied_workspace, Some(proxied_tunnel))
+            .expect("proxied runtime context");
 
         assert!(aggregate_uses_proxy(&[
             (&direct, TunnelServiceKind::Mcp),

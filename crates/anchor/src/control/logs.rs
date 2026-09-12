@@ -4,10 +4,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::daemon;
+use crate::data::DataStore;
 use crate::error::AppResult;
 use crate::logging::{profile_log_files, ProfileLogService};
 use crate::tunnel::log_dir_for_profile;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
 
 use super::protocol::{ControlLogChunk, ControlLogCursor, ControlLogSelection};
 
@@ -22,6 +23,8 @@ pub fn read_log_batch(
     tail_lines: u32,
     cursors: &[ControlLogCursor],
 ) -> AppResult<Vec<ControlLogChunk>> {
+    let store = DataStore::load()?;
+    let runtime_profile = store.runtime_context_for(profile)?;
     let cursor_map = cursors
         .iter()
         .map(|cursor| (cursor.name.as_str(), cursor.offset))
@@ -29,7 +32,7 @@ pub fn read_log_batch(
     let mut remaining = MAX_LOG_TOTAL_CONTENT_BYTES;
     let mut chunks = Vec::new();
 
-    for (name, path) in selected_log_files(profile, selection) {
+    for (name, path) in selected_log_files(&runtime_profile, selection) {
         let limit = remaining.min(MAX_LOG_CHUNK_CONTENT_BYTES);
         let chunk = match cursor_map.get(name.as_str()).copied() {
             Some(offset) => read_since(&name, &path, offset, limit)?,
@@ -50,7 +53,7 @@ pub fn read_log_batch(
 }
 
 fn selected_log_files(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     selection: ControlLogSelection,
 ) -> Vec<(String, PathBuf)> {
     let log_dir = log_dir_for_profile(&profile.id);

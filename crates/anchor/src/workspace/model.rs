@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
 
+use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
-use crate::tunnel::TunnelConfig;
+use crate::tunnel::TunnelProfile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9,19 +11,80 @@ pub struct WorkspaceProfile {
     pub id: String,
     pub name: String,
     pub path: String,
-    /// Derived runtime projection of the top-level Tunnel resource targeting
-    /// this workspace MCP service. It is intentionally excluded from the
-    /// workspace persistence/API model; Tunnel is the sole configuration owner.
-    #[serde(skip, default = "TunnelConfig::disabled")]
-    pub(crate) tunnel: TunnelConfig,
-    #[serde(skip, default)]
-    pub(crate) tunnel_id: String,
-    #[serde(skip, default)]
-    pub(crate) tunnel_enabled: bool,
-    #[serde(skip, default)]
-    pub(crate) tunnel_revision: u64,
     pub auth: AuthConfig,
     pub runtime: RuntimeConfig,
+}
+
+/// Non-persisted composition used by runtime/control paths that need both the
+/// Workspace authority and its optional top-level MCP Tunnel authority.
+///
+/// The Tunnel remains a first-class `TunnelProfile`; this type never copies
+/// Tunnel fields back into `WorkspaceProfile`.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRuntimeContext {
+    pub workspace: WorkspaceProfile,
+    pub tunnel: Option<TunnelProfile>,
+}
+
+impl WorkspaceRuntimeContext {
+    pub fn new(workspace: WorkspaceProfile, tunnel: Option<TunnelProfile>) -> AppResult<Self> {
+        if let Some(tunnel) = &tunnel {
+            if tunnel.workspace_id != workspace.id || !tunnel.service.eq_ignore_ascii_case("mcp") {
+                return Err(AppError::Message(format!(
+                    "tunnel {} does not target workspace {} MCP service",
+                    tunnel.id, workspace.id
+                )));
+            }
+        }
+        Ok(Self { workspace, tunnel })
+    }
+
+    pub fn tunnel_profile(&self) -> Option<&TunnelProfile> {
+        self.tunnel.as_ref()
+    }
+
+    pub fn effective_public_url_with(&self, settings: &AppSettings) -> String {
+        self.tunnel
+            .as_ref()
+            .map(|tunnel| tunnel.effective_public_url(settings))
+            .unwrap_or_default()
+    }
+
+    pub fn effective_public_url(&self) -> AppResult<String> {
+        Ok(self.effective_public_url_with(&AppSettings::load()?))
+    }
+
+    /// External base URL used by this logical MCP server. In gateway mode the
+    /// public hostname is shared, while the workspace path remains unique.
+    pub fn mcp_external_base_url_with(&self, settings: &AppSettings) -> String {
+        if settings.mcp_gateway.enabled {
+            let base = settings.mcp_gateway.effective_public_url();
+            return format!("{base}/w/{}", self.workspace.id);
+        }
+        self.effective_public_url_with(settings)
+    }
+
+    pub fn public_endpoint_with(&self, settings: &AppSettings) -> String {
+        let base = self.mcp_external_base_url_with(settings);
+        if base.is_empty() {
+            return String::new();
+        }
+        format!("{}/mcp", base.trim_end_matches('/'))
+    }
+}
+
+impl Deref for WorkspaceRuntimeContext {
+    type Target = WorkspaceProfile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.workspace
+    }
+}
+
+impl DerefMut for WorkspaceRuntimeContext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.workspace
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,10 +276,6 @@ impl WorkspaceProfile {
             id: uuid::Uuid::new_v4().to_string().replace('-', ""),
             name: label,
             path: cleaned,
-            tunnel: TunnelConfig::disabled(),
-            tunnel_id: String::new(),
-            tunnel_enabled: false,
-            tunnel_revision: 0,
             auth: AuthConfig::default(),
             runtime: RuntimeConfig::default(),
         }
@@ -225,50 +284,23 @@ impl WorkspaceProfile {
     pub fn local_endpoint(&self) -> String {
         format!("http://127.0.0.1:{}/mcp", self.runtime.local_port)
     }
-
-    pub fn effective_public_url(&self) -> crate::error::AppResult<String> {
-        Ok(self.effective_public_url_with(&AppSettings::load()?))
-    }
-
-    pub fn effective_public_url_with(&self, settings: &AppSettings) -> String {
-        self.tunnel.effective_public_url(settings)
-    }
-
-    /// External base URL used by this logical MCP server. In gateway mode the
-    /// public hostname is shared, while the workspace path remains unique.
-    pub fn mcp_external_base_url_with(&self, settings: &AppSettings) -> String {
-        if settings.mcp_gateway.enabled {
-            let base = settings.mcp_gateway.effective_public_url();
-            return format!("{base}/w/{}", self.id);
-        }
-        self.effective_public_url_with(settings)
-    }
-
-    pub fn public_endpoint(&self) -> crate::error::AppResult<String> {
-        Ok(self.public_endpoint_with(&AppSettings::load()?))
-    }
-
-    pub fn public_endpoint_with(&self, settings: &AppSettings) -> String {
-        let base = self.mcp_external_base_url_with(settings);
-        if base.is_empty() {
-            return String::new();
-        }
-        format!("{}/mcp", base.trim_end_matches('/'))
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{McpActivityDto, RuntimeConfig, WorkspaceProfile};
+    use super::{McpActivityDto, RuntimeConfig, WorkspaceProfile, WorkspaceRuntimeContext};
     use crate::settings::AppSettings;
-    use crate::tunnel::TunnelConfig;
+    use crate::tunnel::{TunnelConfig, TunnelProfile};
 
     #[test]
     fn workspace_defaults_without_owned_tunnel_configuration() {
         let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
 
-        assert_eq!(profile.tunnel.tunnel_type, "none");
-        assert_eq!(profile.tunnel.cloudflare_mode, "named");
+        let value = serde_json::to_value(&profile).expect("workspace json");
+        assert!(value.get("tunnel").is_none());
+        assert!(value.get("tunnel_id").is_none());
+        assert!(value.get("tunnel_enabled").is_none());
+        assert!(value.get("tunnel_revision").is_none());
     }
 
     #[test]
@@ -303,11 +335,13 @@ mod tests {
 
     #[test]
     fn explicit_frp_public_url_is_not_replaced_by_the_control_address() {
-        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
-        profile.tunnel.tunnel_type = "frp".into();
-        profile.tunnel.frp_server = "43.157.17.95".into();
-        profile.tunnel.frp_subdomain = "anchor".into();
-        profile.tunnel.public_url = "https://anchor.taoyan.icu/".into();
+        let profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        let mut tunnel = TunnelProfile::new(profile.id.clone(), &profile.name, "mcp");
+        tunnel.config.tunnel_type = "frp".into();
+        tunnel.config.frp_server = "43.157.17.95".into();
+        tunnel.config.frp_subdomain = "anchor".into();
+        tunnel.config.public_url = "https://anchor.taoyan.icu/".into();
+        let profile = WorkspaceRuntimeContext::new(profile, Some(tunnel)).expect("runtime context");
 
         assert_eq!(
             profile.effective_public_url_with(&AppSettings::default()),

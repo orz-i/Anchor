@@ -48,31 +48,12 @@ impl TunnelProfile {
         }
     }
 
-    pub fn migrated(workspace_id: String, workspace_name: &str, config: TunnelConfig) -> Self {
-        Self {
-            id: format!("{workspace_id}-mcp"),
-            name: format!("{workspace_name} MCP"),
-            workspace_id,
-            service: "mcp".into(),
-            enabled: config.tunnel_type != "none",
-            revision: 1,
-            config,
-        }
-    }
-
     pub fn effective_public_url(&self, settings: &AppSettings) -> String {
         self.config.effective_public_url(settings)
     }
 }
 
 impl TunnelConfig {
-    pub fn disabled() -> Self {
-        Self {
-            tunnel_type: "none".into(),
-            ..Self::default()
-        }
-    }
-
     pub fn effective_public_url(&self, settings: &AppSettings) -> String {
         computed_public_url(
             &self.tunnel_type,

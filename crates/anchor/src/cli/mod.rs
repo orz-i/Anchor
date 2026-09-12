@@ -13,8 +13,7 @@ mod workspace;
 
 pub(crate) use args::ConfigApplyOptions;
 pub(crate) use config::{
-    apply_staged_config, pending_candidate as pending_profile_candidate, stage_profile_config,
-    ConfigApplyReport, ConfigSetReport,
+    apply_staged_config, stage_profile_config, ConfigApplyReport, ConfigSetReport,
 };
 
 use std::fs::File;
@@ -42,10 +41,10 @@ use crate::settings::McpGatewayConfig;
 use crate::tunnel::{
     ensure_for_runtime, is_quick_tunnel_url_change_error, log_dir_for_profile,
     maybe_start_for_runtime, reconcile_mcp_gateway, stop_for_runtime,
-    supervisor as tunnel_supervisor, TunnelServiceKind, TunnelStatus,
+    supervisor as tunnel_supervisor, TunnelProfile, TunnelServiceKind, TunnelStatus,
 };
 use crate::workspace::config_apply::plan_workspace_config_apply;
-use crate::workspace::{RuntimeStatusDto, WorkspaceProfile};
+use crate::workspace::{RuntimeStatusDto, WorkspaceProfile, WorkspaceRuntimeContext};
 
 use args::{
     AdminCommand, CliArgs, Command, EventsOptions, EventsTarget, GatewayCommand,
@@ -94,6 +93,29 @@ async fn execute_admin(command: AdminCommand, as_json: bool) -> AppResult<i32> {
             print_admin_service_status(crate::admin_service::upgrade().await?, as_json)
         }
     }
+}
+
+fn resolve_runtime_context(
+    store: &DataStore,
+    selector: &str,
+) -> AppResult<WorkspaceRuntimeContext> {
+    let workspace = resolve_workspace(store.list(), selector)?;
+    store.runtime_context_for(workspace)
+}
+
+fn runtime_context_for_profile(
+    profile: &WorkspaceProfile,
+    tunnels: &[TunnelProfile],
+) -> AppResult<WorkspaceRuntimeContext> {
+    WorkspaceRuntimeContext::new(
+        profile.clone(),
+        tunnels
+            .iter()
+            .find(|tunnel| {
+                tunnel.workspace_id == profile.id && tunnel.service.eq_ignore_ascii_case("mcp")
+            })
+            .cloned(),
+    )
 }
 
 fn print_admin_service_status(
@@ -154,6 +176,7 @@ async fn apply_gateway_routes(
     selected: &mut Vec<WorkspaceProfile>,
     config: &mut McpGatewayConfig,
     all_profiles: &mut Vec<WorkspaceProfile>,
+    all_tunnels: &mut Vec<TunnelProfile>,
     workspace_ids: Vec<String>,
 ) -> AppResult<()> {
     let desired_ids = normalize_gateway_route_ids(workspace_ids)?;
@@ -171,10 +194,12 @@ async fn apply_gateway_routes(
     let previous = GatewayRuntimeSnapshot {
         config: config.clone(),
         profiles: all_profiles.clone(),
+        tunnels: all_tunnels.clone(),
         selected: selected.clone(),
     };
     let store = DataStore::load()?;
     let latest_profiles = store.list().to_vec();
+    let latest_tunnels = store.list_tunnels().to_vec();
     let mut latest_config = store.settings().mcp_gateway;
     drop(store);
     if !latest_config.enabled {
@@ -182,16 +207,17 @@ async fn apply_gateway_routes(
             "Gateway 配置已禁用；不能修改运行 route".into(),
         ));
     }
-    gateway::validate_config(&latest_config, &latest_profiles)?;
+    gateway::validate_config(&latest_config, &latest_profiles, &latest_tunnels)?;
     let latest_selected = resolve_gateway_route_profiles(&latest_profiles, &desired_ids)?;
 
-    shutdown_gateway_services(runtime, started, config, all_profiles).await?;
+    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels).await?;
     started.clear();
     match start_gateway_services(
         runtime,
         &latest_selected,
         &mut latest_config,
         &latest_profiles,
+        &latest_tunnels,
     )
     .await
     {
@@ -200,10 +226,12 @@ async fn apply_gateway_routes(
             *selected = latest_selected;
             *config = latest_config;
             *all_profiles = latest_profiles;
+            *all_tunnels = latest_tunnels;
             if let Err(state_error) = gateway_daemon::update_state(&desired_ids, config.local_port)
             {
                 let cleanup =
-                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels)
+                        .await;
                 if let Err(cleanup_error) = cleanup {
                     return Err(AppError::Message(format!(
                         "Gateway route 已切换但 daemon state 更新失败：{state_error}；清理新运行态也失败：{cleanup_error}"
@@ -212,10 +240,13 @@ async fn apply_gateway_routes(
                 started.clear();
                 return match restore_gateway_runtime(
                     runtime,
-                    started,
-                    selected,
-                    config,
-                    all_profiles,
+                    GatewayRuntimeStateMut {
+                        started,
+                        selected,
+                        config,
+                        profiles: all_profiles,
+                        tunnels: all_tunnels,
+                    },
                     previous,
                     &previous_ids,
                 )
@@ -233,10 +264,13 @@ async fn apply_gateway_routes(
         }
         Err(error) => match restore_gateway_runtime(
             runtime,
-            started,
-            selected,
-            config,
-            all_profiles,
+            GatewayRuntimeStateMut {
+                started,
+                selected,
+                config,
+                profiles: all_profiles,
+                tunnels: all_tunnels,
+            },
             previous,
             &previous_ids,
         )
@@ -420,7 +454,16 @@ fn publish_gateway_runtime_event(
 struct GatewayRuntimeSnapshot {
     config: McpGatewayConfig,
     profiles: Vec<WorkspaceProfile>,
+    tunnels: Vec<TunnelProfile>,
     selected: Vec<WorkspaceProfile>,
+}
+
+struct GatewayRuntimeStateMut<'a> {
+    started: &'a mut Vec<WorkspaceProfile>,
+    selected: &'a mut Vec<WorkspaceProfile>,
+    config: &'a mut McpGatewayConfig,
+    profiles: &'a mut Vec<WorkspaceProfile>,
+    tunnels: &'a mut Vec<TunnelProfile>,
 }
 
 async fn apply_gateway_config(
@@ -429,6 +472,7 @@ async fn apply_gateway_config(
     selected: &mut Vec<WorkspaceProfile>,
     config: &mut McpGatewayConfig,
     all_profiles: &mut Vec<WorkspaceProfile>,
+    all_tunnels: &mut Vec<TunnelProfile>,
     mut next_config: McpGatewayConfig,
 ) -> AppResult<()> {
     if !next_config.enabled {
@@ -439,6 +483,7 @@ async fn apply_gateway_config(
     let previous = GatewayRuntimeSnapshot {
         config: config.clone(),
         profiles: all_profiles.clone(),
+        tunnels: all_tunnels.clone(),
         selected: selected.clone(),
     };
     let selected_ids = selected
@@ -448,8 +493,9 @@ async fn apply_gateway_config(
 
     let latest_store = DataStore::load()?;
     let latest_profiles = latest_store.list().to_vec();
+    let latest_tunnels = latest_store.list_tunnels().to_vec();
     drop(latest_store);
-    gateway::validate_config(&next_config, &latest_profiles)?;
+    gateway::validate_config(&next_config, &latest_profiles, &latest_tunnels)?;
     let mut next_selected = Vec::new();
     for workspace_id in &selected_ids {
         let profile = resolve_workspace(&latest_profiles, workspace_id)?.clone();
@@ -457,20 +503,29 @@ async fn apply_gateway_config(
         next_selected.push(profile);
     }
 
-    shutdown_gateway_services(runtime, started, config, all_profiles).await?;
+    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels).await?;
     started.clear();
-    match start_gateway_services(runtime, &next_selected, &mut next_config, &latest_profiles).await
+    match start_gateway_services(
+        runtime,
+        &next_selected,
+        &mut next_config,
+        &latest_profiles,
+        &latest_tunnels,
+    )
+    .await
     {
         Ok(next_started) => {
             *started = next_started;
             *selected = next_selected;
             *config = next_config;
             *all_profiles = latest_profiles;
+            *all_tunnels = latest_tunnels;
 
             if let Err(state_error) = gateway_daemon::update_state(&selected_ids, config.local_port)
             {
                 let cleanup =
-                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels)
+                        .await;
                 if let Err(cleanup_error) = cleanup {
                     return Err(AppError::Message(format!(
                         "Gateway 新运行态已建立但 daemon state 更新失败：{state_error}；清理新运行态也失败：{cleanup_error}"
@@ -479,10 +534,13 @@ async fn apply_gateway_config(
                 started.clear();
                 return match restore_gateway_runtime(
                     runtime,
-                    started,
-                    selected,
-                    config,
-                    all_profiles,
+                    GatewayRuntimeStateMut {
+                        started,
+                        selected,
+                        config,
+                        profiles: all_profiles,
+                        tunnels: all_tunnels,
+                    },
                     previous.clone(),
                     &selected_ids,
                 )
@@ -499,7 +557,8 @@ async fn apply_gateway_config(
 
             if let Err(persist_error) = gateway_control::persist_config(config) {
                 let cleanup =
-                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels)
+                        .await;
                 if let Err(cleanup_error) = cleanup {
                     return Err(AppError::Message(format!(
                         "Gateway 新运行态已建立但持久化失败：{persist_error}；清理新运行态也失败：{cleanup_error}"
@@ -508,10 +567,13 @@ async fn apply_gateway_config(
                 started.clear();
                 return match restore_gateway_runtime(
                     runtime,
-                    started,
-                    selected,
-                    config,
-                    all_profiles,
+                    GatewayRuntimeStateMut {
+                        started,
+                        selected,
+                        config,
+                        profiles: all_profiles,
+                        tunnels: all_tunnels,
+                    },
                     previous,
                     &selected_ids,
                 )
@@ -530,10 +592,13 @@ async fn apply_gateway_config(
         Err(error) => {
             match restore_gateway_runtime(
                 runtime,
-                started,
-                selected,
-                config,
-                all_profiles,
+                GatewayRuntimeStateMut {
+                    started,
+                    selected,
+                    config,
+                    profiles: all_profiles,
+                    tunnels: all_tunnels,
+                },
                 previous,
                 &selected_ids,
             )
@@ -552,25 +617,31 @@ async fn apply_gateway_config(
 
 async fn restore_gateway_runtime(
     runtime: &mut RuntimeSupervisor,
-    started: &mut Vec<WorkspaceProfile>,
-    selected: &mut Vec<WorkspaceProfile>,
-    config: &mut McpGatewayConfig,
-    all_profiles: &mut Vec<WorkspaceProfile>,
+    state: GatewayRuntimeStateMut<'_>,
     previous: GatewayRuntimeSnapshot,
     selected_ids: &[String],
 ) -> AppResult<()> {
+    let GatewayRuntimeStateMut {
+        started,
+        selected,
+        config,
+        profiles,
+        tunnels,
+    } = state;
     let mut rollback_config = previous.config;
     let previous_started = start_gateway_services(
         runtime,
         &previous.selected,
         &mut rollback_config,
         &previous.profiles,
+        &previous.tunnels,
     )
     .await?;
     *started = previous_started;
     *selected = previous.selected;
     *config = rollback_config;
-    *all_profiles = previous.profiles;
+    *profiles = previous.profiles;
+    *tunnels = previous.tunnels;
     gateway_daemon::update_state(selected_ids, config.local_port)
 }
 
@@ -579,24 +650,28 @@ async fn start_gateway_services(
     selected: &[WorkspaceProfile],
     config: &mut McpGatewayConfig,
     all_profiles: &[WorkspaceProfile],
+    all_tunnels: &[TunnelProfile],
 ) -> AppResult<Vec<WorkspaceProfile>> {
     ensure_gateway_ports_available(config, selected)?;
     let mut started = Vec::new();
     let startup = async {
         for profile in selected {
-            ensure_running(runtime.start_mcp(profile)?, "MCP")?;
+            let runtime_profile = runtime_context_for_profile(profile, all_tunnels)?;
+            ensure_running(runtime.start_mcp(&runtime_profile)?, "MCP")?;
             started.push(profile.clone());
         }
         let active = runtime.active_mcp_workspace_ids();
-        gateway::ensure(config, all_profiles, &active).await?;
-        if let Some(url) = reconcile_mcp_gateway(config, all_profiles, &active).await? {
-            persist_cli_gateway_observation(config, all_profiles, &url)?;
+        gateway::ensure(config, all_profiles, all_tunnels, &active).await?;
+        if let Some(url) = reconcile_mcp_gateway(config, all_profiles, all_tunnels, &active).await?
+        {
+            persist_cli_gateway_observation(config, all_profiles, all_tunnels, &url)?;
         }
         Ok::<(), AppError>(())
     }
     .await;
     if let Err(error) = startup {
-        let cleanup = shutdown_gateway_services(runtime, &started, config, all_profiles).await;
+        let cleanup =
+            shutdown_gateway_services(runtime, &started, config, all_profiles, all_tunnels).await;
         return match cleanup {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(AppError::Message(format!(
@@ -613,10 +688,12 @@ async fn apply_gateway_reload(
     selected: &mut Vec<WorkspaceProfile>,
     config: &mut McpGatewayConfig,
     all_profiles: &mut Vec<WorkspaceProfile>,
+    all_tunnels: &mut Vec<TunnelProfile>,
 ) -> AppResult<()> {
     let previous = GatewayRuntimeSnapshot {
         config: config.clone(),
         profiles: all_profiles.clone(),
+        tunnels: all_tunnels.clone(),
         selected: selected.clone(),
     };
     let selected_ids = selected
@@ -626,13 +703,14 @@ async fn apply_gateway_reload(
 
     let store = DataStore::load()?;
     let latest_profiles = store.list().to_vec();
+    let latest_tunnels = store.list_tunnels().to_vec();
     let mut latest_config = store.settings().mcp_gateway;
     if !latest_config.enabled {
         return Err(AppError::Message(
             "Gateway 配置已禁用；请使用 gateway stop 关闭当前 daemon".into(),
         ));
     }
-    gateway::validate_config(&latest_config, &latest_profiles)?;
+    gateway::validate_config(&latest_config, &latest_profiles, &latest_tunnels)?;
     let mut latest_selected = Vec::new();
     for workspace_id in &selected_ids {
         let profile = resolve_workspace(&latest_profiles, workspace_id)?.clone();
@@ -641,13 +719,14 @@ async fn apply_gateway_reload(
     }
     drop(store);
 
-    shutdown_gateway_services(runtime, started, config, all_profiles).await?;
+    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels).await?;
     started.clear();
     match start_gateway_services(
         runtime,
         &latest_selected,
         &mut latest_config,
         &latest_profiles,
+        &latest_tunnels,
     )
     .await
     {
@@ -659,7 +738,8 @@ async fn apply_gateway_reload(
             if let Err(state_error) = gateway_daemon::update_state(&selected_ids, config.local_port)
             {
                 let cleanup =
-                    shutdown_gateway_services(runtime, started, config, all_profiles).await;
+                    shutdown_gateway_services(runtime, started, config, all_profiles, all_tunnels)
+                        .await;
                 if let Err(cleanup_error) = cleanup {
                     return Err(AppError::Message(format!(
                         "Gateway reload 后 daemon state 更新失败：{state_error}；清理新运行态也失败：{cleanup_error}"
@@ -668,10 +748,13 @@ async fn apply_gateway_reload(
                 started.clear();
                 return match restore_gateway_runtime(
                     runtime,
-                    started,
-                    selected,
-                    config,
-                    all_profiles,
+                    GatewayRuntimeStateMut {
+                        started,
+                        selected,
+                        config,
+                        profiles: all_profiles,
+                        tunnels: all_tunnels,
+                    },
                     previous,
                     &selected_ids,
                 )
@@ -690,10 +773,13 @@ async fn apply_gateway_reload(
         Err(error) => {
             let rollback = restore_gateway_runtime(
                 runtime,
-                started,
-                selected,
-                config,
-                all_profiles,
+                GatewayRuntimeStateMut {
+                    started,
+                    selected,
+                    config,
+                    profiles: all_profiles,
+                    tunnels: all_tunnels,
+                },
                 previous,
                 &selected_ids,
             )
@@ -1172,7 +1258,7 @@ fn resolve_gateway_workspace_ids(selectors: &[String]) -> AppResult<Vec<String>>
             "MCP Gateway 尚未启用；请先运行 gateway configure --enable --tunnel TUNNEL".into(),
         ));
     }
-    gateway::validate_config(&config, store.list())?;
+    gateway::validate_config(&config, store.list(), store.list_tunnels())?;
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for selector in selectors {
@@ -1457,13 +1543,14 @@ async fn serve_gateway(
 ) -> AppResult<()> {
     let store = DataStore::load()?;
     let mut all_profiles = store.list().to_vec();
+    let mut all_tunnels = store.list_tunnels().to_vec();
     let mut config = store.settings().mcp_gateway;
     if !config.enabled {
         return Err(AppError::Message(
             "MCP Gateway 尚未启用；请先运行 gateway configure --enable --tunnel TUNNEL".into(),
         ));
     }
-    gateway::validate_config(&config, &all_profiles)?;
+    gateway::validate_config(&config, &all_profiles, &all_tunnels)?;
     let mut selected = Vec::new();
     let mut selected_ids = std::collections::HashSet::new();
     for selector in selectors {
@@ -1477,8 +1564,14 @@ async fn serve_gateway(
         return Err(AppError::Message("Gateway 没有选中的工作区。".into()));
     }
     let mut runtime = RuntimeSupervisor::default();
-    let mut started =
-        start_gateway_services(&mut runtime, &selected, &mut config, &all_profiles).await?;
+    let mut started = start_gateway_services(
+        &mut runtime,
+        &selected,
+        &mut config,
+        &all_profiles,
+        &all_tunnels,
+    )
+    .await?;
     publish_gateway_runtime_event(
         event_scope,
         gateway_control::GatewayEventKind::DaemonReady,
@@ -1552,6 +1645,7 @@ async fn serve_gateway(
                             &mut selected,
                             &mut config,
                             &mut all_profiles,
+                            &mut all_tunnels,
                         )
                         .await;
                         match &result {
@@ -1581,6 +1675,7 @@ async fn serve_gateway(
                             &mut selected,
                             &mut config,
                             &mut all_profiles,
+                            &mut all_tunnels,
                             workspace_ids,
                         )
                         .await;
@@ -1611,6 +1706,7 @@ async fn serve_gateway(
                             &mut selected,
                             &mut config,
                             &mut all_profiles,
+                            &mut all_tunnels,
                             *next_config,
                         )
                         .await;
@@ -1650,7 +1746,8 @@ async fn serve_gateway(
             }
             _ = maintenance.tick() => {
                 for profile in &selected {
-                    match runtime.maintain_mcp(profile) {
+                    let runtime_profile = runtime_context_for_profile(profile, &all_tunnels)?;
+                    match runtime.maintain_mcp(&runtime_profile) {
                         Ok(status) if status.state == "error" && !status.recovery.enabled => {
                             let error = AppError::Message(format!(
                                 "工作区 {} MCP 自动恢复耗尽：{}",
@@ -1682,7 +1779,7 @@ async fn serve_gateway(
                     break;
                 }
                 let active = runtime.active_mcp_workspace_ids();
-                if let Err(error) = gateway::ensure(&config, &all_profiles, &active).await {
+                if let Err(error) = gateway::ensure(&config, &all_profiles, &all_tunnels, &active).await {
                     publish_gateway_runtime_event(
                         event_scope,
                         gateway_control::GatewayEventKind::GatewayState,
@@ -1697,12 +1794,17 @@ async fn serve_gateway(
                 {
                     continue;
                 }
-                match reconcile_mcp_gateway(&config, &all_profiles, &active).await {
+                match reconcile_mcp_gateway(&config, &all_profiles, &all_tunnels, &active).await {
                     Ok(Some(url)) => {
                         let recovered_attempts = gateway_tunnel_retry.take().map(|retry| retry.attempts);
                         gateway::clear_runtime_error().await;
                         if url != config.observed_public_url {
-                            persist_cli_gateway_observation(&mut config, &all_profiles, &url)?;
+                            persist_cli_gateway_observation(
+                                &mut config,
+                                &all_profiles,
+                                &all_tunnels,
+                                &url,
+                            )?;
                         }
                         if let Some(attempts) = recovered_attempts {
                             publish_gateway_runtime_event(
@@ -1788,7 +1890,7 @@ async fn serve_gateway(
             .map(ToString::to_string)
             .unwrap_or_else(|| "Gateway daemon 正在优雅停止".into()),
     );
-    shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles).await?;
+    shutdown_gateway_services(&mut runtime, &started, &config, &all_profiles, &all_tunnels).await?;
     publish_gateway_runtime_event(
         event_scope,
         gateway_control::GatewayEventKind::GatewayState,
@@ -1823,21 +1925,26 @@ fn ensure_gateway_ports_available(
 fn persist_cli_gateway_observation(
     config: &mut McpGatewayConfig,
     profiles: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
     url: &str,
 ) -> AppResult<()> {
     let normalized = url.trim().trim_end_matches('/');
     if normalized.is_empty() || normalized.starts_with("http://127.0.0.1:") {
         return Ok(());
     }
+    let tunnel = tunnels
+        .iter()
+        .find(|tunnel| tunnel.id == config.tunnel_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 引用的 Tunnel 不存在。".into()))?;
     let owner = profiles
         .iter()
-        .find(|profile| profile.tunnel_id == config.tunnel_id)
-        .ok_or_else(|| AppError::Message("MCP Gateway 引用的 Tunnel 不存在。".into()))?;
-    let signature = gateway::tunnel_identity_signature(config, owner)?;
+        .find(|profile| profile.id == tunnel.workspace_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway Tunnel 的 Workspace 不存在。".into()))?;
+    let signature = gateway::tunnel_identity_signature(config, owner, tunnel)?;
     config.observed_public_url = normalized.to_string();
     config.observed_tunnel_id = config.tunnel_id.clone();
     config.observed_tunnel_signature = signature.clone();
-    gateway::validate_config(config, profiles)?;
+    gateway::validate_config(config, profiles, tunnels)?;
     DataStore::update_file(|data| {
         if data.mcp_gateway.identity_changed(config) {
             return Ok(());
@@ -1860,6 +1967,7 @@ async fn shutdown_gateway_services(
     profiles: &[WorkspaceProfile],
     config: &McpGatewayConfig,
     all_profiles: &[WorkspaceProfile],
+    all_tunnels: &[TunnelProfile],
 ) -> AppResult<()> {
     for profile in profiles.iter().rev() {
         let handle = runtime.begin_stop(&profile.id, ServiceKind::Mcp);
@@ -1867,7 +1975,7 @@ async fn shutdown_gateway_services(
         runtime.finish_stop(&profile.id, ServiceKind::Mcp);
     }
     let active = runtime.active_mcp_workspace_ids();
-    let tunnel_result = reconcile_mcp_gateway(config, all_profiles, &active).await;
+    let tunnel_result = reconcile_mcp_gateway(config, all_profiles, all_tunnels, &active).await;
     let gateway_result = gateway::stop().await;
     for profile in profiles {
         update_public_url(&profile.id, "mcp", "");
@@ -1878,11 +1986,13 @@ async fn shutdown_gateway_services(
 
 async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    let profile = resolve_runtime_context(&store, &options.workspace)?;
     ensure_workspace_directory(&profile)?;
     let service = options.service.unwrap_or(ServiceSelection::Mcp);
-    let tunnels =
-        (profile.tunnel_enabled && profile.tunnel.tunnel_type != "none").then_some(service);
+    let tunnels = profile
+        .tunnel_profile()
+        .is_some_and(|tunnel| tunnel.enabled && tunnel.config.tunnel_type != "none")
+        .then_some(service);
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
             "MCP Gateway 模式不支持每工作区独立 MCP daemon；请使用 `anchor gateway start <workspace ...>` 管理 Gateway route。"
@@ -1962,7 +2072,7 @@ struct CliLogChunk {
 
 async fn show_logs(options: LogsOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    let profile = resolve_runtime_context(&store, &options.workspace)?;
     if daemon::inspect(&profile)?.running {
         return show_logs_via_daemon(&profile, options, as_json).await;
     }
@@ -2167,7 +2277,7 @@ async fn follow_logs(files: Vec<(String, PathBuf)>, lines: usize, as_json: bool)
 }
 
 fn selected_log_files(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     selection: LogSelection,
 ) -> Vec<(String, PathBuf)> {
     let log_dir = log_dir_for_profile(&profile.id);
@@ -2230,7 +2340,7 @@ struct DoctorCheck {
 
 async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), selector)?.clone();
+    let profile = resolve_runtime_context(&store, selector)?;
     let inspection = daemon::inspect(&profile)?;
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -2331,8 +2441,14 @@ async fn doctor_workspace(selector: &str, as_json: bool) -> AppResult<bool> {
     Ok(checks.iter().all(|check| check.ok))
 }
 
-fn append_tunnel_doctor_checks(profile: &WorkspaceProfile, checks: &mut Vec<DoctorCheck>) {
-    for (label, tunnel_type) in [("MCP 隧道依赖", profile.tunnel.tunnel_type.as_str())] {
+fn append_tunnel_doctor_checks(profile: &WorkspaceRuntimeContext, checks: &mut Vec<DoctorCheck>) {
+    for (label, tunnel_type) in [(
+        "MCP 隧道依赖",
+        profile
+            .tunnel_profile()
+            .map(|tunnel| tunnel.config.tunnel_type.as_str())
+            .unwrap_or("none"),
+    )] {
         let result = match tunnel_type {
             "frp" => crate::tunnel::resolve_frpc().map(|path| path.display().to_string()),
             "cloudflare" => {
@@ -2366,18 +2482,17 @@ fn doctor_check(name: &str, ok: bool, detail: String, hint: &str) -> DoctorCheck
 
 async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
-    let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
+    let profile = resolve_runtime_context(&store, &options.workspace)?;
     let inspection = daemon::inspect(&profile)?;
     let current = inspection.state.as_ref().filter(|_| inspection.running);
     let service = options
         .service
         .or_else(|| current.map(|state| state.service))
         .unwrap_or(ServiceSelection::Mcp);
-    let tunnels = if profile.tunnel_enabled && profile.tunnel.tunnel_type != "none" {
-        Some(service)
-    } else {
-        None
-    };
+    let tunnels = profile
+        .tunnel_profile()
+        .is_some_and(|tunnel| tunnel.enabled && tunnel.config.tunnel_type != "none")
+        .then_some(service);
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
             "MCP Gateway 模式不支持每工作区独立 MCP daemon；请使用 `anchor gateway start <workspace ...>` 管理 Gateway route。"
@@ -2768,12 +2883,11 @@ async fn execute(cli: CliArgs) -> AppResult<i32> {
         Command::Status(options) => show_status(options, cli.json).await.map(|_| 0),
         Command::Serve { workspace, service } => {
             let store = DataStore::load()?;
-            let profile = resolve_workspace(store.list(), &workspace)?;
-            let tunnels = if profile.tunnel_enabled && profile.tunnel.tunnel_type != "none" {
-                Some(service)
-            } else {
-                None
-            };
+            let profile = resolve_runtime_context(&store, &workspace)?;
+            let tunnels = profile
+                .tunnel_profile()
+                .is_some_and(|tunnel| tunnel.enabled && tunnel.config.tunnel_type != "none")
+                .then_some(service);
             drop(store);
             serve_workspace(
                 &workspace,
@@ -2971,7 +3085,7 @@ async fn serve_workspace(
     mut serve_context: WorkspaceServeContext,
 ) -> AppResult<()> {
     let store = DataStore::load()?;
-    let mut profile = resolve_workspace(store.list(), selector)?.clone();
+    let mut profile = resolve_runtime_context(&store, selector)?;
     control::reset_workspace_event_stream(&profile.id);
     ensure_workspace_directory(&profile)?;
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
@@ -3362,7 +3476,7 @@ async fn serve_workspace(
                         let result = apply_daemon_config_command(
                             &mut profile,
                             service,
-                            &mut managed_tunnels,
+                            &managed_tunnels,
                             &mut runtime,
                         )
                         .await;
@@ -3566,7 +3680,7 @@ fn ensure_running(status: RuntimeStatusDto, label: &str) -> AppResult<()> {
 
 async fn shutdown(
     runtime: &mut RuntimeSupervisor,
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     services: &[ServiceKind],
     tunnels: &[TunnelServiceKind],
 ) -> AppResult<()> {
@@ -3608,43 +3722,38 @@ fn managed_tunnel_selection(tunnels: &[TunnelServiceKind]) -> Option<ServiceSele
     }
 }
 
-fn tunnel_type_for_profile(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
+fn tunnel_type_for_profile(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> &str {
+    let Some(tunnel) = profile.tunnel_profile() else {
+        return "none";
+    };
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
+        TunnelServiceKind::Mcp => tunnel.config.tunnel_type.as_str(),
     }
 }
 
 fn tunnel_config_matches(
-    left: &WorkspaceProfile,
-    right: &WorkspaceProfile,
+    left: &WorkspaceRuntimeContext,
+    right: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> bool {
     match kind {
-        TunnelServiceKind::Mcp => {
-            left.tunnel.tunnel_type == right.tunnel.tunnel_type
-                && left.tunnel.public_url == right.tunnel.public_url
-                && left.tunnel.frp_server == right.tunnel.frp_server
-                && left.tunnel.frp_subdomain == right.tunnel.frp_subdomain
-                && left.tunnel.frp_profile_id == right.tunnel.frp_profile_id
-                && left.tunnel.frp_server_port == right.tunnel.frp_server_port
-                && left.tunnel.frp_proxy_type == right.tunnel.frp_proxy_type
-                && left.tunnel.frp_cert_path == right.tunnel.frp_cert_path
-                && left.tunnel.frp_key_path == right.tunnel.frp_key_path
-                && left.tunnel.cloudflare_mode == right.tunnel.cloudflare_mode
-                && left.tunnel.use_proxy == right.tunnel.use_proxy
-        }
+        TunnelServiceKind::Mcp => match (left.tunnel_profile(), right.tunnel_profile()) {
+            (Some(left), Some(right)) => left.id == right.id && left.config == right.config,
+            (None, None) => true,
+            _ => false,
+        },
     }
 }
 
 fn restore_daemon_tunnel_config(
-    failed: &WorkspaceProfile,
-    restored: &WorkspaceProfile,
+    failed: &WorkspaceRuntimeContext,
+    restored: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<()> {
-    let tunnel_id = failed.tunnel_id.clone();
-    if tunnel_id.is_empty() {
+    let Some(failed_tunnel) = failed.tunnel_profile() else {
         return Ok(());
-    }
+    };
+    let tunnel_id = failed_tunnel.id.clone();
     DataStore::update_file(|data| {
         let Some(current) = data
             .tunnels
@@ -3653,33 +3762,37 @@ fn restore_daemon_tunnel_config(
         else {
             return Ok(());
         };
-        let current_config = current.config.clone();
-        let mut current_profile = failed.clone();
-        current_profile.tunnel = current_config;
+        let current_profile =
+            WorkspaceRuntimeContext::new(failed.workspace.clone(), Some(current.clone()))?;
         if !tunnel_config_matches(&current_profile, failed, kind) {
             return Err(AppError::Message(
                 "检测到更新的隧道配置，已拒绝用旧 daemon 配置覆盖。".into(),
             ));
         }
         match kind {
-            TunnelServiceKind::Mcp => current.config = restored.tunnel.clone(),
+            TunnelServiceKind::Mcp => {
+                let restored = restored.tunnel_profile().ok_or_else(|| {
+                    AppError::Message("恢复 daemon Tunnel 配置时目标 Tunnel 不存在".into())
+                })?;
+                current.config = restored.config.clone();
+            }
         }
         Ok(())
     })
 }
 
 fn persist_daemon_tunnel_url(
-    profile: &mut WorkspaceProfile,
+    profile: &mut WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     public_url: &str,
 ) -> AppResult<()> {
     if public_url.is_empty() {
         return Ok(());
     }
-    if profile.tunnel_id.is_empty() {
+    let Some(profile_tunnel) = profile.tunnel_profile() else {
         return Ok(());
-    }
-    let tunnel_id = profile.tunnel_id.clone();
+    };
+    let tunnel_id = profile_tunnel.id.clone();
     DataStore::update_file(|data| {
         let Some(current) = data
             .tunnels
@@ -3688,8 +3801,8 @@ fn persist_daemon_tunnel_url(
         else {
             return Ok(());
         };
-        let mut current_profile = profile.clone();
-        current_profile.tunnel = current.config.clone();
+        let current_profile =
+            WorkspaceRuntimeContext::new(profile.workspace.clone(), Some(current.clone()))?;
         if !tunnel_config_matches(&current_profile, profile, kind) {
             return Ok(());
         }
@@ -3699,21 +3812,25 @@ fn persist_daemon_tunnel_url(
         Ok(())
     })?;
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.public_url = public_url.to_string(),
+        TunnelServiceKind::Mcp => {
+            if let Some(tunnel) = profile.tunnel.as_mut() {
+                tunnel.config.public_url = public_url.to_string();
+            }
+        }
     }
     update_public_url(&profile.id, "mcp", public_url);
     Ok(())
 }
 
 async fn apply_daemon_tunnel_command(
-    profile: &mut WorkspaceProfile,
+    profile: &mut WorkspaceRuntimeContext,
     service_selection: ServiceSelection,
     managed_tunnels: &mut Vec<TunnelServiceKind>,
     kind: TunnelServiceKind,
     action: control::ControlTunnelAction,
 ) -> AppResult<TunnelStatus> {
     let store = DataStore::load()?;
-    let latest = resolve_workspace(store.list(), &profile.id)?.clone();
+    let latest = resolve_runtime_context(&store, &profile.id)?;
     let settings = store.settings();
     drop(store);
     if kind == TunnelServiceKind::Mcp && settings.mcp_gateway.enabled {
@@ -3804,14 +3921,14 @@ async fn apply_daemon_tunnel_command(
 }
 
 async fn apply_daemon_reload_command(
-    profile: &mut WorkspaceProfile,
+    profile: &mut WorkspaceRuntimeContext,
     service_selection: ServiceSelection,
     managed_tunnels: &[TunnelServiceKind],
     runtime: &mut RuntimeSupervisor,
     service: control::ControlService,
 ) -> AppResult<()> {
     let store = DataStore::load()?;
-    let latest = resolve_workspace(store.list(), &profile.id)?.clone();
+    let latest = resolve_runtime_context(&store, &profile.id)?;
     drop(store);
     ensure_workspace_directory(&latest)?;
 
@@ -3877,8 +3994,8 @@ enum AppliedRuntimeConfigChange {
 
 async fn reload_runtime_service_to_profile(
     runtime: &mut RuntimeSupervisor,
-    current: &WorkspaceProfile,
-    target: &WorkspaceProfile,
+    current: &WorkspaceRuntimeContext,
+    target: &WorkspaceRuntimeContext,
     kind: ServiceKind,
 ) -> AppResult<()> {
     let handle = runtime.begin_stop(&current.id, kind);
@@ -3915,8 +4032,8 @@ async fn reload_runtime_service_to_profile(
 
 async fn apply_runtime_config_change(
     runtime: &mut RuntimeSupervisor,
-    current: &WorkspaceProfile,
-    target: &WorkspaceProfile,
+    current: &WorkspaceRuntimeContext,
+    target: &WorkspaceRuntimeContext,
     service_selection: ServiceSelection,
     service: control::ControlService,
     listener_reload: bool,
@@ -3957,104 +4074,14 @@ async fn apply_runtime_config_change(
     Ok(AppliedRuntimeConfigChange::None)
 }
 
-async fn rollback_runtime_config_change(
-    runtime: &mut RuntimeSupervisor,
-    current: &WorkspaceProfile,
-    target: &WorkspaceProfile,
-    service: control::ControlService,
-    applied: AppliedRuntimeConfigChange,
-) -> AppResult<()> {
-    match applied {
-        AppliedRuntimeConfigChange::None => Ok(()),
-        AppliedRuntimeConfigChange::ListenerReload => {
-            let kind = match service {
-                control::ControlService::Mcp => ServiceKind::Mcp,
-            };
-            reload_runtime_service_to_profile(runtime, target, current, kind).await
-        }
-        AppliedRuntimeConfigChange::CallbackHotUpdate => {
-            let (service_name, redirect_uris, redirect_hosts) = match service {
-                control::ControlService::Mcp => (
-                    "mcp",
-                    current.auth.oauth_redirect_uris.as_str(),
-                    current.auth.oauth_redirect_hosts.as_str(),
-                ),
-            };
-            let updated = crate::auth::update_oauth_redirect_policy(
-                &current.id,
-                service_name,
-                redirect_uris,
-                redirect_hosts,
-            )
-            .map_err(AppError::Message)?;
-            if updated {
-                Ok(())
-            } else {
-                Err(AppError::Message(format!(
-                    "恢复 {service_name} OAuth Callback 策略时活动 runtime 已不存在"
-                )))
-            }
-        }
-    }
-}
-
-async fn reconcile_managed_tunnel_config(
-    current: &WorkspaceProfile,
-    target: &WorkspaceProfile,
-    kind: TunnelServiceKind,
-    settings: &crate::settings::AppSettings,
-) -> AppResult<TunnelStatus> {
-    let current_type = tunnel_type_for_profile(current, kind);
-    let target_type = tunnel_type_for_profile(target, kind);
-    let mut tunnels = tunnel_supervisor().lock().await;
-    if target_type == "none" {
-        tunnels.stop(current, kind, settings).await?;
-        return Ok(tunnels.status(target, kind, settings));
-    }
-    if current_type == "frp" && target_type == "frp" {
-        return tunnels.start(target, kind, settings).await;
-    }
-
-    tunnels.stop(current, kind, settings).await?;
-    match tunnels.start(target, kind, settings).await {
-        Ok(status) => Ok(status),
-        Err(error) => {
-            let rollback = if current_type == "none" {
-                Ok(())
-            } else {
-                tunnels.start(current, kind, settings).await.map(|_| ())
-            };
-            match rollback {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(AppError::Message(format!(
-                    "{} 隧道配置应用失败：{error}；恢复旧线路也失败：{rollback_error}",
-                    tunnel_label(kind)
-                ))),
-            }
-        }
-    }
-}
-
-async fn rollback_managed_tunnel_config(
-    current: &WorkspaceProfile,
-    target: &WorkspaceProfile,
-    kind: TunnelServiceKind,
-    settings: &crate::settings::AppSettings,
-) -> AppResult<()> {
-    reconcile_managed_tunnel_config(target, current, kind, settings)
-        .await
-        .map(|_| ())
-}
-
 async fn apply_daemon_config_command(
-    profile: &mut WorkspaceProfile,
+    profile: &mut WorkspaceRuntimeContext,
     service_selection: ServiceSelection,
-    managed_tunnels: &mut Vec<TunnelServiceKind>,
+    managed_tunnels: &[TunnelServiceKind],
     runtime: &mut RuntimeSupervisor,
 ) -> AppResult<control::ControlConfigApplyResult> {
     let store = DataStore::load()?;
-    let latest = resolve_workspace(store.list(), &profile.id)?.clone();
-    let settings = store.settings();
+    let latest = resolve_runtime_context(&store, &profile.id)?;
     drop(store);
     ensure_workspace_directory(&latest)?;
     let previous = profile.clone();
@@ -4085,58 +4112,8 @@ async fn apply_daemon_config_command(
         plan.mcp_callback_policy_hot_update,
     )
     .await?;
-    let mcp_tunnel_managed =
-        managed_tunnels.contains(&TunnelServiceKind::Mcp) && !settings.mcp_gateway.enabled;
-    let mut applied_tunnels = Vec::new();
-    for (kind, should_apply) in [(
-        TunnelServiceKind::Mcp,
-        mcp_tunnel_managed && plan.mcp_tunnel_changed,
-    )] {
-        if !should_apply {
-            continue;
-        }
-        match reconcile_managed_tunnel_config(&previous, &latest, kind, &settings).await {
-            Ok(status) => applied_tunnels.push((kind, status)),
-            Err(error) => {
-                let mut rollback_errors = Vec::new();
-                for (applied_kind, _) in applied_tunnels.iter().rev() {
-                    if let Err(rollback_error) =
-                        rollback_managed_tunnel_config(&previous, &latest, *applied_kind, &settings)
-                            .await
-                    {
-                        rollback_errors.push(rollback_error.to_string());
-                    }
-                }
-                if let Err(rollback_error) = rollback_runtime_config_change(
-                    runtime,
-                    &previous,
-                    &latest,
-                    control::ControlService::Mcp,
-                    mcp_change,
-                )
-                .await
-                {
-                    rollback_errors.push(rollback_error.to_string());
-                }
-                return if rollback_errors.is_empty() {
-                    Err(error)
-                } else {
-                    Err(AppError::Message(format!(
-                        "隧道配置应用失败：{error}；运行态回滚存在错误：{}",
-                        rollback_errors.join("；")
-                    )))
-                };
-            }
-        }
-    }
 
     *profile = latest;
-    for (kind, status) in &applied_tunnels {
-        if tunnel_type_for_profile(profile, *kind) == "none" {
-            managed_tunnels.retain(|candidate| *candidate != *kind);
-        }
-        persist_daemon_tunnel_url(profile, *kind, &status.public_url)?;
-    }
     daemon::update_tunnel_services(
         profile,
         service_selection,
@@ -4147,9 +4124,7 @@ async fn apply_daemon_config_command(
         changed: true,
         mcp_listener_reloaded: mcp_change == AppliedRuntimeConfigChange::ListenerReload,
         mcp_callback_hot_updated: mcp_change == AppliedRuntimeConfigChange::CallbackHotUpdate,
-        mcp_tunnel_reloaded: applied_tunnels
-            .iter()
-            .any(|(kind, _)| *kind == TunnelServiceKind::Mcp),
+        mcp_tunnel_reloaded: false,
     })
 }
 
@@ -4304,8 +4279,11 @@ mod tests {
 
     #[test]
     fn cli_log_selection_includes_diagnostic_logs() {
-        let mut profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
-        profile.tunnel.tunnel_type = "none".into();
+        let profile = WorkspaceRuntimeContext::new(
+            WorkspaceProfile::new(".".into(), Some("logs".into())),
+            None,
+        )
+        .expect("runtime context");
 
         let mcp = selected_log_files(&profile, LogSelection::Mcp);
 

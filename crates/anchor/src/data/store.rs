@@ -6,7 +6,7 @@ use fs2::FileExt;
 use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
 use crate::tunnel::TunnelProfile;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
 
 use super::model::AppData;
 #[cfg(windows)]
@@ -153,7 +153,6 @@ impl DataStore {
         let mut data = load()?;
         validate_data(&data)?;
         let result = f(&mut data)?;
-        data.hydrate_workspace_tunnels();
         validate_data(&data)?;
         save(&data)?;
         Ok(result)
@@ -163,9 +162,8 @@ impl DataStore {
     /// decrypting the destination secrets file. Portable config import needs
     /// this path because a copied Windows DPAPI envelope is intentionally not
     /// decryptable on Linux/macOS (and vice versa).
-    pub(crate) fn replace_file(mut data: AppData) -> AppResult<()> {
+    pub(crate) fn replace_file(data: AppData) -> AppResult<()> {
         let _guard = lock_data_file()?;
-        data.hydrate_workspace_tunnels();
         validate_data(&data)?;
         save(&data)
     }
@@ -208,6 +206,16 @@ impl DataStore {
         self.data.tunnel_for_workspace(workspace_id)
     }
 
+    pub fn runtime_context_for(
+        &self,
+        workspace: &WorkspaceProfile,
+    ) -> AppResult<WorkspaceRuntimeContext> {
+        WorkspaceRuntimeContext::new(
+            workspace.clone(),
+            self.tunnel_for_workspace(&workspace.id).cloned(),
+        )
+    }
+
     pub fn register_tunnel(&mut self, tunnel: TunnelProfile) -> AppResult<()> {
         if self.data.tunnels.iter().any(|item| item.id == tunnel.id) {
             return Err(AppError::Message(format!(
@@ -216,7 +224,6 @@ impl DataStore {
             )));
         }
         self.data.tunnels.push(tunnel);
-        self.data.hydrate_workspace_tunnels();
         validate_data(&self.data)?;
         self.save()
     }
@@ -234,7 +241,6 @@ impl DataStore {
             )));
         };
         self.data.tunnels[index] = tunnel;
-        self.data.hydrate_workspace_tunnels();
         validate_data(&self.data)?;
         self.save()
     }
@@ -257,7 +263,6 @@ impl DataStore {
                 }
             }
         }
-        self.data.hydrate_workspace_tunnels();
         self.save()?;
         Ok(Some(removed))
     }
@@ -316,7 +321,6 @@ impl DataStore {
             }
         }
         self.data.workspace_secrets.remove(id);
-        self.data.hydrate_workspace_tunnels();
         self.save()?;
         Ok(Some(removed))
     }

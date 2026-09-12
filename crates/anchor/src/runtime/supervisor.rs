@@ -11,7 +11,9 @@ use crate::runtime::port::{is_own_process, port_busy_message, wait_for_port_free
 use crate::secret::SecretStore;
 use crate::settings::AppSettings;
 use crate::tunnel::append_profile_log;
-use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
+use crate::workspace::{
+    RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile, WorkspaceRuntimeContext,
+};
 
 const MAX_RECOVERY_ATTEMPTS: u8 = 5;
 const RECOVERY_BASE_DELAY_MS: u64 = 1_000;
@@ -64,7 +66,7 @@ impl RuntimeSupervisor {
     #[cfg(test)]
     fn mcp_status_with_settings(
         &self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         settings: &AppSettings,
     ) -> RuntimeStatusDto {
         let mut status = self.status_with_settings(profile, ServiceKind::Mcp, settings);
@@ -74,14 +76,14 @@ impl RuntimeSupervisor {
         status
     }
 
-    pub fn start_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+    pub fn start_mcp(&mut self, profile: &WorkspaceRuntimeContext) -> AppResult<RuntimeStatusDto> {
         self.start(profile, ServiceKind::Mcp)
     }
 
     #[cfg(unix)]
     pub(crate) fn start_from_handoff(
         &mut self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: ServiceKind,
         listener: crate::runtime::HandoffListener,
         mcp_snapshot: Option<mcp::McpHandoffSnapshot>,
@@ -171,7 +173,10 @@ impl RuntimeSupervisor {
         }
     }
 
-    pub fn maintain_mcp(&mut self, profile: &WorkspaceProfile) -> AppResult<RuntimeStatusDto> {
+    pub fn maintain_mcp(
+        &mut self,
+        profile: &WorkspaceRuntimeContext,
+    ) -> AppResult<RuntimeStatusDto> {
         self.maintain(profile, ServiceKind::Mcp)
     }
 
@@ -230,14 +235,18 @@ impl RuntimeSupervisor {
         self.entries.remove(&(workspace_id.to_string(), kind));
     }
 
-    fn status(&self, profile: &WorkspaceProfile, kind: ServiceKind) -> AppResult<RuntimeStatusDto> {
+    fn status(
+        &self,
+        profile: &WorkspaceRuntimeContext,
+        kind: ServiceKind,
+    ) -> AppResult<RuntimeStatusDto> {
         let settings = AppSettings::load()?;
         Ok(self.status_with_settings(profile, kind, &settings))
     }
 
     fn status_with_settings(
         &self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: ServiceKind,
         settings: &AppSettings,
     ) -> RuntimeStatusDto {
@@ -352,7 +361,7 @@ impl RuntimeSupervisor {
 
     fn start(
         &mut self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: ServiceKind,
     ) -> AppResult<RuntimeStatusDto> {
         self.attempt_start(profile, kind, false, None, None)
@@ -360,7 +369,7 @@ impl RuntimeSupervisor {
 
     fn attempt_start(
         &mut self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: ServiceKind,
         recovery: bool,
         imported_listener: Option<crate::runtime::HandoffListener>,
@@ -611,7 +620,7 @@ impl RuntimeSupervisor {
 
     fn maintain(
         &mut self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: ServiceKind,
     ) -> AppResult<RuntimeStatusDto> {
         let key = (profile.id.clone(), kind);
@@ -761,7 +770,7 @@ fn port_for(profile: &WorkspaceProfile, kind: ServiceKind) -> u16 {
 }
 
 fn endpoints(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: ServiceKind,
     settings: &AppSettings,
 ) -> (String, String) {
@@ -774,7 +783,7 @@ fn endpoints(
 }
 
 fn public_message_for(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: ServiceKind,
     settings: &AppSettings,
 ) -> String {
@@ -908,7 +917,11 @@ mod tests {
 
     #[test]
     fn running_mcp_status_exposes_registered_activity() {
-        let profile = WorkspaceProfile::new(".".into(), Some("activity".into()));
+        let profile = WorkspaceRuntimeContext::new(
+            WorkspaceProfile::new(".".into(), Some("activity".into())),
+            None,
+        )
+        .expect("runtime context");
         let tracker = mcp::register_activity(&profile.id);
         let mut supervisor = RuntimeSupervisor::default();
         supervisor.entries.insert(

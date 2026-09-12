@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult};
 use crate::platform::platform;
 use crate::secret::SecretStore;
 use crate::settings::AppSettings;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::WorkspaceRuntimeContext;
 
 use super::cloudflare::{self, CloudflareTunnelHandle};
 use super::frp::{self, FrpServerConfig};
@@ -45,7 +45,7 @@ struct TunnelSession {
 }
 
 struct FrpRoute {
-    profile: WorkspaceProfile,
+    profile: WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 }
 
@@ -77,7 +77,7 @@ impl TunnelSupervisor {
 
     pub fn status(
         &self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: TunnelServiceKind,
         settings: &AppSettings,
     ) -> TunnelStatus {
@@ -101,12 +101,12 @@ impl TunnelSupervisor {
 
     pub async fn start(
         &mut self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: TunnelServiceKind,
         settings: &AppSettings,
     ) -> AppResult<TunnelStatus> {
         let key = (profile.id.clone(), kind);
-        let tunnel_type = tunnel_type_for(profile, kind);
+        let tunnel_type = tunnel_type_for(profile, kind)?;
         if self.session_is_running(&key) && tunnel_type != "frp" {
             return Ok(self.status(profile, kind, settings));
         }
@@ -220,7 +220,7 @@ impl TunnelSupervisor {
 
     pub async fn stop(
         &mut self,
-        profile: &WorkspaceProfile,
+        profile: &WorkspaceRuntimeContext,
         kind: TunnelServiceKind,
         settings: &AppSettings,
     ) -> AppResult<()> {
@@ -394,14 +394,14 @@ impl TunnelSupervisor {
             return Ok(());
         }
 
-        let route_specs: Vec<(WorkspaceProfile, TunnelServiceKind)> = self
+        let route_specs: Vec<(WorkspaceRuntimeContext, TunnelServiceKind)> = self
             .frp_routes
             .iter()
             .filter(|((route_workspace_id, _), _)| route_workspace_id == workspace_id)
             .map(|(_, route)| route)
             .map(|route| (route.profile.clone(), route.kind))
             .collect();
-        let route_refs: Vec<(&WorkspaceProfile, TunnelServiceKind)> = route_specs
+        let route_refs: Vec<(&WorkspaceRuntimeContext, TunnelServiceKind)> = route_specs
             .iter()
             .map(|(profile, kind)| (profile, *kind))
             .collect();
@@ -441,14 +441,14 @@ impl TunnelSupervisor {
             return Ok(());
         }
 
-        let route_specs: Vec<(WorkspaceProfile, TunnelServiceKind)> = self
+        let route_specs: Vec<(WorkspaceRuntimeContext, TunnelServiceKind)> = self
             .frp_routes
             .iter()
             .filter(|((route_workspace_id, _), _)| route_workspace_id == workspace_id)
             .map(|(_, route)| route)
             .map(|route| (route.profile.clone(), route.kind))
             .collect();
-        let route_refs: Vec<(&WorkspaceProfile, TunnelServiceKind)> = route_specs
+        let route_refs: Vec<(&WorkspaceRuntimeContext, TunnelServiceKind)> = route_specs
             .iter()
             .map(|(profile, kind)| (profile, *kind))
             .collect();
@@ -549,15 +549,24 @@ fn proxy_already_exists(error: &AppError) -> bool {
     message.contains("proxy") && message.contains("already exists")
 }
 
-fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
+fn tunnel_type_for(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> AppResult<&str> {
+    let tunnel = profile.tunnel_profile().ok_or_else(|| {
+        AppError::Message(format!(
+            "workspace {} has no top-level MCP Tunnel resource",
+            profile.id
+        ))
+    })?;
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
+        TunnelServiceKind::Mcp => Ok(tunnel.config.tunnel_type.as_str()),
     }
 }
 
-fn tunnel_use_proxy(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+fn tunnel_use_proxy(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> bool {
+    let Some(tunnel) = profile.tunnel_profile() else {
+        return false;
+    };
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.use_proxy,
+        TunnelServiceKind::Mcp => tunnel.config.use_proxy,
     }
 }
 
@@ -568,7 +577,7 @@ fn tunnel_service_label(kind: TunnelServiceKind) -> &'static str {
 }
 
 fn public_url_for_profile(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> String {
@@ -578,18 +587,24 @@ fn public_url_for_profile(
 }
 
 fn validate_tunnel_requirements(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> AppResult<()> {
-    let tunnel_type = tunnel_type_for(profile, kind);
+    let tunnel = profile.tunnel_profile().ok_or_else(|| {
+        AppError::Message(format!(
+            "workspace {} has no top-level MCP Tunnel resource",
+            profile.id
+        ))
+    })?;
+    let tunnel_type = tunnel_type_for(profile, kind)?;
     if tunnel_type == "frp" {
         let (profile_id, server, subdomain, port) = match kind {
             TunnelServiceKind::Mcp => (
-                profile.tunnel.frp_profile_id.as_str(),
-                profile.tunnel.frp_server.as_str(),
-                profile.tunnel.frp_subdomain.as_str(),
-                profile.tunnel.frp_server_port,
+                tunnel.config.frp_profile_id.as_str(),
+                tunnel.config.frp_server.as_str(),
+                tunnel.config.frp_subdomain.as_str(),
+                tunnel.config.frp_server_port,
             ),
         };
         let server = resolve_frp_server(profile_id, server, settings);
@@ -612,14 +627,14 @@ fn validate_tunnel_requirements(
 
     let (mode, secret_key, named_url) = match kind {
         TunnelServiceKind::Mcp => (
-            profile.tunnel.cloudflare_mode.as_str(),
+            tunnel.config.cloudflare_mode.as_str(),
             "tunnel_cloudflare_token",
-            profile.tunnel.public_url.clone(),
+            tunnel.config.public_url.clone(),
         ),
     };
 
     if mode == "named" {
-        let token = SecretStore::get_app(secret_key, &profile.tunnel_id)?.unwrap_or_default();
+        let token = SecretStore::get_app(secret_key, &tunnel.id)?.unwrap_or_default();
         if token.trim().is_empty() {
             return Err(AppError::Message(
                 "Cloudflare 命名隧道模式需要填写 Tunnel Token。".into(),
@@ -643,18 +658,24 @@ fn resolve_frp_server(profile_id: &str, inline_server: &str, settings: &AppSetti
 }
 
 fn cloudflare_config(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<(u16, &str, String, String, &'static str)> {
+    let tunnel = profile.tunnel_profile().ok_or_else(|| {
+        AppError::Message(format!(
+            "workspace {} has no top-level MCP Tunnel resource",
+            profile.id
+        ))
+    })?;
     match kind {
         TunnelServiceKind::Mcp => {
-            let token = SecretStore::get_app("tunnel_cloudflare_token", &profile.tunnel_id)?
-                .unwrap_or_default();
+            let token =
+                SecretStore::get_app("tunnel_cloudflare_token", &tunnel.id)?.unwrap_or_default();
             Ok((
                 profile.runtime.local_port,
-                profile.tunnel.cloudflare_mode.as_str(),
+                tunnel.config.cloudflare_mode.as_str(),
                 token,
-                profile.tunnel.public_url.clone(),
+                tunnel.config.public_url.clone(),
                 "cloudflared.log",
             ))
         }
@@ -699,25 +720,31 @@ pub fn append_profile_log(profile_id: &str, file_name: &str, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::TunnelProfile;
+    use crate::workspace::WorkspaceProfile;
 
-    fn frp_profile(name: &str, subdomain: &str) -> WorkspaceProfile {
-        let mut profile = WorkspaceProfile::new(format!("C:/workspace/{name}"), Some(name.into()));
-        profile.tunnel.tunnel_type = "frp".into();
-        profile.tunnel.frp_server = "frp.example.com".into();
-        profile.tunnel.frp_server_port = 7000;
-        profile.tunnel.frp_subdomain = subdomain.into();
-        profile
+    fn frp_profile(name: &str, subdomain: &str) -> WorkspaceRuntimeContext {
+        let workspace = WorkspaceProfile::new(format!("C:/workspace/{name}"), Some(name.into()));
+        let mut tunnel = TunnelProfile::new(workspace.id.clone(), &workspace.name, "mcp");
+        tunnel.config.tunnel_type = "frp".into();
+        tunnel.config.frp_server = "frp.example.com".into();
+        tunnel.config.frp_server_port = 7000;
+        tunnel.config.frp_subdomain = subdomain.into();
+        WorkspaceRuntimeContext::new(workspace, Some(tunnel)).expect("runtime context")
     }
 
     #[test]
     fn cloudflare_quick_validation_does_not_require_preinstalled_binary() {
         let settings = AppSettings::default();
-        let mut profile = WorkspaceProfile::new(
+        let workspace = WorkspaceProfile::new(
             "C:/workspace/cloudflare-quick".into(),
             Some("cloudflare-quick".into()),
         );
-        profile.tunnel.tunnel_type = "cloudflare".into();
-        profile.tunnel.cloudflare_mode = "quick".into();
+        let mut tunnel = TunnelProfile::new(workspace.id.clone(), &workspace.name, "mcp");
+        tunnel.config.tunnel_type = "cloudflare".into();
+        tunnel.config.cloudflare_mode = "quick".into();
+        let profile =
+            WorkspaceRuntimeContext::new(workspace, Some(tunnel)).expect("runtime context");
 
         validate_tunnel_requirements(&profile, TunnelServiceKind::Mcp, &settings)
             .expect("quick tunnel validation should defer binary resolution to async spawn");
@@ -768,9 +795,9 @@ mod tests {
     fn active_routes_allow_mixed_proxy_preferences() {
         let settings = AppSettings::default();
         let mut direct = frp_profile("direct", "direct");
-        direct.tunnel.use_proxy = false;
+        direct.tunnel.as_mut().unwrap().config.use_proxy = false;
         let mut proxied = frp_profile("proxied", "proxied");
-        proxied.tunnel.use_proxy = true;
+        proxied.tunnel.as_mut().unwrap().config.use_proxy = true;
         let mut supervisor = TunnelSupervisor::new();
         supervisor.frp_routes.insert(
             (direct.id.clone(), TunnelServiceKind::Mcp),
@@ -791,7 +818,7 @@ mod tests {
         let settings = AppSettings::default();
         let first = frp_profile("first", "first");
         let mut second = frp_profile("second", "second");
-        second.tunnel.frp_server = "another-frp.example.com".into();
+        second.tunnel.as_mut().unwrap().config.frp_server = "another-frp.example.com".into();
         let mut supervisor = TunnelSupervisor::new();
         supervisor.frp_routes.insert(
             (first.id.clone(), TunnelServiceKind::Mcp),

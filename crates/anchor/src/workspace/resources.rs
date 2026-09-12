@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use crate::tunnel::TunnelProfile;
 use crate::workspace::WorkspaceProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +36,7 @@ pub fn assign_free_workspace_ports_with_reserved(
     let mut reserved: std::collections::HashSet<u16> = profiles
         .iter()
         .filter(|profile| profile.id != candidate.id)
-        .flat_map(service_claims)
-        .map(|claim| claim.local_port)
+        .map(|profile| profile.runtime.local_port)
         .collect();
     reserved.extend(additional_reserved.iter().copied());
 
@@ -64,20 +64,24 @@ pub fn validate_workspace_resources_update(
     current: &WorkspaceProfile,
     candidate: &WorkspaceProfile,
 ) -> AppResult<()> {
-    let existing_claims: Vec<_> = profiles
-        .iter()
-        .filter(|profile| profile.id != candidate.id)
-        .flat_map(service_claims)
-        .collect();
-    let candidate_claims = service_claims(candidate);
-
-    validate_changed_candidate_ports(&existing_claims, &candidate_claims, current, candidate)?;
-    validate_changed_candidate_subdomains(&existing_claims, &candidate_claims, current, candidate)
+    if current.runtime.local_port == candidate.runtime.local_port {
+        return Ok(());
+    }
+    if let Some(owner) = profiles.iter().find(|profile| {
+        profile.id != candidate.id && profile.runtime.local_port == candidate.runtime.local_port
+    }) {
+        return Err(AppError::Message(format!(
+            "本地端口 {} 与工作区“{}”的 MCP 服务重复。请修改当前工作区 MCP 端口后再启动。",
+            candidate.runtime.local_port, owner.name
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "cli", test))]
 pub fn validate_service_start(
     profiles: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
     workspace_id: &str,
     service: WorkspaceService,
 ) -> AppResult<()> {
@@ -85,10 +89,10 @@ pub fn validate_service_start(
         .iter()
         .find(|profile| profile.id == workspace_id)
         .ok_or_else(|| AppError::Message(format!("workspace not found: {workspace_id}")))?;
-    let target_claim = claim_for(target, service);
+    let target_claim = claim_for(target, tunnel_for_workspace(tunnels, workspace_id), service);
 
     for profile in profiles {
-        for claim in service_claims(profile) {
+        for claim in service_claims(profile, tunnel_for_workspace(tunnels, &profile.id)) {
             if claim.profile.id == workspace_id && claim.service == service {
                 continue;
             }
@@ -104,91 +108,37 @@ pub fn validate_service_start(
     Ok(())
 }
 
-fn validate_changed_candidate_ports(
-    existing: &[ServiceClaim<'_>],
-    candidate: &[ServiceClaim<'_>],
-    current: &WorkspaceProfile,
-    next: &WorkspaceProfile,
-) -> AppResult<()> {
-    for claim in candidate
-        .iter()
-        .copied()
-        .filter(|claim| service_changed(current, next, claim.service))
-    {
-        if let Some(owner) = existing
-            .iter()
-            .copied()
-            .find(|owner| owner.local_port == claim.local_port)
-        {
-            return Err(port_conflict_error(claim, owner));
-        }
-        if let Some(owner) = candidate
-            .iter()
-            .copied()
-            .find(|owner| owner.service != claim.service && owner.local_port == claim.local_port)
-        {
-            return Err(port_conflict_error(claim, owner));
-        }
-    }
-    Ok(())
+fn service_claims<'a>(
+    profile: &'a WorkspaceProfile,
+    tunnel: Option<&'a TunnelProfile>,
+) -> [ServiceClaim<'a>; 1] {
+    [claim_for(profile, tunnel, WorkspaceService::Mcp)]
 }
 
-fn validate_changed_candidate_subdomains(
-    existing: &[ServiceClaim<'_>],
-    candidate: &[ServiceClaim<'_>],
-    current: &WorkspaceProfile,
-    next: &WorkspaceProfile,
-) -> AppResult<()> {
-    for claim in candidate
-        .iter()
-        .copied()
-        .filter(|claim| service_changed(current, next, claim.service) && claim.uses_frp)
-    {
-        if claim.subdomain.trim().is_empty() {
-            continue;
-        }
-        if let Some(owner) = existing
-            .iter()
-            .copied()
-            .find(|owner| same_non_empty_subdomain(claim, *owner))
-        {
-            return Err(subdomain_conflict_error(claim, owner));
-        }
-        if let Some(owner) = candidate
-            .iter()
-            .copied()
-            .find(|owner| owner.service != claim.service && same_non_empty_subdomain(claim, *owner))
-        {
-            return Err(subdomain_conflict_error(claim, owner));
-        }
-    }
-    Ok(())
-}
-
-fn service_claims(profile: &WorkspaceProfile) -> [ServiceClaim<'_>; 1] {
-    [claim_for(profile, WorkspaceService::Mcp)]
-}
-
-fn service_changed(
-    current: &WorkspaceProfile,
-    next: &WorkspaceProfile,
+fn claim_for<'a>(
+    profile: &'a WorkspaceProfile,
+    tunnel: Option<&'a TunnelProfile>,
     service: WorkspaceService,
-) -> bool {
-    let current = claim_for(current, service);
-    let next = claim_for(next, service);
-    current.local_port != next.local_port
-        || current.subdomain != next.subdomain
-        || current.uses_frp != next.uses_frp
-}
-
-fn claim_for(profile: &WorkspaceProfile, service: WorkspaceService) -> ServiceClaim<'_> {
+) -> ServiceClaim<'a> {
+    let config = tunnel.map(|tunnel| &tunnel.config);
     ServiceClaim {
         profile,
         service,
         local_port: profile.runtime.local_port,
-        subdomain: profile.tunnel.frp_subdomain.as_str(),
-        uses_frp: profile.tunnel.tunnel_type == "frp",
+        subdomain: config
+            .map(|config| config.frp_subdomain.as_str())
+            .unwrap_or(""),
+        uses_frp: config.is_some_and(|config| config.tunnel_type == "frp"),
     }
+}
+
+fn tunnel_for_workspace<'a>(
+    tunnels: &'a [TunnelProfile],
+    workspace_id: &str,
+) -> Option<&'a TunnelProfile> {
+    tunnels.iter().find(|tunnel| {
+        tunnel.workspace_id == workspace_id && tunnel.service.eq_ignore_ascii_case("mcp")
+    })
 }
 
 fn same_non_empty_subdomain(left: ServiceClaim<'_>, right: ServiceClaim<'_>) -> bool {
@@ -226,23 +176,31 @@ mod tests {
         assign_free_workspace_ports_with_reserved, validate_service_start,
         validate_workspace_resources_update, WorkspaceService,
     };
+    use crate::tunnel::TunnelProfile;
     use crate::workspace::WorkspaceProfile;
 
     fn profile(name: &str, mcp_port: u16) -> WorkspaceProfile {
         let mut profile = WorkspaceProfile::new(format!("C:/workspace/{name}"), Some(name.into()));
         profile.runtime.local_port = mcp_port;
-        profile.tunnel.tunnel_type = "frp".into();
-        profile.tunnel.frp_subdomain = format!("{name}-mcp");
         profile
+    }
+
+    fn frp_tunnel(profile: &WorkspaceProfile) -> TunnelProfile {
+        let mut tunnel = TunnelProfile::new(profile.id.clone(), &profile.name, "mcp");
+        tunnel.config.tunnel_type = "frp".into();
+        tunnel.config.frp_subdomain = format!("{}-mcp", profile.name);
+        tunnel
     }
 
     #[test]
     fn rejects_duplicate_mcp_port_across_workspaces_before_start() {
         let owner = profile("owner", 28_766);
         let target = profile("target", 28_766);
+        let tunnels = [frp_tunnel(&owner), frp_tunnel(&target)];
 
         let error = validate_service_start(
             &[owner.clone(), target.clone()],
+            &tunnels,
             &target.id,
             WorkspaceService::Mcp,
         )
@@ -283,6 +241,7 @@ mod tests {
         assert_eq!(candidate.runtime.local_port, 28_767);
         assert!(validate_service_start(
             &[owner, candidate.clone()],
+            &[],
             &candidate.id,
             WorkspaceService::Mcp,
         )
@@ -347,9 +306,13 @@ mod tests {
         let first = profile("first", 28_766);
         let target = profile("target", 28_766);
 
-        let error =
-            validate_service_start(&[first, target.clone()], &target.id, WorkspaceService::Mcp)
-                .unwrap_err();
+        let error = validate_service_start(
+            &[first, target.clone()],
+            &[],
+            &target.id,
+            WorkspaceService::Mcp,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("端口"));
     }
@@ -357,31 +320,37 @@ mod tests {
     #[test]
     fn rejects_duplicate_subdomains_with_owner_details() {
         let owner = profile("owner", 28_765);
-        let mut candidate = profile("target", 28_766);
-        candidate.tunnel.frp_subdomain = owner.tunnel.frp_subdomain.clone();
+        let candidate = profile("target", 28_766);
+        let owner_tunnel = frp_tunnel(&owner);
+        let mut candidate_tunnel = frp_tunnel(&candidate);
+        candidate_tunnel.config.frp_subdomain = owner_tunnel.config.frp_subdomain.clone();
 
         let error = validate_service_start(
             &[owner.clone(), candidate.clone()],
+            &[owner_tunnel.clone(), candidate_tunnel],
             &candidate.id,
             WorkspaceService::Mcp,
         )
         .unwrap_err();
 
         let message = error.to_string();
-        assert!(message.contains(&owner.tunnel.frp_subdomain));
+        assert!(message.contains(&owner_tunnel.config.frp_subdomain));
         assert!(message.contains(&owner.name));
         assert!(message.contains("MCP"));
     }
 
     #[test]
     fn ignores_blank_subdomain_claims() {
-        let mut first = profile("first", 28_765);
-        let mut second = profile("second", 28_766);
-        first.tunnel.frp_subdomain.clear();
-        second.tunnel.frp_subdomain.clear();
+        let first = profile("first", 28_765);
+        let second = profile("second", 28_766);
+        let mut first_tunnel = frp_tunnel(&first);
+        let mut second_tunnel = frp_tunnel(&second);
+        first_tunnel.config.frp_subdomain.clear();
+        second_tunnel.config.frp_subdomain.clear();
 
         assert!(validate_service_start(
             &[first, second.clone()],
+            &[first_tunnel, second_tunnel],
             &second.id,
             WorkspaceService::Mcp,
         )

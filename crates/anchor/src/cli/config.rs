@@ -15,8 +15,6 @@ use crate::data::{
     ConfigExportSummary, ConfigImportSummary, DataStore, WorkspacePathMapping,
 };
 use crate::error::{AppError, AppResult};
-use crate::gateway_control;
-use crate::gateway_daemon;
 use crate::mcp::gateway;
 use crate::platform::platform;
 use crate::workspace::config_apply::{plan_workspace_config_apply, WorkspaceConfigApplyPlan};
@@ -335,10 +333,6 @@ pub(crate) fn stage_profile_config(
     })
 }
 
-pub(crate) fn pending_candidate(active: &WorkspaceProfile) -> AppResult<Option<WorkspaceProfile>> {
-    Ok(load_pending_for_active(active)?.map(|pending| pending.candidate))
-}
-
 async fn apply_config(options: ConfigApplyOptions) -> AppResult<()> {
     let output = apply_staged_config(options).await?;
     print_report(&output)
@@ -361,11 +355,7 @@ pub(crate) async fn apply_staged_config(
             warnings: vec!["没有待应用配置".into()],
         });
     };
-    let mut candidate = pending.candidate;
-    candidate.tunnel = active.tunnel.clone();
-    candidate.tunnel_id = active.tunnel_id.clone();
-    candidate.tunnel_enabled = active.tunnel_enabled;
-    candidate.tunnel_revision = active.tunnel_revision;
+    let candidate = pending.candidate;
     validate_candidate(&store, &active, &candidate)?;
     let plan = plan_workspace_config_apply(&active, &candidate);
     let changes = config_changes(&active, &candidate)?;
@@ -375,25 +365,8 @@ pub(crate) async fn apply_staged_config(
         return Err(AppError::Message(daemon_inspection.detail));
     }
     let daemon_running = daemon_inspection.running && daemon_inspection.pid_matches;
-    reject_uncoordinated_live_runtime(&active, &plan, &previous_settings, daemon_running)?;
-    let gateway_inspection = gateway_daemon::inspect()?;
-    if gateway_inspection.ambiguous {
-        return Err(AppError::Message(gateway_inspection.detail));
-    }
-    let gateway_live = gateway_inspection.running
-        && gateway_inspection.state.as_ref().is_some_and(|state| {
-            state.workspace_ids.contains(&active.id)
-                || previous_settings.mcp_gateway.tunnel_id == active.tunnel_id
-        });
-
-    let reset_gateway_observed =
-        gateway::owner_tunnel_identity_changed(&previous_settings.mcp_gateway, &active, &candidate);
+    reject_uncoordinated_live_runtime(&active, &plan, daemon_running)?;
     store.update(candidate.clone())?;
-    if reset_gateway_observed {
-        let mut settings = store.settings();
-        settings.mcp_gateway.clear_observation();
-        store.update_settings(settings)?;
-    }
     drop(store);
 
     let timeout = Duration::from_secs(options.wait_seconds);
@@ -402,7 +375,7 @@ pub(crate) async fn apply_staged_config(
             Ok(result) => Some(result),
             Err(error) => {
                 let restore_errors =
-                    restore_active_config(&active, &previous_settings, false, false, timeout).await;
+                    restore_active_config(&active, &previous_settings, false, timeout).await;
                 return Err(apply_failure(
                     format!("Workspace daemon 配置应用失败：{error}"),
                     restore_errors,
@@ -413,24 +386,7 @@ pub(crate) async fn apply_staged_config(
         None
     };
 
-    let mut gateway_reloaded = false;
-    if gateway_live && plan.mcp_tunnel_changed {
-        if let Err(error) = gateway_control::request_reload(timeout).await {
-            let restore_errors = restore_active_config(
-                &active,
-                &previous_settings,
-                workspace_runtime.is_some(),
-                true,
-                timeout,
-            )
-            .await;
-            return Err(apply_failure(
-                format!("Gateway daemon 配置应用失败：{error}"),
-                restore_errors,
-            ));
-        }
-        gateway_reloaded = true;
-    }
+    let gateway_reloaded = false;
 
     let mut warnings = Vec::new();
     if let Err(error) = remove_pending(&active.id) {
@@ -453,7 +409,6 @@ async fn restore_active_config(
     active: &WorkspaceProfile,
     settings: &crate::settings::AppSettings,
     rollback_workspace_runtime: bool,
-    rollback_gateway: bool,
     timeout: Duration,
 ) -> Vec<String> {
     let mut errors = Vec::new();
@@ -470,11 +425,6 @@ async fn restore_active_config(
     if rollback_workspace_runtime {
         if let Err(error) = control::request_apply_config_operation(active, timeout).await {
             errors.push(format!("恢复 Workspace daemon 运行态失败：{error}"));
-        }
-    }
-    if rollback_gateway {
-        if let Err(error) = gateway_control::request_reload(timeout).await {
-            errors.push(format!("恢复 Gateway daemon 运行态失败：{error}"));
         }
     }
     errors
@@ -494,15 +444,12 @@ fn apply_failure(primary: String, restore_errors: Vec<String>) -> AppError {
 fn reject_uncoordinated_live_runtime(
     active: &WorkspaceProfile,
     plan: &WorkspaceConfigApplyPlan,
-    settings: &crate::settings::AppSettings,
     daemon_running: bool,
 ) -> AppResult<()> {
     if daemon_running {
         return Ok(());
     }
-    let mcp_runtime_change = plan.mcp_listener_reload
-        || plan.mcp_callback_policy_hot_update
-        || (!settings.mcp_gateway.enabled && plan.mcp_tunnel_changed);
+    let mcp_runtime_change = plan.mcp_listener_reload || plan.mcp_callback_policy_hot_update;
     if mcp_runtime_change
         && platform()
             .find_pid_listening_on_port(active.runtime.local_port)?
@@ -510,17 +457,6 @@ fn reject_uncoordinated_live_runtime(
     {
         return Err(AppError::Message(
             "当前 Workspace daemon 未运行，但 MCP 端口存在活动 listener；CLI config apply 不会让活动 GUI Server/外部运行态与磁盘配置分叉。请先停止该 listener，或先启动并由 Workspace daemon 接管。"
-                .into(),
-        ));
-    }
-    if settings.mcp_gateway.enabled
-        && plan.mcp_tunnel_changed
-        && platform()
-            .find_pid_listening_on_port(settings.mcp_gateway.local_port)?
-            .is_some()
-    {
-        return Err(AppError::Message(
-            "当前平台后台 Gateway daemon 尚未可用，且 Gateway 端口存在活动运行态；CLI config apply 不会接管 GUI Server Gateway。"
                 .into(),
         ));
     }

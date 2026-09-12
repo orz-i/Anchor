@@ -1398,9 +1398,21 @@ async fn handle_request_with_settings(
                             }
                         },
                     };
+                    let runtime_profile = match crate::data::DataStore::load()
+                        .and_then(|store| store.runtime_context_for(profile))
+                    {
+                        Ok(profile) => profile,
+                        Err(error) => {
+                            return handled(ControlResponse::error(
+                                request_id,
+                                ERROR_INTERNAL,
+                                error.to_string(),
+                            ));
+                        }
+                    };
                     let tunnels = crate::tunnel::supervisor().lock().await;
                     status.mcp_tunnel = Some(tunnels.status(
-                        profile,
+                        &runtime_profile,
                         crate::tunnel::TunnelServiceKind::Mcp,
                         &settings,
                     ));

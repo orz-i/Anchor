@@ -113,6 +113,26 @@ fn persisted_configuration_requires_current_content_schema_versions() {
 }
 
 #[test]
+fn tunnel_runtime_has_one_top_level_authority() {
+    let workspace = source("src/workspace/model.rs");
+    let data_model = source("src/data/model.rs");
+    let data_store = source("src/data/store.rs");
+    let config_apply = source("src/workspace/config_apply.rs");
+    let gateway = source("src/mcp/gateway.rs");
+
+    assert!(!workspace.contains("pub(crate) tunnel: TunnelConfig"));
+    assert!(!workspace.contains("pub(crate) tunnel_id: String"));
+    assert!(!workspace.contains("pub(crate) tunnel_enabled: bool"));
+    assert!(!workspace.contains("pub(crate) tunnel_revision: u64"));
+    assert!(workspace.contains("pub struct WorkspaceRuntimeContext"));
+    assert!(workspace.contains("pub tunnel: Option<TunnelProfile>"));
+    assert!(!data_model.contains("hydrate_workspace_tunnels"));
+    assert!(!data_store.contains("hydrate_workspace_tunnels"));
+    assert!(!config_apply.contains("mcp_tunnel_changed"));
+    assert!(gateway.contains("tunnels: &[TunnelProfile]"));
+}
+
+#[test]
 fn control_planes_have_no_cross_version_retry_bridge() {
     let workspace_protocol = source("src/control/protocol.rs");
     let workspace_ipc = source("src/control/ipc.rs");

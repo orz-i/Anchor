@@ -7,17 +7,32 @@ use tokio::sync::Mutex;
 use crate::error::{AppError, AppResult};
 use crate::runtime::{current_public_url, update_public_url};
 use crate::settings::{AppSettings, McpGatewayConfig};
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
 
-use super::{TunnelServiceKind, TunnelSupervisor};
+use super::{TunnelProfile, TunnelServiceKind, TunnelSupervisor};
 
 static TUNNEL_SUPERVISOR: LazyLock<Mutex<TunnelSupervisor>> =
     LazyLock::new(|| Mutex::new(TunnelSupervisor::new()));
 
 #[derive(Clone)]
 struct GatewayTunnelBinding {
-    profile: WorkspaceProfile,
+    profile: WorkspaceRuntimeContext,
     signature: String,
+}
+
+fn runtime_context_for_profile(
+    profile: &WorkspaceProfile,
+    tunnels: &[TunnelProfile],
+) -> AppResult<WorkspaceRuntimeContext> {
+    WorkspaceRuntimeContext::new(
+        profile.clone(),
+        tunnels
+            .iter()
+            .find(|tunnel| {
+                tunnel.workspace_id == profile.id && tunnel.service.eq_ignore_ascii_case("mcp")
+            })
+            .cloned(),
+    )
 }
 
 static GATEWAY_TUNNEL_BINDING: LazyLock<Mutex<Option<GatewayTunnelBinding>>> =
@@ -28,7 +43,7 @@ pub fn supervisor() -> &'static Mutex<TunnelSupervisor> {
 }
 
 pub async fn ensure_for_runtime(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<Option<String>> {
     let settings = AppSettings::load()?;
@@ -62,14 +77,17 @@ pub async fn ensure_for_runtime(
     Ok(Some(status.public_url))
 }
 
-fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
+fn tunnel_type_for(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> &str {
+    let Some(tunnel) = profile.tunnel_profile() else {
+        return "none";
+    };
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type.as_str(),
+        TunnelServiceKind::Mcp => tunnel.config.tunnel_type.as_str(),
     }
 }
 
 pub async fn maybe_start_for_runtime(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<Option<String>> {
     let settings = AppSettings::load()?;
@@ -93,7 +111,7 @@ pub fn is_quick_tunnel_url_change_error(error: &AppError) -> bool {
 }
 
 fn validate_automatic_recovery_url(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     recovered_url: &str,
     settings: &AppSettings,
@@ -120,7 +138,7 @@ fn validate_automatic_recovery_url(
     )))
 }
 
-fn publish_listener_url(profile: &WorkspaceProfile, kind: TunnelServiceKind, url: &str) {
+fn publish_listener_url(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind, url: &str) {
     update_public_url(&profile.id, service_key(kind), url);
 }
 
@@ -130,22 +148,28 @@ fn service_key(kind: TunnelServiceKind) -> &'static str {
     }
 }
 
-fn configured_public_url(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str {
+fn configured_public_url(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> &str {
+    let Some(tunnel) = profile.tunnel_profile() else {
+        return "";
+    };
     match kind {
-        TunnelServiceKind::Mcp => &profile.tunnel.public_url,
+        TunnelServiceKind::Mcp => &tunnel.config.public_url,
     }
 }
 
-fn is_quick_cloudflare(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+fn is_quick_cloudflare(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> bool {
+    let Some(tunnel) = profile.tunnel_profile() else {
+        return false;
+    };
     match kind {
         TunnelServiceKind::Mcp => {
-            profile.tunnel.tunnel_type == "cloudflare" && profile.tunnel.cloudflare_mode == "quick"
+            tunnel.config.tunnel_type == "cloudflare" && tunnel.config.cloudflare_mode == "quick"
         }
     }
 }
 
 pub async fn stop_for_runtime(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<()> {
     let settings = AppSettings::load()?;
@@ -167,6 +191,7 @@ pub async fn drop_workspace(workspace_id: &str) -> AppResult<()> {
 pub async fn reconcile_mcp_gateway(
     config: &McpGatewayConfig,
     profiles: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
     active_workspace_ids: &HashSet<String>,
 ) -> AppResult<Option<String>> {
     let settings = AppSettings::load()?;
@@ -189,25 +214,31 @@ pub async fn reconcile_mcp_gateway(
                 .await?;
         }
         for profile in profiles {
+            let profile = runtime_context_for_profile(profile, tunnels)?;
             guard
-                .stop(profile, TunnelServiceKind::Mcp, &settings)
+                .stop(&profile, TunnelServiceKind::Mcp, &settings)
                 .await?;
         }
         return Ok(None);
     }
 
-    crate::mcp::gateway::validate_config(config, profiles)?;
+    crate::mcp::gateway::validate_config(config, profiles, tunnels)?;
+    let tunnel = tunnels
+        .iter()
+        .find(|tunnel| tunnel.id == config.tunnel_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway 引用的 Tunnel 不存在。".into()))?;
     let owner = profiles
         .iter()
-        .find(|profile| profile.tunnel_id == config.tunnel_id)
-        .ok_or_else(|| AppError::Message("MCP Gateway 引用的 Tunnel 不存在。".into()))?;
-    let mut gateway_profile = owner.clone();
+        .find(|profile| profile.id == tunnel.workspace_id)
+        .ok_or_else(|| AppError::Message("MCP Gateway Tunnel 的 Workspace 不存在。".into()))?;
+    let mut gateway_profile = WorkspaceRuntimeContext::new(owner.clone(), Some(tunnel.clone()))?;
     gateway_profile.runtime.local_port = config.local_port;
     if !config.public_url.trim().is_empty() {
-        gateway_profile.tunnel.public_url =
-            config.public_url.trim().trim_end_matches('/').to_string();
+        if let Some(tunnel) = gateway_profile.tunnel.as_mut() {
+            tunnel.config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
+        }
     }
-    let signature = crate::mcp::gateway::tunnel_identity_signature(config, owner)?;
+    let signature = crate::mcp::gateway::tunnel_identity_signature(config, owner, tunnel)?;
 
     let binding_changed = binding
         .as_ref()
@@ -225,13 +256,17 @@ pub async fn reconcile_mcp_gateway(
     // the old workspace listener port.
     if binding.is_none() {
         for profile in profiles {
+            let profile = runtime_context_for_profile(profile, tunnels)?;
             guard
-                .stop(profile, TunnelServiceKind::Mcp, &settings)
+                .stop(&profile, TunnelServiceKind::Mcp, &settings)
                 .await?;
         }
     }
 
-    let tunnel_type = gateway_profile.tunnel.tunnel_type.as_str();
+    let tunnel_type = gateway_profile
+        .tunnel_profile()
+        .map(|tunnel| tunnel.config.tunnel_type.as_str())
+        .unwrap_or("none");
     if tunnel_type.is_empty() || tunnel_type == "none" {
         *binding = Some(GatewayTunnelBinding {
             profile: gateway_profile,
@@ -268,11 +303,14 @@ pub async fn reconcile_mcp_gateway(
 
 fn validate_gateway_recovery_url(
     config: &McpGatewayConfig,
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     signature: &str,
     recovered_url: &str,
 ) -> AppResult<()> {
-    if profile.tunnel.tunnel_type != "cloudflare" || profile.tunnel.cloudflare_mode != "quick" {
+    let Some(tunnel) = profile.tunnel_profile() else {
+        return Ok(());
+    };
+    if tunnel.config.tunnel_type != "cloudflare" || tunnel.config.cloudflare_mode != "quick" {
         return Ok(());
     }
     let observed = config.observed_public_url.trim().trim_end_matches('/');
@@ -303,7 +341,8 @@ fn publish_gateway_workspace_urls(base_url: &str, active_workspace_ids: &HashSet
 #[cfg(test)]
 mod tests {
     use crate::runtime::register_public_url;
-    use crate::workspace::WorkspaceProfile;
+    use crate::tunnel::TunnelProfile;
+    use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
 
     use super::{
         is_quick_tunnel_url_change_error, validate_automatic_recovery_url,
@@ -311,18 +350,23 @@ mod tests {
     };
     use crate::settings::{AppSettings, McpGatewayConfig};
 
-    fn quick_profile() -> WorkspaceProfile {
-        let mut profile = WorkspaceProfile::new("C:/workspace/quick".into(), Some("quick".into()));
-        profile.tunnel.tunnel_type = "cloudflare".into();
-        profile.tunnel.cloudflare_mode = "quick".into();
-        profile.tunnel.public_url = "https://old.trycloudflare.com".into();
-        profile
+    fn quick_profile() -> WorkspaceRuntimeContext {
+        let workspace = WorkspaceProfile::new("C:/workspace/quick".into(), Some("quick".into()));
+        let mut tunnel = TunnelProfile::new(workspace.id.clone(), &workspace.name, "mcp");
+        tunnel.config.tunnel_type = "cloudflare".into();
+        tunnel.config.cloudflare_mode = "quick".into();
+        tunnel.config.public_url = "https://old.trycloudflare.com".into();
+        WorkspaceRuntimeContext::new(workspace, Some(tunnel)).expect("runtime context")
     }
 
     #[test]
     fn automatic_quick_tunnel_recovery_rejects_a_changed_url() {
         let profile = quick_profile();
-        let _listener = register_public_url(&profile.id, "mcp", profile.tunnel.public_url.clone());
+        let _listener = register_public_url(
+            &profile.id,
+            "mcp",
+            profile.tunnel_profile().unwrap().config.public_url.clone(),
+        );
         assert!(validate_automatic_recovery_url(
             &profile,
             TunnelServiceKind::Mcp,
@@ -357,7 +401,7 @@ mod tests {
     #[test]
     fn fixed_tunnels_allow_their_configured_url_to_refresh() {
         let mut profile = quick_profile();
-        profile.tunnel.tunnel_type = "frp".into();
+        profile.tunnel.as_mut().unwrap().config.tunnel_type = "frp".into();
         assert!(validate_automatic_recovery_url(
             &profile,
             TunnelServiceKind::Mcp,
@@ -370,14 +414,16 @@ mod tests {
     #[test]
     fn gateway_quick_tunnel_refuses_silent_public_url_drift() {
         let profile = quick_profile();
+        let tunnel = profile.tunnel_profile().unwrap();
         let config = McpGatewayConfig {
             enabled: true,
             local_port: 28765,
-            tunnel_id: profile.id.clone(),
+            tunnel_id: tunnel.id.clone(),
             public_url: "https://old.trycloudflare.com".into(),
             ..McpGatewayConfig::default()
         };
-        let signature = crate::mcp::gateway::tunnel_identity_signature(&config, &profile).unwrap();
+        let signature =
+            crate::mcp::gateway::tunnel_identity_signature(&config, &profile, tunnel).unwrap();
         assert!(validate_gateway_recovery_url(
             &config,
             &profile,
@@ -390,43 +436,48 @@ mod tests {
     #[test]
     fn quick_tunnel_runtime_url_does_not_change_gateway_signature() {
         let mut first = quick_profile();
-        first.tunnel.public_url = "https://first.trycloudflare.com".into();
+        first.tunnel.as_mut().unwrap().config.public_url = "https://first.trycloudflare.com".into();
         let mut second = first.clone();
-        second.tunnel.public_url = "https://second.trycloudflare.com".into();
+        second.tunnel.as_mut().unwrap().config.public_url =
+            "https://second.trycloudflare.com".into();
         assert_eq!(
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    tunnel_id: first.id.clone(),
+                    tunnel_id: first.tunnel_profile().unwrap().id.clone(),
                     ..McpGatewayConfig::default()
                 },
-                &first
+                &first,
+                first.tunnel_profile().unwrap()
             )
             .unwrap(),
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    tunnel_id: second.id.clone(),
+                    tunnel_id: second.tunnel_profile().unwrap().id.clone(),
                     ..McpGatewayConfig::default()
                 },
-                &second
+                &second,
+                second.tunnel_profile().unwrap()
             )
             .unwrap()
         );
-        second.tunnel.cloudflare_mode = "named".into();
+        second.tunnel.as_mut().unwrap().config.cloudflare_mode = "named".into();
         assert_ne!(
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    tunnel_id: first.id.clone(),
+                    tunnel_id: first.tunnel_profile().unwrap().id.clone(),
                     ..McpGatewayConfig::default()
                 },
-                &first
+                &first,
+                first.tunnel_profile().unwrap()
             )
             .unwrap(),
             crate::mcp::gateway::tunnel_identity_signature(
                 &McpGatewayConfig {
-                    tunnel_id: second.id.clone(),
+                    tunnel_id: second.tunnel_profile().unwrap().id.clone(),
                     ..McpGatewayConfig::default()
                 },
-                &second
+                &second,
+                second.tunnel_profile().unwrap()
             )
             .unwrap()
         );

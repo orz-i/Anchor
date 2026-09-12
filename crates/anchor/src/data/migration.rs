@@ -376,7 +376,8 @@ fn prepare_import_data(
     let mut workspaces = Vec::with_capacity(data.profiles.len());
     let mut warnings = Vec::new();
 
-    for (index, profile) in data.profiles.iter_mut().enumerate() {
+    let (profiles, tunnels) = (&mut data.profiles, &mut data.tunnels);
+    for (index, profile) in profiles.iter_mut().enumerate() {
         let source_path = profile.path.clone();
         let requested = resolved
             .get(&index)
@@ -390,8 +391,12 @@ fn prepare_import_data(
             )));
         }
         let target_path = path_string(&canonical);
+        let mut tunnel = tunnels.iter_mut().find(|tunnel| {
+            tunnel.workspace_id == profile.id && tunnel.service.eq_ignore_ascii_case("mcp")
+        });
         remap_known_profile_paths(
             profile,
+            tunnel.as_deref_mut(),
             &source_path,
             &canonical,
             source_platform,
@@ -399,7 +404,13 @@ fn prepare_import_data(
         );
         profile.path = target_path.clone();
         super::validate_workspace_profile(profile)?;
-        collect_portability_warnings(profile, &source_path, source_platform, &mut warnings);
+        collect_portability_warnings(
+            profile,
+            tunnel.as_deref(),
+            &source_path,
+            source_platform,
+            &mut warnings,
+        );
         workspaces.push(ImportedWorkspacePath {
             workspace_id: profile.id.clone(),
             name: profile.name.clone(),
@@ -509,14 +520,18 @@ fn validate_unique_workspace_ids(data: &AppData) -> AppResult<()> {
 
 fn remap_known_profile_paths(
     profile: &mut crate::workspace::WorkspaceProfile,
+    tunnel: Option<&mut crate::tunnel::TunnelProfile>,
     source_root: &str,
     target_root: &Path,
     source_platform: &str,
     warnings: &mut Vec<String>,
 ) {
+    let Some(tunnel) = tunnel else {
+        return;
+    };
     for (label, value) in [
-        ("MCP FRP 证书", &mut profile.tunnel.frp_cert_path),
-        ("MCP FRP 私钥", &mut profile.tunnel.frp_key_path),
+        ("MCP FRP 证书", &mut tunnel.config.frp_cert_path),
+        ("MCP FRP 私钥", &mut tunnel.config.frp_key_path),
     ] {
         if let Some(remapped) =
             remap_path_under_workspace(value, source_root, target_root, source_platform)
@@ -583,11 +598,14 @@ fn normalize_portable_path(value: &str) -> String {
 
 fn collect_portability_warnings(
     profile: &crate::workspace::WorkspaceProfile,
+    tunnel: Option<&crate::tunnel::TunnelProfile>,
     source_path: &str,
     source_platform: &str,
     warnings: &mut Vec<String>,
 ) {
-    if profile.tunnel.tunnel_type == "cloudflare" && profile.tunnel.cloudflare_mode == "quick" {
+    if tunnel.is_some_and(|tunnel| {
+        tunnel.config.tunnel_type == "cloudflare" && tunnel.config.cloudflare_mode == "quick"
+    }) {
         warnings.push(format!(
             "workspace {} 的 MCP 使用 Cloudflare quick tunnel；URL 可能变化，无法保证复用 ChatGPT 中原有注册入口",
             profile.name
@@ -722,14 +740,17 @@ fn path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::TunnelProfile;
     use crate::workspace::WorkspaceProfile;
 
     fn sample_data(path: String) -> AppData {
         let mut profile = WorkspaceProfile::new(path, Some("demo".into()));
         profile.id = "stable-workspace-id".into();
         profile.auth.oauth_client_id = "chatgpt-client-stable".into();
+        let tunnel = TunnelProfile::new(profile.id.clone(), &profile.name, "mcp");
         let mut data = AppData {
             profiles: vec![profile],
+            tunnels: vec![tunnel],
             last_workspace_id: "stable-workspace-id".into(),
             ..AppData::default()
         };
@@ -856,8 +877,8 @@ mod tests {
         fs::write(cert_dir.join("server.key"), "key").expect("key");
 
         let mut data = sample_data(r"D:\projects\demo".into());
-        data.profiles[0].tunnel.frp_cert_path = r"D:\projects\demo\.anchor\cert\server.pem".into();
-        data.profiles[0].tunnel.frp_key_path = r"D:\projects\demo\.anchor\cert\server.key".into();
+        data.tunnels[0].config.frp_cert_path = r"D:\projects\demo\.anchor\cert\server.pem".into();
+        data.tunnels[0].config.frp_key_path = r"D:\projects\demo\.anchor\cert\server.key".into();
         let mapping = WorkspacePathMapping {
             selector: "stable-workspace-id".into(),
             target: target.path().to_path_buf(),
@@ -872,7 +893,7 @@ mod tests {
             path_string(&target.path().canonicalize().unwrap())
         );
         assert_eq!(
-            PathBuf::from(&profile.tunnel.frp_cert_path),
+            PathBuf::from(&mapped.tunnels[0].config.frp_cert_path),
             target
                 .path()
                 .join(".anchor")
@@ -880,7 +901,7 @@ mod tests {
                 .join("server.pem")
         );
         assert_eq!(
-            PathBuf::from(&profile.tunnel.frp_key_path),
+            PathBuf::from(&mapped.tunnels[0].config.frp_key_path),
             target
                 .path()
                 .join(".anchor")

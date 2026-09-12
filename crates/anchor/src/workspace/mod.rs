@@ -4,5 +4,5 @@ pub mod resources;
 
 pub use model::{
     AuthConfig, McpActivityDto, RuntimeConfig, RuntimeRecoveryDto, RuntimeStatusDto,
-    WorkspaceProfile,
+    WorkspaceProfile, WorkspaceRuntimeContext,
 };

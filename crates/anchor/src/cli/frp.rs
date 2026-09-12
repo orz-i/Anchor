@@ -240,9 +240,15 @@ fn profile_view(data: &AppData, profile: &FrpProfile) -> FrpProfileView {
 
 fn profile_references(data: &AppData, id: &str) -> Vec<String> {
     let mut references = Vec::new();
-    for workspace in &data.profiles {
-        if workspace.tunnel.frp_profile_id == id {
-            references.push(format!("{}:mcp", workspace.name));
+    for tunnel in &data.tunnels {
+        if tunnel.service.eq_ignore_ascii_case("mcp") && tunnel.config.frp_profile_id == id {
+            let workspace_name = data
+                .profiles
+                .iter()
+                .find(|workspace| workspace.id == tunnel.workspace_id)
+                .map(|workspace| workspace.name.as_str())
+                .unwrap_or(tunnel.workspace_id.as_str());
+            references.push(format!("{workspace_name}:mcp"));
         }
     }
     references
@@ -251,6 +257,7 @@ fn profile_references(data: &AppData, id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::TunnelProfile;
     use crate::workspace::WorkspaceProfile;
 
     #[test]
@@ -281,11 +288,13 @@ mod tests {
             server: "frp.example.com".into(),
             server_port: 7000,
         };
-        let mut workspace = WorkspaceProfile::new("/tmp/demo".into(), Some("demo".into()));
-        workspace.tunnel.frp_profile_id = "p1".into();
+        let workspace = WorkspaceProfile::new("/tmp/demo".into(), Some("demo".into()));
+        let mut tunnel = TunnelProfile::new(workspace.id.clone(), &workspace.name, "mcp");
+        tunnel.config.frp_profile_id = "p1".into();
         let mut data = AppData {
             frp_profiles: vec![profile.clone()],
             profiles: vec![workspace],
+            tunnels: vec![tunnel],
             ..AppData::default()
         };
         data.app_secrets

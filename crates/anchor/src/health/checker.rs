@@ -4,7 +4,7 @@ use reqwest::header::ALLOW;
 use serde::Serialize;
 
 use crate::error::AppResult;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::WorkspaceRuntimeContext;
 
 const TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -110,14 +110,17 @@ fn well_known_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
 }
 
-pub async fn run_health_checks(profile: &WorkspaceProfile) -> AppResult<Vec<HealthItem>> {
+pub async fn run_health_checks(profile: &WorkspaceRuntimeContext) -> AppResult<Vec<HealthItem>> {
     let client = http_client();
     let mcp_public = profile.effective_public_url()?;
 
     let (mcp_local_ok, mcp_local_detail) =
         check_mcp_endpoint(&client, &profile.local_endpoint()).await;
-    let (mcp_public_ok, mcp_public_detail) =
-        check_mcp_endpoint(&client, &profile.public_endpoint()?).await;
+    let (mcp_public_ok, mcp_public_detail) = check_mcp_endpoint(
+        &client,
+        &profile.public_endpoint_with(&crate::settings::AppSettings::load()?),
+    )
+    .await;
     let (mcp_oauth_ok, mcp_oauth_detail) = check_json_field(
         &client,
         &well_known_url(&mcp_public, ".well-known/oauth-authorization-server"),

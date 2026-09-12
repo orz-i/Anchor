@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::auth::builtin_redirect_hosts;
 use crate::data::DataStore;
 use crate::error::{AppError, AppResult};
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
 
 use super::args::{
     EndpointSelection, GptConfigOptions, UnregisterOptions, WorkspaceCommand, WorkspaceTestOptions,
@@ -110,6 +110,7 @@ async fn unregister_workspace(options: UnregisterOptions, as_json: bool) -> AppR
 fn show_gpt_config(options: GptConfigOptions, as_json: bool) -> AppResult<()> {
     let store = DataStore::load()?;
     let profile = super::resolve_workspace(store.list(), &options.workspace)?;
+    let runtime_profile = store.runtime_context_for(profile)?;
     let mut root = serde_json::Map::new();
     root.insert("workspace".into(), serde_json::to_value(identity(profile))?);
     root.insert(
@@ -121,7 +122,12 @@ fn show_gpt_config(options: GptConfigOptions, as_json: bool) -> AppResult<()> {
     if options.service.includes_mcp() {
         root.insert(
             "mcp".into(),
-            mcp_gpt_config(&store, profile, options.endpoint, options.show_secrets)?,
+            mcp_gpt_config(
+                &store,
+                &runtime_profile,
+                options.endpoint,
+                options.show_secrets,
+            )?,
         );
     }
     let value = Value::Object(root);
@@ -139,7 +145,7 @@ fn show_gpt_config(options: GptConfigOptions, as_json: bool) -> AppResult<()> {
 
 fn mcp_gpt_config(
     store: &DataStore,
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     mode: EndpointSelection,
     show_secrets: bool,
 ) -> AppResult<Value> {
@@ -198,7 +204,8 @@ fn mcp_gpt_config(
 
 async fn test_workspace(options: WorkspaceTestOptions, as_json: bool) -> AppResult<i32> {
     let store = DataStore::load()?;
-    let profile = super::resolve_workspace(store.list(), &options.workspace)?.clone();
+    let workspace = super::resolve_workspace(store.list(), &options.workspace)?.clone();
+    let profile = store.runtime_context_for(&workspace)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(options.timeout_seconds))
         .build()
@@ -237,7 +244,7 @@ async fn test_workspace(options: WorkspaceTestOptions, as_json: bool) -> AppResu
 async fn test_mcp(
     client: &reqwest::Client,
     store: &DataStore,
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     mode: EndpointSelection,
 ) -> Vec<ConnectionCheck> {
     let endpoint = match select_mcp_endpoint(profile, mode) {
@@ -435,11 +442,11 @@ async fn test_json_url(
 }
 
 fn select_mcp_endpoint(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     mode: EndpointSelection,
 ) -> AppResult<(String, &'static str)> {
     let local = profile.local_endpoint();
-    let public = profile.public_endpoint()?;
+    let public = profile.public_endpoint_with(&crate::settings::AppSettings::load()?);
     select_endpoint(local, public, mode, "MCP")
 }
 

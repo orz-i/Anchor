@@ -6,6 +6,7 @@ use crate::management;
 use crate::secret::SecretStore;
 use crate::settings::{AppSettings, FrpProfile};
 use crate::tunnel::{validate_workspace_frp_config, TunnelProfile, TunnelServiceKind};
+use crate::workspace::WorkspaceRuntimeContext;
 
 use super::args::{TunnelCommand, TunnelConfigureOptions};
 
@@ -85,16 +86,15 @@ async fn configure(options: TunnelConfigureOptions) -> AppResult<()> {
     let store = DataStore::load()?;
     let settings = store.settings();
     let mut tunnel = resolve_tunnel(store.list_tunnels(), &options.tunnel)?.clone();
-    let mut workspace = store.get(&tunnel.workspace_id).cloned().ok_or_else(|| {
+    let workspace = store.get(&tunnel.workspace_id).cloned().ok_or_else(|| {
         AppError::Message(format!("workspace not found: {}", tunnel.workspace_id))
     })?;
     drop(store);
 
     apply_config_options(&mut tunnel, &options, &settings)?;
-    workspace.tunnel = tunnel.config.clone();
-    workspace.tunnel_id = tunnel.id.clone();
     if tunnel.config.tunnel_type == "frp" {
-        validate_workspace_frp_config(&workspace, TunnelServiceKind::Mcp, &settings)?;
+        let runtime = WorkspaceRuntimeContext::new(workspace, Some(tunnel.clone()))?;
+        validate_workspace_frp_config(&runtime, TunnelServiceKind::Mcp, &settings)?;
     }
 
     let saved = management::update_tunnel(tunnel).await?;

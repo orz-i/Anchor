@@ -19,7 +19,9 @@ use crate::tunnel::{
 use crate::workspace::resources::{
     assign_free_workspace_ports_with_reserved, validate_service_start, WorkspaceService,
 };
-use crate::workspace::{RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile};
+use crate::workspace::{
+    RuntimeRecoveryDto, RuntimeStatusDto, WorkspaceProfile, WorkspaceRuntimeContext,
+};
 
 const MANAGEMENT_DAEMON_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGEMENT_TUNNEL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -128,10 +130,11 @@ pub(crate) async fn set_gateway_workspace_route(
     let store = DataStore::load()?;
     let config = store.settings().mcp_gateway;
     let profiles = store.list().to_vec();
+    let tunnels = store.list_tunnels().to_vec();
     if !config.enabled {
         return Err(AppError::Message("MCP Gateway 尚未启用".into()));
     }
-    crate::mcp::gateway::validate_config(&config, &profiles)?;
+    crate::mcp::gateway::validate_config(&config, &profiles, &tunnels)?;
     let profile = profiles
         .iter()
         .find(|profile| profile.id == workspace_id)
@@ -140,7 +143,7 @@ pub(crate) async fn set_gateway_workspace_route(
             AppError::Message(format!("Gateway route workspace 不存在：{workspace_id}"))
         })?;
     if enabled {
-        validate_service_start(&profiles, workspace_id, WorkspaceService::Mcp)?;
+        validate_service_start(&profiles, &tunnels, workspace_id, WorkspaceService::Mcp)?;
         if !std::path::Path::new(&profile.path).is_dir() {
             return Err(AppError::Message(format!(
                 "Workspace 目录不存在或不可用：{}",
@@ -336,7 +339,7 @@ pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfi
     if token.is_empty() {
         return Err(AppError::Message("FRP Token 不能为空。".into()));
     }
-    let (profile, workspaces, gateway, unchanged) = DataStore::read_file(|data| {
+    let (profile, workspaces, tunnels, gateway, unchanged) = DataStore::read_file(|data| {
         let profile = data
             .frp_profiles
             .iter()
@@ -351,6 +354,7 @@ pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfi
         Ok((
             profile,
             data.profiles.clone(),
+            data.tunnels.clone(),
             data.mcp_gateway.clone(),
             unchanged,
         ))
@@ -358,7 +362,7 @@ pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfi
     if unchanged {
         return DataStore::read_file(|data| Ok(frp_profile_dto(data, &profile)));
     }
-    ensure_frp_profile_not_live(&profile, &workspaces, &gateway)?;
+    ensure_frp_profile_not_live(&profile, &workspaces, &tunnels, &gateway)?;
     DataStore::update_file(|data| {
         let profile = data
             .frp_profiles
@@ -375,7 +379,7 @@ pub(crate) fn set_frp_profile_token(id: &str, token: &str) -> AppResult<FrpProfi
 }
 
 pub(crate) fn clear_frp_profile_token(id: &str) -> AppResult<FrpProfileDto> {
-    let (profile, workspaces, gateway, has_token) = DataStore::read_file(|data| {
+    let (profile, workspaces, tunnels, gateway, has_token) = DataStore::read_file(|data| {
         let profile = data
             .frp_profiles
             .iter()
@@ -390,12 +394,13 @@ pub(crate) fn clear_frp_profile_token(id: &str) -> AppResult<FrpProfileDto> {
         Ok((
             profile,
             data.profiles.clone(),
+            data.tunnels.clone(),
             data.mcp_gateway.clone(),
             has_token,
         ))
     })?;
     if has_token {
-        ensure_frp_profile_not_live(&profile, &workspaces, &gateway)?;
+        ensure_frp_profile_not_live(&profile, &workspaces, &tunnels, &gateway)?;
     }
     DataStore::update_file(|data| {
         let profile = data
@@ -651,7 +656,7 @@ pub(crate) async fn delete_workspace_with_timeout(
     let store = DataStore::load()?;
     crate::mcp::gateway::ensure_workspace_is_not_owner(
         &store.settings().mcp_gateway,
-        store.list(),
+        store.list_tunnels(),
         id,
     )?;
     let profile = store
@@ -703,7 +708,7 @@ pub(crate) async fn delete_workspace_with_timeout(
     let mut store = DataStore::load()?;
     crate::mcp::gateway::ensure_workspace_is_not_owner(
         &store.settings().mcp_gateway,
-        store.list(),
+        store.list_tunnels(),
         id,
     )?;
     let removed = store
@@ -729,7 +734,12 @@ pub(crate) async fn delete_workspace(id: &str) -> AppResult<()> {
 }
 
 pub(crate) async fn run_health_checks(id: &str) -> AppResult<Vec<crate::health::HealthItem>> {
-    crate::health::run_health_checks(&workspace_profile(id)?).await
+    let store = DataStore::load()?;
+    let workspace = store
+        .get(id)
+        .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+    let profile = store.runtime_context_for(workspace)?;
+    crate::health::run_health_checks(&profile).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -884,13 +894,10 @@ pub(crate) async fn update_tunnel(mut tunnel: TunnelProfile) -> AppResult<Tunnel
         ));
     }
     let settings = store.settings();
-    let mut runtime_profile = store.get(&current.workspace_id).cloned().ok_or_else(|| {
+    let workspace = store.get(&current.workspace_id).cloned().ok_or_else(|| {
         AppError::Message(format!("workspace not found: {}", current.workspace_id))
     })?;
-    runtime_profile.tunnel = current.config.clone();
-    runtime_profile.tunnel_id = current.id.clone();
-    runtime_profile.tunnel_enabled = current.enabled;
-    runtime_profile.tunnel_revision = current.revision;
+    let runtime_profile = WorkspaceRuntimeContext::new(workspace, Some(current.clone()))?;
     drop(store);
 
     let runtime_changed = current.config != tunnel.config;
@@ -1088,6 +1095,7 @@ pub(crate) async fn set_mcp_gateway(
     config.public_url = config.public_url.trim().trim_end_matches('/').to_string();
     let store = DataStore::load()?;
     let profiles = store.list().to_vec();
+    let tunnels = store.list_tunnels().to_vec();
     let previous = store.settings().mcp_gateway;
     drop(store);
 
@@ -1098,7 +1106,7 @@ pub(crate) async fn set_mcp_gateway(
         config.observed_tunnel_id = previous.observed_tunnel_id.clone();
         config.observed_tunnel_signature = previous.observed_tunnel_signature.clone();
     }
-    crate::mcp::gateway::validate_config(&config, &profiles)?;
+    crate::mcp::gateway::validate_config(&config, &profiles, &tunnels)?;
     let enabled = config.enabled;
     let inspection = crate::gateway_daemon::inspect()?;
     match gateway_config_write_action(&inspection, enabled)? {
@@ -1168,24 +1176,30 @@ pub(crate) async fn get_gateway_control_events(
     }
 }
 
-fn tunnel_configured_for_service(profile: &WorkspaceProfile, service: WorkspaceService) -> bool {
+fn tunnel_configured_for_service(
+    profile: &WorkspaceRuntimeContext,
+    service: WorkspaceService,
+) -> bool {
     match service {
-        WorkspaceService::Mcp => profile.tunnel.tunnel_type != "none",
+        WorkspaceService::Mcp => profile
+            .tunnel_profile()
+            .is_some_and(|tunnel| tunnel.enabled && tunnel.config.tunnel_type != "none"),
     }
 }
 
 fn load_workspace_for_control(
     id: &str,
     validate_start: Option<WorkspaceService>,
-) -> AppResult<(WorkspaceProfile, AppSettings)> {
+) -> AppResult<(WorkspaceRuntimeContext, AppSettings)> {
     let store = DataStore::load()?;
     if let Some(service) = validate_start {
-        validate_service_start(store.list(), id, service)?;
+        validate_service_start(store.list(), store.list_tunnels(), id, service)?;
     }
-    let profile = store
+    let workspace = store
         .get(id)
         .cloned()
         .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+    let profile = store.runtime_context_for(&workspace)?;
     let settings = store.settings();
     Ok((profile, settings))
 }
@@ -1268,7 +1282,7 @@ fn workspace_service_for_tunnel(kind: TunnelServiceKind) -> WorkspaceService {
 }
 
 fn configured_tunnel_status(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<TunnelStatus> {
     let public_url = match kind {
@@ -1307,7 +1321,7 @@ fn persist_tunnel_public_url(id: &str, kind: TunnelServiceKind, public_url: &str
 }
 
 async fn daemon_tunnel_status(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
 ) -> AppResult<TunnelStatus> {
     let inspection = crate::daemon::inspect(profile)?;
@@ -1325,7 +1339,7 @@ async fn daemon_tunnel_status(
 
 fn load_tunnel_target_unchecked(
     id: &str,
-) -> AppResult<(TunnelProfile, WorkspaceProfile, AppSettings)> {
+) -> AppResult<(TunnelProfile, WorkspaceRuntimeContext, AppSettings)> {
     let store = DataStore::load()?;
     let tunnel = store
         .get_tunnel(id)
@@ -1333,19 +1347,23 @@ fn load_tunnel_target_unchecked(
         .ok_or_else(|| AppError::Message(format!("tunnel not found: {id}")))?;
     let kind = TunnelServiceKind::parse(&tunnel.service)?;
     let service = workspace_service_for_tunnel(kind);
-    validate_service_start(store.list(), &tunnel.workspace_id, service)?;
-    let mut profile = store.get(&tunnel.workspace_id).cloned().ok_or_else(|| {
+    validate_service_start(
+        store.list(),
+        store.list_tunnels(),
+        &tunnel.workspace_id,
+        service,
+    )?;
+    let workspace = store.get(&tunnel.workspace_id).cloned().ok_or_else(|| {
         AppError::Message(format!("workspace not found: {}", tunnel.workspace_id))
     })?;
     let settings = store.settings();
-    profile.tunnel = tunnel.config.clone();
-    profile.tunnel_id = tunnel.id.clone();
-    profile.tunnel_enabled = tunnel.enabled;
-    profile.tunnel_revision = tunnel.revision;
+    let profile = WorkspaceRuntimeContext::new(workspace, Some(tunnel.clone()))?;
     Ok((tunnel, profile, settings))
 }
 
-fn load_tunnel_target(id: &str) -> AppResult<(TunnelProfile, WorkspaceProfile, AppSettings)> {
+fn load_tunnel_target(
+    id: &str,
+) -> AppResult<(TunnelProfile, WorkspaceRuntimeContext, AppSettings)> {
     let (tunnel, profile, settings) = load_tunnel_target_unchecked(id)?;
     reject_gateway_managed_mcp(
         &settings,
@@ -1354,9 +1372,11 @@ fn load_tunnel_target(id: &str) -> AppResult<(TunnelProfile, WorkspaceProfile, A
     Ok((tunnel, profile, settings))
 }
 
-fn tunnel_is_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+fn tunnel_is_configured(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> bool {
     match kind {
-        TunnelServiceKind::Mcp => profile.tunnel.tunnel_type != "none",
+        TunnelServiceKind::Mcp => profile
+            .tunnel_profile()
+            .is_some_and(|tunnel| tunnel.config.tunnel_type != "none"),
     }
 }
 
@@ -1726,10 +1746,11 @@ pub(crate) fn gui_log_chunks(chunks: Vec<ControlLogChunk>) -> Vec<LogChunk> {
 
 pub(crate) async fn read_workspace_logs(id: &str, service: &str) -> AppResult<Vec<LogChunk>> {
     let store = DataStore::load()?;
-    let profile = store
+    let workspace = store
         .get(id)
         .cloned()
         .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+    let profile = store.runtime_context_for(&workspace)?;
     drop(store);
     let selection = control_log_service(service)?;
     let chunks = if crate::daemon::inspect(&profile)?.running {
@@ -2081,10 +2102,23 @@ fn ensure_unique_frp_name(profiles: &[FrpProfile], name: &str, except_id: &str) 
 
 fn frp_profile_references(data: &crate::data::AppData, id: &str) -> Vec<String> {
     let mut references = data
-        .profiles
+        .tunnels
         .iter()
-        .filter(|workspace| workspace.tunnel.frp_profile_id == id)
-        .map(|workspace| format!("{}:mcp", workspace.name))
+        .filter(|tunnel| {
+            tunnel.service.eq_ignore_ascii_case("mcp") && tunnel.config.frp_profile_id == id
+        })
+        .map(|tunnel| {
+            let workspace = data
+                .profiles
+                .iter()
+                .find(|workspace| workspace.id == tunnel.workspace_id);
+            format!(
+                "{}:mcp",
+                workspace
+                    .map(|workspace| workspace.name.as_str())
+                    .unwrap_or(tunnel.workspace_id.as_str())
+            )
+        })
         .collect::<Vec<_>>();
     references.sort();
     references.dedup();
@@ -2093,15 +2127,6 @@ fn frp_profile_references(data: &crate::data::AppData, id: &str) -> Vec<String> 
 
 fn all_frp_profile_references(data: &crate::data::AppData, id: &str) -> AppResult<Vec<String>> {
     let mut references = frp_profile_references(data, id);
-    #[cfg(feature = "cli")]
-    for workspace in &data.profiles {
-        let Some(pending) = crate::cli::pending_profile_candidate(workspace)? else {
-            continue;
-        };
-        if pending.tunnel.frp_profile_id == id && workspace.tunnel.frp_profile_id != id {
-            references.push(format!("{}:mcp(pending)", workspace.name));
-        }
-    }
     references.sort();
     references.dedup();
     Ok(references)
@@ -2110,6 +2135,7 @@ fn all_frp_profile_references(data: &crate::data::AppData, id: &str) -> AppResul
 fn ensure_frp_profile_not_live(
     profile: &FrpProfile,
     workspaces: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
     gateway: &McpGatewayConfig,
 ) -> AppResult<()> {
     let mut live = Vec::new();
@@ -2126,19 +2152,24 @@ fn ensure_frp_profile_not_live(
                 .state
                 .as_ref()
                 .and_then(|state| state.managed_tunnels());
-            if workspace.tunnel.frp_profile_id == profile.id
-                && managed.is_some_and(|selection| selection.includes_mcp())
-            {
+            let uses_profile = tunnels.iter().any(|tunnel| {
+                tunnel.workspace_id == workspace.id
+                    && tunnel.service.eq_ignore_ascii_case("mcp")
+                    && tunnel.config.frp_profile_id == profile.id
+            });
+            if uses_profile && managed.is_some_and(|selection| selection.includes_mcp()) {
                 live.push(format!("{}:mcp", workspace.name));
             }
         }
     }
 
     if gateway.enabled && !gateway.tunnel_id.trim().is_empty() {
-        if let Some(owner) = workspaces.iter().find(|workspace| {
-            workspace.tunnel_id == gateway.tunnel_id
-                && workspace.tunnel.frp_profile_id == profile.id
+        if let Some(tunnel) = tunnels.iter().find(|tunnel| {
+            tunnel.id == gateway.tunnel_id && tunnel.config.frp_profile_id == profile.id
         }) {
+            let owner = workspaces
+                .iter()
+                .find(|workspace| workspace.id == tunnel.workspace_id);
             let inspection = crate::gateway_daemon::inspect()?;
             if inspection.ambiguous {
                 return Err(AppError::Message(format!(
@@ -2147,7 +2178,12 @@ fn ensure_frp_profile_not_live(
                 )));
             }
             if inspection.running && inspection.pid_matches {
-                live.push(format!("{}:gateway-mcp", owner.name));
+                live.push(format!(
+                    "{}:gateway-mcp",
+                    owner
+                        .map(|workspace| workspace.name.as_str())
+                        .unwrap_or(tunnel.workspace_id.as_str())
+                ));
             }
         }
     }
@@ -2175,19 +2211,20 @@ pub(crate) fn save_frp_profile_metadata(profile: FrpProfileInput) -> AppResult<F
         saved.id = uuid::Uuid::new_v4().to_string().replace('-', "");
     }
 
-    let (existing, workspaces, gateway) = DataStore::read_file(|data| {
+    let (existing, workspaces, tunnels, gateway) = DataStore::read_file(|data| {
         Ok((
             data.frp_profiles
                 .iter()
                 .find(|profile| profile.id == saved.id)
                 .cloned(),
             data.profiles.clone(),
+            data.tunnels.clone(),
             data.mcp_gateway.clone(),
         ))
     })?;
     if let Some(existing) = existing.as_ref() {
         if existing.server != saved.server || existing.server_port != saved.server_port {
-            ensure_frp_profile_not_live(existing, &workspaces, &gateway)?;
+            ensure_frp_profile_not_live(existing, &workspaces, &tunnels, &gateway)?;
         }
     }
 
@@ -2282,7 +2319,7 @@ fn empty_recovery(enabled: bool, last_error: String) -> RuntimeRecoveryDto {
 }
 
 pub(crate) fn runtime_status_from_control(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     settings: &AppSettings,
     status: &WorkspaceControlStatus,
     service: WorkspaceService,
@@ -2426,10 +2463,11 @@ pub(crate) async fn runtime_status(
     service: WorkspaceService,
 ) -> AppResult<RuntimeStatusDto> {
     let store = DataStore::load()?;
-    let profile = store
+    let workspace = store
         .get(id)
         .cloned()
         .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))?;
+    let profile = store.runtime_context_for(&workspace)?;
     let settings = store.settings();
     let profiles = store.list().to_vec();
     drop(store);
@@ -2452,7 +2490,7 @@ pub(crate) async fn runtime_status(
 
 #[cfg(windows)]
 async fn gateway_route_runtime_status(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     settings: &AppSettings,
     profiles: &[WorkspaceProfile],
 ) -> AppResult<RuntimeStatusDto> {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::settings::{DownloadConfig, FrpProfile, McpGatewayConfig, ProxyConfig};
-use crate::tunnel::{TunnelConfig, TunnelProfile};
+use crate::tunnel::TunnelProfile;
 use crate::workspace::WorkspaceProfile;
 
 pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 2;
@@ -66,7 +66,7 @@ impl ProfilesData {
     }
 
     pub fn into_app_data(self) -> AppData {
-        let mut data = AppData {
+        AppData {
             frp_profiles: self.frp_profiles,
             tunnels: self.tunnels,
             last_workspace_id: self.last_workspace_id,
@@ -75,27 +75,11 @@ impl ProfilesData {
             mcp_gateway: self.mcp_gateway,
             profiles: self.profiles,
             ..AppData::default()
-        };
-        data.hydrate_workspace_tunnels();
-        data
+        }
     }
 }
 
 impl AppData {
-    pub(crate) fn hydrate_workspace_tunnels(&mut self) {
-        for workspace in &mut self.profiles {
-            let tunnel = self.tunnels.iter().find(|tunnel| {
-                tunnel.workspace_id == workspace.id && tunnel.service.eq_ignore_ascii_case("mcp")
-            });
-            workspace.tunnel = tunnel
-                .map(|tunnel| tunnel.config.clone())
-                .unwrap_or_else(TunnelConfig::disabled);
-            workspace.tunnel_id = tunnel.map(|tunnel| tunnel.id.clone()).unwrap_or_default();
-            workspace.tunnel_enabled = tunnel.is_some_and(|tunnel| tunnel.enabled);
-            workspace.tunnel_revision = tunnel.map_or(0, |tunnel| tunnel.revision);
-        }
-    }
-
     pub(crate) fn tunnel_for_workspace(&self, workspace_id: &str) -> Option<&TunnelProfile> {
         self.tunnels.iter().find(|tunnel| {
             tunnel.workspace_id == workspace_id && tunnel.service.eq_ignore_ascii_case("mcp")

@@ -9,7 +9,7 @@ use tokio::io::{
 };
 use tokio::sync::mpsc;
 
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::WorkspaceRuntimeContext;
 
 pub(crate) const PROCESS_LOG_CHANNEL_CAPACITY: usize = 128;
 pub(crate) const PROCESS_LOG_LINE_MAX_BYTES: usize = 16 * 1024;
@@ -78,12 +78,15 @@ const MCP_LOG_FILES: &[ProfileLogFile] = &[
 ];
 
 pub(crate) fn profile_log_files(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     service: ProfileLogService,
 ) -> Vec<ProfileLogFile> {
     let (tunnel_type, tunnel_file, base_files) = match service {
         ProfileLogService::Mcp => (
-            profile.tunnel.tunnel_type.as_str(),
+            profile
+                .tunnel_profile()
+                .map(|tunnel| tunnel.config.tunnel_type.as_str())
+                .unwrap_or("none"),
             (
                 "mcp-cloudflare",
                 "mcp-frp",
@@ -316,6 +319,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::TunnelProfile;
+    use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
 
     #[test]
     fn log_line_uses_parseable_utc_rfc3339_timestamp() {
@@ -332,8 +337,11 @@ mod tests {
 
     #[test]
     fn gui_and_cli_share_complete_profile_log_catalogs() {
-        let mut profile = WorkspaceProfile::new(".".into(), Some("logs".into()));
-        profile.tunnel.tunnel_type = "cloudflare".into();
+        let workspace = WorkspaceProfile::new(".".into(), Some("logs".into()));
+        let mut tunnel = TunnelProfile::new(workspace.id.clone(), &workspace.name, "mcp");
+        tunnel.config.tunnel_type = "cloudflare".into();
+        let profile =
+            WorkspaceRuntimeContext::new(workspace, Some(tunnel)).expect("runtime context");
 
         let mcp = profile_log_files(&profile, ProfileLogService::Mcp);
 

@@ -5,12 +5,11 @@ use super::WorkspaceProfile;
 pub struct WorkspaceConfigApplyPlan {
     pub mcp_listener_reload: bool,
     pub mcp_callback_policy_hot_update: bool,
-    pub mcp_tunnel_changed: bool,
 }
 
 impl WorkspaceConfigApplyPlan {
     pub fn has_changes(self) -> bool {
-        self.mcp_listener_reload || self.mcp_callback_policy_hot_update || self.mcp_tunnel_changed
+        self.mcp_listener_reload || self.mcp_callback_policy_hot_update
     }
 }
 
@@ -27,22 +26,7 @@ pub fn plan_workspace_config_apply(
             || mcp_runtime_changed(current, next)
             || mcp_auth_listener_changed(current, next),
         mcp_callback_policy_hot_update,
-        mcp_tunnel_changed: mcp_tunnel_changed(current, next),
     }
-}
-
-fn mcp_tunnel_changed(current: &WorkspaceProfile, next: &WorkspaceProfile) -> bool {
-    current.tunnel.tunnel_type != next.tunnel.tunnel_type
-        || current.tunnel.public_url != next.tunnel.public_url
-        || current.tunnel.frp_server != next.tunnel.frp_server
-        || current.tunnel.frp_subdomain != next.tunnel.frp_subdomain
-        || current.tunnel.frp_profile_id != next.tunnel.frp_profile_id
-        || current.tunnel.frp_server_port != next.tunnel.frp_server_port
-        || current.tunnel.frp_proxy_type != next.tunnel.frp_proxy_type
-        || current.tunnel.frp_cert_path != next.tunnel.frp_cert_path
-        || current.tunnel.frp_key_path != next.tunnel.frp_key_path
-        || current.tunnel.cloudflare_mode != next.tunnel.cloudflare_mode
-        || current.tunnel.use_proxy != next.tunnel.use_proxy
 }
 
 fn mcp_runtime_changed(current: &WorkspaceProfile, next: &WorkspaceProfile) -> bool {
@@ -88,7 +72,6 @@ mod tests {
         let plan = plan_workspace_config_apply(&current, &next);
         assert!(!plan.mcp_listener_reload);
         assert!(!plan.mcp_callback_policy_hot_update);
-        assert!(!plan.mcp_tunnel_changed);
     }
 
     #[test]
@@ -120,17 +103,6 @@ mod tests {
         let plan = plan_workspace_config_apply(&current, &next);
         assert!(!plan.mcp_listener_reload);
         assert!(plan.mcp_callback_policy_hot_update);
-    }
-
-    #[test]
-    fn tunnel_changes_do_not_restart_listeners() {
-        let current = profile();
-        let mut next = current.clone();
-        next.tunnel.frp_server = "frp.example.com".into();
-
-        let plan = plan_workspace_config_apply(&current, &next);
-        assert!(!plan.mcp_listener_reload);
-        assert!(plan.mcp_tunnel_changed);
     }
 
     #[test]

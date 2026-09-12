@@ -16,6 +16,7 @@ use crate::async_runtime::JoinHandle;
 use crate::error::{AppError, AppResult};
 use crate::mcp::protocol::RateLimiter;
 use crate::settings::McpGatewayConfig;
+use crate::tunnel::TunnelProfile;
 use crate::workspace::WorkspaceProfile;
 
 const GATEWAY_MAX_BODY_BYTES: usize = 1_048_576;
@@ -57,12 +58,13 @@ fn oauth_gateway_path(path: &str) -> bool {
 pub fn tunnel_identity_signature(
     config: &McpGatewayConfig,
     owner: &WorkspaceProfile,
+    tunnel: &TunnelProfile,
 ) -> AppResult<String> {
     let public_url =
-        if owner.tunnel.tunnel_type == "cloudflare" && owner.tunnel.cloudflare_mode == "named" {
+        if tunnel.config.tunnel_type == "cloudflare" && tunnel.config.cloudflare_mode == "named" {
             let configured = config.public_url.trim().trim_end_matches('/');
             if configured.is_empty() {
-                owner.tunnel.public_url.trim().trim_end_matches('/')
+                tunnel.config.public_url.trim().trim_end_matches('/')
             } else {
                 configured
             }
@@ -70,21 +72,21 @@ pub fn tunnel_identity_signature(
             ""
         };
     serde_json::to_string(&serde_json::json!({
-        "tunnelId": owner.tunnel_id,
-        "tunnelRevision": owner.tunnel_revision,
+        "tunnelId": tunnel.id,
+        "tunnelRevision": tunnel.revision,
         "workspaceId": owner.id,
         "localPort": config.local_port,
-        "type": owner.tunnel.tunnel_type,
-        "frpServer": owner.tunnel.frp_server,
-        "frpSubdomain": owner.tunnel.frp_subdomain,
-        "frpProfileId": owner.tunnel.frp_profile_id,
-        "frpServerPort": owner.tunnel.frp_server_port,
-        "frpProxyType": owner.tunnel.frp_proxy_type,
-        "frpCertPath": owner.tunnel.frp_cert_path,
-        "frpKeyPath": owner.tunnel.frp_key_path,
-        "cloudflareMode": owner.tunnel.cloudflare_mode,
+        "type": tunnel.config.tunnel_type,
+        "frpServer": tunnel.config.frp_server,
+        "frpSubdomain": tunnel.config.frp_subdomain,
+        "frpProfileId": tunnel.config.frp_profile_id,
+        "frpServerPort": tunnel.config.frp_server_port,
+        "frpProxyType": tunnel.config.frp_proxy_type,
+        "frpCertPath": tunnel.config.frp_cert_path,
+        "frpKeyPath": tunnel.config.frp_key_path,
+        "cloudflareMode": tunnel.config.cloudflare_mode,
         "publicUrl": public_url,
-        "useProxy": owner.tunnel.use_proxy,
+        "useProxy": tunnel.config.use_proxy,
     }))
     .map_err(|error| AppError::Message(format!("MCP Gateway 隧道配置序列化失败：{error}")))
 }
@@ -150,31 +152,6 @@ fn bounded_response_stream(
     )
 }
 
-pub fn owner_tunnel_identity_changed(
-    config: &McpGatewayConfig,
-    current: &WorkspaceProfile,
-    next: &WorkspaceProfile,
-) -> bool {
-    if !config.enabled
-        || config.tunnel_id != current.tunnel_id
-        || current.tunnel_id != next.tunnel_id
-    {
-        return false;
-    }
-
-    current.tunnel.tunnel_type != next.tunnel.tunnel_type
-        || current.tunnel.public_url != next.tunnel.public_url
-        || current.tunnel.frp_server != next.tunnel.frp_server
-        || current.tunnel.frp_subdomain != next.tunnel.frp_subdomain
-        || current.tunnel.frp_profile_id != next.tunnel.frp_profile_id
-        || current.tunnel.frp_server_port != next.tunnel.frp_server_port
-        || current.tunnel.frp_proxy_type != next.tunnel.frp_proxy_type
-        || current.tunnel.frp_cert_path != next.tunnel.frp_cert_path
-        || current.tunnel.frp_key_path != next.tunnel.frp_key_path
-        || current.tunnel.cloudflare_mode != next.tunnel.cloudflare_mode
-        || current.tunnel.use_proxy != next.tunnel.use_proxy
-}
-
 impl McpGatewayStatus {
     fn stopped(config: &McpGatewayConfig) -> Self {
         Self {
@@ -218,7 +195,11 @@ struct GatewaySupervisor {
 static GATEWAY_SUPERVISOR: LazyLock<Mutex<GatewaySupervisor>> =
     LazyLock::new(|| Mutex::new(GatewaySupervisor::default()));
 
-pub fn validate_config(config: &McpGatewayConfig, profiles: &[WorkspaceProfile]) -> AppResult<()> {
+pub fn validate_config(
+    config: &McpGatewayConfig,
+    profiles: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
+) -> AppResult<()> {
     if !config.enabled {
         return Ok(());
     }
@@ -230,10 +211,7 @@ pub fn validate_config(config: &McpGatewayConfig, profiles: &[WorkspaceProfile])
             "MCP Gateway 必须选择有效的 Tunnel。".into(),
         ));
     }
-    if !profiles
-        .iter()
-        .any(|profile| profile.tunnel_id == config.tunnel_id)
-    {
+    if !tunnels.iter().any(|tunnel| tunnel.id == config.tunnel_id) {
         return Err(AppError::Message(
             "MCP Gateway 引用的 Tunnel 不存在。".into(),
         ));
@@ -268,12 +246,12 @@ pub fn validate_workspace_ports(
 
 pub fn ensure_workspace_is_not_owner(
     config: &McpGatewayConfig,
-    profiles: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
     workspace_id: &str,
 ) -> AppResult<()> {
-    let is_target = profiles
+    let is_target = tunnels
         .iter()
-        .any(|profile| profile.id == workspace_id && profile.tunnel_id == config.tunnel_id);
+        .any(|tunnel| tunnel.id == config.tunnel_id && tunnel.workspace_id == workspace_id);
     if config.enabled && is_target {
         return Err(AppError::Message(
             "该工作区是 MCP Gateway 当前 Tunnel 的目标；请先更换 Tunnel 或禁用 Gateway。".into(),
@@ -294,9 +272,10 @@ pub fn workspace_base_url(config: &McpGatewayConfig, workspace_id: &str) -> AppR
 pub async fn ensure(
     config: &McpGatewayConfig,
     profiles: &[WorkspaceProfile],
+    tunnels: &[TunnelProfile],
     active_workspace_ids: &HashSet<String>,
 ) -> AppResult<McpGatewayStatus> {
-    validate_config(config, profiles)?;
+    validate_config(config, profiles, tunnels)?;
     let mut supervisor = GATEWAY_SUPERVISOR.lock().await;
     if !config.enabled || active_workspace_ids.is_empty() {
         supervisor.stop().await?;
@@ -1223,21 +1202,23 @@ mod tests {
     fn gateway_port_must_not_overlap_workspace_services() {
         let mut profile = WorkspaceProfile::new("C:/workspace".into(), None);
         profile.id = "owner".into();
-        profile.tunnel_id = "owner-tunnel".into();
+        let mut tunnel = TunnelProfile::new(profile.id.clone(), &profile.name, "mcp");
+        tunnel.id = "owner-tunnel".into();
         let config = McpGatewayConfig {
             enabled: true,
             local_port: profile.runtime.local_port,
-            tunnel_id: profile.tunnel_id.clone(),
+            tunnel_id: tunnel.id.clone(),
             ..McpGatewayConfig::default()
         };
-        assert!(validate_config(&config, &[profile]).is_err());
+        assert!(validate_config(&config, &[profile], &[tunnel]).is_err());
     }
 
     #[test]
     fn enabled_gateway_owner_cannot_be_removed() {
         let mut owner = WorkspaceProfile::new("C:/owner".into(), Some("owner".into()));
         owner.id = "owner".into();
-        owner.tunnel_id = "owner-tunnel".into();
+        let mut tunnel = TunnelProfile::new(owner.id.clone(), &owner.name, "mcp");
+        tunnel.id = "owner-tunnel".into();
         let mut other = WorkspaceProfile::new("C:/other".into(), Some("other".into()));
         other.id = "other".into();
         let config = McpGatewayConfig {
@@ -1246,9 +1227,8 @@ mod tests {
             tunnel_id: "owner-tunnel".into(),
             ..McpGatewayConfig::default()
         };
-        let profiles = [owner, other];
-        assert!(ensure_workspace_is_not_owner(&config, &profiles, "owner").is_err());
-        assert!(ensure_workspace_is_not_owner(&config, &profiles, "other").is_ok());
+        assert!(ensure_workspace_is_not_owner(&config, &[tunnel.clone()], "owner").is_err());
+        assert!(ensure_workspace_is_not_owner(&config, &[tunnel], "other").is_ok());
     }
 
     #[tokio::test]

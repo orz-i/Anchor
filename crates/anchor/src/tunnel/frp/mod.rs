@@ -2,7 +2,7 @@ mod client;
 
 use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
-use crate::workspace::WorkspaceProfile;
+use crate::workspace::WorkspaceRuntimeContext;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ const FRP_PROXY_HTTPS2HTTP: &str = "https2http";
 
 #[cfg(test)]
 pub fn frp_snippet(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> AppResult<String> {
@@ -51,7 +51,7 @@ pub(crate) struct FrpServerConfig {
 }
 
 pub fn frp_public_url(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> String {
@@ -71,18 +71,21 @@ pub fn frp_public_url(
 }
 
 pub fn frp_server_config(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
     token_override: Option<String>,
 ) -> FrpServerConfig {
     let proxy = frp_proxy_config(profile, kind);
+    let tunnel = profile
+        .tunnel_profile()
+        .expect("FRP config requires a top-level TunnelProfile");
     let (profile_id, server_addr, server_port, public_url) = match kind {
         TunnelServiceKind::Mcp => (
-            profile.tunnel.frp_profile_id.as_str(),
-            profile.tunnel.frp_server.clone(),
-            profile.tunnel.frp_server_port,
-            profile.tunnel.public_url.clone(),
+            tunnel.config.frp_profile_id.as_str(),
+            tunnel.config.frp_server.clone(),
+            tunnel.config.frp_server_port,
+            tunnel.config.public_url.clone(),
         ),
     };
 
@@ -105,7 +108,7 @@ pub fn frp_server_config(
 }
 
 pub(crate) fn validate_workspace_frp_config(
-    profile: &WorkspaceProfile,
+    profile: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> AppResult<()> {
@@ -115,7 +118,7 @@ pub(crate) fn validate_workspace_frp_config(
 
 fn resolve_frp_token(
     profile_id: &str,
-    workspace: &WorkspaceProfile,
+    workspace: &WorkspaceRuntimeContext,
     kind: TunnelServiceKind,
     settings: &AppSettings,
 ) -> Option<String> {
@@ -129,9 +132,8 @@ fn resolve_frp_token(
         }
     }
 
-    if let Ok(Some(token)) =
-        crate::secret::SecretStore::get_app("tunnel_frp_token", &workspace.tunnel_id)
-    {
+    let tunnel = workspace.tunnel_profile()?;
+    if let Ok(Some(token)) = crate::secret::SecretStore::get_app("tunnel_frp_token", &tunnel.id) {
         if !token.trim().is_empty() {
             return Some(token);
         }
@@ -139,7 +141,7 @@ fn resolve_frp_token(
 
     // Manual inline server: reuse token from a global profile with the same host.
     let inline_server = match kind {
-        TunnelServiceKind::Mcp => workspace.tunnel.frp_server.as_str(),
+        TunnelServiceKind::Mcp => tunnel.config.frp_server.as_str(),
     };
     let inline_server = inline_server.trim();
     if !inline_server.is_empty() {
@@ -200,7 +202,7 @@ pub(crate) fn build_frpc_toml_for_routes(configs: &[FrpServerConfig]) -> String 
 }
 
 pub(crate) fn build_frpc_toml_for_route_refs(
-    routes: &[(&WorkspaceProfile, TunnelServiceKind)],
+    routes: &[(&WorkspaceRuntimeContext, TunnelServiceKind)],
     settings: &AppSettings,
 ) -> AppResult<String> {
     let configs: Vec<FrpServerConfig> = routes
@@ -401,16 +403,19 @@ fn toml_string(value: &str) -> String {
     format!("{value:?}")
 }
 
-fn frp_proxy_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> FrpProxyConfig {
+fn frp_proxy_config(profile: &WorkspaceRuntimeContext, kind: TunnelServiceKind) -> FrpProxyConfig {
     let prefix = workspace_proxy_prefix(&profile.id);
+    let tunnel = profile
+        .tunnel_profile()
+        .expect("FRP proxy config requires a top-level TunnelProfile");
     match kind {
         TunnelServiceKind::Mcp => FrpProxyConfig {
             proxy_name: format!("{prefix}-mcp"),
             local_port: profile.runtime.local_port,
-            subdomain: profile.tunnel.frp_subdomain.clone(),
-            proxy_type: profile.tunnel.frp_proxy_type.clone(),
-            cert_path: profile.tunnel.frp_cert_path.clone(),
-            key_path: profile.tunnel.frp_key_path.clone(),
+            subdomain: tunnel.config.frp_subdomain.clone(),
+            proxy_type: tunnel.config.frp_proxy_type.clone(),
+            cert_path: tunnel.config.frp_cert_path.clone(),
+            key_path: tunnel.config.frp_key_path.clone(),
             workspace_root: profile.path.clone(),
         },
     }
@@ -464,12 +469,23 @@ fn workspace_proxy_prefix(workspace_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::settings::FrpProfile;
-    use crate::workspace::WorkspaceProfile;
+    use crate::tunnel::{TunnelConfig, TunnelProfile};
+    use crate::workspace::{WorkspaceProfile, WorkspaceRuntimeContext};
+
+    fn runtime_profile(path: String, name: &str) -> WorkspaceRuntimeContext {
+        let workspace = WorkspaceProfile::new(path, Some(name.into()));
+        let tunnel = TunnelProfile::new(workspace.id.clone(), &workspace.name, "mcp");
+        WorkspaceRuntimeContext::new(workspace, Some(tunnel)).expect("runtime context")
+    }
+
+    fn tunnel(profile: &mut WorkspaceRuntimeContext) -> &mut TunnelConfig {
+        &mut profile.tunnel.as_mut().expect("MCP tunnel").config
+    }
 
     #[test]
     fn mcp_snippet_uses_tunnel_subdomain() {
-        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo WS".into()));
-        profile.tunnel.frp_subdomain = "demo-mcp".into();
+        let mut profile = runtime_profile("/tmp/demo".into(), "Demo WS");
+        tunnel(&mut profile).frp_subdomain = "demo-mcp".into();
         profile.runtime.local_port = 28766;
         let settings = AppSettings {
             frp_profiles: vec![FrpProfile {
@@ -480,7 +496,7 @@ mod tests {
             }],
             ..AppSettings::default()
         };
-        profile.tunnel.frp_profile_id = "p1".into();
+        tunnel(&mut profile).frp_profile_id = "p1".into();
 
         let snippet =
             frp_snippet(&profile, TunnelServiceKind::Mcp, &settings).expect("build FRP snippet");
@@ -500,14 +516,11 @@ mod tests {
         std::fs::write(cert_dir.join("demo.pem"), "certificate").expect("certificate");
         std::fs::write(cert_dir.join("demo.key"), "private-key").expect("private key");
 
-        let mut profile = WorkspaceProfile::new(
-            temp.path().to_string_lossy().into_owned(),
-            Some("Demo".into()),
-        );
-        profile.tunnel.frp_server = "frp.example.com".into();
-        profile.tunnel.frp_subdomain = "demo".into();
-        profile.tunnel.public_url = "https://demo.frp.example.com".into();
-        profile.tunnel.frp_proxy_type = "https2http".into();
+        let mut profile = runtime_profile(temp.path().to_string_lossy().into_owned(), "Demo");
+        tunnel(&mut profile).frp_server = "frp.example.com".into();
+        tunnel(&mut profile).frp_subdomain = "demo".into();
+        tunnel(&mut profile).public_url = "https://demo.frp.example.com".into();
+        tunnel(&mut profile).frp_proxy_type = "https2http".into();
 
         let config = prepare_frp_server_config(frp_server_config(
             &profile,
@@ -540,15 +553,12 @@ mod tests {
         std::fs::write(&cert, "certificate").expect("certificate");
         std::fs::write(&key, "private-key").expect("private key");
 
-        let mut profile = WorkspaceProfile::new(
-            workspace.path().to_string_lossy().into_owned(),
-            Some("Demo".into()),
-        );
-        profile.tunnel.frp_server = "frp.example.com".into();
-        profile.tunnel.frp_subdomain = "demo".into();
-        profile.tunnel.frp_proxy_type = "https2http".into();
-        profile.tunnel.frp_cert_path = cert.to_string_lossy().into_owned();
-        profile.tunnel.frp_key_path = key.to_string_lossy().into_owned();
+        let mut profile = runtime_profile(workspace.path().to_string_lossy().into_owned(), "Demo");
+        tunnel(&mut profile).frp_server = "frp.example.com".into();
+        tunnel(&mut profile).frp_subdomain = "demo".into();
+        tunnel(&mut profile).frp_proxy_type = "https2http".into();
+        tunnel(&mut profile).frp_cert_path = cert.to_string_lossy().into_owned();
+        tunnel(&mut profile).frp_key_path = key.to_string_lossy().into_owned();
 
         let error = prepare_frp_server_config(frp_server_config(
             &profile,
@@ -562,9 +572,9 @@ mod tests {
 
     #[test]
     fn build_frpc_toml_uses_global_profile_server() {
-        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
-        profile.tunnel.frp_subdomain = "demo".into();
-        profile.tunnel.frp_profile_id = "p1".into();
+        let mut profile = runtime_profile("/tmp/demo".into(), "Demo");
+        tunnel(&mut profile).frp_subdomain = "demo".into();
+        tunnel(&mut profile).frp_profile_id = "p1".into();
         let settings = AppSettings {
             frp_profiles: vec![FrpProfile {
                 id: "p1".into(),
@@ -587,16 +597,16 @@ mod tests {
 
     #[test]
     fn build_frpc_toml_for_routes_contains_all_proxies() {
-        let mut first = WorkspaceProfile::new("/tmp/first".into(), Some("First".into()));
-        first.tunnel.frp_server = "frp.example.com".into();
-        first.tunnel.frp_server_port = 7000;
-        first.tunnel.frp_subdomain = "first".into();
+        let mut first = runtime_profile("/tmp/first".into(), "First");
+        tunnel(&mut first).frp_server = "frp.example.com".into();
+        tunnel(&mut first).frp_server_port = 7000;
+        tunnel(&mut first).frp_subdomain = "first".into();
         first.runtime.local_port = 28766;
 
-        let mut second = WorkspaceProfile::new("/tmp/second".into(), Some("Second".into()));
-        second.tunnel.frp_server = "frp.example.com".into();
-        second.tunnel.frp_server_port = 7000;
-        second.tunnel.frp_subdomain = "second".into();
+        let mut second = runtime_profile("/tmp/second".into(), "Second");
+        tunnel(&mut second).frp_server = "frp.example.com".into();
+        tunnel(&mut second).frp_server_port = 7000;
+        tunnel(&mut second).frp_subdomain = "second".into();
         second.runtime.local_port = 28767;
 
         let settings = AppSettings::default();
@@ -618,15 +628,15 @@ mod tests {
 
     #[test]
     fn build_frpc_toml_for_routes_keeps_workspace_proxy_names_unique() {
-        let mut first = WorkspaceProfile::new("/tmp/first".into(), Some("Same Name".into()));
-        first.tunnel.frp_server = "frp.example.com".into();
-        first.tunnel.frp_server_port = 7000;
-        first.tunnel.frp_subdomain = "first".into();
+        let mut first = runtime_profile("/tmp/first".into(), "Same Name");
+        tunnel(&mut first).frp_server = "frp.example.com".into();
+        tunnel(&mut first).frp_server_port = 7000;
+        tunnel(&mut first).frp_subdomain = "first".into();
 
-        let mut second = WorkspaceProfile::new("/tmp/second".into(), Some("Same Name".into()));
-        second.tunnel.frp_server = "frp.example.com".into();
-        second.tunnel.frp_server_port = 7000;
-        second.tunnel.frp_subdomain = "second".into();
+        let mut second = runtime_profile("/tmp/second".into(), "Same Name");
+        tunnel(&mut second).frp_server = "frp.example.com".into();
+        tunnel(&mut second).frp_server_port = 7000;
+        tunnel(&mut second).frp_subdomain = "second".into();
 
         let settings = AppSettings::default();
         let configs = vec![
@@ -649,8 +659,8 @@ mod tests {
 
     #[test]
     fn same_name_workspaces_receive_distinct_proxy_names() {
-        let first = WorkspaceProfile::new("/tmp/first".into(), Some("Same Name".into()));
-        let second = WorkspaceProfile::new("/tmp/second".into(), Some("Same Name".into()));
+        let first = runtime_profile("/tmp/first".into(), "Same Name");
+        let second = runtime_profile("/tmp/second".into(), "Same Name");
         let settings = AppSettings::default();
 
         let first_config = frp_server_config(&first, TunnelServiceKind::Mcp, &settings, None);
@@ -664,7 +674,7 @@ mod tests {
 
     #[test]
     fn proxy_name_is_stable_when_workspace_is_renamed() {
-        let original = WorkspaceProfile::new("/tmp/demo".into(), Some("Before".into()));
+        let original = runtime_profile("/tmp/demo".into(), "Before");
         let mut renamed = original.clone();
         renamed.name = "After".into();
         let settings = AppSettings::default();
@@ -677,12 +687,12 @@ mod tests {
 
     #[test]
     fn frp_public_url_prefers_explicit_url_over_control_server() {
-        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
-        profile.tunnel.tunnel_type = "frp".into();
-        profile.tunnel.frp_server = "43.157.17.95".into();
-        profile.tunnel.frp_server_port = 17001;
-        profile.tunnel.frp_subdomain = "anchor".into();
-        profile.tunnel.public_url = "https://anchor.taoyan.icu/".into();
+        let mut profile = runtime_profile("/tmp/demo".into(), "Demo");
+        tunnel(&mut profile).tunnel_type = "frp".into();
+        tunnel(&mut profile).frp_server = "43.157.17.95".into();
+        tunnel(&mut profile).frp_server_port = 17001;
+        tunnel(&mut profile).frp_subdomain = "anchor".into();
+        tunnel(&mut profile).public_url = "https://anchor.taoyan.icu/".into();
 
         assert_eq!(
             frp_public_url(&profile, TunnelServiceKind::Mcp, &AppSettings::default()),
@@ -692,9 +702,9 @@ mod tests {
 
     #[test]
     fn explicit_token_override_is_used_for_manual_server() {
-        let mut profile = WorkspaceProfile::new("/tmp/demo".into(), Some("Demo".into()));
-        profile.tunnel.frp_server = "frp.example.com".into();
-        profile.tunnel.frp_subdomain = "demo".into();
+        let mut profile = runtime_profile("/tmp/demo".into(), "Demo");
+        tunnel(&mut profile).frp_server = "frp.example.com".into();
+        tunnel(&mut profile).frp_subdomain = "demo".into();
         let settings = AppSettings {
             frp_profiles: vec![FrpProfile {
                 id: "p1".into(),
