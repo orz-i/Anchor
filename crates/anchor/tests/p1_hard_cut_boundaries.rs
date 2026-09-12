@@ -140,6 +140,39 @@ fn unix_control_unavailable_stop_is_a_verified_recovery_not_a_protocol_bridge() 
 }
 
 #[test]
+fn daemon_tunnel_runtime_uses_only_the_current_services_contract() {
+    let daemon = source("src/daemon.rs");
+    let args = source("src/cli/args.rs");
+    let cli = source("src/cli/mod.rs");
+    let lifecycle = source("src/control/lifecycle.rs");
+    let windows_service = source("src/windows_service.rs");
+
+    assert!(daemon.contains("const STATE_SCHEMA_VERSION: u32 = 3;"));
+    assert!(daemon.contains(
+        "#[serde(rename_all = \"camelCase\", deny_unknown_fields)]\npub struct DaemonState"
+    ));
+    assert!(!daemon.contains("pub tunnel: bool"));
+    assert!(!daemon.contains("self.tunnel.then_some"));
+    assert!(!daemon.contains("\"--tunnel\" =>"));
+    assert!(!daemon.contains("\"--no-tunnel\" =>"));
+    assert!(!args.contains("\"--tunnel\" => tunnel_services"));
+    assert!(!args.contains("\"--no-tunnel\" => tunnel_services"));
+    assert!(!windows_service.contains("args.push(\"--no-tunnel\""));
+    assert!(!cli.contains("\"tunnel\": tunnel"));
+    assert!(cli.contains("\"tunnelServices\": tunnel_services.map(ServiceSelection::as_str)"));
+    let restart_start = lifecycle
+        .find("pub async fn restart_daemon_service(")
+        .expect("restart_daemon_service");
+    let restart_end = lifecycle[restart_start..]
+        .find("pub fn service_is_selected(")
+        .map(|offset| restart_start + offset)
+        .expect("service_is_selected");
+    let restart = &lifecycle[restart_start..restart_end];
+    assert!(!restart.contains("tunnel_on_start: bool"));
+    assert!(restart.contains("tunnels_on_start: Option<ServiceSelection>"));
+}
+
+#[test]
 fn windows_service_has_no_pre_owner_token_frpc_cleanup_lane() {
     let service = source("src/windows_service.rs");
     let platform = source("src/platform/mod.rs");

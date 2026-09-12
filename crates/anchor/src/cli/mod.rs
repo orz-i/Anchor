@@ -1881,7 +1881,8 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     let profile = resolve_workspace(store.list(), &options.workspace)?.clone();
     ensure_workspace_directory(&profile)?;
     let service = options.service.unwrap_or(ServiceSelection::Mcp);
-    let tunnel = profile.tunnel_enabled && profile.tunnel.tunnel_type != "none";
+    let tunnels =
+        (profile.tunnel_enabled && profile.tunnel.tunnel_type != "none").then_some(service);
     if store.settings().mcp_gateway.enabled && service.includes_mcp() {
         return Err(AppError::Message(
             "MCP Gateway 模式不支持每工作区独立 MCP daemon；请使用 `anchor gateway start <workspace ...>` 管理 Gateway route。"
@@ -1895,28 +1896,19 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
     }
     let state = control::ensure_daemon_running(
         &profile,
-        control::DaemonLaunchSpec {
-            service,
-            tunnels: tunnel.then_some(service),
-        },
+        control::DaemonLaunchSpec { service, tunnels },
         Duration::from_secs(options.wait_seconds),
     )
     .await?;
     #[cfg(windows)]
     crate::windows_service::set_workspace_desired(
         &profile.id,
-        Some(control::DaemonLaunchSpec {
-            service,
-            tunnels: tunnel.then_some(service),
-        }),
+        Some(control::DaemonLaunchSpec { service, tunnels }),
     )?;
     #[cfg(target_os = "linux")]
     crate::linux_service::set_workspace_desired(
         &profile.id,
-        Some(control::DaemonLaunchSpec {
-            service,
-            tunnels: tunnel.then_some(service),
-        }),
+        Some(control::DaemonLaunchSpec { service, tunnels }),
     )?;
     print_daemon_result(
         if already_running {
@@ -1927,7 +1919,7 @@ async fn start_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         &profile,
         Some(state.pid),
         service,
-        tunnel,
+        tunnels,
         as_json,
     )
 }
@@ -2430,7 +2422,7 @@ async fn restart_daemon(options: RunOptions, as_json: bool) -> AppResult<()> {
         &profile,
         Some(state.pid),
         service,
-        tunnels.is_some(),
+        tunnels,
         as_json,
     )
 }
@@ -2539,7 +2531,7 @@ fn print_daemon_result(
     profile: &WorkspaceProfile,
     pid: Option<u32>,
     service: ServiceSelection,
-    tunnel: bool,
+    tunnel_services: Option<ServiceSelection>,
     as_json: bool,
 ) -> AppResult<()> {
     if as_json {
@@ -2548,7 +2540,7 @@ fn print_daemon_result(
             "workspace": {"id": profile.id, "name": profile.name, "path": profile.path},
             "pid": pid,
             "service": service,
-            "tunnel": tunnel,
+            "tunnelServices": tunnel_services.map(ServiceSelection::as_str),
             "log_path": daemon::daemon_log_path(&profile.id)
         }))?;
     } else {
@@ -2556,14 +2548,17 @@ fn print_daemon_result(
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".into());
         println!(
-            "workspace {} daemon {}：PID {pid}，service={}，tunnel={tunnel}",
+            "workspace {} daemon {}：PID {pid}，service={}，tunnelServices={}",
             profile.name,
             if event == "started" {
                 "已启动"
             } else {
                 "已在运行"
             },
-            service.as_str()
+            service.as_str(),
+            tunnel_services
+                .map(ServiceSelection::as_str)
+                .unwrap_or("none")
         );
         println!("日志：{}", daemon::daemon_log_path(&profile.id).display());
         #[cfg(target_os = "linux")]
@@ -3097,7 +3092,6 @@ async fn serve_workspace(
             "event": "ready",
             "workspace": {"id": profile.id, "name": profile.name, "path": profile.path},
             "services": started_services.iter().map(|kind| service_label(*kind)).collect::<Vec<_>>(),
-            "tunnel": tunnel_services.is_some(),
             "tunnelServices": tunnel_services.map(ServiceSelection::as_str)
         }))?;
     } else {

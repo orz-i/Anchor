@@ -925,8 +925,6 @@ pub(crate) fn spawn_workspace_daemon_as_owner_from_executable(
     if let Some(tunnels) = tunnel_services {
         args.push("--tunnel-service".to_string());
         args.push(tunnels.as_str().to_string());
-    } else {
-        args.push("--no-tunnel".to_string());
     }
     spawn_as_config_owner(
         executable,

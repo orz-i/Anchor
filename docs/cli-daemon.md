@@ -273,7 +273,7 @@ Workspace 控制协议当前版本为 `7`，支持 `ping`、`version`、`workspa
 
 `version` 按当前协议必须发布 `buildIdentity`（package version、Git SHA、dirty 标志和构建工作区）以及当前 capability 集合；缺少这些当前字段的旧响应会按协议不兼容拒绝。同一 `0.1.x` 包版本下仍通过 build identity 区分不同构建，不把“package version 相同”误当成“运行构建相同”。
 
-Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|all` 隧道集合。旧状态中的 `tunnel=true` 继续按“所选 listener 全部启用隧道”解释，保证升级兼容。
+Workspace daemon 的 listener 与 tunnel ownership 分开记录。`service` 仍表示 `mcp|all` listener 选择，`tunnelServices` 表示由该 daemon 实际管理的 `mcp|all` 隧道集合。daemon state 当前为 schema v3，只接受这一当前合同；v2 的 `tunnel=true|false` 布尔字段不再读取或回填。内部 `daemon-run` 仅接受可选 `--tunnel-service mcp|all`，未提供时表示不托管 Tunnel；旧 `--tunnel` / `--no-tunnel` 参数直接拒绝。
 
 Tunnel 写控制是异步操作：daemon 先返回 `OperationAccepted` 并完整关闭本次响应帧，然后主循环才执行 Tunnel Supervisor 的 start/stop/restart；客户端使用 `operation_status` 查询 `pending/running/succeeded/failed`。这保证协议响应不会被正在执行的 tunnel 替换操作截断。FRP restart 继续使用 supervisor 的原子 route replacement，失败时保留旧线路；非 FRP restart 失败时也尝试恢复上一线路和持久配置。
 

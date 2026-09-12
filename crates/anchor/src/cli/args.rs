@@ -1546,8 +1546,6 @@ fn parse_daemon_run(args: &mut VecDeque<String>) -> Result<Command, String> {
             "--service" => {
                 service = ServiceSelection::parse(&pop_value(args, "--service")?)?;
             }
-            "--tunnel" => tunnel_services = Some(service),
-            "--no-tunnel" => tunnel_services = None,
             "--tunnel-service" => {
                 tunnel_services = Some(ServiceSelection::parse(&pop_value(
                     args,
@@ -2730,7 +2728,6 @@ mod tests {
             "workspace-a",
             "--service",
             "all",
-            "--no-tunnel",
             "--handoff-id",
             "handoff-1",
             "--handoff-predecessor-pid",
@@ -2752,6 +2749,12 @@ mod tests {
                 }),
             }
         );
+
+        for retired in ["--tunnel", "--no-tunnel"] {
+            let error = parse(strings(&["daemon-run", "workspace-a", retired]))
+                .expect_err("retired daemon tunnel flags must be rejected");
+            assert!(error.contains("daemon-run 不支持参数"));
+        }
 
         let partial = parse(strings(&[
             "daemon-run",

@@ -277,7 +277,7 @@ pub async fn set_daemon_service(
 pub async fn restart_daemon_service(
     profile: &WorkspaceProfile,
     service: WorkspaceService,
-    tunnel_on_start: bool,
+    tunnels_on_start: Option<ServiceSelection>,
     timeout: Duration,
     force: bool,
 ) -> AppResult<DaemonState> {
@@ -320,7 +320,7 @@ pub async fn restart_daemon_service(
         tunnels: current
             .as_ref()
             .and_then(DaemonState::managed_tunnels)
-            .or_else(|| tunnel_on_start.then_some(desired_service)),
+            .or(tunnels_on_start),
     };
 
     if current.is_some() {

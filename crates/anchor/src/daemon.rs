@@ -15,7 +15,7 @@ use crate::platform::platform;
 use crate::tunnel::log_dir_for_profile;
 use crate::workspace::WorkspaceProfile;
 
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 3;
 #[cfg(unix)]
 const HANDOFF_SCHEMA_VERSION: u32 = 2;
 const DAEMON_LOG_FILE: &str = "daemon.log";
@@ -277,7 +277,7 @@ impl ServiceSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DaemonState {
     pub schema_version: u32,
     pub workspace_id: String,
@@ -286,8 +286,6 @@ pub struct DaemonState {
     pub pid: u32,
     pub started_at_unix: u64,
     pub service: ServiceSelection,
-    pub tunnel: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_services: Option<ServiceSelection>,
     pub log_path: String,
     pub version: String,
@@ -299,7 +297,6 @@ pub struct DaemonState {
 impl DaemonState {
     pub fn managed_tunnels(&self) -> Option<ServiceSelection> {
         self.tunnel_services
-            .or_else(|| self.tunnel.then_some(self.service))
     }
 }
 
@@ -334,7 +331,6 @@ fn discover_daemon_states(profile: &WorkspaceProfile) -> AppResult<Vec<DaemonSta
                 pid,
                 started_at_unix: linux_process_started_at_unix(pid).unwrap_or(0),
                 service,
-                tunnel: tunnel_services.is_some(),
                 tunnel_services,
                 log_path: daemon_log_path(&profile.id).display().to_string(),
                 version: "unknown".into(),
@@ -370,20 +366,16 @@ fn parse_daemon_args(
                 service = ServiceSelection::parse(args.get(index + 1).copied()?).ok()?;
                 index += 2;
             }
-            "--tunnel" => {
-                tunnel_services = Some(service);
-                index += 1;
-            }
-            "--no-tunnel" => {
-                tunnel_services = None;
-                index += 1;
-            }
             "--tunnel-service" => {
                 tunnel_services =
                     Some(ServiceSelection::parse(args.get(index + 1).copied()?).ok()?);
                 index += 2;
             }
-            _ => index += 1,
+            "--handoff-id" | "--handoff-predecessor-pid" | "--handoff-mcp-fd" => {
+                args.get(index + 1)?;
+                index += 2;
+            }
+            _ => return None,
         }
     }
     Some((service, tunnel_services))
@@ -661,7 +653,6 @@ pub fn acquire_with_tunnels(
         pid,
         started_at_unix: unix_now(),
         service,
-        tunnel: tunnel_services.is_some(),
         tunnel_services,
         log_path: daemon_log_path(&profile.id).display().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -697,7 +688,6 @@ pub fn update_tunnel_services(
     state.workspace_name = profile.name.clone();
     state.workspace_path = profile.path.clone();
     state.service = service;
-    state.tunnel = tunnel_services.is_some();
     state.tunnel_services = tunnel_services;
     atomic_write_json(&paths.state, &state)
 }
@@ -765,8 +755,6 @@ pub(crate) fn spawn_with_tunnels_from_executable(
         .arg(service.as_str());
     if let Some(tunnels) = tunnel_services {
         command.arg("--tunnel-service").arg(tunnels.as_str());
-    } else {
-        command.arg("--no-tunnel");
     }
     command
         .current_dir(&profile.path)
@@ -856,7 +844,6 @@ pub(crate) fn spawn_handoff_successor(
         .arg(&profile.id)
         .arg("--service")
         .arg(service.as_str())
-        .arg("--no-tunnel")
         .arg("--handoff-id")
         .arg(handoff_id)
         .arg("--handoff-predecessor-pid")
@@ -1480,7 +1467,6 @@ mod tests {
             pid: 42,
             started_at_unix: 100,
             service: ServiceSelection::All,
-            tunnel: true,
             tunnel_services: Some(ServiceSelection::Mcp),
             log_path: "/tmp/daemon.log".into(),
             version: "1".into(),
@@ -1491,8 +1477,8 @@ mod tests {
         let value = serde_json::to_value(state).expect("serialize state");
 
         assert_eq!(value["service"], "all");
-        assert_eq!(value["tunnel"], true);
         assert_eq!(value["tunnelServices"], "mcp");
+        assert!(value.get("tunnel").is_none());
         assert_eq!(value["pid"], 42);
         assert_eq!(value["executablePath"], "/usr/local/bin/anchor");
     }
@@ -1510,7 +1496,6 @@ mod tests {
             pid: 222,
             started_at_unix: 100,
             service: ServiceSelection::Mcp,
-            tunnel: false,
             tunnel_services: None,
             log_path: "/tmp/daemon.log".into(),
             version: "1".into(),
@@ -1610,11 +1595,24 @@ mod tests {
                     "workspace",
                     "--service",
                     "all",
+                ],
+                "workspace",
+            ),
+            Some((ServiceSelection::All, None))
+        );
+        assert_eq!(
+            parse_daemon_args(
+                &[
+                    "/usr/local/bin/anchor",
+                    "daemon-run",
+                    "workspace",
+                    "--service",
+                    "all",
                     "--tunnel",
                 ],
                 "workspace",
             ),
-            Some((ServiceSelection::All, Some(ServiceSelection::All)))
+            None
         );
         assert_eq!(
             parse_daemon_args(
@@ -1630,6 +1628,25 @@ mod tests {
                 "workspace",
             ),
             Some((ServiceSelection::All, Some(ServiceSelection::Mcp)))
+        );
+        assert_eq!(
+            parse_daemon_args(
+                &[
+                    "anchor",
+                    "daemon-run",
+                    "workspace",
+                    "--service",
+                    "mcp",
+                    "--handoff-id",
+                    "handoff-1",
+                    "--handoff-predecessor-pid",
+                    "42",
+                    "--handoff-mcp-fd",
+                    "11",
+                ],
+                "workspace",
+            ),
+            Some((ServiceSelection::Mcp, None))
         );
         assert_eq!(
             parse_daemon_args(&["anchor", "daemon-run", "other"], "workspace"),

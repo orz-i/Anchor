@@ -1939,7 +1939,7 @@ async fn restart_running_service_after_secret_change(
                 if let Err(error) = crate::control::restart_daemon_service(
                     profile,
                     service,
-                    daemon_state.tunnel,
+                    daemon_state.managed_tunnels(),
                     MANAGEMENT_DAEMON_TIMEOUT,
                     true,
                 )
