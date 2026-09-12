@@ -72,6 +72,14 @@ pub(crate) fn install_windows_kill_on_close_job() -> AppResult<()> {
     windows::install_kill_on_close_job()
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) use windows::DurableSupervisorJob as WindowsDurableSupervisorJob;
+
+#[cfg(target_os = "windows")]
+pub(crate) fn install_windows_durable_supervisor_job() -> AppResult<WindowsDurableSupervisorJob> {
+    windows::install_durable_supervisor_job()
+}
+
 static PLATFORM: std::sync::OnceLock<Box<dyn Platform>> = std::sync::OnceLock::new();
 
 pub fn platform() -> &'static dyn Platform {

@@ -13,6 +13,12 @@ pub(crate) fn install_kill_on_close_job() -> AppResult<()> {
     process::install_kill_on_close_job()
 }
 
+pub(crate) use process::DurableSupervisorJob;
+
+pub(crate) fn install_durable_supervisor_job() -> AppResult<DurableSupervisorJob> {
+    process::install_durable_supervisor_job()
+}
+
 impl Platform for WindowsPlatform {
     fn app_config_dir(&self) -> AppResult<PathBuf> {
         if let Some(path) = crate::platform::app_config_dir_override() {

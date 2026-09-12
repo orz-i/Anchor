@@ -14,7 +14,64 @@ use windows::Win32::System::Threading::{
 
 use crate::error::{AppError, AppResult};
 
-pub fn install_kill_on_close_job() -> AppResult<()> {
+const DURABLE_JOB_MAX_TRACKED_PROCESSES: usize = 4096;
+const DURABLE_JOB_TERMINATION_POLL: Duration = Duration::from_millis(25);
+
+/// Process-lifetime Job Object owned by the detached durable-command supervisor.
+///
+/// The supervisor itself is assigned to this Job before it creates the real
+/// workspace child. Windows therefore associates every non-breakaway child and
+/// descendant with the same Job from process creation onward. The raw Job handle
+/// intentionally remains open until the supervisor process exits; closing the last
+/// handle while the supervisor is still a member would also terminate the
+/// supervisor because KILL_ON_JOB_CLOSE is enabled.
+pub(crate) struct DurableSupervisorJob {
+    handle: HANDLE,
+    supervisor_pid: u32,
+}
+
+// Windows kernel handles are process-wide capabilities. This wrapper never
+// closes or transfers ownership of the raw Job handle; moving the supervisor
+// future between Tokio worker threads therefore preserves the same process-
+// lifetime Job identity.
+unsafe impl Send for DurableSupervisorJob {}
+
+impl DurableSupervisorJob {
+    pub(crate) fn terminate_descendants_and_wait(&self, timeout: Duration) -> AppResult<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut quiet_passes = 0_u8;
+        loop {
+            let members = job_process_ids(self.handle)?;
+            let descendants = members
+                .into_iter()
+                .filter(|pid| *pid != self.supervisor_pid)
+                .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                quiet_passes = quiet_passes.saturating_add(1);
+                if quiet_passes >= 3 {
+                    return Ok(());
+                }
+            } else {
+                quiet_passes = 0;
+                for pid in descendants {
+                    terminate_job_member_nowait(self.handle, pid)?;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let remaining = job_process_ids(self.handle)?
+                    .into_iter()
+                    .filter(|pid| *pid != self.supervisor_pid)
+                    .collect::<Vec<_>>();
+                return Err(AppError::Message(format!(
+                    "durable supervisor Job 未能在终态前清空后代进程：remaining={remaining:?}"
+                )));
+            }
+            sleep(DURABLE_JOB_TERMINATION_POLL);
+        }
+    }
+}
+
+fn create_current_process_kill_on_close_job(allow_breakaway: bool) -> AppResult<HANDLE> {
     use std::ffi::c_void;
 
     use windows::core::PCWSTR;
@@ -29,8 +86,10 @@ pub fn install_kill_on_close_job() -> AppResult<()> {
         let job = CreateJobObjectW(None, PCWSTR::null())
             .map_err(|err| AppError::Message(format!("CreateJobObjectW failed: {err}")))?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if allow_breakaway {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        }
         if let Err(err) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
@@ -45,18 +104,115 @@ pub fn install_kill_on_close_job() -> AppResult<()> {
         if let Err(err) = AssignProcessToJobObject(job, GetCurrentProcess()) {
             let _ = CloseHandle(job);
             return Err(AppError::Message(format!(
-                "AssignProcessToJobObject(current daemon) failed: {err}"
+                "AssignProcessToJobObject(current process) failed: {err}"
             )));
         }
-
-        // Intentionally keep this handle open for the entire daemon lifetime.
-        // When the daemon exits for any reason Windows closes its last handle
-        // to the Job Object and KILL_ON_JOB_CLOSE terminates every descendant
-        // still associated with the job. Closing it explicitly here (or from a
-        // Rust Drop guard before process exit) would terminate this daemon too.
-        let _ = job;
+        Ok(job)
     }
+}
+
+pub fn install_kill_on_close_job() -> AppResult<()> {
+    // This Job deliberately permits the detached durable supervisor to break
+    // away. Ordinary daemon children remain lifecycle-bound to the daemon.
+    let _job = create_current_process_kill_on_close_job(true)?;
     Ok(())
+}
+
+pub(crate) fn install_durable_supervisor_job() -> AppResult<DurableSupervisorJob> {
+    // Unlike the daemon Job, the durable Job never permits breakaway. The
+    // supervisor already escaped the daemon Job before reaching this function,
+    // and every workspace descendant must remain contained here.
+    Ok(DurableSupervisorJob {
+        handle: create_current_process_kill_on_close_job(false)?,
+        supervisor_pid: std::process::id(),
+    })
+}
+
+fn job_process_ids(job: HANDLE) -> AppResult<Vec<u32>> {
+    use std::ffi::c_void;
+
+    use windows::Win32::System::JobObjects::{
+        JobObjectBasicProcessIdList, QueryInformationJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    };
+
+    let mut last_error = None;
+    for capacity in [64_usize, 256, 1024, DURABLE_JOB_MAX_TRACKED_PROCESSES] {
+        let header_bytes = mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+            .saturating_sub(mem::size_of::<usize>());
+        let buffer_bytes = header_bytes.saturating_add(capacity * mem::size_of::<usize>());
+        let word_count = buffer_bytes.div_ceil(mem::size_of::<usize>());
+        let mut buffer = vec![0_usize; word_count];
+        match unsafe {
+            QueryInformationJobObject(
+                Some(job),
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer_bytes as u32,
+                None,
+            )
+        } {
+            Ok(()) => unsafe {
+                let list = &*(buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>());
+                let count = list.NumberOfProcessIdsInList as usize;
+                if count > capacity || list.NumberOfAssignedProcesses as usize > capacity {
+                    continue;
+                }
+                let first = std::ptr::addr_of!(list.ProcessIdList).cast::<usize>();
+                return Ok(std::slice::from_raw_parts(first, count)
+                    .iter()
+                    .filter_map(|pid| u32::try_from(*pid).ok())
+                    .collect());
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(AppError::Message(format!(
+        "QueryInformationJobObject(process ids) failed or exceeded {DURABLE_JOB_MAX_TRACKED_PROCESSES} members: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "process list exceeded the supported bound".into())
+    )))
+}
+
+fn terminate_job_member_nowait(job: HANDLE, pid: u32) -> AppResult<()> {
+    unsafe {
+        let handle = match OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return if job_process_ids(job)?.contains(&pid) {
+                    Err(AppError::Message(format!(
+                        "OpenProcess durable Job member failed: pid={pid}: {error}"
+                    )))
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Ok(());
+        }
+        if WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 {
+            let _ = CloseHandle(handle);
+            return Ok(());
+        }
+
+        // Re-check membership only after opening the process handle. If the
+        // original Job member exited and Windows reused its raw PID for an
+        // unrelated process, the opened handle pins that process object while
+        // the second Job query prevents us from terminating it.
+        if !job_process_ids(job)?.contains(&pid) {
+            let _ = CloseHandle(handle);
+            return Ok(());
+        }
+        let result = TerminateProcess(handle, 1);
+        if result.is_err() && WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 {
+            let _ = CloseHandle(handle);
+            return Ok(());
+        }
+        let _ = CloseHandle(handle);
+        result.map_err(|err| AppError::Message(format!("TerminateProcess failed: {err}")))?;
+        Ok(())
+    }
 }
 
 pub fn is_process_alive(pid: u32) -> bool {
@@ -174,7 +330,7 @@ pub fn terminate_process_tree(root_pid: u32) -> AppResult<()> {
     let result = terminate_pid(root_pid);
     match result {
         Ok(()) => Ok(()),
-        Err(err) if !is_process_alive(root_pid) => Ok(()),
+        Err(_err) if !is_process_alive(root_pid) => Ok(()),
         Err(err) => Err(err),
     }
 }

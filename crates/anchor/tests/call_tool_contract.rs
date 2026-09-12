@@ -12,6 +12,56 @@ const TEST_PYTHON: &str = "python";
 #[cfg(not(windows))]
 const TEST_PYTHON: &str = "python3";
 
+#[cfg(windows)]
+fn wait_for_pid_file(path: &std::path::Path, timeout: std::time::Duration) -> u32 {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(value) = fs::read_to_string(path) {
+            if let Ok(pid) = value.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PID file was not published: {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_is_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
+            return false;
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+        let _ = CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(windows)]
+fn assert_windows_process_exits(pid: u32, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while windows_process_is_alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !windows_process_is_alive(pid),
+        "Windows process {pid} remained alive after durable command reached terminal state"
+    );
+}
+
 #[test]
 fn server_info_returns_workspace_and_tools() {
     let fx = tiny_js_fixture();
@@ -1734,6 +1784,102 @@ fn durable_kill_works_after_tool_context_reconstruction() {
     assert_eq!(killed["durable"], true, "{killed}");
     assert_eq!(killed["process_bound"], false, "{killed}");
     assert_eq!(killed["error"]["code"], "COMMAND_KILLED", "{killed}");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_durable_kill_cleans_grandchild_process_tree_after_reconnect() {
+    let fx = tiny_js_fixture();
+    let pid_file = fx.root.join("durable-grandchild-kill.pid");
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-u",
+                "-c",
+                "import pathlib,subprocess,sys,time; p=subprocess.Popen([sys.executable,'-u','-c','import time; time.sleep(60)']); pathlib.Path('durable-grandchild-kill.pid').write_text(str(p.pid)); print('tree-ready', flush=True); time.sleep(60)"
+            ],
+            "filesystem_scope": "workspace",
+            "timeout_ms": 60_000,
+            "yield_time_ms": 0,
+            "durable": true
+        }),
+    );
+    let started = assert_ok(&started);
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("durable session id")
+        .to_string();
+    let grandchild_pid = wait_for_pid_file(&pid_file, std::time::Duration::from_secs(5));
+    assert!(windows_process_is_alive(grandchild_pid));
+    drop(ctx);
+
+    let recovered_ctx = ctx_for(&fx.root);
+    let killed = invoke(
+        &recovered_ctx,
+        "kill_session",
+        json!({
+            "session_id": session_id,
+            "signal": "KILL",
+            "wait_ms": 10_000,
+            "max_output_bytes": 4096
+        }),
+    );
+    let killed = assert_err(&killed);
+    assert_eq!(killed["killed"], true, "{killed}");
+    assert_eq!(killed["status"], "killed", "{killed}");
+    assert_eq!(killed["error"]["code"], "COMMAND_KILLED", "{killed}");
+    assert_windows_process_exits(grandchild_pid, std::time::Duration::from_secs(2));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_durable_timeout_cleans_grandchild_before_terminal_result() {
+    let fx = tiny_js_fixture();
+    let pid_file = fx.root.join("durable-grandchild-timeout.pid");
+    let ctx = ctx_for(&fx.root);
+    let started = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "executable": TEST_PYTHON,
+            "args": [
+                "-u",
+                "-c",
+                "import pathlib,subprocess,sys,time; p=subprocess.Popen([sys.executable,'-u','-c','import time; time.sleep(60)']); pathlib.Path('durable-grandchild-timeout.pid').write_text(str(p.pid)); print('tree-ready', flush=True); time.sleep(60)"
+            ],
+            "filesystem_scope": "workspace",
+            "timeout_ms": 1_500,
+            "yield_time_ms": 0,
+            "durable": true
+        }),
+    );
+    let started = assert_ok(&started);
+    let session_id = started["session_id"]
+        .as_str()
+        .expect("durable session id")
+        .to_string();
+    let grandchild_pid = wait_for_pid_file(&pid_file, std::time::Duration::from_secs(5));
+    assert!(windows_process_is_alive(grandchild_pid));
+
+    let waited = invoke(
+        &ctx,
+        "wait_command",
+        json!({
+            "session_id": session_id,
+            "timeout_ms": 10_000,
+            "stdout_offset": 0,
+            "stderr_offset": 0,
+            "return_incremental_output": true
+        }),
+    );
+    let waited = assert_err(&waited);
+    assert_eq!(waited["termination_reason"], "timeout", "{waited}");
+    assert_eq!(waited["execution_status"], "timed_out", "{waited}");
+    assert_windows_process_exits(grandchild_pid, std::time::Duration::from_secs(2));
 }
 
 #[test]

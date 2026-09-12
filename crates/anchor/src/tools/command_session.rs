@@ -442,6 +442,22 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     state.heartbeat_at = Some(timestamp());
     persist_durable_state(&paths, &state);
 
+    #[cfg(all(windows, not(test)))]
+    let windows_job = match crate::platform::install_windows_durable_supervisor_job() {
+        Ok(job) => job,
+        Err(error) => {
+            state.status = "spawn_failed".into();
+            state.termination_reason = "spawn_failed".into();
+            state.stdin_open = false;
+            state.finished_at = Some(timestamp());
+            state.heartbeat_at = state.finished_at.clone();
+            persist_durable_state(&paths, &state);
+            return Err(format!(
+                "install Windows durable supervisor Job failed: {error}"
+            ));
+        }
+    };
+
     let mut command = tokio::process::Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -583,6 +599,18 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+
+    // On Windows the detached supervisor is the root of a dedicated
+    // non-breakaway KILL_ON_JOB_CLOSE Job. The direct child may have exited
+    // while compiler workers, browser helpers, or other descendants remain.
+    // Never publish a terminal durable state until the Job contains only this
+    // supervisor process. If cleanup itself fails, leave the persisted state
+    // non-terminal; process exit then closes the Job handle and Windows performs
+    // the fail-safe tree teardown before recovery can reconcile the session.
+    #[cfg(all(windows, not(test)))]
+    windows_job
+        .terminate_descendants_and_wait(Duration::from_secs(5))
+        .map_err(|error| format!("Windows durable process-tree cleanup failed: {error}"))?;
 
     for reader in readers {
         let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
@@ -1433,6 +1461,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervisor_loss_keeps_capacity_until_recorded_child_exits() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let creator = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let job = creator
+            .create_durable_job(durable_test_spec(
+                session_id.clone(),
+                "tools::command_session::tests::durable_supervisor_output_child",
+                5_000,
+            ))
+            .expect("durable job");
+        let dead_supervisor_pid = (2_000_000_000_u32..2_000_000_100_u32)
+            .find(|pid| !crate::platform::platform().is_process_alive(*pid))
+            .expect("find unused pid");
+        let mut state = job.read_state().expect("state");
+        state.status = "running".into();
+        state.supervisor_pid = Some(dead_supervisor_pid);
+        state.child_pid = Some(std::process::id());
+        persist_durable_state(&job.paths, &state);
+
+        let recovered = CommandSessionStore::with_durable_root(root);
+        let error = recovered
+            .ensure_execution_capacity(1)
+            .expect_err("live child must keep capacity while lost-supervisor Job cleanup runs");
+        assert!(matches!(
+            error,
+            WorkspaceError::ToolDetails {
+                code: "EXECUTION_CAPACITY_HELD",
+                ..
+            }
+        ));
+        let session = recovered.get(&session_id).expect("recovered session");
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "running", "{snapshot}");
+        assert_eq!(
+            snapshot["termination_reason"],
+            "supervisor_lost_cleanup_pending"
+        );
+        assert_eq!(snapshot["command_ok"], Value::Null);
+
+        let mut state = job.read_state().expect("pending state");
+        state.child_pid = Some(dead_supervisor_pid);
+        persist_durable_state(&job.paths, &state);
+        crate::async_runtime::block_on(session.refresh_status());
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
+        assert_eq!(snapshot["termination_reason"], "supervisor_lost");
+        recovered
+            .ensure_execution_capacity(1)
+            .expect("capacity must release only after recorded child exit");
     }
 
     #[test]
@@ -2634,18 +2717,39 @@ impl ExecSession {
         let supervisor_lost = state
             .supervisor_pid
             .is_some_and(|pid| !crate::platform::platform().is_process_alive(pid));
+        let child_alive = state
+            .child_pid
+            .is_some_and(|pid| crate::platform::platform().is_process_alive(pid));
         let launcher_never_published_pid = state.status == "starting"
             && state.supervisor_pid.is_none()
             && elapsed_since_timestamp(&state.started_at)
                 .is_some_and(|elapsed| elapsed > Duration::from_secs(5));
         let heartbeat = state.heartbeat_at.as_deref().unwrap_or(&state.started_at);
         let child_lost = state.status == "running"
-            && state
-                .child_pid
-                .is_some_and(|pid| !crate::platform::platform().is_process_alive(pid))
+            && state.child_pid.is_some()
+            && !child_alive
             && elapsed_since_timestamp(heartbeat)
                 .is_some_and(|elapsed| elapsed > Duration::from_secs(10));
+        let supervisor_cleanup_pending = cfg!(windows) && supervisor_lost && child_alive;
+        let child_cleanup_pending = cfg!(windows) && child_lost && !supervisor_lost;
         if matches!(state.status.as_str(), "starting" | "running")
+            && (supervisor_cleanup_pending || child_cleanup_pending)
+        {
+            // A dead Windows durable supervisor closes its process-lifetime Job
+            // and triggers tree teardown. Keep execution capacity reserved until
+            // the recorded direct child is actually gone instead of prematurely
+            // declaring the session interrupted and allowing more work to start.
+            let pending_reason = if supervisor_cleanup_pending {
+                "supervisor_lost_cleanup_pending"
+            } else {
+                "child_lost_cleanup_pending"
+            };
+            if state.termination_reason != pending_reason {
+                state.termination_reason = pending_reason.into();
+                state.stdin_open = false;
+                let _ = write_json_atomic(&job.paths.state, &state);
+            }
+        } else if matches!(state.status.as_str(), "starting" | "running")
             && (supervisor_lost || launcher_never_published_pid || child_lost)
         {
             state.status = "interrupted".into();
@@ -2766,11 +2870,13 @@ impl ExecSession {
             "exited" | "late_success" => {
                 Some(exit_code.is_some_and(|code| self.expected_exit_codes.contains(&code)))
             }
-            "running" => None,
+            "running" | "supervisor_lost_cleanup_pending" | "child_lost_cleanup_pending" => None,
             _ => Some(false),
         };
         let execution_status = match reason {
-            "running" => "running",
+            "running" | "supervisor_lost_cleanup_pending" | "child_lost_cleanup_pending" => {
+                "running"
+            }
             "exited" | "late_success" if command_ok == Some(true) => "succeeded",
             "exited" => "failed",
             "cancelled" => "cancelled",
@@ -2789,6 +2895,8 @@ impl ExecSession {
                 | "spawn_failed"
                 | "server_restart"
                 | "supervisor_lost"
+                | "supervisor_lost_cleanup_pending"
+                | "child_lost_cleanup_pending"
                 | "launch_interrupted"
                 | "child_lost"
         );
@@ -2847,6 +2955,12 @@ impl ExecSession {
                 "killed" => "确认终止原因后重新执行命令",
                 "supervisor_lost" | "launch_interrupted" | "child_lost" => {
                     "durable supervisor did not complete; start a new command rather than replaying this session"
+                }
+                "supervisor_lost_cleanup_pending" => {
+                    "Windows durable supervisor exited; waiting for Job process-tree cleanup before releasing execution capacity"
+                }
+                "child_lost_cleanup_pending" => {
+                    "Windows durable child disappeared before terminal convergence; retaining execution capacity until supervisor Job cleanup completes"
                 }
                 "exited" => "检查 exit_code 和 stderr",
                 "crashed" => "检查 stderr 后重试或恢复工作区",
