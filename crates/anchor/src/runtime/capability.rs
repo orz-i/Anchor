@@ -162,7 +162,7 @@ fn load_or_create_node_id(config_dir: &Path) -> AppResult<String> {
         options.mode(0o600);
     }
     let lock_file = options.open(lock_path)?;
-    lock_file.lock_exclusive()?;
+    crate::locking::lock_file_app(&lock_file, "NODE_IDENTITY_LOCK", "node identity")?;
 
     let result = if identity_path.exists() {
         read_node_id(&identity_path)

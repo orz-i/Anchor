@@ -25,6 +25,7 @@ pub mod harness;
 mod health;
 #[cfg(all(feature = "cli", target_os = "linux"))]
 pub mod linux_service;
+mod locking;
 mod logging;
 mod management;
 mod mcp;

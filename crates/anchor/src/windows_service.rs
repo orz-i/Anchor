@@ -308,6 +308,10 @@ fn plan_lock_path() -> AppResult<PathBuf> {
 
 fn acquire_plan_lock() -> AppResult<PlanGuard> {
     let path = plan_lock_path()?;
+    acquire_plan_lock_at(&path)
+}
+
+fn acquire_plan_lock_at(path: &Path) -> AppResult<PlanGuard> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -317,7 +321,7 @@ fn acquire_plan_lock() -> AppResult<PlanGuard> {
         .read(true)
         .write(true)
         .open(path)?;
-    FileExt::lock_exclusive(&file)?;
+    crate::locking::lock_file_app(&file, "WINDOWS_SERVICE_PLAN_LOCK", "Windows service plan")?;
     Ok(PlanGuard { file })
 }
 
@@ -1758,8 +1762,8 @@ async fn run_service_supervisor() -> AppResult<()> {
         if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
             break;
         }
-        match load_plan() {
-            Ok(plan) => {
+        match tokio::task::spawn_blocking(load_plan).await {
+            Ok(Ok(plan)) => {
                 if let Err(error) =
                     reconcile_service_plan(&plan, &mut managed_workspaces, &mut gateway_managed)
                         .await
@@ -1767,7 +1771,12 @@ async fn run_service_supervisor() -> AppResult<()> {
                     append_service_log(&format!("[service] reconcile failed: {error}"));
                 }
             }
-            Err(error) => append_service_log(&format!("[service] plan read failed: {error}")),
+            Ok(Err(error)) => {
+                append_service_log(&format!("[service] plan read failed: {error}"));
+            }
+            Err(error) => {
+                append_service_log(&format!("[service] plan read task failed: {error}"));
+            }
         }
         tokio::time::sleep(SERVICE_RECONCILE_INTERVAL).await;
     }
@@ -1782,10 +1791,14 @@ async fn reconcile_service_plan(
     managed_workspaces: &mut HashSet<String>,
     gateway_managed: &mut bool,
 ) -> AppResult<()> {
-    let store = crate::data::DataStore::load_profiles_only()?;
-    let profiles = store.list().to_vec();
-    let gateway_config = store.settings().mcp_gateway;
-    drop(store);
+    let (profiles, gateway_config) = tokio::task::spawn_blocking(|| {
+        let store = crate::data::DataStore::load_profiles_only()?;
+        Ok::<_, AppError>((store.list().to_vec(), store.settings().mcp_gateway))
+    })
+    .await
+    .map_err(|error| {
+        AppError::Message(format!("Windows service DataStore task failed: {error}"))
+    })??;
     let desired = plan
         .workspaces
         .iter()

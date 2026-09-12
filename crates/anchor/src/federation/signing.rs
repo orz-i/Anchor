@@ -53,7 +53,11 @@ fn rotate_signing_identity_with_notice_at(
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir)?;
     let lock_file = open_private_lock(&data_dir.join(".federation-signing.lock"))?;
-    lock_file.lock_exclusive()?;
+    crate::locking::lock_file_app(
+        &lock_file,
+        "FEDERATION_SIGNING_LOCK",
+        "federation signing identity",
+    )?;
     let result = {
         let path = data_dir.join("federation-signing.json");
         let previous = if path.exists() {
@@ -611,7 +615,11 @@ fn load_or_create_signing_identity_at(root: &Path) -> AppResult<LocalSigningIden
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir)?;
     let lock_file = open_private_lock(&data_dir.join(".federation-signing.lock"))?;
-    lock_file.lock_exclusive()?;
+    crate::locking::lock_file_app(
+        &lock_file,
+        "FEDERATION_SIGNING_LOCK",
+        "federation signing identity",
+    )?;
     let result = {
         let path = data_dir.join("federation-signing.json");
         if path.exists() {
@@ -629,7 +637,11 @@ fn rotate_signing_identity_at(root: &Path) -> AppResult<FederationNodeSigningPub
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir)?;
     let lock_file = open_private_lock(&data_dir.join(".federation-signing.lock"))?;
-    lock_file.lock_exclusive()?;
+    crate::locking::lock_file_app(
+        &lock_file,
+        "FEDERATION_SIGNING_LOCK",
+        "federation signing identity",
+    )?;
     let result = {
         let path = data_dir.join("federation-signing.json");
         let next_epoch = if path.exists() {

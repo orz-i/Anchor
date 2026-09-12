@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use chrono::Utc;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -486,8 +485,7 @@ impl SkillPackageStore {
             .write(true)
             .open(self.root.join("state.lock"))
             .map_err(|error| format!("failed to open Skill package store lock: {error}"))?;
-        FileExt::lock_exclusive(&lock)
-            .map_err(|error| format!("failed to lock Skill package store: {error}"))?;
+        crate::locking::lock_file_string(&lock, "SKILL_STORE_LOCK", "Skill package store")?;
         Ok(lock)
     }
 }

@@ -99,6 +99,10 @@ fn plan_lock_path() -> AppResult<PathBuf> {
 
 fn acquire_plan_lock() -> AppResult<PlanGuard> {
     let path = plan_lock_path()?;
+    acquire_plan_lock_at(&path)
+}
+
+fn acquire_plan_lock_at(path: &Path) -> AppResult<PlanGuard> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -108,7 +112,7 @@ fn acquire_plan_lock() -> AppResult<PlanGuard> {
         .read(true)
         .write(true)
         .open(path)?;
-    FileExt::lock_exclusive(&file)?;
+    crate::locking::lock_file_app(&file, "LINUX_SERVICE_PLAN_LOCK", "Linux service plan")?;
     Ok(PlanGuard { file })
 }
 
@@ -466,8 +470,8 @@ pub async fn run_service(config_dir: PathBuf) -> AppResult<()> {
     let mut managed_workspaces = HashSet::<String>::new();
     let mut gateway_managed = false;
     loop {
-        match load_plan() {
-            Ok(plan) => {
+        match tokio::task::spawn_blocking(load_plan).await {
+            Ok(Ok(plan)) => {
                 if let Err(error) =
                     reconcile_service_plan(&plan, &mut managed_workspaces, &mut gateway_managed)
                         .await
@@ -475,7 +479,12 @@ pub async fn run_service(config_dir: PathBuf) -> AppResult<()> {
                     append_service_log(&format!("[service] reconcile failed: {error}"));
                 }
             }
-            Err(error) => append_service_log(&format!("[service] plan read failed: {error}")),
+            Ok(Err(error)) => {
+                append_service_log(&format!("[service] plan read failed: {error}"));
+            }
+            Err(error) => {
+                append_service_log(&format!("[service] plan read task failed: {error}"));
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(SERVICE_RECONCILE_INTERVAL) => {},
@@ -493,10 +502,14 @@ async fn reconcile_service_plan(
     managed_workspaces: &mut HashSet<String>,
     gateway_managed: &mut bool,
 ) -> AppResult<()> {
-    let store = crate::data::DataStore::load()?;
-    let profiles = store.list().to_vec();
-    let gateway_config = store.settings().mcp_gateway;
-    drop(store);
+    let (profiles, gateway_config) = tokio::task::spawn_blocking(|| {
+        let store = crate::data::DataStore::load()?;
+        Ok::<_, AppError>((store.list().to_vec(), store.settings().mcp_gateway))
+    })
+    .await
+    .map_err(|error| {
+        AppError::Message(format!("Linux service DataStore task failed: {error}"))
+    })??;
     let desired = plan
         .workspaces
         .iter()
@@ -740,5 +753,26 @@ mod tests {
         assert_eq!(plan.workspaces[0].workspace_id, "b");
         assert_eq!(plan.workspaces[0].service, ServiceSelection::All);
         assert_eq!(plan.gateway_workspace_ids, vec!["a", "z"]);
+    }
+
+    #[test]
+    fn contended_plan_lock_returns_retryable_busy_instead_of_blocking_forever() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("linux-service.lock");
+        let first = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("first lock file");
+        FileExt::try_lock_exclusive(&first).expect("first lock");
+
+        let started = std::time::Instant::now();
+        let error = acquire_plan_lock_at(&path).expect_err("contended plan lock must time out");
+        assert!(error.to_string().contains("LINUX_SERVICE_PLAN_LOCK_BUSY"));
+        assert!(error.to_string().contains("retryable=true"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        FileExt::unlock(&first).expect("unlock first");
     }
 }

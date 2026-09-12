@@ -1122,7 +1122,11 @@ fn update_registry_at<T>(
         options.mode(0o600);
     }
     let lock = options.open(registry_lock_path(root))?;
-    lock.lock_exclusive()?;
+    crate::locking::lock_file_app(
+        &lock,
+        "FEDERATION_REGISTRY_LOCK",
+        "federation peer registry",
+    )?;
     let result = (|| {
         let mut registry = load_registry_at(root)?;
         let output = mutate(&mut registry)?;

@@ -105,7 +105,7 @@ fn acquire_lock(dir: &Path) -> Result<OutboxLock, String> {
         .truncate(false)
         .open(dir.join(".lock"))
         .map_err(|error| error.to_string())?;
-    file.lock_exclusive().map_err(|error| error.to_string())?;
+    crate::locking::lock_file_string(&file, "NOTIFICATION_OUTBOX_LOCK", "notification outbox")?;
     Ok(OutboxLock(file))
 }
 

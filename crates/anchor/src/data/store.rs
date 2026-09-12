@@ -337,9 +337,8 @@ impl DataStore {
 }
 
 fn lock_data_file() -> AppResult<DataFileGuard> {
-    let process_guard = DATA_FILE_LOCK
-        .lock()
-        .map_err(|_| AppError::Message("data file lock poisoned".into()))?;
+    let process_guard =
+        crate::locking::lock_mutex_app(&DATA_FILE_LOCK, "DATA_STORE_LOCK", "configuration data")?;
     let data_path = data_file_path()?;
     let parent = data_path
         .parent()
@@ -354,7 +353,7 @@ fn lock_data_file() -> AppResult<DataFileGuard> {
         options.mode(0o600);
     }
     let lock_file = options.open(lock_path)?;
-    FileExt::lock_exclusive(&lock_file)?;
+    crate::locking::lock_file_app(&lock_file, "DATA_STORE_LOCK", "configuration data")?;
     Ok(DataFileGuard {
         _process_guard: process_guard,
         lock_file,
