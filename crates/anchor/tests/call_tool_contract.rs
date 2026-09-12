@@ -1594,6 +1594,11 @@ fn direct_exec_uses_the_same_result_contract() {
     assert_eq!(payload["duration_ms"], payload["elapsed_ms"]);
     assert_eq!(payload["transport_ok"], true);
     assert_eq!(payload["command_ok"], true);
+    assert_eq!(
+        payload["execution_resources"]["host_wide_command_admission"],
+        true
+    );
+    assert!(payload["execution_resources"]["memory_pressure"].is_object());
     assert!(payload.get("cost_policy").is_none());
     assert!(payload.get("filesystem_scope").is_none());
     assert!(payload.get("execution_boundary").is_none());
@@ -1762,6 +1767,11 @@ fn durable_wait_recovers_after_tool_context_reconstruction() {
     let stdout = waited["stdout"]["content"].as_str().expect("stdout");
     assert!(stdout.contains("before-reconnect"), "{waited}");
     assert!(stdout.contains("after-reconnect"), "{waited}");
+    assert_eq!(
+        waited["execution_resources"]["host_wide_command_admission"], true,
+        "{waited}"
+    );
+    assert!(waited["execution_resources"]["memory_pressure"].is_object());
 }
 
 #[test]

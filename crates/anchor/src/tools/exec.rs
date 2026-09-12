@@ -12,7 +12,7 @@ use tokio::process::Command;
 use crate::harness::state::{capture_baseline_entries, diff_baseline_entries};
 use crate::tools::command_session::{
     finalize_execution_result, DurableCommandSpec, ExecSession, SessionHarnessMetadata,
-    StreamEncoding,
+    StreamEncoding, DURABLE_COMMAND_SCHEMA_VERSION,
 };
 use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
@@ -1588,13 +1588,27 @@ async fn run_command(
     // briefly create a child only to kill it after insertion fails.
     ctx.sessions.ensure_capacity()?;
     let heavy_command = ctx.resources.is_cpu_intensive(&program, &args);
-    let resource_lease = ctx.resources.acquire(heavy_command, cancellation).await?;
-    let child_parallelism = resource_lease.parallelism();
+    let durable_requested = execution
+        .get("durable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if durable_requested && tty {
+        return Err(WorkspaceError::invalid_argument(
+            "durable commands do not support tty mode",
+        ));
+    }
+    let durable_enabled = durable_requested && ctx.sessions.durable_enabled();
+    let resource_lease = if durable_enabled {
+        None
+    } else {
+        Some(ctx.resources.acquire(heavy_command, cancellation).await?)
+    };
+    let child_parallelism = resource_lease
+        .as_ref()
+        .map(|lease| lease.parallelism())
+        .unwrap_or_else(|| ctx.resources.parallelism_for(heavy_command));
     ctx.resources
         .clamp_parallel_args(&program, &mut args, child_parallelism);
-    let execution_start_guard = ctx.sessions.execution_start_guard();
-    ctx.sessions
-        .ensure_execution_capacity(ctx.resources.max_running_commands())?;
 
     let harness_metadata = task_id
         .and_then(|task_id| ctx.task_harness.task(task_id).ok())
@@ -1613,22 +1627,13 @@ async fn run_command(
     let owner_scope = ctx.command_owner_scope_for_session(mcp_session_id);
     let transport_session_id = mcp_session_id.map(str::to_string);
     let output_encoding = stream_encoding_for_program(&program);
-    let durable_requested = execution
-        .get("durable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if durable_requested && tty {
-        return Err(WorkspaceError::invalid_argument(
-            "durable commands do not support tty mode",
-        ));
-    }
 
-    let session = if durable_requested && ctx.sessions.durable_enabled() {
+    let session = if durable_enabled {
         let session_id = uuid::Uuid::new_v4().to_string();
         let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let execution_resources = resource_lease.to_value();
+        let execution_resources = ctx.resources.planned_execution_resources(heavy_command);
         let spec = DurableCommandSpec {
-            schema_version: 1,
+            schema_version: DURABLE_COMMAND_SCHEMA_VERSION,
             session_id,
             command: cmd.to_string(),
             program: program.clone(),
@@ -1684,14 +1689,13 @@ async fn run_command(
             owner_scope.clone(),
             transport_session_id.clone(),
             output_encoding,
-            Some(resource_lease),
+            None,
         )
         .with_expected_exit_codes(expected_exit_codes.clone())
         .attach_durable_job(job);
         match ctx.sessions.insert(session) {
             Ok(session) => session,
             Err(rejected) => {
-                drop(execution_start_guard);
                 rejected.mark_termination_reason("session_limit");
                 if let Err(error) = rejected.kill_and_wait().await {
                     return Err(process_tree_termination_error(&rejected.session_id, error));
@@ -1700,6 +1704,7 @@ async fn run_command(
             }
         }
     } else {
+        let resource_lease = resource_lease.expect("non-durable command must own a host lease");
         let mut command = command_for_program(&program, &args);
         crate::platform::configure_exec_tokio_process(&mut command);
         command
@@ -1740,7 +1745,6 @@ async fn run_command(
         ) {
             Ok(session) => session,
             Err(rejected) => {
-                drop(execution_start_guard);
                 rejected.mark_termination_reason("session_limit");
                 if let Err(error) = rejected.kill_and_wait().await {
                     return Err(process_tree_termination_error(&rejected.session_id, error));
@@ -1749,7 +1753,6 @@ async fn run_command(
             }
         }
     };
-    drop(execution_start_guard);
     session.spawn_readers().await;
     let deadline = start + limit;
 

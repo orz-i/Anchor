@@ -1,12 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::tools::workspace::WorkspaceError;
 use crate::tools::CancellationToken;
@@ -16,7 +14,16 @@ const MIN_CPU_TARGET_PERCENT: usize = 25;
 const MAX_RUNNING_COMMANDS: usize = 4;
 const RESOURCE_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOURCE_LOCK_POLL: Duration = Duration::from_millis(100);
+const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
+const MIN_MEMORY_RESERVE_BYTES: u64 = 256 * MIB;
+const MAX_MEMORY_RESERVE_BYTES: u64 = 2 * GIB;
+const MEMORY_PER_ADDITIONAL_COMMAND_BYTES: u64 = 2 * GIB;
+const RESOURCE_GOVERNOR_DIR: &str = "resource-governor";
+const HOST_ADMISSION_LOCK_FILE: &str = "host-admission.lock";
+const HOST_SLOT_FILE_PREFIX: &str = "command-slot";
+const MAX_DURABLE_DEBT_SCAN_JOBS: usize = 4096;
+const MAX_DURABLE_STATE_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionResourcePolicy {
@@ -31,6 +38,177 @@ pub struct ExecutionResourcePolicy {
     pub execution_cpu_budget: usize,
     pub max_running_commands: usize,
     pub queue_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryPressureSnapshot {
+    detected_available_memory_bytes: Option<u64>,
+    cgroup_memory_current_bytes: Option<u64>,
+    cgroup_memory_available_bytes: Option<u64>,
+    effective_available_memory_bytes: Option<u64>,
+    reserve_memory_bytes: Option<u64>,
+    pressure_max_running_commands: usize,
+    state: &'static str,
+}
+
+impl MemoryPressureSnapshot {
+    fn to_value(&self) -> Value {
+        json!({
+            "detected_available_memory_bytes": self.detected_available_memory_bytes,
+            "cgroup_memory_current_bytes": self.cgroup_memory_current_bytes,
+            "cgroup_memory_available_bytes": self.cgroup_memory_available_bytes,
+            "effective_available_memory_bytes": self.effective_available_memory_bytes,
+            "reserve_memory_bytes": self.reserve_memory_bytes,
+            "pressure_max_running_commands": self.pressure_max_running_commands,
+            "state": self.state,
+        })
+    }
+}
+
+struct HostSlotLease {
+    file: File,
+    pressure: MemoryPressureSnapshot,
+    active_before: usize,
+}
+
+async fn acquire_host_slot(
+    harness_root: &Path,
+    governor_root: &Path,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+    policy: &ExecutionResourcePolicy,
+    heavy: bool,
+) -> Result<HostSlotLease, WorkspaceError> {
+    std::fs::create_dir_all(governor_root).map_err(|error| {
+        resource_lock_error(&format!("create governor directory failed: {error}"))
+    })?;
+    let admission = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(governor_root.join(HOST_ADMISSION_LOCK_FILE))
+        .map_err(|error| {
+            resource_lock_error(&format!("open host admission lock failed: {error}"))
+        })?;
+    let mut last_pressure = None;
+    let mut last_active = None;
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(resource_cancelled_error());
+        }
+        match FileExt::try_lock_exclusive(&admission) {
+            Ok(()) => {
+                let pressure = detect_memory_pressure(policy);
+                let result =
+                    try_reserve_host_slot(harness_root, governor_root, policy, &pressure, heavy);
+                let _ = FileExt::unlock(&admission);
+                match result? {
+                    HostSlotAttempt::Acquired {
+                        file,
+                        active_before,
+                    } => {
+                        return Ok(HostSlotLease {
+                            file,
+                            pressure,
+                            active_before,
+                        });
+                    }
+                    HostSlotAttempt::Busy { active_before } => {
+                        last_active = Some(active_before);
+                        last_pressure = Some(pressure);
+                    }
+                }
+            }
+            Err(error) if lock_is_contended(&error) => {}
+            Err(error) => {
+                return Err(resource_lock_error(&format!(
+                    "host admission lock acquisition failed: {error}"
+                )))
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(resource_queue_timeout_error(
+                policy,
+                heavy,
+                last_pressure.as_ref(),
+                last_active,
+            ));
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => return Err(resource_cancelled_error()),
+            _ = tokio::time::sleep(RESOURCE_LOCK_POLL) => {}
+        }
+    }
+}
+
+enum HostSlotAttempt {
+    Acquired { file: File, active_before: usize },
+    Busy { active_before: usize },
+}
+
+fn try_reserve_host_slot(
+    harness_root: &Path,
+    governor_root: &Path,
+    policy: &ExecutionResourcePolicy,
+    pressure: &MemoryPressureSnapshot,
+    heavy: bool,
+) -> Result<HostSlotAttempt, WorkspaceError> {
+    let debt = orphaned_durable_debt(harness_root);
+    let mut busy_slots = 0usize;
+    let mut candidate = None;
+
+    for index in 0..MAX_RUNNING_COMMANDS {
+        let path = governor_root.join(format!("{HOST_SLOT_FILE_PREFIX}-{index}.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| {
+                resource_lock_error(&format!("open host command slot failed: {error}"))
+            })?;
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) if candidate.is_none() => candidate = Some(file),
+            Ok(()) => {
+                let _ = FileExt::unlock(&file);
+            }
+            Err(error) if lock_is_contended(&error) => busy_slots += 1,
+            Err(error) => {
+                return Err(resource_lock_error(&format!(
+                    "host command slot inspection failed: {error}"
+                )))
+            }
+        }
+    }
+
+    let active_before = busy_slots.saturating_add(debt.total);
+    let admission_limit = policy
+        .max_running_commands
+        .min(pressure.pressure_max_running_commands);
+    let blocked_by_heavy_orphan = heavy && debt.heavy > 0;
+    if admission_limit > 0 && active_before < admission_limit && !blocked_by_heavy_orphan {
+        if let Some(file) = candidate {
+            return Ok(HostSlotAttempt::Acquired {
+                file,
+                active_before,
+            });
+        }
+    }
+
+    if let Some(file) = candidate {
+        let _ = FileExt::unlock(&file);
+    }
+    Ok(HostSlotAttempt::Busy { active_before })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OrphanedDurableDebt {
+    total: usize,
+    heavy: usize,
 }
 
 fn constrain_unknown_memory(policy: &mut ExecutionResourcePolicy, required: bool) {
@@ -93,7 +271,14 @@ impl ExecutionResourcePolicy {
             cpu_target_percent,
             max_running_override,
         );
-        constrain_unknown_memory(&mut policy, cfg!(target_os = "windows"));
+        constrain_unknown_memory(
+            &mut policy,
+            cfg!(any(
+                target_os = "linux",
+                target_os = "windows",
+                target_os = "macos"
+            )),
+        );
         policy
     }
 
@@ -173,6 +358,8 @@ impl ExecutionResourcePolicy {
             "max_running_commands": self.max_running_commands,
             "heavy_command_parallelism": self.execution_cpu_budget,
             "queue_timeout_ms": self.queue_timeout_ms,
+            "host_wide_command_admission": true,
+            "memory_pressure_admission": true,
             "cross_daemon_heavy_serialization": true,
             "child_priority": "below_normal",
             "retained_session_limit_is_execution_limit": false
@@ -182,16 +369,19 @@ impl ExecutionResourcePolicy {
 
 pub struct ExecutionResourceManager {
     policy: ExecutionResourcePolicy,
-    permits: Arc<Semaphore>,
+    harness_root: PathBuf,
+    governor_root: PathBuf,
     heavy_lock_path: PathBuf,
 }
 
 pub struct ExecutionLease {
-    _permit: OwnedSemaphorePermit,
+    _host_slot: File,
     _heavy_lock: Option<File>,
     heavy: bool,
     parallelism: usize,
     policy: ExecutionResourcePolicy,
+    pressure: MemoryPressureSnapshot,
+    host_active_commands_before_admission: usize,
 }
 
 impl std::fmt::Debug for ExecutionLease {
@@ -218,6 +408,11 @@ impl ExecutionLease {
         if let Some(object) = value.as_object_mut() {
             object.insert("heavy_command".into(), Value::Bool(self.heavy));
             object.insert("child_parallelism".into(), json!(self.parallelism));
+            object.insert("memory_pressure".into(), self.pressure.to_value());
+            object.insert(
+                "host_active_commands_before_admission".into(),
+                json!(self.host_active_commands_before_admission),
+            );
         }
         value
     }
@@ -229,17 +424,24 @@ impl ExecutionResourceManager {
     }
 
     fn with_policy(harness_root: &Path, policy: ExecutionResourcePolicy) -> Self {
+        let governor_root = harness_root.join(RESOURCE_GOVERNOR_DIR);
         Self {
-            permits: Arc::new(Semaphore::new(policy.max_running_commands)),
-            heavy_lock_path: harness_root
-                .join("resource-governor")
-                .join("heavy-command.lock"),
+            harness_root: harness_root.to_path_buf(),
+            heavy_lock_path: governor_root.join("heavy-command.lock"),
+            governor_root,
             policy,
         }
     }
 
     pub fn policy_value(&self) -> Value {
-        self.policy.to_value()
+        let mut value = self.policy.to_value();
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "memory_pressure".into(),
+                detect_memory_pressure(&self.policy).to_value(),
+            );
+        }
+        value
     }
 
     pub fn max_running_commands(&self) -> usize {
@@ -250,48 +452,62 @@ impl ExecutionResourceManager {
         is_cpu_intensive_command(program, args)
     }
 
+    pub fn parallelism_for(&self, heavy: bool) -> usize {
+        if heavy {
+            self.policy.execution_cpu_budget
+        } else {
+            (self.policy.execution_cpu_budget / self.policy.max_running_commands).max(1)
+        }
+    }
+
+    pub fn planned_execution_resources(&self, heavy: bool) -> Value {
+        let mut value = self.policy_value();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("heavy_command".into(), Value::Bool(heavy));
+            object.insert(
+                "child_parallelism".into(),
+                json!(self.parallelism_for(heavy)),
+            );
+        }
+        value
+    }
+
     pub async fn acquire(
         &self,
         heavy: bool,
         cancellation: &CancellationToken,
     ) -> Result<ExecutionLease, WorkspaceError> {
         let queue_timeout = Duration::from_millis(self.policy.queue_timeout_ms);
-        let permit = tokio::select! {
-            _ = cancellation.cancelled() => return Err(resource_cancelled_error()),
-            result = tokio::time::timeout(queue_timeout, self.permits.clone().acquire_owned()) => {
-                match result {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => return Err(resource_queue_closed_error(&self.policy)),
-                    Err(_) => return Err(resource_queue_timeout_error(&self.policy, heavy)),
-                }
-            }
-        };
+        let deadline = Instant::now() + queue_timeout;
 
         let heavy_lock = if heavy {
             Some(
-                acquire_heavy_lock(
-                    &self.heavy_lock_path,
-                    queue_timeout,
-                    cancellation,
-                    &self.policy,
-                )
-                .await?,
+                acquire_heavy_lock(&self.heavy_lock_path, deadline, cancellation, &self.policy)
+                    .await?,
             )
         } else {
             None
         };
 
-        let parallelism = if heavy {
-            self.policy.execution_cpu_budget
-        } else {
-            (self.policy.execution_cpu_budget / self.policy.max_running_commands).max(1)
-        };
+        let host_slot = acquire_host_slot(
+            &self.harness_root,
+            &self.governor_root,
+            deadline,
+            cancellation,
+            &self.policy,
+            heavy,
+        )
+        .await?;
+
+        let parallelism = self.parallelism_for(heavy);
         Ok(ExecutionLease {
-            _permit: permit,
+            _host_slot: host_slot.file,
             _heavy_lock: heavy_lock,
             heavy,
             parallelism,
             policy: self.policy.clone(),
+            pressure: host_slot.pressure,
+            host_active_commands_before_admission: host_slot.active_before,
         })
     }
 
@@ -329,7 +545,7 @@ impl ExecutionResourceManager {
 
 async fn acquire_heavy_lock(
     path: &Path,
-    timeout: Duration,
+    deadline: Instant,
     cancellation: &CancellationToken,
     policy: &ExecutionResourcePolicy,
 ) -> Result<File, WorkspaceError> {
@@ -345,7 +561,6 @@ async fn acquire_heavy_lock(
         .write(true)
         .open(path)
         .map_err(|error| resource_lock_error(&format!("open lock file failed: {error}")))?;
-    let deadline = Instant::now() + timeout;
     loop {
         if cancellation.is_cancelled() {
             return Err(resource_cancelled_error());
@@ -354,7 +569,7 @@ async fn acquire_heavy_lock(
             Ok(()) => return Ok(file),
             Err(error) if lock_is_contended(&error) => {
                 if Instant::now() >= deadline {
-                    return Err(resource_queue_timeout_error(policy, true));
+                    return Err(resource_queue_timeout_error(policy, true, None, None));
                 }
                 tokio::select! {
                     _ = cancellation.cancelled() => return Err(resource_cancelled_error()),
@@ -370,7 +585,167 @@ async fn acquire_heavy_lock(
     }
 }
 
-fn resource_queue_timeout_error(policy: &ExecutionResourcePolicy, heavy: bool) -> WorkspaceError {
+fn detect_memory_pressure(policy: &ExecutionResourcePolicy) -> MemoryPressureSnapshot {
+    let detected_available_memory_bytes = detect_available_memory_bytes();
+    let cgroup_memory_current_bytes = detect_cgroup_memory_current();
+    memory_pressure_from_values(
+        policy.effective_memory_bytes,
+        detected_available_memory_bytes,
+        policy.cgroup_memory_limit_bytes,
+        cgroup_memory_current_bytes,
+    )
+}
+
+fn memory_pressure_from_values(
+    effective_memory_bytes: Option<u64>,
+    detected_available_memory_bytes: Option<u64>,
+    cgroup_memory_limit_bytes: Option<u64>,
+    cgroup_memory_current_bytes: Option<u64>,
+) -> MemoryPressureSnapshot {
+    let cgroup_memory_available_bytes = match (
+        cgroup_memory_limit_bytes.filter(|value| *value > 0),
+        cgroup_memory_current_bytes,
+    ) {
+        (Some(limit), Some(current)) => Some(limit.saturating_sub(current)),
+        _ => None,
+    };
+    let pressure_complete = detected_available_memory_bytes.is_some()
+        && (cgroup_memory_limit_bytes.is_none() || cgroup_memory_current_bytes.is_some());
+    let effective_available_memory_bytes = pressure_complete.then(|| {
+        min_optional(
+            detected_available_memory_bytes,
+            cgroup_memory_available_bytes,
+        )
+        .unwrap_or(0)
+    });
+    let reserve_memory_bytes = effective_memory_bytes.map(memory_reserve_bytes);
+    let pressure_max_running_commands = match (
+        effective_memory_bytes,
+        effective_available_memory_bytes,
+        reserve_memory_bytes,
+    ) {
+        (Some(_), Some(available), Some(reserve)) if available <= reserve => 0,
+        (Some(_), Some(available), Some(reserve)) => (1
+            + (available.saturating_sub(reserve) / MEMORY_PER_ADDITIONAL_COMMAND_BYTES) as usize)
+            .clamp(1, MAX_RUNNING_COMMANDS),
+        _ => 1,
+    };
+    let state = if !pressure_complete || effective_memory_bytes.is_none() {
+        "unknown"
+    } else if pressure_max_running_commands == 0 {
+        "critical"
+    } else if pressure_max_running_commands < MAX_RUNNING_COMMANDS {
+        "constrained"
+    } else {
+        "normal"
+    };
+
+    MemoryPressureSnapshot {
+        detected_available_memory_bytes,
+        cgroup_memory_current_bytes,
+        cgroup_memory_available_bytes,
+        effective_available_memory_bytes,
+        reserve_memory_bytes,
+        pressure_max_running_commands,
+        state,
+    }
+}
+
+fn memory_reserve_bytes(total: u64) -> u64 {
+    let half = (total / 2).max(1);
+    (total / 8)
+        .clamp(MIN_MEMORY_RESERVE_BYTES, MAX_MEMORY_RESERVE_BYTES)
+        .min(half)
+}
+
+fn orphaned_durable_debt(harness_root: &Path) -> OrphanedDurableDebt {
+    let mut debt = OrphanedDurableDebt::default();
+    let workspaces = harness_root.join("workspaces");
+    let Ok(workspace_entries) = std::fs::read_dir(workspaces) else {
+        return debt;
+    };
+    let mut scanned = 0usize;
+
+    'workspaces: for workspace in workspace_entries.flatten() {
+        let jobs_root = workspace.path().join("command-jobs");
+        let Ok(job_entries) = std::fs::read_dir(jobs_root) else {
+            continue;
+        };
+        for job in job_entries.flatten() {
+            if scanned >= MAX_DURABLE_DEBT_SCAN_JOBS {
+                break 'workspaces;
+            }
+            scanned += 1;
+            let state_path = job.path().join("state.json");
+            let Ok(metadata) = std::fs::metadata(&state_path) else {
+                continue;
+            };
+            if metadata.len() > MAX_DURABLE_STATE_BYTES {
+                continue;
+            }
+            let Ok(raw) = std::fs::read(&state_path) else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_slice::<Value>(&raw) else {
+                continue;
+            };
+            let Some(status) = state.get("status").and_then(Value::as_str) else {
+                continue;
+            };
+            if !matches!(status, "starting" | "running") {
+                continue;
+            }
+            let supervisor_alive = state
+                .get("supervisor_pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .is_some_and(|pid| crate::platform::platform().is_process_alive(pid));
+            if supervisor_alive {
+                continue;
+            }
+            let child_alive = state
+                .get("child_pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+                .is_some_and(crate::platform::exec_process_tree_is_alive);
+            if !child_alive {
+                continue;
+            }
+
+            debt.total = debt.total.saturating_add(1);
+            let heavy = read_durable_heavy_flag(&job.path().join("spec.json"));
+            if heavy {
+                debt.heavy = debt.heavy.saturating_add(1);
+            }
+        }
+    }
+    debt
+}
+
+fn read_durable_heavy_flag(spec_path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(spec_path) else {
+        return false;
+    };
+    if metadata.len() > MAX_DURABLE_STATE_BYTES {
+        return false;
+    }
+    std::fs::read(spec_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|spec| {
+            spec.get("execution_resources")
+                .and_then(|resources| resources.get("heavy_command"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn resource_queue_timeout_error(
+    policy: &ExecutionResourcePolicy,
+    heavy: bool,
+    pressure: Option<&MemoryPressureSnapshot>,
+    active_commands: Option<usize>,
+) -> WorkspaceError {
     WorkspaceError::ToolDetails {
         code: "EXECUTION_RESOURCE_BUSY",
         message: "Host execution budget is busy; command was not started.".into(),
@@ -383,21 +758,9 @@ fn resource_queue_timeout_error(policy: &ExecutionResourcePolicy, heavy: bool) -
             "max_running_commands": policy.max_running_commands,
             "execution_cpu_budget": policy.execution_cpu_budget,
             "queue_timeout_ms": policy.queue_timeout_ms,
+            "host_active_commands": active_commands,
+            "memory_pressure": pressure.map(MemoryPressureSnapshot::to_value),
             "suggestion": "Wait for an existing command to finish, consume its result, or retry later"
-        }),
-    }
-}
-
-fn resource_queue_closed_error(policy: &ExecutionResourcePolicy) -> WorkspaceError {
-    WorkspaceError::ToolDetails {
-        code: "EXECUTION_RESOURCE_UNAVAILABLE",
-        message: "Host execution resource governor is unavailable.".into(),
-        category: "runtime",
-        retryable: true,
-        details: json!({
-            "stage": "resource_governor",
-            "execution_started": false,
-            "max_running_commands": policy.max_running_commands
         }),
     }
 }
@@ -705,15 +1068,60 @@ fn quota_to_cpu_limit(quota: i64, period: u64) -> Option<usize> {
 #[cfg(target_os = "linux")]
 fn detect_physical_memory_bytes() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = contents
-        .lines()
-        .find(|line| line.starts_with("MemTotal:"))?;
+    parse_linux_meminfo_bytes(&contents, "MemTotal:")
+}
+
+#[cfg(target_os = "windows")]
+fn detect_physical_memory_bytes() -> Option<u64> {
+    windows_memory_bytes().map(|(total, _)| total)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_physical_memory_bytes() -> Option<u64> {
+    macos_sysctl_u64(b"hw.memsize\0").filter(|bytes| *bytes > 0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn detect_physical_memory_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_available_memory_bytes() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_linux_meminfo_bytes(&contents, "MemAvailable:")
+}
+
+#[cfg(target_os = "windows")]
+fn detect_available_memory_bytes() -> Option<u64> {
+    windows_memory_bytes().map(|(_, available)| available)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_available_memory_bytes() -> Option<u64> {
+    let page_size = macos_sysctl_u64(b"hw.pagesize\0")?;
+    let free = macos_sysctl_u64(b"vm.page_free_count\0")?;
+    let inactive = macos_sysctl_u64(b"vm.page_inactive_count\0")?;
+    let speculative = macos_sysctl_u64(b"vm.page_speculative_count\0").unwrap_or(0);
+    let pages = free.checked_add(inactive)?.checked_add(speculative)?;
+    let available = pages.checked_mul(page_size)?;
+    detect_physical_memory_bytes().map(|total| available.min(total))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn detect_available_memory_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_meminfo_bytes(contents: &str, key: &str) -> Option<u64> {
+    let line = contents.lines().find(|line| line.starts_with(key))?;
     let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     kib.checked_mul(1024)
 }
 
 #[cfg(target_os = "windows")]
-fn detect_physical_memory_bytes() -> Option<u64> {
+fn windows_memory_bytes() -> Option<(u64, u64)> {
     use std::mem;
 
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -723,12 +1131,45 @@ fn detect_physical_memory_bytes() -> Option<u64> {
         ..Default::default()
     };
     unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
-    (status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+    (status.ullTotalPhys > 0 && status.ullAvailPhys > 0)
+        .then_some((status.ullTotalPhys, status.ullAvailPhys))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn detect_physical_memory_bytes() -> Option<u64> {
-    None
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn sysctlbyname(
+        name: *const libc::c_char,
+        oldp: *mut libc::c_void,
+        oldlenp: *mut libc::size_t,
+        newp: *mut libc::c_void,
+        newlen: libc::size_t,
+    ) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_u64(name: &[u8]) -> Option<u64> {
+    if name.last().copied() != Some(0) {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    let mut len = bytes.len();
+    let status = unsafe {
+        sysctlbyname(
+            name.as_ptr().cast(),
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    match len {
+        4 => Some(u32::from_ne_bytes(bytes[..4].try_into().ok()?) as u64),
+        8 => Some(u64::from_ne_bytes(bytes)),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -748,6 +1189,23 @@ fn detect_cgroup_memory_limit() -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 fn detect_cgroup_memory_limit() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_cgroup_memory_current() -> Option<u64> {
+    if let Ok(value) = std::fs::read_to_string("/sys/fs/cgroup/memory.current") {
+        if let Ok(bytes) = value.trim().parse::<u64>() {
+            return Some(bytes);
+        }
+    }
+    std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_cgroup_memory_current() -> Option<u64> {
     None
 }
 
@@ -841,10 +1299,86 @@ mod tests {
         assert_eq!(unknown.effective_memory_bytes, None);
     }
 
+    #[test]
+    fn memory_pressure_uses_available_headroom_and_reserve() {
+        let normal = memory_pressure_from_values(Some(16 * GIB), Some(12 * GIB), None, None);
+        assert_eq!(normal.reserve_memory_bytes, Some(2 * GIB));
+        assert_eq!(normal.pressure_max_running_commands, 4);
+        assert_eq!(normal.state, "normal");
+
+        let constrained = memory_pressure_from_values(Some(16 * GIB), Some(3 * GIB), None, None);
+        assert_eq!(constrained.pressure_max_running_commands, 1);
+        assert_eq!(constrained.state, "constrained");
+
+        let critical = memory_pressure_from_values(Some(16 * GIB), Some(2 * GIB), None, None);
+        assert_eq!(critical.pressure_max_running_commands, 0);
+        assert_eq!(critical.state, "critical");
+    }
+
+    #[test]
+    fn cgroup_remaining_memory_can_force_critical_pressure() {
+        let pressure = memory_pressure_from_values(
+            Some(4 * GIB),
+            Some(3 * GIB),
+            Some(4 * GIB),
+            Some(4 * GIB - 256 * MIB),
+        );
+        assert_eq!(pressure.cgroup_memory_available_bytes, Some(256 * MIB));
+        assert_eq!(pressure.effective_available_memory_bytes, Some(256 * MIB));
+        assert_eq!(pressure.reserve_memory_bytes, Some(512 * MIB));
+        assert_eq!(pressure.pressure_max_running_commands, 0);
+        assert_eq!(pressure.state, "critical");
+
+        let unknown =
+            memory_pressure_from_values(Some(4 * GIB), Some(3 * GIB), Some(4 * GIB), None);
+        assert_eq!(unknown.effective_available_memory_bytes, None);
+        assert_eq!(unknown.pressure_max_running_commands, 1);
+        assert_eq!(unknown.state, "unknown");
+    }
+
+    #[test]
+    fn critical_memory_pressure_refuses_a_free_host_slot() {
+        let temp = tempfile::tempdir().expect("temp");
+        let governor_root = temp.path().join(RESOURCE_GOVERNOR_DIR);
+        std::fs::create_dir_all(&governor_root).expect("governor root");
+        let policy = policy(32, 16);
+        let critical = memory_pressure_from_values(Some(16 * GIB), Some(2 * GIB), None, None);
+        let attempt = try_reserve_host_slot(temp.path(), &governor_root, &policy, &critical, false)
+            .expect("host slot attempt");
+        assert!(matches!(
+            attempt,
+            HostSlotAttempt::Busy { active_before: 0 }
+        ));
+
+        let normal = memory_pressure_from_values(Some(16 * GIB), Some(12 * GIB), None, None);
+        let attempt = try_reserve_host_slot(temp.path(), &governor_root, &policy, &normal, false)
+            .expect("host slot attempt");
+        assert!(matches!(attempt, HostSlotAttempt::Acquired { .. }));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_physical_memory_detection_reports_nonzero_capacity() {
         assert!(detect_physical_memory_bytes().is_some_and(|bytes| bytes > 0));
+        let available = detect_available_memory_bytes().expect("available physical memory");
+        let total = detect_physical_memory_bytes().expect("physical memory");
+        assert!(available > 0 && available <= total);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_available_memory_detection_reports_sane_capacity() {
+        let available = detect_available_memory_bytes().expect("MemAvailable");
+        let total = detect_physical_memory_bytes().expect("MemTotal");
+        assert!(available > 0 && available <= total);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_memory_detection_reports_sane_capacity() {
+        let available = detect_available_memory_bytes().expect("macOS available memory");
+        let total = detect_physical_memory_bytes().expect("macOS physical memory");
+        assert!(available > 0 && available <= total);
     }
 
     #[test]
@@ -904,21 +1438,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_execution_budget_is_acquired_before_another_command_can_run() {
+    async fn host_execution_budget_is_shared_across_managers() {
         let temp = tempfile::tempdir().expect("temp");
         let manager = ExecutionResourceManager::with_policy(temp.path(), policy(2, 8));
+        let second_manager = ExecutionResourceManager::with_policy(temp.path(), policy(2, 8));
         let token = CancellationToken::default();
         let first = manager.acquire(false, &token).await.expect("first permit");
         assert_eq!(first.parallelism(), 1);
+        let telemetry = first.to_value();
+        assert_eq!(telemetry["host_wide_command_admission"], true);
+        assert!(telemetry["memory_pressure"].is_object());
+        assert_eq!(telemetry["host_active_commands_before_admission"], json!(0));
 
         let cancelled = CancellationToken::default();
-        cancelled.cancel();
-        let error = manager
-            .acquire(false, &cancelled)
-            .await
-            .expect_err("cancelled waiter");
+        let cancellation = cancelled.clone();
+        let waiter = second_manager.acquire(false, &cancelled);
+        tokio::pin!(waiter);
+        tokio::select! {
+            result = &mut waiter => panic!("second manager acquired host slot early: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+        cancellation.cancel();
+        let error = waiter.await.expect_err("cancelled waiter");
         assert_eq!(error.to_error_value()["code"], "REQUEST_CANCELLED");
         drop(first);
+    }
+
+    const HOST_SLOT_PROBE_ROOT_ENV: &str = "ANCHOR_HOST_SLOT_PROBE_ROOT";
+    const HOST_SLOT_PROBE_READY_ENV: &str = "ANCHOR_HOST_SLOT_PROBE_READY";
+
+    #[test]
+    #[ignore = "invoked as a child process by host resource governor tests"]
+    fn host_slot_probe_child() {
+        let Some(root) = std::env::var_os(HOST_SLOT_PROBE_ROOT_ENV) else {
+            return;
+        };
+        let ready = std::env::var_os(HOST_SLOT_PROBE_READY_ENV).expect("probe ready path");
+        let manager = ExecutionResourceManager::with_policy(Path::new(&root), policy(2, 8));
+        let token = CancellationToken::default();
+        let lease = crate::async_runtime::block_on(manager.acquire(false, &token))
+            .expect("child host slot");
+        std::fs::write(ready, b"ready").expect("publish child host slot");
+        std::thread::sleep(Duration::from_secs(2));
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn host_execution_budget_is_shared_across_processes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let ready = temp.path().join("host-slot-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .arg("tools::resource_budget::tests::host_slot_probe_child")
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(HOST_SLOT_PROBE_ROOT_ENV, temp.path())
+            .env(HOST_SLOT_PROBE_READY_ENV, &ready)
+            .spawn()
+            .expect("spawn host slot probe child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.is_file() && Instant::now() < deadline {
+            if child.try_wait().expect("probe child status").is_some() {
+                panic!("host slot probe child exited before publishing readiness");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ready.is_file(), "host slot probe did not become ready");
+
+        let manager = ExecutionResourceManager::with_policy(temp.path(), policy(2, 8));
+        let token = CancellationToken::default();
+        let cancellation = token.clone();
+        let waiter = manager.acquire(false, &token);
+        tokio::pin!(waiter);
+        tokio::select! {
+            result = &mut waiter => panic!("cross-process host slot was not exclusive: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+        }
+        cancellation.cancel();
+        let error = waiter.await.expect_err("cancel cross-process waiter");
+        assert_eq!(error.to_error_value()["code"], "REQUEST_CANCELLED");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_durable_child_is_counted_as_host_resource_debt() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let job = temp
+            .path()
+            .join("workspaces")
+            .join("workspace")
+            .join("command-jobs")
+            .join("job");
+        std::fs::create_dir_all(&job).expect("job dir");
+        let dead_supervisor_pid = (2_000_000_000_u32..2_000_000_100_u32)
+            .find(|pid| !crate::platform::platform().is_process_alive(*pid))
+            .expect("unused pid");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 & wait")
+            .process_group(0)
+            .spawn()
+            .expect("orphan debt process group");
+        let child_pid = child.id();
+        std::fs::write(
+            job.join("state.json"),
+            serde_json::to_vec(&json!({
+                "status": "running",
+                "supervisor_pid": dead_supervisor_pid,
+                "child_pid": child_pid,
+            }))
+            .expect("state json"),
+        )
+        .expect("state");
+        std::fs::write(
+            job.join("spec.json"),
+            serde_json::to_vec(&json!({
+                "execution_resources": {"heavy_command": true}
+            }))
+            .expect("spec json"),
+        )
+        .expect("spec");
+
+        assert_eq!(
+            orphaned_durable_debt(temp.path()),
+            OrphanedDurableDebt { total: 1, heavy: 1 }
+        );
+
+        crate::platform::signal_exec_process_tree(child_pid, "KILL").expect("kill debt tree");
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::platform::exec_process_tree_is_alive(child_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            orphaned_durable_debt(temp.path()),
+            OrphanedDurableDebt::default()
+        );
     }
 
     #[tokio::test]

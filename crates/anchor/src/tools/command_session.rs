@@ -14,8 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::harness::model::BaselineEntry;
-use crate::tools::resource_budget::ExecutionLease;
+use crate::tools::resource_budget::{ExecutionLease, ExecutionResourceManager};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
+use crate::tools::CancellationToken;
 use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
@@ -25,7 +26,7 @@ const DEFAULT_MAX_EXEC_SESSIONS: usize = 64;
 // the store for terminal_log_retention so output refs stay readable.
 const DEFAULT_TERMINAL_SLOT_RETENTION: Duration = Duration::ZERO;
 const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
-const DURABLE_COMMAND_SCHEMA_VERSION: u32 = 1;
+pub(crate) const DURABLE_COMMAND_SCHEMA_VERSION: u32 = 1;
 const TERMINAL_RECONCILIATION_GRACE: Duration = Duration::from_millis(250);
 const TERMINAL_RECONCILIATION_POLL: Duration = Duration::from_millis(10);
 const EXEC_PROCESS_TREE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +36,6 @@ const DURABLE_JSON_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 pub struct CommandSessionStore {
     sessions: Mutex<HashMap<String, Arc<ExecSession>>>,
-    execution_admission: Mutex<()>,
     max_sessions: usize,
     terminal_slot_retention: Duration,
     terminal_log_retention: Duration,
@@ -106,6 +106,8 @@ struct DurableCommandState {
     last_output_at: String,
     #[serde(default)]
     heartbeat_at: Option<String>,
+    #[serde(default)]
+    execution_resources: Option<Value>,
     stdout_total_bytes: u64,
     stderr_total_bytes: u64,
 }
@@ -405,6 +407,33 @@ fn validate_durable_spec_location(spec_path: &Path) -> Result<(), String> {
     }
 }
 
+fn durable_resource_governor_root(_spec_path: &Path) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        _spec_path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "durable command spec path has no test governor root".into())
+    }
+
+    #[cfg(not(test))]
+    {
+        let expected = crate::harness::CodingHarness::default_root()
+            .map_err(|error| format!("resolve Harness root failed: {error}"))?;
+        fs::canonicalize(expected)
+            .map_err(|error| format!("canonicalize Harness root failed: {error}"))
+    }
+}
+
+fn durable_spec_heavy_command(spec: &DurableCommandSpec) -> bool {
+    spec.execution_resources
+        .as_ref()
+        .and_then(|resources| resources.get("heavy_command"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Internal one-shot entrypoint used by the CLI. Recovery code never calls
 /// this function: it only reads the persisted job state, so a daemon restart
 /// cannot replay a command.
@@ -443,6 +472,30 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     state.heartbeat_at = Some(timestamp());
     persist_durable_state(&paths, &state);
 
+    let resource_governor_root = durable_resource_governor_root(&spec_path)?;
+    let resource_manager = ExecutionResourceManager::new(&resource_governor_root);
+    let resource_cancellation = CancellationToken::default();
+    let resource_lease = match resource_manager
+        .acquire(durable_spec_heavy_command(&spec), &resource_cancellation)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            state.status = "spawn_failed".into();
+            state.termination_reason = "spawn_failed".into();
+            state.stdin_open = false;
+            state.finished_at = Some(timestamp());
+            state.heartbeat_at = state.finished_at.clone();
+            persist_durable_state(&paths, &state);
+            let message = format!("durable resource admission failed: {error}");
+            let _ = append_bounded_log(&paths.stderr, message.as_bytes());
+            return Err(message);
+        }
+    };
+    let child_parallelism = resource_lease.parallelism();
+    state.execution_resources = Some(resource_lease.to_value());
+    persist_durable_state(&paths, &state);
+
     #[cfg(all(windows, not(test)))]
     let windows_job = match crate::platform::install_windows_durable_supervisor_job() {
         Ok(job) => job,
@@ -459,13 +512,16 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
         }
     };
 
+    let mut child_args = spec.args.clone();
+    resource_manager.clamp_parallel_args(&spec.program, &mut child_args, child_parallelism);
     let mut command = tokio::process::Command::new(&spec.program);
     command
-        .args(&spec.args)
+        .args(&child_args)
         .current_dir(&spec.cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    resource_manager.apply_child_environment(&mut command, child_parallelism, &spec.program);
     crate::platform::configure_exec_tokio_process(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -644,6 +700,7 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     current.finished_at = Some(timestamp());
     current.heartbeat_at = current.finished_at.clone();
     persist_durable_state(&paths, &current);
+    drop(resource_lease);
     Ok(exit_status.code().unwrap_or(1))
 }
 
@@ -1154,6 +1211,7 @@ pub fn wait_command(store: &CommandSessionStore, args: &Value) -> Result<Value, 
         "exit_code": snapshot["exit_code"],
         "command_ok": snapshot["command_ok"],
         "execution_status": snapshot["execution_status"],
+        "execution_resources": snapshot["execution_resources"],
         "execution_duration_ms": snapshot["execution_duration_ms"],
         "result_observed": snapshot["result_observed"],
         "stdout": stdout,
@@ -1250,6 +1308,13 @@ mod tests {
             .read_line(&mut input)
             .expect("read durable stdin");
         println!("durable-stdin:{}", input.trim());
+    }
+
+    #[test]
+    #[ignore = "invoked as a child process by durable resource ownership tests"]
+    fn durable_supervisor_resource_child() {
+        println!("durable-resource-child");
+        std::thread::sleep(Duration::from_secs(2));
     }
 
     fn durable_child_args(test_name: &str) -> Vec<String> {
@@ -1359,6 +1424,55 @@ mod tests {
     }
 
     #[test]
+    fn durable_supervisor_owns_heavy_resource_lease() {
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let store = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let mut spec = durable_test_spec(
+            session_id,
+            "tools::command_session::tests::durable_supervisor_resource_child",
+            5_000,
+        );
+        spec.execution_resources = Some(json!({"heavy_command": true}));
+        let job = store.create_durable_job(spec).expect("create durable job");
+        let state_path = job.paths.state.clone();
+        let supervisor = std::thread::spawn({
+            let spec_path = job.spec_path().to_path_buf();
+            move || crate::async_runtime::block_on(run_durable_command_supervisor(spec_path))
+        });
+        wait_for_durable_status(&state_path, "running");
+        let running_state = job.read_state().expect("running state");
+        let resources = running_state
+            .execution_resources
+            .expect("durable execution resources");
+        assert_eq!(resources["heavy_command"], true);
+        assert_eq!(resources["host_wide_command_admission"], true);
+        assert!(resources["memory_pressure"].is_object());
+
+        let manager = ExecutionResourceManager::new(&root);
+        let token = CancellationToken::default();
+        let cancellation = token.clone();
+        crate::async_runtime::block_on(async {
+            let waiter = manager.acquire(true, &token);
+            tokio::pin!(waiter);
+            tokio::select! {
+                result = &mut waiter => panic!("durable supervisor did not retain heavy lease: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+            }
+            cancellation.cancel();
+            let error = waiter.await.expect_err("cancel competing heavy lease");
+            assert_eq!(error.to_error_value()["code"], "REQUEST_CANCELLED");
+        });
+
+        let result = supervisor
+            .join()
+            .expect("supervisor thread")
+            .expect("resource child exit");
+        assert_eq!(result, 0);
+    }
+
+    #[test]
     fn recovered_durable_session_accepts_stdin_control() {
         let temp = tempfile::tempdir().expect("durable root");
         let root = temp.path().join("jobs");
@@ -1453,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_running_durable_job_holds_execution_capacity() {
+    fn recovered_running_durable_job_remains_running() {
         let temp = tempfile::tempdir().expect("durable root");
         let root = temp.path().join("jobs");
         let creator = CommandSessionStore::with_durable_root(root.clone());
@@ -1470,21 +1584,16 @@ mod tests {
         state.supervisor_pid = Some(std::process::id());
         persist_durable_state(&job.paths, &state);
         let recovered = CommandSessionStore::with_durable_root(root);
-        let error = recovered
-            .ensure_execution_capacity(1)
-            .expect_err("recovered running durable job must consume capacity");
-        assert!(matches!(
-            error,
-            WorkspaceError::ToolDetails {
-                code: "EXECUTION_CAPACITY_HELD",
-                ..
-            }
-        ));
+        let session = recovered
+            .get(&job.spec.session_id)
+            .expect("recovered session");
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "running", "{snapshot}");
     }
 
     #[cfg(windows)]
     #[test]
-    fn supervisor_loss_keeps_capacity_until_recorded_child_exits() {
+    fn supervisor_loss_stays_cleanup_pending_until_recorded_child_exits() {
         let temp = tempfile::tempdir().expect("durable root");
         let root = temp.path().join("jobs");
         let creator = CommandSessionStore::with_durable_root(root.clone());
@@ -1506,16 +1615,6 @@ mod tests {
         persist_durable_state(&job.paths, &state);
 
         let recovered = CommandSessionStore::with_durable_root(root);
-        let error = recovered
-            .ensure_execution_capacity(1)
-            .expect_err("live child must keep capacity while lost-supervisor Job cleanup runs");
-        assert!(matches!(
-            error,
-            WorkspaceError::ToolDetails {
-                code: "EXECUTION_CAPACITY_HELD",
-                ..
-            }
-        ));
         let session = recovered.get(&session_id).expect("recovered session");
         let snapshot = session.snapshot(0);
         assert_eq!(snapshot["execution_status"], "running", "{snapshot}");
@@ -1532,14 +1631,11 @@ mod tests {
         let snapshot = session.snapshot(0);
         assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
         assert_eq!(snapshot["termination_reason"], "supervisor_lost");
-        recovered
-            .ensure_execution_capacity(1)
-            .expect("capacity must release only after recorded child exit");
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_supervisor_loss_kills_recorded_process_group_before_releasing_capacity() {
+    fn unix_supervisor_loss_kills_recorded_process_group_before_terminal_state() {
         use std::os::unix::process::CommandExt;
 
         let temp = tempfile::tempdir().expect("durable root");
@@ -1572,19 +1668,16 @@ mod tests {
         persist_durable_state(&job.paths, &state);
 
         let recovered = CommandSessionStore::with_durable_root(root);
-        let error = recovered
-            .ensure_execution_capacity(1)
-            .expect_err("lost-supervisor process group must hold capacity during cleanup");
-        assert!(matches!(
-            error,
-            WorkspaceError::ToolDetails {
-                code: "EXECUTION_CAPACITY_HELD",
-                ..
-            }
-        ));
+        let session = recovered.get(&session_id).expect("recovered session");
+        crate::async_runtime::block_on(session.refresh_status());
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "running", "{snapshot}");
+        assert_eq!(
+            snapshot["termination_reason"],
+            "supervisor_lost_cleanup_pending"
+        );
 
         child.wait().expect("reap killed process-group leader");
-        let session = recovered.get(&session_id).expect("recovered session");
         let deadline = Instant::now() + Duration::from_secs(2);
         while crate::platform::exec_process_tree_is_alive(child_pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
@@ -1593,9 +1686,6 @@ mod tests {
         let snapshot = session.snapshot(0);
         assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
         assert_eq!(snapshot["termination_reason"], "supervisor_lost");
-        recovered
-            .ensure_execution_capacity(1)
-            .expect("capacity releases only after Unix process group cleanup");
     }
 
     #[test]
@@ -1625,9 +1715,6 @@ mod tests {
         persist_durable_state(&job.paths, &state);
 
         let recovered = CommandSessionStore::with_durable_root(root);
-        recovered
-            .ensure_execution_capacity(1)
-            .expect("dead durable child must not retain execution capacity");
         let session = recovered.get(&session_id).expect("recovered session");
         let snapshot = session.snapshot(0);
         assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
@@ -1953,7 +2040,6 @@ impl CommandSessionStore {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            execution_admission: Mutex::new(()),
             max_sessions: max_sessions.max(1),
             terminal_slot_retention,
             terminal_log_retention: terminal_log_retention.max(terminal_slot_retention),
@@ -1964,7 +2050,6 @@ impl CommandSessionStore {
     pub fn with_durable_root(root: PathBuf) -> Self {
         let store = Self {
             sessions: Mutex::new(HashMap::new()),
-            execution_admission: Mutex::new(()),
             max_sessions: DEFAULT_MAX_EXEC_SESSIONS,
             terminal_slot_retention: DEFAULT_TERMINAL_SLOT_RETENTION,
             terminal_log_retention: DEFAULT_TERMINAL_LOG_RETENTION,
@@ -1976,42 +2061,6 @@ impl CommandSessionStore {
 
     pub fn durable_enabled(&self) -> bool {
         self.durable_root.is_some()
-    }
-
-    pub fn execution_start_guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.execution_admission
-            .lock()
-            .expect("execution admission lock")
-    }
-
-    pub fn ensure_execution_capacity(&self, max_running: usize) -> Result<(), WorkspaceError> {
-        let sessions = {
-            let mut sessions = self.sessions.lock().expect("sessions lock");
-            prune_terminal_sessions(&mut sessions, self.terminal_log_retention);
-            sessions.values().cloned().collect::<Vec<_>>()
-        };
-        let running = sessions
-            .into_iter()
-            .filter(|session| {
-                crate::async_runtime::block_on(session.refresh_status());
-                !session.has_exited()
-            })
-            .count();
-        if running >= max_running.max(1) {
-            return Err(WorkspaceError::ToolDetails {
-                code: "EXECUTION_CAPACITY_HELD",
-                message: "Execution capacity is currently held by running command sessions.".into(),
-                category: "runtime",
-                retryable: true,
-                details: json!({
-                    "running_command_sessions": running,
-                    "max_running_commands": max_running.max(1),
-                    "durable_sessions_included": true,
-                    "suggestion": "Wait for or terminate an existing command session before starting another."
-                }),
-            });
-        }
-        Ok(())
     }
 
     pub(crate) fn create_durable_job(
@@ -2069,6 +2118,7 @@ impl CommandSessionStore {
             finished_at: None,
             last_output_at: spec.started_at.clone(),
             heartbeat_at: Some(spec.started_at.clone()),
+            execution_resources: spec.execution_resources.clone(),
             stdout_total_bytes: 0,
             stderr_total_bytes: 0,
         };
@@ -2435,6 +2485,7 @@ pub struct ExecSession {
     harness_finalized: AtomicBool,
     terminal_observed: AtomicBool,
     externally_retained: AtomicBool,
+    execution_resources: Mutex<Option<Value>>,
     resource_lease: Mutex<Option<ExecutionLease>>,
     expected_exit_codes: Vec<i32>,
     durable_job: Option<DurableJobHandle>,
@@ -2536,6 +2587,7 @@ impl ExecSession {
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
         let started_at_iso = timestamp();
+        let execution_resources = resource_lease.as_ref().map(ExecutionLease::to_value);
         Self {
             session_id,
             child: AsyncMutex::new(Some(child)),
@@ -2565,6 +2617,7 @@ impl ExecSession {
             harness_finalized: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(false),
             externally_retained: AtomicBool::new(false),
+            execution_resources: Mutex::new(execution_resources),
             resource_lease: Mutex::new(resource_lease),
             expected_exit_codes: vec![0],
             durable_job: None,
@@ -2602,6 +2655,7 @@ impl ExecSession {
             harness_finalized: AtomicBool::new(job.paths.harness_finalized.is_file()),
             terminal_observed: AtomicBool::new(job.paths.observed.is_file()),
             externally_retained: AtomicBool::new(true),
+            execution_resources: Mutex::new(state.execution_resources.clone()),
             resource_lease: Mutex::new(None),
             expected_exit_codes: job.spec.expected_exit_codes.clone(),
             durable_job: Some(job),
@@ -2948,6 +3002,10 @@ impl ExecSession {
         *self.exit_code.lock().expect("exit_code lock") = state.exit_code;
         *self.stdin_open.lock().expect("stdin_open lock") = state.stdin_open;
         *self.last_output_at.lock().expect("last output lock") = state.last_output_at.clone();
+        *self
+            .execution_resources
+            .lock()
+            .expect("execution resources lock") = state.execution_resources.clone();
         *self.termination_reason.lock().expect("termination lock") =
             Some(state.termination_reason.clone());
         *self.finished_at_iso.lock().expect("finished_at_iso lock") = state.finished_at.clone();
@@ -3143,6 +3201,11 @@ impl ExecSession {
             })
             .or_else(|| finished_at.map(|finished_at| finished_at.elapsed().as_millis()))
             .unwrap_or(0);
+        let execution_resources = self
+            .execution_resources
+            .lock()
+            .expect("execution resources lock")
+            .clone();
         json!({
             "session_id": self.session_id,
             "command": self.command,
@@ -3189,6 +3252,7 @@ impl ExecSession {
             "finished_at": self.finished_at_iso.lock().expect("finished_at_iso lock").clone(),
             "last_output_at": self.last_output_at.lock().expect("last output lock").clone(),
             "result_observed": self.terminal_observed(),
+            "execution_resources": execution_resources,
             "output_refs": {
                 "stdout": format!("session:{}:stdout", self.session_id),
                 "stderr": format!("session:{}:stderr", self.session_id)
