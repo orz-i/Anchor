@@ -672,14 +672,24 @@ pub fn append_profile_log(profile_id: &str, file_name: &str, line: &str) {
     use std::io::Write;
 
     let log_dir = log_dir_for_profile(profile_id);
+    let path = log_dir.join(file_name);
+    if file_name != "daemon.log" {
+        let _ = crate::logging::append_bounded_profile_log(&path, line);
+        return;
+    }
+
+    // Windows daemon stdout/stderr keeps long-lived handles to daemon.log.
+    // Rotating or truncating that file safely requires coordinating those
+    // stdio handles, which is intentionally outside this bounded profile-log
+    // round. Keep daemon.log behavior unchanged here; all other profile logs
+    // use the shared bounded contract above.
     if std::fs::create_dir_all(&log_dir).is_err() {
         return;
     }
-    let path = log_dir.join(file_name);
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
     {
         let line = crate::logging::timestamped_line(line);
         let _ = writeln!(file, "{line}");

@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
 use crate::error::{AppError, AppResult};
+use crate::logging::{forward_bounded_lines, BoundedAsyncLogWriter, PROCESS_LOG_CHANNEL_CAPACITY};
 use crate::platform::platform;
 use crate::settings::ProxyConfig;
 
@@ -350,22 +350,10 @@ async fn stream_cloudflare_output<R, E>(
     let mut ready_tx = Some(ready_tx);
     let mut public_url: Option<String> = None;
 
-    let mut log = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .await
-    {
-        Ok(file) => file,
-        Err(_) => {
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(QuickTunnelReady {
-                    public_url: if quick { None } else { Some(named_url) },
-                });
-            }
-            return;
-        }
-    };
+    // Logging failure must not stop draining cloudflared pipes. Otherwise a
+    // full child pipe can stall the tunnel process itself. Keep the writer
+    // optional and continue readiness detection even when disk logging fails.
+    let mut log = BoundedAsyncLogWriter::open(log_path).await.ok();
 
     let send_ready = |tx: &mut Option<oneshot::Sender<QuickTunnelReady>>, url: Option<String>| {
         if let Some(sender) = tx.take() {
@@ -394,36 +382,37 @@ async fn stream_cloudflare_output<R, E>(
             }
         };
 
-    // cloudflared logs primarily to stderr; read stdout and stderr concurrently.
-    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let stderr_line_tx = line_tx.clone();
+    // cloudflared logs primarily to stderr. A fixed-capacity channel applies
+    // backpressure to both pipe readers when disk is slow, preventing an
+    // unbounded in-memory log backlog.
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(PROCESS_LOG_CHANNEL_CAPACITY);
 
+    let stdout_line_tx = line_tx.clone();
     tokio::spawn(async move {
-        let mut stdout = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = stdout.next_line().await {
-            if line_tx.send(line).is_err() {
-                break;
-            }
-        }
+        forward_bounded_lines(stdout, stdout_line_tx).await;
     });
 
     if let Some(stderr) = stderr {
+        let stderr_line_tx = line_tx.clone();
         tokio::spawn(async move {
-            let mut stderr = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = stderr.next_line().await {
-                if stderr_line_tx.send(line).is_err() {
-                    break;
-                }
-            }
+            forward_bounded_lines(stderr, stderr_line_tx).await;
         });
     }
+    drop(line_tx);
 
     while let Some(line) = line_rx.recv().await {
-        let timestamped = crate::logging::timestamped_line(&line);
-        let _ = log.write_all(timestamped.as_bytes()).await;
-        let _ = log.write_all(b"\n").await;
-        let _ = log.flush().await;
+        // Readiness is more important than log persistence latency; detect it
+        // before touching disk so a slow filesystem cannot delay the public URL.
         handle_line(&line, &mut public_url, &mut ready_tx);
+        if let Some(writer) = log.as_mut() {
+            if writer.write_line(&line).await.is_err() {
+                log = None;
+            }
+        }
+    }
+
+    if let Some(writer) = log.as_mut() {
+        let _ = writer.flush().await;
     }
 
     send_ready(&mut ready_tx, public_url);
@@ -441,7 +430,9 @@ pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_trycloudflare_url;
+    use super::{extract_trycloudflare_url, stream_cloudflare_output};
+
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn extracts_trycloudflare_url_from_log_line() {
@@ -456,5 +447,42 @@ mod tests {
     fn ignores_invalid_hosts() {
         let line = "https://bad_host.trycloudflare.com";
         assert!(extract_trycloudflare_url(line).is_none());
+    }
+
+    #[tokio::test]
+    async fn stdout_only_stream_completes_and_publishes_quick_tunnel_url() {
+        let temp = tempfile::tempdir().expect("log root");
+        let log_path = temp.path().join("cloudflared.log");
+        let (mut producer, stdout) = tokio::io::duplex(4096);
+        producer
+            .write_all(b"INF https://bounded-test.trycloudflare.com ready\n")
+            .await
+            .expect("write cloudflared output");
+        producer.shutdown().await.expect("close cloudflared output");
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream_cloudflare_output(
+                stdout,
+                Option::<tokio::io::DuplexStream>::None,
+                &log_path,
+                true,
+                String::new(),
+                ready_tx,
+            ),
+        )
+        .await
+        .expect("stdout-only stream must terminate");
+
+        let ready = ready_rx.await.expect("quick tunnel readiness");
+        assert_eq!(
+            ready.public_url.as_deref(),
+            Some("https://bounded-test.trycloudflare.com")
+        );
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("cloudflared log");
+        assert!(log.contains("bounded-test.trycloudflare.com"));
     }
 }

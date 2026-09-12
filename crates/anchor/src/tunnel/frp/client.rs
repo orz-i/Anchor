@@ -3,11 +3,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use crate::error::{AppError, AppResult};
+use crate::logging::{forward_bounded_lines, BoundedAsyncLogWriter, PROCESS_LOG_CHANNEL_CAPACITY};
 use crate::platform::platform;
 use crate::tunnel::cloudflare::stop_child;
 use crate::tunnel::supervisor::log_dir_for_profile;
@@ -330,16 +331,12 @@ pub async fn spawn_frpc(
         .spawn()
         .map_err(|err| AppError::Message(format!("启动 frpc 失败: {err}")))?;
     let pid = child.id();
-    if let Some(stdout) = child.stdout.take() {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    if stdout.is_some() || stderr.is_some() {
         let log_paths = log_paths.clone();
         tokio::spawn(async move {
-            stream_frpc_logs(stdout, log_paths).await;
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        let log_paths = log_paths.clone();
-        tokio::spawn(async move {
-            stream_frpc_logs(stderr, log_paths).await;
+            stream_frpc_logs(stdout, stderr, log_paths).await;
         });
     }
 
@@ -589,37 +586,53 @@ fn strip_ansi(text: &str) -> String {
     out
 }
 
-async fn stream_frpc_logs<R>(stderr: R, log_paths: Vec<PathBuf>)
+async fn stream_frpc_logs<R, E>(stdout: Option<R>, stderr: Option<E>, log_paths: Vec<PathBuf>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    E: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    let mut files = Vec::new();
-    for log_path in log_paths {
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(file) = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .await
-        {
-            files.push(file);
-        }
+    // stdout/stderr share one bounded queue and one writer set. This avoids
+    // both unbounded producer memory and competing file handles flushing the
+    // same log on every line.
+    let (line_tx, mut line_rx) = mpsc::channel::<String>(PROCESS_LOG_CHANNEL_CAPACITY);
+    if let Some(stdout) = stdout {
+        let tx = line_tx.clone();
+        tokio::spawn(async move {
+            forward_bounded_lines(stdout, tx).await;
+        });
     }
-    if files.is_empty() {
-        return;
+    if let Some(stderr) = stderr {
+        let tx = line_tx.clone();
+        tokio::spawn(async move {
+            forward_bounded_lines(stderr, tx).await;
+        });
+    }
+    drop(line_tx);
+
+    let mut writers = Vec::new();
+    let mut seen = HashSet::new();
+    for log_path in log_paths {
+        if !seen.insert(log_path.clone()) {
+            continue;
+        }
+        if let Ok(writer) = BoundedAsyncLogWriter::open(&log_path).await {
+            writers.push(writer);
+        }
     }
 
-    let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
-        use tokio::io::AsyncWriteExt;
-        let timestamped = crate::logging::timestamped_line(&line);
-        for file in &mut files {
-            let _ = file.write_all(timestamped.as_bytes()).await;
-            let _ = file.write_all(b"\n").await;
-            let _ = file.flush().await;
+    while let Some(line) = line_rx.recv().await {
+        let mut index = 0;
+        while index < writers.len() {
+            if writers[index].write_line(&line).await.is_err() {
+                writers.swap_remove(index);
+            } else {
+                index += 1;
+            }
         }
+    }
+
+    for writer in &mut writers {
+        let _ = writer.flush().await;
     }
 }
 
@@ -774,13 +787,16 @@ fn frp_release_asset() -> AppResult<(&'static str, &'static str)> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        aggregate_uses_proxy, managed_frpc_config_path, managed_frpc_pid_path,
+        aggregate_uses_proxy, managed_frpc_config_path, managed_frpc_pid_path, stream_frpc_logs,
         successful_proxy_names, validate_frp_config,
     };
     use crate::tunnel::frp::{FrpProxyConfig, FrpServerConfig};
     use crate::tunnel::TunnelServiceKind;
     use crate::workspace::WorkspaceProfile;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn login_success_alone_is_not_a_ready_proxy() {
@@ -886,5 +902,41 @@ mod tests {
 
         config.public_url = "https://demo.example.com".into();
         validate_frp_config(&config).expect("HTTPS URL is valid");
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_share_one_bounded_writer_per_log_path() {
+        let temp = tempfile::tempdir().expect("log root");
+        let log_path = temp.path().join("frpc-mcp.log");
+        let (mut stdout_writer, stdout) = tokio::io::duplex(1024);
+        let (mut stderr_writer, stderr) = tokio::io::duplex(1024);
+
+        stdout_writer
+            .write_all(b"stdout-line\n")
+            .await
+            .expect("write stdout");
+        stdout_writer.shutdown().await.expect("close stdout");
+        stderr_writer
+            .write_all(b"stderr-line\n")
+            .await
+            .expect("write stderr");
+        stderr_writer.shutdown().await.expect("close stderr");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stream_frpc_logs(
+                Some(stdout),
+                Some(stderr),
+                vec![log_path.clone(), log_path.clone()],
+            ),
+        )
+        .await
+        .expect("frpc log aggregation must terminate");
+
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("frpc log");
+        assert_eq!(log.matches("stdout-line").count(), 1);
+        assert_eq!(log.matches("stderr-line").count(), 1);
     }
 }
