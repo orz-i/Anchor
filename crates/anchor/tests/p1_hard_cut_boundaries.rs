@@ -95,9 +95,10 @@ fn persisted_configuration_requires_current_content_schema_versions() {
     let migration = source("src/data/migration.rs");
 
     assert!(model.contains("pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 2;"));
-    assert!(model.contains("pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;"));
+    assert!(model.contains("pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 2;"));
     assert!(model.contains("pub schema_version: u32"));
-    assert!(storage.contains("migrate_profiles_v1_to_v2"));
+    assert!(!storage.contains("migrate_profiles_v1_to_v2"));
+    assert!(!storage.contains("migrate_legacy_tunnel_secrets"));
     assert!(!storage.contains("migrate_unversioned_profiles"));
     assert!(!storage.contains("migrate_unversioned_secrets"));
     assert!(!storage.contains("migrate_legacy_profiles"));
@@ -106,6 +107,9 @@ fn persisted_configuration_requires_current_content_schema_versions() {
     assert!(storage.contains("无版本配置已停止支持"));
     assert!(storage.contains("无版本凭据已停止支持"));
     assert!(migration.contains("const PORTABLE_CONFIG_VERSION: u32 = 2;"));
+    assert!(migration.contains("validate_payload_schema(&payload)?;"));
+    assert!(migration.contains("payload.profiles.schema_version != PROFILES_SCHEMA_VERSION"));
+    assert!(migration.contains("payload.secrets.schema_version != SECRETS_SCHEMA_VERSION"));
 }
 
 #[test]

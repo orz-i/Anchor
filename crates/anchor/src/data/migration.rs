@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
-use super::model::{AppData, ProfilesData, SecretsData};
+use super::model::{
+    AppData, ProfilesData, SecretsData, PROFILES_SCHEMA_VERSION, SECRETS_SCHEMA_VERSION,
+};
 use super::storage::{atomic_write, data_file_path, secrets_file_path};
 use super::DataStore;
 
@@ -299,11 +301,27 @@ fn decode_bundle(envelope: &PortableConfigEnvelope, passphrase: &[u8]) -> AppRes
         })?;
     let payload: PortableConfigPayload = serde_json::from_slice(&plaintext)
         .map_err(|error| AppError::Message(format!("迁移包解密后的配置无效：{error}")))?;
+    validate_payload_schema(&payload)?;
     let mut data = payload.profiles.into_app_data();
     let mut secrets = payload.secrets;
     strip_non_portable_app_secrets(&mut secrets);
     secrets.apply_to(&mut data);
     Ok(data)
+}
+
+fn validate_payload_schema(payload: &PortableConfigPayload) -> AppResult<()> {
+    if payload.profiles.schema_version != PROFILES_SCHEMA_VERSION
+        || payload.secrets.schema_version != SECRETS_SCHEMA_VERSION
+    {
+        return Err(AppError::Message(format!(
+            "迁移包内容 schema 不受支持：profiles={} secrets={}；当前要求 profiles={} secrets={}",
+            payload.profiles.schema_version,
+            payload.secrets.schema_version,
+            PROFILES_SCHEMA_VERSION,
+            SECRETS_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
 }
 
 fn portable_aad(
@@ -799,6 +817,24 @@ mod tests {
         let error = decode_bundle(&envelope, b"migration-passphrase")
             .expect_err("retired portable bundle version must fail");
         assert!(error.to_string().contains("不支持的 Anchor 迁移包"));
+    }
+
+    #[test]
+    fn portable_config_v2_rejects_retired_inner_content_schemas() {
+        let data = sample_data("C:/work/demo".into());
+        let mut payload = PortableConfigPayload {
+            profiles: ProfilesData::from_app_data(&data),
+            secrets: portable_secrets(&data),
+        };
+
+        payload.profiles.schema_version = 1;
+        let error = validate_payload_schema(&payload).expect_err("profiles v1 must fail");
+        assert!(error.to_string().contains("profiles=1 secrets=2"));
+
+        payload.profiles.schema_version = PROFILES_SCHEMA_VERSION;
+        payload.secrets.schema_version = 1;
+        let error = validate_payload_schema(&payload).expect_err("secrets v1 must fail");
+        assert!(error.to_string().contains("profiles=2 secrets=1"));
     }
 
     #[test]

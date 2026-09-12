@@ -33,13 +33,13 @@ Linux private-file-permissions -> 加密迁移包 -> Windows DPAPI
 
 不要把 `profiles.json` / `secrets.json` 的直接复制作为跨平台迁移方案。
 
-当前本机持久化内容有独立且显式的 schema 边界：`profiles.json` 与 `secrets.json` 解密后的 payload 都必须携带 `schema_version=1`。缺少版本、声明未知版本或未来版本都会直接 fail closed；当前构建不再识别退休字段，也不会在读取时执行 v0 → v1 清洗、补版本或重写。仍持有早期无版本配置的安装，应先使用能够读取该旧格式的 Anchor 完成迁移/导出，再切换到当前构建；跨平台迁移继续使用下述 portable config v2，而不是直接复制本机数据文件。
+当前本机持久化内容有独立且显式的 schema 边界：`profiles.json` 必须是 `schema_version=2`，`secrets.json` 解密后的 payload 必须是 `schema_version=2`。缺少版本、旧版本、未知版本或未来版本都会直接 fail closed；当前构建不再识别退休字段，也不会在正常读取路径执行旧 Workspace Tunnel → 顶级 Tunnel、旧 Workspace Tunnel token → Tunnel secret scope 等迁移、补版本或重写。仍持有 `profiles` v1、`secrets` v1 或更早配置的安装，应先使用能够读取该旧格式的 Anchor 完成迁移/导出，再切换到当前构建；跨平台迁移继续使用下述 portable config v2，而不是直接复制本机数据文件。
 
 ## 迁移包安全模型
 
 迁移包包含完整配置和 secrets，因此必须视为敏感备份：
 
-- 当前 portable config 格式为 **v2**；v1 不再接受。v2 与本机显式配置内容 schema 同步切换，避免把旧无版本 payload 在新代码中静默解释为当前格式；
+- 当前 portable config envelope 格式为 **v2**；v1 不再接受。v2 导入还会校验解密后的 inner payload，必须同时满足 `profiles.schema_version=2` 与 `secrets.schema_version=2`；旧构建生成、虽然 envelope 已是 v2 但 inner content 仍为退休 schema 的迁移包也会 fail closed，不会静默升级；
 - payload 使用 AES-256-GCM 加密；
 - 密钥通过 Argon2id 从 passphrase 派生；
 - 格式版本、导出时间、源平台和源 Anchor 版本均参与 AEAD 认证，篡改会导致导入失败；

@@ -7,7 +7,7 @@ use crate::tunnel::{TunnelConfig, TunnelProfile};
 use crate::workspace::WorkspaceProfile;
 
 pub(crate) const PROFILES_SCHEMA_VERSION: u32 = 2;
-pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SECRETS_SCHEMA_VERSION: u32 = 2;
 
 /// In-memory application state. Disk serialization is intentionally handled by
 /// `ProfilesData` and `SecretsData` so configuration and secrets cannot be
