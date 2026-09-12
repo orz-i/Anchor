@@ -33,6 +33,17 @@ pub struct ExecutionResourcePolicy {
     pub queue_timeout_ms: u64,
 }
 
+fn constrain_unknown_memory(policy: &mut ExecutionResourcePolicy, required: bool) {
+    if required && policy.detected_memory_bytes.is_none() {
+        // Windows normally provides total physical memory through
+        // GlobalMemoryStatusEx. If that system call ever fails, retain the
+        // missing telemetry instead of fabricating a capacity value, but fail
+        // closed on command concurrency so a detection failure cannot recreate
+        // the pre-governor resource-exhaustion risk.
+        policy.max_running_commands = 1;
+    }
+}
+
 fn package_manager_cpu_intensive(args: &[String]) -> bool {
     let Some(first) = args.first().map(String::as_str) else {
         return false;
@@ -74,14 +85,16 @@ impl ExecutionResourcePolicy {
         let cgroup_memory_limit_bytes = detect_cgroup_memory_limit();
         let cpu_target_percent = configured_cpu_target_percent();
         let max_running_override = configured_max_running_commands();
-        Self::from_capacity(
+        let mut policy = Self::from_capacity(
             detected_cpus,
             cgroup_cpu_limit,
             detected_memory_bytes,
             cgroup_memory_limit_bytes,
             cpu_target_percent,
             max_running_override,
-        )
+        );
+        constrain_unknown_memory(&mut policy, cfg!(target_os = "windows"));
+        policy
     }
 
     fn from_capacity(
@@ -699,7 +712,21 @@ fn detect_physical_memory_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+fn detect_physical_memory_bytes() -> Option<u64> {
+    use std::mem;
+
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
+    (status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn detect_physical_memory_bytes() -> Option<u64> {
     None
 }
@@ -772,6 +799,52 @@ mod tests {
         assert_eq!(constrained.effective_cpus, 2);
         assert_eq!(constrained.execution_cpu_budget, 1);
         assert_eq!(constrained.max_running_commands, 1);
+    }
+
+    #[test]
+    fn physical_memory_thresholds_cap_command_concurrency() {
+        let below_four = ExecutionResourcePolicy::from_capacity(
+            32,
+            None,
+            Some(4 * GIB - 1),
+            None,
+            DEFAULT_CPU_TARGET_PERCENT,
+            None,
+        );
+        assert_eq!(below_four.max_running_commands, 1);
+
+        let four = policy(32, 4);
+        assert_eq!(four.max_running_commands, 2);
+
+        let eight = policy(32, 8);
+        assert_eq!(eight.max_running_commands, 3);
+
+        let sixteen = policy(32, 16);
+        assert_eq!(sixteen.max_running_commands, 4);
+    }
+
+    #[test]
+    fn required_memory_detection_failure_fails_closed_without_fabricating_capacity() {
+        let mut unknown = ExecutionResourcePolicy::from_capacity(
+            32,
+            None,
+            None,
+            None,
+            DEFAULT_CPU_TARGET_PERCENT,
+            None,
+        );
+        assert_eq!(unknown.max_running_commands, 4);
+
+        constrain_unknown_memory(&mut unknown, true);
+        assert_eq!(unknown.max_running_commands, 1);
+        assert_eq!(unknown.detected_memory_bytes, None);
+        assert_eq!(unknown.effective_memory_bytes, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_physical_memory_detection_reports_nonzero_capacity() {
+        assert!(detect_physical_memory_bytes().is_some_and(|bytes| bytes > 0));
     }
 
     #[test]
