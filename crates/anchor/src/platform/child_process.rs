@@ -55,8 +55,104 @@ pub fn configure_exec_tokio_process(command: &mut tokio::process::Command) {
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    command.process_group(0);
+
+    #[cfg(not(any(windows, unix)))]
     let _ = command;
+}
+
+/// Signal the complete process tree owned by one workspace command.
+///
+/// Unix workspace commands are created as process-group leaders, so signaling
+/// the negative root PID reaches the root and every descendant that inherited
+/// that group. Windows does not provide an equivalent kill-by-process-group
+/// primitive; its verified tree terminator repeatedly snapshots descendants
+/// before terminating the root.
+pub(crate) fn signal_exec_process_tree(pid: u32, signal: &str) -> crate::error::AppResult<()> {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(pid).map_err(|_| {
+            crate::error::AppError::Message(format!("invalid exec process-group pid: {pid}"))
+        })?;
+        if pid <= 0 {
+            return Err(crate::error::AppError::Message(format!(
+                "invalid exec process-group pid: {pid}"
+            )));
+        }
+        let signal = match signal {
+            "KILL" => libc::SIGKILL,
+            "INT" => libc::SIGINT,
+            _ => libc::SIGTERM,
+        };
+        let result = unsafe { libc::kill(-pid, signal) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            // A configured workspace command must be its own process-group
+            // leader. If the root PID is still alive while its group is
+            // missing, fail closed instead of silently falling back to a
+            // root-only kill that can leak descendants.
+            if unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            {
+                return Err(crate::error::AppError::Message(format!(
+                    "exec process group {pid} is missing while root process is still alive"
+                )));
+            }
+            return Ok(());
+        }
+        Err(crate::error::AppError::Message(format!(
+            "signal exec process group {pid} failed: {error}"
+        )))
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = signal;
+        crate::platform::platform().terminate_process_tree(pid)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (pid, signal);
+        Ok(())
+    }
+}
+
+/// Return whether the process tree for a workspace command can still contain
+/// live members after a termination request.
+pub(crate) fn exec_process_tree_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        let result = unsafe { libc::kill(-pid, 0) };
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows tree termination is synchronous and does not return until
+        // descendants have been cleared before the root is terminated. The
+        // root liveness check is therefore sufficient after that operation.
+        return crate::platform::platform().is_process_alive(pid);
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Lower the priority of a newly spawned arbitrary workspace command.

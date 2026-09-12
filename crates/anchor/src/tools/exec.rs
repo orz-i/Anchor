@@ -1693,7 +1693,9 @@ async fn run_command(
             Err(rejected) => {
                 drop(execution_start_guard);
                 rejected.mark_termination_reason("session_limit");
-                rejected.kill_and_wait().await;
+                if let Err(error) = rejected.kill_and_wait().await {
+                    return Err(process_tree_termination_error(&rejected.session_id, error));
+                }
                 return Err(ctx.sessions.capacity_error());
             }
         }
@@ -1740,7 +1742,9 @@ async fn run_command(
             Err(rejected) => {
                 drop(execution_start_guard);
                 rejected.mark_termination_reason("session_limit");
-                rejected.kill_and_wait().await;
+                if let Err(error) = rejected.kill_and_wait().await {
+                    return Err(process_tree_termination_error(&rejected.session_id, error));
+                }
                 return Err(ctx.sessions.capacity_error());
             }
         }
@@ -1791,7 +1795,9 @@ async fn run_command(
         session.refresh_status().await;
         if cancellation.is_cancelled() {
             session.mark_termination_reason("cancelled");
-            session.kill_and_wait().await;
+            if let Err(error) = session.kill_and_wait().await {
+                return Err(process_tree_termination_error(&session.session_id, error));
+            }
             session.refresh_status().await;
             session.wait_for_readers().await;
             session.mark_terminal_observed();
@@ -1843,7 +1849,9 @@ async fn run_command(
                 ));
             }
             session.mark_termination_reason("timeout");
-            session.kill_and_wait().await;
+            if let Err(error) = session.kill_and_wait().await {
+                return Err(process_tree_termination_error(&session.session_id, error));
+            }
             session.refresh_status().await;
             session.wait_for_readers().await;
             let snapshot = merge_exec_result(
@@ -1930,14 +1938,31 @@ fn spawn_timeout_monitor(session: std::sync::Arc<ExecSession>, deadline: Instant
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 session.mark_termination_reason("timeout");
-                session.kill_and_wait().await;
-                session.refresh_status().await;
-                session.wait_for_readers().await;
-                break;
+                if session.kill_and_wait().await.is_ok() {
+                    session.refresh_status().await;
+                    session.wait_for_readers().await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
             tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
         }
     });
+}
+
+fn process_tree_termination_error(session_id: &str, error: String) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "PROCESS_TREE_TERMINATION_FAILED",
+        message: error,
+        category: "runtime",
+        retryable: true,
+        details: json!({
+            "session_id": session_id,
+            "recoverable": true,
+            "suggestion": "保留 session 并重试 kill_session；不要启动更多高负载命令"
+        }),
+    }
 }
 
 pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {

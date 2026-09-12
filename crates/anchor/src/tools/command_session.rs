@@ -28,6 +28,7 @@ const DEFAULT_TERMINAL_LOG_RETENTION: Duration = Duration::from_secs(30 * 60);
 const DURABLE_COMMAND_SCHEMA_VERSION: u32 = 1;
 const TERMINAL_RECONCILIATION_GRACE: Duration = Duration::from_millis(250);
 const TERMINAL_RECONCILIATION_POLL: Duration = Duration::from_millis(10);
+const EXEC_PROCESS_TREE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DURABLE_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DURABLE_LOG_RETAIN_BYTES: u64 = 8 * 1024 * 1024;
 const DURABLE_JSON_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -556,9 +557,9 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
                 persist_durable_state(&paths, &current);
             }
             if let Some(pid) = child.id() {
-                send_session_signal(pid, "KILL");
+                send_session_signal(pid, "KILL")?;
             } else {
-                let _ = child.start_kill();
+                return Err("durable command lost its root PID before timeout cleanup".into());
             }
             break child
                 .wait()
@@ -587,9 +588,11 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
                             persist_durable_state(&paths, &current);
                         }
                         if let Some(pid) = child.id() {
-                            send_session_signal(pid, signal);
+                            send_session_signal(pid, signal)?;
                         } else {
-                            let _ = child.start_kill();
+                            return Err(
+                                "durable command lost its root PID before signal cleanup".into()
+                            );
                         }
                     }
                     _ => {}
@@ -611,6 +614,22 @@ pub(crate) async fn run_durable_command_supervisor(spec_path: PathBuf) -> Result
     windows_job
         .terminate_descendants_and_wait(Duration::from_secs(5))
         .map_err(|error| format!("Windows durable process-tree cleanup failed: {error}"))?;
+
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        let termination_reason = state
+            .lock()
+            .expect("durable state lock")
+            .termination_reason
+            .clone();
+        if matches!(termination_reason.as_str(), "timeout" | "killed")
+            && !wait_for_exec_process_tree_exit(pid, EXEC_PROCESS_TREE_EXIT_TIMEOUT).await
+        {
+            return Err(format!(
+                "Unix durable process group {pid} remained alive after {termination_reason}"
+            ));
+        }
+    }
 
     for reader in readers {
         let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
@@ -1518,6 +1537,67 @@ mod tests {
             .expect("capacity must release only after recorded child exit");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_supervisor_loss_kills_recorded_process_group_before_releasing_capacity() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().expect("durable root");
+        let root = temp.path().join("jobs");
+        let creator = CommandSessionStore::with_durable_root(root.clone());
+        let session_id = Uuid::new_v4().to_string();
+        let job = creator
+            .create_durable_job(durable_test_spec(
+                session_id.clone(),
+                "tools::command_session::tests::durable_supervisor_output_child",
+                5_000,
+            ))
+            .expect("durable job");
+        let dead_supervisor_pid = (2_000_000_000_u32..2_000_000_100_u32)
+            .find(|pid| !crate::platform::platform().is_process_alive(*pid))
+            .expect("find unused pid");
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60 & wait")
+            .process_group(0)
+            .spawn()
+            .expect("spawn isolated process group");
+        let child_pid = child.id();
+        assert!(crate::platform::exec_process_tree_is_alive(child_pid));
+
+        let mut state = job.read_state().expect("state");
+        state.status = "running".into();
+        state.supervisor_pid = Some(dead_supervisor_pid);
+        state.child_pid = Some(child_pid);
+        persist_durable_state(&job.paths, &state);
+
+        let recovered = CommandSessionStore::with_durable_root(root);
+        let error = recovered
+            .ensure_execution_capacity(1)
+            .expect_err("lost-supervisor process group must hold capacity during cleanup");
+        assert!(matches!(
+            error,
+            WorkspaceError::ToolDetails {
+                code: "EXECUTION_CAPACITY_HELD",
+                ..
+            }
+        ));
+
+        child.wait().expect("reap killed process-group leader");
+        let session = recovered.get(&session_id).expect("recovered session");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::platform::exec_process_tree_is_alive(child_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        crate::async_runtime::block_on(session.refresh_status());
+        let snapshot = session.snapshot(0);
+        assert_eq!(snapshot["execution_status"], "interrupted", "{snapshot}");
+        assert_eq!(snapshot["termination_reason"], "supervisor_lost");
+        recovered
+            .ensure_execution_capacity(1)
+            .expect("capacity releases only after Unix process group cleanup");
+    }
+
     #[test]
     fn stale_running_state_with_dead_child_is_reconciled_even_if_supervisor_pid_is_alive() {
         let temp = tempfile::tempdir().expect("durable root");
@@ -1558,10 +1638,10 @@ mod tests {
     fn spawn_test_session() -> ExecSession {
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
         let child = crate::async_runtime::block_on(async {
-            tokio::process::Command::new(rustc)
-                .arg("--version")
-                .spawn()
-                .expect("spawn rustc --version")
+            let mut command = tokio::process::Command::new(rustc);
+            command.arg("--version");
+            crate::platform::configure_exec_tokio_process(&mut command);
+            command.spawn().expect("spawn rustc --version")
         });
         ExecSession::new(child)
     }
@@ -1588,6 +1668,7 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        crate::platform::configure_exec_tokio_process(&mut command);
         let child = crate::async_runtime::block_on(async {
             command.spawn().expect("spawn handoff test child")
         });
@@ -1699,7 +1780,7 @@ mod tests {
             .expect_err("externally retained initiator must block handoff");
         assert!(error.contains(&session.session_id));
 
-        crate::async_runtime::block_on(session.kill_and_wait());
+        crate::async_runtime::block_on(session.kill_and_wait()).expect("kill handoff session");
     }
 
     #[test]
@@ -1825,11 +1906,13 @@ mod tests {
         let rejected = match store.insert(spawn_test_session()) {
             Err(rejected) => rejected,
             Ok(session) => {
-                crate::async_runtime::block_on(session.kill_and_wait());
+                crate::async_runtime::block_on(session.kill_and_wait())
+                    .expect("kill unexpected admitted session");
                 panic!("capacity must remain full");
             }
         };
-        crate::async_runtime::block_on(rejected.kill_and_wait());
+        crate::async_runtime::block_on(rejected.kill_and_wait())
+            .expect("kill rejected capacity probe session");
     }
 }
 
@@ -2326,6 +2409,7 @@ fn prune_terminal_sessions(
 pub struct ExecSession {
     pub session_id: String,
     pub(crate) child: AsyncMutex<Option<Child>>,
+    process_root_pid: Option<u32>,
     pub stdin: AsyncMutex<Option<ChildStdin>>,
     stdin_open: Mutex<bool>,
     interactive: bool,
@@ -2340,6 +2424,7 @@ pub struct ExecSession {
     finished_at_iso: Mutex<Option<String>>,
     last_output_at: Mutex<String>,
     pub exit_code: Mutex<Option<i32>>,
+    root_exited: AtomicBool,
     exited: AtomicBool,
     last_access: Mutex<Instant>,
     termination_reason: Mutex<Option<String>>,
@@ -2447,12 +2532,14 @@ impl ExecSession {
         resource_lease: Option<ExecutionLease>,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
+        let process_root_pid = child.id();
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
         let started_at_iso = timestamp();
         Self {
             session_id,
             child: AsyncMutex::new(Some(child)),
+            process_root_pid,
             stdin: AsyncMutex::new(stdin),
             stdin_open: Mutex::new(stdin_open),
             interactive,
@@ -2467,6 +2554,7 @@ impl ExecSession {
             finished_at_iso: Mutex::new(None),
             last_output_at: Mutex::new(started_at_iso),
             exit_code: Mutex::new(None),
+            root_exited: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             last_access: Mutex::new(Instant::now()),
             termination_reason: Mutex::new(None),
@@ -2488,6 +2576,7 @@ impl ExecSession {
         Self {
             session_id: job.spec.session_id.clone(),
             child: AsyncMutex::new(None),
+            process_root_pid: None,
             stdin: AsyncMutex::new(None),
             stdin_open: Mutex::new(state.stdin_open),
             interactive: false,
@@ -2502,6 +2591,7 @@ impl ExecSession {
             finished_at_iso: Mutex::new(state.finished_at.clone()),
             last_output_at: Mutex::new(state.last_output_at.clone()),
             exit_code: Mutex::new(state.exit_code),
+            root_exited: AtomicBool::new(exited),
             exited: AtomicBool::new(exited),
             last_access: Mutex::new(Instant::now()),
             termination_reason: Mutex::new(Some(state.termination_reason.clone())),
@@ -2667,38 +2757,112 @@ impl ExecSession {
         }
     }
 
-    pub async fn kill_and_wait(&self) {
+    pub async fn kill_and_wait(&self) -> Result<(), String> {
         if let Some(job) = &self.durable_job {
-            let _ = job.enqueue_control(&DurableControl {
+            job.enqueue_control(&DurableControl {
                 action: "signal".into(),
                 chars: None,
                 signal: Some("KILL".into()),
-            });
+            })
+            .map_err(|error| error.to_string())?;
             for _ in 0..100 {
                 self.refresh_status().await;
                 if self.has_exited() {
-                    return;
+                    return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            return;
+            return Err(format!(
+                "durable session {} did not converge after process-tree kill",
+                self.session_id
+            ));
         }
+        if self
+            .termination_reason
+            .lock()
+            .expect("termination lock")
+            .is_none()
+        {
+            self.mark_termination_reason("killed");
+        }
+        let pid = self.process_root_pid.ok_or_else(|| {
+            format!(
+                "session {} is missing its process-tree root PID",
+                self.session_id
+            )
+        })?;
+        send_session_signal(pid, "KILL")?;
         let status = {
             let mut child = self.child.lock().await;
             let Some(child) = child.as_mut() else {
-                return;
+                return Err(format!("session {} child is unavailable", self.session_id));
             };
-            let _ = child.start_kill();
-            child.wait().await.ok()
+            tokio::time::timeout(EXEC_PROCESS_TREE_EXIT_TIMEOUT, child.wait())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "session {} root did not exit after tree kill",
+                        self.session_id
+                    )
+                })?
+                .map_err(|error| format!("wait after process-tree kill failed: {error}"))?
         };
-        if let Some(status) = status {
-            self.record_exit_status(status);
+        self.record_exit_status(status);
+        if !wait_for_exec_process_tree_exit(pid, EXEC_PROCESS_TREE_EXIT_TIMEOUT).await {
+            return Err(format!(
+                "session {} process group {pid} remained alive after KILL",
+                self.session_id
+            ));
         }
+        self.finalize_root_exit();
+        Ok(())
+    }
+
+    async fn signal_and_wait(&self, signal: &str, timeout: Duration) -> Result<bool, String> {
+        let pid = self.process_root_pid.ok_or_else(|| {
+            format!(
+                "session {} is missing its process-tree root PID",
+                self.session_id
+            )
+        })?;
+        send_session_signal(pid, signal)?;
+        let started = Instant::now();
+        let status = {
+            let mut child = self.child.lock().await;
+            let Some(child) = child.as_mut() else {
+                return Err(format!("session {} child is unavailable", self.session_id));
+            };
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(error)) => {
+                    return Err(format!("wait after process-tree signal failed: {error}"));
+                }
+                Err(_) => None,
+            }
+        };
+        let Some(status) = status else {
+            return Ok(false);
+        };
+        self.record_exit_status(status);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if self.process_tree_is_alive()
+            && (remaining.is_zero() || !wait_for_exec_process_tree_exit(pid, remaining).await)
+        {
+            return Ok(false);
+        }
+        self.finalize_root_exit();
+        Ok(self.has_exited())
     }
 
     pub async fn refresh_status(&self) {
         if let Some(job) = &self.durable_job {
             self.refresh_durable_status(job);
+            return;
+        }
+        if self.root_exited.load(Ordering::Acquire) {
+            if !self.tree_convergence_required() || !self.process_tree_is_alive() {
+                self.finalize_root_exit();
+            }
             return;
         }
         let mut child = self.child.lock().await;
@@ -2720,6 +2884,9 @@ impl ExecSession {
         let child_alive = state
             .child_pid
             .is_some_and(|pid| crate::platform::platform().is_process_alive(pid));
+        let child_tree_alive = state
+            .child_pid
+            .is_some_and(crate::platform::exec_process_tree_is_alive);
         let launcher_never_published_pid = state.status == "starting"
             && state.supervisor_pid.is_none()
             && elapsed_since_timestamp(&state.started_at)
@@ -2730,15 +2897,28 @@ impl ExecSession {
             && !child_alive
             && elapsed_since_timestamp(heartbeat)
                 .is_some_and(|elapsed| elapsed > Duration::from_secs(10));
-        let supervisor_cleanup_pending = cfg!(windows) && supervisor_lost && child_alive;
-        let child_cleanup_pending = cfg!(windows) && child_lost && !supervisor_lost;
+
+        #[cfg(unix)]
+        if supervisor_lost && child_tree_alive {
+            if let Some(pid) = state.child_pid {
+                let _ = crate::platform::signal_exec_process_tree(pid, "KILL");
+            }
+        }
+
+        let supervisor_cleanup_pending = supervisor_lost && child_tree_alive;
+        #[cfg(windows)]
+        let child_cleanup_pending = child_lost && !supervisor_lost;
+        #[cfg(unix)]
+        let child_cleanup_pending = child_lost && child_tree_alive && !supervisor_lost;
+        #[cfg(not(any(windows, unix)))]
+        let child_cleanup_pending = false;
         if matches!(state.status.as_str(), "starting" | "running")
             && (supervisor_cleanup_pending || child_cleanup_pending)
         {
-            // A dead Windows durable supervisor closes its process-lifetime Job
-            // and triggers tree teardown. Keep execution capacity reserved until
-            // the recorded direct child is actually gone instead of prematurely
-            // declaring the session interrupted and allowing more work to start.
+            // Windows closes the supervisor-owned Job and Unix recovery kills
+            // the child-owned process group. Keep execution capacity reserved
+            // until the complete tree is gone instead of declaring the session
+            // interrupted while descendants can still consume host resources.
             let pending_reason = if supervisor_cleanup_pending {
                 "supervisor_lost_cleanup_pending"
             } else {
@@ -2786,6 +2966,17 @@ impl ExecSession {
             return;
         }
         *self.exit_code.lock().expect("exit_code lock") = status.code();
+        self.root_exited.store(true, Ordering::Release);
+        if self.tree_convergence_required() && self.process_tree_is_alive() {
+            return;
+        }
+        self.finalize_root_exit();
+    }
+
+    fn finalize_root_exit(&self) {
+        if self.has_exited() || !self.root_exited.load(Ordering::Acquire) {
+            return;
+        }
         let mut finished_at = self.finished_at.lock().expect("finished_at lock");
         if finished_at.is_none() {
             *finished_at = Some(Instant::now());
@@ -2802,6 +2993,21 @@ impl ExecSession {
             .expect("resource lease lock")
             .take();
         self.touch();
+    }
+
+    fn tree_convergence_required(&self) -> bool {
+        matches!(
+            self.termination_reason
+                .lock()
+                .expect("termination lock")
+                .as_deref(),
+            Some("killed" | "timeout" | "cancelled" | "session_limit")
+        )
+    }
+
+    fn process_tree_is_alive(&self) -> bool {
+        self.process_root_pid
+            .is_some_and(crate::platform::exec_process_tree_is_alive)
     }
 
     pub(crate) fn has_exited(&self) -> bool {
@@ -3196,11 +3402,11 @@ pub fn kill_session(store: &CommandSessionStore, args: &Value) -> Result<Value, 
     if running {
         session.mark_termination_reason("killed");
         if let Some(job) = session.durable_job.as_ref() {
-            let _ = job.enqueue_control(&DurableControl {
+            job.enqueue_control(&DurableControl {
                 action: "signal".into(),
                 chars: None,
                 signal: Some(signal.to_string()),
-            });
+            })?;
             crate::async_runtime::block_on(async {
                 let deadline = Instant::now() + Duration::from_millis(wait_ms);
                 while Instant::now() < deadline {
@@ -3212,27 +3418,20 @@ pub fn kill_session(store: &CommandSessionStore, args: &Value) -> Result<Value, 
                 }
             });
         } else {
-            crate::async_runtime::block_on(async {
-                let pid = {
-                    let child = session.child.lock().await;
-                    child.as_ref().and_then(|child| child.id())
-                };
-                if let Some(pid) = pid {
-                    send_session_signal(pid, signal);
-                } else {
-                    let mut child = session.child.lock().await;
-                    if let Some(child) = child.as_mut() {
-                        let _ = child.start_kill();
-                    }
-                }
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), async {
-                    let mut child = session.child.lock().await;
-                    if let Some(child) = child.as_mut() {
-                        let _ = child.wait().await;
-                    }
-                })
-                .await;
-            });
+            crate::async_runtime::block_on(
+                session.signal_and_wait(signal, Duration::from_millis(wait_ms)),
+            )
+            .map_err(|error| WorkspaceError::ToolDetails {
+                code: "PROCESS_TREE_TERMINATION_FAILED",
+                message: error,
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "session_id": session_id,
+                    "signal": signal,
+                    "recoverable": true
+                }),
+            })?;
         }
         crate::async_runtime::block_on(session.refresh_status());
         if crate::async_runtime::block_on(session.is_running()) {
@@ -3268,27 +3467,15 @@ pub fn kill_session(store: &CommandSessionStore, args: &Value) -> Result<Value, 
     Ok(finalize_execution_result(payload))
 }
 
-#[cfg(unix)]
-fn send_session_signal(pid: u32, signal: &str) {
-    let sig = match signal {
-        "KILL" => libc::SIGKILL,
-        "INT" => libc::SIGINT,
-        _ => libc::SIGTERM,
-    };
-    unsafe {
-        libc::kill(pid as i32, sig);
-    }
+fn send_session_signal(pid: u32, signal: &str) -> Result<(), String> {
+    crate::platform::signal_exec_process_tree(pid, signal)
+        .map_err(|error| format!("terminate exec process tree {pid} failed: {error}"))
 }
 
-#[cfg(windows)]
-fn send_session_signal(pid: u32, _signal: &str) {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    unsafe {
-        if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-            let _ = TerminateProcess(handle, 1);
-            let _ = CloseHandle(handle);
-        }
+async fn wait_for_exec_process_tree_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while crate::platform::exec_process_tree_is_alive(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    !crate::platform::exec_process_tree_is_alive(pid)
 }
