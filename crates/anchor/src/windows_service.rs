@@ -49,7 +49,7 @@ const SERVICE_CONTROL_SHUTDOWN: u32 = 0x0000_0005;
 const NO_ERROR: u32 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WindowsWorkspaceAutostart {
     pub workspace_id: String,
     pub service: ServiceSelection,
@@ -158,16 +158,12 @@ fn service_build_state(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WindowsServicePlan {
     pub schema_version: u32,
-    #[serde(default)]
     pub owner_sid: String,
-    #[serde(default)]
     pub owner_username: String,
-    #[serde(default)]
     pub workspaces: Vec<WindowsWorkspaceAutostart>,
-    #[serde(default)]
     pub gateway_workspace_ids: Vec<String>,
 }
 
@@ -2064,6 +2060,15 @@ fn append_service_log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_plan_schema_rejects_missing_required_fields() {
+        let value = serde_json::json!({
+            "schemaVersion": PLAN_SCHEMA_VERSION
+        });
+
+        assert!(serde_json::from_value::<WindowsServicePlan>(value).is_err());
+    }
 
     #[test]
     fn service_name_is_scoped_by_config_directory() {

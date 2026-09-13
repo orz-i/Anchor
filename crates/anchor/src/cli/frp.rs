@@ -131,7 +131,6 @@ pub(super) fn read_token_input(input: Option<FrpTokenInput>) -> AppResult<Option
         return Ok(None);
     };
     let raw = match input {
-        FrpTokenInput::Inline(value) => value,
         FrpTokenInput::File(path) => {
             let metadata = std::fs::metadata(&path).map_err(|error| {
                 AppError::Message(format!(

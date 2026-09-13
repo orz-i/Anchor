@@ -534,15 +534,11 @@ pub struct TaskSession {
     pub workspace_id: String,
     pub objective: String,
     pub status: TaskStatus,
-    #[serde(default)]
     pub phase: TaskPhase,
-    #[serde(default)]
     pub contract: TaskContract,
-    #[serde(default)]
     pub slices: Vec<TaskSlice>,
     #[serde(default)]
     pub current_slice_id: Option<String>,
-    #[serde(default)]
     pub working_set: TaskWorkingSet,
     #[serde(default)]
     pub recovery: Option<TaskRecoveryState>,
@@ -550,9 +546,7 @@ pub struct TaskSession {
     pub termination: Option<TaskTermination>,
     pub baseline: ProjectBaseline,
     pub expected_state: ExpectedWorkspaceState,
-    #[serde(default)]
     pub completed_steps: Vec<String>,
-    #[serde(default)]
     pub pending_steps: Vec<String>,
     pub latest_change_id: Option<String>,
     pub latest_verification_id: Option<String>,
@@ -729,22 +723,20 @@ pub struct ProjectState {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceHarnessState {
     pub schema_version: u32,
     pub active_task_id: Option<String>,
-    #[serde(default)]
     pub active_task_ids: Vec<String>,
-    #[serde(default)]
     pub session_status: HarnessSessionStatus,
-    #[serde(default)]
     pub recent_task_ids: Vec<String>,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessIndex {
     pub schema_version: u32,
-    #[serde(default)]
     pub workspaces: HashMap<String, WorkspaceHarnessState>,
 }
 

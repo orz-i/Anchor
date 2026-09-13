@@ -198,3 +198,84 @@ fn service_run_has_platform_specific_hard_cut_parser_contracts() {
     assert!(windows.contains("owner_sid: String,\n    owner_username: String,"));
     assert!(!windows.contains("registration 尚未固定配置 owner 身份"));
 }
+
+#[test]
+fn current_persisted_shapes_and_secret_inputs_have_no_p2_compatibility_bridges() {
+    let workspace = crate_source("src/workspace/model.rs");
+    let tunnel = crate_source("src/tunnel/model.rs");
+    let storage = crate_source("src/data/storage.rs");
+    let harness_model = crate_source("src/harness/model.rs");
+    let harness_store = crate_source("src/harness/store.rs");
+    let linux_service = crate_source("src/linux_service.rs");
+    let windows_service = crate_source("src/windows_service.rs");
+    let args = crate_source("src/cli/args.rs");
+
+    assert!(!workspace.contains("#[serde(default = \"default_preferred_shell\")]"));
+    assert!(!workspace.contains("legacy_mcp_activity_payload_defaults_new_transport_fields"));
+    assert!(!tunnel.contains("#[serde(default = \"default_frp_proxy_type\")]"));
+    assert!(!storage.contains("ensure_service_secret_mirror"));
+    assert!(!storage.contains("user_load_upgrades_legacy_envelope_with_service_mirror"));
+    assert!(!harness_store.contains("schema5_task_without_termination_metadata_remains_compatible"));
+
+    let task_start = harness_model
+        .find("pub struct TaskSession {")
+        .expect("TaskSession");
+    let task_end = harness_model[task_start..]
+        .find("pub struct TaskGitWorktree {")
+        .map(|offset| task_start + offset)
+        .expect("TaskGitWorktree");
+    let task = &harness_model[task_start..task_end];
+    for required_field in [
+        "pub phase: TaskPhase",
+        "pub contract: TaskContract",
+        "pub slices: Vec<TaskSlice>",
+        "pub working_set: TaskWorkingSet",
+        "pub completed_steps: Vec<String>",
+        "pub pending_steps: Vec<String>",
+    ] {
+        let field = task
+            .find(required_field)
+            .expect("required TaskSession field");
+        let prefix = &task[..field];
+        let previous_line = prefix.lines().next_back().unwrap_or_default().trim();
+        assert_ne!(
+            previous_line, "#[serde(default)]",
+            "{required_field} must be required"
+        );
+    }
+
+    for service_source in [&linux_service, &windows_service] {
+        assert!(service_source.contains("rename_all = \"camelCase\", deny_unknown_fields"));
+    }
+    assert!(!linux_service.contains("#[serde(default)]\n    pub executable_path: String"));
+    assert!(!linux_service
+        .contains("#[serde(default)]\n    pub workspaces: Vec<LinuxWorkspaceAutostart>"));
+    assert!(
+        !linux_service.contains("#[serde(default)]\n    pub gateway_workspace_ids: Vec<String>")
+    );
+    assert!(!windows_service.contains("#[serde(default)]\n    pub owner_sid: String"));
+    assert!(!windows_service.contains("#[serde(default)]\n    pub owner_username: String"));
+    assert!(!windows_service
+        .contains("#[serde(default)]\n    pub workspaces: Vec<WindowsWorkspaceAutostart>"));
+    assert!(
+        !windows_service.contains("#[serde(default)]\n    pub gateway_workspace_ids: Vec<String>")
+    );
+
+    assert!(!args.contains("Inline(String)"));
+    assert!(!args.contains("--token TOKEN"));
+    let frp_parser_start = args.find("fn parse_frp_command(").expect("FRP parser");
+    let frp_parser_end = args[frp_parser_start..]
+        .find("fn parse_tunnel_command(")
+        .map(|offset| frp_parser_start + offset)
+        .expect("Tunnel parser");
+    let frp_parser = &args[frp_parser_start..frp_parser_end];
+    assert!(!frp_parser.contains("\"--token\" =>"));
+
+    let tunnel_parser_start = frp_parser_end;
+    let tunnel_parser_end = args[tunnel_parser_start..]
+        .find("fn parse_software_kind(")
+        .map(|offset| tunnel_parser_start + offset)
+        .expect("software parser");
+    let tunnel_parser = &args[tunnel_parser_start..tunnel_parser_end];
+    assert!(!tunnel_parser.contains("\"--token\" =>"));
+}

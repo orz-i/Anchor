@@ -106,7 +106,6 @@ pub struct RuntimeConfig {
     pub local_port: u16,
     pub tool_profile: String,
     pub permission_mode: String,
-    #[serde(default = "default_preferred_shell")]
     pub preferred_shell: String,
     pub runtime_command: String,
     /// Optional JSON configuration containing stdio MCP servers to merge into this service.
@@ -155,13 +154,9 @@ pub struct McpActivityDto {
     pub completed_requests: u64,
     pub recent_window_ms: u64,
     pub suspected_stall_after_ms: u64,
-    #[serde(default)]
     pub last_transport_activity_at: Option<String>,
-    #[serde(default)]
     pub last_transport_activity_age_ms: Option<u64>,
-    #[serde(default)]
     pub last_transport_method: String,
-    #[serde(default)]
     pub transport_requests: u64,
 }
 
@@ -320,17 +315,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tunnel_configs_default_to_http_without_certificate_paths() {
+    fn persisted_tunnel_configs_require_current_frp_fields() {
         let mut tunnel = serde_json::to_value(TunnelConfig::default()).expect("tunnel config");
         let object = tunnel.as_object_mut().expect("tunnel object");
         object.remove("frp_proxy_type");
         object.remove("frp_cert_path");
         object.remove("frp_key_path");
 
-        let tunnel: TunnelConfig = serde_json::from_value(tunnel).expect("legacy tunnel");
-        assert_eq!(tunnel.frp_proxy_type, "http");
-        assert!(tunnel.frp_cert_path.is_empty());
-        assert!(tunnel.frp_key_path.is_empty());
+        assert!(serde_json::from_value::<TunnelConfig>(tunnel).is_err());
     }
 
     #[test]
@@ -355,8 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mcp_activity_payload_defaults_new_transport_fields() {
-        let activity: McpActivityDto = serde_json::from_value(serde_json::json!({
+    fn mcp_activity_payload_requires_current_transport_fields() {
+        let payload = serde_json::json!({
             "state": "idle",
             "message": "当前没有在途 MCP 调用",
             "inFlightRequests": 0,
@@ -369,14 +361,20 @@ mod tests {
             "completedRequests": 3,
             "recentWindowMs": 15_000,
             "suspectedStallAfterMs": 120_000
-        }))
-        .expect("legacy MCP activity payload");
+        });
 
-        assert_eq!(activity.state, "idle");
-        assert_eq!(activity.transport_requests, 0);
-        assert!(activity.last_transport_activity_at.is_none());
-        assert!(activity.last_transport_activity_age_ms.is_none());
-        assert!(activity.last_transport_method.is_empty());
+        assert!(serde_json::from_value::<McpActivityDto>(payload).is_err());
+    }
+
+    #[test]
+    fn persisted_runtime_config_requires_preferred_shell() {
+        let mut runtime = serde_json::to_value(RuntimeConfig::default()).expect("runtime config");
+        runtime
+            .as_object_mut()
+            .expect("runtime object")
+            .remove("preferred_shell");
+
+        assert!(serde_json::from_value::<RuntimeConfig>(runtime).is_err());
     }
 
     #[test]

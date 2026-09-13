@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn schema5_task_without_termination_metadata_remains_compatible() {
+    fn schema5_task_missing_current_structural_fields_is_rejected() {
         let value = json!({
             "schema_version": SCHEMA_VERSION,
             "id": "existing-schema5-task",
@@ -1220,9 +1220,8 @@ mod tests {
             "updated_at": "0"
         });
 
-        let task: TaskSession = serde_json::from_value(value).expect("legacy schema-v5 task");
-        assert_eq!(task.status, TaskStatus::Verifying);
-        assert!(task.termination.is_none());
+        serde_json::from_value::<TaskSession>(value)
+            .expect_err("same-schema task missing current fields must be rejected");
     }
 
     #[test]

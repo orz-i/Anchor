@@ -43,7 +43,7 @@ anchor tunnel configure example-mcp \
 anchor tunnel enable example-mcp
 ```
 
-`anchor tunnel secret set` 推荐使用 `--token-stdin` 或 `--token-file`；`--token` 会进入 shell history，只适合受控场景。
+`anchor tunnel secret set` 只接受 `--token-stdin` 或 `--token-file`。Anchor 不再接受把 token 直接放在命令行参数中的 `--token`，避免 secret 进入 shell history 和进程参数。
 
 ### 查看与运行
 

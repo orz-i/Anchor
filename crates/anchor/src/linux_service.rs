@@ -25,7 +25,7 @@ const SERVICE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const SERVICE_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LinuxWorkspaceAutostart {
     pub workspace_id: String,
     pub service: ServiceSelection,
@@ -34,16 +34,13 @@ pub struct LinuxWorkspaceAutostart {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LinuxServicePlan {
     pub schema_version: u32,
-    #[serde(default)]
     pub executable_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_build: Option<BuildIdentity>,
-    #[serde(default)]
     pub workspaces: Vec<LinuxWorkspaceAutostart>,
-    #[serde(default)]
     pub gateway_workspace_ids: Vec<String>,
 }
 
@@ -753,6 +750,16 @@ mod tests {
         assert_eq!(plan.workspaces[0].workspace_id, "b");
         assert_eq!(plan.workspaces[0].service, ServiceSelection::All);
         assert_eq!(plan.gateway_workspace_ids, vec!["a", "z"]);
+    }
+
+    #[test]
+    fn current_plan_schema_rejects_missing_required_fields() {
+        let value = serde_json::json!({
+            "schemaVersion": PLAN_SCHEMA_VERSION,
+            "installedBuild": null
+        });
+
+        assert!(serde_json::from_value::<LinuxServicePlan>(value).is_err());
     }
 
     #[test]

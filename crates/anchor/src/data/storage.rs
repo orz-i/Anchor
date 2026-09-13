@@ -336,38 +336,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn user_load_upgrades_legacy_envelope_with_service_mirror() {
+    fn user_load_rejects_envelope_without_service_mirror() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("secrets.json");
         let mut data = SecretsData::default();
         data.shared_secrets
-            .insert("bearer_token".into(), "legacy-secret".into());
+            .insert("bearer_token".into(), "stale-secret".into());
         let plaintext = serde_json::to_vec(&data).expect("serialize secrets");
         let (protection, protected) = secret_protection::protect(&plaintext).expect("protect user");
-        let legacy = SecretsEnvelope {
+        let stale = SecretsEnvelope {
             version: SECRETS_ENVELOPE_VERSION,
             protection: protection.into(),
             payload: BASE64_STANDARD.encode(protected),
             service_protection: None,
             service_payload: None,
         };
-        write_json(&path, &legacy).expect("write legacy envelope");
-        let original = read_secrets_envelope(&path).expect("legacy envelope");
+        let text = serde_json::to_string_pretty(&stale).expect("stale envelope");
+        fs::write(&path, text).expect("write stale envelope");
 
-        let loaded =
-            load_secrets_with_backup(&path, SecretAccess::User).expect("upgrade user envelope");
-        assert_eq!(loaded.shared_secrets, data.shared_secrets);
-
-        let upgraded = read_secrets_envelope(&path).expect("upgraded envelope");
-        assert_eq!(upgraded.protection, original.protection);
-        assert_eq!(upgraded.payload, original.payload);
-        assert_eq!(
-            upgraded.service_protection.as_deref(),
-            Some("windows-dpapi-local-machine-v1")
-        );
-        let service =
-            read_secrets_file(&path, SecretAccess::Service).expect("service mirror readable");
-        assert_eq!(service.shared_secrets, data.shared_secrets);
+        let error = load_secrets_with_backup(&path, SecretAccess::User)
+            .expect_err("current Windows envelope requires service mirror");
+        assert!(error.to_string().contains("Windows Service 凭据镜像"));
     }
 
     #[cfg(windows)]
@@ -520,12 +509,7 @@ fn write_service_secrets_data(path: &Path, data: &SecretsData) -> AppResult<()> 
 
 fn load_secrets_with_backup(path: &Path, access: SecretAccess) -> AppResult<SecretsData> {
     match read_secrets_file_versioned(path, access) {
-        Ok(data) => {
-            if access == SecretAccess::User {
-                ensure_service_secret_mirror(path, &data)?;
-            }
-            Ok(data)
-        }
+        Ok(data) => Ok(data),
         Err(primary_error) => {
             let backup = backup_path(path);
             if !backup.exists() {
@@ -567,6 +551,13 @@ fn read_secrets_envelope(path: &Path) -> AppResult<SecretsEnvelope> {
             "不支持的凭据文件版本：{}",
             envelope.version
         )));
+    }
+    #[cfg(windows)]
+    if envelope.service_protection.is_none() || envelope.service_payload.is_none() {
+        return Err(crate::error::AppError::Message(
+            "Windows Service 凭据镜像缺失；当前版本不再自动升级旧凭据封装，请先使用支持该旧格式的 Anchor 完成迁移或重新生成凭据"
+                .into(),
+        ));
     }
     Ok(envelope)
 }
@@ -633,20 +624,6 @@ fn parse_secrets_payload(plaintext: &[u8]) -> AppResult<SecretsData> {
         crate::error::AppError::Message(format!("无法解析解密后的凭据文件：{error}"))
     })?;
     Ok(data)
-}
-
-fn ensure_service_secret_mirror(path: &Path, data: &SecretsData) -> AppResult<()> {
-    #[cfg(windows)]
-    {
-        let envelope = read_secrets_envelope(path)?;
-        if envelope.service_protection.is_some() && envelope.service_payload.is_some() {
-            return Ok(());
-        }
-        write_service_secrets_data(path, data)?;
-    }
-    #[cfg(not(windows))]
-    let _ = (path, data);
-    Ok(())
 }
 
 fn current_secret_access() -> SecretAccess {

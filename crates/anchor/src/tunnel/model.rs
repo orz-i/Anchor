@@ -12,11 +12,8 @@ pub struct TunnelConfig {
     pub frp_subdomain: String,
     pub frp_profile_id: String,
     pub frp_server_port: u16,
-    #[serde(default = "default_frp_proxy_type")]
     pub frp_proxy_type: String,
-    #[serde(default)]
     pub frp_cert_path: String,
-    #[serde(default)]
     pub frp_key_path: String,
     pub cloudflare_mode: String,
     pub use_proxy: bool,
@@ -30,7 +27,6 @@ pub struct TunnelProfile {
     pub workspace_id: String,
     pub service: String,
     pub enabled: bool,
-    #[serde(default)]
     pub revision: u64,
     pub config: TunnelConfig,
 }

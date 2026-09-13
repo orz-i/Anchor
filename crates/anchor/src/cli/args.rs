@@ -218,9 +218,7 @@ fn set_frp_token_input(
     value: FrpTokenInput,
 ) -> Result<(), String> {
     if target.is_some() {
-        return Err(
-            "FRP token 输入方式只能选择一种：--token、--token-file 或 --token-stdin".into(),
-        );
+        return Err("FRP token 输入方式只能选择一种：--token-file 或 --token-stdin".into());
     }
     *target = Some(value);
     Ok(())
@@ -371,7 +369,6 @@ pub enum ConfigCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrpTokenInput {
-    Inline(String),
     File(PathBuf),
     Stdin,
 }
@@ -431,10 +428,6 @@ fn parse_frp_command(args: &mut VecDeque<String>) -> Result<FrpCommand, String> 
                     "--port" => {
                         server_port = parse_u64(args, "--port", 1, 65_535)? as u16;
                     }
-                    "--token" => set_frp_token_input(
-                        &mut token,
-                        FrpTokenInput::Inline(pop_value(args, "--token")?),
-                    )?,
                     "--token-file" => set_frp_token_input(
                         &mut token,
                         FrpTokenInput::File(PathBuf::from(pop_value(args, "--token-file")?)),
@@ -466,10 +459,6 @@ fn parse_frp_command(args: &mut VecDeque<String>) -> Result<FrpCommand, String> 
                     "--port" => {
                         server_port = Some(parse_u64(args, "--port", 1, 65_535)? as u16);
                     }
-                    "--token" => set_frp_token_input(
-                        &mut token,
-                        FrpTokenInput::Inline(pop_value(args, "--token")?),
-                    )?,
                     "--token-file" => set_frp_token_input(
                         &mut token,
                         FrpTokenInput::File(PathBuf::from(pop_value(args, "--token-file")?)),
@@ -482,7 +471,7 @@ fn parse_frp_command(args: &mut VecDeque<String>) -> Result<FrpCommand, String> 
                 }
             }
             if token.is_some() && clear_token {
-                return Err("frp update 的 --token 与 --clear-token 不能同时使用".into());
+                return Err("frp update 的 token 输入与 --clear-token 不能同时使用".into());
             }
             if name.is_none()
                 && server.is_none()
@@ -752,10 +741,6 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
                 let mut token = None;
                 while let Some(option) = args.pop_front() {
                     match option.as_str() {
-                        "--token" => set_frp_token_input(
-                            &mut token,
-                            FrpTokenInput::Inline(pop_value(args, "--token")?),
-                        )?,
                         "--token-file" => set_frp_token_input(
                             &mut token,
                             FrpTokenInput::File(PathBuf::from(pop_value(args, "--token-file")?)),
@@ -765,7 +750,7 @@ fn parse_tunnel_command(args: &mut VecDeque<String>) -> Result<TunnelCommand, St
                     }
                 }
                 let token = token.ok_or_else(|| {
-                    "tunnel secret set 需要 --token-file、--token-stdin 或 --token".to_string()
+                    "tunnel secret set 需要 --token-file 或 --token-stdin".to_string()
                 })?;
                 Ok(TunnelCommand::SecretSet { tunnel, key, token })
             }
@@ -2069,11 +2054,11 @@ pub fn frp_usage() -> &'static str {
     "FRP Profile 命令：\n\
   anchor frp list\n\
   anchor frp show <profile-id|name>\n\
-  anchor frp add <name> --server HOST [--port PORT] [--token-file PATH|--token-stdin|--token TOKEN]\n\
+  anchor frp add <name> --server HOST [--port PORT] [--token-file PATH|--token-stdin]\n\
   anchor frp update <profile-id|name> [--name NAME] [--server HOST] [--port PORT]\n\
-      [--token-file PATH|--token-stdin|--token TOKEN|--clear-token]\n\
+      [--token-file PATH|--token-stdin|--clear-token]\n\
   anchor frp delete <profile-id|name> --force\n\n\
-FRP profile 是全局服务器连接配置；token 作为受保护 secret 保存且不会在 list/show 输出中回显。优先使用 --token-file 或 --token-stdin，避免 secret 进入 shell history/进程参数；--token 仅为兼容便捷场景保留。Tunnel 通过 profile ID 引用它。"
+FRP profile 是全局服务器连接配置；token 作为受保护 secret 保存且不会在 list/show 输出中回显。token 只接受 --token-file 或 --token-stdin，避免 secret 进入 shell history/进程参数。Tunnel 通过 profile ID 引用它。"
 }
 
 pub fn tunnel_usage() -> &'static str {
@@ -2088,7 +2073,7 @@ pub fn tunnel_usage() -> &'static str {
       [--cloudflare-mode quick|named] [--use-proxy|--no-proxy]\n\
   anchor tunnel enable|disable|delete <tunnel-id|name>\n\
   anchor tunnel status|start|stop|restart|test <tunnel-id|name>\n\
-  anchor tunnel secret set <tunnel-id|name> <frp|cloudflare> (--token-file PATH|--token-stdin|--token TOKEN)\n\
+  anchor tunnel secret set <tunnel-id|name> <frp|cloudflare> (--token-file PATH|--token-stdin)\n\
   anchor tunnel secret clear <tunnel-id|name> <frp|cloudflare>\n\n\
 Tunnel 是应用级顶层资源；Workspace 仅作为 MCP 运行目标。enable/disable 控制 Workspace daemon 启动时是否自动托管 Tunnel；显式 start/stop/test 直接操作指定 Tunnel。"
 }
@@ -2312,11 +2297,38 @@ mod tests {
             "--server",
             "frp.example.com",
             "--token-stdin",
-            "--token",
-            "secret",
+            "--token-file",
+            "token.txt",
         ]))
         .expect_err("conflicting token sources");
         assert!(error.contains("只能选择一种"));
+    }
+
+    #[test]
+    fn inline_token_arguments_are_hard_rejected() {
+        let error = parse(strings(&[
+            "frp",
+            "add",
+            "prod",
+            "--server",
+            "frp.example.com",
+            "--token",
+            "secret",
+        ]))
+        .expect_err("inline FRP token must be rejected");
+        assert!(error.contains("frp add 不支持参数：--token"));
+
+        let error = parse(strings(&[
+            "tunnel",
+            "secret",
+            "set",
+            "prod-tunnel",
+            "frp",
+            "--token",
+            "secret",
+        ]))
+        .expect_err("inline tunnel secret must be rejected");
+        assert!(error.contains("tunnel secret set 不支持参数：--token"));
     }
 
     #[test]
@@ -2329,8 +2341,8 @@ mod tests {
             "43.157.17.95",
             "--port",
             "17001",
-            "--token",
-            "secret",
+            "--token-file",
+            "token.txt",
         ]))
         .expect("frp add");
         assert_eq!(
@@ -2339,7 +2351,7 @@ mod tests {
                 name: "prod".into(),
                 server: "43.157.17.95".into(),
                 server_port: 17_001,
-                token: Some(FrpTokenInput::Inline("secret".into())),
+                token: Some(FrpTokenInput::File(PathBuf::from("token.txt"))),
             }))
         );
 

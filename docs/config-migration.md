@@ -33,7 +33,9 @@ Linux private-file-permissions -> 加密迁移包 -> Windows DPAPI
 
 不要把 `profiles.json` / `secrets.json` 的直接复制作为跨平台迁移方案。
 
-当前本机持久化内容有独立且显式的 schema 边界：`profiles.json` 必须是 `schema_version=2`，`secrets.json` 解密后的 payload 必须是 `schema_version=2`。缺少版本、旧版本、未知版本或未来版本都会直接 fail closed；当前构建不再识别退休字段，也不会在正常读取路径执行旧 Workspace Tunnel → 顶级 Tunnel、旧 Workspace Tunnel token → Tunnel secret scope 等迁移、补版本或重写。仍持有 `profiles` v1、`secrets` v1 或更早配置的安装，应先使用能够读取该旧格式的 Anchor 完成迁移/导出，再切换到当前构建；跨平台迁移继续使用下述 portable config v2，而不是直接复制本机数据文件。
+当前本机持久化内容有独立且显式的 schema 边界：`profiles.json` 必须是 `schema_version=2`，`secrets.json` 解密后的 payload 必须是 `schema_version=2`。缺少版本、旧版本、未知版本或未来版本都会直接 fail closed；**同一 schema/version 也必须满足当前完整字段合同**，当前构建不会因为版本号相同就为早期 shape 补齐后来新增的 Workspace runtime、Tunnel FRP/revision、Harness state 或 service-plan 字段。当前构建也不再识别退休字段，不会在正常读取路径执行旧 Workspace Tunnel → 顶级 Tunnel、旧 Workspace Tunnel token → Tunnel secret scope 等迁移、补版本或重写。仍持有 `profiles` v1、`secrets` v1，或虽然版本号相同但字段 shape 早于当前合同的安装，应先使用能够读取该旧格式的 Anchor 完成迁移/导出，再切换到当前构建；跨平台迁移继续使用下述 portable config v2，而不是直接复制本机数据文件。
+
+Windows 还有一项当前凭据封装要求：`secrets.json` 的 envelope 必须同时包含 current-user payload 和 Windows Service 使用的 LocalMachine service mirror。当前构建不会在读取旧 envelope 时自动补写 service mirror；缺失时会 fail closed，需先由能够读取旧 envelope 的版本完成迁移，或在受控环境重新生成当前凭据文件。Linux/Windows 的 service plan 同样按当前 schema shape 严格读取，不再利用默认值吸收同版本的旧字段布局。
 
 ## 迁移包安全模型
 
