@@ -1,5 +1,7 @@
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
@@ -179,6 +181,65 @@ pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 pub struct Workspace {
     root: PathBuf,
     allow_external_reads: bool,
+    child_process_boundary_cache: Arc<Mutex<Option<ChildProcessBoundarySnapshot>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundaryDirectoryStamp {
+    path: PathBuf,
+    boundary_children: Vec<BoundaryChildStamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BoundaryChildStamp {
+    name: OsString,
+    kind: u8,
+    target: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct ChildProcessBoundarySnapshot {
+    directories: Vec<BoundaryDirectoryStamp>,
+    stable: bool,
+}
+
+fn boundary_directory_stamp(path: &Path) -> std::io::Result<BoundaryDirectoryStamp> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || is_link_like(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workspace boundary directory changed type",
+        ));
+    }
+    let mut boundary_children = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child_path = entry.path();
+        let file_type = entry.file_type()?;
+        let link_like = if file_type.is_symlink() {
+            true
+        } else {
+            is_link_like(&child_path)
+        };
+        if link_like {
+            boundary_children.push(BoundaryChildStamp {
+                name: entry.file_name(),
+                kind: 2,
+                target: child_path.canonicalize().ok(),
+            });
+        } else if file_type.is_dir() {
+            boundary_children.push(BoundaryChildStamp {
+                name: entry.file_name(),
+                kind: 1,
+                target: None,
+            });
+        }
+    }
+    boundary_children.sort();
+    Ok(BoundaryDirectoryStamp {
+        path: path.to_path_buf(),
+        boundary_children,
+    })
 }
 
 impl Workspace {
@@ -215,6 +276,7 @@ impl Workspace {
         Ok(Self {
             root,
             allow_external_reads: false,
+            child_process_boundary_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -283,9 +345,54 @@ impl Workspace {
     /// reject symlinks or Windows junctions that resolve outside the workspace so
     /// an interpreter cannot escape through an otherwise relative path.
     pub fn ensure_child_process_boundary(&self) -> WorkspaceResult<()> {
+        let cached = self
+            .child_process_boundary_cache
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.clone());
+        if cached
+            .as_ref()
+            .is_some_and(|snapshot| self.boundary_snapshot_is_current(snapshot))
+        {
+            return Ok(());
+        }
+
+        let snapshot = self.scan_child_process_boundary(MAX_CHILD_PROCESS_BOUNDARY_ENTRIES)?;
+        if self.boundary_snapshot_is_current(&snapshot) {
+            if let Ok(mut cached) = self.child_process_boundary_cache.lock() {
+                *cached = Some(snapshot);
+            }
+        } else if let Ok(mut cached) = self.child_process_boundary_cache.lock() {
+            *cached = None;
+        }
+        Ok(())
+    }
+
+    fn scan_child_process_boundary(
+        &self,
+        maximum_entries: usize,
+    ) -> WorkspaceResult<ChildProcessBoundarySnapshot> {
         let mut pending = vec![self.root.clone()];
         let mut scanned = 0usize;
+        let mut directories = Vec::new();
+        let mut stable = true;
         while let Some(directory) = pending.pop() {
+            let before = boundary_directory_stamp(&directory).map_err(|error| {
+                WorkspaceError::ToolDetails {
+                    code: "WORKSPACE_SCAN_FAILED",
+                    message: format!(
+                        "Failed to inspect workspace boundary at {}: {error}",
+                        relative_display(&self.root, &directory)
+                    ),
+                    category: "runtime",
+                    retryable: true,
+                    details: json!({
+                        "stage": "workspace_boundary_scan",
+                        "path": relative_display(&self.root, &directory),
+                        "retryable": true
+                    }),
+                }
+            })?;
             let entries =
                 fs::read_dir(&directory).map_err(|error| WorkspaceError::ToolDetails {
                     code: "WORKSPACE_SCAN_FAILED",
@@ -309,39 +416,58 @@ impl Workspace {
                     retryable: true,
                     details: json!({"stage": "workspace_boundary_scan", "retryable": true}),
                 })?;
-                scanned = scanned.saturating_add(1);
-                if scanned > MAX_CHILD_PROCESS_BOUNDARY_ENTRIES {
-                    return Err(WorkspaceError::ToolDetails {
-                        code: "WORKSPACE_SCAN_LIMIT_EXCEEDED",
-                        message: "Workspace boundary scan exceeded its safety limit".into(),
-                        category: "security",
-                        retryable: false,
+                let path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| WorkspaceError::ToolDetails {
+                        code: "WORKSPACE_SCAN_FAILED",
+                        message: format!("Failed to inspect workspace entry type: {error}"),
+                        category: "runtime",
+                        retryable: true,
                         details: json!({
                             "stage": "workspace_boundary_scan",
-                            "maximum_entries": MAX_CHILD_PROCESS_BOUNDARY_ENTRIES,
-                            "sandbox_enforced": false,
-                            "recoverable": true,
-                            "suggestion": "Reduce generated dependency trees or use an OS-sandboxed execution backend"
+                            "path": relative_display(&self.root, &path),
+                            "retryable": true
                         }),
-                    });
-                }
-
-                let path = entry.path();
-                let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                    })?;
+                let is_directory = file_type.is_dir();
                 let generated_subtree = entry
                     .file_name()
                     .to_str()
                     .is_some_and(|name| DEFAULT_EXCLUDED_NAMES.contains(&name));
+                let link_like = is_link_like(&path);
                 // Package managers and build systems commonly materialize their
                 // generated roots as Windows junctions (notably node_modules and
                 // target). These trees are intentionally excluded from the
                 // recursive boundary walk, so apply that exclusion before trying
                 // to resolve the final entry as a link. Broken links elsewhere in
                 // the workspace remain blocked and recoverable via remove_path.
-                if generated_subtree && (is_directory || is_link_like(&path)) {
+                if generated_subtree && (is_directory || link_like) {
                     continue;
                 }
-                if is_link_like(&path) {
+                // The safety budget tracks only entries that can affect traversal
+                // or redirect it. Ordinary files cannot change the boundary and
+                // must not make large source trees fail before command spawn.
+                if is_directory || link_like {
+                    scanned = scanned.saturating_add(1);
+                    if scanned > maximum_entries {
+                        return Err(WorkspaceError::ToolDetails {
+                            code: "WORKSPACE_SCAN_LIMIT_EXCEEDED",
+                            message: "Workspace boundary scan exceeded its safety limit".into(),
+                            category: "security",
+                            retryable: false,
+                            details: json!({
+                                "stage": "workspace_boundary_scan",
+                                "maximum_entries": maximum_entries,
+                                "budget_scope": "directories_and_links",
+                                "sandbox_enforced": false,
+                                "recoverable": true,
+                                "suggestion": "Reduce directory/link fanout or use an OS-sandboxed execution backend"
+                            }),
+                        });
+                    }
+                }
+                if link_like {
                     let link_path = relative_display(&self.root, &path);
                     let resolved = path.canonicalize().map_err(|error| WorkspaceError::ToolDetails {
                         code: "WORKSPACE_LINK_UNRESOLVED",
@@ -387,8 +513,39 @@ impl Workspace {
                     pending.push(path);
                 }
             }
+            let after = boundary_directory_stamp(&directory).map_err(|error| {
+                WorkspaceError::ToolDetails {
+                    code: "WORKSPACE_SCAN_FAILED",
+                    message: format!(
+                        "Failed to finalize workspace boundary at {}: {error}",
+                        relative_display(&self.root, &directory)
+                    ),
+                    category: "runtime",
+                    retryable: true,
+                    details: json!({
+                        "stage": "workspace_boundary_scan",
+                        "path": relative_display(&self.root, &directory),
+                        "retryable": true
+                    }),
+                }
+            })?;
+            if before == after {
+                directories.push(after);
+            } else {
+                stable = false;
+            }
         }
-        Ok(())
+        Ok(ChildProcessBoundarySnapshot {
+            directories,
+            stable,
+        })
+    }
+
+    fn boundary_snapshot_is_current(&self, snapshot: &ChildProcessBoundarySnapshot) -> bool {
+        snapshot.stable
+            && snapshot.directories.iter().all(|expected| {
+                boundary_directory_stamp(&expected.path).ok().as_ref() == Some(expected)
+            })
     }
 
     /// Resolve a read-only path. Workspace reads are strict by default; an
@@ -1093,6 +1250,62 @@ mod tests {
         workspace
             .ensure_child_process_boundary()
             .expect("generated root junctions must not block package-manager commands");
+    }
+
+    #[test]
+    fn child_process_boundary_budget_counts_directories_and_links_not_regular_files() {
+        let root = tempfile::tempdir().expect("workspace");
+        for index in 0..32 {
+            std::fs::write(root.path().join(format!("file-{index}.txt")), "data")
+                .expect("regular file");
+        }
+        std::fs::create_dir_all(root.path().join("node_modules/pkg/deep")).expect("generated tree");
+        std::fs::create_dir(root.path().join("source")).expect("source directory");
+
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        workspace
+            .scan_child_process_boundary(1)
+            .expect("only the source directory consumes the boundary budget");
+
+        std::fs::create_dir(root.path().join("second-source")).expect("second directory");
+        let error = workspace
+            .scan_child_process_boundary(1)
+            .expect_err("two ordinary directories exceed the one-entry test budget");
+        assert_eq!(
+            error.to_error_value()["code"],
+            "WORKSPACE_SCAN_LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            error.to_error_value()["details"]["budget_scope"],
+            "directories_and_links"
+        );
+    }
+
+    #[test]
+    fn child_process_boundary_cache_invalidates_when_directory_structure_changes() {
+        let root = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external");
+        std::fs::create_dir(root.path().join("source")).expect("source");
+        let workspace = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        workspace
+            .ensure_child_process_boundary()
+            .expect("initial boundary");
+
+        let link = root.path().join("escape-after-cache");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(external.path(), &link).expect("symlink");
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(external.path(), &link).is_err() {
+            return;
+        }
+
+        let error = workspace
+            .ensure_child_process_boundary()
+            .expect_err("directory mtime change must invalidate the validated boundary snapshot");
+        assert!(matches!(
+            error.to_error_value()["code"].as_str(),
+            Some("WORKSPACE_LINK_ESCAPE" | "WORKSPACE_LINK_UNRESOLVED")
+        ));
     }
 
     #[test]

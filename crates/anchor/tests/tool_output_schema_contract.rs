@@ -287,6 +287,25 @@ fn incomplete_abort_successes_match_published_output_schemas() {
 #[test]
 fn task_governance_successes_match_published_output_schemas() {
     let fx = tiny_js_fixture();
+    for args in [
+        ["init", "--initial-branch=main"].as_slice(),
+        ["config", "user.email", "anchor@example.invalid"].as_slice(),
+        ["config", "user.name", "Anchor Tests"].as_slice(),
+        ["add", "."].as_slice(),
+        ["commit", "--no-gpg-sign", "--no-verify", "-m", "initial"].as_slice(),
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&fx.root)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let ctx = ctx_for(&fx.root);
     let started = invoke(
         &ctx,
@@ -324,18 +343,60 @@ fn task_governance_successes_match_published_output_schemas() {
     assert_eq!(gate["ready"], false);
     assert_matches_output_schema("task_gate_status", &gate);
 
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fx.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git head")
+            .stdout,
+    )
+    .expect("utf8 head")
+    .trim()
+    .to_string();
+    let wrong_head = invoke(
+        &ctx,
+        "record_external_verification",
+        json!({
+            "task_id": task_id,
+            "head": "0000000000000000000000000000000000000000",
+            "kind": "test",
+            "command": "python -c schema-check",
+            "verification_key": "schema-check",
+            "exit_code": 0,
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "stderr_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recorded_at": "2026-09-13T00:00:00Z"
+        }),
+    );
+    let mismatch = assert_err(&wrong_head);
+    assert_eq!(
+        mismatch["error"]["code"],
+        "EXTERNAL_VERIFICATION_HEAD_MISMATCH"
+    );
+
     let verified = invoke(
         &ctx,
-        "exec_command",
+        "record_external_verification",
         json!({
-            "executable": TEST_PYTHON,
-            "args": ["-c", "print('schema-check')"],
-            "verification_kind": "test",
+            "task_id": task_id,
+            "head": head,
+            "kind": "test",
+            "command": "python -c schema-check",
             "verification_key": "schema-check",
-            "yield_time_ms": 30_000
+            "exit_code": 0,
+            "stdout_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "stderr_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "recorded_at": "2026-09-13T00:00:01Z",
+            "duration_ms": 12
         }),
     );
     assert_ok(&verified);
+    assert_matches_output_schema("record_external_verification", &verified);
+    assert_eq!(verified["verified_checkout"], true);
+    assert_eq!(verified["verification"]["status"], "passed");
+    assert_eq!(verified["receipt"]["source"], "external_local_verification");
     let completed = invoke(
         &ctx,
         "complete_slice",

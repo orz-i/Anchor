@@ -155,11 +155,15 @@ fn apply_patch_with_execution(
     if file_patches.is_empty() {
         return Err(patch_failed("No files were modified."));
     }
-    if let Some(path) = file_patches
-        .iter()
-        .find(|file| is_protected_repository_asset(&file.path))
-        .map(|file| file.path.as_str())
-    {
+    if let Some(path) = file_patches.iter().find_map(|file| {
+        if is_protected_repository_asset(&file.path) {
+            Some(file.path.as_str())
+        } else {
+            file.move_to
+                .as_deref()
+                .filter(|path| is_protected_repository_asset(path))
+        }
+    }) {
         return Err(protected_repository_asset(format!(
             "禁止修改 Git 内部元数据: {path}"
         )));
@@ -167,11 +171,13 @@ fn apply_patch_with_execution(
     if !ctx.policy.skip_permission_gates() {
         if let Some(path) = file_patches
             .iter()
-            .find(|file| file.is_deleted && is_critical_file(&file.path))
+            .find(|file| {
+                (file.is_deleted || file.move_to.is_some()) && is_critical_file(&file.path)
+            })
             .map(|file| file.path.as_str())
         {
             return Err(dangerous_operation(format!(
-                "删除关键项目文件需要操作者在受信任控制面启用 dangerous 权限模式: {path}"
+                "删除或移动关键项目文件需要操作者在受信任控制面启用 dangerous 权限模式: {path}"
             )));
         }
     }
@@ -180,6 +186,8 @@ fn apply_patch_with_execution(
     let mut summaries = Vec::new();
     let mut hunk_matches = Vec::new();
     let mut staged: HashMap<String, Option<String>> = HashMap::new();
+    let mut staged_permissions = HashMap::new();
+    let mut renamed = Vec::new();
     let mut grouped = Vec::<Vec<&FilePatch>>::new();
     let mut group_indexes = HashMap::<&str, usize>::new();
     for file_patch in &file_patches {
@@ -194,6 +202,21 @@ fn apply_patch_with_execution(
     for (file_index, sections) in grouped.iter().enumerate() {
         execution.checkpoint(&format!("prepare_file_{}", file_index + 1))?;
         let first = sections[0];
+        let move_to = sections
+            .iter()
+            .filter_map(|section| section.move_to.as_deref())
+            .next()
+            .map(str::to_string);
+        if sections
+            .iter()
+            .filter_map(|section| section.move_to.as_deref())
+            .any(|path| move_to.as_deref().is_some_and(|expected| path != expected))
+        {
+            return Err(patch_failed(format!(
+                "File {} has conflicting move destinations.",
+                first.path
+            )));
+        }
         ws.reject_unsafe_text(&first.path)?;
         let resolved = if first.is_new_file {
             ws.resolve_for_repository_config_write(&first.path)?
@@ -245,6 +268,64 @@ fn apply_patch_with_execution(
             current = Some(updated);
         }
 
+        if let Some(move_to) = move_to {
+            if move_to == resolved.display {
+                return Err(patch_failed(format!(
+                    "Move destination must differ from source: {}",
+                    resolved.display
+                )));
+            }
+            if file_patches
+                .iter()
+                .any(|patch| patch.path == move_to && patch.path != first.path)
+            {
+                return Err(patch_failed(format!(
+                    "Move destination is also modified as a source path in this transaction: {move_to}"
+                )));
+            }
+            let content = current.ok_or_else(|| {
+                patch_failed(format!(
+                    "File {} cannot be deleted and moved in the same patch.",
+                    resolved.display
+                ))
+            })?;
+            if initial.is_none() {
+                return Err(patch_failed(format!(
+                    "Move source does not exist: {}",
+                    resolved.display
+                )));
+            }
+            ws.reject_unsafe_text(&move_to)?;
+            ws.reject_write_symlink(&move_to)?;
+            let destination = ws.resolve_for_repository_config_write(&move_to)?;
+            if destination.existed || staged.contains_key(&destination.display) {
+                return Err(patch_failed(format!(
+                    "Move destination already exists or is already staged: {}",
+                    destination.display
+                )));
+            }
+            if let Ok(metadata) = fs::metadata(&resolved.path) {
+                staged_permissions.insert(destination.display.clone(), metadata.permissions());
+            }
+            staged.insert(resolved.display.clone(), None);
+            staged.insert(destination.display.clone(), Some(content));
+            let content_modified =
+                initial.as_ref() != staged.get(&destination.display).and_then(Option::as_ref);
+            affected.push(json!({
+                "path": destination.display,
+                "from": resolved.display,
+                "operation": "rename",
+                "content_modified": content_modified
+            }));
+            renamed.push(json!({
+                "from": resolved.display,
+                "to": destination.display,
+                "content_modified": content_modified
+            }));
+            summaries.push(format!("R {} -> {}", resolved.display, destination.display));
+            continue;
+        }
+
         let op = match (&initial, &current) {
             (Some(_), None) => "delete",
             (None, Some(_)) => "add",
@@ -275,7 +356,7 @@ fn apply_patch_with_execution(
     execution.checkpoint("pre_commit")?;
 
     if !dry_run {
-        let _transaction_backups = commit_staged(ws, &staged, execution)?;
+        let _transaction_backups = commit_staged(ws, &staged, &staged_permissions, execution)?;
         let change_id = Uuid::new_v4().simple().to_string();
         return Ok(tool_ok(json!({
             "dry_run": false,
@@ -286,6 +367,7 @@ fn apply_patch_with_execution(
             "files_created": files_created,
             "files_modified": files_modified,
             "files_deleted": files_deleted,
+            "files_renamed": renamed,
             "post_validation": post_validation,
             "hunk_matches": hunk_matches,
             "transaction": {
@@ -294,7 +376,7 @@ fn apply_patch_with_execution(
                 "created": files_created,
                 "modified": files_modified,
                 "deleted": files_deleted,
-                "renamed": []
+                "renamed": renamed
             },
             "recovery": "git",
             "duration_ms": execution.elapsed_ms(),
@@ -313,6 +395,7 @@ fn apply_patch_with_execution(
         "would_create": files_created,
         "would_modify": files_modified,
         "would_delete": files_deleted,
+        "would_rename": renamed,
         "post_validation": post_validation,
         "hunk_matches": hunk_matches,
         "transaction": {
@@ -321,7 +404,7 @@ fn apply_patch_with_execution(
             "created": files_created,
             "modified": files_modified,
             "deleted": files_deleted,
-            "renamed": []
+            "renamed": renamed
         },
         "duration_ms": execution.elapsed_ms(),
         "timeout_ms": execution.timeout_ms,
@@ -538,6 +621,7 @@ fn validate_balanced_structure(content: &str, rust_lifetimes: bool) -> Result<()
             }
             continue;
         }
+
         if line_comment {
             if ch == '\n' {
                 line_comment = false;
@@ -766,6 +850,7 @@ pub fn patch_check_with_cancellation(
 #[derive(Debug)]
 struct FilePatch {
     path: String,
+    move_to: Option<String>,
     hunks: Vec<Hunk>,
     is_new_file: bool,
     is_deleted: bool,
@@ -808,6 +893,7 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
             let path = parse_diff_path(line.strip_prefix("--- ").unwrap_or(""));
             current = Some(FilePatch {
                 path,
+                move_to: None,
                 hunks: Vec::new(),
                 is_new_file: line.contains("/dev/null"),
                 is_deleted: false,
@@ -816,7 +902,11 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
             if let Some(ref mut f) = current {
                 let new_path = parse_diff_path(line.strip_prefix("+++ ").unwrap_or(""));
                 if !new_path.is_empty() && new_path != "/dev/null" {
-                    f.path = new_path;
+                    if f.is_new_file {
+                        f.path = new_path;
+                    } else if new_path != f.path {
+                        f.move_to = Some(new_path);
+                    }
                 }
                 if line.contains("/dev/null") {
                     f.is_deleted = true;
@@ -882,6 +972,7 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
             finish_codex_file(&mut files, &mut current, &mut current_hunk);
             current = Some(FilePatch {
                 path: parse_diff_path(path),
+                move_to: None,
                 hunks: Vec::new(),
                 is_new_file,
                 is_deleted,
@@ -889,6 +980,23 @@ fn parse_codex_patch(patch: &str) -> Result<Vec<FilePatch>, WorkspaceError> {
             if is_new_file {
                 current_hunk = Some(Hunk { lines: Vec::new() });
             }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Move to: ") {
+            let file = current
+                .as_mut()
+                .ok_or_else(|| patch_failed("Move to must follow an Update File section."))?;
+            if file.is_new_file || file.is_deleted {
+                return Err(patch_failed(
+                    "Move to is only valid for an existing Update File section.",
+                ));
+            }
+            let target = parse_diff_path(path);
+            if target.is_empty() {
+                return Err(patch_failed("Move destination must be a non-empty path."));
+            }
+            file.move_to = Some(target);
             continue;
         }
 
@@ -1131,6 +1239,7 @@ fn find_hunk_position(
 fn commit_staged(
     ws: &Workspace,
     staged: &HashMap<String, Option<String>>,
+    staged_permissions: &HashMap<String, fs::Permissions>,
     execution: &PatchExecution<'_>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let staged_bytes = staged
@@ -1142,12 +1251,13 @@ fn commit_staged(
             )
         })
         .collect::<HashMap<_, _>>();
-    commit_staged_bytes_with_execution(ws, &staged_bytes, Some(execution))
+    commit_staged_bytes_with_execution(ws, &staged_bytes, staged_permissions, Some(execution))
 }
 
 fn commit_staged_bytes_with_execution(
     ws: &Workspace,
     staged: &HashMap<String, Option<Vec<u8>>>,
+    staged_permissions: &HashMap<String, fs::Permissions>,
     execution: Option<&PatchExecution<'_>>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
@@ -1221,7 +1331,10 @@ fn commit_staged_bytes_with_execution(
                 .ok_or_else(|| patch_failed("Staged file is missing"));
             match temp {
                 Ok(temp) => replace_file(&temp, &path).and_then(|_| {
-                    if let Some(permissions) = backup_permissions.get(&path) {
+                    if let Some(permissions) = staged_permissions
+                        .get(rel)
+                        .or_else(|| backup_permissions.get(&path))
+                    {
                         fs::set_permissions(&path, permissions.clone())?;
                     }
                     Ok(())
@@ -1395,6 +1508,69 @@ mod tests {
             std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
             "final\n"
         );
+    }
+
+    #[test]
+    fn codex_move_renames_and_modifies_in_one_atomic_transaction() {
+        let (_workspace, _harness, context) = context_with_file();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                context.workspace.root().join("main.rs"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("permissions");
+        }
+
+        let result = apply_patch(
+            &context,
+            &json!({
+                "patch": "*** Begin Patch\n*** Update File: main.rs\n*** Move to: src/renamed.rs\n@@\n-old\n+new\n*** End Patch\n"
+            }),
+        )
+        .expect("move and modify");
+
+        assert!(!context.workspace.root().join("main.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("src/renamed.rs")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(result["files_renamed"][0]["from"], "main.rs");
+        assert_eq!(result["files_renamed"][0]["to"], "src/renamed.rs");
+        assert_eq!(result["files_renamed"][0]["content_modified"], true);
+        assert_eq!(result["transaction"]["renamed"], result["files_renamed"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(context.workspace.root().join("src/renamed.rs"))
+                .expect("renamed metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+    }
+
+    #[test]
+    fn unified_diff_with_distinct_paths_is_treated_as_a_move() {
+        let (_workspace, _harness, context) = context_with_file();
+        let result = apply_patch(
+            &context,
+            &json!({
+                "patch": "--- a/main.rs\n+++ b/renamed.rs\n"
+            }),
+        )
+        .expect("unified rename");
+
+        assert!(!context.workspace.root().join("main.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("renamed.rs")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(result["files_renamed"][0]["from"], "main.rs");
+        assert_eq!(result["files_renamed"][0]["to"], "renamed.rs");
+        assert_eq!(result["files_renamed"][0]["content_modified"], false);
     }
 
     #[test]

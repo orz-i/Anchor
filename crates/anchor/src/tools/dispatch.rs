@@ -93,6 +93,7 @@ fn attach_path_resolution_diagnostics(
             | "search"
             | "view_image"
             | "remove_path"
+            | "replace_text"
     );
     let git_root_relative = matches!(
         name,
@@ -120,6 +121,24 @@ fn attach_path_resolution_diagnostics(
                 .cloned()
                 .unwrap_or_else(|| json!(".")),
             "workdir",
+        )
+    } else if name == "replace_text" {
+        let collect_paths = |value: &Value| {
+            Value::Array(
+                value
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+                    .map(|path| Value::String(path.to_string()))
+                    .collect(),
+            )
+        };
+        (
+            collect_paths(requested_args),
+            collect_paths(effective_args),
+            "files[].path",
         )
     } else if requested_args.get("paths").is_some() || effective_args.get("paths").is_some() {
         (
@@ -2116,6 +2135,15 @@ fn apply_default_cwd(
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
         }
+        "replace_text" => {
+            if let Some(files) = effective.get_mut("files").and_then(Value::as_array_mut) {
+                for file in files {
+                    if let Some(path) = file.get("path").and_then(Value::as_str) {
+                        file["path"] = Value::String(prefix_relative_path(&base, path));
+                    }
+                }
+            }
+        }
         // Git pathspecs are intentionally worktree-root-relative. They must not
         // inherit the session cwd: Git already has a stable repository root and
         // coupling pathspecs to cwd makes stage/diff/restore unpredictable.
@@ -2159,6 +2187,16 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
             for marker in ["--- a/", "+++ b/"] {
                 if let Some(path) = line.strip_prefix(marker) {
                     return format!("{marker}{base}/{path}");
+                }
+            }
+            for marker in [
+                "*** Add File: ",
+                "*** Update File: ",
+                "*** Delete File: ",
+                "*** Move to: ",
+            ] {
+                if let Some(path) = line.strip_prefix(marker) {
+                    return format!("{marker}{}", prefix_relative_path(base, path));
                 }
             }
             line.to_string()
@@ -2746,6 +2784,32 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
     let docker_execution_allowed = ctx.policy.allowed_commands.contains("docker");
     let full_development_environment =
         crate::tools::environment::diagnose(ctx.workspace.root(), docker_execution_allowed);
+    let checkout_kind = full_development_environment["checkout_kind"]
+        .as_str()
+        .unwrap_or("none")
+        .to_string();
+    let session_cwd = ctx.default_cwd_path();
+    let checkout_root = ctx.workspace.root().to_path_buf();
+    let context_mismatch = !session_cwd.starts_with(&checkout_root);
+    let git_context = crate::tools::git::git_status(
+        &ctx.workspace,
+        &json!({
+            "path": ".",
+            "include_untracked": false,
+            "max_entries": 1
+        }),
+    )
+    .ok();
+    let git_branch = git_context
+        .as_ref()
+        .and_then(|value| value.get("branch"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let git_head = git_context
+        .as_ref()
+        .and_then(|value| value.get("head"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let actionable_verification_route = full_development_environment
         ["recommended_verification_route"]
         .as_str()
@@ -2789,6 +2853,13 @@ pub fn check_exec_environment(ctx: &ToolContext, args: &Value) -> Result<Value, 
             "host_scope_available": false
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
+        "workspace_root": ctx.primary_workspace_root().display().to_string(),
+        "session_cwd": session_cwd.display().to_string(),
+        "checkout_root": checkout_root.display().to_string(),
+        "checkout_kind": checkout_kind,
+        "git_branch": git_branch,
+        "git_head": git_head,
+        "context_mismatch": context_mismatch,
         "workspace_exec_available": workspace_exec_available,
         "workspace_read_boundary": if ctx.workspace.strict_read_boundary() { "strict" } else { "operator_override" },
         "external_reads_allowed": !ctx.workspace.strict_read_boundary(),
@@ -2945,6 +3016,79 @@ mod tests {
             &json!({"paths": ["mobile/app/android/build.gradle"]}),
         );
         assert_eq!(git["paths"], json!(["mobile/app/android/build.gradle"]));
+
+        let replace = apply_default_cwd(
+            &ctx,
+            None,
+            "replace_text",
+            &json!({
+                "files": [{"path": "src/main.kt", "expected_matches": 1}],
+                "find": "old",
+                "replace": "new"
+            }),
+        );
+        assert_eq!(
+            replace["files"][0]["path"],
+            "mobile/app/android/src/main.kt"
+        );
+
+        let patch = apply_default_cwd(
+            &ctx,
+            None,
+            "apply_patch",
+            &json!({
+                "patch": "*** Begin Patch\n*** Update File: src/main.kt\n*** Move to: src/renamed.kt\n@@\n-old\n+new\n*** End Patch\n"
+            }),
+        );
+        let patch_text = patch["patch"].as_str().expect("patch text");
+        assert!(patch_text.contains("*** Update File: mobile/app/android/src/main.kt"));
+        assert!(patch_text.contains("*** Move to: mobile/app/android/src/renamed.kt"));
+    }
+
+    #[test]
+    fn cwd_relative_replace_and_codex_patch_mutate_only_the_session_subtree() {
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let nested = workspace.path().join("mobile/app/android");
+        std::fs::create_dir_all(&nested).expect("nested cwd");
+        std::fs::write(nested.join("replace.txt"), "old\n").expect("replace target");
+        std::fs::write(nested.join("patch.txt"), "old\n").expect("patch target");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
+        ctx.set_default_cwd(nested.canonicalize().expect("canonical cwd"));
+
+        let replaced = call_tool_with_cancellation(
+            &ctx,
+            "replace_text",
+            &json!({
+                "files": [{"path": "replace.txt", "expected_matches": 1}],
+                "find": "old",
+                "replace": "new"
+            }),
+            &CancellationToken::default(),
+        );
+        assert_eq!(replaced["ok"], true, "{replaced}");
+
+        let patched = call_tool_with_cancellation(
+            &ctx,
+            "apply_patch",
+            &json!({
+                "patch": "*** Begin Patch\n*** Update File: patch.txt\n@@\n-old\n+new\n*** End Patch\n"
+            }),
+            &CancellationToken::default(),
+        );
+        assert_eq!(patched["ok"], true, "{patched}");
+        assert_eq!(
+            std::fs::read_to_string(nested.join("replace.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(nested.join("patch.txt")).unwrap(),
+            "new\n"
+        );
+        assert!(!workspace.path().join("replace.txt").exists());
+        assert!(!workspace.path().join("patch.txt").exists());
     }
 
     #[test]

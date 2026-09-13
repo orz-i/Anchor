@@ -86,6 +86,7 @@ pub const TASK_OPERATIONS: &[(&str, &str)] = &[
     ("status", "harness_status"),
     ("operation_log", "operation_log"),
     ("resolve_recovery", "resolve_recovery"),
+    ("record_verification", "record_external_verification"),
     (
         "verification_disposition",
         "update_verification_disposition",
@@ -415,6 +416,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "accept_latest_baseline",
         "Accept latest baseline",
         "Capture and accept a stable latest workspace baseline in one call, retrying bounded concurrent changes without a caller-managed observation token.",
+        false,
+        false,
+        false,
+    ),
+    (
+        "record_external_verification",
+        "Record external verification",
+        "Import a local verification receipt against the current task checkout HEAD and persist it as immutable Harness evidence without executing the command through Anchor.",
         false,
         false,
         false,
@@ -1585,6 +1594,24 @@ pub fn output_schema(name: &str) -> Value {
             }),
             &["operation", "facade"],
         ),
+        "record_external_verification" => success_output_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1 },
+                "verification": { "type": "object" },
+                "receipt": { "type": "object" },
+                "accepted": { "type": "boolean", "const": true },
+                "verified_checkout": { "type": "boolean", "const": true },
+                "warnings": warnings_property()
+            }),
+            &[
+                "task_id",
+                "verification",
+                "receipt",
+                "accepted",
+                "verified_checkout",
+                "warnings",
+            ],
+        ),
         "server_info" => success_output_schema(
             merge_schema_properties(vec![
                 json!({
@@ -1861,6 +1888,12 @@ pub fn output_schema(name: &str) -> Value {
                 "target_head": { "type": "string", "minLength": 40 },
                 "after_head": { "type": "string", "minLength": 40 },
                 "mode": { "type": "string", "enum": ["soft", "mixed", "hard"] },
+                "accepted": { "type": "boolean", "const": true },
+                "executed": { "type": "boolean", "const": true },
+                "verified": { "type": "boolean", "const": true },
+                "state_changed": { "type": "boolean" },
+                "status": { "type": "string", "enum": ["changed", "no_op"] },
+                "checkout": { "type": "object" },
                 "mutation_attributed": { "type": "boolean", "const": true },
                 "warnings": warnings_property()
             }),
@@ -1869,6 +1902,12 @@ pub fn output_schema(name: &str) -> Value {
                 "target_head",
                 "after_head",
                 "mode",
+                "accepted",
+                "executed",
+                "verified",
+                "state_changed",
+                "status",
+                "checkout",
                 "mutation_attributed",
                 "warnings",
             ],
@@ -2072,9 +2111,11 @@ pub fn output_schema(name: &str) -> Value {
                         "files_created": { "type": "array", "items": { "type": "string" } },
                         "files_modified": { "type": "array", "items": { "type": "string" } },
                         "files_deleted": { "type": "array", "items": { "type": "string" } },
+                        "files_renamed": { "type": "array", "items": { "type": "object" } },
                         "would_create": { "type": "array", "items": { "type": "string" } },
                         "would_modify": { "type": "array", "items": { "type": "string" } },
                         "would_delete": { "type": "array", "items": { "type": "string" } },
+                        "would_rename": { "type": "array", "items": { "type": "object" } },
                         "post_validation": { "type": "array", "items": { "type": "object" } },
                         "hunk_matches": { "type": "array", "items": { "type": "object" } },
                         "transaction": { "type": "object" },
@@ -2105,7 +2146,7 @@ pub fn output_schema(name: &str) -> Value {
                         "required": ["ok", "dry_run"]
                     },
                     "then": {
-                        "required": ["preflight", "would_create", "would_modify", "would_delete"]
+                        "required": ["preflight", "would_create", "would_modify", "would_delete", "would_rename"]
                     }
                 }),
             ),
@@ -2119,7 +2160,7 @@ pub fn output_schema(name: &str) -> Value {
                 },
                 "then": {
                     "required": [
-                        "change_id", "files_created", "files_modified", "files_deleted", "recovery"
+                        "change_id", "files_created", "files_modified", "files_deleted", "files_renamed", "recovery"
                     ]
                 }
             }),
@@ -2134,6 +2175,7 @@ pub fn output_schema(name: &str) -> Value {
                 "would_create": { "type": "array", "items": { "type": "string" } },
                 "would_modify": { "type": "array", "items": { "type": "string" } },
                 "would_delete": { "type": "array", "items": { "type": "string" } },
+                "would_rename": { "type": "array", "items": { "type": "object" } },
                 "post_validation": { "type": "array", "items": { "type": "object" } },
                 "duration_ms": { "type": "integer", "minimum": 0 },
                 "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 60000 },
@@ -2149,6 +2191,7 @@ pub fn output_schema(name: &str) -> Value {
                 "would_create",
                 "would_modify",
                 "would_delete",
+                "would_rename",
                 "post_validation",
                 "duration_ms",
                 "timeout_ms",
@@ -2394,6 +2437,13 @@ pub fn output_schema(name: &str) -> Value {
                 "path": { "type": "string", "minLength": 1 },
                 "removed": { "type": "boolean", "const": true },
                 "force": { "type": "boolean" },
+                "submodules_deinitialized": { "type": "array", "items": { "type": "string" } },
+                "clean_submodule_removal_override": { "type": "boolean" },
+                "accepted": { "type": "boolean", "const": true },
+                "executed": { "type": "boolean", "const": true },
+                "verified": { "type": "boolean", "const": true },
+                "state_changed": { "type": "boolean", "const": true },
+                "status": { "type": "string", "const": "changed" },
                 "mutation_attributed": { "type": "boolean", "const": false },
                 "warnings": warnings_property()
             }),
@@ -2401,6 +2451,13 @@ pub fn output_schema(name: &str) -> Value {
                 "path",
                 "removed",
                 "force",
+                "submodules_deinitialized",
+                "clean_submodule_removal_override",
+                "accepted",
+                "executed",
+                "verified",
+                "state_changed",
+                "status",
                 "mutation_attributed",
                 "warnings",
             ],
@@ -2517,12 +2574,30 @@ pub fn output_schema(name: &str) -> Value {
             json!({
                 "staged_paths": { "type": "array", "items": { "type": "string" } },
                 "staged_files": { "type": "array", "items": { "type": "string" } },
+                "requested_staged_files": { "type": "array", "items": { "type": "string" } },
+                "before_index_tree": { "type": "string", "minLength": 40 },
+                "after_index_tree": { "type": "string", "minLength": 40 },
+                "accepted": { "type": "boolean", "const": true },
+                "executed": { "type": "boolean", "const": true },
+                "verified": { "type": "boolean", "const": true },
+                "state_changed": { "type": "boolean" },
+                "status": { "type": "string", "enum": ["changed", "no_op"] },
+                "checkout": { "type": "object" },
                 "mutation_attributed": { "type": "boolean", "const": true },
                 "warnings": { "type": "array", "items": { "type": "string" } }
             }),
             &[
                 "staged_paths",
                 "staged_files",
+                "requested_staged_files",
+                "before_index_tree",
+                "after_index_tree",
+                "accepted",
+                "executed",
+                "verified",
+                "state_changed",
+                "status",
+                "checkout",
                 "mutation_attributed",
                 "warnings",
             ],
@@ -2530,17 +2605,31 @@ pub fn output_schema(name: &str) -> Value {
         "git_commit" => success_output_schema(
             json!({
                 "commit_sha": { "type": "string", "minLength": 1 },
+                "before_head": { "type": "string", "minLength": 1 },
                 "message": { "type": "string", "minLength": 1 },
                 "committed_files": { "type": "array", "items": { "type": "string" } },
                 "previously_staged_files": { "type": "array", "items": { "type": "string" } },
+                "accepted": { "type": "boolean", "const": true },
+                "executed": { "type": "boolean", "const": true },
+                "verified": { "type": "boolean", "const": true },
+                "state_changed": { "type": "boolean", "const": true },
+                "status": { "type": "string", "const": "changed" },
+                "checkout": { "type": "object" },
                 "mutation_attributed": { "type": "boolean", "const": true },
                 "warnings": { "type": "array", "items": { "type": "string" } }
             }),
             &[
                 "commit_sha",
+                "before_head",
                 "message",
                 "committed_files",
                 "previously_staged_files",
+                "accepted",
+                "executed",
+                "verified",
+                "state_changed",
+                "status",
+                "checkout",
                 "mutation_attributed",
                 "warnings",
             ],
@@ -2550,6 +2639,14 @@ pub fn output_schema(name: &str) -> Value {
                 "restored_paths": { "type": "array", "items": { "type": "string" } },
                 "staged": { "type": "boolean" },
                 "worktree": { "type": "boolean" },
+                "before_staged": { "type": "array", "items": { "type": "string" } },
+                "before_worktree": { "type": "array", "items": { "type": "string" } },
+                "accepted": { "type": "boolean", "const": true },
+                "executed": { "type": "boolean", "const": true },
+                "verified": { "type": "boolean", "const": true },
+                "state_changed": { "type": "boolean" },
+                "status": { "type": "string", "enum": ["changed", "no_op"] },
+                "checkout": { "type": "object" },
                 "mutation_attributed": { "type": "boolean", "const": true },
                 "warnings": { "type": "array", "items": { "type": "string" } }
             }),
@@ -2557,6 +2654,14 @@ pub fn output_schema(name: &str) -> Value {
                 "restored_paths",
                 "staged",
                 "worktree",
+                "before_staged",
+                "before_worktree",
+                "accepted",
+                "executed",
+                "verified",
+                "state_changed",
+                "status",
+                "checkout",
                 "mutation_attributed",
                 "warnings",
             ],
@@ -3336,6 +3441,26 @@ pub fn input_schema(name: &str) -> Value {
         "mcp_list_servers" => json!({
             "type": "object",
             "properties": {},
+            "additionalProperties": false
+        }),
+        "record_external_verification" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "minLength": 1 },
+                "head": { "type": "string", "minLength": 40, "maxLength": 64 },
+                "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "command": { "type": "string", "minLength": 1, "maxLength": 4000 },
+                "verification_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+                "test_file": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                "test_name": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "exit_code": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+                "stdout_sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+                "stderr_sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+                "recorded_at": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "duration_ms": { "type": "integer", "minimum": 0 },
+                "level": { "type": "string", "enum": ["diagnostic", "informational", "required", "blocking"], "default": "blocking" }
+            },
+            "required": ["task_id", "head", "kind", "command", "exit_code", "stdout_sha256", "stderr_sha256", "recorded_at"],
             "additionalProperties": false
         }),
         "skill_list_packages" => json!({

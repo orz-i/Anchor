@@ -29,6 +29,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "begin_work_session",
     "close_work_session",
     "complete_work_session",
+    "record_external_verification",
     "update_verification_disposition",
     "project_state",
     "start_task",
@@ -81,6 +82,7 @@ pub fn call(
         "begin_work_session" => begin_work_session(ctx, args, session_id),
         "close_work_session" => close_work_session(ctx, args),
         "complete_work_session" => complete_work_session(ctx, args),
+        "record_external_verification" => record_external_verification(ctx, args),
         "update_verification_disposition" => update_verification_disposition(ctx, args),
         "project_state" => project_state(ctx, args, session_id),
         "start_task" => start_task(ctx, args, session_id),
@@ -115,6 +117,131 @@ pub fn call(
     }
 
     Ok(tool_ok(value))
+}
+
+fn record_external_verification(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let task_id = task_id(args)?;
+    let task = ctx.task_harness.task(task_id).map_err(map_error)?;
+    if !task.status.is_writable() {
+        return Err(tool_error(
+            "TASK_NOT_WRITABLE",
+            "当前任务已经关闭，不能导入外部验证 evidence",
+        ));
+    }
+
+    let head = required_non_empty_string(args, "head")?;
+    let expected_head = task.expected_state.head.as_deref();
+    let actual_head = git_lines(ctx.workspace.root(), &["rev-parse", "HEAD"])
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            tool_error(
+                "EXTERNAL_VERIFICATION_HEAD_UNAVAILABLE",
+                "无法读取当前 checkout 的 Git HEAD",
+            )
+        })?;
+    if head != actual_head || expected_head.is_some_and(|expected| head != expected) {
+        return Err(WorkspaceError::ToolDetails {
+            code: "EXTERNAL_VERIFICATION_HEAD_MISMATCH",
+            message: "External verification HEAD does not match the task-bound checkout.".into(),
+            category: "conflict",
+            retryable: true,
+            details: json!({
+                "provided_head": head,
+                "expected_head": expected_head,
+                "actual_head": actual_head,
+                "checkout_root": ctx.workspace.root_display(),
+                "suggestion": "Re-run the local verification against the current task checkout and import the new receipt."
+            }),
+        });
+    }
+
+    let kind = required_non_empty_string(args, "kind")?;
+    let command = required_non_empty_string(args, "command")?;
+    let recorded_at = required_non_empty_string(args, "recorded_at")?;
+    let exit_code = args
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", "exit_code 必须是 32-bit integer"))?;
+    let stdout_sha256 = required_sha256(args, "stdout_sha256")?;
+    let stderr_sha256 = required_sha256(args, "stderr_sha256")?;
+    let verification_key = optional_non_empty_string(args, "verification_key")?;
+    let test_file = optional_non_empty_string(args, "test_file")?;
+    let test_name = optional_non_empty_string(args, "test_name")?;
+    let level = args
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("blocking");
+    let duration_ms = args.get("duration_ms").and_then(Value::as_u64);
+    let receipt = json!({
+        "source": "external_local_verification",
+        "head": head,
+        "stdout_sha256": stdout_sha256,
+        "stderr_sha256": stderr_sha256,
+        "recorded_at": recorded_at,
+        "checkout_root": ctx.workspace.root_display()
+    });
+    let verification = ctx
+        .coding_harness
+        .record_verification(
+            task_id,
+            kind,
+            command,
+            verification_key.as_deref(),
+            test_file.as_deref(),
+            test_name.as_deref(),
+            Some(exit_code),
+            exit_code == 0,
+            duration_ms,
+            Some(recorded_at),
+            Some(receipt.clone()),
+            None,
+            level,
+            true,
+        )
+        .map_err(map_error)?;
+
+    Ok(tool_ok(json!({
+        "task_id": task_id,
+        "verification": verification_view(&verification),
+        "receipt": receipt,
+        "accepted": true,
+        "verified_checkout": true,
+        "warnings": []
+    })))
+}
+
+fn required_non_empty_string<'a>(args: &'a Value, field: &str) -> Result<&'a str, WorkspaceError> {
+    args.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| tool_error("INVALID_ARGUMENT", &format!("{field} 是必填项")))
+}
+
+fn optional_non_empty_string(args: &Value, field: &str) -> Result<Option<String>, WorkspaceError> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.trim().to_string()))
+        }
+        Some(_) => Err(tool_error(
+            "INVALID_ARGUMENT",
+            &format!("{field} 必须是非空字符串或 null"),
+        )),
+    }
+}
+
+fn required_sha256(args: &Value, field: &str) -> Result<String, WorkspaceError> {
+    let value = required_non_empty_string(args, field)?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            &format!("{field} 必须是 64 位十六进制 SHA-256"),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn ensure_session_reclaim_safe(

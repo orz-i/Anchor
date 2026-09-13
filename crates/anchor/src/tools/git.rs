@@ -51,6 +51,89 @@ pub fn git_worktree_list(ws: &Workspace, _args: &Value) -> Result<Value, Workspa
     })))
 }
 
+fn initialized_submodule_paths(cwd: &Path) -> Result<Vec<String>, WorkspaceError> {
+    let completed = run_git(
+        cwd,
+        &["submodule", "status", "--recursive"],
+        Duration::from_secs(30),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(completed
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let marker = line.chars().next()?;
+            if marker == '-' {
+                return None;
+            }
+            line.get(1..)?.split_whitespace().nth(1).map(str::to_string)
+        })
+        .collect())
+}
+
+fn git_index_tree(cwd: &Path) -> Result<String, WorkspaceError> {
+    let completed = run_git(cwd, &["write-tree"], Duration::from_secs(15))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(completed.stdout.trim().to_string())
+}
+
+fn git_status_porcelain(cwd: &Path) -> Result<String, WorkspaceError> {
+    let completed = run_git(cwd, &["status", "--porcelain=v1"], Duration::from_secs(15))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(completed.stdout)
+}
+
+fn git_diff_names_for_paths(
+    cwd: &Path,
+    paths: &[String],
+    staged: bool,
+) -> Result<Vec<String>, WorkspaceError> {
+    let mut command = vec!["diff".to_string()];
+    if staged {
+        command.push("--cached".to_string());
+    }
+    command.push("--name-only".to_string());
+    command.push("--".to_string());
+    command.extend(paths.iter().cloned());
+    let completed = run_git_owned(cwd, &command, Duration::from_secs(15))?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(completed
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn git_mutation_context(ws: &Workspace) -> Value {
+    json!({
+        "checkout_root": ws.root().display().to_string(),
+        "checkout_branch": git_current_branch(ws.root()),
+        "checkout_head": git_rev_parse(ws.root(), "HEAD")
+    })
+}
+
+fn git_postcondition_failed(operation: &str, details: Value) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "GIT_POSTCONDITION_FAILED",
+        message: format!(
+            "Git {operation} completed but its requested post-condition was not observed."
+        ),
+        category: "runtime",
+        retryable: true,
+        details,
+    }
+}
+
 fn ensure_clean_git_worktree(ws: &Workspace, operation: &str) -> Result<(), WorkspaceError> {
     let status = run_git(
         ws.root(),
@@ -349,8 +432,36 @@ pub fn git_worktree_remove(
             }),
         });
     }
+    let initialized_submodules = initialized_submodule_paths(&path)?;
+    if !initialized_submodules.is_empty() {
+        let completed = run_git(
+            &path,
+            &["submodule", "deinit", "--all"],
+            Duration::from_secs(60),
+        )?;
+        if !completed.success {
+            return Err(WorkspaceError::ToolDetails {
+                code: "GIT_SUBMODULE_DEINIT_FAILED",
+                message: completed.stderr.trim().to_string(),
+                category: "runtime",
+                retryable: true,
+                details: json!({
+                    "path": relative_managed_worktree_display(ws, &path),
+                    "submodules": initialized_submodules,
+                    "suggestion": "Inspect the clean managed worktree submodule state, then retry removal."
+                }),
+            });
+        }
+    }
+    // Git refuses to remove a linked worktree that has ever contained an
+    // initialized submodule unless worktree-remove receives --force, even
+    // after a successful deinit. This override is safe here because the
+    // non-force path has already required an exactly clean worktree above;
+    // it does not relax the dirty-worktree permission gate.
+    let clean_submodule_removal_override =
+        !force && status.stdout.trim().is_empty() && !initialized_submodules.is_empty();
     let mut command = vec!["worktree", "remove"];
-    if force {
+    if force || clean_submodule_removal_override {
         command.push("--force");
     }
     let path_text = path.to_string_lossy().into_owned();
@@ -359,10 +470,40 @@ pub fn git_worktree_remove(
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
+    let listed = run_git(
+        ws.root(),
+        &["worktree", "list", "--porcelain", "-z"],
+        Duration::from_secs(15),
+    )?;
+    if !listed.success {
+        return Err(git_error(&listed.stderr));
+    }
+    let still_registered = parse_worktree_porcelain(&listed.stdout)
+        .iter()
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .any(|entry| Path::new(entry) == path);
+    if path.exists() || still_registered {
+        return Err(git_postcondition_failed(
+            "worktree remove",
+            json!({
+                "path": relative_managed_worktree_display(ws, &path),
+                "path_exists": path.exists(),
+                "still_registered": still_registered,
+                "submodules_deinitialized": initialized_submodules
+            }),
+        ));
+    }
     Ok(tool_ok(json!({
         "path": relative_managed_worktree_display(ws, &path),
         "removed": true,
         "force": force,
+        "submodules_deinitialized": initialized_submodules,
+        "clean_submodule_removal_override": clean_submodule_removal_override,
+        "accepted": true,
+        "executed": true,
+        "verified": true,
+        "state_changed": true,
+        "status": "changed",
         "mutation_attributed": false,
         "warnings": []
     })))
@@ -839,16 +980,29 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
 pub fn git_stage(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     ensure_git_repo(ws)?;
     let paths = git_write_paths(ws, args)?;
+    let before_index = git_index_tree(ws.root())?;
     let mut command = vec!["add".to_string(), "--".to_string()];
     command.extend(paths.iter().cloned());
     let completed = run_git_owned(ws.root(), &command, Duration::from_secs(30))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
+    let after_index = git_index_tree(ws.root())?;
     let staged_files = git_name_list(ws.root(), &["diff", "--cached", "--name-only"])?;
+    let requested_staged_files = git_diff_names_for_paths(ws.root(), &paths, true)?;
+    let state_changed = before_index != after_index;
     Ok(tool_ok(json!({
         "staged_paths": paths,
         "staged_files": staged_files,
+        "requested_staged_files": requested_staged_files,
+        "before_index_tree": before_index,
+        "after_index_tree": after_index,
+        "accepted": true,
+        "executed": true,
+        "verified": true,
+        "state_changed": state_changed,
+        "status": if state_changed { "changed" } else { "no_op" },
+        "checkout": git_mutation_context(ws),
         "mutation_attributed": true,
         "warnings": []
     })))
@@ -879,6 +1033,7 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             }),
         });
     }
+    let before_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
     let command = vec![
         "commit".to_string(),
         "--no-gpg-sign".to_string(),
@@ -895,11 +1050,29 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         ws.root(),
         &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
     )?;
+    if commit_sha.is_empty() || commit_sha == before_head || committed_files.is_empty() {
+        return Err(git_postcondition_failed(
+            "commit",
+            json!({
+                "before_head": before_head,
+                "after_head": commit_sha,
+                "committed_files": committed_files,
+                "checkout": git_mutation_context(ws)
+            }),
+        ));
+    }
     Ok(tool_ok(json!({
         "commit_sha": commit_sha,
+        "before_head": before_head,
         "message": message,
         "committed_files": committed_files,
         "previously_staged_files": staged_files,
+        "accepted": true,
+        "executed": true,
+        "verified": true,
+        "state_changed": true,
+        "status": "changed",
+        "checkout": git_mutation_context(ws),
         "mutation_attributed": true,
         "warnings": []
     })))
@@ -918,6 +1091,16 @@ pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             "at least one of staged or worktree must be true",
         ));
     }
+    let before_staged = if staged {
+        git_diff_names_for_paths(ws.root(), &paths, true)?
+    } else {
+        Vec::new()
+    };
+    let before_worktree = if worktree {
+        git_diff_names_for_paths(ws.root(), &paths, false)?
+    } else {
+        Vec::new()
+    };
     if staged {
         let mut command = vec![
             "restore".to_string(),
@@ -942,10 +1125,40 @@ pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             return Err(git_error(&completed.stderr));
         }
     }
+    let after_staged = if staged {
+        git_diff_names_for_paths(ws.root(), &paths, true)?
+    } else {
+        Vec::new()
+    };
+    let after_worktree = if worktree {
+        git_diff_names_for_paths(ws.root(), &paths, false)?
+    } else {
+        Vec::new()
+    };
+    if !after_staged.is_empty() || !after_worktree.is_empty() {
+        return Err(git_postcondition_failed(
+            "restore",
+            json!({
+                "paths": paths,
+                "remaining_staged": after_staged,
+                "remaining_worktree": after_worktree,
+                "checkout": git_mutation_context(ws)
+            }),
+        ));
+    }
+    let state_changed = !before_staged.is_empty() || !before_worktree.is_empty();
     Ok(tool_ok(json!({
         "restored_paths": paths,
         "staged": staged,
         "worktree": worktree,
+        "before_staged": before_staged,
+        "before_worktree": before_worktree,
+        "accepted": true,
+        "executed": true,
+        "verified": true,
+        "state_changed": state_changed,
+        "status": if state_changed { "changed" } else { "no_op" },
+        "checkout": git_mutation_context(ws),
         "mutation_attributed": true,
         "warnings": []
     })))
@@ -987,6 +1200,8 @@ pub fn git_reset(
         WorkspaceError::invalid_argument(format!("Unknown commit revision: {revision}"))
     })?;
     let before_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let before_index = git_index_tree(ws.root())?;
+    let before_status = git_status_porcelain(ws.root())?;
     let flag = format!("--{mode}");
     let completed = run_git(
         ws.root(),
@@ -997,11 +1212,32 @@ pub fn git_reset(
         return Err(git_error(&completed.stderr));
     }
     let after_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let after_index = git_index_tree(ws.root())?;
+    let after_status = git_status_porcelain(ws.root())?;
+    if after_head != target_head {
+        return Err(git_postcondition_failed(
+            "reset",
+            json!({
+                "target_head": target_head,
+                "after_head": after_head,
+                "mode": mode,
+                "checkout": git_mutation_context(ws)
+            }),
+        ));
+    }
+    let state_changed =
+        before_head != after_head || before_index != after_index || before_status != after_status;
     Ok(tool_ok(json!({
         "before_head": before_head,
         "target_head": target_head,
         "after_head": after_head,
         "mode": mode,
+        "accepted": true,
+        "executed": true,
+        "verified": true,
+        "state_changed": state_changed,
+        "status": if state_changed { "changed" } else { "no_op" },
+        "checkout": git_mutation_context(ws),
         "mutation_attributed": true,
         "warnings": []
     })))
@@ -1309,8 +1545,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        diagnose_metadata_only_change, git_clean, git_commit, git_reset, git_restore, git_revert,
-        git_stage, git_status, parse_branch_line, run_process_with_timeout,
+        create_managed_worktree, diagnose_metadata_only_change, git_clean, git_commit, git_reset,
+        git_restore, git_revert, git_stage, git_status, git_worktree_remove, parse_branch_line,
+        run_process_with_timeout,
     };
     use crate::tools::workspace::Workspace;
 
@@ -1542,12 +1779,27 @@ mod tests {
         let staged = git_stage(&workspace, &json!({"paths": ["main.txt"]})).expect("stage");
         assert_eq!(staged["staged_files"], json!(["main.txt"]));
         assert_eq!(staged["mutation_attributed"], true);
+        assert_eq!(staged["accepted"], true);
+        assert_eq!(staged["executed"], true);
+        assert_eq!(staged["verified"], true);
+        assert_eq!(staged["state_changed"], true);
+        assert_eq!(staged["status"], "changed");
+        assert_eq!(staged["checkout"]["checkout_branch"], "main");
 
         let committed = git_commit(&workspace, &json!({"message": "update main"})).expect("commit");
         assert_eq!(committed["committed_files"], json!(["main.txt"]));
         assert!(committed["commit_sha"]
             .as_str()
             .is_some_and(|value| value.len() >= 7));
+        assert_eq!(committed["verified"], true);
+        assert_eq!(committed["state_changed"], true);
+        assert_ne!(committed["before_head"], committed["commit_sha"]);
+
+        let no_op_stage = git_stage(&workspace, &json!({"paths": ["main.txt"]}))
+            .expect("no-op stage remains a verified request");
+        assert_eq!(no_op_stage["verified"], true);
+        assert_eq!(no_op_stage["state_changed"], false);
+        assert_eq!(no_op_stage["status"], "no_op");
 
         fs::write(repo.join("main.txt"), "discard me\n").expect("dirty file");
         let restored = git_restore(
@@ -1556,12 +1808,101 @@ mod tests {
         )
         .expect("restore");
         assert_eq!(restored["restored_paths"], json!(["main.txt"]));
+        assert_eq!(restored["verified"], true);
+        assert_eq!(restored["state_changed"], true);
+        assert_eq!(restored["status"], "changed");
         assert_eq!(
             fs::read_to_string(repo.join("main.txt"))
                 .expect("restored file")
                 .replace("\r\n", "\n"),
             "updated\n"
         );
+
+        let no_op_restore = git_restore(
+            &workspace,
+            &json!({"paths": ["main.txt"], "worktree": true, "staged": false}),
+        )
+        .expect("clean restore is a verified no-op");
+        assert_eq!(no_op_restore["verified"], true);
+        assert_eq!(no_op_restore["state_changed"], false);
+        assert_eq!(no_op_restore["status"], "no_op");
+    }
+
+    #[test]
+    fn managed_worktree_remove_deinitializes_clean_submodules_and_verifies_removal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let subrepo = temp.path().join("subrepo");
+        fs::create_dir_all(&subrepo).expect("subrepo dir");
+        git(&subrepo, &["init", "--initial-branch=main"]);
+        git(
+            &subrepo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(&subrepo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(subrepo.join("sub.txt"), "sub\n").expect("sub file");
+        git(&subrepo, &["add", "sub.txt"]);
+        git(&subrepo, &["commit", "-m", "sub initial"]);
+
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(
+            &repo,
+            &["config", "user.email", "anchor-tests@example.invalid"],
+        );
+        git(&repo, &["config", "user.name", "Anchor Tests"]);
+        fs::write(repo.join(".gitignore"), ".anchor/\n").expect("gitignore");
+        fs::write(repo.join("main.txt"), "main\n").expect("main file");
+        git(&repo, &["add", ".gitignore", "main.txt"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                subrepo.to_str().expect("subrepo path"),
+                "deps/sub",
+            ],
+        );
+        git(&repo, &["commit", "-am", "add submodule"]);
+
+        let workspace = Workspace::new(repo.clone()).expect("workspace");
+        let worktree = create_managed_worktree(
+            &workspace,
+            "submodule_case",
+            Some("anchor/test/submodule-case"),
+            "HEAD",
+            false,
+        )
+        .expect("managed worktree");
+        let worktree_path = std::path::PathBuf::from(&worktree.path);
+        git(
+            &worktree_path,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        );
+        assert!(worktree_path.join("deps/sub/sub.txt").exists());
+
+        let removed = git_worktree_remove(
+            &workspace,
+            &json!({"path": worktree.path, "force": false}),
+            false,
+        )
+        .expect("clean submodule worktree removal");
+        assert_eq!(removed["removed"], true);
+        assert_eq!(removed["verified"], true);
+        assert_eq!(removed["state_changed"], true);
+        assert_eq!(removed["status"], "changed");
+        assert_eq!(removed["submodules_deinitialized"], json!(["deps/sub"]));
+        assert!(!worktree_path.exists());
     }
 
     fn git(cwd: &std::path::Path, args: &[&str]) {
